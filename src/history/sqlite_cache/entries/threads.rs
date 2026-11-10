@@ -1,69 +1,68 @@
 use crate::agent::message_numbering::{ThreadIdentity, ThreadNumbers};
 use crate::history::format::RecordLine;
 use crate::log_entry::{LogEntry, SubagentIdentity};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Default, Hash, PartialEq, Eq)]
-struct ThreadOriginKey {
-    transcript: Option<i64>,
-    label: Option<String>,
-    nickname: Option<String>,
-    role: Option<String>,
-    agent_path: Option<String>,
-    agent_id: Option<String>,
-    launch_call: Option<String>,
+/// A `threads` row's columns besides its number: the transcript its turns
+/// came from and the agent label they carry. A session holds one row for
+/// each.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub(super) struct ThreadOrigin {
+    pub(super) transcript: Option<Arc<Path>>,
+    pub(super) label: Option<String>,
+    pub(super) nickname: Option<String>,
+    pub(super) role: Option<String>,
+    pub(super) agent_path: Option<String>,
+    pub(super) agent_id: Option<String>,
+    pub(super) launch_call: Option<String>,
 }
 
+pub(super) struct ThreadRow {
+    pub(super) origin: ThreadOrigin,
+    /// The index of the origin's transcript in [`Numbering::transcripts`].
+    pub(super) transcript: Option<usize>,
+    pub(super) number: i64,
+}
+
+/// The transcripts and threads of a session's entries, numbered in the
+/// order the entries first name them.
 #[derive(Default)]
 pub(super) struct Numbering {
-    transcripts: HashMap<Arc<Path>, i64>,
-    origins: HashMap<ThreadOriginKey, i64>,
+    pub(super) transcripts: Vec<Arc<Path>>,
+    transcript_indexes: HashMap<Arc<Path>, usize>,
+    pub(super) threads: Vec<ThreadRow>,
+    origins: HashMap<ThreadOrigin, usize>,
     positions: HashMap<i64, i64>,
     logical_threads: ThreadNumbers,
 }
 
+/// An entry's place: indexes into [`Numbering`]'s transcripts and threads.
 pub(super) struct Placement {
-    pub(super) thread: i64,
+    pub(super) thread: usize,
     pub(super) logical_thread: i64,
     pub(super) position: i64,
-    pub(super) transcript: Option<i64>,
+    /// The entry's transcript when its thread's origin names another one.
+    pub(super) transcript: Option<usize>,
 }
 
 impl Numbering {
-    fn transcript(
-        &mut self,
-        connection: &Connection,
-        session: i64,
-        record: &RecordLine,
-    ) -> rusqlite::Result<Option<i64>> {
-        let Some(path) = &record.transcript else {
-            return Ok(None);
-        };
-        if let Some(id) = self.transcripts.get(path) {
-            return Ok(Some(*id));
+    fn transcript(&mut self, path: &Arc<Path>) -> usize {
+        match self.transcript_indexes.entry(path.clone()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                self.transcripts.push(path.clone());
+                *entry.insert(self.transcripts.len() - 1)
+            }
         }
-        connection.execute(
-            "INSERT INTO transcripts (session, path) VALUES (?1, ?2)",
-            params![session, super::path_text(path)],
-        )?;
-        let id = connection.last_insert_rowid();
-        self.transcripts.insert(path.clone(), id);
-        Ok(Some(id))
     }
 
-    pub(super) fn place(
-        &mut self,
-        connection: &Connection,
-        session: i64,
-        record: &RecordLine,
-        entry: &LogEntry,
-    ) -> rusqlite::Result<Placement> {
-        let transcript = self.transcript(connection, session, record)?;
+    pub(super) fn place(&mut self, record: &RecordLine, entry: &LogEntry) -> Placement {
+        let transcript = record.transcript.as_ref().map(|path| self.transcript(path));
         let key = match entry {
             LogEntry::User {
                 parent_tool_use_id: Some(call),
@@ -72,10 +71,10 @@ impl Numbering {
             | LogEntry::Assistant {
                 parent_tool_use_id: Some(call),
                 ..
-            } => ThreadOriginKey {
+            } => ThreadOrigin {
                 label: Some(call.clone()),
                 launch_call: Some(call.clone()),
-                ..ThreadOriginKey::default()
+                ..ThreadOrigin::default()
             },
             LogEntry::Progress { data, extra }
                 if data.get("type").and_then(Value::as_str) == Some("agent_progress")
@@ -84,8 +83,8 @@ impl Numbering {
                 let text =
                     |value: &Value, key| value.get(key).and_then(Value::as_str).map(str::to_owned);
                 let identity = &data["identity"];
-                ThreadOriginKey {
-                    transcript,
+                ThreadOrigin {
+                    transcript: record.transcript.clone(),
                     label: text(data, "agentId"),
                     nickname: text(identity, "nickname"),
                     role: text(identity, "role"),
@@ -94,11 +93,11 @@ impl Numbering {
                     launch_call: text(extra, "parentToolUseID"),
                 }
             }
-            _ => ThreadOriginKey::default(),
+            _ => ThreadOrigin::default(),
         };
         // Metadata changes get their own stored origin, preserving each
         // message's attribution without repeating the strings on entries.
-        let record_transcript = transcript.filter(|value| Some(*value) != key.transcript);
+        let record_transcript = transcript.filter(|_| record.transcript != key.transcript);
         let number = self
             .logical_threads
             .number(ThreadIdentity::of(entry, record.transcript.as_deref()));
@@ -108,31 +107,21 @@ impl Numbering {
         let thread = match self.origins.entry(key) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
-                let key = entry.key();
-                connection.execute(
-                    "INSERT INTO threads (session, number, transcript, label, nickname, role, \
-                 agent_path, agent_id, launch_call) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        session,
-                        number,
-                        key.transcript,
-                        key.label,
-                        key.nickname,
-                        key.role,
-                        key.agent_path,
-                        key.agent_id,
-                        key.launch_call
-                    ],
-                )?;
-                *entry.insert(connection.last_insert_rowid())
+                let origin = entry.key().clone();
+                self.threads.push(ThreadRow {
+                    transcript: transcript.filter(|_| origin.transcript.is_some()),
+                    origin,
+                    number,
+                });
+                *entry.insert(self.threads.len() - 1)
             }
         };
-        Ok(Placement {
+        Placement {
             thread,
             logical_thread: number,
             position,
             transcript: record_transcript,
-        })
+        }
     }
 }
 

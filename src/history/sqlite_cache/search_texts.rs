@@ -149,9 +149,9 @@ fn query(fields: SearchedFields, windowed: bool) -> String {
          WHERE e.session = ?1 AND p.search_field {field_codes} AND p.text IS NULL \
          AND i.searched{inside} \
          UNION ALL \
-         SELECT s.search_field, {ordinal}, s.text, NULL FROM search_texts s \
-         JOIN entries e ON e.id = s.entry {messages} \
-         WHERE s.session = ?1 AND s.search_field {field_codes}{inside}"
+         SELECT s.search_field, {ordinal}, s.text, NULL FROM entries e \
+         JOIN search_texts s ON s.entry = e.id {messages} \
+         WHERE e.session = ?1 AND s.search_field {field_codes}{inside}"
     );
     if !windowed {
         sql.push_str(
@@ -234,6 +234,41 @@ impl ResultItems {
         match self.metadata.take() {
             Some(metadata) => visit(metadata.text(&self.text)),
             None => ControlFlow::Continue(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Search texts come in entry order only while the query walks the
+    /// session's entries and looks up each one's texts.
+    #[test]
+    fn query_reads_one_sessions_texts_through_its_entries() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(super::super::schema::CREATE)
+            .unwrap();
+        for fields in [SearchedFields::List, SearchedFields::Agent] {
+            for windowed in [false, true] {
+                let parameters: &[i64] = if windowed { &[1, 0, 0] } else { &[1] };
+                let plan = connection
+                    .prepare(&format!("EXPLAIN QUERY PLAN {}", query(fields, windowed)))
+                    .unwrap()
+                    .query_map(rusqlite::params_from_iter(parameters), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join("\n");
+                assert!(
+                    plan.contains("SEARCH s USING INDEX search_texts_by_entry")
+                        && !plan.contains("SCAN"),
+                    "the query reads each entry's search texts by entry, scanning no table: {plan}"
+                );
+            }
         }
     }
 }

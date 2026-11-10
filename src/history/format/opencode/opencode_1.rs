@@ -575,7 +575,8 @@ mod tests {
             &crate::clock::TestClock::default(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .row;
 
         assert_eq!(
             conversation.total_tokens,

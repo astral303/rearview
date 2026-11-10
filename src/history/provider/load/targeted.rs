@@ -646,10 +646,11 @@ impl SessionLoader<'_> {
             access,
             &to_parse,
             |permit, stub| {
-                let raw = self.parse(permit, root, stub, &|| {});
-                let record = writes_database
-                    .then(|| cache_record(permit, self.storage, root, stub, &raw))
-                    .flatten();
+                let stamps = writes_database.then(|| StubStamps::current(stub));
+                let (raw, transcripts) = self.parse(permit, root, stub, &|| {});
+                let record = stamps.and_then(|stamps| {
+                    cache_record(self.storage, root, stub, stamps, &raw, transcripts)
+                });
                 (raw, record)
             },
             |group, parsed| {
@@ -676,6 +677,14 @@ impl SessionLoader<'_> {
                 }
             },
         );
+        if let Some(CacheDatabase::Writer(writer)) = &database
+            && let Err(error) = writer.checkpoint_after_writes()
+        {
+            debug::warn(
+                self.debug_level,
+                &format!("Failed to checkpoint the session cache database: {error}"),
+            );
+        }
         reads.extend(unparsed.iter().map(|stub| AttemptRead {
             outcome: self.cached_copy(database.as_ref(), root, external_titles, stub),
             is_current: false,

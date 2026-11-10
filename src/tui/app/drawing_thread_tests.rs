@@ -703,7 +703,11 @@ fn current_sizes(
     SqliteCache::open_waiting(&rearview(base))
         .unwrap()
         .unwrap()
-        .current_fingerprints(fixture.storage().cache(), &fixture.root_under(home).path)
+        .current_fingerprints(
+            fixture.storage().cache(),
+            &fixture.root_under(home).path,
+            &[],
+        )
         .unwrap()
         .into_values()
         .map(|fingerprint| fingerprint.file_size)

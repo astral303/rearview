@@ -36,7 +36,6 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         full_text,
         agent_search_text: String::new(),
         thinking_and_tool_call_text: String::new(),
-        semantic_route_text: String::new(),
         project_name: Some("project".to_string()),
         project_path: None,
         cwd: None,

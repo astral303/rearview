@@ -21,17 +21,7 @@ fn write_stores_each_text_content_rebuilds_once_for_every_provider() {
         let root = root_of(&session);
         let stub = stub_of(&session, 1);
         cache
-            .write(
-                &SessionRecord::listed(
-                    crate::history::FOR_FIXTURES,
-                    storage,
-                    row.source,
-                    &root,
-                    &stub,
-                    row,
-                )
-                .unwrap(),
-            )
+            .write(&parsed_record(row.source, &root, &stub))
             .unwrap();
         let CatalogueSession::Listed(listed) = cache
             .catalogue_session(storage, row.source, &root.path, &stub.cache_key, false)

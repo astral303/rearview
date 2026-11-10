@@ -7,14 +7,24 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 pub fn sanitize_agent_text(text: &str) -> String {
+    without_terminal_codes(text).into_owned()
+}
+
+/// [`sanitize_agent_text`]'s output, borrowing `text` when it holds no
+/// terminal codes.
+pub(crate) fn without_terminal_codes(text: &str) -> Cow<'_, str> {
+    let mut runs = code_runs(text).peekable();
+    if runs.peek().is_none() {
+        return Cow::Borrowed(text);
+    }
     let mut output = String::with_capacity(text.len());
     let mut shown_from = 0;
-    for codes in code_runs(text) {
+    for codes in runs {
         output.push_str(&text[shown_from..codes.start]);
         shown_from = codes.end;
     }
     output.push_str(&text[shown_from..]);
-    output
+    Cow::Owned(output)
 }
 
 /// A text split into the text without its terminal codes and the codes.

@@ -106,6 +106,7 @@ impl Source {
 /// Only `source`'s own format reads the locator — a session the list already
 /// attributed to a provider never meets a foreign format, which is what lets a
 /// provider's locators be something other than openable files.
+#[cfg(test)]
 pub(crate) fn normalized_session(
     permit: ParsePermit<'_>,
     source: Source,
@@ -209,7 +210,6 @@ pub struct Conversation {
     /// [`tool_call_text`](crate::agent::transcript::tool_call_text), the
     /// session's and its sub-agents'. Only `agent search` reads it.
     pub thinking_and_tool_call_text: String,
-    pub semantic_route_text: String,
     pub semantic_turns: Vec<String>,
     pub semantic_turn_ranges: Vec<crate::agent::refs::MessageRange>,
     /// Pre-normalized lowercase search text (avoids re-normalizing on every startup)
@@ -256,32 +256,38 @@ pub struct Conversation {
     pub is_missing_earlier_turns: bool,
 }
 
-pub(crate) fn semantic_route_text(full_text: &str, agent_search_text: &str) -> String {
-    const ROUTE_EVIDENCE_CHARS: usize = 1_000;
-    const ROUTE_EVIDENCE_SEGMENTS: usize = 4;
-    const ROUTE_KEYWORDS: usize = 100;
-    const ROUTE_KEYWORD_CHARS: usize = 800;
+impl Conversation {
+    /// The session's keywords and an excerpt of its text, from `full_text`
+    /// and `agent_search_text`, for the agent's semantic route. Computed on
+    /// each call rather than at parse: ranking the keywords takes seconds on
+    /// a large session, and only the agent's semantic route reads it.
+    pub(crate) fn semantic_route_text(&self) -> String {
+        const ROUTE_EVIDENCE_CHARS: usize = 1_000;
+        const ROUTE_EVIDENCE_SEGMENTS: usize = 4;
+        const ROUTE_KEYWORDS: usize = 100;
+        const ROUTE_KEYWORD_CHARS: usize = 800;
 
-    let mut text = message_texts::without_message_separators(full_text).into_owned();
-    if !agent_search_text.is_empty() {
-        text.push(' ');
-        text.push_str(&message_texts::without_message_separators(
-            agent_search_text,
-        ));
+        let mut text = message_texts::without_message_separators(&self.full_text).into_owned();
+        if !self.agent_search_text.is_empty() {
+            text.push(' ');
+            text.push_str(&message_texts::without_message_separators(
+                &self.agent_search_text,
+            ));
+        }
+        if text.is_empty() {
+            return String::new();
+        }
+        let keywords = semantic_route_keywords(&text, ROUTE_KEYWORDS)
+            .chars()
+            .take(ROUTE_KEYWORD_CHARS)
+            .collect::<String>();
+        let excerpt = evenly_spaced_excerpt(&text, ROUTE_EVIDENCE_CHARS, ROUTE_EVIDENCE_SEGMENTS);
+        [keywords, excerpt]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
-    if text.is_empty() {
-        return String::new();
-    }
-    let keywords = semantic_route_keywords(&text, ROUTE_KEYWORDS)
-        .chars()
-        .take(ROUTE_KEYWORD_CHARS)
-        .collect::<String>();
-    let excerpt = evenly_spaced_excerpt(&text, ROUTE_EVIDENCE_CHARS, ROUTE_EVIDENCE_SEGMENTS);
-    [keywords, excerpt]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn semantic_route_keywords(text: &str, limit: usize) -> String {

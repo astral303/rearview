@@ -498,6 +498,7 @@ pub(super) mod tests {
             )
             .unwrap()
             .unwrap()
+            .row
             .source
     }
 
@@ -589,7 +590,8 @@ pub(super) mod tests {
                 &crate::clock::TestClock::default(),
             )
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .row;
         let stub = discover_sessions(&SystemLister, &root, 1)
             .unwrap()
             .stubs
@@ -605,7 +607,8 @@ pub(super) mod tests {
                 &crate::clock::TestClock::default(),
             )
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .row;
 
         assert_eq!(merged.source, Source::Omp);
         assert_eq!(
@@ -659,7 +662,8 @@ pub(super) mod tests {
                 &crate::clock::TestClock::default(),
             )
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .row;
 
         assert_eq!(merged.source, Source::Omp, "the title slot names OMP");
         assert!(

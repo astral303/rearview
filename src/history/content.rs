@@ -86,8 +86,6 @@ impl ContentBuilder {
             push_separated(&mut row.agent_search_text, &text);
         }
         row.search_text_lower = crate::search::normalize_for_search(&row.full_text);
-        row.semantic_route_text =
-            super::semantic_route_text(&row.full_text, &row.agent_search_text);
         row.semantic_turns = self.semantic;
         row.semantic_turn_ranges = self.semantic_ranges;
         row.cached_session = None;

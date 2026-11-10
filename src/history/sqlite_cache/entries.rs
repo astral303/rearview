@@ -3,13 +3,17 @@
 //! columns and shared thread metadata.
 
 mod context;
+mod diff;
+mod digest;
 mod messages;
 mod parts;
+mod rows;
 mod search;
 mod threads;
 mod times;
+mod write;
 
-use crate::agent::sanitize::{join_terminal_codes, split_terminal_codes};
+use crate::agent::sanitize::join_terminal_codes;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
 use crate::history::{MalformedLine, MalformedLineDetail, TranscriptEntries};
@@ -18,159 +22,65 @@ use crate::log_entry::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::path::Path;
-use threads::Numbering;
 
-/// Entries written per transaction, so a session of hundreds of thousands of
-/// entries does not hold the database's write lock while all of it is
-/// written.
+pub(super) use diff::update;
+pub(super) use rows::SessionRows;
+
+/// Entries a first write of a session writes per transaction, so a session
+/// of hundreds of thousands of entries does not hold the database's write
+/// lock while all of it is written.
 const ENTRIES_PER_TRANSACTION: usize = 20_000;
 
-/// Writes `entries`, the entries of the session with id `session`, whose
-/// sub-agent transcripts are `subagents`, with the search field of each of
-/// their search texts.
-pub(super) fn write(
+/// Inserts `rows`, the entry rows of the session with id `session`, whose
+/// row is marked writing and holds none yet, a slice of entries per
+/// transaction.
+pub(super) fn insert(
     connection: &mut Connection,
     session: i64,
-    entries: &TranscriptEntries,
-    subagents: &HashSet<&Path>,
+    rows: &SessionRows,
     check_space: &dyn Fn() -> Result<()>,
     owner: &super::refresh::RefreshToken,
 ) -> Result<()> {
-    let mut numbering = Numbering::default();
-    let mut message_writer = messages::Writer::new(session);
-    let mut leading = LeadingTexts::default();
-    for (chunk_index, chunk) in entries.entries.chunks(ENTRIES_PER_TRANSACTION).enumerate() {
+    let mut ids = write::RowIds::new(rows);
+    for start in (0..rows.entries.len()).step_by(ENTRIES_PER_TRANSACTION) {
         check_space()?;
         let transaction = super::session_transaction(connection, session, owner)?;
         {
-            let mut entry_statement = transaction.prepare_cached(INSERT_ENTRY)?;
-            let mut derived_statement = transaction.prepare_cached(INSERT_SEARCH_TEXT)?;
-            let mut part_writer = parts::Writer::new(&transaction)?;
-            for (offset, (record, entry)) in chunk.iter().enumerate() {
-                let sequence = (chunk_index * ENTRIES_PER_TRANSACTION + offset) as i64;
-                let placement = numbering.place(&transaction, session, record, entry)?;
-                let columns = EntryColumns::of(entry);
-                let membership = message_writer.write(&transaction, &placement, entry, &columns)?;
-                let message = membership.map(|membership| membership.id);
-                let metadata_usage = message.is_none().then_some(columns.usage).flatten();
-                let text = columns.text.map(split_terminal_codes);
-                entry_statement.execute(params![
-                    session,
-                    message,
-                    membership.is_some_and(|membership| membership.contributes),
-                    placement.position,
-                    sequence,
-                    placement.transcript,
-                    record.line as i64,
-                    columns.kind,
-                    columns.timestamp_ms,
-                    columns.content,
-                    text.as_ref().map(|text| &*text.text),
-                    text.as_ref().and_then(|text| text.codes.as_deref()),
-                    columns.label,
-                    columns.uuid,
-                    metadata_usage.map(|usage| usage.input_tokens as i64),
-                    metadata_usage.map(|usage| usage.output_tokens as i64),
-                    metadata_usage.map(|usage| usage.cache_creation_input_tokens as i64),
-                    metadata_usage.map(|usage| usage.cache_read_input_tokens as i64),
-                    columns.level,
-                    columns.duration_ms.map(|duration| duration as i64),
-                    columns.parent_uuid,
-                    columns.flag,
-                ])?;
-                let entry_id = transaction.last_insert_rowid();
-                leading.read(entry_id, entry);
-                let spliced = record
-                    .transcript
-                    .as_deref()
-                    .is_some_and(|path| subagents.contains(path));
-                let blocks = columns.parts.blocks();
-                let search = search::entry_search(entry, blocks, spliced);
-                part_writer.write(&transaction, entry_id, blocks, &search.blocks)?;
-                for derived in &search.derived {
-                    derived_statement.execute(params![
-                        session,
-                        entry_id,
-                        derived.field.code(),
-                        split_terminal_codes(&derived.text).text
-                    ])?;
-                }
+            let mut writer = write::RowWriter::new(&transaction, session)?;
+            let end = (start + ENTRIES_PER_TRANSACTION).min(rows.entries.len());
+            for sequence in start..end {
+                writer.insert_entry(rows, &mut ids, sequence)?;
             }
         }
         super::refresh::commit(transaction, owner)?;
-        check_space()?;
     }
-    check_space()?;
-    let transaction = super::session_transaction(connection, session, owner)?;
-    transaction.execute(
-        "UPDATE sessions SET message_count = (SELECT COUNT(*) FROM messages \
-         WHERE session = ?1 AND ordinal IS NOT NULL) WHERE id = ?1",
-        [session],
-    )?;
-    for entry in [leading.title, leading.summary].into_iter().flatten() {
-        transaction.execute(
-            "UPDATE entries SET search_field = ?1 WHERE id = ?2",
-            params![super::SearchField::Leading.code(), entry],
-        )?;
-    }
-    {
-        let mut statement = transaction.prepare_cached(
-            "INSERT INTO malformed_lines (session, position, line_number, line_content, \
-             error_message, context_before, context_after) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        for (position, malformed) in entries.malformed_lines.iter().enumerate() {
-            let detail = malformed.detail.as_ref();
-            statement.execute(params![
-                session,
-                position as i64,
-                malformed.line_number as i64,
-                detail.map(|detail| detail.line_content.as_str()),
-                detail.map(|detail| detail.error_message.as_str()),
-                detail.map(|detail| json_text(&detail.context_before)),
-                detail.map(|detail| json_text(&detail.context_after)),
-            ])?;
-        }
-    }
-    super::refresh::commit(transaction, owner)?;
     Ok(())
 }
 
-const INSERT_ENTRY: &str = "INSERT INTO entries (session, message, contributes, position, sequence, \
-    record_transcript, record_line, kind, timestamp_ms, content, text, text_codes, label, uuid, \
-    usage_input, usage_output, usage_cache_creation, usage_cache_read, level, duration_ms, \
-    parent_uuid, flag) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)";
-
-/// A search text is read only by search, which reads it without terminal
-/// codes, so its codes are dropped.
-const INSERT_SEARCH_TEXT: &str =
-    "INSERT INTO search_texts (session, entry, search_field, text) VALUES (?1, ?2, ?3, ?4)";
-
-/// The entries holding the session's title and summary, which search reads
-/// with its text: the last custom title, unless it is blank; the last AI
-/// title that is not blank, else the first summary.
-#[derive(Default)]
-struct LeadingTexts {
-    title: Option<i64>,
-    summary: Option<i64>,
-}
-
-impl LeadingTexts {
-    fn read(&mut self, id: i64, entry: &LogEntry) {
-        match entry {
-            LogEntry::Summary { .. } if self.summary.is_none() => self.summary = Some(id),
-            LogEntry::AiTitle { ai_title } if !ai_title.trim().is_empty() => {
-                self.summary = Some(id);
+/// The `malformed_lines` rows of `lines`, keyed by line number.
+pub(super) fn malformed_line_rows(
+    lines: &[MalformedLine],
+) -> Vec<super::positional::PositionalRow<i64>> {
+    lines
+        .iter()
+        .map(|malformed| {
+            let detail = malformed.detail.as_ref();
+            super::positional::PositionalRow {
+                key: malformed.line_number as i64,
+                values: vec![
+                    (malformed.line_number as i64).into(),
+                    detail.map(|detail| detail.line_content.clone()).into(),
+                    detail.map(|detail| detail.error_message.clone()).into(),
+                    detail
+                        .map(|detail| json_text(&detail.context_before))
+                        .into(),
+                    detail.map(|detail| json_text(&detail.context_after)).into(),
+                ],
             }
-            LogEntry::CustomTitle { custom_title } => {
-                self.title = (!custom_title.trim().is_empty()).then_some(id);
-            }
-            _ => {}
-        }
-    }
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -718,24 +628,29 @@ fn lines_of(json: &str) -> Vec<String> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
-/// The id of the listed session `storage` found at `cache_key` under `root`.
-pub(super) fn session_id_of(
+/// A stored session row: its id, and the generation its last write gave it.
+pub(super) struct StoredSession {
+    pub(super) id: i64,
+    pub(super) generation: i64,
+}
+
+/// The row of the listed session `storage` found at `cache_key` under
+/// `root`.
+pub(super) fn listed_session_of(
     connection: &Connection,
     storage: &str,
     root: &str,
     cache_key: &str,
-) -> Result<Option<i64>> {
-    let row: Option<(i64, String, Option<String>)> = connection
+) -> Result<Option<StoredSession>> {
+    let row: Option<(i64, i64, String, Option<String>)> = connection
         .query_row(
-            "SELECT id, status, CASE WHEN is_missing_earlier_turns = 1 \
-             THEN 'earlier session history needs rechecking' \
-             WHEN status = 'listed' THEN entries_error END FROM sessions \
-             WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
+            "SELECT id, generation, status, CASE WHEN status = 'listed' THEN entries_error END \
+             FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
             params![storage, root, cache_key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((id, status, error)) = row else {
+    let Some((id, generation, status, error)) = row else {
         return Ok(None);
     };
     if status == super::catalogue::WRITING || error.is_some() {
@@ -744,7 +659,7 @@ pub(super) fn session_id_of(
             reason: error.unwrap_or_else(|| "refresh in progress".to_owned()),
         });
     }
-    Ok(Some(id))
+    Ok(Some(StoredSession { id, generation }))
 }
 
 #[cfg(test)]

@@ -445,7 +445,8 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
         current
             .current_fingerprints(
                 Source::Pi.provider().storage().cache(),
-                Path::new("virtual")
+                Path::new("virtual"),
+                &[]
             )
             .unwrap()["session"]
             .mtime_secs,
@@ -461,7 +462,8 @@ fn takeover_between_batches_prevents_more_entries_and_final_status() {
     let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.mark_admitted().unwrap();
     let record = record();
-    let session = cache.write_catalogue(&record).unwrap();
+    let keys = cache.catalogue_keys(&record.catalogue);
+    let session = cache.write_catalogue(&record, &keys, None).unwrap();
     let replacement = replace_owner(&base);
     assert!(matches!(
         super::super::session_transaction(&mut cache.connection, session, owner.token()),

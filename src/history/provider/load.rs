@@ -12,12 +12,13 @@ use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::format::same_file;
 use crate::history::load_meter::AgentMeter;
-use crate::history::parser::{ParsedSession, UnlistedReason};
+use crate::history::parser::{ParsedSession, SessionTranscripts, UnlistedReason};
 use crate::history::shard_files;
 use crate::history::sqlite_cache::refresh::RefreshToken;
 use crate::history::sqlite_cache::{
     self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, LiveOwner,
     NextStep, OperationAccess, OperationScope, SessionRecord, SessionStatus, SqliteCache,
+    StubStamps,
 };
 use crate::history::{
     Conversation, Environment, FilterTerm, ParsePermit, Source, format_short_name_from_path,
@@ -1012,7 +1013,7 @@ impl SessionLoader<'_> {
             return Ok(None);
         }
         self.open_database_reader(reader)?
-            .map(|database| self.read_root_cache(root, database))
+            .map(|database| self.read_root_cache(root, stubs, database))
             .transpose()
     }
 
@@ -1033,7 +1034,7 @@ impl SessionLoader<'_> {
         let Some(database) = self.open_database_writer(owner) else {
             return Ok(None);
         };
-        let (snapshot, coordinated) = owner.read(|| self.read_root_cache(root, database));
+        let (snapshot, coordinated) = owner.read(|| self.read_root_cache(root, stubs, database));
         self.report_read_coordination(coordinated);
         let snapshot = snapshot?;
         Ok(owner.can_publish().then_some(snapshot))
@@ -1051,12 +1052,18 @@ impl SessionLoader<'_> {
     }
 
     /// Current fingerprints and all stored keys are separate: unfinished
-    /// refreshes must remain eligible for deletion reconciliation.
-    fn read_root_cache(&self, root: &SessionRoot, database: CacheDatabase) -> Result<RootCache> {
+    /// refreshes must remain eligible for deletion reconciliation. `stubs`
+    /// are the root's sessions as discovery stamped them.
+    fn read_root_cache(
+        &self,
+        root: &SessionRoot,
+        stubs: &[SessionStub],
+        database: CacheDatabase,
+    ) -> Result<RootCache> {
         self.meter.reading_cache();
         let reading = self.clock().now();
         let cache = database.reader();
-        let current = cache.current_fingerprints(self.storage.cache(), &root.path)?;
+        let current = cache.current_fingerprints(self.storage.cache(), &root.path, stubs)?;
         let stored = cache.stored_keys(self.storage.cache(), &root.path)?;
         let catalogue = cache.catalogue(
             self.storage.cache(),
@@ -1156,9 +1163,11 @@ impl SessionLoader<'_> {
                     self.meter.transcript_read();
                     let _ = read.send(TranscriptProgress::Completed(1));
                 };
-                let raw = self.parse(permit, root, stub, &on_transcript_read);
-                let record =
-                    database.and_then(|_| cache_record(permit, self.storage, root, stub, &raw));
+                let stamps = database.map(|_| StubStamps::current(stub));
+                let (raw, transcripts) = self.parse(permit, root, stub, &on_transcript_read);
+                let record = stamps.and_then(|stamps| {
+                    cache_record(self.storage, root, stub, stamps, &raw, transcripts)
+                });
                 let unannounced =
                     transcript_count(stub).saturating_sub(announced.load(Ordering::Relaxed));
                 if unannounced > 0 {
@@ -1306,14 +1315,15 @@ impl SessionLoader<'_> {
     }
 
     /// The session at `stub` read from its transcripts with `permit`, the
-    /// parse recorded in the meter.
+    /// parse recorded in the meter, with the transcripts the parse read for
+    /// a listed session.
     fn parse(
         &self,
         permit: ParsePermit<'_>,
         root: &SessionRoot,
         stub: &SessionStub,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> RawRead {
+    ) -> (RawRead, Option<SessionTranscripts>) {
         let parsing = self.clock().now();
         let outcome = parse_session(
             self.storage,
@@ -1570,17 +1580,19 @@ fn restored_row(
 }
 
 /// The session cache database's projection of `raw`, the parse of
-/// `storage`'s session at `stub` under `root`. `None` for a transient
-/// failure and for a row built without a transcript after a transient
-/// error: the next load reads the session again. An empty or
-/// unreadable session records the warning the parse built. `permit` admits
-/// the parse of a listed session's entries.
+/// `storage`'s session at `stub` under `root`, a listed session's entries
+/// from `transcripts`, what that parse read. `stamps` are the stub's files
+/// stamped before the parse. `None` for a transient failure and for a row
+/// built without a transcript after a transient error: the next load reads
+/// the session again. An empty or unreadable session records the warning
+/// the parse built.
 fn cache_record(
-    permit: ParsePermit<'_>,
     storage: &dyn SessionStorage,
     root: &SessionRoot,
     stub: &SessionStub,
+    stamps: StubStamps,
     raw: &RawRead,
+    transcripts: Option<SessionTranscripts>,
 ) -> Option<SessionRecord> {
     let unlisted = |status, warning: &AgentWarning| {
         SessionRecord::unlisted(
@@ -1592,24 +1604,28 @@ fn cache_record(
             warning.to_recorded(),
         )
     };
-    match raw {
-        RawRead::Parsed(conversation) if !conversation.has_transient_read_error => {
+    match (raw, transcripts) {
+        (RawRead::Parsed(conversation), Some(transcripts))
+            if !conversation.has_transient_read_error =>
+        {
             SessionRecord::listed(
-                permit,
                 storage.cache(),
                 storage.source(),
                 root,
                 stub,
+                stamps,
                 conversation,
+                transcripts,
             )
         }
-        RawRead::Empty(Some(warning)) => unlisted(SessionStatus::Empty, warning),
-        RawRead::Failed(ReadError::Permanent, Some(warning)) => {
+        (RawRead::Empty(Some(warning)), _) => unlisted(SessionStatus::Empty, warning),
+        (RawRead::Failed(ReadError::Permanent, Some(warning)), _) => {
             unlisted(SessionStatus::Unreadable, warning)
         }
-        RawRead::Parsed(_) | RawRead::Restored(_) | RawRead::Empty(None) | RawRead::Failed(..) => {
-            None
-        }
+        (
+            RawRead::Parsed(_) | RawRead::Restored(_) | RawRead::Empty(None) | RawRead::Failed(..),
+            _,
+        ) => None,
     }
 }
 
@@ -1640,14 +1656,22 @@ enum RawRead {
 }
 
 impl RawRead {
-    /// The read `parsed`, the parse of `source`'s session at `path`, yields.
-    fn of_parse(source: Source, path: &Path, parsed: Result<ParsedSession>) -> Self {
+    /// The read `parsed`, the parse of `source`'s session at `path`, yields,
+    /// with the transcripts it read for a listed session.
+    fn of_parse(
+        source: Source,
+        path: &Path,
+        parsed: Result<ParsedSession>,
+    ) -> (Self, Option<SessionTranscripts>) {
         match parsed {
-            Ok(Ok(conversation)) => Self::Parsed(conversation),
-            Ok(Err(reason)) => Self::Empty(Some(unlisted_warning(source, reason))),
-            Err(error) => Self::Failed(
-                ReadError::of(&error),
-                Some(read_failure_warning(path, &error)),
+            Ok(Ok(listed)) => (Self::Parsed(listed.row), Some(listed.transcripts)),
+            Ok(Err(reason)) => (Self::Empty(Some(unlisted_warning(source, reason))), None),
+            Err(error) => (
+                Self::Failed(
+                    ReadError::of(&error),
+                    Some(read_failure_warning(path, &error)),
+                ),
+                None,
             ),
         }
     }
@@ -1701,7 +1725,7 @@ fn parse_session(
 ) -> Result<ParsedSession> {
     let parsed = storage.parse_session(permit, stub, root, debug_level, on_transcript_read, clock);
     match parsed {
-        Ok(Ok(conversation)) if conversation.source != storage.source() => {
+        Ok(Ok(listed)) if listed.row.source != storage.source() => {
             Ok(Err(UnlistedReason::ForeignTranscript))
         }
         Err(error) => {
@@ -2030,6 +2054,7 @@ mod tests {
             let environment = environment_of(base.path());
             let ownership = RefreshOwnership::acquire_for_test(environment.cache_base()).unwrap();
             let permit = crate::history::FOR_FIXTURES;
+            let stamps = StubStamps::current(&stub);
             let parsed = parse_session(
                 storage,
                 permit,
@@ -2039,8 +2064,8 @@ mod tests {
                 &|| {},
                 environment.clock().as_ref(),
             );
-            let raw = RawRead::of_parse(storage.source(), &stub.locator, parsed);
-            let record = cache_record(permit, storage, &root, &stub, &raw)
+            let (raw, transcripts) = RawRead::of_parse(storage.source(), &stub.locator, parsed);
+            let record = cache_record(storage, &root, &stub, stamps, &raw, transcripts)
                 .unwrap_or_else(|| panic!("{:?}'s session has a record", row.source));
             let mut database = SqliteCache::open_for_refresh(ownership.token()).unwrap();
             database.admit_storage(storage.cache()).unwrap();
@@ -2580,6 +2605,190 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unchanged_session_missing_earlier_turns_isnt_parsed_again() {
+        let cache_base = admitted_cache_base();
+        let home = CodexHome::new();
+        home.write_rollout_missing_earlier_turns();
+        let first = load_with_cache(home.storage, cache_base.path(), false, None).unwrap();
+        assert!(
+            first.conversations[0].is_missing_earlier_turns,
+            "the fixture's session is missing earlier turns"
+        );
+
+        home.watch.mark();
+        let loaded = load_with_cache(home.storage, cache_base.path(), false, None).unwrap();
+        let stub = home
+            .storage
+            .discover(&home.root(), &SystemLister)
+            .unwrap()
+            .stubs
+            .remove(0);
+        let environment = environment_of(cache_base.path());
+        let by_id = SessionLoader::new(
+            &environment,
+            home.storage,
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        )
+        .cache_row(&home.root(), &stub)
+        .expect("the session refreshed by ID");
+
+        assert_eq!(
+            home.watch.parses_after_mark(),
+            0,
+            "neither the second load nor a refresh by ID parses the unchanged session"
+        );
+        assert!(
+            by_id.cached_session.is_some(),
+            "the session refreshed by ID is restored from the cache"
+        );
+        let [row] = &loaded.conversations[..] else {
+            panic!("one listed session: {}", loaded.conversations.len())
+        };
+        assert!(
+            row.cached_session.is_some(),
+            "the row is restored from the cache"
+        );
+        assert!(
+            row.is_missing_earlier_turns,
+            "the restored row is still missing earlier turns"
+        );
+        let content = row.load_content().unwrap();
+        assert!(
+            content.full_text.contains("a question"),
+            "the restored row's content loads"
+        );
+    }
+
+    /// The load reads the cache against the stamps its discovery took: a
+    /// transcript changed after that discovery is read again by the next
+    /// load, whose discovery stamps the change.
+    #[test]
+    fn load_compares_cache_with_its_discoverys_stamps() {
+        let cache_base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let transcript = home.write("first", 0, &["a question"]);
+        let environment = environment_of(cache_base.path());
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+        loader.load_waiting().unwrap();
+        let discovered = discovered_stub(&home, &transcript);
+        home.write("first", 0, &["a changed question"]);
+        home.watch().mark();
+
+        let (read, _) = mpsc::channel();
+        let loaded = loader.load_root_waiting(
+            &home.root(),
+            DiscoveredSessions::complete(vec![discovered]),
+            &read,
+        );
+        assert_eq!(
+            home.watch().parses_after_mark(),
+            0,
+            "the load compares its discovery's stamp instead of a stat"
+        );
+        assert!(loaded.conversations[0].cached_session.is_some());
+
+        loader.load_waiting().unwrap();
+        assert_eq!(
+            home.watch().sessions_parsed_after_mark(),
+            [transcript],
+            "the next load's discovery stamps the change and reads the session again"
+        );
+    }
+
+    /// SQLite runs automatic checkpoints from a connection's WAL hook after
+    /// a commit, so a test WAL hook that no commit reaches shows that none
+    /// ran. The log is observed before each operation releases its refresh
+    /// ownership, which commits once more.
+    #[test]
+    fn load_and_refresh_by_id_checkpoint_log_once_their_writes_end() {
+        let cache_base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        home.write("first", 0, &["a question"]);
+        let second = home.write("second", 1, &["another question"]);
+        let hooked_commits = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&hooked_commits);
+        let _hooks =
+            sqlite_cache::connection::test_hooks::on_every_connection(cache_base.path(), {
+                move |connection| {
+                    let counted = Arc::clone(&counted);
+                    connection
+                        .wal_hook(Some(move |_: &mut rusqlite::hooks::Wal, _| {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }))
+                        .unwrap();
+                }
+            });
+        // Open and read through the load, so the load's connections do not
+        // checkpoint as the last ones to close.
+        let observer =
+            rusqlite::Connection::open(cache_base.path().join(sqlite_cache::DATABASE_FILE_NAME))
+                .unwrap();
+        let sessions_before: i64 = observer
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let log_and_checkpointed_pages = || -> (i64, i64) {
+            observer
+                .query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
+                    Ok((row.get(1)?, row.get(2)?))
+                })
+                .unwrap()
+        };
+        let environment = environment_of(cache_base.path());
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+
+        let operation = waiting_operation(&environment);
+        loader
+            .load(LeftOutRows::NONE, &operation, &mut |_, _| {})
+            .unwrap();
+        let after_load = log_and_checkpointed_pages();
+        operation.finish().unwrap();
+        home.write("second", 1, &["a changed question"]);
+        let operation = waiting_operation(&environment);
+        loader
+            .read_stubs(
+                &home.root(),
+                &home.storage().external_titles(&home.root()),
+                vec![discovered_stub(&home, &second)],
+                StubsAfterRediscovery::SameFiles,
+                &operation,
+            )
+            .unwrap();
+        let after_refresh = log_and_checkpointed_pages();
+        operation.finish().unwrap();
+
+        assert_eq!(sessions_before, 0);
+        assert_eq!(
+            hooked_commits.load(Ordering::SeqCst),
+            0,
+            "no commit reaches a WAL hook"
+        );
+        for (operation, (log, checkpointed)) in
+            [("load", after_load), ("refresh by ID", after_refresh)]
+        {
+            assert!(log > 0, "the {operation} writes to the log");
+            assert_eq!(
+                checkpointed, log,
+                "the {operation} checkpoints every page of the log once its writes end"
+            );
+        }
+    }
+
     /// Codex rollouts of one day in a temporary home, read through Codex's
     /// storage pinned to the home's `sessions` root and listed through a
     /// lister the test scripts.
@@ -2587,21 +2796,24 @@ mod tests {
         directory: tempfile::TempDir,
         lister: Arc<ScriptedLister>,
         storage: &'static dyn SessionStorage,
+        watch: crate::history::provider::ParseWatch,
     }
 
     impl CodexHome {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
+            let watch = crate::history::provider::ParseWatch::default();
             let storage: &'static dyn SessionStorage =
                 Box::leak(Box::new(crate::history::provider::WatchedStorage {
                     inner: Source::Codex.provider().storage(),
                     roots: vec![SessionRoot::new(directory.path().join("sessions"))],
-                    watch: crate::history::provider::ParseWatch::default(),
+                    watch: watch.clone(),
                 }));
             let home = Self {
                 directory,
                 lister: Arc::default(),
                 storage,
+                watch,
             };
             std::fs::create_dir_all(home.day()).unwrap();
             home
@@ -2627,6 +2839,39 @@ mod tests {
             )
             .unwrap();
             rollout
+        }
+
+        /// Write a rollout from an edited prompt whose earlier rollout is
+        /// gone, so its session is missing earlier turns.
+        fn write_rollout_missing_earlier_turns(&self) {
+            const THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
+            const EDIT: &str = "019f0000-0000-7000-8000-0000000000a1";
+            let timestamp = "2026-08-01T10:04:00.000Z";
+            let header = serde_json::json!({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": {
+                    "id": THREAD,
+                    "timestamp": timestamp,
+                    "cwd": "/tmp/project",
+                    "history_base": {"thread_id": THREAD, "end_byte_offset": 100},
+                },
+            });
+            let prompt = serde_json::json!({
+                "timestamp": timestamp,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "a question"}],
+                },
+            });
+            std::fs::write(
+                self.day()
+                    .join(format!("rollout-2026-08-01T10-04-00-{THREAD}_{EDIT}.jsonl")),
+                format!("{header}\n{prompt}\n"),
+            )
+            .unwrap();
         }
 
         /// [`write_compressed_rollouts_into`] the day's directory.
@@ -3014,7 +3259,7 @@ mod tests {
         SqliteCache::open_waiting(&rearview(cache_base))
             .unwrap()
             .unwrap()
-            .current_fingerprints(home.storage().cache(), &home.root().path)
+            .current_fingerprints(home.storage().cache(), &home.root().path, &[])
             .unwrap()
     }
 
@@ -3767,7 +4012,9 @@ mod tests {
             let database = SqliteCache::open_waiting(&rearview(base.path()))
                 .unwrap()
                 .unwrap();
-            let fingerprint = database.current_fingerprints(storage, &root.path).unwrap();
+            let fingerprint = database
+                .current_fingerprints(storage, &root.path, &[])
+                .unwrap();
             assert_eq!(fingerprint.len(), 1);
             let connection =
                 rusqlite::Connection::open(base.path().join(sqlite_cache::DATABASE_FILE_NAME))
@@ -3780,7 +4027,7 @@ mod tests {
                 .unwrap();
             assert!(
                 database
-                    .current_fingerprints(storage, &root.path)
+                    .current_fingerprints(storage, &root.path, &[])
                     .unwrap()
                     .is_empty()
             );
@@ -3789,7 +4036,9 @@ mod tests {
 
             assert_eq!(rows.len(), 1);
             assert_eq!(
-                database.current_fingerprints(storage, &root.path).unwrap(),
+                database
+                    .current_fingerprints(storage, &root.path, &[])
+                    .unwrap(),
                 fingerprint
             );
             let (replacement, error): (i64, Option<String>) = connection
@@ -4428,6 +4677,58 @@ mod tests {
 
         assert_eq!(listed.len(), 1);
         assert_eq!(home.watch().sessions_parsed_after_mark(), [grows]);
+    }
+
+    /// A read of a home's sessions into the session cache under a base.
+    type CachingRead = fn(&ClaudeHome, &Path);
+
+    #[test]
+    fn transcript_changed_after_load_read_it_fails_record() {
+        let loads: [(&str, CachingRead); 2] = [
+            ("a load", |home, base| {
+                load_sessions_with_cache(home.storage(), base, false, None).unwrap();
+            }),
+            ("a targeted read", |home, base| {
+                let stub = discovered_stub(home, &home.transcript("changed"));
+                let environment = environment_listing_home(base, home);
+                let (read, _) = SessionLoader::new(
+                    &environment,
+                    home.storage(),
+                    false,
+                    None,
+                    AgentMeter::UNMETERED,
+                )
+                .cache_one(&home.root(), stub)
+                .into_parts();
+                assert!(matches!(read, SessionRead::Listed(_)));
+            }),
+        ];
+        for (name, load) in loads {
+            let base = admitted_cache_base();
+            let home = ClaudeHome::new();
+            let transcript = home.write("changed", 0, &["a question"]);
+            let changed = transcript.clone();
+            home.watch().run_after_each_transcript_read(move || {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&changed)
+                    .unwrap();
+                std::io::Write::write_all(&mut file, b"\n").unwrap();
+            });
+
+            load(&home, base.path());
+
+            let error: Option<String> =
+                rusqlite::Connection::open(base.path().join(sqlite_cache::DATABASE_FILE_NAME))
+                    .unwrap()
+                    .query_row("SELECT entries_error FROM sessions", [], |row| row.get(0))
+                    .unwrap();
+            assert_eq!(
+                error,
+                Some(AppError::SessionCacheSourceChanged(transcript).to_string()),
+                "{name} fails the record of a transcript that changed after the read"
+            );
+        }
     }
 
     /// A read can fail for a reason outside the transcript — a file held open,

@@ -12,24 +12,13 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     for session in every_record_sessions() {
-        let row = &session.row;
-        let storage = storage_of(row.source);
-        cache.admit_storage(storage).unwrap();
         let root = root_of(&session);
         let stub = stub_of(&session, 1);
-        cache
-            .write(
-                &SessionRecord::listed(
-                    crate::history::FOR_FIXTURES,
-                    storage,
-                    row.source,
-                    &root,
-                    &stub,
-                    row,
-                )
-                .unwrap(),
-            )
-            .unwrap();
+        let (record, row) = parsed_record_and_row(session.row.source, &root, &stub);
+        let row = &row;
+        let storage = storage_of(row.source);
+        cache.admit_storage(storage).unwrap();
+        cache.write(&record).unwrap();
         let super::super::CatalogueSession::Listed(cached) = cache
             .catalogue_session(storage, row.source, &root.path, &stub.cache_key, false)
             .unwrap()

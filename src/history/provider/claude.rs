@@ -262,17 +262,15 @@ impl SessionStorage for ClaudeStorage {
         clock: &dyn Clock,
     ) -> Result<ParsedSession> {
         Ok(
-            session_row(permit, stub, debug_level, on_transcript_read, clock)?.map(
-                |mut conversation| {
-                    let project_path = conversation.cwd.clone().unwrap_or_else(|| {
-                        decode_project_dir_name_to_path(
-                            project_folder_name(&stub.locator).unwrap_or_default(),
-                        )
-                    });
-                    conversation.project_path = Some(project_path);
-                    conversation
-                },
-            ),
+            session_row(permit, stub, debug_level, on_transcript_read, clock)?.map(|mut listed| {
+                let project_path = listed.row.cwd.clone().unwrap_or_else(|| {
+                    decode_project_dir_name_to_path(
+                        project_folder_name(&stub.locator).unwrap_or_default(),
+                    )
+                });
+                listed.row.project_path = Some(project_path);
+                listed
+            }),
         )
     }
 
@@ -1300,12 +1298,10 @@ pub(crate) mod tests {
         let session = load_the_one_session(root.path(), cache.path());
 
         assert!(!session.full_text.contains("NESTED_SUBAGENT_SENTINEL"));
+        let route_text = session.semantic_route_text();
         assert!(
-            session
-                .semantic_route_text
-                .contains("NESTED_SUBAGENT_SENTINEL"),
-            "{}",
-            session.semantic_route_text
+            route_text.contains("NESTED_SUBAGENT_SENTINEL"),
+            "{route_text}"
         );
     }
 

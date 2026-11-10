@@ -141,8 +141,8 @@ impl SqliteCache {
                 "SELECT id, cache_key, status, locator, file_size, mtime_secs, mtime_nsecs, \
                  session_id, project_path, project_name, cwd, timestamp_ms, preview_first, \
                  preview_last, summary, custom_title, model, total_tokens, duration_minutes, \
-                 message_count, assistant_messages, is_missing_earlier_turns, entries_error \
-                 FROM sessions WHERE storage = ?1 AND root = ?2 AND status != 'writing' \
+                 message_count, assistant_messages, is_missing_earlier_turns, entries_error, \
+                 generation FROM sessions WHERE storage = ?1 AND root = ?2 AND status != 'writing' \
                  AND {} {}",
                 super::catalogue::ENTRIES_NOT_FAILED,
                 if key.is_some() {
@@ -174,7 +174,7 @@ impl SqliteCache {
                             storage,
                             root: root.to_path_buf(),
                             cache_key: row.get(1)?,
-                            generation: row.get(0)?,
+                            generation: row.get(23)?,
                             source,
                             wait: self.wait,
                             checks_source: true,
@@ -260,7 +260,6 @@ fn conversation(
         full_text: String::new(),
         agent_search_text: String::new(),
         thinking_and_tool_call_text: String::new(),
-        semantic_route_text: String::new(),
         semantic_turns: Vec::new(),
         semantic_turn_ranges: Vec::new(),
         search_text_lower: String::new(),
@@ -305,9 +304,8 @@ fn json_error(error: serde_json::Error) -> rusqlite::Error {
 mod tests {
     use super::*;
     use crate::history::provider::contract_tests::every_record_sessions;
-    use crate::history::sqlite_cache::{
-        SessionRecord,
-        tests::{admitted_cache, root_of, storage_of, stub_of},
+    use crate::history::sqlite_cache::tests::{
+        admitted_cache, parsed_record, parsed_record_and_row, root_of, storage_of, stub_of,
     };
 
     #[test]
@@ -321,16 +319,6 @@ mod tests {
         std::fs::write(&path, record("original text")).unwrap();
         let source = Source::Claude;
         let storage = source.provider().storage().cache();
-        let original = source
-            .provider()
-            .format()
-            .parse_conversation(
-                &path,
-                crate::history::parser::RowDating::new(None, &crate::clock::TestClock::default()),
-                None,
-            )
-            .unwrap()
-            .unwrap();
         let root = crate::history::provider::SessionRoot::new(home.path());
         let stub = crate::history::provider::SessionStub {
             locator: path.clone(),
@@ -343,15 +331,7 @@ mod tests {
         };
         let mut cache = admitted_cache(base.path());
         cache.admit_storage(storage).unwrap();
-        let write = SessionRecord::listed(
-            crate::history::FOR_FIXTURES,
-            storage,
-            source,
-            &root,
-            &stub,
-            &original,
-        )
-        .unwrap();
+        let write = parsed_record(source, &root, &stub);
         cache.write(&write).unwrap();
         let CatalogueSession::Listed(cached) = cache
             .catalogue_session(storage, source, &root.path, &stub.cache_key, false)
@@ -402,24 +382,13 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let mut cache = admitted_cache(base.path());
         for session in every_record_sessions() {
-            let original = &session.row;
-            let storage = storage_of(original.source);
             let root = root_of(&session);
             let stub = stub_of(&session, 1);
+            let (record, original) = parsed_record_and_row(session.row.source, &root, &stub);
+            let original = &original;
+            let storage = storage_of(original.source);
             cache.admit_storage(storage).unwrap();
-            cache
-                .write(
-                    &SessionRecord::listed(
-                        crate::history::FOR_FIXTURES,
-                        storage,
-                        original.source,
-                        &root,
-                        &stub,
-                        original,
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
+            cache.write(&record).unwrap();
             let mut catalogue = cache
                 .catalogue(storage, original.source, &root.path, false)
                 .unwrap();
@@ -459,10 +428,19 @@ mod tests {
                     &content.thinking_and_tool_call_text,
                     &original.thinking_and_tool_call_text,
                 ),
-                (&content.semantic_route_text, &original.semantic_route_text),
             ] {
                 assert_eq!(actual, expected, "{} content", original.source.label());
             }
+            let agent_route = |row: &Conversation| {
+                crate::agent::service::agent_route_semantic_conversation(row)
+                    .map(|route| route.semantic_turns)
+            };
+            assert_eq!(
+                agent_route(&content),
+                agent_route(original),
+                "the agent's semantic route reads the same text from the {} content as from its parse",
+                original.source.label()
+            );
             assert_eq!(content.semantic_turns, original.semantic_turns);
             assert_eq!(content.semantic_turn_ranges, original.semantic_turn_ranges);
             assert_eq!(content.message_text_starts, original.message_text_starts);

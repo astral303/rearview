@@ -46,9 +46,16 @@ const SESSIONS_PER_ROOT: usize = 2;
 enum CommitKind {
     /// Inserts the session's row in the catalogue.
     Catalogue,
+    /// Writes a session the cache holds, all in one transaction: updates its
+    /// catalogue row in place and changes its entry rows.
+    Update,
     /// Inserts a chunk of the session's entries.
     Entries,
-    /// Updates the session's row only: its message counts or its final status.
+    /// Updates the session's row only: the final status of a session whose
+    /// row was inserted, or a write of a session the cache holds whose entry
+    /// rows did not change. The update hook reports neither the `meta` nor
+    /// the `session_files` rows that write changes: both tables are
+    /// `WITHOUT ROWID`.
     SessionUpdate,
     /// Any other change, listed.
     Unnamed(String),
@@ -61,15 +68,20 @@ impl CommitKind {
                 .iter()
                 .any(|(action, changed)| *action == Action::SQLITE_INSERT && changed == table)
         };
+        let updates_session = changes
+            .iter()
+            .any(|(action, table)| *action == Action::SQLITE_UPDATE && table == "sessions");
         if inserts("sessions") {
             Self::Catalogue
-        } else if inserts("entries") {
-            Self::Entries
         } else if changes
             .iter()
             .all(|(action, table)| *action == Action::SQLITE_UPDATE && table == "sessions")
         {
             Self::SessionUpdate
+        } else if updates_session {
+            Self::Update
+        } else if inserts("entries") {
+            Self::Entries
         } else {
             Self::Unnamed(format!("{changes:?}"))
         }
@@ -176,13 +188,29 @@ fn commits_to_fail(operation: Operation, kinds: &[CommitKind]) -> Vec<usize> {
             "{operation:?}: data commit {number} is of a named kind: {kind:?}"
         );
     }
-    let session_starts: Vec<usize> = (0..kinds.len())
-        .filter(|&number| kinds[number] == CommitKind::Catalogue)
-        .collect();
+    // A session update ends the write of a session whose row was inserted;
+    // outside such a write, it is the whole write of a session the cache
+    // holds.
+    let mut inserting = false;
+    let mut session_starts = Vec::new();
+    for (number, kind) in kinds.iter().enumerate() {
+        let starts = match kind {
+            CommitKind::Catalogue => {
+                inserting = true;
+                true
+            }
+            CommitKind::SessionUpdate => !std::mem::replace(&mut inserting, false),
+            CommitKind::Update => true,
+            CommitKind::Entries | CommitKind::Unnamed(_) => false,
+        };
+        if starts {
+            session_starts.push(number);
+        }
+    }
     assert_eq!(
         session_starts.first(),
         Some(&0),
-        "{operation:?}: the first data commit begins a session's write"
+        "{operation:?}: the first data commit begins a session's write: {kinds:?}"
     );
     assert!(
         session_starts.len() > SESSIONS_PER_ROOT,

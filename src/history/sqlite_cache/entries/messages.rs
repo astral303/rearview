@@ -1,43 +1,119 @@
+use super::digest::Digest;
 use super::{EntryColumns, threads::Placement};
 use crate::agent::message_numbering::MessageNumbering;
 use crate::agent::transcript::{AgentMessageRole, MessageReport};
-use crate::log_entry::LogEntry;
-use rusqlite::{Connection, params};
+use crate::log_entry::{LogEntry, TokenUsage};
 use std::collections::HashMap;
 
-pub(super) struct Writer {
-    session: i64,
+/// A `messages` row: the shared fields of the entries that make up one
+/// logical message.
+pub(super) struct MessageRow<'a> {
+    /// The index of the message's thread in the session's threads.
+    pub(super) thread: usize,
+    pub(super) ordinal: Option<i64>,
+    /// The index of the entry that started the message: its first.
+    pub(super) first_entry: usize,
+    role: Option<&'a str>,
+    reply_id: Option<&'a str>,
+    first_ms: Option<i64>,
+    last_ms: Option<i64>,
+    model: Option<&'a str>,
+    agent: Option<&'a str>,
+    cwd: Option<&'a str>,
+    parent_tool_use_id: Option<&'a str>,
+    source_tool_use_id: Option<&'a str>,
+    report_has_text: Option<bool>,
+    report_task_id: Option<String>,
+    report_launch_call: Option<String>,
+    usage: Option<&'a TokenUsage>,
+}
+
+impl MessageRow<'_> {
+    /// The row's columns after `thread`, in the order the writer's
+    /// `MESSAGE_COLUMNS` lists them.
+    pub(super) fn values(&self) -> [rusqlite::types::Value; 18] {
+        use rusqlite::types::Value;
+        let usage = |count: fn(&TokenUsage) -> u64| {
+            Value::from(self.usage.map(|usage| count(usage) as i64))
+        };
+        [
+            self.ordinal.into(),
+            self.role.map(str::to_owned).into(),
+            self.reply_id.map(str::to_owned).into(),
+            self.first_ms.into(),
+            self.last_ms.into(),
+            self.model.map(str::to_owned).into(),
+            self.agent.map(str::to_owned).into(),
+            self.cwd.map(str::to_owned).into(),
+            self.parent_tool_use_id.map(str::to_owned).into(),
+            self.source_tool_use_id.map(str::to_owned).into(),
+            self.report_has_text.into(),
+            self.report_task_id.clone().into(),
+            self.report_launch_call.clone().into(),
+            usage(|usage| usage.input_tokens),
+            usage(|usage| usage.output_tokens),
+            usage(|usage| usage.cache_creation_input_tokens),
+            usage(|usage| usage.cache_read_input_tokens),
+            self.digest().into(),
+        ]
+    }
+
+    /// A hash of every column but `thread` and `ordinal`.
+    pub(super) fn digest(&self) -> i64 {
+        let mut digest = Digest::default();
+        for text in [
+            self.role,
+            self.reply_id,
+            self.model,
+            self.agent,
+            self.cwd,
+            self.parent_tool_use_id,
+            self.source_tool_use_id,
+            self.report_task_id.as_deref(),
+            self.report_launch_call.as_deref(),
+        ] {
+            digest.text(text);
+        }
+        digest.number(self.first_ms);
+        digest.number(self.last_ms);
+        digest.flag(self.report_has_text);
+        digest.usage(self.usage);
+        digest.finish()
+    }
+}
+
+/// Groups a session's entries into messages, in entry order: an entry
+/// carrying a reply id already seen in its thread joins that reply's
+/// message.
+#[derive(Default)]
+pub(super) struct Messages<'a> {
     numbering: MessageNumbering,
-    replies: HashMap<(i64, &'static str), HashMap<String, i64>>,
+    replies: HashMap<(i64, &'static str), HashMap<&'a str, usize>>,
+    pub(super) rows: Vec<MessageRow<'a>>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct Membership {
-    pub(super) id: i64,
+    /// The index of the message in [`Messages::rows`].
+    pub(super) message: usize,
     pub(super) contributes: bool,
 }
 
-impl Writer {
-    pub(super) fn new(session: i64) -> Self {
-        Self {
-            session,
-            numbering: MessageNumbering::default(),
-            replies: HashMap::new(),
-        }
-    }
-
-    pub(super) fn write(
+impl<'a> Messages<'a> {
+    /// Adds `entry`, the entry at `index` whose columns are `columns`, to its
+    /// message; `None` for an entry outside every message.
+    pub(super) fn add(
         &mut self,
-        connection: &Connection,
+        index: usize,
         placement: &Placement,
         entry: &LogEntry,
-        columns: &EntryColumns<'_>,
-    ) -> rusqlite::Result<Option<Membership>> {
+        columns: &EntryColumns<'a>,
+    ) -> Option<Membership> {
         let role = columns.role.or_else(|| {
             (columns.kind == "pi-metadata" && columns.flag == Some(true)).then_some("user")
         });
         if role.is_none() && columns.kind != "progress" {
-            return Ok(None);
+            return None;
         }
         let numbered = if columns.kind == "progress" {
             role.and_then(AgentMessageRole::of_progress)
@@ -69,63 +145,57 @@ impl Writer {
                 .and_then(|replies| replies.get(reply))
                 .copied()
         });
-        if let Some(id) = stored {
+        let contributes = numbered.is_some();
+        if let Some(message) = stored {
+            let row = &mut self.rows[message];
             // Usage snapshots can change while a reply streams. Match the
             // catalogue's last-record rule rather than summing the copies.
-            connection.prepare_cached(
-                "UPDATE messages SET ordinal = COALESCE(ordinal, ?2), \
-                 first_ms = CASE WHEN ?3 IS NULL THEN first_ms \
-                     WHEN first_ms IS NULL THEN ?3 ELSE MIN(first_ms, ?3) END, \
-                 last_ms = CASE WHEN ?3 IS NULL THEN last_ms \
-                     WHEN last_ms IS NULL THEN ?3 ELSE MAX(last_ms, ?3) END, \
-                 model = COALESCE(?4, model), agent = COALESCE(?5, agent), \
-                 cwd = COALESCE(?6, cwd), parent_tool_use_id = COALESCE(?7, parent_tool_use_id), \
-                 source_tool_use_id = COALESCE(?8, source_tool_use_id), \
-                 usage_input = COALESCE(?9, usage_input), usage_output = COALESCE(?10, usage_output), \
-                 usage_cache_creation = COALESCE(?11, usage_cache_creation), \
-                 usage_cache_read = COALESCE(?12, usage_cache_read), \
-                 report_has_text = CASE WHEN ordinal IS NULL AND ?2 IS NOT NULL THEN ?13 ELSE report_has_text END, \
-                 report_task_id = CASE WHEN ordinal IS NULL AND ?2 IS NOT NULL THEN ?14 ELSE report_task_id END, \
-                 report_launch_call = CASE WHEN ordinal IS NULL AND ?2 IS NOT NULL THEN ?15 ELSE report_launch_call END WHERE id = ?1",
-            )?.execute(params![
-                id, ordinal, time, columns.model, columns.agent, columns.cwd,
-                columns.parent_tool_use_id, columns.source_tool_use_id,
-                columns.usage.map(|usage| usage.input_tokens as i64),
-                columns.usage.map(|usage| usage.output_tokens as i64),
-                columns.usage.map(|usage| usage.cache_creation_input_tokens as i64),
-                columns.usage.map(|usage| usage.cache_read_input_tokens as i64),
-                report.is_report.then_some(report.has_text), report.sender.task_id, report.sender.launch_call,
-            ])?;
-            return Ok(Some(Membership {
-                id,
-                contributes: numbered.is_some(),
-            }));
+            if row.ordinal.is_none() && ordinal.is_some() {
+                row.report_has_text = report.is_report.then_some(report.has_text);
+                row.report_task_id = report.sender.task_id;
+                row.report_launch_call = report.sender.launch_call;
+            }
+            row.ordinal = row.ordinal.or(ordinal);
+            if let Some(time) = time {
+                row.first_ms = Some(row.first_ms.map_or(time, |first| first.min(time)));
+                row.last_ms = Some(row.last_ms.map_or(time, |last| last.max(time)));
+            }
+            row.model = columns.model.or(row.model);
+            row.agent = columns.agent.or(row.agent);
+            row.cwd = columns.cwd.or(row.cwd);
+            row.parent_tool_use_id = columns.parent_tool_use_id.or(row.parent_tool_use_id);
+            row.source_tool_use_id = columns.source_tool_use_id.or(row.source_tool_use_id);
+            row.usage = columns.usage.or(row.usage);
+            return Some(Membership {
+                message,
+                contributes,
+            });
         }
-        connection.prepare_cached(
-            "INSERT INTO messages (session, thread, ordinal, role, reply_id, first_ms, last_ms, \
-             model, agent, cwd, parent_tool_use_id, source_tool_use_id, usage_input, usage_output, \
-             usage_cache_creation, usage_cache_read, report_has_text, report_task_id, report_launch_call) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-        )?.execute(params![
-            self.session, placement.thread, ordinal, role, columns.message_id, time,
-            columns.model, columns.agent, columns.cwd, columns.parent_tool_use_id,
-            columns.source_tool_use_id,
-            columns.usage.map(|usage| usage.input_tokens as i64),
-            columns.usage.map(|usage| usage.output_tokens as i64),
-            columns.usage.map(|usage| usage.cache_creation_input_tokens as i64),
-            columns.usage.map(|usage| usage.cache_read_input_tokens as i64),
-            report.is_report.then_some(report.has_text), report.sender.task_id, report.sender.launch_call,
-        ])?;
-        let id = connection.last_insert_rowid();
+        self.rows.push(MessageRow {
+            thread: placement.thread,
+            ordinal,
+            first_entry: index,
+            role,
+            reply_id: columns.message_id,
+            first_ms: time,
+            last_ms: time,
+            model: columns.model,
+            agent: columns.agent,
+            cwd: columns.cwd,
+            parent_tool_use_id: columns.parent_tool_use_id,
+            source_tool_use_id: columns.source_tool_use_id,
+            report_has_text: report.is_report.then_some(report.has_text),
+            report_task_id: report.sender.task_id,
+            report_launch_call: report.sender.launch_call,
+            usage: columns.usage,
+        });
+        let message = self.rows.len() - 1;
         if let Some(reply) = columns.message_id {
-            self.replies
-                .entry(key)
-                .or_default()
-                .insert(reply.to_owned(), id);
+            self.replies.entry(key).or_default().insert(reply, message);
         }
-        Ok(Some(Membership {
-            id,
-            contributes: numbered.is_some(),
-        }))
+        Some(Membership {
+            message,
+            contributes,
+        })
     }
 }

@@ -1,7 +1,27 @@
 //! The stamp a cached session is checked against: its transcripts' size and
 //! modification time when the cache recorded it.
 
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A file's stamp, taken just before a read of it. The session cache stores
+/// it as the stamp of the content that read found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub path: PathBuf,
+    /// `None` when the file could not be stat.
+    pub fingerprint: Option<CachedFingerprint>,
+}
+
+impl FileStamp {
+    pub fn before_read(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            fingerprint: CachedFingerprint::of_file(path).ok().flatten(),
+        }
+    }
+}
 
 /// The `(size, mtime)` stamp a cached session is validated against. A
 /// cached session is reused while its transcripts still stamp the same.
@@ -19,6 +39,23 @@ impl CachedFingerprint {
             file_size,
             mtime_secs: since_epoch.as_secs(),
             mtime_nsecs: since_epoch.subsec_nanos(),
+        }
+    }
+
+    /// The stamp of the file at `path`; `None` when no file is there, as for
+    /// a locator inside a database file.
+    pub fn of_file(path: &Path) -> io::Result<Option<Self>> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(Some(Self::of(metadata.len(), metadata.modified()?))),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
         }
     }
 }

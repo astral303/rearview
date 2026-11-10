@@ -1505,15 +1505,14 @@ pub(super) mod tests {
             &TestClock::default(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .row;
 
         assert!(!session.full_text.contains("kimi child answer searchable"));
+        let route_text = session.semantic_route_text();
         assert!(
-            session
-                .semantic_route_text
-                .contains("kimi child answer searchable"),
-            "{}",
-            session.semantic_route_text
+            route_text.contains("kimi child answer searchable"),
+            "{route_text}"
         );
     }
 
@@ -1549,7 +1548,8 @@ pub(super) mod tests {
             &TestClock::default(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .row;
 
         let storage = crate::history::provider::storage::RootedStorage {
             inner: KimiStorage,
@@ -1571,7 +1571,7 @@ pub(super) mod tests {
         let cached = SqliteCache::open_waiting(&database)
             .unwrap()
             .unwrap()
-            .current_fingerprints(storage.cache(), &root.path)
+            .current_fingerprints(storage.cache(), &root.path, &[])
             .unwrap();
         assert_eq!(
             cached.len(),

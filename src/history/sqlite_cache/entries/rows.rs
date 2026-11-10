@@ -1,0 +1,158 @@
+//! A session's entry rows as a write stores them, built in memory before
+//! any is written: its transcripts, threads, messages and entries, each
+//! entry with its search texts and digest. A first write inserts them all;
+//! a later write compares them with the stored rows and writes the
+//! differences.
+
+use super::digest::Digest;
+use super::messages::{MessageRow, Messages};
+use super::search::{self, EntrySearch};
+use super::threads::{Numbering, ThreadRow};
+use super::{EntryColumns, parts};
+use crate::history::TranscriptEntries;
+use crate::history::format::RecordLine;
+use crate::log_entry::{LogEntry, TokenUsage};
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
+
+pub(in super::super) struct SessionRows<'a> {
+    pub(super) transcripts: Vec<Arc<Path>>,
+    pub(super) threads: Vec<ThreadRow>,
+    pub(super) messages: Vec<MessageRow<'a>>,
+    /// In the session's entry order: an entry's index is its `sequence`.
+    pub(super) entries: Vec<EntryRow<'a>>,
+}
+
+pub(super) struct EntryRow<'a> {
+    pub(super) record: &'a RecordLine,
+    pub(super) columns: EntryColumns<'a>,
+    pub(super) search: EntrySearch,
+    /// The index of the entry's message in [`SessionRows::messages`].
+    pub(super) message: Option<usize>,
+    pub(super) contributes: bool,
+    pub(super) position: i64,
+    /// The index of the entry's transcript in [`SessionRows::transcripts`]
+    /// when its thread's origin names another one.
+    pub(super) transcript: Option<usize>,
+    /// True for the title or the summary search reads.
+    pub(super) is_leading: bool,
+    pub(super) digest: i64,
+}
+
+impl EntryRow<'_> {
+    /// The usage the entry row stores: an entry outside every message keeps
+    /// its own; a message stores its entries' usage once.
+    pub(super) fn metadata_usage(&self) -> Option<&TokenUsage> {
+        self.message
+            .is_none()
+            .then_some(self.columns.usage)
+            .flatten()
+    }
+
+    /// A hash of the columns the row stores besides its place, with its
+    /// parts, result items and search texts.
+    fn digest(&self) -> i64 {
+        let columns = &self.columns;
+        let mut digest = Digest::default();
+        digest.number(Some(self.record.line as i64));
+        for text in [
+            Some(columns.kind),
+            columns.content,
+            columns.text,
+            columns.label,
+            columns.uuid,
+            columns.level,
+            columns.parent_uuid,
+        ] {
+            digest.text(text);
+        }
+        digest.number(columns.timestamp_ms);
+        digest.number(columns.duration_ms.map(|duration| duration as i64));
+        digest.flag(columns.flag);
+        digest.usage(self.metadata_usage());
+        parts::digest(&mut digest, columns.parts.blocks(), &self.search.blocks);
+        digest.number(Some(self.search.derived.len() as i64));
+        for derived in &self.search.derived {
+            digest.number(Some(derived.field.code()));
+            digest.text(Some(&derived.text));
+        }
+        digest.finish()
+    }
+}
+
+impl<'a> SessionRows<'a> {
+    /// The rows of `entries`, the entries of a session whose sub-agent
+    /// transcripts are `subagents`.
+    pub(in super::super) fn of(entries: &'a TranscriptEntries, subagents: &HashSet<&Path>) -> Self {
+        let mut numbering = Numbering::default();
+        let mut messages = Messages::default();
+        let mut leading = LeadingTexts::default();
+        let mut rows = Vec::with_capacity(entries.entries.len());
+        for (index, (record, entry)) in entries.entries.iter().enumerate() {
+            let placement = numbering.place(record, entry);
+            let columns = EntryColumns::of(entry);
+            let membership = messages.add(index, &placement, entry, &columns);
+            leading.read(index, entry);
+            let spliced = record
+                .transcript
+                .as_deref()
+                .is_some_and(|path| subagents.contains(path));
+            let search = search::entry_search(entry, columns.parts.blocks(), spliced);
+            let mut row = EntryRow {
+                record,
+                columns,
+                search,
+                message: membership.map(|membership| membership.message),
+                contributes: membership.is_some_and(|membership| membership.contributes),
+                position: placement.position,
+                transcript: placement.transcript,
+                is_leading: false,
+                digest: 0,
+            };
+            row.digest = row.digest();
+            rows.push(row);
+        }
+        for index in [leading.title, leading.summary].into_iter().flatten() {
+            rows[index].is_leading = true;
+        }
+        Self {
+            transcripts: numbering.transcripts,
+            threads: numbering.threads,
+            messages: messages.rows,
+            entries: rows,
+        }
+    }
+
+    /// The number of messages that take a printed number.
+    pub(in super::super) fn message_count(&self) -> i64 {
+        self.messages
+            .iter()
+            .filter(|message| message.ordinal.is_some())
+            .count() as i64
+    }
+}
+
+/// The entries holding the session's title and summary, which search reads
+/// with its text: the last custom title, unless it is blank; the last AI
+/// title that is not blank, else the first summary.
+#[derive(Default)]
+struct LeadingTexts {
+    title: Option<usize>,
+    summary: Option<usize>,
+}
+
+impl LeadingTexts {
+    fn read(&mut self, index: usize, entry: &LogEntry) {
+        match entry {
+            LogEntry::Summary { .. } if self.summary.is_none() => self.summary = Some(index),
+            LogEntry::AiTitle { ai_title } if !ai_title.trim().is_empty() => {
+                self.summary = Some(index);
+            }
+            LogEntry::CustomTitle { custom_title } => {
+                self.title = (!custom_title.trim().is_empty()).then_some(index);
+            }
+            _ => {}
+        }
+    }
+}

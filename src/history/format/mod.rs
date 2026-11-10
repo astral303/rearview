@@ -15,6 +15,7 @@ pub mod opencode;
 pub mod pi_log;
 pub(crate) mod splice;
 
+use super::fingerprint::FileStamp;
 #[cfg(test)]
 use super::parser::RowDating;
 use super::provider::Capability;
@@ -105,6 +106,9 @@ pub struct SessionProjection {
     /// to count them.
     pub dropped: DroppedRecords,
     pub earlier_turns: EarlierTurns,
+    /// Each earlier transcript the read opened, stamped just before it was
+    /// opened; empty for a format whose transcripts continue none.
+    pub earlier_transcripts: Vec<FileStamp>,
 }
 
 /// The outcome of reading the earlier transcripts a transcript continues.

@@ -26,8 +26,8 @@ pub struct CachedSession {
     pub(super) checks_source: bool,
 }
 
-/// One copy of a session in the cache. A refresh that rewrites the session
-/// writes a copy with another key.
+/// One copy of a session in the cache. Every write of the session gives its
+/// copy another key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CopyKey {
     root: PathBuf,
@@ -125,7 +125,7 @@ impl CachedSession {
             if !is_storage_current(connection, self.storage)? {
                 return Ok(None);
             }
-            let Some(session) = entries::session_id_of(
+            let Some(stored) = entries::listed_session_of(
                 connection,
                 self.storage.directory,
                 &path_text(&self.root),
@@ -134,7 +134,8 @@ impl CachedSession {
             else {
                 return Ok(None);
             };
-            if session != self.generation {
+            let session = stored.id;
+            if stored.generation != self.generation {
                 return Err(crate::error::AppError::SessionCacheNotReady {
                     session: self.cache_key.clone(),
                     reason: "catalogue generation changed".to_owned(),
@@ -225,10 +226,10 @@ impl SqliteCache {
         subagents: &[PathBuf],
     ) -> Result<Option<CachedSession>> {
         self.with_read_snapshot(|connection| {
-            let Some(copy) = self.listed_copy(connection, source, path)? else {
+            let Some((copy, session)) = self.listed_copy(connection, source, path)? else {
                 return Ok(None);
             };
-            Ok(lists_subagents(connection, copy.generation, subagents)?.then_some(copy))
+            Ok(lists_subagents(connection, session, subagents)?.then_some(copy))
         })
     }
 
@@ -239,7 +240,11 @@ impl SqliteCache {
         source: crate::history::Source,
         path: &Path,
     ) -> Result<Option<CachedSession>> {
-        self.with_read_snapshot(|connection| self.listed_copy(connection, source, path))
+        self.with_read_snapshot(|connection| {
+            Ok(self
+                .listed_copy(connection, source, path)?
+                .map(|(copy, _)| copy))
+        })
     }
 
     /// The cache key of the listed session `source` stores under `root` at
@@ -252,13 +257,13 @@ impl SqliteCache {
         path: &Path,
     ) -> Result<Option<String>> {
         self.with_read_snapshot(|connection| {
-            let Some(copy) = self
+            let Some((copy, session)) = self
                 .listed_copy(connection, source, path)?
-                .filter(|copy| copy.root == root)
+                .filter(|(copy, _)| copy.root == root)
             else {
                 return Ok(None);
             };
-            match copy.validate_source(connection, copy.generation) {
+            match copy.validate_source(connection, session) {
                 Ok(()) => Ok(Some(copy.cache_key)),
                 Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(None),
                 Err(error) => Err(error),
@@ -266,29 +271,34 @@ impl SqliteCache {
         })
     }
 
-    /// The listed session `source` stores at `path`: spelled as discovery
-    /// spells the locator, or canonical.
+    /// The listed session `source` stores at `path`, spelled as discovery
+    /// spells the locator or canonical, with its row's id.
     fn listed_copy(
         &self,
         connection: &Connection,
         source: crate::history::Source,
         path: &Path,
-    ) -> Result<Option<CachedSession>> {
+    ) -> Result<Option<(CachedSession, i64)>> {
         let storage = source.provider().storage().cache();
-        let stored: Option<(i64, String, String)> = connection.query_row(
-            "SELECT id, root, cache_key FROM sessions WHERE storage = ?1 AND (locator = ?2 OR file_key = ?3) AND status = 'listed' ORDER BY id LIMIT 1",
+        let stored: Option<(i64, i64, String, String)> = connection.query_row(
+            "SELECT id, generation, root, cache_key FROM sessions WHERE storage = ?1 AND (locator = ?2 OR file_key = ?3) AND status = 'listed' ORDER BY id LIMIT 1",
             params![storage.directory, path_text(path), FileKey::of_canonical(path).as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).optional()?;
-        Ok(stored.map(|(generation, root, cache_key)| CachedSession {
-            base: self.base().clone(),
-            storage,
-            root: root.into(),
-            cache_key,
-            generation,
-            source,
-            wait: self.wait,
-            checks_source: true,
+        Ok(stored.map(|(session, generation, root, cache_key)| {
+            (
+                CachedSession {
+                    base: self.base().clone(),
+                    storage,
+                    root: root.into(),
+                    cache_key,
+                    generation,
+                    source,
+                    wait: self.wait,
+                    checks_source: true,
+                },
+                session,
+            )
         }))
     }
 }

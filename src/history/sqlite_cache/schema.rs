@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 12;
+pub(super) const SCHEMA_VERSION: u32 = 13;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Every table, dropped in this order when the schema changes.
@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- The `session_entries` failure for a listed session; its entries are
     -- then missing.
     entries_error TEXT,
+    -- A number no earlier write of any session in this database carried,
+    -- from the `last_generation` meta counter. Every write gives the row a
+    -- new one, so a reader holding the old number sees the copy change.
+    generation INTEGER NOT NULL,
     UNIQUE (storage, root, cache_key)
 );
 CREATE INDEX IF NOT EXISTS sessions_by_session_id ON sessions (session_id_key);
@@ -107,14 +111,14 @@ CREATE TABLE IF NOT EXISTS session_files (
 -- Searchable child metadata omitted by the dialogue splice, one text part
 -- per row. It has no message number and is excluded by active time windows.
 CREATE TABLE IF NOT EXISTS subagent_search_parts (
-    session INTEGER NOT NULL,
+    session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    -- The `session_files` position of the sub-agent transcript holding the
+    -- text.
     file_position INTEGER NOT NULL,
     position INTEGER NOT NULL,
     text TEXT NOT NULL,
-    PRIMARY KEY (session, position),
-    FOREIGN KEY (session, file_position) REFERENCES session_files (session, position) ON DELETE CASCADE
+    PRIMARY KEY (session, position)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS subagent_search_parts_by_file ON subagent_search_parts (session, file_position);
 
 -- Each search text of an entry that no row holds as written, such as a tool
 -- call's header or a task report's text: the text and its search field, as
@@ -128,6 +132,7 @@ CREATE TABLE IF NOT EXISTS search_texts (
     text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS search_texts_by_session ON search_texts (session);
+CREATE INDEX IF NOT EXISTS search_texts_by_entry ON search_texts (entry);
 
 -- The session row's parse errors.
 CREATE TABLE IF NOT EXISTS parse_errors (
@@ -196,6 +201,9 @@ CREATE TABLE IF NOT EXISTS messages (
     usage_output INTEGER,
     usage_cache_creation INTEGER,
     usage_cache_read INTEGER,
+    -- A hash of every column above except `thread` and `ordinal`, so a
+    -- write compares a message with its new version without reading them.
+    digest INTEGER NOT NULL,
     UNIQUE (session, ordinal)
 );
 CREATE INDEX IF NOT EXISTS messages_by_thread ON messages (thread, ordinal);
@@ -242,6 +250,12 @@ CREATE TABLE IF NOT EXISTS entries (
     parent_uuid TEXT,
     -- A metadata row's `searchable`.
     flag INTEGER,
+    -- A hash of what the row stores besides its place in the session and
+    -- its message (`message`, `contributes`, `position`, `sequence`,
+    -- `record_transcript`, `search_field`), with its parts, result items and
+    -- search texts. A write keeps the row and its children when the new
+    -- entry hashes the same.
+    digest INTEGER NOT NULL,
     UNIQUE (session, sequence)
 );
 CREATE INDEX IF NOT EXISTS entries_by_message ON entries (message, sequence);

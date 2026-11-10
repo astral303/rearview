@@ -337,6 +337,7 @@ fn parse_reader(
         malformed_lines,
         dropped,
         earlier_turns: EarlierTurns::Read,
+        earlier_transcripts: Vec::new(),
     }))
 }
 

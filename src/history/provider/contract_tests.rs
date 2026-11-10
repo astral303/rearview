@@ -343,6 +343,7 @@ pub(crate) fn list_row(source: Source, locator: &Path, subagents: &[PathBuf]) ->
         )
         .unwrap()
         .expect("the session is listed")
+        .row
 }
 
 /// One provider's sessions, written under a temporary home and read,

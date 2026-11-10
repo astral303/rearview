@@ -119,6 +119,11 @@ pub(crate) fn subagent_turns(threads: Vec<SubagentThread>) -> Vec<SubagentTurn> 
 }
 
 impl SubagentTurn {
+    /// The sub-agent transcript the turn was read from.
+    pub(crate) fn transcript(&self) -> Option<&Path> {
+        self.record.transcript.as_deref()
+    }
+
     pub(crate) fn thread_identity(&self) -> crate::agent::message_numbering::ThreadIdentity {
         crate::agent::message_numbering::ThreadIdentity::Progress {
             transcript: self.record.transcript.clone(),
@@ -166,7 +171,15 @@ pub(crate) fn splice_threads(
     parent: Vec<(RecordLine, LogEntry)>,
     threads: Vec<SubagentThread>,
 ) -> Vec<(RecordLine, LogEntry)> {
-    let turns = subagent_turns(threads);
+    splice_turns(parent, subagent_turns(threads))
+}
+
+/// `parent` with `turns`, sorted by timestamp, merged in as `Progress`
+/// entries.
+pub(crate) fn splice_turns(
+    parent: Vec<(RecordLine, LogEntry)>,
+    turns: Vec<SubagentTurn>,
+) -> Vec<(RecordLine, LogEntry)> {
     let mut spliced = Vec::with_capacity(parent.len() + turns.len());
     walk_spliced(
         parent,

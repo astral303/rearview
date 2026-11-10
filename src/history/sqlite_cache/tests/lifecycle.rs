@@ -24,16 +24,9 @@ fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() 
                 .is_none()
         );
     }
-    let record = SessionRecord::listed(
-        crate::history::FOR_FIXTURES,
-        storage,
-        row.source,
-        &root,
-        &stub,
-        row,
-    )
-    .unwrap();
-    cache.write_catalogue(&record).unwrap();
+    let record = parsed_record(row.source, &root, &stub);
+    let keys = cache.catalogue_keys(&record.catalogue);
+    cache.write_catalogue(&record, &keys, None).unwrap();
     assert!(
         cache
             .find_session(row.source, &row.path, &row.subagents)
@@ -49,15 +42,7 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
     let session = every_record_sessions().remove(0);
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
-    let mut record = SessionRecord::listed(
-        crate::history::FOR_FIXTURES,
-        storage,
-        session.row.source,
-        &root,
-        &stub_of(&session, 1),
-        &session.row,
-    )
-    .unwrap();
+    let mut record = parsed_record(session.row.source, &root, &stub_of(&session, 1));
     let entries = record.entries.take().unwrap();
     record.entries = Some(Err("temporary entry read failure".to_owned()));
     cache.write(&record).unwrap();
@@ -72,7 +57,7 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
     );
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .is_empty()
     );
@@ -85,7 +70,7 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
     cache.write(&record).unwrap();
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .contains_key(CACHE_KEY)
     );
@@ -108,30 +93,15 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     let session = every_record_sessions().remove(0);
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
-    let old = SessionRecord::listed(
-        crate::history::FOR_FIXTURES,
-        storage,
-        session.row.source,
-        &root,
-        &stub_of(&session, 1),
-        &session.row,
-    )
-    .unwrap();
-    let mut new = SessionRecord::listed(
-        crate::history::FOR_FIXTURES,
-        storage,
-        session.row.source,
-        &root,
-        &stub_of(&session, 2),
-        &session.row,
-    )
-    .unwrap();
+    let old = parsed_record(session.row.source, &root, &stub_of(&session, 1));
+    let mut new = parsed_record(session.row.source, &root, &stub_of(&session, 2));
     new.entries = Some(Ok(message_schema::transcript(vec![
         serde_json::json!({"type":"user","message":{"role":"user","content":"winning generation"}}),
     ])));
-    let previous = older.write_catalogue(&old).unwrap();
+    let keys = older.catalogue_keys(&old.catalogue);
+    let previous = older.write_catalogue(&old, &keys, None).unwrap();
     newer.write(&new).unwrap();
-    let replacement = entries::session_id_of(
+    let replacement = entries::listed_session_of(
         &newer.connection,
         storage.directory,
         &path_text(&root.path),
@@ -139,16 +109,23 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     )
     .unwrap()
     .unwrap();
-    assert_ne!(previous, replacement);
+    assert_ne!(previous, replacement.id);
 
+    let old_rows = entries::SessionRows::of(
+        old.entries.as_ref().unwrap().as_ref().unwrap(),
+        &std::collections::HashSet::new(),
+    );
     assert!(
-        matches!(entries::write(&mut older.connection, previous, old.entries.as_ref().unwrap().as_ref().unwrap(), &std::collections::HashSet::new(), &|| Ok(()), &owner), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
+        matches!(entries::insert(&mut older.connection, previous, &old_rows, &|| Ok(()), &owner), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
     );
     assert!(
         matches!(older.set_final_status(previous, SessionStatus::Listed, None), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
     );
     assert_eq!(
-        newer.current_fingerprints(storage, &root.path).unwrap()[CACHE_KEY].mtime_secs,
+        newer
+            .current_fingerprints(storage, &root.path, &[])
+            .unwrap()[CACHE_KEY]
+            .mtime_secs,
         2
     );
     assert_eq!(
@@ -191,7 +168,7 @@ fn read_snapshot_survives_replacement_between_identity_and_reconstruction() {
         ]),
     );
     let old = reader.with_read_snapshot(|connection| {
-        let id = entries::session_id_of(connection, storage.directory, &path_text(&root.path), CACHE_KEY)?.unwrap();
+        let id = entries::listed_session_of(connection, storage.directory, &path_text(&root.path), CACHE_KEY)?.unwrap().id;
         write_test_entries(&mut writer, message_schema::transcript(vec![
             serde_json::json!({"type":"user","message":{"role":"user","content":"new content"}}),
         ]));
@@ -216,7 +193,7 @@ fn unfinished_session_doesnt_become_reusable_or_leave_deletion_set() {
         .unwrap();
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .is_empty()
     );

@@ -1631,7 +1631,6 @@ fn conversation_from_agent_transcript(
         .and_then(|metadata| metadata.modified())
         .map(chrono::DateTime::<chrono::Local>::from)
         .unwrap_or_else(|_| clock.wall().with_timezone(&chrono::Local));
-    let semantic_route_text = history::semantic_route_text(&full_text, "");
     history::Conversation {
         source: key.source,
         subagents: Vec::new(),
@@ -1646,7 +1645,6 @@ fn conversation_from_agent_transcript(
         full_text,
         agent_search_text: String::new(),
         thinking_and_tool_call_text: String::new(),
-        semantic_route_text,
         semantic_turns: Vec::new(),
         semantic_turn_ranges: Vec::new(),
         project_name: None,
@@ -1867,15 +1865,14 @@ fn run_agent_semantic_hits(
 pub(crate) fn agent_route_semantic_conversation(
     conversation: &history::Conversation,
 ) -> Option<history::Conversation> {
-    let route_text = if conversation.semantic_route_text.is_empty() {
-        conversation
+    let mut route_text = conversation.semantic_route_text();
+    if route_text.is_empty() {
+        route_text = conversation
             .custom_title
             .as_deref()
             .or(conversation.summary.as_deref())?
-            .to_string()
-    } else {
-        conversation.semantic_route_text.clone()
-    };
+            .to_string();
+    }
     let file_name = conversation
         .path
         .file_name()
@@ -1913,7 +1910,6 @@ fn stripped_semantic_conversation(
         full_text: String::new(),
         agent_search_text: String::new(),
         thinking_and_tool_call_text: String::new(),
-        semantic_route_text: String::new(),
         semantic_turns,
         semantic_turn_ranges,
         search_text_lower: String::new(),
@@ -5085,7 +5081,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_route_uses_compact_precomputed_text() {
+    fn agent_route_uses_compact_route_text() {
         let mut conversation = crate::semantic::test_fixtures::SemanticConversationFixture::new(
             "/tmp/session.jsonl",
             ["dialogue that should not be copied into the route"],
@@ -5098,8 +5094,6 @@ mod tests {
         conversation.full_text =
             "calibration isolation and per-device capability memory from bounded tool evidence"
                 .to_string();
-        conversation.semantic_route_text =
-            history::semantic_route_text(&conversation.full_text, "");
 
         let route = agent_route_semantic_conversation(&conversation).unwrap();
 

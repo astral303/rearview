@@ -452,7 +452,6 @@ mod tests {
             full_text: full_text.to_string(),
             agent_search_text: String::new(),
             thinking_and_tool_call_text: String::new(),
-            semantic_route_text: String::new(),
             semantic_turns: vec![full_text.to_string()],
             semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
             search_text_lower: normalize_for_search(full_text),

@@ -21,7 +21,8 @@ use crate::clock::Clock;
 use crate::debug;
 use crate::error::Result;
 use crate::history::parser::{
-    ParsedSession, RowDating, SubagentMark, SubagentReads, UnlistedReason,
+    ListedSession, ParsedRow, ParsedSession, RowDating, SessionTranscripts, SubagentMark,
+    SubagentReads, SubagentRecordParts, SubagentTranscripts, UnlistedReason,
 };
 use crate::history::provider::SessionStub;
 use crate::history::{
@@ -95,6 +96,7 @@ impl SessionFormat for ClaudeTranscript {
                 .collect(),
             dropped,
             earlier_turns: EarlierTurns::Read,
+            earlier_transcripts: Vec::new(),
         }))
     }
 
@@ -249,6 +251,8 @@ pub(crate) fn session_row(
         debug_level,
         on_transcript_read,
     );
+    // The row consumes the malformed lines; the record keeps them too.
+    let own_malformed_lines = malformed_lines.clone();
     let mut row = match transcript_row(
         &stub.locator,
         &entries,
@@ -258,10 +262,20 @@ pub(crate) fn session_row(
         debug_level,
     ) {
         Ok(row) => row,
-        unlisted => return Ok(unlisted),
+        Err(reason) => return Ok(Err(reason)),
     };
-    subagents.merge_into(&mut row, &stub.subagents, debug_level);
-    Ok(Ok(row))
+    let subagents = subagents.merge_into(&mut row, &stub.subagents, debug_level);
+    Ok(Ok(ListedSession {
+        row,
+        transcripts: SessionTranscripts::new(
+            TranscriptEntries {
+                entries,
+                malformed_lines: own_malformed_lines,
+            },
+            Vec::new(),
+            subagents,
+        ),
+    }))
 }
 
 /// Every sub-agent transcript at `subagents`, read in parallel and held at
@@ -279,26 +293,39 @@ fn subagent_reads(
     let transcripts: Vec<_> = subagents
         .par_iter()
         .map(|subagent| {
-            let transcript = transcript_entries(admitted, subagent);
+            let transcript = transcript_entries(admitted, subagent).map(|transcript| {
+                // As the format's projection of the transcript, which it
+                // reads as no transcript without a Claude record.
+                let record = holds_a_claude_record(&transcript.entries)
+                    .then(|| SubagentRecordParts::of_entries(&transcript.entries, Vec::new()));
+                (transcript, record)
+            });
             on_transcript_read();
             transcript
         })
         .collect();
     let mut read = Vec::new();
+    let mut records = SubagentTranscripts::default();
     let mut unreadable = Vec::new();
-    for (subagent, transcript) in subagents.iter().zip(transcripts) {
+    for (index, (subagent, transcript)) in subagents.iter().zip(transcripts).enumerate() {
         match transcript {
-            Ok(TranscriptEntries {
-                entries,
-                malformed_lines,
-            }) => {
+            Ok((
+                TranscriptEntries {
+                    entries,
+                    malformed_lines,
+                },
+                record,
+            )) => {
                 warn_malformed_lines(subagent, malformed_lines, debug_level);
+                if let Some(record) = record {
+                    records.add(index + 1, record);
+                }
                 read.push((subagent, entries));
             }
             Err(error) => unreadable.push((subagent.clone(), error)),
         }
     }
-    SubagentReads::of_threads(threads_to_splice(session, read), unreadable)
+    SubagentReads::of_threads(threads_to_splice(session, read), records, unreadable)
 }
 
 /// One Claude transcript line, parsed by [`parse_record`].
@@ -376,7 +403,7 @@ fn transcript_row(
     malformed_lines: Vec<MalformedLine>,
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> ParsedSession {
+) -> ParsedRow {
     let parse_errors = malformed_lines
         .into_iter()
         .filter_map(|line| parse_error(path, line, debug_level))

@@ -5,7 +5,7 @@
 //! when it built them from the entry.
 
 use super::parts;
-use crate::agent::sanitize::sanitize_agent_text;
+use crate::agent::sanitize::without_terminal_codes;
 use crate::agent::transcript::tool_result_item_text;
 use crate::history::parser::{normalize_full_text, search_parts_of_entry};
 use crate::history::sqlite_cache::SearchField;
@@ -39,24 +39,27 @@ pub(super) fn entry_search(
         blocks: vec![None; blocks.len()],
         derived: Vec::new(),
     };
-    let mut block_texts: Vec<Option<Option<String>>> = vec![None; blocks.len()];
+    let parts = search_parts_of_entry(entry, spliced);
+    if parts.iter().all(Vec::is_empty) {
+        return search;
+    }
+    let block_texts: Vec<Option<BlockText>> = blocks.iter().map(BlockText::of).collect();
     let fields = [SearchField::Full, SearchField::Agent, SearchField::Thinking];
-    for (field, texts) in fields
-        .into_iter()
-        .zip(search_parts_of_entry(entry, spliced))
-    {
+    for (field, texts) in fields.into_iter().zip(parts) {
         for text in texts {
-            let searched = normalize_full_text(&text);
+            let searched = searched_text(&text, &block_texts);
             if searched.is_empty() {
                 continue;
             }
-            let holder = (0..blocks.len()).find(|&index| {
-                search.blocks[index].is_none()
-                    && block_texts[index]
-                        .get_or_insert_with(|| searched_block_text(&blocks[index]))
-                        .as_deref()
-                        == Some(searched.as_str())
-            });
+            let holder = block_texts
+                .iter()
+                .zip(&search.blocks)
+                .position(|(block, held)| {
+                    held.is_none()
+                        && block
+                            .as_ref()
+                            .is_some_and(|block| block.searched == searched)
+                });
             match holder {
                 Some(index) => search.blocks[index] = Some(field),
                 None => search.derived.push(DerivedText { field, text }),
@@ -66,30 +69,52 @@ pub(super) fn entry_search(
     search
 }
 
-/// The text search reads from `block`'s stored text, without terminal codes
-/// and with its whitespace collapsed: a text, a thinking block, a result's
-/// string, or the text items of a result whose items the row stores, joined
-/// by line breaks. `None` for a block without stored text.
-fn searched_block_text(block: &ContentBlock) -> Option<String> {
-    let stored = match block {
-        ContentBlock::Text { text } => Cow::Borrowed(text.as_str()),
-        ContentBlock::Thinking { thinking, .. } => Cow::Borrowed(thinking.as_str()),
-        ContentBlock::ToolResult {
-            content: Some(Value::String(text)),
-            ..
-        } => Cow::Borrowed(text.as_str()),
-        ContentBlock::ToolResult {
-            content: Some(Value::Array(items)),
-            ..
-        } if parts::stores_items(items) => Cow::Owned(
-            items
-                .iter()
-                .filter_map(tool_result_item_text)
-                .map(sanitize_agent_text)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        _ => return None,
-    };
-    Some(normalize_full_text(&stored))
+/// `text` as search reads it. A block storing `text` as written holds it
+/// already normalised.
+fn searched_text<'a>(text: &str, block_texts: &'a [Option<BlockText>]) -> Cow<'a, str> {
+    block_texts
+        .iter()
+        .flatten()
+        .find(|block| block.stored == text)
+        .map_or_else(
+            || Cow::Owned(normalize_full_text(text)),
+            |block| Cow::Borrowed(block.searched.as_str()),
+        )
+}
+
+/// A block's stored text, and the text search reads from it: without
+/// terminal codes and with its whitespace collapsed.
+struct BlockText<'a> {
+    stored: Cow<'a, str>,
+    searched: String,
+}
+
+impl<'a> BlockText<'a> {
+    /// The stored text of `block`: a text, a thinking block, a result's
+    /// string, or the text items of a result whose items the row stores,
+    /// joined by line breaks. `None` for a block without stored text.
+    fn of(block: &'a ContentBlock) -> Option<Self> {
+        let stored = match block {
+            ContentBlock::Text { text } => Cow::Borrowed(text.as_str()),
+            ContentBlock::Thinking { thinking, .. } => Cow::Borrowed(thinking.as_str()),
+            ContentBlock::ToolResult {
+                content: Some(Value::String(text)),
+                ..
+            } => Cow::Borrowed(text.as_str()),
+            ContentBlock::ToolResult {
+                content: Some(Value::Array(items)),
+                ..
+            } if parts::stores_items(items) => Cow::Owned(
+                items
+                    .iter()
+                    .filter_map(tool_result_item_text)
+                    .map(without_terminal_codes)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => return None,
+        };
+        let searched = normalize_full_text(&stored);
+        Some(Self { stored, searched })
+    }
 }

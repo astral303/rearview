@@ -14,17 +14,7 @@ fn database_backed_sessions_validate_current_logical_fingerprint() {
     let stub = stub_of(&session, 1);
     cache.admit_storage(storage).unwrap();
     cache
-        .write(
-            &SessionRecord::listed(
-                crate::history::FOR_FIXTURES,
-                storage,
-                Source::OpenCode,
-                &root,
-                &stub,
-                &session.row,
-            )
-            .unwrap(),
-        )
+        .write(&parsed_record(Source::OpenCode, &root, &stub))
         .unwrap();
     let super::super::CatalogueSession::Listed(cached) = cache
         .catalogue_session(storage, Source::OpenCode, &root.path, CACHE_KEY, false)
@@ -66,28 +56,7 @@ fn resumed_childs_earlier_files_are_dependencies_before_splicing() {
     let mut stub = stub_of(&parent, 1);
     stub.subagents.push(child.newest.clone());
     let source = Source::Codex;
-    let row = source
-        .provider()
-        .storage()
-        .parse_session(
-            crate::history::FOR_FIXTURES,
-            &stub,
-            &root,
-            None,
-            &|| {},
-            &crate::clock::TestClock::default(),
-        )
-        .unwrap()
-        .unwrap();
-    let record = SessionRecord::listed(
-        crate::history::FOR_FIXTURES,
-        storage_of(source),
-        source,
-        &root,
-        &stub,
-        &row,
-    )
-    .unwrap();
+    let record = parsed_record(source, &root, &stub);
     assert!(
         record
             .catalogue
@@ -98,14 +67,70 @@ fn resumed_childs_earlier_files_are_dependencies_before_splicing() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     cache.write(&record).unwrap();
-    let newest = files::fingerprint(&child.newest).unwrap();
+    let newest = CachedFingerprint::of_file(&child.newest).unwrap();
     let earlier = std::fs::read_to_string(&child.root).unwrap();
     std::fs::write(&child.root, earlier.replace("alpha", "omega") + "\n").unwrap();
-    assert_eq!(files::fingerprint(&child.newest).unwrap(), newest);
+    assert_eq!(CachedFingerprint::of_file(&child.newest).unwrap(), newest);
     assert!(matches!(
         cache.entries(storage_of(source), &root.path, CACHE_KEY),
         Err(AppError::SessionCacheSourceChanged(_))
     ));
+}
+
+/// A catalogue read compares the stamps discovery took of a session's
+/// transcript and sub-agent transcripts with the cache's, and stats only the
+/// session's other files.
+#[test]
+fn catalogue_read_stats_only_files_discovery_didnt_stamp() {
+    let home = tempfile::tempdir().unwrap();
+    let child = crate::history::format::codex::test_support::write_edited_thread_with_subagents(
+        home.path(),
+        "019f0000-0000-7000-8000-000000000097",
+    );
+    let parent = every_record_sessions()
+        .into_iter()
+        .find(|session| session.row.source == Source::Codex)
+        .unwrap();
+    let root = root_of(&parent);
+    let discovered_at = |modified_secs| {
+        let mut stub = stub_of(&parent, modified_secs);
+        stub.subagents.push(child.newest.clone());
+        stub
+    };
+    let discovered = discovered_at(1);
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = admitted_cache(base.path());
+    cache
+        .write(&parsed_record(Source::Codex, &root, &discovered))
+        .unwrap();
+    let storage = storage_of(Source::Codex);
+    let is_current = |discovered: &[SessionStub]| {
+        cache
+            .current_fingerprints(storage, &root.path, discovered)
+            .unwrap()
+            .contains_key(CACHE_KEY)
+    };
+    let newest = std::fs::read_to_string(&child.newest).unwrap();
+    std::fs::write(&child.newest, newest + "\n").unwrap();
+
+    assert!(
+        !is_current(&[]),
+        "a stat finds the sub-agent transcript changed"
+    );
+    assert!(
+        is_current(std::slice::from_ref(&discovered)),
+        "the read compares discovery's stamp of the sub-agent transcript instead of a stat"
+    );
+    assert!(
+        !is_current(&[discovered_at(2)]),
+        "a session whose discovery stamp differs from the cache's is stat as before"
+    );
+    let earlier = std::fs::read_to_string(&child.root).unwrap();
+    std::fs::write(&child.root, earlier.replace("alpha", "omega") + "\n").unwrap();
+    assert!(
+        !is_current(std::slice::from_ref(&discovered)),
+        "the read stats the continued transcript discovery didn't stamp"
+    );
 }
 
 #[test]
@@ -118,7 +143,7 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     );
     let mut cache = admitted_cache(base.path());
     let storage = storage_of(Source::Codex);
-    let newest_stamp = files::fingerprint(&thread.newest).unwrap();
+    let newest_stamp = CachedFingerprint::of_file(&thread.newest).unwrap();
     let original = std::fs::read_to_string(&thread.root).unwrap();
     let (record, root) = source_record(Source::Codex, &thread.newest);
     assert!(
@@ -142,16 +167,19 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     assert_eq!(kinds, ["locator", "continuation"]);
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .contains_key(CACHE_KEY)
     );
 
     std::fs::write(&thread.root, original.replace("alpha", "omega") + "\n").unwrap();
-    assert_eq!(files::fingerprint(&thread.newest).unwrap(), newest_stamp);
+    assert_eq!(
+        CachedFingerprint::of_file(&thread.newest).unwrap(),
+        newest_stamp
+    );
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .is_empty()
     );
@@ -179,10 +207,13 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     assert!(format!("{:?}", read.entries).contains("omega"));
 
     std::fs::remove_file(&thread.root).unwrap();
-    assert_eq!(files::fingerprint(&thread.newest).unwrap(), newest_stamp);
+    assert_eq!(
+        CachedFingerprint::of_file(&thread.newest).unwrap(),
+        newest_stamp
+    );
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .is_empty()
     );
@@ -208,21 +239,27 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     cache.write(&missing).unwrap();
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
-            .is_empty()
+            .contains_key(CACHE_KEY),
+        "a session missing earlier turns is current while its files are unchanged"
     );
-    assert!(matches!(
-        cache.entries(storage, &root.path, CACHE_KEY),
-        Err(AppError::SessionCacheNotReady { .. })
-    ));
+    let read = cache
+        .entries(storage, &root.path, CACHE_KEY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        format!("{:?}", read.entries),
+        format!("{:?}", fresh.entries),
+        "the entries of a session missing earlier turns read as its parse"
+    );
 
     std::fs::write(&thread.root, original).unwrap();
     let (recovered, _) = source_record(Source::Codex, &thread.newest);
     cache.write(&recovered).unwrap();
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .contains_key(CACHE_KEY)
     );

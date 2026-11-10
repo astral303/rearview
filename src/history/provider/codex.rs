@@ -550,9 +550,9 @@ impl SessionStorage for CodexStorage {
             on_transcript_read,
             clock,
         )?;
-        Ok(row.map(|mut row| {
-            row.has_transient_read_error |= discarded.has_transient_error;
-            row
+        Ok(row.map(|mut listed| {
+            listed.row.has_transient_read_error |= discarded.has_transient_error;
+            listed
         }))
     }
 
@@ -1235,7 +1235,8 @@ pub(super) mod tests {
                 &TestClock::default(),
             )
             .unwrap()
-            .expect("the thread lists with the conversation it inherits");
+            .expect("the thread lists with the conversation it inherits")
+            .row;
 
         assert_eq!(stub.locator, unsent);
         assert!(conversation.preview.starts_with("active codex question"));
@@ -1938,7 +1939,8 @@ pub(super) mod tests {
             &TestClock::default(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .row;
         assert_eq!(
             listed[0].total_tokens, parent_alone.total_tokens,
             "the review's tokens are not counted"
@@ -2010,7 +2012,8 @@ pub(super) mod tests {
             &TestClock::default(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .row;
 
         let parsed = load_rows(&storage, cache_base.path());
         let restored = load_rows(&storage, cache_base.path());
@@ -2076,7 +2079,8 @@ pub(super) mod tests {
                 &TestClock::default(),
             )
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .row;
 
         assert!(row.has_transient_read_error, "the row is read again");
         assert!(!row.is_missing_earlier_turns);

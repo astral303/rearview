@@ -194,7 +194,8 @@ mod tests {
     use super::*;
     use crate::history::provider::contract_tests::every_record_sessions;
     use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
-    use crate::history::sqlite_cache::{CatalogueSession, SessionRecord, SqliteCache};
+    use crate::history::sqlite_cache::tests::parsed_record_and_row;
+    use crate::history::sqlite_cache::{CatalogueSession, SqliteCache};
     use crate::search::evidence::{LexicalEvidence, build_lexical_evidence};
 
     #[test]
@@ -243,19 +244,8 @@ mod tests {
             } else {
                 stub
             };
-            cache
-                .write(
-                    &SessionRecord::listed(
-                        crate::history::FOR_FIXTURES,
-                        storage,
-                        session.row.source,
-                        &root,
-                        &stub,
-                        &session.row,
-                    )
-                    .unwrap(),
-                )
-                .unwrap();
+            let (record, row) = parsed_record_and_row(session.row.source, &root, &stub);
+            cache.write(&record).unwrap();
             let CatalogueSession::Listed(cached) = cache
                 .catalogue_session(
                     storage,
@@ -269,7 +259,7 @@ mod tests {
             else {
                 panic!("listed fixture")
             };
-            let mut original = session.row.clone();
+            let mut original = row;
             original.project_name.clone_from(&cached.project_name);
             let first_second = original
                 .message_times

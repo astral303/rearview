@@ -44,6 +44,11 @@ pub(super) fn open(
         // Without a journal size limit, a writable connection that closes
         // last leaves the persistent write-ahead log at its full size.
         connection.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT as i64)?;
+        // An automatic checkpoint runs inside the commit that crosses its
+        // threshold and syncs both files, stalling a load's write. The
+        // writer checkpoints once when its writes end instead
+        // (`CacheWriter::checkpoint_after_writes`).
+        connection.pragma_update(None, "wal_autocheckpoint", 0)?;
     }
     Ok(connection)
 }

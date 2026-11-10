@@ -1,15 +1,18 @@
 //! Building a conversation's row — preview text, message counts, search text
 //! and working directory — from its transcript's [`LogEntry`] records.
 
-use super::format::splice::{Spliced, SubagentThread, subagent_turns, walk_spliced};
+use super::fingerprint::FileStamp;
+use super::format::splice::{
+    Spliced, SubagentThread, SubagentTurn, splice_turns, subagent_turns, walk_spliced,
+};
 use super::format::{RecordLine, SessionFormat, SessionProjection};
 use super::message_texts::{MessageTextBuilder, MessageTextStarts, push_separated};
 use super::message_times::MessageTimesBuilder;
 use super::provider::{ReadError, SessionStub};
-use super::{Conversation, ParseError, ParsePermit, Source, parse_task_report};
+use super::{Conversation, ParseError, ParsePermit, Source, TranscriptEntries, parse_task_report};
 use crate::agent::message_numbering::{MessageNumbering, ThreadIdentity, has_visible_block};
 use crate::agent::refs::MessageRange;
-use crate::agent::sanitize::sanitize_agent_text;
+use crate::agent::sanitize::{sanitize_agent_text, without_terminal_codes};
 use crate::agent::transcript::{
     AgentMessageRole, agent_search_parts_from_blocks, thinking_and_tool_call_parts,
 };
@@ -19,14 +22,14 @@ use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::{
     AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent, extract_text_from_assistant,
-    extract_text_from_user, labeled_metadata_text, parse_agent_progress, progress_timestamp,
-    search_texts_of_blocks, search_texts_of_user,
+    extract_text_from_blocks, extract_text_from_user, labeled_metadata_text, parse_agent_progress,
+    progress_timestamp, search_texts_of_blocks, search_texts_of_user,
 };
 use crate::search::normalize_for_search;
 use crate::semantic::filter::{SemanticTurnRole, filter_turn};
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -45,8 +48,91 @@ pub enum UnlistedReason {
     NoConversationMetadata,
 }
 
-/// A session's parse: the row the list shows, or the reason it shows none.
-pub type ParsedSession = std::result::Result<Conversation, UnlistedReason>;
+/// A session's parse: the row the list shows with the transcripts the parse
+/// read, or the reason it shows none.
+pub type ParsedSession = std::result::Result<ListedSession, UnlistedReason>;
+
+/// A row builder's result: the row the list shows, or the reason it shows
+/// none.
+pub(crate) type ParsedRow = std::result::Result<Conversation, UnlistedReason>;
+
+/// A listed session's parse.
+pub struct ListedSession {
+    pub row: Conversation,
+    pub(crate) transcripts: SessionTranscripts,
+}
+
+/// What a listed session's parse read of its transcripts. The session
+/// cache's record is built from it, so no transcript is read twice.
+pub(crate) struct SessionTranscripts {
+    /// The session's own entries and malformed lines.
+    own: TranscriptEntries,
+    /// Each earlier transcript the session's own continues, stamped before
+    /// it was read.
+    own_earlier_transcripts: Vec<FileStamp>,
+    subagents: SubagentTranscripts,
+}
+
+impl SessionTranscripts {
+    pub(crate) fn new(
+        own: TranscriptEntries,
+        own_earlier_transcripts: Vec<FileStamp>,
+        subagents: SubagentTranscripts,
+    ) -> Self {
+        Self {
+            own,
+            own_earlier_transcripts,
+            subagents,
+        }
+    }
+
+    /// Every transcript the session's entries and its sub-agents' records
+    /// came from, beside the session's own: each sub-agent's, and each
+    /// earlier transcript the session or a sub-agent continues.
+    pub(crate) fn transcripts_read(&self) -> BTreeSet<&Path> {
+        self.own
+            .entries
+            .iter()
+            .filter_map(|(record, _)| record.transcript.as_deref())
+            .chain(
+                self.subagents
+                    .turns
+                    .iter()
+                    .filter_map(SubagentTurn::transcript),
+            )
+            .chain(self.subagents.sources.iter().map(PathBuf::as_path))
+            .collect()
+    }
+
+    /// The stamp taken before the read of `path`, an earlier transcript the
+    /// session or one of its sub-agents continues.
+    pub(crate) fn stamp_before_read(&self, path: &Path) -> Option<&FileStamp> {
+        self.own_earlier_transcripts
+            .iter()
+            .chain(&self.subagents.earlier_transcripts)
+            .find(|stamp| stamp.path == path)
+    }
+
+    /// The entries the viewer reads, each sub-agent turn spliced into the
+    /// session's own, and the sub-agents' search parts.
+    pub(crate) fn into_entries_and_search_parts(
+        self,
+    ) -> (TranscriptEntries, Vec<SubagentSearchPart>) {
+        let entries = TranscriptEntries {
+            entries: splice_turns(self.own.entries, self.subagents.turns),
+            malformed_lines: self.own.malformed_lines,
+        };
+        (entries, self.subagents.search_parts)
+    }
+}
+
+/// One search part of a sub-agent transcript: text outside its spliced
+/// turns.
+pub(crate) struct SubagentSearchPart {
+    /// The transcript's position among the row's sub-agents, from 1.
+    pub(crate) file_position: usize,
+    pub(crate) text: String,
+}
 
 /// Process a single conversation file, letting the registry decide which format
 /// owns it.
@@ -114,7 +200,7 @@ pub fn process_projected_session(
         SubagentReads::of_projections(permit, stub, subagent_format, on_transcript_read);
     Ok(row_with_subagents(
         stub,
-        &session,
+        session,
         subagents,
         debug_level,
         clock,
@@ -149,7 +235,7 @@ pub fn process_linked_session(
     );
     Ok(row_with_subagents(
         stub,
-        &session,
+        session,
         subagents,
         debug_level,
         clock,
@@ -158,20 +244,28 @@ pub fn process_linked_session(
 
 fn row_with_subagents(
     stub: &SessionStub,
-    session: &SessionProjection,
+    mut session: SessionProjection,
     subagents: SubagentReads,
     debug_level: Option<DebugLevel>,
     clock: &dyn Clock,
 ) -> ParsedSession {
-    let mut conversation = spliced_conversation_from_projection(
+    let mut row = spliced_conversation_from_projection(
         stub.locator.clone(),
-        session,
+        &session,
         &subagents.marks,
         RowDating::new(stub.fingerprint.modified, clock),
         debug_level,
     )?;
-    subagents.merge_into(&mut conversation, &stub.subagents, debug_level);
-    Ok(conversation)
+    let subagents = subagents.merge_into(&mut row, &stub.subagents, debug_level);
+    let own_earlier_transcripts = std::mem::take(&mut session.earlier_transcripts);
+    Ok(ListedSession {
+        row,
+        transcripts: SessionTranscripts::new(
+            TranscriptEntries::of_projection(session),
+            own_earlier_transcripts,
+            subagents,
+        ),
+    })
 }
 
 /// Read each of `stub`'s sub-agent transcripts with `read`, announcing each
@@ -207,31 +301,25 @@ pub(crate) struct SubagentMark {
     thinking_and_tool_call_parts: Vec<String>,
 }
 
-/// The turns of `threads` as the row numbers them, in the view's splice
-/// order.
-fn subagent_marks(threads: Vec<SubagentThread>) -> Vec<SubagentMark> {
-    subagent_turns(threads)
-        .into_iter()
+/// `turns` as the row numbers them, in their order.
+fn subagent_marks(turns: &[SubagentTurn]) -> Vec<SubagentMark> {
+    turns
+        .iter()
         .map(|turn| {
-            let thread = turn.thread_identity();
-            let is_message = has_visible_block(turn.role, &turn.blocks);
-            let thinking_and_tool_call_parts = thinking_and_tool_call_parts(&turn.blocks);
             let search_parts = match turn.role {
-                AgentMessageRole::User => {
-                    user_turn_text(&UserContent::Blocks(turn.blocks)).search_parts
-                }
+                AgentMessageRole::User => user_blocks_text(&turn.blocks).search_parts,
                 AgentMessageRole::Assistant => search_texts_of_blocks(&turn.blocks),
             };
             SubagentMark {
-                thread,
-                is_message,
-                timestamp: turn.timestamp,
-                reply_id: turn.reply_id,
+                thread: turn.thread_identity(),
+                is_message: has_visible_block(turn.role, &turn.blocks),
+                timestamp: turn.timestamp.clone(),
+                reply_id: turn.reply_id.clone(),
                 agent_search_parts: search_parts
                     .iter()
                     .map(|part| sanitize_agent_text(part))
                     .collect(),
-                thinking_and_tool_call_parts,
+                thinking_and_tool_call_parts: thinking_and_tool_call_parts(&turn.blocks),
             }
         })
         .collect()
@@ -245,28 +333,82 @@ pub(crate) struct SubagentReads {
     /// One contribution per recognized transcript, with or without user text,
     /// in the stub's order.
     contributions: Vec<SubagentContribution>,
-    /// Every sub-agent turn, in the view's splice order.
+    /// The numbering of each turn in `transcripts`, in their order.
     marks: Vec<SubagentMark>,
+    transcripts: SubagentTranscripts,
     unreadable: Vec<(PathBuf, AppError)>,
 }
 
-impl SubagentReads {
-    pub(crate) fn new(
-        contributions: Vec<SubagentContribution>,
-        marks: Vec<SubagentMark>,
-        unreadable: Vec<(PathBuf, AppError)>,
+/// What a session's sub-agent transcripts hold for its record in the
+/// session cache.
+#[derive(Default)]
+pub(crate) struct SubagentTranscripts {
+    /// Every sub-agent turn, in the view's splice order.
+    turns: Vec<SubagentTurn>,
+    search_parts: Vec<SubagentSearchPart>,
+    sources: BTreeSet<PathBuf>,
+    earlier_transcripts: Vec<FileStamp>,
+}
+
+impl SubagentTranscripts {
+    /// Add `read`, the sub-agent transcript at `file_position` among the
+    /// row's sub-agents, counted from 1.
+    pub(crate) fn add(&mut self, file_position: usize, read: SubagentRecordParts) {
+        self.search_parts.extend(
+            read.search_parts
+                .into_iter()
+                .map(|text| SubagentSearchPart {
+                    file_position,
+                    text,
+                }),
+        );
+        self.sources.extend(read.sources);
+        self.earlier_transcripts.extend(read.earlier_transcripts);
+    }
+}
+
+/// One sub-agent transcript's part of its session's record, beside its
+/// turns.
+pub(crate) struct SubagentRecordParts {
+    search_parts: Vec<String>,
+    /// The transcripts the records came from, beside the sub-agent's own.
+    sources: BTreeSet<PathBuf>,
+    earlier_transcripts: Vec<FileStamp>,
+}
+
+impl SubagentRecordParts {
+    /// The parts of the sub-agent transcript holding `entries`, its earlier
+    /// transcripts stamped as `earlier_transcripts`.
+    pub(crate) fn of_entries(
+        entries: &[(RecordLine, LogEntry)],
+        earlier_transcripts: Vec<FileStamp>,
     ) -> Self {
         Self {
-            contributions,
-            marks,
-            unreadable,
+            search_parts: SubagentContribution::search_parts(
+                entries.iter().map(|(_, entry)| entry),
+            ),
+            sources: entries
+                .iter()
+                .filter_map(|(record, _)| record.transcript.as_deref().map(Path::to_path_buf))
+                .collect(),
+            earlier_transcripts,
         }
     }
 
+    /// [`Self::of_entries`] for `projection`; takes its earlier transcripts.
+    fn of_projection(projection: &mut SessionProjection) -> Self {
+        let earlier_transcripts = std::mem::take(&mut projection.earlier_transcripts);
+        Self::of_entries(&projection.entries, earlier_transcripts)
+    }
+}
+
+impl SubagentReads {
     /// Build each thread's contribution and turns from the entries the view
     /// splices in, so the row counts the text and tokens the view shows.
+    /// `transcripts` holds each thread's record parts.
     pub(crate) fn of_threads(
         threads: Vec<SubagentThread>,
+        mut transcripts: SubagentTranscripts,
         unreadable: Vec<(PathBuf, AppError)>,
     ) -> Self {
         let contributions = threads
@@ -275,11 +417,17 @@ impl SubagentReads {
                 SubagentContribution::of_entries(thread.entries.iter().map(|(_, entry)| entry))
             })
             .collect();
-        Self::new(contributions, subagent_marks(threads), unreadable)
+        transcripts.turns = subagent_turns(threads);
+        Self {
+            contributions,
+            marks: subagent_marks(&transcripts.turns),
+            transcripts,
+            unreadable,
+        }
     }
 
     /// Read each of `stub`'s sub-agent transcripts once as `format`, for its
-    /// contribution and its turns.
+    /// contribution, its turns and its record parts.
     fn of_projections(
         permit: ParsePermit<'_>,
         stub: &SessionStub,
@@ -288,18 +436,20 @@ impl SubagentReads {
     ) -> Self {
         let transcripts = read_subagent_transcripts(stub, on_transcript_read, |subagent| {
             let projection = format.parse_transcript(permit, subagent)?;
-            Ok::<_, AppError>(projection.map(|projection| {
+            Ok::<_, AppError>(projection.map(|mut projection| {
                 let contribution = SubagentContribution::of_projection(&projection);
+                let record = SubagentRecordParts::of_projection(&mut projection);
                 let thread = SubagentThread::of_projection(subagent, projection);
-                (contribution, subagent_marks(vec![thread]))
+                (contribution, record, subagent_turns(vec![thread]))
             }))
         });
         let mut reads = Self::default();
-        for (subagent, transcript) in stub.subagents.iter().zip(transcripts) {
+        for (index, (subagent, transcript)) in stub.subagents.iter().zip(transcripts).enumerate() {
             match transcript {
-                Ok(Some((contribution, marks))) => {
+                Ok(Some((contribution, record, turns))) => {
                     reads.contributions.push(contribution);
-                    reads.marks.extend(marks);
+                    reads.transcripts.add(index + 1, record);
+                    reads.transcripts.turns.extend(turns);
                 }
                 Ok(None) => {}
                 Err(error) => reads.unreadable.push((subagent.clone(), error)),
@@ -308,14 +458,17 @@ impl SubagentReads {
         // Stable, so turns at one timestamp keep their threads' order, as the
         // view sorts the turns of every thread at once.
         reads
-            .marks
+            .transcripts
+            .turns
             .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        reads.marks = subagent_marks(&reads.transcripts.turns);
         reads
     }
 
     /// Read every one of `stub`'s sub-agent transcripts as `format` and hold
     /// the threads at once, for `link` to rewrite before their turns are
-    /// numbered. Each contribution comes from its transcript as read.
+    /// numbered. Each contribution and record part comes from its transcript
+    /// as read.
     fn of_linked_projections(
         permit: ParsePermit<'_>,
         stub: &SessionStub,
@@ -325,21 +478,25 @@ impl SubagentReads {
     ) -> Self {
         let transcripts = read_subagent_transcripts(stub, on_transcript_read, |subagent| {
             let projection = format.parse_transcript(permit, subagent)?;
-            Ok::<_, AppError>(projection.map(|projection| {
+            Ok::<_, AppError>(projection.map(|mut projection| {
                 let contribution = SubagentContribution::of_projection(&projection);
+                let record = SubagentRecordParts::of_projection(&mut projection);
                 (
                     contribution,
+                    record,
                     SubagentThread::of_projection(subagent, projection),
                 )
             }))
         });
         let mut contributions = Vec::new();
+        let mut records = SubagentTranscripts::default();
         let mut threads = Vec::new();
         let mut unreadable = Vec::new();
-        for (subagent, transcript) in stub.subagents.iter().zip(transcripts) {
+        for (index, (subagent, transcript)) in stub.subagents.iter().zip(transcripts).enumerate() {
             match transcript {
-                Ok(Some((contribution, thread))) => {
+                Ok(Some((contribution, record, thread))) => {
                     contributions.push(contribution);
+                    records.add(index + 1, record);
                     threads.push(thread);
                 }
                 Ok(None) => {}
@@ -347,7 +504,13 @@ impl SubagentReads {
             }
         }
         link(&mut threads);
-        Self::new(contributions, subagent_marks(threads), unreadable)
+        records.turns = subagent_turns(threads);
+        Self {
+            contributions,
+            marks: subagent_marks(&records.turns),
+            transcripts: records,
+            unreadable,
+        }
     }
 
     pub(crate) fn marks(&self) -> &[SubagentMark] {
@@ -355,7 +518,8 @@ impl SubagentReads {
     }
 
     /// Add each contribution to `session`, and report each unreadable
-    /// transcript. `session` is the row built with these marks.
+    /// transcript. `session` is the row built with these marks. Returns the
+    /// transcripts' part of the session's record.
     ///
     /// An unreadable transcript is left out and reported at warn level, as an
     /// unreadable session is, rather than failing the session: its own
@@ -369,8 +533,7 @@ impl SubagentReads {
         session: &mut Conversation,
         subagents: &[PathBuf],
         debug_level: Option<DebugLevel>,
-    ) {
-        let has_contributions = !self.contributions.is_empty();
+    ) -> SubagentTranscripts {
         for contribution in self.contributions {
             contribution.add_to(session);
         }
@@ -386,11 +549,8 @@ impl SubagentReads {
                 session.has_transient_read_error = true;
             }
         }
-        if has_contributions {
-            session.semantic_route_text =
-                super::semantic_route_text(&session.full_text, &session.agent_search_text);
-        }
         session.subagents = subagents.to_vec();
+        self.transcripts
     }
 }
 
@@ -489,7 +649,7 @@ pub(crate) fn conversation_from_projection(
     projection: &SessionProjection,
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> ParsedSession {
+) -> ParsedRow {
     spliced_conversation_from_projection(path, projection, &[], dating, debug_level)
 }
 
@@ -501,7 +661,7 @@ fn spliced_conversation_from_projection(
     marks: &[SubagentMark],
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> ParsedSession {
+) -> ParsedRow {
     let timestamp = latest_activity_timestamp(&projection.entries)
         .or_else(|| {
             DateTime::parse_from_rfc3339(&projection.header.timestamp)
@@ -665,13 +825,27 @@ pub(crate) fn semantic_text_of_entry(entry: &LogEntry) -> Option<String> {
 /// results. A slash command is searched as `agent read` shows it, so a phrase
 /// spanning the name and its arguments matches in both.
 fn user_turn_text(content: &UserContent) -> UserTurnText {
-    let text = extract_text_from_user(content);
+    user_turn_text_of(extract_text_from_user(content), || {
+        search_texts_of_user(content)
+    })
+}
+
+/// [`user_turn_text`] for a sub-agent turn's `blocks`.
+fn user_blocks_text(blocks: &[ContentBlock]) -> UserTurnText {
+    user_turn_text_of(extract_text_from_blocks(blocks), || {
+        search_texts_of_blocks(blocks)
+    })
+}
+
+/// [`user_turn_text`] for a turn whose text is `text`; `search_texts` gives
+/// the search text of each of its parts.
+fn user_turn_text_of(text: String, search_texts: impl FnOnce() -> Vec<String>) -> UserTurnText {
     let (preview, search_parts, semantic) = match parse_task_report(&text) {
         Some(report) => {
             let search = report.search_text();
             (report.summary, vec![search.clone()], search)
         }
-        None => (text.clone(), search_texts_of_user(content), text),
+        None => (text.clone(), search_texts(), text),
     };
     let skill_preview = extract_skill_preview(&preview);
     UserTurnText {
@@ -1015,7 +1189,7 @@ impl ConversationBuilder {
         path: PathBuf,
         timestamp: DateTime<Local>,
         debug_level: Option<DebugLevel>,
-    ) -> ParsedSession {
+    ) -> ParsedRow {
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1080,7 +1254,6 @@ impl ConversationBuilder {
         let (thinking_and_tool_call_text, thinking_and_tool_call_text_starts) = self
             .thinking_and_tool_call_text
             .finish([], message_count, normalize_whitespace);
-        let semantic_route_text = super::semantic_route_text(&full_text, &agent_search_text);
 
         // Pre-normalize search text to avoid re-normalizing on every startup
         let search_text_lower = normalize_for_search(&full_text);
@@ -1117,7 +1290,6 @@ impl ConversationBuilder {
             full_text,
             agent_search_text,
             thinking_and_tool_call_text,
-            semantic_route_text,
             semantic_turns,
             semantic_turn_ranges,
             search_text_lower,
@@ -1203,7 +1375,7 @@ pub(crate) fn conversation_from_entries<'a>(
     parse_errors: Vec<ParseError>,
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> ParsedSession {
+) -> ParsedRow {
     let mut builder = ConversationBuilder {
         parse_errors,
         ..ConversationBuilder::default()
@@ -1319,13 +1491,20 @@ pub(crate) fn is_clear_only_conversation(user_messages: &[String]) -> bool {
 
 /// Normalize whitespace in a string
 pub(crate) fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<&str>>().join(" ")
+    let mut normalized = String::with_capacity(s.len());
+    for word in s.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(word);
+    }
+    normalized
 }
 
 /// `text` as `full_text` keeps it: terminal codes and control characters
 /// removed, whitespace collapsed.
 pub(crate) fn normalize_full_text(text: &str) -> String {
-    normalize_whitespace(&sanitize_agent_text(text))
+    normalize_whitespace(&without_terminal_codes(text))
 }
 
 #[cfg(test)]
@@ -2851,18 +3030,13 @@ mod tests {
     fn thinking_and_tool_names_stay_out_of_semantic_route_text() {
         let content = reply_with_thinking_and_a_tool_call("weighing the stale index");
 
-        let conv = parse_jsonl(&content).unwrap().unwrap();
+        let route_text = parse_jsonl(&content)
+            .unwrap()
+            .unwrap()
+            .semantic_route_text();
 
-        assert!(
-            !conv.semantic_route_text.contains("weighing"),
-            "{}",
-            conv.semantic_route_text
-        );
-        assert!(
-            !conv.semantic_route_text.contains("WebFetch"),
-            "{}",
-            conv.semantic_route_text
-        );
+        assert!(!route_text.contains("weighing"), "{route_text}");
+        assert!(!route_text.contains("WebFetch"), "{route_text}");
     }
 
     #[test]
@@ -3164,7 +3338,8 @@ mod tests {
             &TestClock::default(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .row;
 
         let positions: Vec<usize> = (0..threads)
             .map(|index| {
@@ -3176,11 +3351,8 @@ mod tests {
             .collect();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(session.subagents, subagents);
-        assert!(
-            session.semantic_route_text.contains("thread"),
-            "{}",
-            session.semantic_route_text
-        );
+        let route_text = session.semantic_route_text();
+        assert!(route_text.contains("thread"), "{route_text}");
     }
 
     #[test]
@@ -3227,7 +3399,8 @@ mod tests {
             &TestClock::default(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .row;
 
         assert!(
             session

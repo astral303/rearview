@@ -198,6 +198,7 @@ fn projection(summary: SessionSummary, updates: ParsedUpdates) -> SessionProject
         malformed_lines: updates.malformed_lines,
         dropped: updates.dropped,
         earlier_turns: EarlierTurns::Read,
+        earlier_transcripts: Vec::new(),
     }
 }
 

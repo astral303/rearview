@@ -2,13 +2,15 @@ use super::*;
 use crate::clock::{Clock, TestClock};
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
-use crate::history::{DisplayEntries, Source, normalized_session};
+use crate::history::{Conversation, DisplayEntries, Source, normalized_session};
 use std::time::{Duration, UNIX_EPOCH};
 
 mod bounded;
+mod diff_write;
 mod file_keys;
 mod lifecycle;
 mod message_schema;
+mod record_from_parse;
 mod search_texts;
 mod sources;
 
@@ -29,18 +31,54 @@ pub(super) fn admitted_cache(base: &Path) -> super::OwnedCache {
     cache
 }
 
+/// The record a load writes for `stub`'s session under `root`, from the
+/// provider's parse, and that parse's row.
+pub(crate) fn parsed_record_and_row(
+    source: Source,
+    root: &SessionRoot,
+    stub: &SessionStub,
+) -> (SessionRecord, Conversation) {
+    let stamps = StubStamps::current(stub);
+    let listed = source
+        .provider()
+        .storage()
+        .parse_session(
+            crate::history::FOR_FIXTURES,
+            stub,
+            root,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
+        .unwrap()
+        .expect("the session is listed");
+    let record = SessionRecord::listed(
+        storage_of(source),
+        source,
+        root,
+        stub,
+        stamps,
+        &listed.row,
+        listed.transcripts,
+    )
+    .unwrap();
+    (record, listed.row)
+}
+
+/// The record a load writes for `stub`'s session under `root`, from the
+/// provider's parse.
+pub(crate) fn parsed_record(
+    source: Source,
+    root: &SessionRoot,
+    stub: &SessionStub,
+) -> SessionRecord {
+    parsed_record_and_row(source, root, stub).0
+}
+
 fn source_record(source: Source, path: &Path) -> (SessionRecord, SessionRoot) {
     let session = AgentSession::new(source, path.to_path_buf(), Vec::new(), Vec::new());
     let root = root_of(&session);
-    let record = SessionRecord::listed(
-        crate::history::FOR_FIXTURES,
-        storage_of(source),
-        source,
-        &root,
-        &stub_of(&session, 1),
-        &session.row,
-    )
-    .unwrap();
+    let record = parsed_record(source, &root, &stub_of(&session, 1));
     (record, root)
 }
 
@@ -93,15 +131,7 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
         let row = &session.row;
         let storage = storage_of(row.source);
         let root = root_of(&session);
-        let record = SessionRecord::listed(
-            crate::history::FOR_FIXTURES,
-            storage,
-            row.source,
-            &root,
-            &stub_of(&session, 1),
-            row,
-        )
-        .unwrap();
+        let record = parsed_record(row.source, &root, &stub_of(&session, 1));
         cache.write(&record).unwrap();
         let subagents = cache
             .connection
@@ -259,15 +289,7 @@ pub(super) fn write_test_entries(
     let session = every_record_sessions().remove(0);
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
-    let mut record = SessionRecord::listed(
-        crate::history::FOR_FIXTURES,
-        storage,
-        session.row.source,
-        &root,
-        &stub_of(&session, 1),
-        &session.row,
-    )
-    .unwrap();
+    let mut record = parsed_record(session.row.source, &root, &stub_of(&session, 1));
     record.entries = Some(Ok(entries));
     record.catalogue.files.clear();
     cache.mark_admitted().unwrap();
@@ -600,15 +622,7 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
         .unwrap();
     let storage = storage_of(Source::Claude);
     let root = root_of(&session);
-    let mut record = SessionRecord::listed(
-        crate::history::FOR_FIXTURES,
-        storage,
-        Source::Claude,
-        &root,
-        &stub_of(&session, 1),
-        &session.row,
-    )
-    .unwrap();
+    let mut record = parsed_record(Source::Claude, &root, &stub_of(&session, 1));
     record.catalogue.locator = source.to_string_lossy().into_owned();
     let metadata = std::fs::metadata(&source).unwrap();
     record.catalogue.files = vec![catalogue::SessionFile {
@@ -680,24 +694,16 @@ fn writing_session_again_replaces_its_rows() {
     let write = |cache: &mut CacheWriter, modified_secs| {
         let stub = stub_of(&session, modified_secs);
         cache
-            .write(
-                &SessionRecord::listed(
-                    crate::history::FOR_FIXTURES,
-                    storage,
-                    row.source,
-                    &root,
-                    &stub,
-                    row,
-                )
-                .unwrap(),
-            )
+            .write(&parsed_record(row.source, &root, &stub))
             .unwrap();
     };
     write(&mut cache, 1);
 
     write(&mut cache, 2);
 
-    let current = cache.current_fingerprints(storage, &root.path).unwrap();
+    let current = cache
+        .current_fingerprints(storage, &root.path, &[])
+        .unwrap();
     assert_eq!(
         current
             .get(CACHE_KEY)
@@ -735,21 +741,13 @@ fn storage_written_under_another_schema_version_loses_its_sessions() {
     let root = root_of(&session);
     cache.admit_storage(storage).unwrap();
     cache
-        .write(
-            &SessionRecord::listed(
-                crate::history::FOR_FIXTURES,
-                storage,
-                row.source,
-                &root,
-                &stub_of(&session, 1),
-                row,
-            )
-            .unwrap(),
-        )
+        .write(&parsed_record(row.source, &root, &stub_of(&session, 1)))
         .unwrap();
 
     cache.admit_storage(storage).unwrap();
-    let kept = cache.current_fingerprints(storage, &root.path).unwrap();
+    let kept = cache
+        .current_fingerprints(storage, &root.path, &[])
+        .unwrap();
     cache
         .admit_storage(SessionCache {
             schema_version: storage.schema_version + 1,
@@ -760,7 +758,7 @@ fn storage_written_under_another_schema_version_loses_its_sessions() {
     assert_eq!(kept.len(), 1, "the same version keeps the sessions");
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .is_empty()
     );
@@ -777,17 +775,7 @@ fn session_still_being_written_is_not_current() {
     let storage = storage_of(row.source);
     let root = root_of(&session);
     cache
-        .write(
-            &SessionRecord::listed(
-                crate::history::FOR_FIXTURES,
-                storage,
-                row.source,
-                &root,
-                &stub_of(&session, 1),
-                row,
-            )
-            .unwrap(),
-        )
+        .write(&parsed_record(row.source, &root, &stub_of(&session, 1)))
         .unwrap();
 
     cache
@@ -797,7 +785,7 @@ fn session_still_being_written_is_not_current() {
 
     assert!(
         cache
-            .current_fingerprints(storage, &root.path)
+            .current_fingerprints(storage, &root.path, &[])
             .unwrap()
             .is_empty()
     );
@@ -812,17 +800,7 @@ fn removed_session_leaves_no_rows() {
     let storage = storage_of(row.source);
     let root = root_of(&session);
     cache
-        .write(
-            &SessionRecord::listed(
-                crate::history::FOR_FIXTURES,
-                storage,
-                row.source,
-                &root,
-                &stub_of(&session, 1),
-                row,
-            )
-            .unwrap(),
-        )
+        .write(&parsed_record(row.source, &root, &stub_of(&session, 1)))
         .unwrap();
 
     cache
@@ -848,20 +826,9 @@ fn database_of_another_schema_version_is_emptied() {
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
     let row = &session.row;
-    let storage = storage_of(row.source);
     let root = root_of(&session);
     cache
-        .write(
-            &SessionRecord::listed(
-                crate::history::FOR_FIXTURES,
-                storage,
-                row.source,
-                &root,
-                &stub_of(&session, 1),
-                row,
-            )
-            .unwrap(),
-        )
+        .write(&parsed_record(row.source, &root, &stub_of(&session, 1)))
         .unwrap();
     cache
         .set_meta(

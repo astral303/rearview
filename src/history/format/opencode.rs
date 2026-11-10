@@ -208,6 +208,7 @@ fn project_session(
         malformed_lines: Vec::new(),
         dropped,
         earlier_turns: EarlierTurns::Read,
+        earlier_transcripts: Vec::new(),
     }))
 }
 

@@ -587,7 +587,8 @@ mod tests {
             &crate::clock::TestClock::default(),
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .row;
 
         assert_eq!(conversation.total_tokens, 40 + 15 + 5 + 2);
         assert_eq!(conversation.model.as_deref(), Some("gpt-6-luna"));

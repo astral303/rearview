@@ -2,10 +2,14 @@
 //! record a load hands the database writer.
 
 use super::entries::path_text;
-use crate::history::fingerprint::CachedFingerprint;
+use super::files::FileKey;
+use super::positional::PositionalRow;
+use crate::history::fingerprint::{CachedFingerprint, FileStamp};
+use crate::history::parser::{SessionTranscripts, SubagentSearchPart};
 use crate::history::provider::{RecordedSession, SessionCache, SessionRoot, SessionStub};
-use crate::history::{Conversation, ParseError, ParsePermit, Source, TranscriptEntries};
-use std::collections::BTreeSet;
+use crate::history::{Conversation, ParseError, Source, TranscriptEntries};
+use rusqlite::types::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,35 +54,48 @@ pub(crate) struct SessionRecord {
     pub(super) search_parts: Vec<SubagentSearchPart>,
 }
 
-pub(super) struct SubagentSearchPart {
-    pub(super) file_position: usize,
-    pub(super) text: String,
+/// A session's transcript files as its stub names them, the locator first,
+/// each with its stamp. A listed record stores these stamps, so take them
+/// before the parse: a file that changes during the parse then fails the
+/// record's check.
+pub(crate) struct StubStamps(Vec<FileStamp>);
+
+impl StubStamps {
+    /// The stub's files as they stamp now.
+    pub(crate) fn current(stub: &SessionStub) -> Self {
+        Self(
+            std::iter::once(&stub.locator)
+                .chain(&stub.subagents)
+                .map(|path| FileStamp::before_read(path))
+                .collect(),
+        )
+    }
 }
 
 impl SessionRecord {
     /// The record of `conversation`, `storage`'s session at `stub` under
-    /// `root`, with its entries as `session_entries` reads them with
-    /// `permit`. `None` when the stub has no fingerprint to validate the
-    /// record against.
+    /// `root`, with the entries of `transcripts`, the parse that built it.
+    /// `stamps` are the stub's files stamped before that parse. `None` when
+    /// the stub has no fingerprint to validate the record against.
     pub(crate) fn listed(
-        permit: ParsePermit<'_>,
         storage: SessionCache,
         source: Source,
         root: &SessionRoot,
         stub: &SessionStub,
+        stamps: StubStamps,
         conversation: &Conversation,
+        transcripts: SessionTranscripts,
     ) -> Option<Self> {
         let mut catalogue =
-            CatalogueRow::of_stub(storage, source, root, stub, SessionStatus::Listed)?;
+            CatalogueRow::of_stub(storage, source, root, stub, stamps, SessionStatus::Listed)?;
         catalogue.describe(stub, conversation);
-        let mut search_parts = Vec::new();
-        let entries = catalogue
-            .read_entries(permit, source, &stub.locator, &conversation.subagents)
-            .map(|(entries, parts)| {
-                search_parts = parts;
-                entries
-            })
-            .map_err(|error| error.to_string());
+        let (entries, search_parts) = match catalogue.add_transcripts_read(&transcripts) {
+            Ok(()) => {
+                let (entries, search_parts) = transcripts.into_entries_and_search_parts();
+                (Ok(entries), search_parts)
+            }
+            Err(error) => (Err(error.to_string()), Vec::new()),
+        };
         Some(Self {
             catalogue,
             entries: Some(entries),
@@ -98,7 +115,8 @@ impl SessionRecord {
         status: SessionStatus,
         reason: String,
     ) -> Option<Self> {
-        let mut catalogue = CatalogueRow::of_stub(storage, source, root, stub, status)?;
+        let stamps = StubStamps::current(stub);
+        let mut catalogue = CatalogueRow::of_stub(storage, source, root, stub, stamps, status)?;
         catalogue.handle = handle(source, stub, None);
         Some(Self {
             catalogue,
@@ -107,39 +125,6 @@ impl SessionRecord {
             search_parts: Vec::new(),
         })
     }
-}
-
-/// The search parts and source transcripts of each sub-agent transcript at
-/// `subagents` that reads. An unreadable sub-agent transcript is left out,
-/// as the session's entries leave it out.
-fn read_subagent_search_parts(
-    permit: ParsePermit<'_>,
-    source: Source,
-    subagents: &[std::path::PathBuf],
-) -> crate::error::Result<(Vec<SubagentSearchPart>, BTreeSet<std::path::PathBuf>)> {
-    let mut parts = Vec::new();
-    let mut sources = BTreeSet::new();
-    for (index, path) in subagents.iter().enumerate() {
-        if let Ok(Some(projection)) = source.provider().format().parse_transcript(permit, path) {
-            sources.extend(
-                projection
-                    .entries
-                    .iter()
-                    .filter_map(|(record, _)| record.transcript.as_deref().map(Path::to_path_buf)),
-            );
-            parts.extend(
-                crate::history::parser::SubagentContribution::search_parts(
-                    projection.entries.iter().map(|(_, entry)| entry),
-                )
-                .into_iter()
-                .map(|text| SubagentSearchPart {
-                    file_position: index + 1,
-                    text,
-                }),
-            );
-        }
-    }
-    Ok((parts, sources))
 }
 
 /// A session's row in the `sessions` table, with the rows of
@@ -182,14 +167,205 @@ pub(super) struct SessionFile {
     pub(super) fingerprint: Option<CachedFingerprint>,
 }
 
+/// The [`FileKey`] of a row's locator and of each of its files, in order.
+pub(super) struct CatalogueKeys {
+    pub(super) locator: FileKey,
+    pub(super) files: Vec<FileKey>,
+}
+
+/// The `sessions` columns [`CatalogueRow::values`] gives, after `storage`,
+/// `root` and `cache_key`.
+const COLUMNS: &[&str] = &[
+    "source",
+    "locator",
+    "file_key",
+    "status",
+    "file_size",
+    "mtime_secs",
+    "mtime_nsecs",
+    "session_id",
+    "session_id_key",
+    "handle",
+    "project_path",
+    "project_name",
+    "cwd",
+    "timestamp_ms",
+    "preview_first",
+    "preview_last",
+    "summary",
+    "custom_title",
+    "model",
+    "total_tokens",
+    "duration_minutes",
+    "message_count",
+    "assistant_messages",
+    "is_missing_earlier_turns",
+    "entries_error",
+    "generation",
+];
+
+/// `INSERT` of a `sessions` row: `storage`, `root` and `cache_key` (`?1` to
+/// `?3`), then [`CatalogueRow::values`].
+pub(super) fn insert_sql() -> String {
+    let parameters: Vec<String> = (4..COLUMNS.len() + 4)
+        .map(|index| format!("?{index}"))
+        .collect();
+    format!(
+        "INSERT INTO sessions (storage, root, cache_key, {}) VALUES (?1, ?2, ?3, {})",
+        COLUMNS.join(", "),
+        parameters.join(", ")
+    )
+}
+
+/// `UPDATE` of a `sessions` row to [`CatalogueRow::values`], then the row's
+/// id.
+pub(super) fn update_sql() -> String {
+    let assignments: Vec<String> = COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(index, column)| format!("{column} = ?{}", index + 1))
+        .collect();
+    format!(
+        "UPDATE sessions SET {} WHERE id = ?{}",
+        assignments.join(", "),
+        COLUMNS.len() + 1
+    )
+}
+
+/// The key a stored `session_files` row matches a new one by: its kind and
+/// path.
+pub(super) fn file_key_of(values: &[Value]) -> (String, String) {
+    let text = |value: &Value| match value {
+        Value::Text(text) => text.clone(),
+        _ => String::new(),
+    };
+    (text(&values[0]), text(&values[1]))
+}
+
 impl CatalogueRow {
-    /// The row's identity and files, before anything the read found. `None`
-    /// when the stub has no fingerprint.
+    /// The row's `sessions` columns, as [`COLUMNS`] lists them, with `keys`,
+    /// the keys of its files, `status`, `message_count`, `entries_error` and
+    /// `generation`.
+    pub(super) fn values(
+        &self,
+        keys: &CatalogueKeys,
+        status: &str,
+        message_count: Option<i64>,
+        entries_error: Option<&str>,
+        generation: i64,
+    ) -> Vec<Value> {
+        let text = |text: &Option<String>| Value::from(text.clone());
+        vec![
+            self.source.to_owned().into(),
+            self.locator.clone().into(),
+            keys.locator.as_str().to_owned().into(),
+            status.to_owned().into(),
+            (self.fingerprint.file_size as i64).into(),
+            (self.fingerprint.mtime_secs as i64).into(),
+            self.fingerprint.mtime_nsecs.into(),
+            text(&self.session_id),
+            text(&self.session_id_key),
+            text(&self.handle),
+            text(&self.project_path),
+            text(&self.project_name),
+            text(&self.cwd),
+            self.timestamp_ms.into(),
+            text(&self.preview_first),
+            text(&self.preview_last),
+            text(&self.summary),
+            text(&self.custom_title),
+            text(&self.model),
+            self.total_tokens.into(),
+            self.duration_minutes.into(),
+            message_count.into(),
+            self.assistant_messages.into(),
+            self.is_missing_earlier_turns.into(),
+            entries_error.map(str::to_owned).into(),
+            generation.into(),
+        ]
+    }
+
+    /// The row's `session_files` rows, with `keys`, the keys of its files.
+    pub(super) fn file_rows(&self, keys: &CatalogueKeys) -> Vec<PositionalRow<(String, String)>> {
+        self.files
+            .iter()
+            .zip(&keys.files)
+            .map(|(file, key)| {
+                let path = path_text(&file.path);
+                PositionalRow {
+                    key: (file.kind.to_owned(), path.clone()),
+                    values: vec![
+                        file.kind.to_owned().into(),
+                        path.into(),
+                        key.as_str().to_owned().into(),
+                        file.fingerprint
+                            .map(|fingerprint| fingerprint.file_size as i64)
+                            .into(),
+                        file.fingerprint
+                            .map(|fingerprint| fingerprint.mtime_secs as i64)
+                            .into(),
+                        file.fingerprint
+                            .map(|fingerprint| fingerprint.mtime_nsecs)
+                            .into(),
+                    ],
+                }
+            })
+            .collect()
+    }
+
+    /// The row's `parse_errors` rows, keyed by line number.
+    pub(super) fn parse_error_rows(&self) -> Vec<PositionalRow<i64>> {
+        let json =
+            |lines: &[String]| serde_json::to_string(lines).expect("a list of strings serializes");
+        self.parse_errors
+            .iter()
+            .map(|error| PositionalRow {
+                key: error.line_number as i64,
+                values: vec![
+                    (error.line_number as i64).into(),
+                    error.line_content.clone().into(),
+                    error.error_message.clone().into(),
+                    json(&error.context_before).into(),
+                    json(&error.context_after).into(),
+                ],
+            })
+            .collect()
+    }
+
+    /// The row's sub-agent transcripts' `subagent_search_parts` rows of
+    /// `parts`, keyed by the path of the transcript holding each.
+    pub(super) fn search_part_rows(
+        &self,
+        parts: &[SubagentSearchPart],
+    ) -> Vec<PositionalRow<String>> {
+        parts
+            .iter()
+            .map(|part| PositionalRow {
+                key: self
+                    .files
+                    .get(part.file_position)
+                    .map(|file| path_text(&file.path))
+                    .unwrap_or_default(),
+                values: vec![
+                    (part.file_position as i64).into(),
+                    // Only search reads these texts, without terminal codes,
+                    // so their codes are dropped.
+                    crate::agent::sanitize::split_terminal_codes(&part.text)
+                        .text
+                        .into_owned()
+                        .into(),
+                ],
+            })
+            .collect()
+    }
+    /// The row's identity and files, the stub's files with `stamps`, before
+    /// anything the read found. `None` when the stub has no fingerprint.
     fn of_stub(
         storage: SessionCache,
         source: Source,
         root: &SessionRoot,
         stub: &SessionStub,
+        stamps: StubStamps,
         status: SessionStatus,
     ) -> Option<Self> {
         let fingerprint = stub.fingerprint.stamp()?;
@@ -218,65 +394,48 @@ impl CatalogueRow {
             message_count: None,
             assistant_messages: None,
             is_missing_earlier_turns: None,
-            files: std::iter::once(&stub.locator)
-                .chain(&stub.subagents)
+            files: stamps
+                .0
+                .into_iter()
                 .enumerate()
-                .map(|(index, file)| SessionFile {
+                .map(|(index, stamp)| SessionFile {
                     kind: if index == 0 { "locator" } else { "subagent" },
-                    path: file.clone(),
-                    fingerprint: file_fingerprint(file),
+                    path: stamp.path,
+                    fingerprint: stamp.fingerprint,
                 })
                 .collect(),
             parse_errors: Vec::new(),
         })
     }
 
-    fn read_entries(
+    /// Add each continuation file `transcripts` read to the row's files,
+    /// stamped as before its read. Fails with `SessionCacheSourceChanged`
+    /// when a file's stamp now differs from the row's: the file changed
+    /// after its stamp was taken, so the parse may hold either version.
+    fn add_transcripts_read(
         &mut self,
-        permit: ParsePermit<'_>,
-        source: Source,
-        path: &Path,
-        subagents: &[std::path::PathBuf],
-    ) -> crate::error::Result<(TranscriptEntries, Vec<SubagentSearchPart>)> {
+        transcripts: &SessionTranscripts,
+    ) -> crate::error::Result<()> {
         use crate::error::AppError;
-        let mut entries = crate::history::normalized_session(permit, source, path, subagents)?;
-        let (mut search_parts, mut child_sources) =
-            read_subagent_search_parts(permit, source, subagents)?;
-        let mut added_dependency = false;
-        for path in transcript_paths(&entries)
-            .into_iter()
-            .chain(child_sources.iter().map(std::path::PathBuf::as_path))
-        {
+        for path in transcripts.transcripts_read() {
             if !self.lists_file(path) {
-                let stamp = super::files::fingerprint(path)?
+                let fingerprint = transcripts
+                    .stamp_before_read(path)
+                    .and_then(|stamp| stamp.fingerprint)
                     .ok_or_else(|| AppError::SessionCacheSourceChanged(path.to_path_buf()))?;
                 self.files.push(SessionFile {
                     kind: "continuation",
                     path: path.to_path_buf(),
-                    fingerprint: Some(stamp),
+                    fingerprint: Some(fingerprint),
                 });
-                added_dependency = true;
-            }
-        }
-        // Discover continuation dependencies before the validated parse.
-        if added_dependency {
-            entries = crate::history::normalized_session(permit, source, path, subagents)?;
-            (search_parts, child_sources) = read_subagent_search_parts(permit, source, subagents)?;
-        }
-        for path in transcript_paths(&entries)
-            .into_iter()
-            .chain(child_sources.iter().map(std::path::PathBuf::as_path))
-        {
-            if !self.lists_file(path) {
-                return Err(AppError::SessionCacheSourceChanged(path.to_path_buf()));
             }
         }
         for file in &self.files {
-            if super::files::fingerprint(&file.path)? != file.fingerprint {
+            if CachedFingerprint::of_file(&file.path)? != file.fingerprint {
                 return Err(AppError::SessionCacheSourceChanged(file.path.clone()));
             }
         }
-        Ok((entries, search_parts))
+        Ok(())
     }
 
     /// True when the row's files hold `path`, as the parse that names it
@@ -318,22 +477,25 @@ impl CatalogueRow {
         // The row's sub-agents, not the stub's: a row leaves out the
         // sub-agents of discarded turns. The stub's fingerprint still spans
         // every sub-agent transcript.
-        self.files.retain(|file| file.kind != "subagent");
-        self.files
-            .extend(conversation.subagents.iter().map(|file| SessionFile {
+        let mut stamped: HashMap<PathBuf, Option<CachedFingerprint>> = HashMap::new();
+        self.files.retain(|file| {
+            if file.kind != "subagent" {
+                return true;
+            }
+            stamped.insert(file.path.clone(), file.fingerprint);
+            false
+        });
+        self.files.extend(conversation.subagents.iter().map(|file| {
+            SessionFile {
                 kind: "subagent",
                 path: file.clone(),
-                fingerprint: file_fingerprint(file),
-            }));
+                fingerprint: stamped
+                    .get(file)
+                    .copied()
+                    .unwrap_or_else(|| file_fingerprint(file)),
+            }
+        }));
     }
-}
-
-fn transcript_paths(entries: &TranscriptEntries) -> BTreeSet<&Path> {
-    entries
-        .entries
-        .iter()
-        .filter_map(|(record, _)| record.transcript.as_deref())
-        .collect()
 }
 
 /// The full digest of the `ch_` handle the agent commands give the session
@@ -351,5 +513,5 @@ fn handle(
 /// The fingerprint of the file at `path`; `None` for a locator that names no
 /// file, as an OpenCode session's does.
 fn file_fingerprint(path: &Path) -> Option<CachedFingerprint> {
-    super::files::fingerprint(path).ok().flatten()
+    CachedFingerprint::of_file(path).ok().flatten()
 }

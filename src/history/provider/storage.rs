@@ -467,8 +467,12 @@ impl SessionStorage for WatchedStorage {
         clock: &dyn Clock,
     ) -> Result<ParsedSession> {
         self.watch.begin_parse(&stub.locator);
+        let on_transcript_read = || {
+            on_transcript_read();
+            self.watch.end_transcript_read();
+        };
         self.inner
-            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
+            .parse_session(permit, stub, root, debug_level, &on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -482,8 +486,8 @@ impl SessionStorage for WatchedStorage {
 
 /// The parses of [`WatchedStorage`]s, as a test watches them: the sessions
 /// parsed, how many parses began after a moment the test marks, an action
-/// run as each parse begins, and a hold that keeps each parse from running
-/// until the test releases it.
+/// run as each parse begins, an action run after each transcript read, and a
+/// hold that keeps each parse from running until the test releases it.
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct ParseWatch(std::sync::Arc<ParseWatchState>);
@@ -497,6 +501,7 @@ struct ParseWatchState {
     parses: std::sync::Mutex<Vec<BegunParse>>,
     is_marked: std::sync::atomic::AtomicBool,
     action: std::sync::Mutex<Option<ParseAction>>,
+    after_read: std::sync::Mutex<Option<ParseAction>>,
     is_held: std::sync::Mutex<bool>,
     released: std::sync::Condvar,
 }
@@ -561,6 +566,12 @@ impl ParseWatch {
         *self.0.action.lock().unwrap() = Some(std::sync::Arc::new(action));
     }
 
+    /// Run `action` after each later parse reads a transcript, on the thread
+    /// that read it.
+    pub(crate) fn run_after_each_transcript_read(&self, action: impl Fn() + Send + Sync + 'static) {
+        *self.0.after_read.lock().unwrap() = Some(std::sync::Arc::new(action));
+    }
+
     /// Keep every later parse from running until [`Self::release`].
     pub(crate) fn hold(&self) {
         *self.0.is_held.lock().unwrap() = true;
@@ -586,6 +597,13 @@ impl ParseWatch {
         let mut is_held = self.0.is_held.lock().unwrap();
         while *is_held {
             is_held = self.0.released.wait(is_held).unwrap();
+        }
+    }
+
+    fn end_transcript_read(&self) {
+        let action = self.0.after_read.lock().unwrap().clone();
+        if let Some(action) = action {
+            action();
         }
     }
 }

@@ -1,3 +1,4 @@
+use super::digest::Digest;
 use super::{ReadPurpose, Selection};
 use crate::agent::sanitize::split_terminal_codes;
 use crate::agent::transcript::tool_result_item_text;
@@ -53,39 +54,93 @@ impl<'connection> Writer<'connection> {
                 columns.json,
                 columns.result_shape
             ])?;
-            if let ContentBlock::ToolResult {
-                content: Some(Value::Array(items)),
-                ..
-            } = block
-                && columns.result_shape == Some(LOSSLESS_ARRAY)
-            {
-                let part = connection.last_insert_rowid();
-                for (position, value) in items.iter().enumerate() {
-                    let (kind, text, item_type) = match value {
-                        Value::String(text) => ("string", Some(text.as_str()), None),
-                        Value::Object(object) => (
-                            "object",
-                            object.get("text").and_then(Value::as_str),
-                            object.get("type").and_then(Value::as_str),
-                        ),
-                        _ => ("external", None, None),
-                    };
-                    let searched = field.is_some() && tool_result_item_text(value).is_some();
-                    let text = text.map(split_terminal_codes);
-                    self.item.execute(params![
-                        part,
-                        position as i64,
-                        kind,
-                        searched,
-                        text.as_ref().map(|text| &*text.text),
-                        text.as_ref().and_then(|text| text.codes.as_deref()),
-                        item_type
-                    ])?;
-                }
+            let part = connection.last_insert_rowid();
+            for (position, item) in result_items(block, &columns, field).enumerate() {
+                let text = item.text.map(split_terminal_codes);
+                self.item.execute(params![
+                    part,
+                    position as i64,
+                    item.kind,
+                    item.searched,
+                    text.as_ref().map(|text| &*text.text),
+                    text.as_ref().and_then(|text| text.codes.as_deref()),
+                    item.item_type
+                ])?;
             }
         }
         Ok(())
     }
+}
+
+/// Feeds `digest` what [`Writer::write`] stores of `blocks` and `search`.
+pub(super) fn digest(digest: &mut Digest, blocks: &[ContentBlock], search: &[Option<SearchField>]) {
+    digest.number(Some(blocks.len() as i64));
+    for (block, field) in blocks.iter().zip(search) {
+        let columns = Columns::of(block);
+        digest.text(Some(columns.kind));
+        digest.number(field.map(SearchField::code));
+        for text in [
+            columns.text,
+            columns.call_id,
+            columns.name,
+            columns.tool.as_deref(),
+            columns.json.as_deref(),
+            columns.result_shape,
+        ] {
+            digest.text(text);
+        }
+        let mut items = 0;
+        for item in result_items(block, &columns, *field) {
+            items += 1;
+            digest.text(Some(item.kind));
+            digest.flag(Some(item.searched));
+            digest.text(item.text);
+            digest.text(item.item_type);
+        }
+        digest.number(Some(items));
+    }
+}
+
+/// A `result_items` row's columns.
+struct ItemColumns<'a> {
+    kind: &'static str,
+    searched: bool,
+    text: Option<&'a str>,
+    item_type: Option<&'a str>,
+}
+
+/// The items `result_items` holds for `block`, whose part's columns are
+/// `columns` and whose search field is `field`: none unless the block is a
+/// result whose items the part stores.
+fn result_items<'a>(
+    block: &'a ContentBlock,
+    columns: &Columns<'_>,
+    field: Option<SearchField>,
+) -> impl Iterator<Item = ItemColumns<'a>> {
+    let items = match block {
+        ContentBlock::ToolResult {
+            content: Some(Value::Array(items)),
+            ..
+        } if columns.result_shape == Some(LOSSLESS_ARRAY) => items.as_slice(),
+        _ => &[],
+    };
+    items.iter().map(move |value| {
+        let (kind, text, item_type) = match value {
+            Value::String(text) => ("string", Some(text.as_str()), None),
+            Value::Object(object) => (
+                "object",
+                object.get("text").and_then(Value::as_str),
+                object.get("type").and_then(Value::as_str),
+            ),
+            _ => ("external", None, None),
+        };
+        ItemColumns {
+            kind,
+            searched: field.is_some() && tool_result_item_text(value).is_some(),
+            text,
+            item_type,
+        }
+    })
 }
 
 #[derive(Default)]

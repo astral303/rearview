@@ -104,6 +104,7 @@ impl SessionFormat for KimiWireFormat {
             malformed_lines: wire.malformed_lines,
             dropped: wire.dropped,
             earlier_turns: EarlierTurns::Read,
+            earlier_transcripts: Vec::new(),
         }))
     }
 }

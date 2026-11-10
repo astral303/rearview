@@ -110,7 +110,6 @@ pub fn one_message_conversation(
         full_text: full_text.clone(),
         agent_search_text: String::new(),
         thinking_and_tool_call_text: String::new(),
-        semantic_route_text: String::new(),
         semantic_turns: vec![text.to_string()],
         semantic_turn_ranges: vec![MessageRange::single(1)],
         search_text_lower: normalize_for_search(&full_text),

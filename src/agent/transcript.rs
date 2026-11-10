@@ -1,7 +1,7 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind, AgentWarning};
 use crate::agent::message_numbering::{MessageNumbering, Numbered, is_visible_block, visible_text};
 use crate::agent::refs::ResolvedConversation;
-use crate::agent::sanitize::sanitize_agent_text;
+use crate::agent::sanitize::{sanitize_agent_text, without_terminal_codes};
 use crate::agent::visibility::ContentVisibility;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
@@ -1023,7 +1023,7 @@ fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) ->
                 AgentMessageRole::User => agent_user_text(text),
                 AgentMessageRole::Assistant => Cow::Borrowed(text.as_str()),
             };
-            non_empty_text(&sanitize_agent_text(&text))
+            unless_blank(sanitize_agent_text(&text))
         }
         ContentBlock::ToolResult { content, .. } => {
             content.as_ref().and_then(tool_result_search_text)
@@ -1043,7 +1043,7 @@ fn thinking_or_tool_call_text(block: &ContentBlock) -> Option<String> {
         ContentBlock::Thinking { thinking, .. } => sanitize_agent_text(thinking),
         _ => return None,
     };
-    non_empty_text(&sanitized)
+    unless_blank(sanitized)
 }
 
 fn non_empty_text(text: &str) -> Option<String> {
@@ -1198,9 +1198,9 @@ pub(crate) fn tool_result_text(content: &Value) -> Option<String> {
 /// read it: terminal codes are stripped from each text before they are
 /// joined. The formats keep a result's codes, so the viewer can show them.
 pub(crate) fn tool_result_search_text(content: &Value) -> Option<String> {
-    let texts: Vec<String> = tool_result_texts(content)?
+    let texts: Vec<Cow<str>> = tool_result_texts(content)?
         .into_iter()
-        .map(sanitize_agent_text)
+        .map(without_terminal_codes)
         .collect();
     unless_blank(texts.join("\n"))
 }

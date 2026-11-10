@@ -24,6 +24,7 @@ use super::{
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
+use crate::history::fingerprint::FileStamp;
 use crate::history::provider::ReadError;
 use crate::history::provider::subagents::SubagentForest;
 use crate::history::provider::walk::{DirectoryLister, SystemLister};
@@ -585,6 +586,7 @@ struct ThreadProjection {
     /// The oldest earlier rollout's start, when one was read.
     started: Option<String>,
     earlier_turns: EarlierTurns,
+    earlier_transcripts: Vec<FileStamp>,
     discarded_turn_subagents: DiscardedTurnSubagents,
 }
 
@@ -604,6 +606,7 @@ impl ThreadProjection {
             dropped,
             started: None,
             earlier_turns: EarlierTurns::Read,
+            earlier_transcripts: Vec::new(),
             discarded_turn_subagents: DiscardedTurnSubagents::default(),
         }
     }
@@ -644,6 +647,8 @@ impl ThreadProjection {
         parallel: ParallelThreshold,
     ) -> std::result::Result<(), EarlierTurns> {
         let unread = |error: AppError| EarlierTurns::from(ReadError::of(&error));
+        self.earlier_transcripts
+            .push(FileStamp::before_read(&rollout.path));
         let file = File::open(&rollout.path)
             .map_err(|error| unread(AppError::from(error)))?
             .take(rollout.end_byte_offset);
@@ -744,6 +749,7 @@ impl ThreadProjection {
             malformed_lines: self.malformed_lines,
             dropped: self.dropped,
             earlier_turns: self.earlier_turns,
+            earlier_transcripts: self.earlier_transcripts,
         };
         ThreadRead {
             projection,

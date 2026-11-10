@@ -3,8 +3,7 @@ use crate::error::{AppError, Result};
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::walk::Canonicaliser;
 use rusqlite::Connection;
-use std::collections::HashMap;
-use std::io;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -79,31 +78,29 @@ impl FileKeys {
     }
 }
 
-pub(super) fn fingerprint(path: &Path) -> io::Result<Option<CachedFingerprint>> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(Some(CachedFingerprint::of(
-            metadata.len(),
-            metadata.modified()?,
-        ))),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
+/// Fails with [`AppError::SessionCacheSourceChanged`] when a file `session`
+/// was read from no longer stamps as the cache recorded it.
+pub(super) fn validate(connection: &Connection, session: i64) -> Result<()> {
+    validate_unstamped(connection, session, &HashSet::new())
 }
 
-pub(super) fn validate(connection: &Connection, session: i64) -> Result<()> {
+/// [`validate`] for the files of `session` outside `stamped`: files whose
+/// discovery stamps the caller compared with the cache's, and that are not
+/// stat again.
+pub(super) fn validate_unstamped(
+    connection: &Connection,
+    session: i64,
+    stamped: &HashSet<&Path>,
+) -> Result<()> {
     let mut statement = connection.prepare(
         "SELECT path, file_size, mtime_secs, mtime_nsecs FROM session_files WHERE session = ?1",
     )?;
     let mut rows = statement.query([session])?;
     while let Some(row) = rows.next()? {
         let path = PathBuf::from(row.get::<_, String>(0)?);
+        if stamped.contains(path.as_path()) {
+            continue;
+        }
         let expected = row
             .get::<_, Option<i64>>(1)?
             .map(|size| {
@@ -114,7 +111,7 @@ pub(super) fn validate(connection: &Connection, session: i64) -> Result<()> {
                 })
             })
             .transpose()?;
-        if fingerprint(&path).ok() != Some(expected) {
+        if CachedFingerprint::of_file(&path).ok() != Some(expected) {
             return Err(AppError::SessionCacheSourceChanged(path));
         }
     }
@@ -130,6 +127,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("sessions.db");
         std::fs::write(&database, []).unwrap();
-        assert_eq!(fingerprint(&database.join("session.jsonl")).unwrap(), None);
+        assert_eq!(
+            CachedFingerprint::of_file(&database.join("session.jsonl")).unwrap(),
+            None
+        );
     }
 }
