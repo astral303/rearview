@@ -269,7 +269,9 @@ impl RefreshOwnership {
 #[cfg(test)]
 thread_local! {
     /// Runs on the deleting thread once a low-space deletion's exclusive
-    /// lock ends, for a test of what another rearview may do then.
+    /// lock ends, before the deletion returns. A test has another rearview
+    /// take the cache over and write in that gap: the deletion does nothing
+    /// there that a test could wait for.
     pub(super) static AFTER_DELETION_LOCK_ENDS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -398,7 +400,9 @@ pub(super) fn leave_wal(connection: &Connection) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     /// The database file's size each time a connection on this thread left
-    /// WAL mode, for a test of what leaving it copies.
+    /// WAL mode. The final size doesn't show whether leaving WAL copied the
+    /// log's load into the database: a deletion that left WAL before
+    /// emptying the database shrinks the file again at its VACUUM.
     static SIZES_AFTER_LEAVING_WAL: std::cell::RefCell<Vec<u64>> = const {
         std::cell::RefCell::new(Vec::new())
     };
@@ -527,8 +531,9 @@ pub(crate) struct RefreshToken {
     /// and a take from the parse waits forever behind its own batch.
     #[cfg(debug_assertions)]
     parsing: Arc<Mutex<Option<std::thread::ThreadId>>>,
-    /// The threads waiting in [`Self::take_turn`], for tests that order a
-    /// step after a thread starts waiting.
+    /// The threads waiting in [`Self::take_turn`]. A test revokes the write
+    /// permission once a free-space check waits for the turn, and the wait
+    /// on the turn's mutex doesn't show any other effect.
     #[cfg(test)]
     waiting_for_turn: Arc<std::sync::atomic::AtomicUsize>,
 }

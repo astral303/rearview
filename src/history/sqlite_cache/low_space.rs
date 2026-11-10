@@ -20,8 +20,9 @@ pub(crate) struct Latch {
     deleting: Mutex<()>,
     checks: Mutex<Checks>,
     check_ended: Condvar,
-    /// Runs once the next [`Latch::wait_for_checks`] begins, for a test of
-    /// what a check does during that wait.
+    /// Runs once the next [`Latch::wait_for_checks`] begins. A test answers a
+    /// free-space check from it, so the check ends during the exit's wait:
+    /// the wait on `check_ended` doesn't show any other effect.
     #[cfg(test)]
     on_wait_start: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }

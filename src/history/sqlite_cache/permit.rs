@@ -89,7 +89,9 @@ pub(crate) const FOR_FIXTURES: ParsePermit<'static> = ParsePermit {
 /// the parses of its own files here, whichever route reads them. Reads of
 /// a file's opening lines only, as discovery and Codex's search for the
 /// rollouts a thread continues make them, are not counted. Temporary
-/// directories keep parallel tests' paths apart.
+/// directories keep parallel tests' paths apart. A second parse of a session
+/// shows the same output, and a parse whose write fails doesn't change the
+/// cache: only this record shows how many times a transcript was parsed.
 #[cfg(test)]
 pub(crate) mod admitted_reads {
     use std::path::{Path, PathBuf};

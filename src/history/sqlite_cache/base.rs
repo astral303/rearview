@@ -311,7 +311,9 @@ pub struct CacheBase {
     /// `path` canonical, once it was asked for. Held while it canonicalises,
     /// so concurrent first callers canonicalise it once.
     canonical_path: Arc<Mutex<Option<PathBuf>>>,
-    /// The longest each step of the low-space deletion waits.
+    /// The longest each step of the low-space deletion waits. Tests shorten
+    /// it with `with_low_space_wait`: the steps wait in real time, and a
+    /// deferred deletion would otherwise take 30 s.
     low_space_wait: Duration,
     /// Made by [`Self::new`] and kept by clones and [`Self::canonical`].
     state: Arc<BaseState>,

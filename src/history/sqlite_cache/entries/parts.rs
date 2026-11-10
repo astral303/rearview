@@ -543,7 +543,9 @@ const SEARCH_ONLY_GROUPS: usize = 1 + ENTRY_SEARCH_FIELDS.len();
 #[cfg(test)]
 thread_local! {
     /// The calls of [`part_rows`] on this thread: one per entry for its
-    /// digests, and one more per entry a write writes.
+    /// digests, and one more per entry a write writes. Building part rows
+    /// leaves no trace in the cache: only this count shows a write building
+    /// an unchanged entry's rows again.
     pub(in super::super) static PART_ROW_BUILDS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }

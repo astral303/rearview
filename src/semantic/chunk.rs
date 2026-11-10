@@ -62,7 +62,8 @@ where
 #[cfg(test)]
 thread_local! {
     /// The conversations [`build_chunks_with_sources`] built chunks of on
-    /// this thread.
+    /// this thread. Building chunks leaves no trace outside its result: only
+    /// this count shows `has_chunks` answering without building them.
     pub(crate) static CONVERSATIONS_CHUNKED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
