@@ -25,7 +25,7 @@ where
     let mut chunks = Vec::new();
     for (conversation_index, source, conversation) in conversations {
         #[cfg(test)]
-        CONVERSATIONS_CHUNKED.with(|chunked| chunked.set(chunked.get() + 1));
+        chunked_conversations::record(&conversation.path);
         let semantic_turns = conversation
             .semantic_turns
             .iter()
@@ -59,13 +59,33 @@ where
     chunks
 }
 
+/// Every conversation [`build_chunks_with_sources`] built chunks of in this
+/// test process, by path, on any thread. Building chunks leaves no trace
+/// outside its result: only this record shows `has_chunks` answering
+/// without building them.
 #[cfg(test)]
-thread_local! {
-    /// The conversations [`build_chunks_with_sources`] built chunks of on
-    /// this thread. Building chunks leaves no trace outside its result: only
-    /// this count shows `has_chunks` answering without building them.
-    pub(crate) static CONVERSATIONS_CHUNKED: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
+pub(crate) mod chunked_conversations {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    static CHUNKED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(conversation: &Path) {
+        CHUNKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(conversation.to_path_buf());
+    }
+
+    /// The chunk builds of the conversation at `conversation` so far.
+    pub(crate) fn count(conversation: &Path) -> usize {
+        CHUNKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|chunked| *chunked == conversation)
+            .count()
+    }
 }
 
 /// True when [`build_chunks_with_sources`] builds at least one chunk of

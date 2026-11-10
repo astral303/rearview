@@ -7076,6 +7076,10 @@ mod tests {
         );
     }
 
+    /// The longest a test waits for a command on another thread to reach a
+    /// wait before it fails: a watchdog for a hang.
+    const COMMAND_WAIT_BEGINS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Claude Code sessions whose session cache another rearview's refresh
     /// owns until a command reading them waits past its patience.
     struct SessionsBesideAnotherRefresh {
@@ -7132,7 +7136,7 @@ mod tests {
                 // Only the command's waits move test time. Its first wait for
                 // ownership gives up at its patience, so time past twice that
                 // is its wait after reading the cache as it is.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + COMMAND_WAIT_BEGINS_WITHIN;
                 while self.clock.elapsed_since(started) < REFRESH_OWNERSHIP_PATIENCE * 2 {
                     assert!(
                         std::time::Instant::now() < deadline,
@@ -7615,8 +7619,12 @@ mod tests {
             vec!["within", reference.as_str(), "question"],
         ] {
             let rebuild = RebuildAtFirstWriter::on(sessions.cache_base.path());
-            let environment =
-                test_environment(vec![sessions.storage], Some(sessions.cache_base.path()));
+            let clock = Arc::new(TestClock::default());
+            let environment = history::environment::test_support::environment_on_clock(
+                vec![sessions.storage],
+                Some(sessions.cache_base.path()),
+                clock.clone(),
+            );
             let (wait_sent, wait_received) = std::sync::mpsc::channel();
             let args: Vec<String> = command.iter().map(|arg| arg.to_string()).collect();
             let running = std::thread::spawn(move || {
@@ -7628,7 +7636,7 @@ mod tests {
                 service.execute(agent_command(&args))
             });
             let wait = wait_received.recv().unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + COMMAND_WAIT_BEGINS_WITHIN;
             while wait.current() != Some(history::OtherRearview::Rebuilding) {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -7636,7 +7644,16 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // Only the command's polls of 200 ms move test time: 400 ms on,
+            // it has tried again since it published its wait.
+            let published = clock.now();
+            while clock.elapsed_since(published) < std::time::Duration::from_millis(400) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{command:?} tries again during the rebuild"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             let still_waiting = wait.current() == Some(history::OtherRearview::Rebuilding);
             rebuild.release();
             assert!(

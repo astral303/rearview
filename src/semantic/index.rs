@@ -1561,16 +1561,27 @@ mod tests {
     /// waits for the model.
     #[test]
     fn has_chunks_answers_for_the_scope_without_building_chunks() {
-        use crate::semantic::chunk::CONVERSATIONS_CHUNKED;
+        use crate::semantic::chunk::chunked_conversations;
+        // Paths no other test uses: the record holds every test's chunk builds.
+        let paths = [
+            "/projects/has-chunks-without-building/session-a.jsonl",
+            "/projects/has-chunks-without-building/session-b.jsonl",
+        ];
         let conversations = vec![
-            conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]),
-            conversation("/projects/project-a/session-b.jsonl", vec!["  "]),
+            conversation(paths[0], vec!["visible alpha"]),
+            conversation(paths[1], vec!["  "]),
         ];
         let (query, candidates) = request("alpha", conversations, vec![0, 1]);
         let full = index_request(&query, &candidates);
         let (mut state, mut embedder) = prepare_indexed_state(&full, ChunkConfig::default());
+        let chunk_builds = || {
+            paths
+                .iter()
+                .map(|path| chunked_conversations::count(std::path::Path::new(path)))
+                .sum::<usize>()
+        };
         let answers_by_scope = |state: &SemanticIndexState| {
-            let chunked_before = CONVERSATIONS_CHUNKED.with(std::cell::Cell::get);
+            let chunked_before = chunk_builds();
             let answers = [&candidates[..1], &candidates[1..]].map(|scope| {
                 let request = SemanticIndexRequest {
                     scope,
@@ -1580,7 +1591,7 @@ mod tests {
                     .has_chunks(&request, &SemanticCancellationToken::new())
                     .unwrap()
             });
-            let chunked = CONVERSATIONS_CHUNKED.with(std::cell::Cell::get) - chunked_before;
+            let chunked = chunk_builds() - chunked_before;
             (answers, chunked)
         };
 

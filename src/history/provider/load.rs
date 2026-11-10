@@ -2659,8 +2659,12 @@ mod tests {
         )
     }
 
+    /// The longest a test waits for a load on another thread to start
+    /// waiting for refresh ownership before it fails: a watchdog for a hang.
+    const REFRESH_WAIT_BEGINS_WITHIN: Duration = Duration::from_secs(60);
+
     fn wait_for_refresh(meter: &LoadMeter) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + REFRESH_WAIT_BEGINS_WITHIN;
         while !meter.is_waiting_for_refresh() {
             assert!(
                 Instant::now() < deadline,
