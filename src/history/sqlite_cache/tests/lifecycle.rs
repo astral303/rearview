@@ -115,7 +115,7 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     ])));
     let (previous, keys) = older.write_catalogue(&old, None).unwrap();
     newer.write(&new).unwrap();
-    let replacement = entries::listed_session_of(
+    let replacement = copy_state::listed_session_of(
         &newer.connection,
         storage.directory,
         newer.session_roots(&root).key(),
@@ -180,7 +180,7 @@ fn read_snapshot_survives_replacement_between_identity_and_reconstruction() {
     );
     let roots = reader.session_roots(&root);
     let old = reader.with_read_snapshot(|connection| {
-        let id = entries::listed_session_of(connection, storage.directory, roots.key(), CACHE_KEY)?.unwrap().id;
+        let id = copy_state::listed_session_of(connection, storage.directory, roots.key(), CACHE_KEY)?.unwrap().id;
         let places = super::super::roots::Places::stored(connection, &roots)?;
         write_test_entries(&mut writer, message_schema::transcript(vec![
             serde_json::json!({"type":"user","message":{"role":"user","content":"new content"}}),
@@ -200,10 +200,14 @@ fn read_of_session_not_in_cache_fails_naming_its_row() {
     let roots = cache.session_roots(&root);
     let failure = cache
         .with_read_snapshot(|connection| {
-            let id =
-                entries::listed_session_of(connection, storage.directory, roots.key(), CACHE_KEY)?
-                    .unwrap()
-                    .id;
+            let id = copy_state::listed_session_of(
+                connection,
+                storage.directory,
+                roots.key(),
+                CACHE_KEY,
+            )?
+            .unwrap()
+            .id;
             let places = super::super::roots::Places::stored(connection, &roots)?;
             entries::read(connection, id + 1, &places, None).map(|_| ())
         })

@@ -56,9 +56,8 @@ impl SqliteCache {
         self.with_read_snapshot(|connection| {
             let mut statement = connection.prepare(&format!(
                 "SELECT cache_key, status, session_id, cwd FROM sessions \
-                 WHERE storage = ?1 AND root = (SELECT id FROM roots WHERE key = ?2) \
-                 AND status != 'writing' AND {}",
-                super::catalogue::ENTRIES_NOT_FAILED
+                 WHERE storage = ?1 AND root = (SELECT id FROM roots WHERE key = ?2) AND {}",
+                super::copy_state::SETTLED_ROW
             ))?;
             let mut rows = statement.query(rusqlite::params![
                 storage.directory,
@@ -97,8 +96,8 @@ impl SqliteCache {
             let mut statement = connection.prepare(&format!(
                 "SELECT s.id, s.cache_key, s.session_id, s.cwd, f.root, f.path FROM sessions s \
                  JOIN session_files f ON f.session = s.id AND f.kind = 'locator' \
-                 WHERE s.storage = ?1 AND s.root = ?2 AND s.status = 'listed' AND {}",
-                super::catalogue::ENTRIES_NOT_FAILED
+                 WHERE s.storage = ?1 AND s.root = ?2 AND {}",
+                super::copy_state::LISTED_COPY
             ))?;
             let mut rows =
                 statement.query(rusqlite::params![storage.directory, places.listing_root()])?;
@@ -196,9 +195,8 @@ impl SqliteCache {
                  session_id, project_path, project_name, cwd, timestamp_ms, preview_first, \
                  preview_last, summary, custom_title, model, total_tokens, duration_minutes, \
                  message_count, assistant_messages, is_missing_earlier_turns, entries_error, \
-                 generation FROM sessions WHERE storage = ?1 AND root = ?2 \
-                 AND status != 'writing' AND {} {}",
-                super::catalogue::ENTRIES_NOT_FAILED,
+                 generation FROM sessions WHERE storage = ?1 AND root = ?2 AND {} {}",
+                super::copy_state::SETTLED_ROW,
                 if key.is_some() {
                     "AND cache_key = ?3"
                 } else {

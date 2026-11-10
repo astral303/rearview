@@ -22,7 +22,7 @@ use crate::history::{MalformedLine, MalformedLineDetail, TranscriptEntries};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
 };
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::ops::RangeInclusive;
@@ -647,45 +647,6 @@ fn json_value(text: Option<&str>) -> rusqlite::Result<Option<Value>> {
 
 fn lines_of(json: &str) -> Vec<String> {
     serde_json::from_str(json).unwrap_or_default()
-}
-
-/// A stored session row: its id, and the generation its last write gave it.
-pub(super) struct StoredSession {
-    pub(super) id: i64,
-    pub(super) generation: i64,
-}
-
-/// The row of the listed session `storage` found at `cache_key` under the
-/// root of `root_key`.
-pub(super) fn listed_session_of(
-    connection: &Connection,
-    storage: &str,
-    root_key: Option<&super::files::RootKey>,
-    cache_key: &str,
-) -> Result<Option<StoredSession>> {
-    let row: Option<(i64, i64, String, Option<String>)> = connection
-        .query_row(
-            "SELECT id, generation, status, CASE WHEN status = 'listed' THEN entries_error END \
-             FROM sessions WHERE storage = ?1 AND cache_key = ?3 \
-             AND root = (SELECT id FROM roots WHERE key = ?2)",
-            params![
-                storage,
-                root_key.map(super::files::RootKey::as_str),
-                cache_key
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((id, generation, status, error)) = row else {
-        return Ok(None);
-    };
-    if status == super::catalogue::WRITING || error.is_some() {
-        return Err(AppError::SessionCacheNotReady {
-            session: cache_key.to_owned(),
-            reason: error.unwrap_or_else(|| "refresh in progress".to_owned()),
-        });
-    }
-    Ok(Some(StoredSession { id, generation }))
 }
 
 #[cfg(test)]

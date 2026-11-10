@@ -40,11 +40,6 @@ impl SessionStatus {
 /// row with it is not a current one.
 pub(super) const WRITING: &str = "writing";
 
-/// The SQL condition on a `sessions` row that holds unless its entries failed
-/// to read: an unlisted row's `entries_error` holds the reason it is not
-/// listed, not a failure.
-pub(super) const ENTRIES_NOT_FAILED: &str = "(status != 'listed' OR entries_error IS NULL)";
-
 /// One session as a load read it, for the database writer: its catalogue
 /// row and, for a listed session, its entries.
 pub(crate) struct SessionRecord {

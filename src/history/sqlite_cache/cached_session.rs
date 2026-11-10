@@ -2,9 +2,10 @@
 //! each read opens a connection of its own, unless it is handed the cache
 //! to read on.
 
+use super::copy_state::{CopyMiss, RowState, StoredSession};
 use super::files::{self, FileKey, RootKey};
 use super::roots::{Places, SessionRoots, StoredPath};
-use super::{CacheBase, ReaderWait, SqliteCache, StoredEntries, entries, is_storage_current};
+use super::{CacheBase, ReaderWait, SqliteCache, StoredEntries, entries};
 use crate::error::{AppError, Result};
 use crate::history::TranscriptEntries;
 use crate::history::fingerprint::CachedFingerprint;
@@ -530,20 +531,15 @@ impl CachedSession {
 
     /// The listed session row at this copy's address, whichever copy it
     /// holds; `None` when the cache holds none there.
-    pub(super) fn listed_in(
-        &self,
-        connection: &Connection,
-    ) -> Result<Option<entries::StoredSession>> {
-        let address = &self.address;
-        if !is_storage_current(connection, address.storage)? {
-            return Ok(None);
+    pub(super) fn listed_in(&self, connection: &Connection) -> Result<Option<StoredSession>> {
+        match RowState::at(connection, &self.address)?.listed() {
+            Ok(stored) => Ok(Some(stored)),
+            Err(CopyMiss::NotThere) => Ok(None),
+            Err(_) => Err(AppError::SessionCacheNotReady {
+                session: self.address.cache_key.clone(),
+                reason: "refresh in progress".to_owned(),
+            }),
         }
-        entries::listed_session_of(
-            connection,
-            address.storage.directory,
-            address.roots.key(),
-            &address.cache_key,
-        )
     }
 
     /// `read`'s result over the session row `session` and the places of its
@@ -659,20 +655,11 @@ impl SqliteCache {
     /// The newest copy of the listed session at `address`; `None` when the
     /// database holds none.
     pub(crate) fn copy_at(&self, address: &SessionAddress) -> Result<Option<CachedSession>> {
-        let generation: Option<i64> = self.with_read_snapshot(|connection| {
-            Ok(connection
-                .query_row(
-                    "SELECT generation FROM sessions WHERE storage = ?1 \
-                     AND root = (SELECT id FROM roots WHERE key = ?2) AND cache_key = ?3 \
-                     AND status = 'listed'",
-                    params![
-                        address.storage.directory,
-                        address.roots.key().map(RootKey::as_str),
-                        address.cache_key
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()?)
+        let generation = self.with_read_snapshot(|connection| {
+            Ok(RowState::at(connection, address)?
+                .listed()
+                .ok()
+                .map(|stored| stored.generation))
         })?;
         Ok(generation.map(|generation| CachedSession {
             base: self.base().clone(),
@@ -728,10 +715,13 @@ impl SqliteCache {
         let storage = source.provider().storage().cache();
         let stored: Option<(i64, i64, String)> = connection
             .query_row(
-                "SELECT s.id, s.generation, s.cache_key FROM session_files f \
-                 JOIN sessions s ON s.id = f.session \
-                 WHERE f.kind = 'locator' AND f.key = ?1 AND f.root = ?2 AND s.root = ?2 \
-                 AND s.storage = ?3 AND s.status = 'listed' ORDER BY s.id LIMIT 1",
+                &format!(
+                    "SELECT s.id, s.generation, s.cache_key FROM session_files f \
+                     JOIN sessions s ON s.id = f.session \
+                     WHERE f.kind = 'locator' AND f.key = ?1 AND f.root = ?2 AND s.root = ?2 \
+                     AND s.storage = ?3 AND {} ORDER BY s.id LIMIT 1",
+                    super::copy_state::LISTED_COPY
+                ),
                 params![key.as_str(), root, storage.directory],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )

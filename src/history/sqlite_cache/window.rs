@@ -106,10 +106,12 @@ impl SqliteCache {
             let places = Places::stored(connection, &roots)?;
             let row: Option<StoredCheckpointRow> = connection
                 .query_row(
-                    "SELECT s.id, s.generation, c.sequence, c.checkpoint, c.ledger \
-                     FROM sessions s JOIN session_checkpoints c ON c.session = s.id \
-                     WHERE s.storage = ?1 AND s.root = ?2 AND s.cache_key = ?3 \
-                     AND s.status = 'listed' AND s.entries_error IS NULL",
+                    &format!(
+                        "SELECT s.id, s.generation, c.sequence, c.checkpoint, c.ledger \
+                         FROM sessions s JOIN session_checkpoints c ON c.session = s.id \
+                         WHERE s.storage = ?1 AND s.root = ?2 AND s.cache_key = ?3 AND {}",
+                        super::copy_state::LISTED_COPY
+                    ),
                     params![storage.directory, places.listing_root(), cache_key],
                     |row| {
                         Ok((

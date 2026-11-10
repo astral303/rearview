@@ -16,6 +16,7 @@ mod catalogue;
 pub(crate) mod connection;
 mod coordinator;
 mod copies_scan;
+mod copy_state;
 mod entries;
 mod files;
 mod free_space;
@@ -328,26 +329,23 @@ impl SqliteCache {
         let places = Places::stored(&self.connection, &self.session_roots(root))?;
         let mut statement = self.connection.prepare_cached(&format!(
             "SELECT cache_key, file_size, mtime_secs, mtime_nsecs, id FROM sessions \
-             WHERE storage = ?1 AND root = ?2 AND status != ?3 AND {}",
-            catalogue::ENTRIES_NOT_FAILED
+             WHERE storage = ?1 AND root = ?2 AND {}",
+            copy_state::SETTLED_ROW
         ))?;
         let candidates = statement
-            .query_map(
-                params![storage.directory, places.listing_root(), catalogue::WRITING],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        (
-                            CachedFingerprint {
-                                file_size: row.get::<_, i64>(1)? as u64,
-                                mtime_secs: row.get::<_, i64>(2)? as u64,
-                                mtime_nsecs: row.get::<_, i64>(3)? as u32,
-                            },
-                            row.get::<_, i64>(4)?,
-                        ),
-                    ))
-                },
-            )?
+            .query_map(params![storage.directory, places.listing_root()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        CachedFingerprint {
+                            file_size: row.get::<_, i64>(1)? as u64,
+                            mtime_secs: row.get::<_, i64>(2)? as u64,
+                            mtime_nsecs: row.get::<_, i64>(3)? as u32,
+                        },
+                        row.get::<_, i64>(4)?,
+                    ),
+                ))
+            })?
             .collect::<rusqlite::Result<HashMap<_, _>>>()?;
         let mut fingerprints = HashMap::new();
         for (key, (stamp, session)) in candidates {
@@ -407,9 +405,8 @@ impl SqliteCache {
             let session: Option<i64> = connection.query_row(
                 &format!(
                     "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
-                     AND file_size = ?4 AND mtime_secs = ?5 AND mtime_nsecs = ?6 \
-                     AND status != 'writing' AND {}",
-                    catalogue::ENTRIES_NOT_FAILED
+                     AND file_size = ?4 AND mtime_secs = ?5 AND mtime_nsecs = ?6 AND {}",
+                    copy_state::SETTLED_ROW
                 ),
                 params![storage.directory, places.listing_root(), stub.cache_key, stamp.file_size as i64, stamp.mtime_secs as i64, stamp.mtime_nsecs],
                 |row| row.get(0),
@@ -472,7 +469,7 @@ impl SqliteCache {
     ) -> Result<Option<TranscriptEntries>> {
         let roots = self.session_roots(root);
         let Some(session) =
-            entries::listed_session_of(connection, storage.directory, roots.key(), cache_key)?
+            copy_state::listed_session_of(connection, storage.directory, roots.key(), cache_key)?
         else {
             return Ok(None);
         };
@@ -772,8 +769,10 @@ impl CacheWriter {
         let places = &keys.places;
         let stored: Option<i64> = batch
             .query_row(
-                "SELECT generation FROM sessions WHERE id = ?1 AND status = 'listed' \
-                 AND entries_error IS NULL",
+                &format!(
+                    "SELECT generation FROM sessions WHERE id = ?1 AND {}",
+                    copy_state::LISTED_COPY
+                ),
                 [update.session],
                 |row| row.get(0),
             )
@@ -823,8 +822,11 @@ impl CacheWriter {
         let keys = &catalogue_keys(&batch, row)?;
         let session: Option<i64> = batch
             .query_row(
-                "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
-                 AND status = 'listed' AND entries_error IS NULL",
+                &format!(
+                    "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
+                     AND {}",
+                    copy_state::LISTED_COPY
+                ),
                 params![row.storage, keys.root, row.cache_key],
                 |row| row.get(0),
             )
