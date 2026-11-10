@@ -1244,6 +1244,8 @@ pub(crate) fn forks_continuing(
 /// rollout it rewrites: nothing follows, and the whole file is the thread's
 /// own. A live thread that ended before its first own record has the migrated
 /// shape and shows its copied context as its own.
+/// Without a boundary, retain all recorded turns: timestamps, repeated text
+/// and reply ids cannot distinguish inherited context from genuine work.
 #[derive(Clone, Copy)]
 enum OwnHistory {
     /// Every line so far sits below the boundary. Its entries are kept until
@@ -3065,6 +3067,39 @@ mod tests {
             1,
             "the copied context named the same model; the thread's own first turn_context is still a model change"
         );
+    }
+
+    #[test]
+    fn a_legacy_subagent_without_a_boundary_keeps_all_recorded_turns() {
+        let text = std::fs::read_to_string(fixture("subagent.jsonl")).unwrap();
+        let text = text
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                    payload.remove("subagent_history_start_ordinal");
+                }
+                value.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let projection = parse_reader(
+            std::io::Cursor::new(text.as_bytes()),
+            ParallelThreshold::NEVER,
+            DroppedRecords::counting(),
+        )
+        .unwrap()
+        .unwrap();
+        let json = entry_json(&projection);
+
+        for text in [
+            "INHERITED_PARENT_SENTINEL",
+            "INHERITED_ANSWER_SENTINEL",
+            "child task question",
+            "child answer searchable",
+        ] {
+            assert!(json.contains(text), "{text}");
+        }
     }
 
     /// Codex's legacy-to-paginated migration sets the boundary past the last

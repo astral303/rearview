@@ -3,6 +3,7 @@
 //! `agent_progress` shape unconverted, since they index and print it.
 
 use super::format::RecordLine;
+use super::sqlite_cache::{InteractiveCache, InteractiveRead};
 use super::{MalformedLine, Source, TranscriptEntries, normalized_session, sniffed_session};
 use crate::error::Result;
 use crate::log_entry::{
@@ -88,14 +89,40 @@ impl From<TranscriptEntries> for DisplayEntries {
     }
 }
 
-/// The session's [`normalized_session`] as the viewer, the terminal printout,
-/// exports and the clipboard copy read it.
-pub fn display_log_entries(
+/// The session's [`normalized_session`] as the terminal printout reads it,
+/// through the user's cache's waiting reader. The TUI reads through
+/// [`display_log_entries_interactively`].
+pub fn display_log_entries_waiting(
     source: Source,
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<DisplayEntries> {
+    if let Ok(Some(cached)) =
+        super::sqlite_cache::find_cached_session_waiting(source, path, subagents)
+        && let Ok(Some(entries)) = cached.entries()
+    {
+        return Ok(entries.into());
+    }
     Ok(normalized_session(source, path, subagents)?.into())
+}
+
+/// The session's [`normalized_session`] as the viewer, exports and the
+/// clipboard copy read it, through `cache`'s interactive read.
+pub fn display_log_entries_interactively(
+    cache: &InteractiveCache,
+    source: Source,
+    path: &Path,
+    subagents: &[PathBuf],
+) -> Result<InteractiveRead<DisplayEntries>> {
+    cache.read(
+        |reader| {
+            let Some(session) = reader.find_session(source, path, subagents)? else {
+                return Ok(None);
+            };
+            Ok(session.entries()?.map(DisplayEntries::from))
+        },
+        || Ok(normalized_session(source, path, subagents)?.into()),
+    )
 }
 
 /// A bare file's [`sniffed_session`] as the viewer and the terminal printout
@@ -149,12 +176,13 @@ mod tests {
         let first = explore_subagent(dir.path(), "agent-a");
         let second = explore_subagent(dir.path(), "agent-b");
         let before =
-            display_log_entries(Source::Claude, &session, &[first.clone(), second.clone()])
+            display_log_entries_waiting(Source::Claude, &session, &[first.clone(), second.clone()])
                 .unwrap();
 
         let started_since = explore_subagent(dir.path(), "agent-c");
         let after =
-            display_log_entries(Source::Claude, &session, &[first, started_since, second]).unwrap();
+            display_log_entries_waiting(Source::Claude, &session, &[first, started_since, second])
+                .unwrap();
 
         assert_eq!(origin_of(&after, "agent-b"), origin_of(&before, "agent-b"));
         let distinct: HashSet<&EntryOrigin> = after.origins.iter().collect();

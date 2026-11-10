@@ -41,6 +41,7 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         fingerprint: None,
         has_transient_read_error: false,
         is_missing_earlier_turns: false,
+        cached_session: None,
     }
 }
 
@@ -328,6 +329,7 @@ fn stale_response_with_current_generation_but_old_mode_is_ignored() {
     app.selected = None;
 
     tx.send(SearchResponse {
+        error: None,
         filtered: vec![0],
         generation: 7,
         mode: ListSearchMode::Lexical,
@@ -684,6 +686,7 @@ fn load_progress_outlives_appended_batches_and_ends_with_loading() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Lexical,
         },
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     let codex = LoadProgress {
@@ -720,6 +723,7 @@ fn finish_loading_dispatches_buffered_semantic_query() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.append_conversations(vec![conversation(
@@ -754,6 +758,7 @@ fn semantic_dispatch_after_loading_keeps_snapshot_aligned() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.append_conversations(vec![conversation(
@@ -865,6 +870,7 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
     app.filtered = vec![1];
     app.selected = Some(0);
     tx.send(SearchResponse {
+        error: None,
         filtered: vec![0],
         generation: 7,
         mode: ListSearchMode::Semantic,
@@ -894,6 +900,7 @@ fn empty_lexical_fallback_doesnt_clear_rows_while_semantic_search_is_pending() {
     app.filtered = vec![0];
     app.selected = Some(0);
     tx.send(SearchResponse {
+        error: None,
         filtered: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Semantic,
@@ -923,6 +930,7 @@ fn semantic_search_ignores_lexical_fallback_after_completion() {
     app.selected = Some(0);
     tx.send(SearchResponse {
         filtered: Vec::new(),
+        error: None,
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
@@ -1213,6 +1221,7 @@ fn send_semantic_fallback(fallback_tx: &mpsc::Sender<SearchResponse>, filtered: 
     fallback_tx
         .send(SearchResponse {
             filtered,
+            error: None,
             generation: 7,
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
@@ -1276,8 +1285,7 @@ fn rows_answer_previous_query_until_new_results_land() {
     let (response_tx, response_rx) = mpsc::channel();
     app.search_tx = search_tx;
     app.search_rx = response_rx;
-    app.query = "needle".to_string();
-    app.update_filter();
+    app.set_query_for_test("needle");
     assert_eq!(app.shown_results_query(), "needle");
 
     app.query = "needle x".to_string();
@@ -1288,6 +1296,7 @@ fn rows_answer_previous_query_until_new_results_land() {
         .send(SearchResponse {
             filtered: vec![],
             generation: app.search_generation(),
+            error: None,
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
         })
@@ -1325,6 +1334,7 @@ fn lexical_app_showing_needle() -> (
         .send(SearchResponse {
             filtered: vec![0],
             generation: app.search_generation(),
+            error: None,
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
         })
@@ -1356,6 +1366,7 @@ fn backspacing_to_shown_results_query_abandons_search_and_keeps_rows() {
         .send(SearchResponse {
             filtered: vec![],
             generation: abandoned,
+            error: None,
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
         })
@@ -1413,6 +1424,7 @@ fn backspacing_to_shown_results_query_abandons_semantic_search_too() {
         .send(SearchResponse {
             filtered: vec![0, 1],
             generation: abandoned,
+            error: None,
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
         })
@@ -1458,6 +1470,7 @@ fn backspacing_to_semantic_placeholder_doesnt_abandon_search() {
             filtered: vec![0],
             generation: app.search_generation(),
             mode: ListSearchMode::Semantic,
+            error: None,
             evidence: HashMap::new(),
         })
         .unwrap();
@@ -2041,6 +2054,7 @@ fn uuid_dispatch_invalidates_stale_search_response() {
 
     tx.send(SearchResponse {
         filtered: vec![1],
+        error: None,
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
@@ -2059,6 +2073,7 @@ fn finish_loading_invalidates_stale_loading_search_response() {
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
 
@@ -2079,6 +2094,7 @@ fn finish_loading_invalidates_stale_loading_search_response() {
     tx.send(SearchResponse {
         filtered: vec![],
         generation: 1,
+        error: None,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
     })
@@ -2099,6 +2115,7 @@ fn workspace_filter_without_project_context_keeps_rows() {
             ..ListScope::default()
         },
         TuiSearchOptions::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
 
@@ -2123,6 +2140,7 @@ fn exclude_projects_filters_incremental_loading() {
             ..ListScope::default()
         },
         TuiSearchOptions::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
 
@@ -2190,6 +2208,7 @@ fn single_file_mode_has_no_project_exclusions() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
 

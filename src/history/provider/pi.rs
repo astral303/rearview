@@ -148,7 +148,7 @@ impl SessionStorage for PiStorage {
         SessionCache {
             directory: "pi",
             magic: *b"PIHIST01",
-            schema_version: 16,
+            schema_version: 17,
         }
     }
 
@@ -164,6 +164,15 @@ impl SessionStorage for PiStorage {
             root,
             walk::jsonl_files_at_depth(&root.path, depth)?,
         )))
+    }
+
+    /// Pi sessions resolve by ID only once listed.
+    fn rediscover_unlisted_session(
+        &self,
+        _root: &SessionRoot,
+        _locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        Ok(None)
     }
 
     fn parse_session(
@@ -188,7 +197,7 @@ impl SessionStorage for PiStorage {
 pub(super) mod tests {
     use super::*;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
         fixture_with_lines,
     };
     use std::ffi::OsString;
@@ -292,6 +301,19 @@ pub(super) mod tests {
             ])
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 15)
             .kept_in(storage)
+        }
+
+        /// In the directory `write_session` writes to.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let path = &session.row.path;
+            copy_file(
+                path,
+                &self
+                    .root_under(home)
+                    .path
+                    .join(PROJECT_DIR)
+                    .join(path.file_name().unwrap()),
+            );
         }
 
         /// At the depth `write_session` writes: Pi's own discovery takes its

@@ -6,6 +6,22 @@ use super::tools::{
 use super::*;
 use crate::log_entry::Tool;
 
+/// The conversation at `file_path` as the viewer reads it without a session
+/// cache.
+fn read_as_viewer(
+    source: crate::history::Source,
+    file_path: &Path,
+    subagents: &[PathBuf],
+) -> std::io::Result<ParsedConversation> {
+    parse_conversation_file_interactively(
+        &crate::history::InteractiveCache::default(),
+        source,
+        file_path,
+        subagents,
+    )
+    .map(|read| read.value)
+}
+
 /// Entries rendered with an empty roster keep their ID labels.
 fn render_parsed_entries(
     entries: &[RenderableEntry],
@@ -539,7 +555,7 @@ fn codex_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Codex, &path, &[])
+    read_as_viewer(crate::history::Source::Codex, &path, &[])
         .unwrap()
         .entries
 }
@@ -624,7 +640,7 @@ fn codex_session_with_sub_agent(
     sub_agent_rollout.extend_from_slice(sub_agent_lines);
     std::fs::write(&sub_agent, sub_agent_rollout.join("\n") + "\n").unwrap();
 
-    parse_conversation_file(crate::history::Source::Codex, &parent, &[sub_agent])
+    read_as_viewer(crate::history::Source::Codex, &parent, &[sub_agent])
         .unwrap()
         .entries
 }
@@ -711,7 +727,7 @@ fn codex_session_with_named_sub_agents(sub_agents: &[NamedSubAgent]) -> ParsedCo
         sub_agent_paths.push(path);
     }
     std::fs::write(&parent, parent_rollout.join("\n") + "\n").unwrap();
-    parse_conversation_file(crate::history::Source::Codex, &parent, &sub_agent_paths).unwrap()
+    read_as_viewer(crate::history::Source::Codex, &parent, &sub_agent_paths).unwrap()
 }
 
 /// A Codex session of `lines` after its header, parsed for the viewer.
@@ -725,7 +741,7 @@ fn codex_session_of(lines: &[String]) -> ParsedConversation {
     )];
     rollout.extend_from_slice(lines);
     std::fs::write(&path, rollout.join("\n") + "\n").unwrap();
-    parse_conversation_file(crate::history::Source::Codex, &path, &[]).unwrap()
+    read_as_viewer(crate::history::Source::Codex, &path, &[]).unwrap()
 }
 
 #[test]
@@ -1096,7 +1112,7 @@ fn slash_command_from_system_records_renders_as_from_user_records() {
     let rendered = |name: &str, records: &[&str]| {
         let path = dir.path().join(name);
         std::fs::write(&path, records.join("\n")).unwrap();
-        let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
+        let entries = read_as_viewer(crate::history::Source::Claude, &path, &[])
             .unwrap()
             .entries;
         rendered_text(&render_parsed_entries(
@@ -1128,7 +1144,7 @@ fn queued_prompt_renders_as_user_record_holding_its_text() {
     let rendered = |name: &str, records: &[&str]| {
         let path = dir.path().join(name);
         std::fs::write(&path, records.join("\n")).unwrap();
-        let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
+        let entries = read_as_viewer(crate::history::Source::Claude, &path, &[])
             .unwrap()
             .entries;
         rendered_text(&render_parsed_entries(
@@ -1150,7 +1166,7 @@ fn queued_prompt_renders_as_user_record_holding_its_text() {
 fn claude_entries(dir: &tempfile::TempDir, records: &[&str]) -> Vec<RenderableEntry> {
     let path = dir.path().join("session.jsonl");
     std::fs::write(&path, records.join("\n")).unwrap();
-    parse_conversation_file(crate::history::Source::Claude, &path, &[])
+    read_as_viewer(crate::history::Source::Claude, &path, &[])
         .unwrap()
         .entries
 }
@@ -1223,7 +1239,7 @@ fn recap_shows_behind_thinking_toggle_for_claude_and_grok() {
             ),
         ],
     );
-    let grok = parse_conversation_file(crate::history::Source::Grok, &grok_locator, &[])
+    let grok = read_as_viewer(crate::history::Source::Grok, &grok_locator, &[])
         .unwrap()
         .entries;
 
@@ -1260,7 +1276,7 @@ fn refusal_warning_renders_as_one_notice_row() {
 fn expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
-    let entries = parse_conversation_file(crate::history::Source::Claude, &path, &[])
+    let entries = read_as_viewer(crate::history::Source::Claude, &path, &[])
         .unwrap()
         .entries;
     let rendered = render_with_every_run_expanded(&entries);
@@ -1280,7 +1296,7 @@ fn expanded_sub_agent_run_shows_its_result_when_another_agents_call_came_between
 fn yanking_interleaved_sub_agent_call_copies_its_own_result() {
     let dir = tempfile::tempdir().unwrap();
     let path = interleaved_sub_agents_file(&dir);
-    let conversation = parse_conversation_file(crate::history::Source::Claude, &path, &[]).unwrap();
+    let conversation = read_as_viewer(crate::history::Source::Claude, &path, &[]).unwrap();
     let rendered = render_with_every_run_expanded(&conversation.entries);
     let a_call = rendered
         .calls
@@ -1309,7 +1325,7 @@ fn fork_launch_doesnt_show_second_started_agent_row_in_summary_mode() {
     let project = tempfile::tempdir().unwrap();
     let (transcript, subagents) = write_launch_session(project.path());
     let conversation =
-        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+        read_as_viewer(crate::history::Source::Claude, &transcript, &subagents).unwrap();
 
     let text = rendered_text(&render_parsed_conversation(
         &conversation,
@@ -1333,7 +1349,7 @@ fn handed_back_report_shows_as_task_row_and_its_call_as_handed_back_report() {
     let project = tempfile::tempdir().unwrap();
     let (transcript, subagents) = write_handback_session(project.path(), true);
     let conversation =
-        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+        read_as_viewer(crate::history::Source::Claude, &transcript, &subagents).unwrap();
 
     let text = rendered_text(&render_parsed_conversation(
         &conversation,
@@ -1363,7 +1379,7 @@ fn delivered_handback_call_shows_as_one_row_and_its_report_once() {
     let project = tempfile::tempdir().unwrap();
     let (transcript, subagents) = write_handback_session(project.path(), true);
     let conversation =
-        parse_conversation_file(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+        read_as_viewer(crate::history::Source::Claude, &transcript, &subagents).unwrap();
     let mut options = test_render_options(ToolDisplayMode::Full);
     options.show_thinking = true;
 
@@ -1431,7 +1447,7 @@ fn kimi_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Kimi, &path, &[])
+    read_as_viewer(crate::history::Source::Kimi, &path, &[])
         .unwrap()
         .entries
 }
@@ -1485,7 +1501,7 @@ fn kimi_system_text_renders_as_task_hook_and_scheduled_rows_and_shell_call() {
         ),
     )
     .unwrap();
-    let entries = parse_conversation_file(crate::history::Source::Kimi, &path, &[])
+    let entries = read_as_viewer(crate::history::Source::Kimi, &path, &[])
         .unwrap()
         .entries;
 
@@ -1542,7 +1558,7 @@ fn pi_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Pi, &path, &[])
+    read_as_viewer(crate::history::Source::Pi, &path, &[])
         .unwrap()
         .entries
 }
@@ -1595,7 +1611,7 @@ fn omp_tool_run_entries() -> Vec<RenderableEntry> {
         ),
     )
     .unwrap();
-    parse_conversation_file(crate::history::Source::Omp, &path, &[])
+    read_as_viewer(crate::history::Source::Omp, &path, &[])
         .unwrap()
         .entries
 }
@@ -1688,7 +1704,7 @@ fn opencode_tool_run_entries() -> Vec<RenderableEntry> {
         );
     }
     drop(connection);
-    parse_conversation_file(
+    read_as_viewer(
         crate::history::Source::OpenCode,
         &session_ref(&database, "ses_tools"),
         &[],

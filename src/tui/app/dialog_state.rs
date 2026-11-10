@@ -226,9 +226,7 @@ impl App {
         use crate::history::provider::SessionRead;
         let path = self.conversations[idx].path.clone();
         self.note_changed_during_refresh(&path);
-        let read = (self.session_reader)(&[&self.conversations[idx]], self.show_last)
-            .pop()
-            .flatten();
+        let read = self.read_rows_again(&[idx]).pop().flatten();
         match read {
             Some(SessionRead::Listed(conv)) => self.conversations[idx] = *conv,
             Some(SessionRead::Failed(_)) => {
@@ -246,6 +244,8 @@ impl App {
         self.dialog_mode = DialogMode::None;
         self.status_message = Some(("Session renamed".to_string(), self.clock.now()));
         self.refresh_search_data();
+        // The search results arrive later; they keep the renamed row selected.
+        self.selection_anchor = Some(path.clone());
         self.update_filter();
         if let Some(new_selected) = self
             .filtered
@@ -275,21 +275,42 @@ impl App {
             None => return,
         };
 
-        if to_clipboard {
-            match crate::tui::export::generate_content(source, &path, &subagents, format, options) {
-                Ok(content) => self.copy_to_clipboard("Conversation", &content),
-                Err(error) => self.set_status(format!("Failed to read: {error}")),
-            }
-        } else {
-            let result = crate::tui::export::export_to_file(
+        let mut follow_up = None;
+        let read_entries = || {
+            let read = crate::history::display_log_entries_interactively(
+                &self.cache,
                 source,
                 &path,
                 &subagents,
-                format,
-                options,
-                self.clock.wall(),
-            );
-            self.set_status(result.message);
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            follow_up = read.follow_up;
+            Ok(read.value)
+        };
+        let status = if to_clipboard {
+            match crate::tui::export::export_content(&path, format, options, read_entries) {
+                Ok(content) => {
+                    self.copy_to_clipboard("Conversation", &content);
+                    None
+                }
+                Err(error) => Some(format!("Failed to read: {error}")),
+            }
+        } else {
+            let exported_at = self.clock.wall();
+            Some(
+                crate::tui::export::export_to_file(
+                    &path,
+                    format,
+                    options,
+                    exported_at,
+                    read_entries,
+                )
+                .message,
+            )
+        };
+        if let Some(status) = status {
+            self.set_status(status);
         }
+        self.follow_up_read(&path, follow_up);
     }
 }

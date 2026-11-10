@@ -163,6 +163,12 @@ pub(crate) struct MessageTextBuilder {
 }
 
 impl MessageTextBuilder {
+    pub(crate) fn into_parts(self) -> impl Iterator<Item = String> {
+        self.outside_messages
+            .into_iter()
+            .chain(self.messages.into_iter().flatten())
+    }
+
     /// Add one part's `text` to message `ordinal`, or outside every message
     /// for `None`. An empty `text` adds nothing.
     pub(crate) fn push(&mut self, ordinal: Option<usize>, text: String) {

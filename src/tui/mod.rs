@@ -2,6 +2,8 @@ mod actions_menu;
 mod app;
 mod backend;
 mod command_tags;
+#[cfg(test)]
+pub(crate) mod contract_outputs;
 mod export;
 #[cfg(test)]
 pub(crate) mod output_coverage;

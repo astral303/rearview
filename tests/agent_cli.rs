@@ -184,6 +184,19 @@ fn assert_hides(output: &str, needle: &str) {
     );
 }
 
+/// `output`'s stderr holds nothing but the progress records a command
+/// prints once it has run for a while.
+#[track_caller]
+fn assert_stderr_shows_only_progress(output: &Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .all(|line| line.starts_with("protocol agent-progress ")),
+        "stderr holds more than progress records:\n{stderr}"
+    );
+}
+
 #[test]
 fn pi_sessions_support_agent_search_read_and_outline_without_claude_storage() {
     let config = tempfile::tempdir().expect("config");
@@ -1267,7 +1280,7 @@ fn search_reports_partial_warnings_and_preserves_compact_success_output() {
         &["agent", "search", "--lexical", "warning contract needle"],
     );
     let stdout = stdout_of(&output);
-    assert!(output.stderr.is_empty());
+    assert_stderr_shows_only_progress(&output);
     assert!(stdout.starts_with("protocol agent-search mode=lexical"));
     assert_shows(
         &stdout,
@@ -1445,7 +1458,7 @@ fn ref_only_commands_parse_only_selected_transcript() {
     let outline = run(config.path(), &["agent", "outline", &reference]);
 
     let stdout = stdout_of(&outline);
-    assert!(outline.stderr.is_empty());
+    assert_stderr_shows_only_progress(&outline);
     assert_shows_user_question_and_agent_answer(&stdout);
     assert_hides(&stdout, "malformed-transcript");
 }
@@ -1964,5 +1977,133 @@ fn lexical_and_exact_search_omit_similarity_and_word_match() {
         for atom in [" similarity=", " word-match="] {
             assert!(!text.contains(atom), "{text}");
         }
+    }
+}
+
+/// The command's `perf` records on stderr, after checking it succeeded.
+#[track_caller]
+fn perf_records_of(output: &Output) -> String {
+    stdout_of(output);
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.starts_with("perf "))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// `records` holds each of `stages` in order, then each agent's discovery,
+/// cache and refresh, then `transcripts` transcript records, a search's
+/// reads and retrieval, peak memory, and the total last.
+#[track_caller]
+fn assert_perf_records_in_order(
+    records: &str,
+    stages: &[&str],
+    transcripts: usize,
+    search_reads: bool,
+) {
+    let names = records
+        .lines()
+        .map(|line| line.split(' ').nth(1).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let agents = names.iter().filter(|name| **name == "discovery").count();
+    assert!(agents > 0, "{records}");
+    let mut expected = stages
+        .iter()
+        .map(|stage| format!("stage={stage}"))
+        .collect::<Vec<_>>();
+    for _ in 0..agents {
+        expected.extend(["discovery", "cache", "refresh"].map(str::to_owned));
+    }
+    expected.extend(std::iter::repeat_n("transcript".to_owned(), transcripts));
+    if search_reads {
+        expected.extend(["reads", "retrieval"].map(str::to_owned));
+    }
+    expected.extend(["memory", "total"].map(str::to_owned));
+    assert_eq!(names, expected, "{records}");
+}
+
+/// The Claude Code record of `kind` (`discovery`, `cache` or `refresh`).
+#[track_caller]
+fn claude_record<'a>(records: &'a str, kind: &str) -> &'a str {
+    let prefix = format!("perf {kind} source=claude ");
+    records
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no {prefix:?} record in:\n{records}"))
+}
+
+#[test]
+fn every_agent_command_prints_its_perf_records_in_order() {
+    let config = tempfile::tempdir().expect("config");
+    let transcript = project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl");
+    write_transcript(&transcript, "perf stats needle");
+    let transcript_bytes = std::fs::metadata(&transcript)
+        .expect("the transcript's size")
+        .len();
+
+    let cold = perf_records_of(&run(config.path(), &["agent", "sessions", "--perf-stats"]));
+    assert_perf_records_in_order(
+        &cold,
+        &["load", "discovery", "skipped-transcripts", "render"],
+        0,
+        false,
+    );
+    assert_shows(claude_record(&cold, "discovery"), " roots=1 sessions=1 ");
+    assert_shows(
+        claude_record(&cold, "refresh"),
+        &format!(" parsed=1 bytes={transcript_bytes} "),
+    );
+
+    let search = run(
+        config.path(),
+        &[
+            "agent",
+            "search",
+            "--lexical",
+            "perf stats needle",
+            "--perf-stats",
+        ],
+    );
+    let reference = first_ref(&stdout_of(&search));
+    let warm = perf_records_of(&search);
+    assert_perf_records_in_order(
+        &warm,
+        &[
+            "load",
+            "discovery",
+            "skipped-transcripts",
+            "ranking",
+            "transcript-search",
+            "render",
+        ],
+        0,
+        true,
+    );
+    assert_shows(claude_record(&warm, "cache"), " files=1 ");
+    assert_shows(claude_record(&warm, "cache"), " entries=1");
+    assert_shows(claude_record(&warm, "refresh"), " parsed=0 bytes=0 ");
+
+    let transcript_record = format!(" bytes={transcript_bytes} messages=2\n");
+    let reference = reference.as_str();
+    for (args, stages) in [
+        (
+            vec!["agent", "within", reference, "needle", "--lexical"],
+            &["keys", "transcript", "search", "render"][..],
+        ),
+        (
+            vec!["agent", "read", reference],
+            &["keys", "transcript", "render"][..],
+        ),
+        (
+            vec!["agent", "outline", reference],
+            &["keys", "transcript", "render"][..],
+        ),
+    ] {
+        let records = perf_records_of(&run(
+            config.path(),
+            &[&args[..], &["--perf-stats"]].concat(),
+        ));
+        assert_perf_records_in_order(&records, stages, 1, false);
+        assert_shows(&records, &transcript_record);
     }
 }

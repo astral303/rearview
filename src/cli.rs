@@ -96,6 +96,29 @@ pub enum AgentCommand {
     Outline(AgentOutlineArgs),
 }
 
+impl AgentCommand {
+    /// The subcommand's name, as typed.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Sessions(_) => "sessions",
+            Self::Search(_) => "search",
+            Self::Within(_) => "within",
+            Self::Read(_) => "read",
+            Self::Outline(_) => "outline",
+        }
+    }
+
+    pub fn reports_perf_stats(&self) -> bool {
+        match self {
+            Self::Sessions(args) => args.perf_stats,
+            Self::Search(args) => args.perf_stats,
+            Self::Within(args) => args.perf_stats,
+            Self::Read(args) => args.perf_stats,
+            Self::Outline(args) => args.perf_stats,
+        }
+    }
+}
+
 #[derive(Debug, ClapArgs, Default)]
 #[group(id = "agent_search_mode", multiple = false)]
 pub struct AgentSearchModeArgs {
@@ -169,8 +192,7 @@ pub struct AgentSearchArgs {
     pub offset: usize,
     #[command(flatten)]
     pub scope: AgentScopeArgs,
-    /// Report time per stage, sessions opened and the size of their
-    /// transcripts on stderr
+    /// Report time per stage, what was read, and peak memory on stderr
     #[arg(long)]
     pub perf_stats: bool,
     #[command(flatten)]
@@ -196,6 +218,9 @@ pub struct AgentSessionsArgs {
     pub offset: usize,
     #[command(flatten)]
     pub scope: AgentScopeArgs,
+    /// Report time per stage, what was read, and peak memory on stderr
+    #[arg(long)]
+    pub perf_stats: bool,
     #[command(flatten)]
     pub time: TimeRangeArgs,
 }
@@ -231,6 +256,9 @@ pub struct AgentWithinArgs {
     /// Disable output budgeting
     #[arg(long)]
     pub no_budget: bool,
+    /// Report time per stage, what was read, and peak memory on stderr
+    #[arg(long)]
+    pub perf_stats: bool,
     #[command(flatten)]
     pub search_mode: AgentSearchModeArgs,
     #[command(flatten)]
@@ -291,6 +319,9 @@ pub struct AgentReadArgs {
     /// Content lines to include before and after each match
     #[arg(long, default_value_t = 3, requires = "match_query")]
     pub context: usize,
+    /// Report time per stage, what was read, and peak memory on stderr
+    #[arg(long)]
+    pub perf_stats: bool,
     #[command(flatten)]
     pub output: AgentOutputFlags,
 }
@@ -301,6 +332,9 @@ pub struct AgentOutlineArgs {
     /// path, optionally followed by :mN, :mN..mM, or :sN for one sub-agent
     #[arg(value_parser = non_empty_string)]
     pub conversation: String,
+    /// Report time per stage, what was read, and peak memory on stderr
+    #[arg(long)]
+    pub perf_stats: bool,
     #[command(flatten)]
     pub output: AgentOutputFlags,
 }

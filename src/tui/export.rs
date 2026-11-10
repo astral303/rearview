@@ -20,7 +20,9 @@ use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
@@ -67,20 +69,20 @@ pub struct ExportOptions {
     pub show_thinking: bool,
 }
 
-/// Export conversation to a file named for `exported_at`, in local time.
+/// Export the session at `source_path` to a file named for `exported_at`, in
+/// local time, as [`export_content`] reads it.
 pub fn export_to_file(
-    source: crate::history::Source,
     source_path: &Path,
-    subagents: &[PathBuf],
     format: ExportFormat,
     options: ExportOptions,
     exported_at: DateTime<Utc>,
+    read_entries: impl FnOnce() -> std::io::Result<DisplayEntries>,
 ) -> ExportResult {
     let timestamp = exported_at.with_timezone(&Local).format("%Y-%m-%d-%H%M%S");
     let ext = format.extension();
     let filename = format!("conversation-{}.{}", timestamp, ext);
 
-    let content = match generate_content(source, source_path, subagents, format, options) {
+    let content = match export_content(source_path, format, options, read_entries) {
         Ok(c) => c,
         Err(e) => {
             return ExportResult {
@@ -452,20 +454,21 @@ impl<'a> ExportedEntry<'a> {
     }
 }
 
-/// Generate content in the specified format
-pub(crate) fn generate_content(
-    source: crate::history::Source,
+/// The session at `source_path` in `format`. JSONL copies the file; the
+/// other formats read the conversation's entries with `read_entries`.
+pub(crate) fn export_content(
     source_path: &Path,
-    subagents: &[PathBuf],
     format: ExportFormat,
     options: ExportOptions,
+    read_entries: impl FnOnce() -> std::io::Result<DisplayEntries>,
 ) -> std::io::Result<String> {
-    match format {
-        ExportFormat::Jsonl => fs::read_to_string(source_path),
-        ExportFormat::Plain => generate_plain(source, source_path, subagents, options),
-        ExportFormat::Markdown => generate_markdown(source, source_path, subagents, options),
-        ExportFormat::Ledger => generate_ledger(source, source_path, subagents, options),
-    }
+    let conversation = || read_entries().map(ExportedConversation::from);
+    Ok(match format {
+        ExportFormat::Jsonl => fs::read_to_string(source_path)?,
+        ExportFormat::Plain => generate_rows(&conversation()?, options, &PlainRowWriter),
+        ExportFormat::Markdown => generate_rows(&conversation()?, options, &MarkdownRowWriter),
+        ExportFormat::Ledger => ledger_text(&conversation()?, options),
+    })
 }
 
 /// A conversation as the exports read it: its entries, and the viewer's label
@@ -492,18 +495,6 @@ impl From<DisplayEntries> for ExportedConversation {
             entries: displayed.entries,
         }
     }
-}
-
-/// The conversation at `path`, read through `source`'s format with the row's
-/// sub-agent transcripts spliced in.
-fn export_conversation(
-    source: crate::history::Source,
-    path: &Path,
-    subagents: &[PathBuf],
-) -> std::io::Result<ExportedConversation> {
-    crate::history::display_log_entries(source, path, subagents)
-        .map(ExportedConversation::from)
-        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 /// The Plain export's text for a conversation already read. The terminal
@@ -652,43 +643,11 @@ impl ExportRowWriter for MarkdownRowWriter {
     }
 }
 
-fn generate_plain(
-    source: crate::history::Source,
-    path: &Path,
-    subagents: &[PathBuf],
-    options: ExportOptions,
-) -> std::io::Result<String> {
-    Ok(generate_rows(
-        &export_conversation(source, path, subagents)?,
-        options,
-        &PlainRowWriter,
-    ))
-}
-
-fn generate_markdown(
-    source: crate::history::Source,
-    path: &Path,
-    subagents: &[PathBuf],
-    options: ExportOptions,
-) -> std::io::Result<String> {
-    Ok(generate_rows(
-        &export_conversation(source, path, subagents)?,
-        options,
-        &MarkdownRowWriter,
-    ))
-}
-
 /// Total line width for ledger export (including name column and separator)
 const LEDGER_WIDTH: usize = 90;
 
-/// Generate ledger-style format (formatted like the TUI viewer)
-fn generate_ledger(
-    source: crate::history::Source,
-    path: &Path,
-    subagents: &[PathBuf],
-    options: ExportOptions,
-) -> std::io::Result<String> {
-    let conversation = export_conversation(source, path, subagents)?;
+/// The ledger-style export of `conversation`, formatted like the TUI viewer.
+fn ledger_text(conversation: &ExportedConversation, options: ExportOptions) -> String {
     let mut output = String::new();
 
     const NAME_WIDTH: usize = 9;
@@ -791,7 +750,7 @@ fn generate_ledger(
         }
     }
 
-    Ok(output)
+    output
 }
 
 /// Append a ledger-formatted block to the output
@@ -908,6 +867,46 @@ fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::InteractiveCache;
+
+    /// The entries `source`'s format reads at `path`, with `subagents`
+    /// spliced in, as the TUI reads them without a session cache.
+    fn read_entries(
+        source: crate::history::Source,
+        path: &Path,
+        subagents: &[PathBuf],
+    ) -> std::io::Result<DisplayEntries> {
+        crate::history::display_log_entries_interactively(
+            &InteractiveCache::default(),
+            source,
+            path,
+            subagents,
+        )
+        .map(|read| read.value)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+
+    /// [`export_content`] of the session at `path`, read by [`read_entries`].
+    fn exported(
+        source: crate::history::Source,
+        path: &Path,
+        subagents: &[PathBuf],
+        format: ExportFormat,
+        options: ExportOptions,
+    ) -> std::io::Result<String> {
+        export_content(path, format, options, || {
+            read_entries(source, path, subagents)
+        })
+    }
+
+    /// The conversation the exports read at `path`, read by [`read_entries`].
+    fn exported_conversation(
+        source: crate::history::Source,
+        path: &Path,
+        subagents: &[PathBuf],
+    ) -> std::io::Result<ExportedConversation> {
+        read_entries(source, path, subagents).map(ExportedConversation::from)
+    }
 
     fn pi_fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -963,7 +962,7 @@ mod tests {
     }
 
     fn export_claude_fixture(path: &Path, format: ExportFormat, options: ExportOptions) -> String {
-        generate_content(crate::history::Source::Claude, path, &[], format, options)
+        exported(crate::history::Source::Claude, path, &[], format, options)
             .unwrap_or_else(|error| panic!("{format:?} export fails: {error}"))
     }
 
@@ -1060,7 +1059,7 @@ mod tests {
     fn copying_skill_text_copies_its_skill_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_user_texts_fixture(&dir, &[SKILL_TEXT]);
-        let entries = export_conversation(crate::history::Source::Claude, &path, &[])
+        let entries = exported_conversation(crate::history::Source::Claude, &path, &[])
             .expect("the fixture parses")
             .entries;
         let skill_entry = entries.first().expect("the fixture holds one entry");
@@ -1125,7 +1124,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (parent, sub_agents) = codex_session_with_concurrent_sub_agents(&dir);
         let export = |format| {
-            generate_content(
+            exported(
                 crate::history::Source::Codex,
                 &parent,
                 &sub_agents,
@@ -1229,7 +1228,7 @@ mod tests {
     fn clipboard_carries_assistant_tool_call_and_thinking_block() {
         let dir = tempfile::tempdir().unwrap();
         let path = claude_assistant_fixture(&dir);
-        let entries = export_conversation(crate::history::Source::Claude, &path, &[])
+        let entries = exported_conversation(crate::history::Source::Claude, &path, &[])
             .expect("the fixture parses")
             .entries;
         let assistant_entry = entries.first().expect("the fixture holds one entry");
@@ -1242,7 +1241,7 @@ mod tests {
 
     /// The first entry of the Claude session at `path`, as exports read it.
     fn first_exported_entry(path: &Path) -> LogEntry {
-        export_conversation(crate::history::Source::Claude, path, &[])
+        exported_conversation(crate::history::Source::Claude, path, &[])
             .expect("the fixture parses")
             .entries
             .into_iter()
@@ -1375,10 +1374,9 @@ mod tests {
             block_index: 0,
         };
 
-        let entries =
-            crate::history::display_log_entries(crate::history::Source::Claude, &path, &[])
-                .unwrap()
-                .entries;
+        let entries = read_entries(crate::history::Source::Claude, &path, &[])
+            .unwrap()
+            .entries;
 
         let copied_call = extract_call_text(|index| entries.get(index), call, Some(result))
             .expect("the sub-agent's call is found");
@@ -1416,7 +1414,7 @@ mod tests {
             ExportFormat::Plain,
             ExportFormat::Markdown,
         ] {
-            let exported = generate_content(
+            let exported = exported(
                 crate::history::Source::Pi,
                 &pi_fixture(),
                 &[],
@@ -1492,7 +1490,7 @@ mod tests {
             ),
             (ExportFormat::Markdown, "### send_message_to_thread"),
         ] {
-            let exported = generate_content(
+            let exported = exported(
                 crate::history::Source::Codex,
                 &path,
                 &[],
@@ -1520,7 +1518,7 @@ mod tests {
     /// through a path of its own.
     #[test]
     fn clipboard_carries_user_run_command() {
-        let entries = export_conversation(crate::history::Source::Pi, &pi_fixture(), &[])
+        let entries = exported_conversation(crate::history::Source::Pi, &pi_fixture(), &[])
             .expect("the fixture parses")
             .entries;
         let bash_entry = entries
@@ -1714,9 +1712,11 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
         let options = ExportOptions::default();
 
-        let plain = generate_plain(crate::history::Source::Pi, &path, &[], options).unwrap();
-        let markdown = generate_markdown(crate::history::Source::Pi, &path, &[], options).unwrap();
-        let ledger = generate_ledger(crate::history::Source::Pi, &path, &[], options).unwrap();
+        let pi_export =
+            |format| exported(crate::history::Source::Pi, &path, &[], format, options).unwrap();
+        let plain = pi_export(ExportFormat::Plain);
+        let markdown = pi_export(ExportFormat::Markdown);
+        let ledger = pi_export(ExportFormat::Ledger);
 
         assert!(plain.contains("Pi: root answer"));
         assert!(markdown.contains("## Pi\n\nroot answer"));
@@ -1759,10 +1759,11 @@ mod tests {
         let tmppath = tmpdir.join("rearview-test-ledger.jsonl");
         std::fs::write(&tmppath, format!("{}\n", entry)).unwrap();
 
-        let result = generate_ledger(
+        let result = exported(
             crate::history::Source::Claude,
             &tmppath,
             &[],
+            ExportFormat::Ledger,
             ExportOptions {
                 show_tools: false,
                 show_thinking: false,
@@ -1828,7 +1829,7 @@ mod tests {
                 format!("## Task\n\n{AGENT_SUMMARY}"),
             ),
         ] {
-            let exported = generate_content(
+            let exported = exported(
                 crate::history::Source::Claude,
                 &path,
                 &[],
@@ -1859,7 +1860,7 @@ mod tests {
         let path = dir.path().join("diagnostics.jsonl");
         std::fs::write(&path, format!("{IDE_DIAGNOSTICS}\n")).unwrap();
 
-        let exported = generate_content(
+        let exported = exported(
             crate::history::Source::Claude,
             &path,
             &[],

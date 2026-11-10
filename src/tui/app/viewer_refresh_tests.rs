@@ -1,9 +1,10 @@
 //! `Ctrl+R` in the viewer: the open session read again from its file.
 
+use super::refresh_tests::refresh_found;
 use super::*;
 use crate::clock::TestClock;
 use crate::history::provider::{ReadError, SessionRead};
-use crate::history::{Source, UpdatedSession};
+use crate::history::{SessionChanges, Source, UpdatedSession};
 
 const VIEWPORT: usize = 10;
 
@@ -528,7 +529,7 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
     write_messages(&path, &numbered(0..5));
     press_refresh(&mut app);
     app.handle_key(KeyCode::Esc, KeyModifiers::empty(), VIEWPORT);
-    app.finish_refresh(Ok(SessionChanges {
+    app.finish_refresh(refresh_found(SessionChanges {
         updated: vec![UpdatedSession {
             row: read_by_the_list_refresh,
             replaces_listed_row: true,
@@ -553,6 +554,7 @@ fn refresh_reads_directly_opened_file_again() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.check_view_resize(80, VIEWPORT);
@@ -584,6 +586,7 @@ fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refre
         false,
         KeyBindings::default(),
         |source, session_id, _| source == Source::Omp && session_id == "omp_session_custom_id",
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.check_view_resize(80, VIEWPORT);
@@ -607,6 +610,7 @@ fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.check_view_resize(80, VIEWPORT);

@@ -100,6 +100,39 @@ pub enum AppError {
     /// shows it after `Refresh failed: `.
     #[error("it stopped before finishing")]
     RefreshStopped,
+
+    /// The session cache database could not be opened, read or written.
+    #[error("Session cache database error: {0}")]
+    SessionCache(#[from] rusqlite::Error),
+
+    #[error("Session cache refresh was superseded: {0}")]
+    SessionCacheSuperseded(i64),
+
+    #[error("Session cache refresh ownership was lost")]
+    SessionCacheRefreshLost,
+
+    #[error("Session cache entries need refreshing for {session}: {reason}")]
+    SessionCacheNotReady { session: String, reason: String },
+
+    #[error("Session cache source changed or cannot be validated: {}", .0.display())]
+    SessionCacheSourceChanged(std::path::PathBuf),
+
+    #[error("Session cache build refused: free space could not be determined for {}", .0.display())]
+    SessionCacheCapacityUnknown(std::path::PathBuf),
+
+    /// The first build of the session cache database would leave less than
+    /// `floor` bytes free on its drive: the sessions it wrote first project
+    /// its peak size at `projected` bytes, and the drive has `free` bytes
+    /// free.
+    #[error(
+        "Session cache build refused: its projected peak size of {projected} bytes would \
+         leave less than {floor} of the {free} bytes free on its drive"
+    )]
+    SessionCacheBuildRefused {
+        projected: u64,
+        free: u64,
+        floor: u64,
+    },
 }
 
 impl AppError {

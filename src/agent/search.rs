@@ -2,7 +2,7 @@ use crate::agent::diagnostic::{
     AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms,
 };
 use crate::agent::ordered_scan::{ScanStep, scan_in_order};
-use crate::agent::perf::{SearchPerf, time_retrieval};
+use crate::agent::perf::{SearchReads, time_retrieval};
 use crate::agent::protocol::{
     budget_atom, cut_short, flags_showing, protocol_snippet, title_for_conversation,
 };
@@ -611,7 +611,7 @@ pub fn run_global_lexical_search(
 /// Searches the transcripts of `ranked_indices`, from `request`'s offset, in
 /// rank order until `request` has enough hits or the page of sessions ends.
 /// With a window, a session without hits inside it does not take a place on
-/// the page: the next-ranked session is searched in its place. `perf`, when
+/// the page: the next-ranked session is searched in its place. `reads`, when
 /// collecting, records the time spent matching the searched transcripts.
 ///
 /// Transcripts are read and searched on several threads, each as soon as it
@@ -624,7 +624,7 @@ pub fn run_global_lexical_search_reporting(
     ranked_indices: &[usize],
     retention: TranscriptRetention,
     load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript> + Sync,
-    perf: Option<&SearchPerf>,
+    reads: Option<&SearchReads>,
 ) -> Result<LexicalSearchRun> {
     let mode = request.mode();
     let retrieval_mode = match mode {
@@ -674,7 +674,7 @@ pub fn run_global_lexical_search_reporting(
                 Ok(transcript) => transcript,
                 Err(error) => return SessionSearch::Failed { resolved, error },
             };
-            let (hits, retrieval_time) = time_retrieval(perf, || {
+            let (hits, retrieval_time) = time_retrieval(reads, || {
                 retrieval_hits(
                     &request.query,
                     hits_per_session,
@@ -730,8 +730,8 @@ pub fn run_global_lexical_search_reporting(
         },
     );
 
-    if let Some(perf) = perf {
-        perf.add_retrieval_time(retrieval_time);
+    if let Some(reads) = reads {
+        reads.add_retrieval_time(retrieval_time);
     }
     sort_output_hits(&mut hits);
     let (hits, groups) = finalize_global_hits(hits, request);
@@ -1598,6 +1598,7 @@ mod tests {
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
         }
     }
 

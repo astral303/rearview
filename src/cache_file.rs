@@ -29,6 +29,16 @@ pub(crate) fn user_cache_base() -> Option<PathBuf> {
     cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), home::home_dir())
 }
 
+/// Root of the session caches: [`user_cache_base`]. A unit test build reads
+/// only a session cache `$REARVIEW_CACHE_DIR` names, never the developer's,
+/// which another rearview may be refreshing while the tests run.
+pub(crate) fn session_cache_base() -> Option<PathBuf> {
+    #[cfg(test)]
+    return cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), None);
+    #[cfg(not(test))]
+    user_cache_base()
+}
+
 fn cache_base_from(
     override_dir: Option<std::ffi::OsString>,
     home: Option<PathBuf>,
@@ -106,6 +116,12 @@ pub(crate) fn read_if_header_matches(
     if let Some(parent) = path.parent() {
         sweep_stale_temp_files(parent, clock);
     }
+    read_existing_if_header_matches(path, header)
+}
+
+/// [`read_if_header_matches`] without sweeping the directory's stale temp
+/// files.
+pub(crate) fn read_existing_if_header_matches(path: &Path, header: &[u8]) -> Option<Vec<u8>> {
     read_matching(std::fs::File::open(path).ok()?, header)
 }
 
@@ -125,7 +141,7 @@ fn read_matching(mut reader: impl Read, header: &[u8]) -> Option<Vec<u8>> {
 /// Remove `directory`'s stale temp files the first time this process reads
 /// or writes a cache file in it, so a directory of many cache files is
 /// listed once, not once per file.
-fn sweep_stale_temp_files(directory: &Path, clock: &dyn Clock) {
+pub(crate) fn sweep_stale_temp_files(directory: &Path, clock: &dyn Clock) {
     static SWEPT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     let first_visit = SWEPT
         .get_or_init(Mutex::default)

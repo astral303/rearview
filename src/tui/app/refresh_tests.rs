@@ -3,10 +3,14 @@ use super::*;
 use crate::clock::TestClock;
 use crate::error::AppError;
 use crate::history::cache::CachedFingerprint;
-use crate::history::provider::{ReadError, SessionRead, SessionTitle};
-use crate::history::{FoundSession, Source, UpdatedSession};
+use crate::history::provider::{InteractiveRead, ReadError, SessionRead, SessionTitle};
+use crate::history::{
+    CacheFollowUp, FoundSession, RefreshOutcome, RefreshOwner, SessionChanges, Source,
+    UpdatedSession,
+};
 use crate::search::test_fixtures::one_message_conversation;
 use chrono::TimeZone;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 fn fingerprint(size: u64) -> CachedFingerprint {
     CachedFingerprint {
@@ -112,12 +116,17 @@ fn status_text(app: &App) -> Option<&str> {
     app.status_message().map(|(message, _)| message.as_str())
 }
 
+/// The outcome of a `Ctrl+R` refresh that found `changes`.
+pub(super) fn refresh_found(changes: SessionChanges) -> crate::error::Result<RefreshOutcome> {
+    Ok(RefreshOutcome::Changes(changes))
+}
+
 #[test]
 fn new_session_is_listed_by_its_time() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
 
-    app.finish_refresh(Ok(SessionChanges {
+    app.finish_refresh(refresh_found(SessionChanges {
         updated: vec![
             new_session(session("c", "c", 20, 1)),
             new_session(session("between", "x", 7, 1)),
@@ -200,6 +209,7 @@ fn refresh_reruns_query() {
     ]);
     app.set_query_for_test("needle");
     app.update_filter_for_test();
+    app.settle_search_for_test();
     assert_eq!(listed_names(&app), ["a"]);
 
     app.apply_session_changes(SessionChanges {
@@ -209,6 +219,7 @@ fn refresh_reruns_query() {
         ],
         ..Default::default()
     });
+    app.settle_search_for_test();
 
     assert_eq!(listed_names(&app), ["c", "a"]);
 }
@@ -226,10 +237,12 @@ fn search_finds_changed_session_by_its_new_text() {
 
     app.set_query_for_test("revised");
     app.update_filter_for_test();
+    app.settle_search_for_test();
     assert_eq!(listed_names(&app), ["a"]);
 
     app.set_query_for_test("original");
     app.update_filter_for_test();
+    app.settle_search_for_test();
     assert!(listed_names(&app).is_empty());
 }
 
@@ -240,7 +253,7 @@ fn refresh_requested_while_one_runs_is_ignored() {
     assert!(app.begin_refresh().is_some());
     assert!(app.begin_refresh().is_none());
 
-    app.finish_refresh(Ok(SessionChanges::default()));
+    app.finish_refresh(refresh_found(SessionChanges::default()));
     assert!(app.begin_refresh().is_some());
 }
 
@@ -252,6 +265,7 @@ fn refresh_requested_while_list_loads_is_ignored() {
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
 
@@ -291,7 +305,7 @@ fn session_deleted_during_refresh_stays_deleted() {
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
     app.remove_selected_from_list();
 
-    app.finish_refresh(Ok(SessionChanges {
+    app.finish_refresh(refresh_found(SessionChanges {
         updated: vec![changed_session(session("a", "grew", 15, 2))],
         removed: vec![doomed.path],
         ..Default::default()
@@ -309,7 +323,7 @@ fn rename_in_title_store_during_refresh_keeps_its_new_title() {
     app.show_renamed_session(0, "Renamed");
 
     // The refresh read the title store before the rename.
-    app.finish_refresh(Ok(SessionChanges {
+    app.finish_refresh(refresh_found(SessionChanges {
         external_titles: vec![(
             Source::Claude,
             HashMap::from([("a".to_owned(), SessionTitle::Custom("Before".to_owned()))]),
@@ -338,7 +352,7 @@ fn rename_during_refresh_also_shows_messages_written_meanwhile() {
 
     // The refresh read the new messages before the rename, so its row has
     // the old title.
-    app.finish_refresh(Ok(SessionChanges {
+    app.finish_refresh(refresh_found(SessionChanges {
         updated: vec![changed_session(session("a", "written meanwhile", 20, 9))],
         ..Default::default()
     }));
@@ -377,7 +391,7 @@ fn app_listing_a_as_unreadable() -> (App, SkippedSessions) {
         ..Default::default()
     };
     app.begin_refresh().unwrap();
-    app.finish_refresh(Ok(SessionChanges {
+    app.finish_refresh(refresh_found(SessionChanges {
         skipped: skipped.clone(),
         ..Default::default()
     }));
@@ -450,7 +464,7 @@ fn session_read_again_when_refresh_applies_keeps_lists_last_message_preview() {
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(Path::new("/sessions/a.jsonl"));
 
-    app.finish_refresh(Ok(SessionChanges::default()));
+    app.finish_refresh(refresh_found(SessionChanges::default()));
 
     let a = app
         .conversations()
@@ -468,16 +482,306 @@ fn sessions_changed_during_refresh_are_read_again_in_one_batch() {
     app.set_sessions_reader_for_test(Box::new(move |rows, _| {
         seen.borrow_mut().push(rows.len());
         rows.iter()
-            .map(|_| Some(SessionRead::Failed(ReadError::Permanent)))
+            .map(|_| InteractiveRead::settled(Some(SessionRead::Failed(ReadError::Permanent))))
             .collect()
     }));
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(Path::new("/sessions/a.jsonl"));
     app.note_changed_during_refresh(Path::new("/sessions/b.jsonl"));
 
-    app.finish_refresh(Ok(SessionChanges::default()));
+    app.finish_refresh(refresh_found(SessionChanges::default()));
 
     assert_eq!(*batches.borrow(), [2]);
+}
+
+/// Session `a` as a reread shows it: from its transcripts while another
+/// rearview refreshes the cache, then from the cache.
+fn a_read_from(
+    title: &str,
+    refresh_to_await: Option<RefreshOwner>,
+) -> Vec<InteractiveRead<Option<SessionRead>>> {
+    let mut read = session("a", "a", 5, 1);
+    read.custom_title = Some(title.to_owned());
+    vec![InteractiveRead {
+        value: Some(SessionRead::Listed(Box::new(read))),
+        follow_up: refresh_to_await.map(CacheFollowUp::AwaitRefresh),
+    }]
+}
+
+#[test]
+fn a_row_read_during_another_refresh_is_read_again_once_it_completes() {
+    static IS_REFRESH_RUNNING: AtomicBool = AtomicBool::new(true);
+    let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = calls.clone();
+    app.set_sessions_reader_for_test(Box::new(move |_, _| {
+        counted.set(counted.get() + 1);
+        match counted.get() {
+            1 => a_read_from("From the transcript", Some(RefreshOwner::AnotherProcess)),
+            _ => a_read_from("From the cache", None),
+        }
+    }));
+    app.set_running_refresh_check_for_test(|| {
+        IS_REFRESH_RUNNING
+            .load(AtomicOrdering::Relaxed)
+            .then_some(RefreshOwner::AnotherProcess)
+    });
+    app.begin_refresh().unwrap();
+    app.note_changed_during_refresh(Path::new("/sessions/a.jsonl"));
+    app.finish_refresh(refresh_found(SessionChanges::default()));
+    let title_of_a = |app: &App| {
+        app.conversations()
+            .iter()
+            .find(|row| row.session_id == "a")
+            .and_then(|row| row.custom_title.clone())
+    };
+    assert_eq!(title_of_a(&app).as_deref(), Some("From the transcript"));
+    assert!(app.is_waiting_for_another_rearview());
+
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+    assert!(
+        app.is_waiting_for_another_rearview(),
+        "the row waits while the other refresh runs"
+    );
+    assert_eq!(calls.get(), 1);
+
+    IS_REFRESH_RUNNING.store(false, AtomicOrdering::Relaxed);
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert!(!app.is_waiting_for_another_rearview());
+    assert_eq!(title_of_a(&app).as_deref(), Some("From the cache"));
+    assert_eq!(listed_names(&app), ["b", "a"]);
+}
+
+/// Session `a` read from the cache, with the title `From the cache`.
+fn a_from_the_cache(_: &Conversation, _: bool) -> Option<SessionRead> {
+    let mut read = session("a", "a", 5, 1);
+    read.custom_title = Some("From the cache".to_owned());
+    Some(SessionRead::Listed(Box::new(read)))
+}
+
+#[test]
+fn a_row_the_background_thread_read_while_it_lost_ownership_is_read_again_after_the_new_owner() {
+    static IS_REFRESH_RUNNING: AtomicBool = AtomicBool::new(true);
+    let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
+    app.set_session_reader_for_test(a_from_the_cache);
+    app.set_running_refresh_check_for_test(|| {
+        IS_REFRESH_RUNNING
+            .load(AtomicOrdering::Relaxed)
+            .then_some(RefreshOwner::AnotherProcess)
+    });
+    let [read_outside_the_database] =
+        a_read_from("From the transcript", Some(RefreshOwner::AnotherProcess))
+            .try_into()
+            .ok()
+            .unwrap();
+
+    app.finish_refresh(Ok(RefreshOutcome::Cached(vec![(
+        PathBuf::from("/sessions/a.jsonl"),
+        read_outside_the_database,
+    )])));
+
+    let title_of_a = |app: &App| {
+        app.conversations()
+            .iter()
+            .find(|row| row.session_id == "a")
+            .and_then(|row| row.custom_title.clone())
+    };
+    assert_eq!(title_of_a(&app).as_deref(), Some("From the transcript"));
+    assert!(app.is_waiting_for_another_rearview());
+
+    IS_REFRESH_RUNNING.store(false, AtomicOrdering::Relaxed);
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert_eq!(title_of_a(&app).as_deref(), Some("From the cache"));
+    assert!(!app.is_waiting_for_another_rearview());
+}
+
+#[test]
+fn a_completed_refresh_removes_awaiting_rows_now_gone_or_empty_and_keeps_failed_reads() {
+    static IS_REFRESH_RUNNING: AtomicBool = AtomicBool::new(true);
+    let mut app = app_listing(vec![
+        session("gone", "gone", 40, 1),
+        session("empty", "empty", 30, 1),
+        session("failed", "failed", 20, 1),
+        session("listed", "listed", 10, 1),
+    ]);
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = calls.clone();
+    app.set_sessions_reader_for_test(Box::new(move |rows, _| {
+        counted.set(counted.get() + 1);
+        let is_first_read = counted.get() == 1;
+        rows.iter()
+            .map(|row| {
+                if is_first_read {
+                    return InteractiveRead {
+                        value: Some(SessionRead::Listed(Box::new((*row).clone()))),
+                        follow_up: Some(CacheFollowUp::AwaitRefresh(RefreshOwner::AnotherProcess)),
+                    };
+                }
+                InteractiveRead::settled(match row.session_id.as_str() {
+                    "gone" => None,
+                    "empty" => Some(SessionRead::Empty),
+                    "failed" => Some(SessionRead::Failed(ReadError::Transient)),
+                    _ => Some(SessionRead::Listed(Box::new((*row).clone()))),
+                })
+            })
+            .collect()
+    }));
+    app.set_running_refresh_check_for_test(|| {
+        IS_REFRESH_RUNNING
+            .load(AtomicOrdering::Relaxed)
+            .then_some(RefreshOwner::AnotherProcess)
+    });
+    app.begin_refresh().unwrap();
+    for name in ["gone", "empty", "failed", "listed"] {
+        app.note_changed_during_refresh(Path::new(&format!("/sessions/{name}.jsonl")));
+    }
+    app.finish_refresh(refresh_found(SessionChanges::default()));
+    assert_eq!(listed_names(&app), ["gone", "empty", "failed", "listed"]);
+
+    IS_REFRESH_RUNNING.store(false, AtomicOrdering::Relaxed);
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert_eq!(calls.get(), 2);
+    assert_eq!(listed_names(&app), ["failed", "listed"]);
+    assert!(!app.is_waiting_for_another_rearview());
+}
+
+#[test]
+fn only_rows_read_outside_the_database_wait_for_the_refresh() {
+    let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
+    let read_again = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = read_again.clone();
+    app.set_sessions_reader_for_test(Box::new(move |rows, _| {
+        seen.borrow_mut().push(
+            rows.iter()
+                .map(|row| row.session_id.clone())
+                .collect::<Vec<_>>(),
+        );
+        rows.iter()
+            .map(|row| InteractiveRead {
+                value: Some(SessionRead::Listed(Box::new((*row).clone()))),
+                follow_up: (row.session_id == "a")
+                    .then_some(CacheFollowUp::AwaitRefresh(RefreshOwner::AnotherProcess)),
+            })
+            .collect()
+    }));
+    app.set_running_refresh_check_for_test(|| None);
+    app.begin_refresh().unwrap();
+    app.note_changed_during_refresh(Path::new("/sessions/a.jsonl"));
+    app.note_changed_during_refresh(Path::new("/sessions/b.jsonl"));
+    app.finish_refresh(refresh_found(SessionChanges::default()));
+
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert_eq!(read_again.borrow().last().unwrap(), &["a"]);
+}
+
+/// Sessions written under `home` with the first registered agent's format,
+/// listed newest first: its fixture's session at minute 20, then its other
+/// session at minute 10.
+fn written_sessions(home: &Path) -> Vec<Conversation> {
+    let fixture = crate::history::provider::contract_tests::registered_fixtures()[0];
+    let ids = fixture.ids();
+    [(ids.session, 20), (ids.other, 10)]
+        .into_iter()
+        .map(|(id, minute)| {
+            let mut row = session(id, id, minute, 1);
+            row.source = fixture.provider().source();
+            row.path = fixture.write_session(home, id);
+            row
+        })
+        .collect()
+}
+
+/// The session `row` names, read again after more messages arrived at
+/// minute 30.
+fn written_again_at_minute_30(row: &Conversation, _: bool) -> Option<SessionRead> {
+    let mut read = row.clone();
+    read.timestamp = chrono::Local
+        .with_ymd_and_hms(2026, 10, 1, 12, 30, 0)
+        .unwrap();
+    Some(SessionRead::Listed(Box::new(read)))
+}
+
+#[test]
+fn an_open_requested_before_a_completion_check_moves_its_row_opens_the_requested_session() {
+    let home = tempfile::tempdir().unwrap();
+    let rows = written_sessions(home.path());
+    let requested = rows[1].path.clone();
+    let mut app = app_listing(rows);
+    app.set_session_reader_for_test(written_again_at_minute_30);
+    app.set_running_refresh_check_for_test(|| None);
+    app.await_refresh([requested.clone()], RefreshOwner::AnotherProcess);
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
+    assert!(app.request_open());
+
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+    assert!(app.complete_pending_open(80));
+
+    let AppMode::View(state) = app.app_mode() else {
+        panic!("a session opens: {:?}", status_text(&app));
+    };
+    assert_eq!(state.conversation_path, requested);
+}
+
+#[test]
+fn a_completion_check_under_a_delete_confirmation_waits_until_it_closes() {
+    let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
+    app.set_session_reader_for_test(gone);
+    app.set_running_refresh_check_for_test(|| None);
+    app.await_refresh(
+        [PathBuf::from("/sessions/a.jsonl")],
+        RefreshOwner::AnotherProcess,
+    );
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
+    app.dialog_mode = DialogMode::ConfirmDelete;
+
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert_eq!(listed_names(&app), ["b", "a"]);
+    assert_eq!(
+        selected_name(&app),
+        Some("a"),
+        "the confirmation applies to the session it asked about"
+    );
+    assert!(app.is_awaiting_refresh());
+
+    app.dialog_mode = DialogMode::None;
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert_eq!(listed_names(&app), ["b"]);
+    assert!(!app.is_awaiting_refresh());
+}
+
+#[test]
+fn rows_waiting_for_this_processs_own_refresh_dont_report_another_rearview() {
+    let mut app = app_listing(vec![session("a", "a", 5, 1)]);
+    app.set_sessions_reader_for_test(Box::new(|_, _| {
+        a_read_from("From the transcript", Some(RefreshOwner::ThisProcess))
+    }));
+    app.set_running_refresh_check_for_test(|| Some(RefreshOwner::ThisProcess));
+    app.begin_refresh().unwrap();
+    app.note_changed_during_refresh(Path::new("/sessions/a.jsonl"));
+    app.finish_refresh(refresh_found(SessionChanges::default()));
+
+    assert!(app.is_awaiting_refresh());
+    assert!(!app.is_waiting_for_another_rearview());
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+    assert!(
+        app.is_awaiting_refresh(),
+        "the row waits while this process's refresh runs"
+    );
 }
 
 #[test]
@@ -487,7 +791,7 @@ fn session_that_cannot_be_read_again_keeps_its_row() {
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(Path::new("/sessions/a.jsonl"));
 
-    app.finish_refresh(Ok(SessionChanges::default()));
+    app.finish_refresh(refresh_found(SessionChanges::default()));
 
     assert_eq!(listed_names(&app), ["b", "a"]);
     assert_eq!(status_text(&app), None, "nothing is counted as removed");
@@ -500,7 +804,7 @@ fn session_its_agent_no_longer_finds_is_removed_when_read_again() {
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(Path::new("/sessions/a.jsonl"));
 
-    app.finish_refresh(Ok(SessionChanges::default()));
+    app.finish_refresh(refresh_found(SessionChanges::default()));
 
     assert_eq!(listed_names(&app), ["b"]);
     assert_eq!(status_text(&app), Some("1 removed"));
@@ -547,7 +851,7 @@ fn refresh_that_finishes_in_viewer_applies_back_in_list() {
         false,
     ));
 
-    app.finish_refresh(Ok(SessionChanges {
+    app.finish_refresh(refresh_found(SessionChanges {
         updated: vec![new_session(session("c", "c", 20, 1))],
         ..Default::default()
     }));
@@ -650,7 +954,7 @@ fn refresh_that_finds_nothing_changed_reports_nothing() {
     let mut app = app_listing(vec![listed.clone()]);
     app.begin_refresh().unwrap();
 
-    app.finish_refresh(Ok(SessionChanges {
+    app.finish_refresh(refresh_found(SessionChanges {
         external_titles: vec![(
             Source::Claude,
             HashMap::from([("other".to_owned(), SessionTitle::Custom("x".to_owned()))]),

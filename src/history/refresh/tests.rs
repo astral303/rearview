@@ -302,6 +302,136 @@ fn listed_session_gone_from_disk_is_removed() {
 }
 
 #[test]
+fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() {
+    use crate::history::provider::DiscoveredSessions;
+    use crate::history::provider::{
+        RootEnvironment, RootedStorage, SessionCache, SessionRoot, SessionStorage,
+    };
+    use crate::history::sqlite_cache::refresh::tests::OtherProcessOwner;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ObservedStorage {
+        inner: RootedStorage<&'static dyn SessionStorage>,
+        discovered: std::sync::mpsc::Sender<()>,
+        calls: AtomicUsize,
+    }
+
+    impl SessionStorage for ObservedStorage {
+        fn source(&self) -> Source {
+            self.inner.source()
+        }
+        fn cache(&self) -> SessionCache {
+            self.inner.cache()
+        }
+        fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+            self.inner.roots_in(environment)
+        }
+        fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+            let found = self.inner.discover(root)?;
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.discovered.send(()).unwrap();
+            }
+            Ok(found)
+        }
+        fn rediscover_unlisted_session(
+            &self,
+            root: &SessionRoot,
+            locator: &std::path::Path,
+        ) -> Result<Option<SessionStub>> {
+            self.inner.rediscover_unlisted_session(root, locator)
+        }
+        fn parse_session(
+            &self,
+            stub: &SessionStub,
+            root: &SessionRoot,
+            debug_level: Option<DebugLevel>,
+            on_read: &(dyn Fn() + Sync),
+            clock: &dyn crate::clock::Clock,
+        ) -> Result<Option<Conversation>> {
+            self.inner
+                .parse_session(stub, root, debug_level, on_read, clock)
+        }
+    }
+
+    let fixture = crate::history::provider::contract_tests::registered_fixtures()
+        .into_iter()
+        .find(|fixture| fixture.provider().source() == Source::Pi)
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let path = fixture.write_session(home.path(), fixture.ids().session);
+    let (send, receive) = std::sync::mpsc::channel();
+    let storage = ObservedStorage {
+        inner: RootedStorage {
+            inner: fixture.storage(),
+            root: fixture.root_under(home.path()),
+        },
+        discovered: send,
+        calls: AtomicUsize::new(0),
+    };
+    let cache = crate::history::cache::SessionCacheStore::under(base.path(), storage.cache());
+    let owner = OtherProcessOwner::hold(base.path());
+    let known = KnownSessions {
+        listed: HashMap::from([(
+            path.clone(),
+            FoundSession {
+                source: Source::Pi,
+                fingerprint: None,
+                has_transient_read_error: false,
+            },
+        )]),
+        skipped: SkippedSessions::default(),
+    };
+    std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            refresh_sources(
+                &known,
+                &[Source::Pi],
+                RefreshOptions::default(),
+                &|_, needs_reading| {
+                    crate::history::provider::rediscover_sessions_with_cache(
+                        &storage,
+                        &cache,
+                        false,
+                        needs_reading,
+                    )
+                },
+            )
+        });
+        receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        owner.release();
+        let changes = running.join().unwrap().unwrap();
+        assert_eq!(changes.removed, vec![path]);
+        assert!(changes.updated.is_empty());
+    });
+}
+
+#[test]
+fn an_incomplete_directory_doesnt_remove_its_known_sessions() {
+    let known = known(
+        &[
+            ("blocked/kept", found(Source::Claude, 1)),
+            ("gone", found(Source::Claude, 1)),
+        ],
+        &[],
+    );
+    let rediscovered = RediscoveredSessions {
+        unreadable_directories: vec![PathBuf::from("/sessions/blocked")],
+        ..Default::default()
+    };
+    let mut changes = SessionChanges::default();
+    changes.absorb(
+        Source::Claude,
+        rediscovered,
+        &known,
+        &mut HashSet::new(),
+        TimeFilter::default(),
+    );
+    assert_eq!(changes.removed, vec![locator("gone")]);
+}
+
+#[test]
 fn listed_session_that_now_holds_no_conversation_is_removed_and_unlisted() {
     let disk = Disk::default().with(Source::Claude, "emptied", 2, Content::Empty);
     let known = known(&[("emptied", found(Source::Claude, 1))], &[]);

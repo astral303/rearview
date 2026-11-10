@@ -196,6 +196,32 @@ pub trait SessionStorage: Sync {
     /// helpers in [`walk`](super::walk).
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions>;
 
+    /// The stub of the session at `locator` under `root`, with its current
+    /// fingerprint, for a session [`discover`](Self::discover) leaves out,
+    /// such as a sub-agent opened by its ID. A read calls this when the
+    /// root's discovery does not list `locator`. `None` when the session is
+    /// gone, or when discovery lists every session the provider resolves.
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<SessionStub>>;
+
+    /// Validate a non-file locator from metadata, without loading its body.
+    /// Database providers can override this with their targeted lookup.
+    fn current_fingerprint(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<CachedFingerprint>> {
+        Ok(self
+            .discover(root)?
+            .stubs
+            .into_iter()
+            .find(|stub| stub.locator == locator)
+            .and_then(|stub| stub.fingerprint.stamp()))
+    }
+
     /// Parse one session into a conversation, its sub-agent transcripts
     /// merged in, or `None` if the locator holds nothing this provider
     /// recognizes.
@@ -267,6 +293,14 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         self.inner.discover(root)
     }
 
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        self.inner.rediscover_unlisted_session(root, locator)
+    }
+
     fn parse_session(
         &self,
         stub: &SessionStub,
@@ -306,6 +340,14 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
 
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         (**self).discover(root)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        (**self).rediscover_unlisted_session(root, locator)
     }
 
     fn parse_session(

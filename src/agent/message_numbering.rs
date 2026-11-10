@@ -8,6 +8,63 @@ use crate::history::is_clear_metadata_message;
 use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, UserContent};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+/// Reply ids are unique within a logical thread, including when a provider
+/// copies a parent's context into several child transcripts.
+#[derive(Clone, Default, Hash, PartialEq, Eq)]
+pub(crate) enum ThreadIdentity {
+    #[default]
+    Session,
+    Progress {
+        transcript: Option<Arc<Path>>,
+        label: String,
+    },
+}
+
+impl ThreadIdentity {
+    pub(crate) fn of(entry: &LogEntry, transcript: Option<&Path>) -> Self {
+        match entry {
+            LogEntry::User {
+                parent_tool_use_id: Some(call),
+                ..
+            }
+            | LogEntry::Assistant {
+                parent_tool_use_id: Some(call),
+                ..
+            } => Self::Progress {
+                transcript: None,
+                label: call.clone(),
+            },
+            LogEntry::Progress { data, .. }
+                if data.get("type").and_then(serde_json::Value::as_str)
+                    == Some("agent_progress") =>
+            {
+                data.get("agentId")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(Self::Session, |label| Self::Progress {
+                        transcript: transcript.map(Arc::from),
+                        label: label.to_owned(),
+                    })
+            }
+            _ => Self::Session,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ThreadNumbers(HashMap<ThreadIdentity, i64>);
+
+impl ThreadNumbers {
+    pub(crate) fn number(&mut self, identity: ThreadIdentity) -> i64 {
+        if identity == ThreadIdentity::Session {
+            return 0;
+        }
+        let next = self.0.len() as i64 + 1;
+        *self.0.entry(identity).or_insert(next)
+    }
+}
 
 /// A message's place in the numbering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,41 +79,49 @@ pub(crate) struct Numbered {
 pub(crate) struct MessageNumbering {
     count: usize,
     has_user_message: bool,
-    /// The session's own replies, apart from the sub-agents': a sub-agent
-    /// record with one of their ids is a copy, as a fork's transcript opens
-    /// with a copy of the reply that launched it.
+    /// Direct replies and progress replies use separate id namespaces.
     own_replies: ReplyOrdinals,
     subagent_replies: ReplyOrdinals,
+    threads: ThreadNumbers,
 }
 
 impl MessageNumbering {
-    /// `entry`'s place among the messages; `None` when `entry` is not a
-    /// message. A progress record is numbered by [`Self::number_progress`],
-    /// from the caller's parse.
-    pub(crate) fn number(&mut self, entry: &LogEntry) -> Option<Numbered> {
+    pub(crate) fn thread(&mut self, identity: ThreadIdentity) -> i64 {
+        self.threads.number(identity)
+    }
+
+    /// Number entries using reply ids scoped to a logical thread.
+    pub(crate) fn number_in_thread(&mut self, entry: &LogEntry, thread: i64) -> Option<Numbered> {
         match entry {
             LogEntry::User { message, .. } => self.user_message(&message.content),
-            LogEntry::Assistant { message, .. } => self.reply(message),
+            LogEntry::Assistant { message, .. } => self.reply(message, thread),
             LogEntry::PiMetadata { searchable, .. } => searchable.then(|| self.next()),
             _ => None,
         }
     }
 
-    /// A sub-agent progress record's place among the messages, from its
-    /// `role`, `blocks` and `reply_id`.
-    pub(crate) fn number_progress(
+    pub(crate) fn number_progress_in_thread(
         &mut self,
         role: AgentMessageRole,
         blocks: &[ContentBlock],
         reply_id: Option<&str>,
+        thread: i64,
     ) -> Option<Numbered> {
-        has_visible_block(role, blocks).then(|| self.number_subagent_message(reply_id))
+        has_visible_block(role, blocks).then(|| {
+            self.subagent_replies
+                .number(thread, reply_id, &mut self.count)
+        })
     }
 
     /// Number one spliced sub-agent message: records sharing `reply_id` are
     /// one message. [`has_visible_block`] decides which turns are messages.
-    pub(crate) fn number_subagent_message(&mut self, reply_id: Option<&str>) -> Numbered {
-        self.subagent_replies.number(reply_id, &mut self.count)
+    pub(crate) fn number_subagent_message(
+        &mut self,
+        reply_id: Option<&str>,
+        thread: i64,
+    ) -> Numbered {
+        self.subagent_replies
+            .number(thread, reply_id, &mut self.count)
     }
 
     pub(crate) fn count(&self) -> usize {
@@ -82,7 +147,7 @@ impl MessageNumbering {
         Some(self.next())
     }
 
-    fn reply(&mut self, message: &AssistantMessage) -> Option<Numbered> {
+    fn reply(&mut self, message: &AssistantMessage, thread: i64) -> Option<Numbered> {
         if !self.has_user_message
             || !has_visible_block(AgentMessageRole::Assistant, &message.content)
         {
@@ -90,7 +155,7 @@ impl MessageNumbering {
         }
         Some(
             self.own_replies
-                .number(message.id.as_deref(), &mut self.count),
+                .number(thread, message.id.as_deref(), &mut self.count),
         )
     }
 
@@ -101,13 +166,14 @@ impl MessageNumbering {
 
 /// The ordinal of each reply id numbered so far.
 #[derive(Default)]
-struct ReplyOrdinals(HashMap<String, usize>);
+struct ReplyOrdinals(HashMap<i64, HashMap<String, usize>>);
 
 impl ReplyOrdinals {
     /// The ordinal of the reply `id` when an earlier record started it, else
     /// the next message after `count`.
-    fn number(&mut self, id: Option<&str>, count: &mut usize) -> Numbered {
-        if let Some(&ordinal) = id.and_then(|id| self.0.get(id)) {
+    fn number(&mut self, thread: i64, id: Option<&str>, count: &mut usize) -> Numbered {
+        let replies = self.0.entry(thread).or_default();
+        if let Some(&ordinal) = id.and_then(|id| replies.get(id)) {
             return Numbered {
                 ordinal,
                 starts_message: false,
@@ -115,7 +181,7 @@ impl ReplyOrdinals {
         }
         let numbered = next_message(count);
         if let Some(id) = id {
-            self.0.insert(id.to_owned(), numbered.ordinal);
+            replies.insert(id.to_owned(), numbered.ordinal);
         }
         numbered
     }
@@ -342,6 +408,79 @@ mod tests {
         let copy = subagent_progress("assistant", "msg_parent", "Launching the fork.");
 
         assert_numbered_alike(&[prompt(), opening, copy, reply()], 4);
+    }
+
+    #[test]
+    fn equal_reply_ids_in_distinct_children_are_separate_messages() {
+        let first = subagent_progress("assistant", "copied_reply", "First child.");
+        let mut second = subagent_progress("assistant", "copied_reply", "Second child.");
+        second["data"]["agentId"] = json!("a2");
+        let records = [prompt(), first, second, reply()];
+
+        assert_numbered_alike(&records, 4);
+        assert_eq!(
+            message_texts(&records)[1..3],
+            [["First child."], ["Second child."]]
+        );
+    }
+
+    #[test]
+    fn repeated_child_labels_in_distinct_transcripts_doesnt_merge_replies() {
+        let records = [
+            prompt(),
+            subagent_progress("assistant", "copied_reply", "First child."),
+            subagent_progress("assistant", "copied_reply", "Second child."),
+            subagent_progress("assistant", "copied_reply", "First child continues."),
+        ];
+        let lines = entries(&records)
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let transcript = match index {
+                    1 | 3 => Some(std::sync::Arc::from(Path::new("child-1.jsonl"))),
+                    2 => Some(std::sync::Arc::from(Path::new("child-2.jsonl"))),
+                    _ => None,
+                };
+                (
+                    RecordLine {
+                        line: index + 1,
+                        transcript,
+                    },
+                    entry,
+                )
+            })
+            .collect();
+
+        let transcript =
+            AgentTranscript::from_entries(Path::new("parent.jsonl"), lines, Vec::new()).unwrap();
+
+        assert_eq!(transcript.messages.len(), 3);
+        let texts: Vec<_> = transcript.messages[1]
+            .parts
+            .iter()
+            .filter_map(agent_part_text)
+            .collect();
+        assert_eq!(texts, ["First child.", "First child continues."]);
+        assert_eq!(
+            transcript.messages[2]
+                .parts
+                .iter()
+                .filter_map(agent_part_text)
+                .collect::<Vec<_>>(),
+            ["Second child."]
+        );
+    }
+
+    #[test]
+    fn sidechains_with_equal_reply_ids_have_distinct_semantic_turns() {
+        let mut first = reply();
+        first["message"]["id"] = json!("shared_reply");
+        first["parent_tool_use_id"] = json!("call_1");
+        let mut second = first.clone();
+        second["parent_tool_use_id"] = json!("call_2");
+        second["message"]["content"][0]["text"] = json!("The second child checks the source.");
+
+        assert_numbered_alike(&[prompt(), first, second], 3);
     }
 
     #[test]

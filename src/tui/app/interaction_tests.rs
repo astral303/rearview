@@ -51,6 +51,7 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         fingerprint: None,
         has_transient_read_error: false,
         is_missing_earlier_turns: false,
+        cached_session: None,
     }
 }
 
@@ -571,6 +572,7 @@ fn single_file_view_click_uses_cached_entries_after_file_removed() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.check_view_resize(80, 17);
@@ -707,6 +709,7 @@ fn pending_open_opens_requested_session_after_list_reorders() {
     press(&mut app, KeyCode::Enter);
 
     tx.send(SearchResponse {
+        error: None,
         filtered: vec![0, 1],
         generation: app.search_generation,
         mode: ListSearchMode::Lexical,
@@ -748,6 +751,7 @@ fn enter_while_corpus_loads_doesnt_request_open() {
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.append_conversations(vec![test_conversation(path, None)]);
@@ -1800,6 +1804,7 @@ fn copying_session_id_of_directly_opened_file_reads_its_header() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
@@ -1822,6 +1827,7 @@ fn file_that_holds_no_conversation_copies_no_session_id() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
@@ -1845,6 +1851,7 @@ fn copying_path_yields_path_not_session_id() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
@@ -1866,6 +1873,7 @@ fn exporting_to_clipboard_copies_generated_content() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
@@ -2231,6 +2239,7 @@ fn directly_opened_session_its_agent_stores_offers_only_rename() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
     app.is_opened_file_stored = true;
@@ -2266,6 +2275,7 @@ fn directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        InteractiveCache::default(),
         Arc::new(TestClock::default()),
     );
 

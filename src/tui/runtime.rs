@@ -5,7 +5,11 @@ use crate::clock::Clock;
 use crate::config::KeyBindings;
 use crate::debug_log;
 use crate::error::{AppError, Result};
-use crate::history::{Conversation, LoaderMessage, RefreshOptions, SessionChanges};
+use crate::history::load_meter::LoadMeter;
+use crate::history::{
+    Conversation, InteractiveCache, LoaderMessage, RefreshOptions, RefreshOutcome,
+    refresh_in_background, refresh_sessions,
+};
 use crate::tui::viewer::ToolDisplayMode;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
@@ -206,7 +210,7 @@ where
 
 /// Hand a finished refresh to `app`. A refresh thread that stopped without
 /// an outcome reports as a failed refresh.
-fn receive_refresh(app: &mut App, refresh: &mut Option<Receiver<Result<SessionChanges>>>) {
+fn receive_refresh(app: &mut App, refresh: &mut Option<Receiver<Result<RefreshOutcome>>>) {
     let Some(outcome) = refresh.as_ref() else {
         return;
     };
@@ -222,6 +226,7 @@ fn receive_refresh(app: &mut App, refresh: &mut Option<Receiver<Result<SessionCh
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_loader(
     rx: Receiver<LoaderMessage>,
+    load_meter: &LoadMeter,
     refresh_options: RefreshOptions,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
@@ -238,6 +243,7 @@ pub fn run_with_loader(
         keys,
         scope,
         search_options,
+        InteractiveCache::in_user_cache(),
         clock.clone(),
     );
     app.set_active_filters(active_filters);
@@ -283,6 +289,15 @@ pub fn run_with_loader(
 
         receive_refresh(&mut app, &mut refresh);
         app.apply_finished_refresh();
+        app.set_load_waiting_for_another_rearview(
+            app.is_loading() && load_meter.is_waiting_for_refresh(),
+        );
+        app.check_awaited_refresh();
+        if refresh.is_none()
+            && let Some(rows) = app.begin_caching_refresh()
+        {
+            refresh = Some(refresh_in_background(move || Ok(rows.cache())));
+        }
 
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);
         app.receive_search_results();
@@ -310,11 +325,11 @@ pub fn run_with_loader(
             |app, action| match action {
                 Action::Refresh => {
                     if let Some(known) = app.begin_refresh() {
-                        refresh = Some(crate::history::refresh_in_background(
-                            known,
-                            refresh_options,
-                            clock.clone(),
-                        ));
+                        let clock = clock.clone();
+                        refresh = Some(refresh_in_background(move || {
+                            refresh_sessions(&known, refresh_options, clock.as_ref())
+                                .map(RefreshOutcome::Changes)
+                        }));
                     }
                     EventLoopResult::Continue
                 }
@@ -364,9 +379,18 @@ pub fn run_single_file(
     clock: Arc<dyn Clock>,
 ) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new_single_file(path, source, tool_display, show_thinking, keys, clock);
+    let mut app = App::new_single_file(
+        path,
+        source,
+        tool_display,
+        show_thinking,
+        keys,
+        InteractiveCache::in_user_cache(),
+        clock,
+    );
 
     loop {
+        app.check_awaited_refresh();
         let frame_state = prepare_frame(&mut app, &mut guard.terminal);
         draw_frame(&app, &mut guard.terminal)?;
         if app.complete_pending_open(frame_state.frame_width())

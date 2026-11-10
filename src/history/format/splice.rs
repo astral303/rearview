@@ -119,6 +119,13 @@ pub(crate) fn subagent_turns(threads: Vec<SubagentThread>) -> Vec<SubagentTurn> 
 }
 
 impl SubagentTurn {
+    pub(crate) fn thread_identity(&self) -> crate::agent::message_numbering::ThreadIdentity {
+        crate::agent::message_numbering::ThreadIdentity::Progress {
+            transcript: self.record.transcript.clone(),
+            label: self.thread.label.clone(),
+        }
+    }
+
     /// The turn as Claude records a sub-agent turn: an `agent_progress`
     /// payload with the agent label in `agentId`. Every consumer renders it
     /// nested and keeps it out of the session's own index. The record carries

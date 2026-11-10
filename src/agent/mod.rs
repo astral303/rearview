@@ -11,7 +11,9 @@ mod message_time_coverage;
 pub mod ordered_scan;
 #[cfg(test)]
 mod outline_coverage;
+mod peak_memory;
 pub mod perf;
+pub mod progress;
 pub mod protocol;
 #[cfg(test)]
 mod read_coverage;

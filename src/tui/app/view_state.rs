@@ -24,7 +24,7 @@ impl App {
 
     pub(super) fn open_conversation(&mut self, conv_idx: usize, frame_width: usize) {
         use crate::tui::viewer::{
-            content_width, parse_conversation_file, render_parsed_conversation,
+            content_width, parse_conversation_file_interactively, render_parsed_conversation,
         };
 
         let path = self.conversations[conv_idx].path.clone();
@@ -32,9 +32,10 @@ impl App {
         let session_id = Some(self.conversations[conv_idx].session_id.clone());
         let subagents = self.conversations[conv_idx].subagents.clone();
 
-        match parse_conversation_file(source, &path, &subagents) {
-            Ok(conversation) => {
-                let conversation = Arc::new(conversation);
+        match parse_conversation_file_interactively(&self.cache, source, &path, &subagents) {
+            Ok(read) => {
+                self.follow_up_read(&path, read.follow_up);
+                let conversation = Arc::new(read.value);
                 let options = RenderOptions {
                     tool_display: self.tool_display,
                     show_thinking: self.show_thinking,
@@ -244,7 +245,7 @@ impl App {
     pub(super) fn refresh_open_session(&mut self, viewport_height: usize) -> bool {
         use crate::history::format::same_file;
         use crate::history::provider::SessionRead;
-        use crate::tui::viewer::parse_conversation_file;
+        use crate::tui::viewer::parse_conversation_file_interactively;
 
         let AppMode::View(state) = &self.app_mode else {
             return false;
@@ -259,13 +260,15 @@ impl App {
         match self.read_open_session(&path, source, row_index) {
             Some(SessionRead::Listed(row)) => {
                 let subagents = row.subagents.clone();
-                match parse_conversation_file(source, &path, &subagents) {
-                    Ok(conversation) => {
+                match parse_conversation_file_interactively(&self.cache, source, &path, &subagents)
+                {
+                    Ok(read) => {
+                        self.follow_up_read(&path, read.follow_up);
                         let session_id = Some(row.session_id.clone());
                         self.store_open_session_row(row_index, Some(*row));
                         self.show_reread_conversation(
                             viewport_height,
-                            Arc::new(conversation),
+                            Arc::new(read.value),
                             subagents,
                             session_id,
                         );
@@ -299,7 +302,7 @@ impl App {
     /// directly is read by the format it was opened with, since no agent's
     /// discovery lists it.
     fn read_open_session(
-        &self,
+        &mut self,
         path: &std::path::Path,
         source: crate::history::Source,
         row_index: Option<usize>,
@@ -323,10 +326,7 @@ impl App {
                 },
             );
         }
-        let row = &self.conversations[row_index?];
-        (self.session_reader)(&[row], self.show_last)
-            .pop()
-            .flatten()
+        self.read_rows_again(&[row_index?]).pop().flatten()
     }
 
     /// Replace the open session's row with `row`, or remove it when `row` is
@@ -402,9 +402,14 @@ impl App {
         relocation: Option<&EntryRelocation>,
         stick_to_bottom: bool,
     ) {
-        use crate::tui::viewer::{parse_conversation_file, render_parsed_conversation};
+        use crate::tui::viewer::{
+            parse_conversation_file_interactively, render_parsed_conversation,
+        };
 
         let clock = &self.clock;
+        let mut followed_up = None;
+        let cache = &self.cache;
+
         if let AppMode::View(ref mut state) = self.app_mode {
             let anchor = capture_anchor(
                 &state.message_ranges,
@@ -429,13 +434,15 @@ impl App {
 
             let conversation = match state.parsed_conversation.clone() {
                 Some(conversation) => conversation,
-                None => match parse_conversation_file(
+                None => match parse_conversation_file_interactively(
+                    cache,
                     state.conversation_source,
                     &state.conversation_path,
                     &state.subagents,
                 ) {
-                    Ok(conversation) => {
-                        let conversation = Arc::new(conversation);
+                    Ok(read) => {
+                        followed_up = Some((state.conversation_path.clone(), read.follow_up));
+                        let conversation = Arc::new(read.value);
                         state.parsed_conversation = Some(conversation.clone());
                         conversation
                     }
@@ -506,6 +513,9 @@ impl App {
                         .min(state.search_matches.len() - 1);
                 }
             }
+        }
+        if let Some((path, follow_up)) = followed_up {
+            self.follow_up_read(&path, follow_up);
         }
     }
 

@@ -452,7 +452,7 @@ impl SessionStorage for CodexStorage {
         SessionCache {
             directory: "codex",
             magic: *b"CXHIST01",
-            schema_version: 25,
+            schema_version: 26,
         }
     }
 
@@ -471,6 +471,17 @@ impl SessionStorage for CodexStorage {
     /// week back would otherwise look complete.
     fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
         Ok(CodexThreadIndex::under(root)?.discovered(root))
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+    ) -> Result<Option<SessionStub>> {
+        let Some(name) = RolloutFileName::parse_path(locator) else {
+            return Ok(None);
+        };
+        Ok(CodexThreadIndex::under(root)?.stub_of(root, name.thread_id))
     }
 
     /// Leaves out of the row each discarded turn's sub-agents and the threads
@@ -1074,6 +1085,19 @@ pub(super) mod tests {
             // without user text; 0 in the other, without a `token_count` event.
             .with_subagent_tokens(525)
             .kept_in(storage)
+        }
+
+        /// Each transcript is filed as Codex files a rollout: under its start
+        /// day, named for its start time and thread.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            for transcript in std::iter::once(&session.row.path).chain(&session.row.subagents) {
+                let text = std::fs::read_to_string(transcript).unwrap();
+                let header: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+                let thread = header["payload"]["id"].as_str().unwrap();
+                let started = header["payload"]["timestamp"].as_str().unwrap();
+                let stamp = started[..19].replace(':', "-");
+                std::fs::write(rollout_path(home, &stamp, thread), text).unwrap();
+            }
         }
 
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
