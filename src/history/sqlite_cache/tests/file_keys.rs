@@ -1,98 +1,105 @@
-//! Lookups of a cached session by a spelling of its files other than
-//! discovery's: the canonical path a named file resolves to, and on a file
-//! system that ignores case, a name in another case.
+//! A cached session named by a path other than the one the load that wrote
+//! it built: the canonical path and, on a file system that ignores case, a
+//! name in another case print the copy the root's load cached.
 
-use crate::history::environment::test_support::{current_copy, load_rows, test_environment};
+use crate::history::environment::test_support::{
+    load_rows_in, test_environment, waiting_operation,
+};
+use crate::history::provider::walk::SystemCanonicaliser;
+use crate::history::provider::walk::test_support::CountingCanonicaliser;
 use crate::history::provider::{ParseWatch, SessionRoot, SessionStorage, WatchedStorage};
-use crate::history::sqlite_cache::{find_cached_copy_without_waiting, find_cached_session_waiting};
-use crate::history::{CacheBase, Conversation, InteractiveCache, Source};
+use crate::history::{Environment, Source};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[test]
-fn root_reached_through_another_spelling_finds_copy_by_canonical_paths() {
+fn canonical_path_prints_copy_cached_through_another_spelling_of_root() {
     let directory = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let (canonical, alias) = canonical_and_alias(directory.path());
+    let (environment, row_path) = cached_claude_session(&alias, base.path());
 
-    let row = cached_claude_session(&alias, base.path());
+    let named = canonical.join(row_path.strip_prefix(&alias).unwrap());
 
     assert!(
-        row.subagents.iter().all(|path| path.starts_with(&alias)),
-        "the restored sub-agents keep the root's spelling: {:?}",
-        row.subagents
-    );
-    let canonical_of = |path: &Path| canonical.join(path.strip_prefix(&alias).unwrap());
-    let subagents: Vec<PathBuf> = row
-        .subagents
-        .iter()
-        .map(|path| canonical_of(path))
-        .collect();
-    let copy = find_cached_session_waiting(
-        &cache_base(base.path()),
-        Source::Claude,
-        &canonical_of(&row.path),
-        &subagents,
-    )
-    .unwrap();
-    assert!(
-        copy.is_some(),
-        "the canonical paths find the copy written through the root's other spelling"
+        !printed(&environment, &named).is_empty(),
+        "the canonical path prints the copy written through the root's other spelling"
     );
 }
 
+/// A targeted read finds a listed session among discovery's files by the
+/// named path below the root: a path a load built canonicalises only the
+/// root, as each discovery does, and a path named through `..`
+/// canonicalises its directory once besides.
 #[test]
-fn user_named_file_finds_copy_its_root_cached() {
+fn targeted_read_finds_named_session_by_its_path_below_root() {
     let directory = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
-    let row = cached_claude_session(directory.path(), base.path());
-    let environment = test_environment(Vec::new(), Some(base.path()));
-    let named = environment.canonicaliser().canonicalise(&row.path).unwrap();
+    let storage = claude_session_with_two_subagents(directory.path());
+    let canonicaliser = Arc::new(CountingCanonicaliser::default());
+    let environment = test_environment(vec![storage], Some(base.path()))
+        .with_canonicaliser(canonicaliser.clone());
+    let row = load_rows_in(&environment, storage).pop().unwrap();
+    let root = directory.path().join("projects");
+    let through_parent = root
+        .join("project")
+        .join("..")
+        .join("project")
+        .join("session.jsonl");
 
-    let entries = current_copy(crate::history::display_log_entries_interactively(
-        &InteractiveCache::at(cache_base(base.path())),
-        Source::Claude,
-        &named,
-        &row.subagents,
-    ));
+    for (named, expected) in [
+        (row.path.clone(), vec![root.clone()]),
+        (
+            through_parent.clone(),
+            vec![through_parent.parent().unwrap().to_path_buf(), root.clone()],
+        ),
+    ] {
+        let before = canonicaliser.canonicalised().len();
+        let outcome = crate::history::provider::cache_sessions(
+            &environment,
+            Source::Claude,
+            &[named.as_path()],
+            false,
+            &waiting_operation(&environment),
+            crate::history::load_meter::AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
 
-    assert!(
-        !entries.entries.is_empty(),
-        "the viewer of `rearview <file>` reads the copy the root's load cached"
-    );
+        assert!(outcome.is_listed(), "{} reads as listed", named.display());
+        let mut since = canonicaliser.canonicalised()[before..].to_vec();
+        since.sort();
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(
+            since,
+            expected,
+            "the read of {} canonicalises each directory once",
+            named.display()
+        );
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 #[test]
-fn file_named_in_another_case_finds_copy() {
+fn file_named_in_another_case_prints_its_copy() {
     let directory = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
-    let canonical = std::fs::canonicalize(directory.path()).unwrap();
-    let row = cached_claude_session(&canonical, base.path());
-    let shouted = |path: &Path| {
-        let name = path.file_name().unwrap().to_string_lossy().to_uppercase();
-        path.with_file_name(name)
-    };
-    let subagents: Vec<PathBuf> = row.subagents.iter().map(|path| shouted(path)).collect();
-
-    let copy = find_cached_session_waiting(
-        &cache_base(base.path()),
-        Source::Claude,
-        &shouted(&row.path),
-        &subagents,
-    )
-    .unwrap();
-    let any_copy = find_cached_copy_without_waiting(
-        &cache_base(base.path()),
-        Source::Claude,
-        &shouted(&row.path),
-    )
-    .unwrap();
+    let canonical = SystemCanonicaliser::shared()
+        .canonicalise(directory.path())
+        .unwrap();
+    let (environment, row_path) = cached_claude_session(&canonical, base.path());
+    let name = row_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_uppercase();
 
     assert!(
-        copy.is_some(),
-        "file names in upper case find the copy and match its sub-agents"
+        !printed(&environment, &row_path.with_file_name(name)).is_empty(),
+        "a locator in upper case prints the copy"
     );
-    assert!(any_copy.is_some(), "a locator in upper case finds the copy");
 }
 
 /// The canonical path of a directory in `directory`, and a spelling of it
@@ -105,11 +112,16 @@ fn canonical_and_alias(directory: &Path) -> (PathBuf, PathBuf) {
         std::fs::create_dir_all(&target).unwrap();
         let alias = directory.join("alias");
         std::os::unix::fs::symlink(&target, &alias).unwrap();
-        (std::fs::canonicalize(&target).unwrap(), alias)
+        (
+            SystemCanonicaliser::shared().canonicalise(&target).unwrap(),
+            alias,
+        )
     }
     #[cfg(windows)]
     {
-        let canonical = std::fs::canonicalize(directory).unwrap();
+        let canonical = SystemCanonicaliser::shared()
+            .canonicalise(directory)
+            .unwrap();
         let alias = PathBuf::from(
             canonical
                 .to_string_lossy()
@@ -121,10 +133,35 @@ fn canonical_and_alias(directory: &Path) -> (PathBuf, PathBuf) {
     }
 }
 
-/// The row of a Claude Code session with two sub-agents, written under
-/// `directory`'s `projects` root, as a second load restores it from the
-/// cache under `base`.
-fn cached_claude_session(directory: &Path, base: &Path) -> Conversation {
+/// The environment of a Claude Code session with two sub-agents, written
+/// under `directory`'s `projects` root and cached under `base` by a load,
+/// with the path of the session's row.
+fn cached_claude_session(directory: &Path, base: &Path) -> (Environment, PathBuf) {
+    let storage = claude_session_with_two_subagents(directory);
+    let environment = test_environment(vec![storage], Some(base));
+    let mut rows = load_rows_in(&environment, storage);
+    assert_eq!(rows.len(), 1, "the load lists the session");
+    let row = rows.pop().unwrap();
+    assert_eq!(row.subagents.len(), 2, "the session lists both sub-agents");
+    (environment, row.path)
+}
+
+/// The entries the terminal printout reads of the session at `named`.
+fn printed(environment: &Environment, named: &Path) -> Vec<crate::log_entry::LogEntry> {
+    crate::history::printed_log_entries(
+        environment,
+        Source::Claude,
+        named,
+        false,
+        &mut std::io::sink(),
+    )
+    .unwrap()
+    .entries
+}
+
+/// The storage of a Claude Code session with two sub-agents, written under
+/// `directory`'s `projects` root.
+fn claude_session_with_two_subagents(directory: &Path) -> &'static dyn SessionStorage {
     let root = directory.join("projects");
     let transcript = root.join("project").join("session.jsonl");
     write_user_message(&transcript, "a question");
@@ -135,21 +172,11 @@ fn cached_claude_session(directory: &Path, base: &Path) -> Conversation {
             .join(format!("agent-{agent}.jsonl"));
         write_user_message(&subagent, "a task");
     }
-    let storage: &'static dyn SessionStorage = Box::leak(Box::new(WatchedStorage {
+    Box::leak(Box::new(WatchedStorage {
         inner: Source::Claude.provider().storage(),
         roots: vec![SessionRoot::new(root)],
         watch: ParseWatch::default(),
-    }));
-    load_rows(storage, base);
-    let mut rows = load_rows(storage, base);
-    assert_eq!(rows.len(), 1, "the load lists the session");
-    let row = rows.pop().unwrap();
-    assert_eq!(row.subagents.len(), 2, "the session lists both sub-agents");
-    assert!(
-        row.cached_session.is_some(),
-        "the second load restores the session"
-    );
-    row
+    }))
 }
 
 fn write_user_message(path: &Path, text: &str) {
@@ -160,10 +187,4 @@ fn write_user_message(path: &Path, text: &str) {
         "message": {"role": "user", "content": text},
     });
     std::fs::write(path, format!("{record}\n")).unwrap();
-}
-
-fn cache_base(base: &Path) -> CacheBase {
-    test_environment(Vec::new(), Some(base))
-        .cache_base()
-        .clone()
 }

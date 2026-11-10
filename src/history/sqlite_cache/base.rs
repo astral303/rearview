@@ -1,7 +1,7 @@
 //! A session cache directory as one rearview reaches it.
 
 use crate::clock::Clock;
-use crate::history::provider::walk::{Canonicaliser, SystemCanonicaliser};
+use crate::history::provider::walk::Canonicaliser;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -199,23 +199,33 @@ pub struct CacheBase {
     clock: Arc<dyn Clock>,
     disk: Arc<dyn DiskSpace>,
     canonicaliser: Arc<dyn Canonicaliser>,
+    /// `path` canonical, once it was asked for. Held while it canonicalises,
+    /// so concurrent first callers canonicalise it once.
+    canonical_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl CacheBase {
     /// The base at `path`, its writes checking the system's free space, and
-    /// its reads and writes keying session roots and files through the file
-    /// system's canonicalisation.
-    pub fn new(path: impl Into<PathBuf>, process: ProcessIdentity, clock: Arc<dyn Clock>) -> Self {
+    /// its reads and writes keying session roots and files through
+    /// `canonicaliser`.
+    pub fn new(
+        path: impl Into<PathBuf>,
+        process: ProcessIdentity,
+        clock: Arc<dyn Clock>,
+        canonicaliser: Arc<dyn Canonicaliser>,
+    ) -> Self {
         Self {
             path: path.into(),
             process,
             clock,
             disk: Arc::new(SystemDiskSpace),
-            canonicaliser: Arc::new(SystemCanonicaliser),
+            canonicaliser,
+            canonical_path: Arc::default(),
         }
     }
 
     /// This base, keying session roots and files through `canonicaliser`.
+    #[cfg(test)]
     pub(crate) fn with_canonicaliser(self, canonicaliser: Arc<dyn Canonicaliser>) -> Self {
         Self {
             canonicaliser,
@@ -260,9 +270,23 @@ impl CacheBase {
     pub(crate) fn canonical(&self) -> crate::error::Result<Self> {
         std::fs::create_dir_all(&self.path)?;
         Ok(Self {
-            path: std::fs::canonicalize(&self.path)?,
+            path: self.canonical_path()?,
             ..self.clone()
         })
+    }
+
+    /// This base's directory, canonical.
+    pub(crate) fn canonical_path(&self) -> std::io::Result<PathBuf> {
+        let mut memo = self
+            .canonical_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(canonical) = memo.as_ref() {
+            return Ok(canonical.clone());
+        }
+        let canonical = self.canonicaliser.canonicalise(&self.path)?;
+        *memo = Some(canonical.clone());
+        Ok(canonical)
     }
 }
 
@@ -272,5 +296,56 @@ impl std::fmt::Debug for CacheBase {
             .debug_struct("CacheBase")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::TestClock;
+    use crate::history::provider::walk::test_support::CountingCanonicaliser;
+    use std::sync::Barrier;
+
+    #[test]
+    fn concurrent_first_callers_canonicalise_cache_directory_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let base = CacheBase::new(
+            directory.path(),
+            ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+            canonicaliser.clone(),
+        );
+        let callers = 8;
+        let start = Barrier::new(callers);
+
+        let canonical_paths: Vec<PathBuf> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..callers)
+                .map(|_| {
+                    let base = base.clone();
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        base.canonical_path().unwrap()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect()
+        });
+
+        assert_eq!(
+            canonicaliser.canonicalised(),
+            vec![directory.path().to_path_buf()],
+            "the first callers canonicalise the directory once between them"
+        );
+        assert!(
+            canonical_paths
+                .iter()
+                .all(|path| *path == canonical_paths[0]),
+            "every caller gets the one canonical path"
+        );
     }
 }

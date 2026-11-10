@@ -14,6 +14,7 @@ use super::storage::UnreadableDirectory;
 use super::{DiscoveredSessions, Fingerprint, SessionRoot, SessionStub};
 use crate::error::Result;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::{Mutex, PoisonError};
 
 /// Lists the entries of one directory.
@@ -35,17 +36,37 @@ impl DirectoryLister for SystemLister {
     }
 }
 
-/// Resolves a directory to its canonical path: links followed, `.` and `..`
-/// removed, and on Windows the verbatim `\\?\` form.
+/// Canonicalises a path: links followed, `.` and `..` removed, and on
+/// Windows the verbatim `\\?\` form.
 pub trait Canonicaliser: Send + Sync {
     fn canonicalise(&self, path: &Path) -> std::io::Result<PathBuf>;
 }
 
-/// The file system's own resolution.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemCanonicaliser;
+/// The file system's canonicalisation. [`Environment::new`] and the
+/// [`RootEnvironment`] constructors make one; other code canonicalises a
+/// path through its environment's canonicaliser, which a test replaces with
+/// its own.
+///
+/// [`Environment::new`]: crate::history::Environment::new
+/// [`RootEnvironment`]: super::RootEnvironment
+#[derive(Clone, Copy, Debug)]
+pub struct SystemCanonicaliser(());
+
+impl SystemCanonicaliser {
+    pub(in crate::history) fn of_process() -> Arc<dyn Canonicaliser> {
+        Arc::new(Self(()))
+    }
+
+    /// The file system's canonicalisation, for a test.
+    #[cfg(test)]
+    pub(crate) fn shared() -> Arc<dyn Canonicaliser> {
+        Self::of_process()
+    }
+}
 
 impl Canonicaliser for SystemCanonicaliser {
+    // The one call every canonicalisation in the environment goes through.
+    #[allow(clippy::disallowed_methods)]
     fn canonicalise(&self, path: &Path) -> std::io::Result<PathBuf> {
         std::fs::canonicalize(path)
     }
@@ -113,6 +134,27 @@ pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex;
 
+    /// `link` made a link to the directory `target`: a symbolic link on
+    /// Unix, a junction on Windows. Creating a junction does not require
+    /// administrator rights.
+    pub(crate) fn link_directory(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "mklink /J makes the junction");
+        }
+    }
+
     /// The file system's listing, recording each directory it lists,
     /// running the actions a test schedules before a listing, and refusing
     /// the directories a test names, as a directory the user cannot read
@@ -130,7 +172,7 @@ pub(crate) mod test_support {
     struct ListingAction {
         directory: PathBuf,
         listing: usize,
-        action: std::sync::Arc<dyn Fn() + Send + Sync>,
+        action: Arc<dyn Fn() + Send + Sync>,
     }
 
     impl ScriptedLister {
@@ -159,7 +201,7 @@ pub(crate) mod test_support {
             self.actions.lock().unwrap().push(ListingAction {
                 directory: directory.to_path_buf(),
                 listing,
-                action: std::sync::Arc::new(action),
+                action: Arc::new(action),
             });
         }
 
@@ -175,23 +217,90 @@ pub(crate) mod test_support {
         }
     }
 
-    /// The file system's resolution, counting each path it resolves.
+    /// The file system's canonicalisation, recording each path it
+    /// canonicalises.
     #[derive(Default)]
     pub(crate) struct CountingCanonicaliser {
-        resolved: Mutex<Vec<PathBuf>>,
+        canonicalised: Mutex<Vec<PathBuf>>,
     }
 
     impl CountingCanonicaliser {
-        /// Every path resolved so far, in order.
-        pub(crate) fn resolved(&self) -> Vec<PathBuf> {
-            self.resolved.lock().unwrap().clone()
+        /// Every path canonicalised so far, in order and with repeats.
+        pub(crate) fn canonicalised(&self) -> Vec<PathBuf> {
+            self.canonicalised.lock().unwrap().clone()
+        }
+    }
+
+    /// Asserts that `actual` canonicalisations are `expected`, in order and
+    /// with repeats. On a mismatch the failure lists each expected call with
+    /// its purpose.
+    pub(crate) fn assert_canonicalised(actual: &[PathBuf], expected: &[(&Path, &str)]) {
+        let matches = actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected)
+                .all(|(path, (expected_path, _))| path == expected_path);
+        let expected_calls: Vec<String> = expected
+            .iter()
+            .map(|(path, purpose)| format!("{} ({purpose})", path.display()))
+            .collect();
+        assert!(
+            matches,
+            "expected these canonicalisations, each with its purpose:\n{}\nactual:\n{actual:#?}",
+            expected_calls.join("\n")
+        );
+    }
+
+    /// A canonicalisation a test expects: the path, and what it is for.
+    pub(crate) type ExpectedCall<'a> = (&'a Path, &'a str);
+
+    /// The canonicalisations of opening one session by its path through
+    /// `agent read` and the printout, each from a cache its own load filled.
+    pub(crate) struct OpeningCanonicalisations<'a> {
+        /// Key discovery's: the roots, then each directory a session
+        /// recorded that the agent's keys canonicalise.
+        pub(crate) key_discovery: Vec<ExpectedCall<'a>>,
+        /// The canonical path's directory, compared with each key's file;
+        /// `None` when the canonical path is spelled as the path typed.
+        pub(crate) canonical_directory: Option<ExpectedCall<'a>>,
+        /// The roots `agent read`'s refresh canonicalises again: those key
+        /// discovery could not canonicalise.
+        pub(crate) canonicalised_again: Vec<ExpectedCall<'a>>,
+        /// The printout's: the roots its record of the session is placed
+        /// below.
+        pub(crate) record_placement: Vec<ExpectedCall<'a>>,
+    }
+
+    impl<'a> OpeningCanonicalisations<'a> {
+        /// `agent read` of the path as typed.
+        pub(crate) fn agent_read(&self) -> Vec<ExpectedCall<'a>> {
+            [&self.key_discovery, &self.canonicalised_again]
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect()
+        }
+
+        /// `agent read` of the canonical path.
+        pub(crate) fn agent_read_by_canonical_path(&self) -> Vec<ExpectedCall<'a>> {
+            self.key_discovery
+                .iter()
+                .chain(&self.canonical_directory)
+                .chain(&self.canonicalised_again)
+                .copied()
+                .collect()
+        }
+
+        /// The printout of the path as typed.
+        pub(crate) fn printout(&self) -> Vec<ExpectedCall<'a>> {
+            self.record_placement.clone()
         }
     }
 
     impl Canonicaliser for CountingCanonicaliser {
         fn canonicalise(&self, path: &Path) -> std::io::Result<PathBuf> {
-            self.resolved.lock().unwrap().push(path.to_path_buf());
-            SystemCanonicaliser.canonicalise(path)
+            self.canonicalised.lock().unwrap().push(path.to_path_buf());
+            SystemCanonicaliser(()).canonicalise(path)
         }
     }
 
@@ -211,7 +320,7 @@ pub(crate) mod test_support {
                 .filter(|scheduled| {
                     scheduled.directory == directory && scheduled.listing == listing
                 })
-                .map(|scheduled| std::sync::Arc::clone(&scheduled.action))
+                .map(|scheduled| Arc::clone(&scheduled.action))
                 .collect();
             for action in actions {
                 action();

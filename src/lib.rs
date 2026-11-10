@@ -3,11 +3,11 @@
 //!
 //! See [GitHub](https://github.com/astral303/rearview) for more information.
 //!
-//! A limited public library interface is available. It has no semantic
-//! version guarantees and may break or change at any time.
+//! A limited public library interface is available. It doesn't follow
+//! semantic versioning and may break or change at any time.
 
-// Denied in `history` only; see `clippy.toml`.
-#![allow(clippy::disallowed_methods)]
+// Denied everywhere but the functions that allow it; see `clippy.toml`.
+#![deny(clippy::disallowed_methods)]
 
 mod agent;
 mod cache_file;
@@ -210,7 +210,7 @@ fn delete_session_by_id(environment: &history::Environment, session_id: &str) ->
     let operation = history::OperationScope::new(
         environment.cache_base(),
         history::Patience::UntilAcquired,
-        std::sync::Arc::default(),
+        Arc::default(),
     );
     let permit = operation.wait_for_ownership_and_parse_permit()?;
     let found = history::provider::find_sessions_by_id(environment, session_id);
@@ -523,7 +523,7 @@ fn run_with(
         let operation = history::OperationScope::new(
             environment.cache_base(),
             history::Patience::UntilAcquired,
-            std::sync::Arc::default(),
+            Arc::default(),
         );
         let mut conversations = history::load_history(
             &environment,
@@ -567,7 +567,14 @@ fn run_with(
             use_pager,
             no_color: args.no_color,
         };
-        return display::render_to_terminal(render_path, &display_options, clock.as_ref());
+        // `--render` reads one named file without the session cache, whose
+        // directory `user_environment` requires.
+        return display::render_to_terminal(
+            render_path,
+            &display_options,
+            clock.as_ref(),
+            &history::provider::RootEnvironment::of_process(),
+        );
     }
 
     // Handle direct file input mode
@@ -585,7 +592,7 @@ fn run_with(
             )));
         }
         let environment = user_environment()?;
-        let file = tui::DirectFile::resolve(input_file.clone(), environment.canonicaliser())?;
+        let file = tui::DirectFile::canonicalise(input_file.clone(), environment.canonicaliser())?;
         tui::run_single_file(file, tool_display, show_thinking, keys, environment)?;
         return Ok(());
     }
@@ -618,15 +625,14 @@ fn run_with(
         return Ok(());
     }
 
+    let environment = user_environment()?;
     let scope = tui::ListScope {
         // --local starts with workspace filter on; default is global (filter off)
         workspace_filter: use_local,
-        workspace: current_dir.map(history::Workspace::at),
+        workspace: environment.workspace().ok(),
         exclude_projects,
     };
-
-    let environment = user_environment()?;
-    let load_meter = std::sync::Arc::new(history::load_meter::LoadMeter::default());
+    let load_meter = Arc::new(history::load_meter::LoadMeter::default());
 
     // An empty result is far more often the time filter than an empty history,
     // so say which when a filter is in play.
@@ -754,8 +760,13 @@ fn run_with(
     };
 
     let selected = listed_conversation(&conversations, &selected_path)?;
-    let session =
-        history::printed_log_entries(&environment, selected.source, &selected.path, show_last)?;
+    let session = history::printed_log_entries(
+        &environment,
+        selected.source,
+        &selected.path,
+        show_last,
+        &mut std::io::stderr(),
+    )?;
     if plain_mode {
         display::display_conversation_plain(
             &selected_path,
@@ -850,6 +861,7 @@ mod agent_command_tests {
     use crate::agent::test_support::{
         assistant_jsonl_line as assistant, day_record, record_time, user_jsonl_line as user,
     };
+    use crate::history::provider::walk::SystemCanonicaliser;
     use crate::search::mode::SearchMode;
     use cli::{AgentOutlineArgs, AgentOutputFlags, AgentReadArgs};
 
@@ -1082,7 +1094,8 @@ mod agent_command_tests {
             vec![format!("{conversation}:m2..m4")],
             Some("m5".to_string()),
         );
-        let err = resolve_agent_read_args(&args, &keys).unwrap_err();
+        let err =
+            resolve_agent_read_args(&args, &keys, &SystemCanonicaliser::shared()).unwrap_err();
         assert!(err.to_string().contains("outside"));
     }
 
@@ -1101,17 +1114,20 @@ mod agent_command_tests {
         let uuid = "12345678-1234-4234-9234-123456789abc";
 
         let read = read_args(vec![format!("{uuid}:m1..m2")], None);
-        let (resolved, _) = resolve_agent_read_args(&read, &keys).unwrap();
+        let (resolved, _) =
+            resolve_agent_read_args(&read, &keys, &SystemCanonicaliser::shared()).unwrap();
         assert_eq!(resolved[0].1.key, keys[0]);
 
         let focus = read_args(
             vec![format!("{}:m1..m2", keys[0].conversation_ref().canonical())],
             Some(format!("{uuid}:m1")),
         );
-        assert!(resolve_agent_read_args(&focus, &keys).is_ok());
+        assert!(resolve_agent_read_args(&focus, &keys, &SystemCanonicaliser::shared()).is_ok());
 
         assert_eq!(
-            resolve_agent_conversation_arg(uuid, &keys).unwrap().key,
+            resolve_agent_conversation_arg(uuid, &keys, &SystemCanonicaliser::shared())
+                .unwrap()
+                .key,
             keys[0]
         );
     }
@@ -1170,7 +1186,8 @@ mod agent_command_tests {
         let mut args = read_args(vec![format!("{conversation}:m1..m2")], None);
         args.match_query = Some("needle".to_string());
 
-        let error = resolve_agent_read_args(&args, &keys).unwrap_err();
+        let error =
+            resolve_agent_read_args(&args, &keys, &SystemCanonicaliser::shared()).unwrap_err();
 
         assert!(error.to_string().contains("single-message ref"));
     }
@@ -1445,6 +1462,10 @@ mod agent_command_tests {
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
             cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             thinking_and_tool_call_text: String::new(),
         }
     }
@@ -2769,6 +2790,10 @@ mod agent_command_tests {
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
             cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             thinking_and_tool_call_text: String::new(),
         };
         let input = agent::search::AgentConversationInput {

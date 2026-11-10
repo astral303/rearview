@@ -677,11 +677,11 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
 }
 
 fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
-    // Find the conversation by path (works for both list and single file mode)
-    let conv = app
-        .conversations()
-        .iter()
-        .find(|c| c.path == state.conversation_path);
+    let conv = state.copy_row.as_ref().map(|row| &*row.0).or_else(|| {
+        app.conversations()
+            .iter()
+            .find(|c| c.path == state.conversation_path)
+    });
 
     let (
         project,
@@ -2806,6 +2806,10 @@ mod tests {
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
             cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
         }
     }
 

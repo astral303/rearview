@@ -74,6 +74,9 @@ fn listed_tasks(root: &Path, config_file: Option<&str>) -> BTreeMap<String, Opti
         .collect()
 }
 
+// The repository's own task files; the rule in `clippy.toml` covers session
+// paths in the crate.
+#[allow(clippy::disallowed_methods)]
 fn canonical_or_given(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

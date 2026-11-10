@@ -25,6 +25,7 @@ mod permit;
 mod positional;
 mod read_catalogue;
 pub(crate) mod refresh;
+mod roots;
 mod schema;
 mod scope;
 mod search_parts;
@@ -35,17 +36,20 @@ mod window;
 pub use base::{CacheBase, ProcessIdentity};
 #[cfg(test)]
 pub(crate) use base::{DiskSpace, DriveRunningOut};
-pub use cached_session::CachedSession;
 pub(crate) use cached_session::CopyKey;
+pub(crate) use cached_session::Currency;
 pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
 pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
-pub(crate) use catalogue::{SessionRecord, SessionStatus, StubStamps};
+pub use cached_session::{CachedSession, Publication, SessionAddress};
+pub(crate) use catalogue::{RecordPlace, SessionRecord, SessionStatus, StubStamps, UnbuiltRecord};
 pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
 pub(crate) use entries::StoredEntries;
 pub(crate) use interactive::{CachedCopy, refuse_the_drawing_thread};
-pub use interactive::{CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead};
+pub use interactive::{
+    CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead, NewerCopy,
+};
 pub use next_step::NextStep;
 pub use observer::{AwaitedRefresh, Observation, OtherRearview};
 #[cfg(test)]
@@ -68,11 +72,12 @@ use crate::history::format::RecordLine;
 use crate::history::provider::{SessionCache, SessionRoot};
 use crate::log_entry::LogEntry;
 use connection::Access;
-use entries::path_text;
+use files::RootKey;
+pub(crate) use roots::SessionRoots;
+use roots::{Places, WrittenPlaces};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -167,8 +172,6 @@ pub(crate) struct SqliteCache {
 pub(crate) struct CacheWriter {
     cache: SqliteCache,
     owner: refresh::RefreshToken,
-    /// Boxed, so a load's reader-or-writer value stays the size of a reader.
-    file_keys: Box<files::FileKeys>,
 }
 
 impl std::ops::Deref for CacheWriter {
@@ -271,9 +274,10 @@ impl SqliteCache {
         &self.base
     }
 
-    /// The key this database stores `root`'s sessions under.
-    fn root_key(&self, root: &SessionRoot) -> files::RootKey {
-        files::RootKey::of(root, self.base.canonicaliser().as_ref())
+    /// `root` and the directories beside it, with the keys this database
+    /// stores them under.
+    pub(crate) fn session_roots(&self, root: &SessionRoot) -> SessionRoots {
+        SessionRoots::of(root, self.base.canonicaliser().as_ref())
     }
 
     pub(crate) fn storage_is_current(&self, storage: SessionCache) -> Result<bool> {
@@ -294,18 +298,15 @@ impl SqliteCache {
             .iter()
             .map(|stub| (stub.cache_key.as_str(), stub))
             .collect();
+        let places = Places::stored(&self.connection, &self.session_roots(root))?;
         let mut statement = self.connection.prepare_cached(&format!(
             "SELECT cache_key, file_size, mtime_secs, mtime_nsecs, id FROM sessions \
-             WHERE storage = ?1 AND root_key = ?2 AND status != ?3 AND {}",
+             WHERE storage = ?1 AND root = ?2 AND status != ?3 AND {}",
             catalogue::ENTRIES_NOT_FAILED
         ))?;
         let candidates = statement
             .query_map(
-                params![
-                    storage.directory,
-                    self.root_key(root).as_str(),
-                    catalogue::WRITING
-                ],
+                params![storage.directory, places.listing_root(), catalogue::WRITING],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -332,11 +333,11 @@ impl SqliteCache {
                         .collect()
                 })
                 .unwrap_or_default();
-            match files::validate_unstamped(&self.connection, session, &stamped) {
+            match files::validate_unstamped(&self.connection, &places, session, &stamped) {
                 Ok(()) => {
                     fingerprints.insert(key, stamp);
                 }
-                Err(AppError::SessionCacheSourceChanged(_)) => {}
+                Err(error) if error.is_changed_source() => {}
                 Err(error) => return Err(error),
             }
         }
@@ -350,9 +351,15 @@ impl SqliteCache {
     ) -> Result<Vec<String>> {
         Ok(self
             .connection
-            .prepare_cached("SELECT cache_key FROM sessions WHERE storage = ?1 AND root_key = ?2")?
+            .prepare_cached(
+                "SELECT cache_key FROM sessions WHERE storage = ?1 \
+                 AND root = (SELECT id FROM roots WHERE key = ?2)",
+            )?
             .query_map(
-                params![storage.directory, self.root_key(root).as_str()],
+                params![
+                    storage.directory,
+                    self.session_roots(root).key().map(RootKey::as_str)
+                ],
                 |row| row.get(0),
             )?
             .collect::<rusqlite::Result<_>>()?)
@@ -367,22 +374,23 @@ impl SqliteCache {
         let Some(stamp) = stub.fingerprint.stamp() else {
             return Ok(false);
         };
-        let root_key = self.root_key(root);
+        let roots = self.session_roots(root);
         self.with_read_snapshot(|connection| {
+            let places = Places::stored(connection, &roots)?;
             let session: Option<i64> = connection.query_row(
                 &format!(
-                    "SELECT id FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3 \
+                    "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
                      AND file_size = ?4 AND mtime_secs = ?5 AND mtime_nsecs = ?6 \
                      AND status != 'writing' AND {}",
                     catalogue::ENTRIES_NOT_FAILED
                 ),
-                params![storage.directory, root_key.as_str(), stub.cache_key, stamp.file_size as i64, stamp.mtime_secs as i64, stamp.mtime_nsecs],
+                params![storage.directory, places.listing_root(), stub.cache_key, stamp.file_size as i64, stamp.mtime_secs as i64, stamp.mtime_nsecs],
                 |row| row.get(0),
             ).optional()?;
             let Some(session) = session else { return Ok(false) };
-            match files::validate(connection, session) {
+            match files::validate(connection, &places, session) {
                 Ok(()) => Ok(true),
-                Err(AppError::SessionCacheSourceChanged(_)) => Ok(false),
+                Err(error) if error.is_changed_source() => Ok(false),
                 Err(error) => Err(error),
             }
         })
@@ -435,17 +443,15 @@ impl SqliteCache {
         cache_key: &str,
         messages: Option<std::ops::RangeInclusive<u64>>,
     ) -> Result<Option<TranscriptEntries>> {
-        let Some(session) = entries::listed_session_of(
-            connection,
-            storage.directory,
-            &self.root_key(root),
-            cache_key,
-        )?
+        let roots = self.session_roots(root);
+        let Some(session) =
+            entries::listed_session_of(connection, storage.directory, roots.key(), cache_key)?
         else {
             return Ok(None);
         };
-        files::validate(connection, session.id)?;
-        let entries = entries::read(connection, session.id, messages)?;
+        let places = Places::stored(connection, &roots)?;
+        files::validate(connection, &places, session.id)?;
+        let entries = entries::read(connection, session.id, &places, messages)?;
         Ok(Some(entries))
     }
 }
@@ -489,7 +495,6 @@ impl CacheWriter {
         // A write that compares a session with its stored rows prepares about
         // forty statements; keep each prepared across the sessions of a load.
         connection.set_prepared_statement_cache_capacity(64);
-        let file_keys = Box::new(files::FileKeys::new(Arc::clone(base.canonicaliser())));
         Ok(Self {
             cache: SqliteCache {
                 connection,
@@ -497,7 +502,6 @@ impl CacheWriter {
                 wait: ReaderWait::Waiting(WAITING_BUSY_TIMEOUT),
             },
             owner,
-            file_keys,
         })
     }
 
@@ -669,9 +673,8 @@ impl CacheWriter {
             .filter(|file| file.kind == "subagent")
             .map(|file| file.path.as_path())
             .collect();
-        let keys = self.catalogue_keys(&record.catalogue);
         if let (Some(update), Some(Ok(entries))) = (&record.update, &record.entries) {
-            return self.update_window(record, &keys, update, entries, &subagents);
+            return self.update_window(record, update, entries, &subagents);
         }
         let rows = match &record.entries {
             Some(Ok(entries)) => Some(entries::SessionRows::of(entries, &subagents)),
@@ -680,11 +683,11 @@ impl CacheWriter {
         // The free space is checked above, outside the transaction: the check
         // takes the owner's turn, which the transaction holds.
         if let (Some(rows), Some(Ok(entries))) = (&rows, &record.entries)
-            && let Some(generation) = self.update_stored(record, &keys, rows, entries)?
+            && let Some(generation) = self.update_stored(record, rows, entries)?
         {
             return Ok(generation);
         }
-        self.insert_session(record, &keys, rows.as_ref(), check_space)
+        self.insert_session(record, rows.as_ref(), check_space)
     }
 
     /// Writes `record`, a resumed read's `update` of its stored session
@@ -694,12 +697,13 @@ impl CacheWriter {
     fn update_window(
         &mut self,
         record: &SessionRecord,
-        keys: &catalogue::CatalogueKeys,
         update: &window::WindowUpdate,
         entries: &TranscriptEntries,
         subagents: &HashSet<&Path>,
     ) -> Result<i64> {
         let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
+        let keys = &catalogue_keys(&batch, &record.catalogue)?;
+        let places = &keys.places;
         let stored: Option<i64> = batch
             .query_row(
                 "SELECT generation FROM sessions WHERE id = ?1 AND status = 'listed' \
@@ -720,20 +724,27 @@ impl CacheWriter {
             record.catalogue.message_count,
         )?;
         for (path, launch_call) in &update.launch_calls {
+            let place = places.place_written(path)?;
             batch
                 .prepare_cached(
-                    "UPDATE threads SET launch_call = ?3 WHERE session = ?1 AND transcript = \
-                     (SELECT id FROM transcripts WHERE session = ?1 AND path = ?2) \
-                     AND launch_call IS NOT ?3",
+                    "UPDATE threads SET launch_call = ?4 WHERE session = ?1 AND transcript = \
+                     (SELECT id FROM transcripts WHERE session = ?1 AND root = ?2 AND path = ?3) \
+                     AND launch_call IS NOT ?4",
                 )?
-                .execute(params![session, path_text(path), launch_call])?;
+                .execute(params![session, place.root, place.path, launch_call])?;
         }
         let mut leading =
             entries::SessionRows::from(&update.leading, subagents, &entries::RowsStart::default());
         if update.checkpoint.fold.has_entry_title() {
             leading.yield_title();
         }
-        entries::replace_leading(&batch, session, &leading, update.stored_leading_rows)?;
+        entries::replace_leading(
+            &batch,
+            session,
+            places,
+            &leading,
+            update.stored_leading_rows,
+        )?;
         let moved = update.leading.len() as i64 - update.stored_leading_rows as i64;
         let fold = update
             .checkpoint
@@ -748,7 +759,7 @@ impl CacheWriter {
             leading: entries::stored_leading(&batch, session, sequence)?,
         };
         let tail = entries::SessionRows::from(&entries.entries, subagents, &start);
-        entries::update_tail(&batch, session, &tail)?;
+        entries::update_tail(&batch, session, places, &tail)?;
         let in_place_entries: Vec<(RecordLine, LogEntry)> = update
             .in_place
             .iter()
@@ -764,24 +775,10 @@ impl CacheWriter {
             .iter()
             .map(|row| (row.id, row.message, row.digest))
             .collect();
-        entries::rewrite_in_place(&batch, session, &in_place, &stored_in_place)?;
+        entries::rewrite_in_place(&batch, session, places, &in_place, &stored_in_place)?;
         write_malformed_lines(&batch, session, entries)?;
         refresh::commit(batch, &self.owner)?;
         Ok(generation)
-    }
-
-    /// The keys of `row`'s root, its locator and each of its files.
-    fn catalogue_keys(&mut self, row: &catalogue::CatalogueRow) -> catalogue::CatalogueKeys {
-        let root = &row.root;
-        catalogue::CatalogueKeys {
-            root: self.root_key(root),
-            locator: self.file_keys.of_file_under(root, Path::new(&row.locator)),
-            files: row
-                .files
-                .iter()
-                .map(|file| self.file_keys.of_file_under(root, &file.path))
-                .collect(),
-        }
     }
 
     /// Writes `record`, a listed session with `entries`, whose rows are
@@ -792,17 +789,17 @@ impl CacheWriter {
     fn update_stored(
         &mut self,
         record: &SessionRecord,
-        keys: &catalogue::CatalogueKeys,
         rows: &entries::SessionRows,
         entries: &TranscriptEntries,
     ) -> Result<Option<i64>> {
         let row = &record.catalogue;
         let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
+        let keys = &catalogue_keys(&batch, row)?;
         let session: Option<i64> = batch
             .query_row(
-                "SELECT id FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3 \
+                "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
                  AND status = 'listed' AND entries_error IS NULL",
-                params![row.storage, keys.root.as_str(), row.cache_key],
+                params![row.storage, keys.root, row.cache_key],
                 |row| row.get(0),
             )
             .optional()?;
@@ -811,7 +808,7 @@ impl CacheWriter {
         };
         let generation =
             write_catalogue_rows(&batch, session, record, keys, Some(rows.message_count()))?;
-        entries::update(&batch, session, rows)?;
+        entries::update(&batch, session, &keys.places, rows)?;
         write_malformed_lines(&batch, session, entries)?;
         refresh::commit(batch, &self.owner)?;
         Ok(Some(generation))
@@ -823,11 +820,10 @@ impl CacheWriter {
     fn insert_session(
         &mut self,
         record: &SessionRecord,
-        keys: &catalogue::CatalogueKeys,
         rows: Option<&entries::SessionRows>,
         check_space: &dyn Fn() -> Result<()>,
     ) -> Result<i64> {
-        let session = self.write_catalogue(record, keys, rows)?;
+        let (session, keys) = self.write_catalogue(record, rows)?;
         let generation: i64 = self.connection.query_row(
             "SELECT generation FROM sessions WHERE id = ?1",
             [session],
@@ -840,6 +836,7 @@ impl CacheWriter {
                 entries::insert(
                     &mut self.cache.connection,
                     session,
+                    &keys.places,
                     rows,
                     check_space,
                     owner,
@@ -847,7 +844,7 @@ impl CacheWriter {
                 check_space()?;
                 let batch = session_transaction(&mut self.cache.connection, session, owner)?;
                 write_malformed_lines(&batch, session, entries)?;
-                write_search_parts(&batch, session, record, &[])?;
+                write_search_parts(&batch, session, record, &keys, &[])?;
                 refresh::commit(batch, owner)?;
                 None
             }
@@ -859,22 +856,22 @@ impl CacheWriter {
         Ok(generation)
     }
 
-    /// Inserts `record`'s catalogue row, marked writing; returns its id.
+    /// Inserts `record`'s catalogue row, marked writing; returns its id and
+    /// where its files are stored.
     fn write_catalogue(
         &mut self,
         record: &SessionRecord,
-        keys: &catalogue::CatalogueKeys,
         rows: Option<&entries::SessionRows>,
-    ) -> Result<i64> {
+    ) -> Result<(i64, catalogue::CatalogueKeys)> {
         let row = &record.catalogue;
         let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
+        let keys = catalogue_keys(&batch, row)?;
         batch.execute(
-            "DELETE FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3",
-            params![row.storage, keys.root.as_str(), row.cache_key],
+            "DELETE FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
+            params![row.storage, keys.root, row.cache_key],
         )?;
         let generation = next_generation(&batch)?;
         let values = row.values(
-            keys,
             catalogue::WRITING,
             rows.map(entries::SessionRows::message_count)
                 .or(row.message_count),
@@ -883,7 +880,7 @@ impl CacheWriter {
         );
         let mut statement = batch.prepare_cached(&catalogue::insert_sql())?;
         statement.raw_bind_parameter(1, row.storage)?;
-        statement.raw_bind_parameter(2, keys.root.as_str())?;
+        statement.raw_bind_parameter(2, keys.root)?;
         statement.raw_bind_parameter(3, &row.cache_key)?;
         for (offset, value) in values.iter().enumerate() {
             statement.raw_bind_parameter(offset + 4, value)?;
@@ -894,15 +891,15 @@ impl CacheWriter {
         positional::SESSION_FILES.write(
             &batch,
             session,
-            &row.file_rows(keys),
+            &row.file_rows(&keys),
             Vec::new(),
             catalogue::file_key_of,
         )?;
-        write_transcript_reads(&batch, session, row)?;
-        write_checkpoint(&batch, session, record)?;
+        write_transcript_reads(&batch, session, row, &keys)?;
+        write_checkpoint(&batch, session, record, &keys.places)?;
         write_parse_errors(&batch, session, row)?;
         refresh::commit(batch, &self.owner)?;
-        Ok(session)
+        Ok((session, keys))
     }
 
     /// Replace the [`catalogue::WRITING`] status of `session`'s row with
@@ -933,14 +930,19 @@ impl CacheWriter {
         root: &SessionRoot,
         cache_keys: &[String],
     ) -> Result<()> {
-        let root_key = self.root_key(root);
+        let roots = self.session_roots(root);
         let batch = refresh::transaction(&self.connection, &self.owner)?;
         {
             let mut statement = batch.prepare_cached(
-                "DELETE FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3",
+                "DELETE FROM sessions WHERE storage = ?1 AND cache_key = ?3 \
+                 AND root = (SELECT id FROM roots WHERE key = ?2)",
             )?;
             for cache_key in cache_keys {
-                statement.execute(params![storage.directory, root_key.as_str(), cache_key])?;
+                statement.execute(params![
+                    storage.directory,
+                    roots.key().map(RootKey::as_str),
+                    cache_key
+                ])?;
             }
         }
         refresh::commit(batch, &self.owner)?;
@@ -1030,30 +1032,37 @@ fn next_generation(connection: &Connection) -> Result<i64> {
     )?)
 }
 
-/// The integer a stored column holds; 0 for any other value.
-fn integer(value: &rusqlite::types::Value) -> i64 {
-    match value {
-        rusqlite::types::Value::Integer(integer) => *integer,
-        _ => 0,
-    }
+/// The keys `row` is stored under: the rows of the roots its files are
+/// placed below, inserted when missing, and the stored path of each of its
+/// files.
+fn catalogue_keys(
+    connection: &Connection,
+    row: &catalogue::CatalogueRow,
+) -> Result<catalogue::CatalogueKeys> {
+    let placed: Vec<&roots::FilePlace> = row.files.iter().map(|file| &file.place).collect();
+    let session = row.files.first().map_or(Path::new(""), |own| &own.path);
+    let (places, files) = WrittenPlaces::of(connection, &row.roots, session, &placed)?;
+    Ok(catalogue::CatalogueKeys {
+        root: places.written_listing_root(),
+        files,
+        places,
+    })
 }
 
 fn write_transcript_reads(
     connection: &Connection,
     session: i64,
     row: &catalogue::CatalogueRow,
+    keys: &catalogue::CatalogueKeys,
 ) -> Result<()> {
     let table = positional::TRANSCRIPT_READS;
     let stored = table.stored(connection, session)?;
     table.write(
         connection,
         session,
-        &row.read_rows(),
+        &row.read_rows(keys),
         stored,
-        |values| match &values[0] {
-            rusqlite::types::Value::Text(path) => path.clone(),
-            _ => String::new(),
-        },
+        catalogue::read_key_of,
     )
 }
 
@@ -1070,7 +1079,7 @@ fn write_catalogue_rows(
 ) -> Result<i64> {
     let row = &record.catalogue;
     let generation = next_generation(connection)?;
-    let values = row.values(keys, row.status.as_str(), message_count, None, generation);
+    let values = row.values(row.status.as_str(), message_count, None, generation);
     let mut statement = connection.prepare_cached(&catalogue::update_sql())?;
     for (offset, value) in values.iter().enumerate() {
         statement.raw_bind_parameter(offset + 1, value)?;
@@ -1079,7 +1088,7 @@ fn write_catalogue_rows(
     statement.raw_execute()?;
     drop(statement);
     let stored_files = positional::SESSION_FILES.stored(connection, session)?;
-    write_search_parts(connection, session, record, &stored_files)?;
+    write_search_parts(connection, session, record, keys, &stored_files)?;
     positional::SESSION_FILES.write(
         connection,
         session,
@@ -1087,16 +1096,26 @@ fn write_catalogue_rows(
         stored_files,
         catalogue::file_key_of,
     )?;
-    write_transcript_reads(connection, session, row)?;
-    write_checkpoint(connection, session, record)?;
+    write_transcript_reads(connection, session, row, keys)?;
+    write_checkpoint(connection, session, record, &keys.places)?;
     write_parse_errors(connection, session, row)?;
     Ok(generation)
 }
 
-/// Stores where a resumed read of `record`'s session starts, or removes the
-/// stored checkpoint of a session whose next change is read whole.
-fn write_checkpoint(connection: &Connection, session: i64, record: &SessionRecord) -> Result<()> {
-    match &record.checkpoint {
+/// Stores where a resumed read of `record`'s session starts, its transcripts
+/// named below the roots of `places`, or removes the stored checkpoint of a
+/// session whose next change is read whole.
+fn write_checkpoint(
+    connection: &Connection,
+    session: i64,
+    record: &SessionRecord,
+    places: &Places,
+) -> Result<()> {
+    let stored = record
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.stored_in(places));
+    match stored {
         Some((checkpoint, ledger)) => {
             connection
                 .prepare_cached(
@@ -1134,7 +1153,7 @@ fn write_parse_errors(
         session,
         &row.parse_error_rows(),
         stored,
-        |values| integer(&values[0]),
+        |values| table.integer(values, "line_number"),
     )
 }
 
@@ -1150,34 +1169,34 @@ fn write_malformed_lines(
         session,
         &entries::malformed_line_rows(&entries.malformed_lines),
         stored,
-        |values| integer(&values[0]),
+        |values| table.integer(values, "line_number"),
     )
 }
 
-/// Writes the search parts of `record`, whose session's stored files were
-/// `stored_files` before this write.
+/// Writes the search parts of `record`, whose files `keys` places, and
+/// whose session's stored files were `stored_files` before this write.
 fn write_search_parts(
     connection: &Connection,
     session: i64,
     record: &SessionRecord,
+    keys: &catalogue::CatalogueKeys,
     stored_files: &[(i64, Vec<rusqlite::types::Value>)],
 ) -> Result<()> {
-    let stored_paths: HashMap<i64, String> = stored_files
+    let stored_places: HashMap<i64, roots::StoredPath> = stored_files
         .iter()
-        .map(|(position, values)| (*position, catalogue::file_key_of(values).1))
-        .collect();
+        .map(|(position, values)| Ok((*position, catalogue::file_place_of(values)?)))
+        .collect::<Result<_>>()?;
     let table = positional::SUBAGENT_SEARCH_PARTS;
     let stored = table.stored(connection, session)?;
     table.write(
         connection,
         session,
-        &record.catalogue.search_part_rows(&record.search_parts),
+        &catalogue::CatalogueRow::search_part_rows(keys, &record.search_parts),
         stored,
         |values| {
-            stored_paths
-                .get(&integer(&values[0]))
-                .cloned()
-                .unwrap_or_default()
+            Ok(stored_places
+                .get(&table.integer(values, "file_position")?)
+                .cloned())
         },
     )
 }

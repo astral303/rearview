@@ -93,13 +93,21 @@ pub struct ViewState {
     /// `None` for a file opened directly until the background worker reads
     /// it.
     pub conversation_source: Option<crate::history::Source>,
+    /// The conversation's address in the session cache. Re-reads and exports
+    /// read its newest copy through it. `None` for a file opened directly
+    /// until the background worker lists it, or one outside every root.
+    pub cache_address: Option<crate::history::sqlite_cache::SessionAddress>,
     /// The session ID as this conversation's provider recorded it. `None` when
     /// the transcript did not parse; a file name is not guaranteed to be the
     /// session ID.
     pub session_id: Option<String>,
-    /// The sub-agent transcripts the row was built from, spliced into every
-    /// re-parse and export of the view.
-    pub subagents: Vec<PathBuf>,
+    /// The open session's row's publication of its copy. It decides whether
+    /// the view and its exports read a copy as current.
+    pub publication: crate::history::sqlite_cache::Publication,
+    /// The catalogue row of a copy newer than the list's row. The header
+    /// shows it in place of the list's row; `None` while the view shows the
+    /// list's row.
+    pub copy_row: Option<CopyRow>,
     /// The open view's conversation as parsed.
     pub parsed_conversation: Option<Arc<ParsedConversation>>,
     /// Current scroll position (line offset)
@@ -143,6 +151,19 @@ pub struct ViewState {
     /// True while the session is missing from the session cache, so the
     /// view shows no messages.
     pub is_copy_missing: bool,
+}
+
+/// The catalogue row of a copy written after the list's row.
+#[derive(Clone)]
+pub struct CopyRow(pub Box<crate::history::Conversation>);
+
+impl std::fmt::Debug for CopyRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("CopyRow")
+            .field(&self.0.path)
+            .finish()
+    }
 }
 
 /// A refresh's change in the session's message count, marked until `until`:
@@ -195,9 +216,12 @@ pub struct DirectFile {
 }
 
 impl DirectFile {
-    /// The file at `typed`, resolved through `canonicaliser`. Fails when the
-    /// path does not resolve.
-    pub fn resolve(typed: PathBuf, canonicaliser: &dyn Canonicaliser) -> std::io::Result<Self> {
+    /// The file at `typed`, canonicalised through `canonicaliser`. Fails when
+    /// the path doesn't canonicalise.
+    pub fn canonicalise(
+        typed: PathBuf,
+        canonicaliser: &dyn Canonicaliser,
+    ) -> std::io::Result<Self> {
         let canonical = canonicaliser.canonicalise(&typed)?;
         Ok(Self { typed, canonical })
     }
@@ -224,15 +248,18 @@ impl ViewState {
         conversation_path: PathBuf,
         conversation_source: Option<crate::history::Source>,
         session_id: Option<String>,
-        subagents: Vec<PathBuf>,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
     ) -> Self {
         Self {
             conversation_path,
             conversation_source,
+            cache_address: None,
             session_id,
-            subagents,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
+            copy_row: None,
             parsed_conversation: None,
             scroll_offset: 0,
             rendered_lines: Vec::new(),

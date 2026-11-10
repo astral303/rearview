@@ -13,6 +13,7 @@ mod threads;
 mod times;
 mod write;
 
+use super::roots::{Places, WrittenPlaces};
 use crate::agent::sanitize::join_terminal_codes;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
@@ -39,6 +40,7 @@ const ENTRIES_PER_TRANSACTION: usize = 20_000;
 pub(super) fn insert(
     connection: &mut Connection,
     session: i64,
+    places: &WrittenPlaces,
     rows: &SessionRows,
     check_space: &dyn Fn() -> Result<()>,
     owner: &super::refresh::RefreshToken,
@@ -48,7 +50,7 @@ pub(super) fn insert(
         check_space()?;
         let transaction = super::session_transaction(connection, session, owner)?;
         {
-            let mut writer = write::RowWriter::new(&transaction, session)?;
+            let mut writer = write::RowWriter::new(&transaction, session, places)?;
             let end = (start + ENTRIES_PER_TRANSACTION).min(rows.entries.len());
             for sequence in start..end {
                 writer.insert_entry(rows, &mut ids, sequence)?;
@@ -314,10 +316,11 @@ impl Selection {
 pub(super) fn read(
     connection: &Connection,
     session: i64,
+    places: &Places,
     messages: Option<RangeInclusive<u64>>,
 ) -> Result<TranscriptEntries> {
     let selected = Selection::new(session, messages);
-    Ok(read_selected(connection, session, &selected, ReadPurpose::Display)?.transcript)
+    Ok(read_selected(connection, session, places, &selected, ReadPurpose::Display)?.transcript)
 }
 
 pub(crate) struct StoredEntries {
@@ -360,11 +363,13 @@ impl ReadPurpose {
 pub(super) fn read_numbered(
     connection: &Connection,
     session: i64,
+    places: &Places,
     messages: Option<RangeInclusive<u64>>,
 ) -> Result<StoredEntries> {
     read_selected(
         connection,
         session,
+        places,
         &Selection::new(session, messages),
         ReadPurpose::Display,
     )
@@ -375,13 +380,14 @@ pub(super) fn read_numbered(
 pub(super) fn read_range(
     connection: &Connection,
     session: i64,
+    places: &Places,
     path: &Path,
     messages: RangeInclusive<u64>,
 ) -> Result<crate::agent::transcript::AgentTranscript> {
-    let mut transcript = context::read(connection, session, path)?;
+    let mut transcript = context::read(connection, session, places, path)?;
     let selected = crate::agent::transcript::AgentTranscript::from_stored(
         path,
-        read_numbered(connection, session, Some(messages))?,
+        read_numbered(connection, session, places, Some(messages))?,
     )?;
     for message in selected.messages {
         let index = transcript
@@ -396,6 +402,7 @@ pub(super) fn read_range(
 pub(super) fn read_search_batch(
     connection: &Connection,
     session: i64,
+    places: &Places,
     after: i64,
     window: &crate::time_filter::TimeFilter,
 ) -> Result<StoredEntries> {
@@ -425,16 +432,17 @@ pub(super) fn read_search_batch(
             parameters: vec![session.into(), after.into()],
         }
     };
-    read_selected(connection, session, &selected, ReadPurpose::Search)
+    read_selected(connection, session, places, &selected, ReadPurpose::Search)
 }
 
 pub(super) fn read_selected(
     connection: &Connection,
     session: i64,
+    places: &Places,
     selected: &Selection,
     purpose: ReadPurpose,
 ) -> Result<StoredEntries> {
-    let stored = threads::read(connection, session)?;
+    let stored = threads::read(connection, session, places)?;
     let mut parts = parts::read(connection, selected, purpose)?;
     let sql = format!(
         "SELECT m.thread, e.id, e.record_transcript, e.record_line, e.kind, e.timestamp_ms, m.role, \
@@ -652,14 +660,19 @@ pub(super) struct StoredSession {
 pub(super) fn listed_session_of(
     connection: &Connection,
     storage: &str,
-    root_key: &super::files::RootKey,
+    root_key: Option<&super::files::RootKey>,
     cache_key: &str,
 ) -> Result<Option<StoredSession>> {
     let row: Option<(i64, i64, String, Option<String>)> = connection
         .query_row(
             "SELECT id, generation, status, CASE WHEN status = 'listed' THEN entries_error END \
-             FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3",
-            params![storage, root_key.as_str(), cache_key],
+             FROM sessions WHERE storage = ?1 AND cache_key = ?3 \
+             AND root = (SELECT id FROM roots WHERE key = ?2)",
+            params![
+                storage,
+                root_key.map(super::files::RootKey::as_str),
+                cache_key
+            ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;

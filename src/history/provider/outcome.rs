@@ -4,9 +4,9 @@
 
 use super::load::ReadError;
 use super::storage::SessionStub;
-use crate::history::Conversation;
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::sqlite_cache::NextStep;
+use crate::history::{Conversation, TranscriptEntries};
 use std::path::{Path, PathBuf};
 
 /// The result of reading one session.
@@ -35,6 +35,11 @@ pub struct SessionOutcome {
     revision: Option<CachedFingerprint>,
     read: SessionRead,
     next: NextStep,
+    /// The entries of the session's parse that its copy in the cache does
+    /// not hold: the write did not land, no record could be built, or a
+    /// file changed after its stamp. `None` when the copy holds them or the
+    /// read parsed nothing.
+    unwritten_entries: Option<TranscriptEntries>,
 }
 
 impl SessionOutcome {
@@ -45,6 +50,21 @@ impl SessionOutcome {
             revision: stub.fingerprint.stamp(),
             read,
             next: NextStep::Settled,
+            unwritten_entries: None,
+        }
+    }
+
+    /// `read`, the read of the session at `stub` whose parse read
+    /// `unwritten_entries`, which the session's copy in the cache does not
+    /// hold, settled.
+    pub(super) fn settled_with_unwritten_entries(
+        stub: &SessionStub,
+        read: SessionRead,
+        unwritten_entries: Option<TranscriptEntries>,
+    ) -> Self {
+        Self {
+            unwritten_entries,
+            ..Self::settled(stub, read)
         }
     }
 
@@ -73,6 +93,7 @@ impl SessionOutcome {
             revision: None,
             read,
             next: NextStep::Settled,
+            unwritten_entries: None,
         }
     }
 
@@ -127,5 +148,12 @@ impl SessionOutcome {
     /// The read and the next step, which the caller acts on.
     pub fn into_parts(self) -> (SessionRead, NextStep) {
         (self.read, self.next)
+    }
+
+    /// The read, and the entries of its parse that the session's copy in
+    /// the cache does not hold, for a caller that reads the session's
+    /// content once and refreshes it no further.
+    pub fn into_read_and_unwritten_entries(self) -> (SessionRead, Option<TranscriptEntries>) {
+        (self.read, self.unwritten_entries)
     }
 }

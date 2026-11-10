@@ -6,8 +6,9 @@
 
 use super::Source;
 use super::Workspace;
-use super::provider::SessionStorage;
+use super::path::CanonicalDirectories;
 use super::provider::walk::{Canonicaliser, DirectoryLister, SystemCanonicaliser, SystemLister};
+use super::provider::{RootEnvironment, SessionStorage};
 use super::sqlite_cache::{CacheBase, ProcessIdentity};
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
@@ -27,6 +28,9 @@ pub struct Environment {
     /// Or the error reading it: only a command scoped to the workspace fails
     /// on that error.
     working_directory: std::result::Result<PathBuf, Arc<std::io::Error>>,
+    /// The directories one command canonicalises, each once; `None` until
+    /// [`Self::for_one_command`] makes this environment for a command.
+    command_directories: Option<Arc<CanonicalDirectories>>,
 }
 
 impl Environment {
@@ -58,15 +62,20 @@ impl Environment {
         clock: Arc<dyn Clock>,
         lister: Arc<dyn DirectoryLister>,
     ) -> Self {
-        let canonicaliser: Arc<dyn Canonicaliser> = Arc::new(SystemCanonicaliser);
+        let canonicaliser = SystemCanonicaliser::of_process();
         Self {
             storages,
-            cache_base: CacheBase::new(cache_base, process, Arc::clone(&clock))
-                .with_canonicaliser(Arc::clone(&canonicaliser)),
+            cache_base: CacheBase::new(
+                cache_base,
+                process,
+                Arc::clone(&clock),
+                Arc::clone(&canonicaliser),
+            ),
             clock,
             lister,
             canonicaliser,
             working_directory: std::env::current_dir().map_err(Arc::new),
+            command_directories: None,
         }
     }
 
@@ -99,7 +108,34 @@ impl Environment {
         self.canonicaliser.as_ref()
     }
 
-    /// This environment, resolving paths through `canonicaliser`.
+    pub(crate) fn shared_canonicaliser(&self) -> &Arc<dyn Canonicaliser> {
+        &self.canonicaliser
+    }
+
+    /// The memo to canonicalise directories through. An environment
+    /// [`Self::for_one_command`] made returns the command's memo. The
+    /// command's loads, key building, root environment and workspace share
+    /// it. Any other environment returns a new memo on each call.
+    pub(crate) fn canonical_directories(&self) -> Arc<CanonicalDirectories> {
+        match &self.command_directories {
+            Some(directories) => Arc::clone(directories),
+            None => Arc::new(CanonicalDirectories::new(Arc::clone(&self.canonicaliser))),
+        }
+    }
+
+    /// This environment for one command. Canonicalisations through
+    /// [`Self::canonical_directories`] share one memo and canonicalise each
+    /// directory at most once.
+    #[must_use]
+    pub(crate) fn for_one_command(self) -> Self {
+        let directories = CanonicalDirectories::new(Arc::clone(&self.canonicaliser));
+        Self {
+            command_directories: Some(Arc::new(directories)),
+            ..self
+        }
+    }
+
+    /// This environment, canonicalising paths through `canonicaliser`.
     #[cfg(test)]
     pub(crate) fn with_canonicaliser(self, canonicaliser: Arc<dyn Canonicaliser>) -> Self {
         Self {
@@ -111,11 +147,20 @@ impl Environment {
         }
     }
 
+    /// The process's variables and directories, canonicalising directories
+    /// through [`Self::canonical_directories`].
+    pub(crate) fn root_environment(&self) -> RootEnvironment<'static> {
+        RootEnvironment::of_process().with_directory_memo(self.canonical_directories())
+    }
+
     /// The workspace of the working directory. Fails when the process could
     /// not read its working directory.
     pub fn workspace(&self) -> Result<Workspace> {
         match &self.working_directory {
-            Ok(directory) => Ok(Workspace::at(directory.clone())),
+            Ok(directory) => Ok(Workspace::in_environment(
+                directory.clone(),
+                &self.root_environment(),
+            )),
             Err(error) => Err(std::io::Error::new(error.kind(), error.to_string()).into()),
         }
     }
@@ -154,16 +199,53 @@ impl Environment {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::test_support::test_environment;
+    use crate::history::provider::walk::test_support::CountingCanonicaliser;
+    use std::sync::Arc;
+
+    #[test]
+    fn commands_loads_root_environment_and_workspace_canonicalise_a_directory_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let environment = test_environment(Vec::new(), None)
+            .with_canonicaliser(canonicaliser.clone())
+            .with_working_directory(directory.path().to_path_buf())
+            .for_one_command();
+
+        environment
+            .canonical_directories()
+            .canonical(directory.path());
+        environment
+            .root_environment()
+            .directories()
+            .canonical(directory.path());
+        assert!(environment.workspace().unwrap().includes(directory.path()));
+
+        // A temporary directory inside a repository also has the
+        // repository's checkouts canonicalised for the workspace.
+        let canonicalised = canonicaliser.canonicalised();
+        let distinct: std::collections::HashSet<_> = canonicalised.iter().collect();
+        assert!(
+            canonicalised.first() == Some(&directory.path().to_path_buf())
+                && distinct.len() == canonicalised.len(),
+            "the command's loads, root environment and workspace canonicalise each directory once: {canonicalised:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
     use crate::cli::DebugLevel;
     use crate::clock::TestClock;
     use crate::history::Conversation;
+    use crate::history::provider::walk::test_support::CountingCanonicaliser;
     use crate::history::provider::walk::{SessionFiles, session_stubs};
     use crate::history::provider::{
         DiscoveredSessions, Fingerprint, RootEnvironment, SessionCache, SessionRoot, SessionStub,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
 
     /// `storages` in presentation order, the session cache under
@@ -236,12 +318,86 @@ pub(crate) mod test_support {
         storage: &dyn SessionStorage,
         cache_base: &Path,
     ) -> Vec<crate::history::Conversation> {
-        let environment = test_environment(Vec::new(), Some(cache_base));
+        load_rows_in(&test_environment(Vec::new(), Some(cache_base)), storage)
+    }
+
+    /// The paths `open` canonicalises, in order and with repeats, on a
+    /// command that starts from a cache its own load of `storage` filled.
+    pub(crate) fn canonicalised_by_opening(
+        storage: &'static dyn SessionStorage,
+        open: &dyn Fn(&Environment),
+    ) -> Vec<PathBuf> {
+        let base = tempfile::tempdir().unwrap();
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let environment = test_environment(vec![storage], Some(base.path()))
+            .with_canonicaliser(canonicaliser.clone());
+        load_rows_in(&environment, storage);
+        let after_load = canonicaliser.canonicalised().len();
+        open(&environment);
+        canonicaliser.canonicalised()[after_load..].to_vec()
+    }
+
+    /// `agent read` of the session at `path`.
+    pub(crate) fn agent_read_of(path: &Path) -> impl Fn(&Environment) {
+        let path = path.to_path_buf();
+        move |environment| {
+            crate::agent::service::AgentService::new(environment.clone())
+                .execute(crate::agent::test_support::agent_command(&[
+                    "read",
+                    &path.to_string_lossy(),
+                ]))
+                .unwrap();
+        }
+    }
+
+    /// The TUI's open of the session at `path`, a file named on the command
+    /// line.
+    pub(crate) fn direct_open_of(path: &Path) -> impl Fn(&Environment) {
+        let path = path.to_path_buf();
+        move |environment| {
+            let operation = waiting_operation(environment);
+            let read =
+                crate::history::provider::open_direct_file(environment, &path, false, &operation);
+            operation.finish().unwrap();
+            assert!(
+                matches!(
+                    read,
+                    Ok(crate::history::provider::DirectFileRead::Session { .. })
+                ),
+                "the file opens as a session"
+            );
+        }
+    }
+
+    /// The printout of `source`'s session at `path`.
+    pub(crate) fn printout_of(
+        source: crate::history::Source,
+        path: &Path,
+    ) -> impl Fn(&Environment) {
+        let path = path.to_path_buf();
+        move |environment| {
+            crate::history::printed_log_entries(
+                environment,
+                source,
+                &path,
+                false,
+                &mut std::io::sink(),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Every session `storage` holds, newest first, loaded through
+    /// `environment`.
+    pub(crate) fn load_rows_in(
+        environment: &Environment,
+        storage: &dyn SessionStorage,
+    ) -> Vec<crate::history::Conversation> {
         crate::history::provider::load_sessions(
-            &environment,
+            environment,
             storage,
             crate::history::provider::LoadOptions::default(),
-            &waiting_operation(&environment),
+            &waiting_operation(environment),
             &mut |_, _| {},
         )
         .unwrap()
@@ -282,21 +438,28 @@ pub(crate) mod test_support {
     /// `source`'s session at `locator`, with the sub-agent transcripts
     /// `subagents`, written into this test's own session cache as
     /// [`cache_sessions`] writes it, whether or not the load lists it.
-    pub(crate) fn cache_files(source: Source, locator: &Path, subagents: &[PathBuf]) {
+    /// Returns its row; `None` when the load lists none.
+    pub(crate) fn cache_files(
+        source: Source,
+        locator: &Path,
+        subagents: &[PathBuf],
+    ) -> Option<Conversation> {
         cache_sessions(
             source,
             vec![SessionFiles {
                 transcript: locator.to_path_buf(),
                 subagents: subagents.to_vec(),
             }],
-        );
+        )
+        .pop()
     }
 
     /// The session each of `rows` names, with its sub-agent transcripts,
-    /// cached as [`cache_sessions`] caches it.
-    pub(crate) fn cache_rows(rows: &[Conversation]) {
+    /// cached as [`cache_sessions`] caches it. Each row the load lists gets
+    /// the address the load lists it at.
+    pub(crate) fn cache_rows(rows: &mut [Conversation]) {
         let mut sources: Vec<Source> = Vec::new();
-        for row in rows {
+        for row in rows.iter() {
             if !sources.contains(&row.source) {
                 sources.push(row.source);
             }
@@ -310,7 +473,14 @@ pub(crate) mod test_support {
                     subagents: row.subagents.clone(),
                 })
                 .collect();
-            cache_sessions(source, sessions);
+            for listed in cache_sessions(source, sessions) {
+                for row in rows
+                    .iter_mut()
+                    .filter(|row| row.source == source && row.path == listed.path)
+                {
+                    row.cache_address = listed.cache_address.clone();
+                }
+            }
         }
     }
 
@@ -343,9 +513,10 @@ pub(crate) mod test_support {
     }
 
     /// `source`'s `sessions` cached in this test's own session cache by one
-    /// load whose discovery finds them alone, each under the directory of
-    /// its transcript. Returns their rows as the load lists them. A later
-    /// load of a directory removes the sessions this one cached there.
+    /// load whose discovery finds them alone, each under the deepest
+    /// directory holding all its files. Returns their rows as the load lists
+    /// them. A later load of a directory removes the sessions this one
+    /// cached there.
     fn cache_sessions(source: Source, sessions: Vec<SessionFiles>) -> Vec<Conversation> {
         load_rows(
             &SessionFilesStorage { source, sessions },
@@ -353,9 +524,31 @@ pub(crate) mod test_support {
         )
     }
 
-    /// The storage of `sessions`: discovery under the directory of each
-    /// session's transcript finds the sessions there and no others, and
-    /// `source`'s storage parses them.
+    /// The deepest directory holding every file of `session`.
+    fn directory_holding(session: &SessionFiles) -> PathBuf {
+        directory_holding_files(&session.transcript, &session.subagents)
+    }
+
+    /// The deepest directory holding `transcript` and `subagents`.
+    pub(crate) fn directory_holding_files(transcript: &Path, subagents: &[PathBuf]) -> PathBuf {
+        let mut directory = transcript
+            .parent()
+            .expect("a transcript in a directory")
+            .to_path_buf();
+        for subagent in subagents {
+            while !subagent.starts_with(&directory) {
+                directory = directory
+                    .parent()
+                    .expect("the session's files share a drive")
+                    .to_path_buf();
+            }
+        }
+        directory
+    }
+
+    /// The storage of `sessions`: discovery under the deepest directory
+    /// holding each session's files finds the sessions there and no others,
+    /// and `source`'s storage parses them.
     struct SessionFilesStorage {
         source: Source,
         sessions: Vec<SessionFiles>,
@@ -401,12 +594,7 @@ pub(crate) mod test_support {
         fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
             let mut roots: Vec<SessionRoot> = Vec::new();
             for session in &self.sessions {
-                let root = SessionRoot::new(
-                    session
-                        .transcript
-                        .parent()
-                        .expect("a transcript in a directory"),
-                );
+                let root = SessionRoot::new(directory_holding(session));
                 if !roots.contains(&root) {
                     roots.push(root);
                 }
@@ -421,7 +609,7 @@ pub(crate) mod test_support {
         ) -> Result<DiscoveredSessions> {
             let mut stubs = Vec::new();
             for session in &self.sessions {
-                if session.transcript.parent() == Some(root.path.as_path()) {
+                if SessionRoot::new(directory_holding(session)) == *root {
                     stubs.extend(self.stub(root, session)?);
                 }
             }

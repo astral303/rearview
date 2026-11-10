@@ -4,6 +4,7 @@ use crate::clock::Zone;
 use crate::error::SessionDatabaseFailure;
 use crate::history::MessageTimes;
 use crate::history::provider::Fingerprint;
+use crate::history::provider::walk::SystemCanonicaliser;
 use crate::search::test_fixtures::one_message_conversation;
 use chrono::{Local, TimeZone};
 use std::cell::RefCell;
@@ -113,6 +114,7 @@ impl Disk {
                 time,
                 ..Default::default()
             },
+            &SystemCanonicaliser::shared(),
             &|source, needs_reading| self.rediscover(source, needs_reading),
         )
     }
@@ -402,6 +404,7 @@ fn session_deleted_during_cache_wait_is_removed_by_refresh_consumer() {
                 &known,
                 &[Source::Pi],
                 RefreshOptions::default(),
+                environment.shared_canonicaliser(),
                 &|_, needs_reading| {
                     crate::history::provider::rediscover_sessions(
                         &environment,

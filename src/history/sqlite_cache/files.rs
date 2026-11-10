@@ -1,16 +1,15 @@
-use super::path_text;
+use super::roots::{Places, StoredPath};
 use crate::error::{AppError, Result};
 use crate::history::fingerprint::CachedFingerprint;
-use crate::history::provider::SessionRoot;
-use crate::history::provider::walk::Canonicaliser;
+use crate::history::path::path_key;
 use rusqlite::Connection;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::Path;
 
-/// The text two spellings of one session file share: its canonical path,
-/// lowercased on a file system that ignores case.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The text two spellings of one session file share: its path below its
+/// root, or its canonical path, lowercased on a file system that ignores
+/// case.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct FileKey(String);
 
 impl FileKey {
@@ -18,12 +17,13 @@ impl FileKey {
     /// rearview canonicalised, or a canonical directory joined with names
     /// beneath it.
     pub(super) fn of_canonical(path: &Path) -> Self {
-        let text = path_text(path);
-        Self(if IGNORES_CASE {
-            text.to_lowercase()
-        } else {
-            text
-        })
+        Self(path_key(path))
+    }
+
+    /// The key of `below`, a file's path below its root: two spellings of
+    /// one file share it, as they share the root's key.
+    pub(super) fn of_path_below_root(below: &Path) -> Self {
+        Self::of_canonical(below)
     }
 
     pub(super) fn as_str(&self) -> &str {
@@ -31,27 +31,17 @@ impl FileKey {
     }
 }
 
-/// Windows and macOS file systems ignore case by default; Linux's do not.
-const IGNORES_CASE: bool = cfg!(any(windows, target_os = "macos"));
-
 /// The text every spelling of one session root shares, as [`FileKey`] keys a
 /// file: the root's canonical path, lowercased on a file system that ignores
-/// case. The `sessions` table keys each session by it, so a root named with
-/// either separator, through `..` or through a link reads and writes one
-/// copy of each session.
+/// case. The `roots` table keys each root by it: a root named through `..`
+/// or through a link reads and writes the copy its canonical spelling does.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RootKey(String);
 
 impl RootKey {
-    /// The key of `root`, whose canonical path `canonicaliser` resolves once
-    /// per root.
-    pub(super) fn of(root: &SessionRoot, canonicaliser: &dyn Canonicaliser) -> Self {
-        Self(FileKey::of_canonical(root.canonical_path(canonicaliser)).0)
-    }
-
-    /// A key as the database stores it.
-    pub(super) fn stored(text: String) -> Self {
-        Self(text)
+    /// The key of the root whose canonical path is `canonical`.
+    pub(super) fn of_canonical(canonical: &Path) -> Self {
+        Self(FileKey::of_canonical(canonical).0)
     }
 
     pub(super) fn as_str(&self) -> &str {
@@ -59,59 +49,11 @@ impl RootKey {
     }
 }
 
-/// The keys of the session files one cache writer writes. A file beneath
-/// its session root joins the root's canonical path; the directory of a
-/// file outside the root is canonicalised at most once.
-pub(super) struct FileKeys {
-    canonicaliser: Arc<dyn Canonicaliser>,
-    /// Each directory's canonical path, or its spelling when it does not
-    /// resolve.
-    canonical_directories: HashMap<PathBuf, PathBuf>,
-}
-
-impl FileKeys {
-    pub(super) fn new(canonicaliser: Arc<dyn Canonicaliser>) -> Self {
-        Self {
-            canonicaliser,
-            canonical_directories: HashMap::new(),
-        }
-    }
-
-    /// The key of `file`, as discovery under the session root `root` spells
-    /// it: the root's canonical path joined with the file's path beneath
-    /// the root. A file outside the root joins its directory's canonical
-    /// path instead.
-    pub(super) fn of_file_under(&mut self, root: &SessionRoot, file: &Path) -> FileKey {
-        match file.strip_prefix(&root.path) {
-            Ok(beneath) => FileKey::of_canonical(
-                &root
-                    .canonical_path(self.canonicaliser.as_ref())
-                    .join(beneath),
-            ),
-            Err(_) => match (file.parent(), file.file_name()) {
-                (Some(directory), Some(name)) => {
-                    FileKey::of_canonical(&self.canonical(directory).join(name))
-                }
-                _ => FileKey::of_canonical(file),
-            },
-        }
-    }
-
-    fn canonical(&mut self, directory: &Path) -> &Path {
-        self.canonical_directories
-            .entry(directory.to_path_buf())
-            .or_insert_with(|| {
-                self.canonicaliser
-                    .canonicalise(directory)
-                    .unwrap_or_else(|_| directory.to_path_buf())
-            })
-    }
-}
-
 /// Fails with [`AppError::SessionCacheSourceChanged`] when a file `session`
-/// was read from no longer stamps as the cache recorded it.
-pub(super) fn validate(connection: &Connection, session: i64) -> Result<()> {
-    validate_unstamped(connection, session, &HashSet::new())
+/// was read from, at its path in `places`, no longer stamps as the cache
+/// recorded it.
+pub(super) fn validate(connection: &Connection, places: &Places, session: i64) -> Result<()> {
+    validate_unstamped(connection, places, session, &HashSet::new())
 }
 
 /// [`validate`] for the files of `session` outside `stamped`: files whose
@@ -119,25 +61,30 @@ pub(super) fn validate(connection: &Connection, session: i64) -> Result<()> {
 /// stat again.
 pub(super) fn validate_unstamped(
     connection: &Connection,
+    places: &Places,
     session: i64,
     stamped: &HashSet<&Path>,
 ) -> Result<()> {
-    let mut statement = connection.prepare(
-        "SELECT path, file_size, mtime_secs, mtime_nsecs FROM session_files WHERE session = ?1",
+    let mut statement = connection.prepare_cached(
+        "SELECT root, path, file_size, mtime_secs, mtime_nsecs FROM session_files \
+         WHERE session = ?1",
     )?;
     let mut rows = statement.query([session])?;
     while let Some(row) = rows.next()? {
-        let path = PathBuf::from(row.get::<_, String>(0)?);
+        let path = places.path(StoredPath {
+            root: row.get(0)?,
+            path: row.get(1)?,
+        })?;
         if stamped.contains(path.as_path()) {
             continue;
         }
         let expected = row
-            .get::<_, Option<i64>>(1)?
+            .get::<_, Option<i64>>(2)?
             .map(|size| {
                 Ok::<_, rusqlite::Error>(CachedFingerprint {
                     file_size: size as u64,
-                    mtime_secs: row.get::<_, i64>(2)? as u64,
-                    mtime_nsecs: row.get(3)?,
+                    mtime_secs: row.get::<_, i64>(3)? as u64,
+                    mtime_nsecs: row.get(4)?,
                 })
             })
             .transpose()?;

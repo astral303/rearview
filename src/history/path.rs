@@ -1,9 +1,172 @@
-//! Short project names from paths, and the project names
-//! `tui.exclude_projects` and `agent.exclude_projects` hide.
+//! Short project names from paths, the project names
+//! `tui.exclude_projects` and `agent.exclude_projects` hide, and paths
+//! spelled with the platform's separator.
 
 use super::Conversation;
-use std::collections::HashSet;
-use std::path::Path;
+use super::provider::walk::Canonicaliser;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// `path` with each separator spelled as the platform's own: on Windows,
+/// every `/` becomes `\`; elsewhere `path` is returned as it is. The change
+/// is a string operation and doesn't ask the file system. Environment
+/// variables, the home, current and temporary directories, session roots and
+/// a path an agent command names pass through it, so that a session path
+/// built below one doesn't mix separators. Paths read from transcripts don't
+/// pass through it.
+pub(crate) fn with_platform_separators(path: impl Into<OsString>) -> PathBuf {
+    let path = path.into();
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        const SLASH: u16 = b'/' as u16;
+        const BACKSLASH: u16 = b'\\' as u16;
+        if path.encode_wide().any(|unit| unit == SLASH) {
+            let units: Vec<u16> = path
+                .encode_wide()
+                .map(|unit| if unit == SLASH { BACKSLASH } else { unit })
+                .collect();
+            return PathBuf::from(OsString::from_wide(&units));
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Windows and macOS file systems ignore case by default; Linux's do not.
+const FILE_NAMES_IGNORE_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// The text two spellings of `path` share when both are canonical, or both
+/// lie below one directory as spelled: lowercased where file names ignore
+/// case.
+pub(crate) fn path_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if FILE_NAMES_IGNORE_CASE {
+        text.to_lowercase()
+    } else {
+        text.into_owned()
+    }
+}
+
+/// A file's path below a root, both as spelled: the names below the root,
+/// joined with the platform's separator whichever separators the path
+/// mixes. Every comparison of a path with a root goes through it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PathBelowRoot(String);
+
+impl PathBelowRoot {
+    /// `path` below `root`; `None` when `path` does not begin with `root`,
+    /// or steps through `..` below it, which only the file system
+    /// canonicalises.
+    /// `root` itself is the empty path below it.
+    pub(crate) fn of(path: &Path, root: &Path) -> Option<Self> {
+        let below = path.strip_prefix(root).ok()?;
+        let mut text = OsString::new();
+        for component in below.components() {
+            let std::path::Component::Normal(name) = component else {
+                return None;
+            };
+            if !text.is_empty() {
+                text.push(std::path::MAIN_SEPARATOR_STR);
+            }
+            text.push(name);
+        }
+        Some(Self(text.to_string_lossy().into_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+
+    /// The text two spellings of the file below one root share: the
+    /// [`path_key`] of the path below it.
+    pub(crate) fn key(&self) -> String {
+        path_key(Path::new(&self.0))
+    }
+}
+
+/// The text every spelling of one file shares: the [`path_key`] of the
+/// file's path with its directory canonical. Two rows with one identity
+/// name one file.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct FileIdentity(String);
+
+impl FileIdentity {
+    /// The identity of `path`, whose directory is canonical: a canonical
+    /// root or directory joined with the names below it.
+    pub(crate) fn of_canonical(path: &Path) -> Self {
+        Self(path_key(path))
+    }
+}
+
+/// The canonical path of each directory asked for, canonicalised once through
+/// the canonicaliser, for one command, load, lookup or workspace. Shared
+/// across threads.
+pub struct CanonicalDirectories {
+    canonicaliser: Arc<dyn Canonicaliser>,
+    /// `None` for a directory that didn't canonicalise.
+    canonical_by_directory: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+}
+
+impl CanonicalDirectories {
+    pub(crate) fn new(canonicaliser: Arc<dyn Canonicaliser>) -> Self {
+        Self {
+            canonicaliser,
+            canonical_by_directory: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Directories the file system canonicalises, for a test that doesn't
+    /// count canonicalisations.
+    #[cfg(test)]
+    pub(crate) fn of_system() -> Self {
+        Self::new(super::provider::walk::SystemCanonicaliser::shared())
+    }
+
+    /// `directory`'s canonical path; `None` when it doesn't canonicalise.
+    pub(crate) fn canonical(&self, directory: &Path) -> Option<PathBuf> {
+        let mut canonical_by_directory = self
+            .canonical_by_directory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        canonical_by_directory
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| self.canonicaliser.canonicalise(directory).ok())
+            .clone()
+    }
+
+    /// The identity of the file at `path`, named without its root: its
+    /// directory's canonical path joined with its name, or `path` as spelled
+    /// when the directory doesn't canonicalise. A bare file name sits in the
+    /// current directory.
+    pub(crate) fn file_identity(&self, path: &Path) -> FileIdentity {
+        let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+            return FileIdentity::of_canonical(path);
+        };
+        let directory = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            directory
+        };
+        match self.canonical(directory) {
+            Some(canonical) => FileIdentity::of_canonical(&canonical.join(name)),
+            None => FileIdentity::of_canonical(path),
+        }
+    }
+}
+
+impl std::fmt::Debug for CanonicalDirectories {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CanonicalDirectories")
+            .finish_non_exhaustive()
+    }
+}
 
 /// Format a path into a short display name.
 ///
@@ -81,6 +244,43 @@ impl FromIterator<String> for ExcludedProjects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_below_root_joins_names_with_platforms_separator() {
+        let root = Path::new("root");
+        let below = |path: &str| PathBelowRoot::of(Path::new(path), root);
+
+        let expected = ["2025", "01", "rollout.jsonl"].join(std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(
+            below(&format!("root{}{expected}", std::path::MAIN_SEPARATOR)).map(|place| place.0),
+            Some(expected.clone()),
+            "a path below the root keeps its names"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            below(r"root\2025/01\rollout.jsonl").map(|place| place.0),
+            Some(expected),
+            "a path mixing separators is below the root as the platform spells it"
+        );
+        assert_eq!(
+            below("root").map(|place| place.0),
+            Some(String::new()),
+            "the root is the empty path below itself"
+        );
+    }
+
+    #[test]
+    fn path_below_root_refuses_paths_the_file_system_canonicalises() {
+        let root = Path::new("root");
+
+        for path in ["root/../other/session.jsonl", "other/root"] {
+            assert_eq!(
+                PathBelowRoot::of(Path::new(path), root),
+                None,
+                "{path} is not below the root as spelled"
+            );
+        }
+    }
 
     // === format_project_short_name tests (worktree display) ===
 
@@ -168,5 +368,21 @@ mod tests {
     #[test]
     fn row_without_project_name_is_not_excluded() {
         assert!(!excluded(&["repo"]).excludes(&row_in_project(None)));
+    }
+
+    #[test]
+    fn platform_separators_replace_forward_slashes_on_windows_alone() {
+        let spelled = with_platform_separators("C:/Users/x/.claude\\projects");
+
+        let expected = if cfg!(windows) {
+            r"C:\Users\x\.claude\projects"
+        } else {
+            "C:/Users/x/.claude\\projects"
+        };
+        assert_eq!(
+            spelled.as_os_str(),
+            expected,
+            "forward slashes become the platform's separator on Windows, and stay elsewhere"
+        );
     }
 }

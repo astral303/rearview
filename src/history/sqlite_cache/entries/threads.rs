@@ -1,11 +1,12 @@
 use crate::agent::message_numbering::{NumberingCheckpoint, ThreadIdentity, ThreadNumbers};
 use crate::history::format::RecordLine;
+use crate::history::sqlite_cache::roots::{Places, StoredPath};
 use crate::log_entry::{LogEntry, SubagentIdentity};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// A `threads` row's columns besides its number: the transcript its turns
@@ -195,16 +196,24 @@ pub(super) struct StoredThreads {
     pub(super) transcripts: HashMap<i64, Arc<Path>>,
 }
 
-pub(super) fn read(connection: &Connection, session: i64) -> rusqlite::Result<StoredThreads> {
-    let transcripts: HashMap<i64, Arc<Path>> = connection
-        .prepare("SELECT id, path FROM transcripts WHERE session = ?1")?
-        .query_map([session], |row| {
-            Ok((
-                row.get(0)?,
-                Arc::from(PathBuf::from(row.get::<_, String>(1)?)),
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+/// The threads of `session`, with the transcripts they came from at their
+/// paths in `places`.
+pub(super) fn read(
+    connection: &Connection,
+    session: i64,
+    places: &Places,
+) -> crate::error::Result<StoredThreads> {
+    let mut transcripts: HashMap<i64, Arc<Path>> = HashMap::new();
+    let mut statement =
+        connection.prepare_cached("SELECT id, root, path FROM transcripts WHERE session = ?1")?;
+    let mut rows = statement.query([session])?;
+    while let Some(row) = rows.next()? {
+        let path = places.path(StoredPath {
+            root: row.get(1)?,
+            path: row.get(2)?,
+        })?;
+        transcripts.insert(row.get(0)?, Arc::from(path));
+    }
     let threads = connection
         .prepare(
             "SELECT id, transcript, label, nickname, role, agent_path, agent_id, launch_call \

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 /// The debug log file, `~/.local/state/<app>/debug.log` on every platform, or
 /// `None` without a home directory.
+#[allow(clippy::disallowed_methods)]
 pub fn debug_log_path() -> Option<PathBuf> {
     let home = home::home_dir()?;
     Some(

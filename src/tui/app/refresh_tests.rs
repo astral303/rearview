@@ -1,4 +1,6 @@
-use super::claude_home::{ClaudeHome, admitted_cache, another_rearview, app_reading};
+use super::claude_home::{
+    ClaudeHome, admitted_cache, another_rearview, app_reading, serve_list_refresh,
+};
 use super::refresh_state::AppliedChanges;
 use super::*;
 use crate::clock::TestClock;
@@ -586,50 +588,33 @@ fn row_waiting_for_another_refresh_is_refreshed_once_it_completes() {
     assert_eq!(listed_names(&app), ["b", "a"]);
 }
 
-/// A list `Ctrl+R` of `app` under `window`, run as the background worker
-/// runs it.
-pub(super) fn serve_list_refresh(app: &mut App, window: TimeFilter) {
-    let known = app.begin_refresh().expect("a list refresh begins");
-    let environment = app.environment.clone();
-    let outcome = std::thread::spawn(move || {
-        let operation = crate::history::OperationScope::new(
-            environment.cache_base(),
-            crate::history::Patience::UntilAcquired,
-            Arc::default(),
-        );
-        let options = crate::history::RefreshOptions {
-            time: window,
-            ..Default::default()
-        };
-        let outcome = crate::history::refresh_sessions(&environment, &known, options, &operation)
-            .map(|changes| RefreshOutcome::Changes(Box::new(changes)));
-        operation.finish().and(outcome)
-    })
-    .join()
-    .unwrap();
-    app.finish_refresh(outcome);
-}
-
 #[test]
 fn load_and_refresh_canonicalise_root_alone_whatever_sub_agent_count() {
     let single = directories_canonicalised(1);
     let multiple = directories_canonicalised(4);
 
     let root = std::slice::from_ref(&single.root);
-    assert_eq!(single.cold_load, root, "a cold load resolves the root once");
+    assert_eq!(
+        single.cold_load,
+        [single.cache_directory.clone(), single.root.clone()],
+        "a cold load canonicalises the cache directory and the root once each"
+    );
     assert_eq!(
         single.warm_load, root,
-        "a warm load resolves the root its sessions are keyed under once"
+        "a warm load canonicalises the root its sessions are keyed under once"
     );
-    assert_eq!(single.refresh, root, "a refresh resolves the root once");
+    assert_eq!(
+        single.refresh, root,
+        "a refresh canonicalises the root once"
+    );
     assert_eq!(
         (
             multiple.cold_load.len(),
             multiple.warm_load.len(),
             multiple.refresh.len()
         ),
-        (1, 1, 1),
-        "four sessions of four sub-agents each resolve no more: {multiple:?}"
+        (2, 1, 1),
+        "four sessions of four sub-agents each canonicalise the same number of paths as one session: {multiple:?}"
     );
 }
 
@@ -637,6 +622,7 @@ fn load_and_refresh_canonicalise_root_alone_whatever_sub_agent_count() {
 #[derive(Debug)]
 struct Canonicalised {
     root: PathBuf,
+    cache_directory: PathBuf,
     cold_load: Vec<PathBuf>,
     warm_load: Vec<PathBuf>,
     refresh: Vec<PathBuf>,
@@ -659,7 +645,8 @@ fn directories_canonicalised(sessions: usize) -> Canonicalised {
         .collect();
     let canonicaliser = Arc::new(CountingCanonicaliser::default());
     let environment = home.environment().with_canonicaliser(canonicaliser.clone());
-    let since = |earlier: usize| canonicaliser.resolved()[earlier..].to_vec();
+    let cache_directory = environment.cache_base().path().to_path_buf();
+    let since = |earlier: usize| canonicaliser.canonicalised()[earlier..].to_vec();
 
     let rows = home.rows(&environment);
     let cold_load = since(0);
@@ -677,6 +664,7 @@ fn directories_canonicalised(sessions: usize) -> Canonicalised {
     );
     Canonicalised {
         root: home.root().path,
+        cache_directory,
         cold_load,
         warm_load,
         refresh,
@@ -1012,7 +1000,6 @@ fn refresh_that_finishes_in_viewer_applies_back_in_list() {
         PathBuf::from("/sessions/a.jsonl"),
         Some(Source::Claude),
         Some("a".to_owned()),
-        Vec::new(),
         ToolDisplayMode::Hidden,
         false,
     ));

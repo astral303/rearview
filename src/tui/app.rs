@@ -42,9 +42,9 @@ use search_state::{
 };
 #[allow(unused_imports)]
 pub use types::{
-    Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, LIST_LINES_PER_ITEM, ListScope,
-    ListSearchMode, LoadingState, OpenSessionStatus, SemanticProgress, SemanticResultMetadata,
-    TuiSearchOptions, ViewSearchMode, ViewState, list_lines_per_item,
+    Action, AppMode, CopyRow, CountHighlight, DialogMode, DirectFile, Focus, LIST_LINES_PER_ITEM,
+    ListScope, ListSearchMode, LoadingState, OpenSessionStatus, SemanticProgress,
+    SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewState, list_lines_per_item,
 };
 
 /// App state
@@ -461,14 +461,7 @@ impl App {
         environment: Environment,
     ) -> Self {
         let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
-        let mut view = ViewState::initial(
-            file.canonical,
-            None,
-            None,
-            Vec::new(),
-            tool_display,
-            show_thinking,
-        );
+        let mut view = ViewState::initial(file.canonical, None, None, tool_display, show_thinking);
         view.parsed_conversation = Some(Arc::new(crate::tui::viewer::ParsedConversation::empty()));
         view.is_copy_missing = true;
         let conversations = Vec::new();

@@ -216,11 +216,13 @@ pub fn render_to_terminal(
     file_path: &Path,
     options: &DisplayOptions,
     clock: &dyn Clock,
+    environment: &crate::history::provider::RootEnvironment,
 ) -> Result<()> {
     let rendered = RenderedFile(());
     let conversation = parse_unattributed_conversation_file(
         crate::history::ParsePermit::rendered_file(&rendered),
         file_path,
+        environment,
     )?;
     let lines = rendered_ledger_lines(&conversation, options, terminal_content_width(), clock);
     write_through_pager(options.use_pager, |writer| {
@@ -307,8 +309,14 @@ mod tests {
         let row = rows.iter().find(|row| row.path == a).unwrap();
         home.append(&a, 6, "newest question");
 
-        let printed =
-            crate::history::printed_log_entries(&environment, row.source, &a, false).unwrap();
+        let printed = crate::history::printed_log_entries(
+            &environment,
+            row.source,
+            &a,
+            false,
+            &mut std::io::sink(),
+        )
+        .unwrap();
 
         assert!(
             serde_json::to_string(&printed.entries)
@@ -318,16 +326,250 @@ mod tests {
         );
         let copy = crate::history::sqlite_cache::find_cached_session_waiting(
             environment.cache_base(),
-            row.source,
-            &a,
-            &row.subagents,
+            row.cache_address.as_ref().unwrap(),
         )
         .unwrap()
         .expect("the cache holds the session");
+        let currency = copy
+            .currency(&crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: row.subagents.clone(),
+            })
+            .unwrap();
         assert!(
-            copy.matches_source().unwrap(),
-            "the printout refreshes the session's cached copy"
+            matches!(
+                currency,
+                Some(crate::history::sqlite_cache::Currency::Newer { .. })
+            ),
+            "the printout refreshes the session's cached copy: {currency:?}"
         );
+    }
+
+    /// A Claude Code session cached in its own session cache before it
+    /// started a sub-agent.
+    struct SessionWithNewSubAgent {
+        home: crate::tui::claude_home::ClaudeHome,
+        cache: tempfile::TempDir,
+        transcript: std::path::PathBuf,
+    }
+
+    impl SessionWithNewSubAgent {
+        fn new() -> Self {
+            let home = crate::tui::claude_home::ClaudeHome::new();
+            let transcript = home.write("a", 5, &["first question"]);
+            let session = Self {
+                home,
+                cache: crate::tui::claude_home::admitted_cache(),
+                transcript,
+            };
+            session.home.rows(&session.environment());
+            session
+                .home
+                .write_subagent(&session.transcript, "explore", 6, &["sub-agent question"]);
+            session
+        }
+
+        fn environment(&self) -> crate::history::Environment {
+            self.home.environment_with_cache(
+                self.cache.path(),
+                crate::history::ProcessIdentity::default(),
+                std::sync::Arc::new(crate::clock::TestClock::default()),
+            )
+        }
+
+        /// The printout of the session, its entries as JSON, and the notices
+        /// it wrote.
+        fn printed(&self) -> crate::error::Result<(String, String)> {
+            let mut notices = Vec::new();
+            let printed = crate::history::printed_log_entries(
+                &self.environment(),
+                crate::history::Source::Claude,
+                &self.transcript,
+                false,
+                &mut notices,
+            )?;
+            Ok((
+                serde_json::to_string(&printed.entries).unwrap(),
+                String::from_utf8(notices).unwrap(),
+            ))
+        }
+
+        /// `read`'s result while another rearview owns the cache's refresh.
+        fn beside_another_refresh<T>(&self, read: impl FnOnce() -> T) -> T {
+            let other_refresh =
+                crate::history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
+                    &crate::tui::claude_home::another_rearview(
+                        self.cache.path(),
+                        std::sync::Arc::new(crate::clock::TestClock::default()),
+                    ),
+                )
+                .unwrap();
+            let result = read();
+            drop(other_refresh);
+            result
+        }
+
+        /// The notice of the printout of an older copy, for `reason`.
+        fn older_copy_notice(&self, reason: &str) -> String {
+            format!(
+                "Showing an older cached copy of {}: {reason}\n",
+                self.transcript.display()
+            )
+        }
+    }
+
+    #[test]
+    fn printout_of_session_with_new_sub_agent_prints_it() {
+        let session = SessionWithNewSubAgent::new();
+
+        let (entries, notices) = session.printed().unwrap();
+
+        assert!(entries.contains("sub-agent question"), "{entries}");
+        assert_eq!(notices, "");
+    }
+
+    /// The printout of a session that started a sub-agent since it was
+    /// cached, whose refresh reads on from the copy and fails to write,
+    /// prints the older copy and names it on one line.
+    #[test]
+    fn printout_whose_resumed_refresh_write_fails_prints_older_copy_with_notice() {
+        let session = SessionWithNewSubAgent::new();
+        let _failing =
+            crate::history::sqlite_cache::connection::test_hooks::fail_the_first_data_commit(
+                session.cache.path(),
+                || {},
+            );
+
+        let (entries, notices) = session.printed().unwrap();
+
+        assert!(
+            entries.contains("first question") && !entries.contains("sub-agent question"),
+            "{entries}"
+        );
+        assert_eq!(
+            notices,
+            session.older_copy_notice("rearview could not update it in the session cache")
+        );
+    }
+
+    /// The printout of a session whose transcript changes once its refresh
+    /// has written the copy prints that copy, without a notice: the refresh
+    /// published it.
+    #[test]
+    fn printout_prints_copy_its_refresh_published_when_transcript_changes_after_the_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let session = SessionWithNewSubAgent::new();
+        let transcript = session.transcript.clone();
+        let has_appended = Arc::new(AtomicBool::new(false));
+        let _appending = crate::history::sqlite_cache::connection::test_hooks::on_every_connection(
+            session.cache.path(),
+            move |connection| {
+                if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+                    return;
+                }
+                let changes_data = Arc::new(AtomicBool::new(false));
+                let changed = Arc::clone(&changes_data);
+                connection
+                    .update_hook(Some(
+                        move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                            if table != "refresh_state" {
+                                changed.store(true, Ordering::SeqCst);
+                            }
+                        },
+                    ))
+                    .unwrap();
+                let (transcript, has_appended) = (transcript.clone(), Arc::clone(&has_appended));
+                connection
+                    .commit_hook(Some(move || {
+                        if changes_data.swap(false, Ordering::SeqCst)
+                            && !has_appended.swap(true, Ordering::SeqCst)
+                        {
+                            let mut file = std::fs::OpenOptions::new()
+                                .append(true)
+                                .open(&transcript)
+                                .unwrap();
+                            std::io::Write::write_all(&mut file, b"{}\n").unwrap();
+                        }
+                        false
+                    }))
+                    .unwrap();
+            },
+        );
+
+        let (entries, notices) = session.printed().unwrap();
+
+        assert!(entries.contains("sub-agent question"), "{entries}");
+        assert_eq!(notices, "");
+    }
+
+    /// The printout of a session the cache never held, whose refresh fails
+    /// to write, prints the session the refresh parsed, without a notice.
+    #[test]
+    fn printout_of_session_cache_never_held_whose_write_fails_prints_its_parse() {
+        let session = SessionWithNewSubAgent::new();
+        let never_cached = SessionWithNewSubAgent {
+            transcript: session.home.write("b", 7, &["unseen question"]),
+            ..session
+        };
+        let _failing =
+            crate::history::sqlite_cache::connection::test_hooks::fail_the_first_data_commit(
+                never_cached.cache.path(),
+                || {},
+            );
+
+        let (entries, notices) = never_cached.printed().unwrap();
+
+        assert!(entries.contains("unseen question"), "{entries}");
+        assert_eq!(notices, "");
+    }
+
+    /// Beside another rearview's refresh, the printout of a session that
+    /// started a sub-agent since it was cached prints the older copy and
+    /// names it on one line.
+    #[test]
+    fn printout_beside_another_refresh_prints_older_copy_with_notice() {
+        let session = SessionWithNewSubAgent::new();
+
+        let (entries, notices) = session.beside_another_refresh(|| session.printed().unwrap());
+
+        assert!(
+            entries.contains("first question") && !entries.contains("sub-agent question"),
+            "{entries}"
+        );
+        assert_eq!(
+            notices,
+            session.older_copy_notice("another rearview is refreshing the session cache")
+        );
+    }
+
+    /// Beside another rearview's refresh, the printout of a session whose
+    /// copy another rearview refreshed after it started a sub-agent prints
+    /// that copy as current.
+    #[test]
+    fn printout_beside_another_refresh_prints_copy_another_rearview_published() {
+        let session = SessionWithNewSubAgent::new();
+        session.home.rows(&session.environment());
+
+        let (entries, notices) = session.beside_another_refresh(|| session.printed().unwrap());
+
+        assert!(entries.contains("sub-agent question"), "{entries}");
+        assert_eq!(notices, "");
+    }
+
+    /// Beside another rearview's refresh, the printout of a session the
+    /// cache never held fails: the cache doesn't hold a copy, and the
+    /// printout may not parse the session.
+    #[test]
+    fn printout_beside_another_refresh_fails_for_session_cache_never_held() {
+        let session = SessionWithNewSubAgent::new();
+        let never_cached = SessionWithNewSubAgent {
+            transcript: session.home.write("b", 7, &["unseen question"]),
+            ..session
+        };
+
+        let printed = never_cached.beside_another_refresh(|| never_cached.printed());
+
+        assert!(printed.is_err(), "{printed:?}");
     }
 
     /// `--render` has no expand gesture, so a task report prints whole with
@@ -344,8 +586,12 @@ mod tests {
         })
         .to_string();
         std::fs::write(&path, format!("{notification}\n")).unwrap();
-        let conversation =
-            parse_unattributed_conversation_file(crate::history::FOR_FIXTURES, &path).unwrap();
+        let conversation = parse_unattributed_conversation_file(
+            crate::history::FOR_FIXTURES,
+            &path,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .unwrap();
 
         for no_tools in [true, false] {
             let options = DisplayOptions {
@@ -386,9 +632,12 @@ mod tests {
         };
         let project = tempfile::tempdir().unwrap();
         let (transcript, _) = write_launch_session(project.path());
-        let session =
-            crate::history::sniffed_display_log_entries(crate::history::FOR_FIXTURES, &transcript)
-                .unwrap();
+        let session = crate::history::sniffed_display_log_entries(
+            crate::history::FOR_FIXTURES,
+            &transcript,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .unwrap();
 
         let printed = printout(session, &DisplayOptions::default(), DisplayFormat::Plain);
 
@@ -414,6 +663,7 @@ mod tests {
             row.source,
             &row.path,
             false,
+            &mut std::io::sink(),
         )
         .unwrap();
         let printed = printout(session, &DisplayOptions::default(), DisplayFormat::Plain);
@@ -435,9 +685,12 @@ mod tests {
                 .join("\n"),
         )
         .unwrap();
-        let session =
-            crate::history::sniffed_display_log_entries(crate::history::FOR_FIXTURES, &path)
-                .unwrap();
+        let session = crate::history::sniffed_display_log_entries(
+            crate::history::FOR_FIXTURES,
+            &path,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .unwrap();
 
         let text = printout(session, &DisplayOptions::default(), DisplayFormat::Plain);
 

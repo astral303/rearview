@@ -2,11 +2,12 @@
 //! session is listed exactly when it was found by its session ID, is already
 //! listed, or has a message inside the window.
 
-use super::claude_home::{ClaudeHome, TemplateCache, admitted_cache, app_reading};
+use super::claude_home::{
+    ClaudeHome, TemplateCache, admitted_cache, app_reading, serve_list_refresh,
+};
 use super::commit_failure_tests::{launched_app, tick_until_no_refresh_is_pending};
 use super::refresh_tests::{
-    refresh_a_new_session_with_an_old_copy, serve_list_refresh, serve_session_refresh,
-    window_from_half_past_noon,
+    refresh_a_new_session_with_an_old_copy, serve_session_refresh, window_from_half_past_noon,
 };
 use super::*;
 use crate::agent::service::AgentService;

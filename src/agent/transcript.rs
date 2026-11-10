@@ -181,15 +181,15 @@ impl AgentTranscript {
     #[cfg(test)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let transcript =
-            crate::history::format::sniffed_session_entries(crate::history::FOR_FIXTURES, path)
-                .map_err(|error| transcript_error(path, error))?
-                .ok_or_else(|| {
-                    unrecognized_transcript(
-                        path,
-                        "not a transcript of any supported agent".to_owned(),
-                    )
-                })?;
+        let transcript = crate::history::format::sniffed_session_entries(
+            crate::history::FOR_FIXTURES,
+            path,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .map_err(|error| transcript_error(path, error))?
+        .ok_or_else(|| {
+            unrecognized_transcript(path, "not a transcript of any supported agent".to_owned())
+        })?;
         Self::from_transcript_entries(path, transcript)
     }
 
@@ -240,39 +240,41 @@ impl AgentTranscript {
         subagents: &[PathBuf],
     ) -> Result<Self> {
         let path = path.as_ref();
-        crate::history::environment::test_support::cache_files(source, path, subagents);
+        let row = crate::history::environment::test_support::cache_files(source, path, subagents);
+        let Some(address) = row.and_then(|row| row.cache_address) else {
+            return CachedTranscript::NotCached.into_copy(&path.to_string_lossy());
+        };
         Self::load_cached_as_is(
             &crate::history::environment::test_support::test_cache_base(),
-            source,
+            &address,
             path,
         )?
         .into_copy(&path.to_string_lossy())
     }
 
-    /// The transcript at `path`, attributed to `source`, as the cache under
-    /// `base` holds it: its copy, with the sub-agents the copy lists, whether
+    /// The transcript at `path`, kept at `address`, as the cache under `base`
+    /// holds it: its newest copy, with the sub-agents the copy lists, whether
     /// or not the transcript changed since. Parses nothing. Fails at once
     /// with a busy error while the database is exclusively locked, as during
     /// a rebuild.
     pub fn load_cached_as_is(
         base: &crate::history::CacheBase,
-        source: crate::history::Source,
+        address: &crate::history::sqlite_cache::SessionAddress,
         path: impl AsRef<Path>,
     ) -> Result<CachedTranscript> {
         let path = path.as_ref();
-        let stored = crate::history::sqlite_cache::find_cached_session_as_is_without_waiting(
-            base, source, path,
-        )?
-        .map(|cached| cached.numbered_entries(None))
-        .transpose()?
-        .flatten();
+        let stored =
+            crate::history::sqlite_cache::find_cached_session_as_is_without_waiting(base, address)?
+                .map(|cached| cached.numbered_entries(None))
+                .transpose()?
+                .flatten();
         match stored {
             Some(stored) => Self::from_stored(path, stored).map(CachedTranscript::Copy),
             None => Ok(CachedTranscript::NotCached),
         }
     }
 
-    fn from_transcript_entries(
+    pub(crate) fn from_transcript_entries(
         path: &Path,
         transcript: crate::history::TranscriptEntries,
     ) -> Result<Self> {
@@ -2144,7 +2146,7 @@ mod tests {
     fn two_sub_agents_sharing_label_are_two_threads_each_naming_its_launch() {
         let turn = |transcript: &str, text: &str, launch_call: &str| {
             let record = RecordLine {
-                transcript: Some(std::sync::Arc::from(Path::new(transcript))),
+                transcript: Some(Arc::from(Path::new(transcript))),
                 line: 1,
             };
             let entry = LogEntry::Progress {

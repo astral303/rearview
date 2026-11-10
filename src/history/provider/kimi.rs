@@ -14,6 +14,7 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::format::{self, SessionFormat, kimi};
+use crate::history::path::PathBelowRoot;
 use crate::history::{ParsePermit, Source, parser};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -92,8 +93,12 @@ impl SessionProvider for KimiProvider {
         Capability::Capable(self)
     }
 
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, &KimiStorage, session_id)
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, &KimiStorage, environment, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -169,11 +174,15 @@ impl SessionDeleter for KimiProvider {
 impl SubagentFinder for KimiProvider {
     /// Every other agent's wire in the session directory of a main wire. A
     /// sub-agent's wire, and a wire in a directory without a main wire, have
-    /// none.
+    /// none. Every wire the listing names, and `locator`, begin with the
+    /// session directory as `locator` spells it: the main wire is the one
+    /// with `locator`'s path below it, its names and separators compared by
+    /// the platform's rule.
     fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
         let session_dir = kimi::wire_location(locator).session_dir;
+        let below = |path: &Path| Some(PathBelowRoot::of(path, &session_dir)?.key());
         Ok(match session_directory(&SystemLister, &session_dir)? {
-            SessionDirectory::Session(files) if format::same_file(&files.transcript, locator) => {
+            SessionDirectory::Session(files) if below(&files.transcript) == below(locator) => {
                 files.subagents
             }
             SessionDirectory::Session(_) | SessionDirectory::NoMainWire(_) => Vec::new(),
@@ -1058,6 +1067,127 @@ pub(super) mod tests {
         }
     }
 
+    /// Every agent's wire is `wire.jsonl`, in a directory per agent: only the
+    /// main agent's names the sub-agents. On a file system that ignores
+    /// case, the main wire named in another case still names them.
+    #[test]
+    fn only_main_agents_wire_names_sub_agents() {
+        let home = tempfile::tempdir().unwrap();
+        let ids = KimiFixture.ids();
+        let main_wire = KimiFixture.write_session(home.path(), ids.session);
+        let subagent = KimiFixture.write_subagent(home.path(), ids.session);
+
+        assert_eq!(
+            KimiProvider.subagent_transcripts(&main_wire).unwrap(),
+            std::slice::from_ref(&subagent),
+            "the main wire names its sub-agent"
+        );
+        assert_eq!(
+            KimiProvider.subagent_transcripts(&subagent).unwrap(),
+            [] as [PathBuf; 0],
+            "the sub-agent's wire names none"
+        );
+        if cfg!(any(windows, target_os = "macos")) {
+            let other_case = main_wire.with_file_name(
+                main_wire
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_uppercase(),
+            );
+            assert_eq!(
+                KimiProvider.subagent_transcripts(&other_case).unwrap(),
+                [subagent],
+                "the main wire named in another case names its sub-agent"
+            );
+        }
+    }
+
+    /// A session in Kimi's legacy second root, opened by `agent read`, the
+    /// printout and the TUI's open of a named file, through the path as
+    /// typed and through its canonical path. `agent read`'s refresh reads
+    /// below the roots its key discovery canonicalised. Each route starts
+    /// from a cache its own load filled, and its canonicalisations are
+    /// listed in order.
+    #[test]
+    fn session_in_second_root_opens_canonicalising_each_root_once_per_route() {
+        use crate::history::environment::test_support::{
+            agent_read_of, canonicalised_by_opening, direct_open_of, printout_of,
+        };
+        use crate::history::provider::walk::test_support::{
+            OpeningCanonicalisations, assert_canonicalised,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let roots = [".kimi-code", ".kimi"].map(|name| home.path().join(name).join("sessions"));
+        let wire = write_session(&home.path().join(".kimi"), SESSION, "kimi title", false);
+        let canonical_wire = crate::history::provider::walk::SystemCanonicaliser::shared()
+            .canonicalise(&wire)
+            .unwrap();
+        let canonical_directory = canonical_wire.parent().unwrap().to_path_buf();
+        let spelled_alike = canonical_wire == wire;
+        let project = Path::new(PROJECT);
+        let [first_root, second_root] = [roots[0].as_path(), roots[1].as_path()];
+        let storage: &'static dyn SessionStorage =
+            Box::leak(Box::new(crate::history::provider::WatchedStorage {
+                inner: &KimiStorage,
+                roots: roots
+                    .iter()
+                    .map(|root| SessionRoot::new(root).in_agent_tree())
+                    .collect(),
+                watch: Default::default(),
+            }));
+        let read = |path: &Path| canonicalised_by_opening(storage, &agent_read_of(path));
+        let printout =
+            |path: &Path| canonicalised_by_opening(storage, &printout_of(Source::Kimi, path));
+        let direct_open = |path: &Path| canonicalised_by_opening(storage, &direct_open_of(path));
+        let expected = OpeningCanonicalisations {
+            key_discovery: vec![
+                (first_root, "key discovery: the first root"),
+                (second_root, "key discovery: the second root"),
+                (
+                    project,
+                    "key discovery: the session's recorded project directory",
+                ),
+            ],
+            canonical_directory: (!spelled_alike).then_some((
+                canonical_directory.as_path(),
+                "the canonical path's directory, compared with each key's file because the \
+                 path doesn't match a key's text",
+            )),
+            canonicalised_again: Vec::new(),
+            record_placement: vec![(
+                second_root,
+                "the record placement in the root holding the file",
+            )],
+        };
+        let search_for_the_files_root = [
+            (first_root, "the search for the file's root: the first root"),
+            (
+                second_root,
+                "the search for the file's root: the second root",
+            ),
+        ];
+
+        assert_canonicalised(&read(&wire), &expected.agent_read());
+        assert_canonicalised(&printout(&wire), &expected.printout());
+        let opened_directly = [
+            (first_root, "the TUI's open: the first root"),
+            (second_root, "the TUI's open: the second root"),
+        ];
+        assert_canonicalised(&direct_open(&wire), &opened_directly);
+        assert_canonicalised(
+            &read(&canonical_wire),
+            &expected.agent_read_by_canonical_path(),
+        );
+        let by_canonical_path = if spelled_alike {
+            expected.printout()
+        } else {
+            search_for_the_files_root.to_vec()
+        };
+        assert_canonicalised(&printout(&canonical_wire), &by_canonical_path);
+        assert_canonicalised(&direct_open(&canonical_wire), &opened_directly);
+    }
+
     #[test]
     fn session_roots_are_both_kimi_homes_or_override() {
         let home = Path::new("/home/user");
@@ -1662,8 +1792,11 @@ pub(super) mod tests {
     /// An id joined to a workspace directory would otherwise be a path.
     #[test]
     fn id_that_is_not_session_directory_name_resolves_to_nothing() {
-        let resolve =
-            |query| super::super::resolve_in_storage(&KimiProvider, &KimiStorage, query).unwrap();
+        let environment = RootEnvironment::of_process();
+        let resolve = |query| {
+            super::super::resolve_in_storage(&KimiProvider, &KimiStorage, &environment, query)
+                .unwrap()
+        };
         assert_eq!(resolve("session_../escape"), None);
         assert_eq!(resolve("wire.jsonl"), None);
     }

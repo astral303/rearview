@@ -53,6 +53,10 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
         has_transient_read_error: false,
         is_missing_earlier_turns: false,
         cached_session: None,
+        cache_address: None,
+        publication: crate::history::sqlite_cache::Publication::Unpublished {
+            discovered: Vec::new(),
+        },
     }
 }
 
@@ -60,8 +64,13 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
 /// sessions again through `home`, whose sessions a load cached first.
 fn app_with_conversation(home: &ClaudeHome, path: PathBuf, custom_title: Option<String>) -> App {
     let environment = home.environment();
-    home.rows(&environment);
-    app_reading(vec![test_conversation(path, custom_title)], environment)
+    let listed = home.rows(&environment);
+    let mut row = test_conversation(path, custom_title);
+    row.cache_address = listed
+        .into_iter()
+        .find(|listed| listed.path == row.path)
+        .and_then(|listed| listed.cache_address);
+    app_reading(vec![row], environment)
 }
 
 fn write_conversation(path: &std::path::Path, title: Option<&str>) {
@@ -270,8 +279,8 @@ fn app_listing(rows: Vec<Conversation>, tool_display: ToolDisplayMode) -> App {
 
 /// [`app_listing`], with each row's session cached first by a load, as the
 /// viewer reads it.
-fn app_over_cached_sessions(rows: Vec<Conversation>, tool_display: ToolDisplayMode) -> App {
-    cache_rows(&rows);
+fn app_over_cached_sessions(mut rows: Vec<Conversation>, tool_display: ToolDisplayMode) -> App {
+    cache_rows(&mut rows);
     app_listing(rows, tool_display)
 }
 
@@ -397,11 +406,11 @@ fn semantic_ranked_selection_opens_selected_conversation_and_returns() {
     let second = dir.path().join("second.jsonl");
     write_named_conversation(&first, "first body");
     write_named_conversation(&second, "second body");
-    let rows = vec![
+    let mut rows = vec![
         test_conversation(first.clone(), None),
         test_conversation(second.clone(), None),
     ];
-    cache_rows(&rows);
+    cache_rows(&mut rows);
     let mut app = App::new_with_options(
         rows,
         ToolDisplayMode::Hidden,
@@ -1855,7 +1864,7 @@ fn file_opened_by_non_canonical_path_shows_and_copies_path_as_typed() {
         .join("..")
         .join(project.file_name().unwrap())
         .join(transcript.file_name().unwrap());
-    let file = DirectFile::resolve(typed.clone(), environment.canonicaliser()).unwrap();
+    let file = DirectFile::canonicalise(typed.clone(), environment.canonicaliser()).unwrap();
     assert_ne!(file.canonical, typed, "the typed path is not canonical");
     let mut app = App::new_single_file(
         file,
@@ -1889,6 +1898,43 @@ fn file_opened_by_non_canonical_path_shows_and_copies_path_as_typed() {
         copied,
         vec![typed_text],
         "path copy (`Y`) copies the path as typed"
+    );
+}
+
+/// `rearview <file>` canonicalises the typed path once, as it opens, then
+/// reads the session by finding the canonical path below a root: the read
+/// canonicalises the root and the cache directory, not the file.
+#[test]
+fn file_opened_directly_canonicalises_typed_path_once_and_its_root() {
+    use crate::history::provider::walk::test_support::CountingCanonicaliser;
+    let home = ClaudeHome::new();
+    let transcript = home.write("a", 5, &["a question"]);
+    let canonicaliser = Arc::new(CountingCanonicaliser::default());
+    let environment = home.environment().with_canonicaliser(canonicaliser.clone());
+    let cache_directory = environment.cache_base().path().to_path_buf();
+    let file = DirectFile::canonicalise(transcript.clone(), environment.canonicaliser()).unwrap();
+    let mut app = App::new_single_file(
+        file,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        environment,
+    );
+
+    app.serve_direct_file_read();
+    app.complete_pending_view_refresh(20);
+
+    let AppMode::View(state) = app.app_mode() else {
+        unreachable!()
+    };
+    assert!(
+        state.parsed_conversation.is_some() && !state.is_copy_missing,
+        "the viewer reads the session"
+    );
+    assert_eq!(
+        canonicaliser.canonicalised(),
+        [transcript, home.root().path, cache_directory],
+        "the open canonicalises the typed path, the root and the cache directory, each once"
     );
 }
 
@@ -1989,8 +2035,8 @@ fn right_arrow_expands_focused_subagent_reply_and_left_arrow_collapses_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reply.jsonl");
     write_subagent_reply_conversation(&path);
-    let rows = vec![test_conversation(path, None)];
-    cache_rows(&rows);
+    let mut rows = vec![test_conversation(path, None)];
+    cache_rows(&mut rows);
     let show_thinking = true;
     let mut app = App::new_with_options(
         rows,

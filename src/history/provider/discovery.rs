@@ -1,18 +1,24 @@
-//! Where a provider keeps its sessions.
+//! Provider session locations.
 
-use super::walk::Canonicaliser;
+use super::walk::{Canonicaliser, SystemCanonicaliser};
+use crate::history::path::{CanonicalDirectories, PathBelowRoot, with_platform_separators};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// The environment variables and the home, current and temporary
-/// directories a provider resolves its roots from. Tests build their own,
-/// since a parallel test run cannot set the process environment.
+/// directories a provider resolves its roots from, each spelled with the
+/// platform's separator. Tests build their own, since a parallel test run
+/// cannot set the process environment.
 pub struct RootEnvironment<'a> {
     variable: &'a dyn Fn(&str) -> Option<OsString>,
     home: Option<PathBuf>,
     current_dir: Option<PathBuf>,
     temp_dir: Option<PathBuf>,
+    /// The memo this environment canonicalises directories through: the
+    /// command's, when an [`Environment`](crate::history::Environment) made
+    /// for one command made this environment.
+    directories: Arc<CanonicalDirectories>,
 }
 
 impl RootEnvironment<'static> {
@@ -23,19 +29,19 @@ impl RootEnvironment<'static> {
     #[allow(clippy::disallowed_methods)]
     pub fn of_process() -> Self {
         #[cfg(test)]
-        return Self {
-            variable: &no_variable,
-            home: Some(test_home::directory()),
-            current_dir: std::env::current_dir().ok(),
-            temp_dir: Some(std::env::temp_dir()),
-        };
+        return Self::with_directories(
+            &no_variable,
+            Some(test_home::directory()),
+            std::env::current_dir().ok(),
+            Some(std::env::temp_dir()),
+        );
         #[cfg(not(test))]
-        Self {
-            variable: &process_variable,
-            home: home::home_dir(),
-            current_dir: std::env::current_dir().ok(),
-            temp_dir: Some(std::env::temp_dir()),
-        }
+        Self::with_directories(
+            &process_variable,
+            home::home_dir(),
+            std::env::current_dir().ok(),
+            Some(std::env::temp_dir()),
+        )
     }
 }
 
@@ -74,16 +80,61 @@ impl<'a> RootEnvironment<'a> {
         home: Option<PathBuf>,
         current_dir: Option<PathBuf>,
     ) -> Self {
+        Self::with_directories(variable, home, current_dir, None)
+    }
+
+    /// This environment with `temp_dir` as the temporary directory.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_temp_dir(self, temp_dir: PathBuf) -> Self {
         Self {
-            variable,
-            home,
-            current_dir,
-            temp_dir: None,
+            temp_dir: Some(with_platform_separators(temp_dir)),
+            ..self
         }
     }
 
+    fn with_directories(
+        variable: &'a dyn Fn(&str) -> Option<OsString>,
+        home: Option<PathBuf>,
+        current_dir: Option<PathBuf>,
+        temp_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            variable,
+            home: home.map(with_platform_separators),
+            current_dir: current_dir.map(with_platform_separators),
+            temp_dir: temp_dir.map(with_platform_separators),
+            directories: Arc::new(CanonicalDirectories::new(SystemCanonicaliser::of_process())),
+        }
+    }
+
+    /// This environment, canonicalising directories through `canonicaliser`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_canonicaliser(self, canonicaliser: Arc<dyn Canonicaliser>) -> Self {
+        self.with_directory_memo(Arc::new(CanonicalDirectories::new(canonicaliser)))
+    }
+
+    /// This environment, canonicalising directories through `directories`.
+    #[must_use]
+    pub(in crate::history) fn with_directory_memo(
+        self,
+        directories: Arc<CanonicalDirectories>,
+    ) -> Self {
+        Self {
+            directories,
+            ..self
+        }
+    }
+
+    pub(crate) fn directories(&self) -> &Arc<CanonicalDirectories> {
+        &self.directories
+    }
+
+    /// The variable's value with the platform's separator: every variable a
+    /// provider reads names a directory, or a name joined into one.
     pub fn var_os(&self, name: &str) -> Option<OsString> {
-        (self.variable)(name)
+        (self.variable)(name).map(|value| with_platform_separators(value).into_os_string())
     }
 
     /// The variable's value, or `None` when it is unset or not UTF-8.
@@ -123,8 +174,8 @@ pub enum RootOrigin {
 
 /// One place a provider stores sessions — a directory tree for file-backed
 /// providers, but any container a provider can enumerate: each root carries its
-/// own session cache, keyed by its [canonical path](Self::canonical_path), so
-/// every spelling of one directory shares one cache. How sessions are found
+/// own session cache, keyed by its [canonical path](Self::canonical_path):
+/// every spelling of one directory shares that cache. How sessions are found
 /// inside it is the provider's own knowledge, stated in its
 /// [`discover`](super::SessionStorage::discover).
 ///
@@ -135,9 +186,15 @@ pub enum RootOrigin {
 pub struct SessionRoot {
     pub path: PathBuf,
     origin: RootOrigin,
-    /// `path` as [`Self::canonical_path`] resolved it. A storage hands each
-    /// load roots of their own, so a load resolves each root once.
-    canonical: OnceLock<PathBuf>,
+    /// `path` as [`Self::canonical_path`] canonicalised it. Each load gets
+    /// roots of its own from the storage and canonicalises each of them once.
+    canonical: OnceLock<Option<PathBuf>>,
+    /// Directories beside `path` that hold some files of the sessions
+    /// listed under it, such as Codex's archived threads. Discovery does not
+    /// list a session under them. The session cache stores a file beneath
+    /// one of them by its path below that directory, as it stores a file
+    /// beneath `path` by its path below `path`.
+    beside: Vec<SessionRoot>,
 }
 
 impl PartialEq for SessionRoot {
@@ -149,23 +206,95 @@ impl PartialEq for SessionRoot {
 impl Eq for SessionRoot {}
 
 impl SessionRoot {
+    /// The root at `path`, spelled with the platform's separator.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
-            path: path.into(),
+            path: with_platform_separators(path.into()),
             origin: RootOrigin::Redirected,
             canonical: OnceLock::new(),
+            beside: Vec::new(),
         }
     }
 
-    /// `path` resolved through `canonicaliser`, or `path` itself when it
-    /// does not resolve. Resolved on the first call; later calls on this
-    /// root, and on clones made after it, return the same path.
-    pub(crate) fn canonical_path(&self, canonicaliser: &dyn Canonicaliser) -> &Path {
-        self.canonical.get_or_init(|| {
-            canonicaliser
-                .canonicalise(&self.path)
-                .unwrap_or_else(|_| self.path.clone())
-        })
+    /// This root, with the directory at `path` beside it holding some files
+    /// of its sessions.
+    #[must_use]
+    pub fn with_directory_beside(mut self, path: impl Into<PathBuf>) -> Self {
+        self.beside.push(Self::new(path));
+        self
+    }
+
+    /// The directories beside this root that hold some files of its
+    /// sessions.
+    pub(crate) fn directories_beside(&self) -> &[SessionRoot] {
+        &self.beside
+    }
+
+    /// This root, then each directory beside it, in the order positions
+    /// count them.
+    fn and_directories_beside(&self) -> impl Iterator<Item = &SessionRoot> {
+        std::iter::once(self).chain(&self.beside)
+    }
+
+    /// The directory `path` lies below, by its position (0 for this root,
+    /// then each directory beside it in order), and the path below it, as
+    /// [`PathBelowRoot`] places it: a string comparison, without a
+    /// file-system call. `None` for a path below neither.
+    pub(crate) fn position_of(&self, path: &Path) -> Option<(usize, PathBelowRoot)> {
+        self.and_directories_beside()
+            .enumerate()
+            .find_map(|(position, root)| Some((position, PathBelowRoot::of(path, &root.path)?)))
+    }
+
+    /// [`Self::position_of`] `path`, a path below the canonical path of this
+    /// root or of a directory beside it, each canonicalised once per root.
+    pub(crate) fn canonical_position_of(
+        &self,
+        path: &Path,
+        canonicaliser: &dyn Canonicaliser,
+    ) -> Option<(usize, PathBelowRoot)> {
+        self.and_directories_beside()
+            .enumerate()
+            .find_map(|(position, root)| {
+                let below = PathBelowRoot::of(path, root.canonical_path(canonicaliser)?)?;
+                Some((position, below))
+            })
+    }
+
+    /// True when `path` lies below this root or a directory beside it.
+    pub(crate) fn holds(&self, path: &Path) -> bool {
+        self.position_of(path).is_some()
+    }
+
+    /// `path` canonicalised through `canonicaliser`; `None` when it doesn't
+    /// canonicalise, as for a directory the agent hasn't created yet.
+    /// Canonicalised on the first call; later calls on this root, and on
+    /// clones made after it, return the same answer.
+    pub(crate) fn canonical_path(&self, canonicaliser: &dyn Canonicaliser) -> Option<&Path> {
+        self.canonical
+            .get_or_init(|| canonicaliser.canonicalise(&self.path).ok())
+            .as_deref()
+    }
+
+    /// This root, keeping the canonical path found so far of itself and of
+    /// each directory beside it. A directory that did not canonicalise is
+    /// canonicalised again on its next use, because the agent may have
+    /// created it since.
+    pub(crate) fn forgetting_failed_canonicalisations(&self) -> Self {
+        let canonical = match self.canonical.get() {
+            Some(None) => OnceLock::new(),
+            _ => self.canonical.clone(),
+        };
+        Self {
+            path: self.path.clone(),
+            origin: self.origin,
+            canonical,
+            beside: self
+                .beside
+                .iter()
+                .map(Self::forgetting_failed_canonicalisations)
+                .collect(),
+        }
     }
 
     /// Mark this root as part of the agent's own tree rather than a directory

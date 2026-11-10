@@ -1,10 +1,14 @@
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::error::{AppError, Result};
-use crate::history::provider::{RecordedSession, SessionProvider, SessionStub};
+use crate::history::path::CanonicalDirectories;
+use crate::history::provider::walk::Canonicaliser;
+use crate::history::provider::{RecordedDirectory, RecordedSession, SessionProvider, SessionStub};
+use crate::history::sqlite_cache::{Publication, SessionAddress};
 use crate::history::{Conversation, SeenPaths, Source};
 use crate::search::session_id_matches;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The prefix of a conversation's handle, `ch_1234abcd5678`.
 const HANDLE_PREFIX: &str = "ch_";
@@ -85,9 +89,16 @@ pub struct AgentConversationKey {
     pub session_filename: String,
     pub session_id: String,
     pub path: PathBuf,
+    /// The session's address in the session cache. The commands read the
+    /// session through it.
+    pub address: SessionAddress,
     /// The sub-agent transcripts the session's row was built from, spliced
     /// into the transcript the key loads. Not part of the reference digest.
     pub subagents: Vec<PathBuf>,
+    /// The key's row's publication of its copy at `address`: the row's own,
+    /// or for a key made from a discovery stub, unpublished with the
+    /// sub-agent transcripts discovery found.
+    pub publication: Publication,
     /// The transcript's size as discovery found it, the session's and its
     /// sub-agents' together: their files' bytes, or for OpenCode the bytes of
     /// the session's rows. `None` when the row carries no fingerprint.
@@ -111,13 +122,36 @@ impl AgentConversationKey {
                 .to_owned(),
             project_dir_name: project_dir_name.into(),
             session_filename,
+            address: Self::address_for_test(Source::Claude, &path),
             path,
             subagents: Vec::new(),
+            publication: Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             transcript_bytes: None,
         }
     }
 
-    pub fn from_conversation(conversation: &Conversation) -> Result<Self> {
+    /// An address for the session file at `path`, with the file's directory
+    /// as its root, canonicalised by the file system.
+    #[cfg(test)]
+    pub(crate) fn address_for_test(source: Source, path: &Path) -> SessionAddress {
+        SessionAddress::new(
+            source.provider().storage().cache(),
+            source,
+            crate::history::sqlite_cache::SessionRoots::of_system(
+                &crate::history::provider::SessionRoot::new(path.parent().unwrap_or(path)),
+            ),
+            path.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// The key of `conversation`, its recorded directory canonicalised
+    /// through `directories`.
+    pub fn from_conversation(
+        conversation: &Conversation,
+        directories: &CanonicalDirectories,
+    ) -> Result<Self> {
         let project_dir_name = conversation
             .source
             .provider()
@@ -126,7 +160,8 @@ impl AgentConversationKey {
                 conversation
                     .project_path
                     .as_deref()
-                    .or(conversation.cwd.as_deref()),
+                    .or(conversation.cwd.as_deref())
+                    .map(|directory| RecordedDirectory::new(directory, directories)),
             )
             .ok_or_else(|| {
                 AppError::ConfigError(format!(
@@ -142,13 +177,21 @@ impl AgentConversationKey {
                 AppError::ConfigError("conversation path has no session filename".to_string())
             })?
             .to_string();
+        let address = conversation.cache_address.clone().ok_or_else(|| {
+            AppError::ConfigError(format!(
+                "{} is not a listed session of the session cache",
+                conversation.path.display()
+            ))
+        })?;
         Ok(Self {
             source: conversation.source,
             project_dir_name,
             session_filename,
             session_id: conversation.session_id.clone(),
             path: conversation.path.clone(),
+            address,
             subagents: conversation.subagents.clone(),
+            publication: conversation.publication.clone(),
             transcript_bytes: conversation
                 .fingerprint
                 .map(|fingerprint| fingerprint.file_size),
@@ -169,15 +212,18 @@ impl AgentConversationKey {
     }
 }
 
-/// The key for the session at `stub`, from the directory and id a load
-/// recorded of it, unless its path names its key.
+/// The key for the session at `stub`, kept at `address`, from the directory
+/// and id a load recorded of it, unless its path names its key. The recorded
+/// directory is canonicalised through `directories`.
 pub(crate) fn loaded_session_key(
     provider: &dyn SessionProvider,
     stub: &SessionStub,
     recorded: Option<&RecordedSession>,
+    directories: &CanonicalDirectories,
+    address: SessionAddress,
 ) -> Option<AgentConversationKey> {
     let recorded = recorded.filter(|_| !is_keyed_by_path(provider, &stub.locator));
-    session_key(provider, stub, recorded)
+    session_key(provider, stub, recorded, directories, address)
 }
 
 /// True when the path at `locator` names both the session's id and its
@@ -187,13 +233,16 @@ pub(crate) fn is_keyed_by_path(provider: &dyn SessionProvider, locator: &Path) -
         && provider.ref_project(locator, None).is_some()
 }
 
-/// Uses recorded identity when available, otherwise identity from the path.
-/// This keeps unread sessions identifiable as skipped in search coverage.
-/// Returns `None` when neither source identifies the session.
+/// The key of the session at `address`, built from the recorded identity or,
+/// without one, from the path, so that search coverage can report an unread
+/// session as skipped. `None` when neither identifies the session. The
+/// recorded directory is canonicalised through `directories`.
 pub(crate) fn session_key(
     provider: &dyn SessionProvider,
     stub: &SessionStub,
     recorded: Option<&RecordedSession>,
+    directories: &CanonicalDirectories,
+    address: SessionAddress,
 ) -> Option<AgentConversationKey> {
     let path = &stub.locator;
     let (project_dir, session_id) = match recorded {
@@ -202,13 +251,20 @@ pub(crate) fn session_key(
     };
     Some(AgentConversationKey {
         source: provider.source(),
-        project_dir_name: provider.ref_project(path, project_dir)?,
+        project_dir_name: provider.ref_project(
+            path,
+            project_dir.map(|directory| RecordedDirectory::new(directory, directories)),
+        )?,
         session_filename: path.file_name()?.to_str()?.to_owned(),
         session_id,
         path: path.clone(),
+        address,
         // Discovery's, not a cache entry's: the entry may predate a sub-agent
         // the next load will merge in.
         subagents: stub.subagents.clone(),
+        publication: Publication::Unpublished {
+            discovered: stub.subagents.clone(),
+        },
         transcript_bytes: Some(stub.fingerprint.size),
     })
 }
@@ -270,16 +326,19 @@ impl ReadRef {
     pub fn resolve_conversation(
         &self,
         keys: &[AgentConversationKey],
+        canonicaliser: &Arc<dyn Canonicaliser>,
     ) -> Result<ResolvedConversation> {
-        resolve_conversation_ref(keys, &self.conversation).map_err(|error| match error {
-            AppError::Agent(mut error)
-                if error.kind == AgentErrorKind::NotFound
-                    && without_drive(&self.conversation).contains(':') =>
-            {
-                error.detail = format!("{}; {}", error.detail, self.command.forms());
-                AppError::Agent(error)
+        resolve_conversation_ref(keys, &self.conversation, canonicaliser).map_err(|error| {
+            match error {
+                AppError::Agent(mut error)
+                    if error.kind == AgentErrorKind::NotFound
+                        && without_drive(&self.conversation).contains(':') =>
+                {
+                    error.detail = format!("{}; {}", error.detail, self.command.forms());
+                    AppError::Agent(error)
+                }
+                error => error,
             }
-            error => error,
         })
     }
 }
@@ -515,22 +574,26 @@ pub fn validate_resolved_focus_in_ranges(
     }
 }
 
+/// The session `reference` names among `keys`. A key without a file
+/// identity has its directory canonicalised through `canonicaliser`.
 pub fn resolve_conversation_ref(
     keys: &[AgentConversationKey],
     reference: &str,
+    canonicaliser: &Arc<dyn Canonicaliser>,
 ) -> Result<ResolvedConversation> {
+    let matches = |is_match: &dyn Fn(&AgentConversationKey) -> bool| {
+        resolved_matches(keys, canonicaliser, is_match)
+    };
     match validate_conversation_ref(reference)? {
         ConversationRefInput::Handle(prefix) => finish_resolution(
             reference,
-            resolved_matches(keys, |key| {
-                key.conversation_ref().digest_hex.starts_with(&prefix)
-            }),
+            matches(&|key| key.conversation_ref().digest_hex.starts_with(&prefix)),
         ),
-        ConversationRefInput::Path(path) => resolve_path(keys, reference, &path),
+        ConversationRefInput::Path(path) => resolve_path(keys, reference, &path, canonicaliser),
         ConversationRefInput::IdOrFileName(name) => {
-            let by_id = resolved_matches(keys, |key| session_id_matches(&key.session_id, &name));
+            let by_id = matches(&|key| session_id_matches(&key.session_id, &name));
             if by_id.is_empty() {
-                resolve_file_name(keys, reference, &name)
+                resolve_file_name(keys, reference, &name, canonicaliser)
             } else {
                 finish_resolution(reference, by_id)
             }
@@ -540,21 +603,23 @@ pub fn resolve_conversation_ref(
 
 fn resolved_matches(
     keys: &[AgentConversationKey],
-    is_match: impl Fn(&AgentConversationKey) -> bool,
+    canonicaliser: &Arc<dyn Canonicaliser>,
+    is_match: impl FnMut(&AgentConversationKey) -> bool,
 ) -> Vec<ResolvedConversation> {
-    matching_files(keys, is_match)
+    matching_files(keys, canonicaliser, is_match)
         .map(|key| resolved_conversation_for_key(keys, key))
         .collect()
 }
 
 /// One key per transcript file, the first provider's.
-fn matching_files(
-    keys: &[AgentConversationKey],
-    is_match: impl Fn(&AgentConversationKey) -> bool,
-) -> impl Iterator<Item = &AgentConversationKey> {
-    let mut seen = SeenPaths::default();
+fn matching_files<'k>(
+    keys: &'k [AgentConversationKey],
+    canonicaliser: &Arc<dyn Canonicaliser>,
+    mut is_match: impl FnMut(&AgentConversationKey) -> bool,
+) -> impl Iterator<Item = &'k AgentConversationKey> {
+    let mut seen = SeenPaths::new(canonicaliser);
     keys.iter()
-        .filter(move |key| is_match(key) && seen.insert(&key.path))
+        .filter(move |key| is_match(key) && seen.insert(&key.path, Some(&key.address)))
 }
 
 /// The session whose transcript is the file at `path`. The path may be
@@ -564,31 +629,26 @@ fn resolve_path(
     keys: &[AgentConversationKey],
     reference: &str,
     path: &Path,
+    canonicaliser: &Arc<dyn Canonicaliser>,
 ) -> Result<ResolvedConversation> {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let canonical = std::fs::canonicalize(path).ok();
-    let matches = resolved_matches(keys, |key| {
-        key.path == path
-            || key.path == absolute
-            || canonical
-                .as_deref()
-                .is_some_and(|canonical| is_same_file(&key.path, canonical))
+    let mut matches = resolved_matches(keys, canonicaliser, |key| {
+        key.path == path || key.path == absolute
     });
+    if matches.is_empty() {
+        let directories = CanonicalDirectories::new(Arc::clone(canonicaliser));
+        let named = directories.file_identity(path);
+        matches = resolved_matches(keys, canonicaliser, |key| {
+            key.address
+                .file_identity(&key.path)
+                .unwrap_or_else(|| directories.file_identity(&key.path))
+                == named
+        });
+    }
     if matches.is_empty() {
         return Err(not_found_as_session(reference));
     }
     finish_resolution(reference, matches)
-}
-
-/// True when `discovered` resolves to `canonical`. Canonicalize only a path
-/// with the same file name, so a lookup does not canonicalize every
-/// discovered transcript.
-fn is_same_file(discovered: &Path, canonical: &Path) -> bool {
-    let same_name = discovered
-        .file_name()
-        .zip(canonical.file_name())
-        .is_some_and(|(discovered, canonical)| discovered.eq_ignore_ascii_case(canonical));
-    same_name && std::fs::canonicalize(discovered).is_ok_and(|resolved| resolved == canonical)
 }
 
 /// Resolve a bare file name only when exactly one transcript has it; every
@@ -597,8 +657,9 @@ fn resolve_file_name(
     keys: &[AgentConversationKey],
     reference: &str,
     name: &str,
+    canonicaliser: &Arc<dyn Canonicaliser>,
 ) -> Result<ResolvedConversation> {
-    let named = matching_files(keys, |key| key.session_filename == name)
+    let named = matching_files(keys, canonicaliser, |key| key.session_filename == name)
         .take(2)
         .collect::<Vec<_>>();
     match named.as_slice() {
@@ -774,7 +835,9 @@ fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
         .into());
     }
     if reference.contains(['/', '\\']) {
-        return Ok(ConversationRefInput::Path(PathBuf::from(reference)));
+        return Ok(ConversationRefInput::Path(
+            crate::history::path::with_platform_separators(reference),
+        ));
     }
     Ok(ConversationRefInput::IdOrFileName(reference.to_owned()))
 }
@@ -845,6 +908,11 @@ fn digest_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::provider::SessionRoot;
+    use crate::history::provider::walk::SystemCanonicaliser;
+    use crate::history::provider::walk::test_support::CountingCanonicaliser;
+    use crate::history::sqlite_cache::SessionRoots;
+    use std::sync::Arc;
 
     fn key(project: &str, filename: &str) -> AgentConversationKey {
         AgentConversationKey::new(
@@ -861,6 +929,54 @@ mod tests {
         }
     }
 
+    /// Every agent's keys for sessions recorded in one directory canonicalise
+    /// that directory once. Claude Code files references under the project
+    /// folder and does not canonicalise any directory.
+    #[test]
+    fn keys_of_sessions_recorded_in_one_directory_canonicalise_it_once() {
+        let project = tempfile::tempdir().unwrap();
+        for provider in crate::history::provider::providers() {
+            let canonicaliser = Arc::new(CountingCanonicaliser::default());
+            let directories = CanonicalDirectories::new(canonicaliser.clone());
+            let recorded = RecordedSession {
+                project_dir: Some(project.path().to_path_buf()),
+                session_id: "recorded-session".to_owned(),
+            };
+            let projects: Vec<String> = ["first", "second", "third"]
+                .into_iter()
+                .filter_map(|name| {
+                    let stub = SessionStub {
+                        locator: Path::new("/sessions").join(format!("{name}.jsonl")),
+                        subagents: Vec::new(),
+                        cache_key: name.to_owned(),
+                        fingerprint: crate::history::provider::Fingerprint::UNKNOWN,
+                    };
+                    let address =
+                        AgentConversationKey::address_for_test(provider.source(), &stub.locator);
+                    session_key(*provider, &stub, Some(&recorded), &directories, address)
+                        .map(|key| key.project_dir_name)
+                })
+                .collect();
+
+            let name = provider.labels().name;
+            let expected = if provider.source() == Source::Claude {
+                Vec::new()
+            } else {
+                vec![project.path().to_path_buf()]
+            };
+            assert_eq!(
+                canonicaliser.canonicalised(),
+                expected,
+                "{name}'s keys canonicalise the recorded directory once, or not at all when the \
+                 agent files references under the project folder"
+            );
+            assert!(
+                projects.windows(2).all(|pair| pair[0] == pair[1]),
+                "{name}'s keys file the sessions under one project: {projects:?}"
+            );
+        }
+    }
+
     /// Emitted references are a compatibility contract: users record them and the
     /// agent CLI resolves them later. A digest may only move together with the
     /// namespace version that produced it, never as a side effect of a refactor.
@@ -873,7 +989,14 @@ mod tests {
             session_filename: "session.jsonl".to_owned(),
             session_id: "pinned-session".to_owned(),
             path: PathBuf::from("/sessions/session.jsonl"),
+            address: AgentConversationKey::address_for_test(
+                Source::Pi,
+                Path::new("/sessions/session.jsonl"),
+            ),
             subagents: Vec::new(),
+            publication: Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             transcript_bytes: None,
         };
         let omp = AgentConversationKey {
@@ -923,7 +1046,14 @@ mod tests {
             session_filename: "2024_custom_id_with_underscores.jsonl".to_owned(),
             session_id: "custom_id_with_underscores".to_owned(),
             path: PathBuf::from("/sessions/2024_custom_id_with_underscores.jsonl"),
+            address: AgentConversationKey::address_for_test(
+                Source::Pi,
+                Path::new("/sessions/2024_custom_id_with_underscores.jsonl"),
+            ),
             subagents: Vec::new(),
+            publication: Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             transcript_bytes: None,
         };
         let other_project = AgentConversationKey {
@@ -960,7 +1090,14 @@ mod tests {
             session_filename: "first.jsonl".to_owned(),
             session_id: "copied-session".to_owned(),
             path: PathBuf::from("/sessions/first.jsonl"),
+            address: AgentConversationKey::address_for_test(
+                Source::Pi,
+                Path::new("/sessions/first.jsonl"),
+            ),
             subagents: Vec::new(),
+            publication: Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             transcript_bytes: None,
         };
         let second = AgentConversationKey {
@@ -976,10 +1113,14 @@ mod tests {
         let keys = vec![first, second];
         for resolved in resolved_conversations_for_keys(&keys) {
             assert_eq!(
-                resolve_conversation_ref(&keys, &resolved.reference.canonical())
-                    .unwrap()
-                    .key
-                    .path,
+                resolve_conversation_ref(
+                    &keys,
+                    &resolved.reference.canonical(),
+                    &SystemCanonicaliser::shared()
+                )
+                .unwrap()
+                .key
+                .path,
                 resolved.key.path
             );
         }
@@ -1090,15 +1231,20 @@ mod tests {
         filename: &str,
         session_id: &str,
     ) -> AgentConversationKey {
+        let path = Path::new("/sessions")
+            .join(project.trim_start_matches('/'))
+            .join(filename);
         AgentConversationKey {
             source,
             project_dir_name: project.to_owned(),
             session_filename: filename.to_owned(),
             session_id: session_id.to_owned(),
-            path: Path::new("/sessions")
-                .join(project.trim_start_matches('/'))
-                .join(filename),
+            address: AgentConversationKey::address_for_test(source, &path),
+            path,
             subagents: Vec::new(),
+            publication: Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             transcript_bytes: None,
         }
     }
@@ -1108,7 +1254,9 @@ mod tests {
         let uuid = "12345678-1234-4234-9234-123456789abc";
         let keys = vec![key("project-a", &format!("{uuid}.jsonl"))];
 
-        let resolved = resolve_conversation_ref(&keys, &uuid.to_uppercase()).unwrap();
+        let resolved =
+            resolve_conversation_ref(&keys, &uuid.to_uppercase(), &SystemCanonicaliser::shared())
+                .unwrap();
 
         assert_eq!(resolved.key, keys[0]);
     }
@@ -1123,11 +1271,16 @@ mod tests {
         )];
 
         assert_eq!(
-            resolve_conversation_ref(&keys, "ses_AbC123").unwrap().key,
+            resolve_conversation_ref(&keys, "ses_AbC123", &SystemCanonicaliser::shared())
+                .unwrap()
+                .key,
             keys[0]
         );
         assert_eq!(
-            agent_error_kind(resolve_conversation_ref(&keys, "ses_abc123").unwrap_err()),
+            agent_error_kind(
+                resolve_conversation_ref(&keys, "ses_abc123", &SystemCanonicaliser::shared())
+                    .unwrap_err()
+            ),
             AgentErrorKind::NotFound
         );
     }
@@ -1143,7 +1296,9 @@ mod tests {
         )];
 
         assert_eq!(
-            resolve_conversation_ref(&keys, thread).unwrap().key,
+            resolve_conversation_ref(&keys, thread, &SystemCanonicaliser::shared())
+                .unwrap()
+                .key,
             keys[0]
         );
     }
@@ -1158,11 +1313,17 @@ mod tests {
         for input in [uuid, file_name.as_str()] {
             let read = parse_read_ref(&format!("{input}:m2..m4")).unwrap();
             assert_eq!(read.range, Some(MessageRange { start: 2, end: 4 }));
-            let resolved = resolve_conversation_ref(&keys, &read.conversation).unwrap();
+            let resolved =
+                resolve_conversation_ref(&keys, &read.conversation, &SystemCanonicaliser::shared())
+                    .unwrap();
             assert_eq!(resolved.key, pi);
             let focus = parse_focus_ref(&format!("{input}:m3")).unwrap();
-            let focus_conversation =
-                resolve_conversation_ref(&keys, focus.conversation.as_deref().unwrap()).unwrap();
+            let focus_conversation = resolve_conversation_ref(
+                &keys,
+                focus.conversation.as_deref().unwrap(),
+                &SystemCanonicaliser::shared(),
+            )
+            .unwrap();
             validate_resolved_focus_in_ranges(
                 &[(read, resolved)],
                 &focus,
@@ -1184,7 +1345,12 @@ mod tests {
         let keys = vec![pi.clone(), omp];
 
         for input in [uuid, file_name.as_str()] {
-            assert_eq!(resolve_conversation_ref(&keys, input).unwrap().key, pi);
+            assert_eq!(
+                resolve_conversation_ref(&keys, input, &SystemCanonicaliser::shared())
+                    .unwrap()
+                    .key,
+                pi
+            );
         }
     }
 
@@ -1195,8 +1361,12 @@ mod tests {
             "12345678-1234-4234-9234-123456789abc.jsonl",
         )];
 
-        let error =
-            resolve_conversation_ref(&keys, "00000000-0000-0000-0000-000000000000").unwrap_err();
+        let error = resolve_conversation_ref(
+            &keys,
+            "00000000-0000-0000-0000-000000000000",
+            &SystemCanonicaliser::shared(),
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains(
@@ -1216,7 +1386,8 @@ mod tests {
             key("-tmp-second", &format!("{uuid}.jsonl")),
         ];
 
-        let error = resolve_conversation_ref(&keys, uuid).unwrap_err();
+        let error =
+            resolve_conversation_ref(&keys, uuid, &SystemCanonicaliser::shared()).unwrap_err();
 
         let detail = error.to_string();
         assert!(detail.contains("retry with"), "{detail}");
@@ -1230,7 +1401,12 @@ mod tests {
                 .canonical();
             assert!(detail.contains(&handle), "{detail}");
             assert!(detail.contains(&key.project_dir_name), "{detail}");
-            assert_eq!(resolve_conversation_ref(&keys, &handle).unwrap().key, *key);
+            assert_eq!(
+                resolve_conversation_ref(&keys, &handle, &SystemCanonicaliser::shared())
+                    .unwrap()
+                    .key,
+                *key
+            );
         }
         assert_eq!(agent_error_kind(error), AgentErrorKind::AmbiguousRef);
     }
@@ -1252,7 +1428,8 @@ mod tests {
             ),
         ];
 
-        let error = resolve_conversation_ref(&keys, "wire.jsonl").unwrap_err();
+        let error = resolve_conversation_ref(&keys, "wire.jsonl", &SystemCanonicaliser::shared())
+            .unwrap_err();
 
         let detail = error.to_string();
         assert!(
@@ -1282,7 +1459,7 @@ mod tests {
         assert_eq!(read.conversation, typed);
         assert_eq!(read.range, Some(MessageRange::single(2)));
         assert_eq!(
-            resolve_conversation_ref(&keys, &read.conversation)
+            resolve_conversation_ref(&keys, &read.conversation, &SystemCanonicaliser::shared())
                 .unwrap()
                 .key,
             keys[0]
@@ -1306,9 +1483,63 @@ mod tests {
             .join(dir.path().file_name().unwrap())
             .join(file_name);
 
-        let resolved = resolve_conversation_ref(&keys, detour.to_str().unwrap()).unwrap();
+        let resolved = resolve_conversation_ref(
+            &keys,
+            detour.to_str().unwrap(),
+            &SystemCanonicaliser::shared(),
+        )
+        .unwrap();
 
         assert_eq!(resolved.key, keys[0]);
+    }
+
+    /// Kimi Code names every transcript `wire.jsonl`. A path named through
+    /// a link finds its session among keys a discovery listed by
+    /// canonicalising the named directory alone, not each key's file.
+    #[test]
+    fn named_path_canonicalises_its_directory_once_and_no_listed_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SessionRoot::new(dir.path());
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let shared: Arc<dyn Canonicaliser> = canonicaliser.clone();
+        let roots = SessionRoots::of(&root, shared.as_ref());
+        let keys: Vec<AgentConversationKey> = ["first", "second", "third"]
+            .into_iter()
+            .map(|session| {
+                let path = dir.path().join(session).join("wire.jsonl");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "").unwrap();
+                AgentConversationKey {
+                    address: SessionAddress::new(
+                        Source::Claude.provider().storage().cache(),
+                        Source::Claude,
+                        roots.clone(),
+                        session.to_owned(),
+                    ),
+                    ..AgentConversationKey::new(session, "wire.jsonl", path)
+                }
+            })
+            .collect();
+        let canonicalised_by_listing = canonicaliser.canonicalised().len();
+        let named_directory = dir.path().join("linked");
+        crate::history::provider::walk::test_support::link_directory(
+            &dir.path().join("second"),
+            &named_directory,
+        );
+
+        let resolved = resolve_conversation_ref(
+            &keys,
+            named_directory.join("wire.jsonl").to_str().unwrap(),
+            &shared,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.key, keys[1]);
+        assert_eq!(
+            canonicaliser.canonicalised()[canonicalised_by_listing..],
+            [named_directory],
+            "the lookup canonicalises the named directory alone"
+        );
     }
 
     #[test]
@@ -1367,7 +1598,12 @@ mod tests {
             "12345678-1234-4234-9234-123456789abc.jsonl",
         )
         .digest_hex;
-        let resolved = resolve_conversation_ref(&keys, &format!("ch_{}", &internal[..8])).unwrap();
+        let resolved = resolve_conversation_ref(
+            &keys,
+            &format!("ch_{}", &internal[..8]),
+            &SystemCanonicaliser::shared(),
+        )
+        .unwrap();
         assert_eq!(
             resolved.key.session_filename,
             "12345678-1234-4234-9234-123456789abc.jsonl"
@@ -1411,11 +1647,17 @@ mod tests {
             AgentErrorKind::InvalidRef
         );
         assert_eq!(
-            agent_error_kind(resolve_conversation_ref(&keys, "ch_12345678").unwrap_err()),
+            agent_error_kind(
+                resolve_conversation_ref(&keys, "ch_12345678", &SystemCanonicaliser::shared())
+                    .unwrap_err()
+            ),
             AgentErrorKind::NotFound
         );
         assert_eq!(
-            agent_error_kind(resolve_conversation_ref(&keys, "bad-ref").unwrap_err()),
+            agent_error_kind(
+                resolve_conversation_ref(&keys, "bad-ref", &SystemCanonicaliser::shared())
+                    .unwrap_err()
+            ),
             AgentErrorKind::NotFound
         );
 
@@ -1522,11 +1764,11 @@ mod tests {
 
         let read = parse_read_ref(reference)
             .unwrap()
-            .resolve_conversation(&keys)
+            .resolve_conversation(&keys, &SystemCanonicaliser::shared())
             .unwrap_err();
         let outline = parse_outline_ref(reference)
             .unwrap()
-            .resolve_conversation(&keys)
+            .resolve_conversation(&keys, &SystemCanonicaliser::shared())
             .unwrap_err();
 
         assert_eq!(
@@ -1557,7 +1799,7 @@ mod tests {
 
         let error = parse_read_ref(reference)
             .unwrap()
-            .resolve_conversation(&keys)
+            .resolve_conversation(&keys, &SystemCanonicaliser::shared())
             .unwrap_err();
 
         assert_eq!(

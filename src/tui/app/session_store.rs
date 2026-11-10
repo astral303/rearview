@@ -7,6 +7,7 @@ use crate::clock::{Clock, Moment};
 use crate::error::{AppError, Result};
 use crate::history::listing::SessionOrigin;
 use crate::history::provider::{SessionOutcome, SessionRead};
+use crate::history::sqlite_cache::NewerCopy;
 use crate::history::{
     AwaitedRefresh, CachedRead, CurrentCopy, InteractiveRead, NextStep, OtherRearview,
     RefreshOutcome, SessionChanges, Source,
@@ -84,12 +85,16 @@ pub(super) enum SessionCopy<T> {
 }
 
 impl<T> SessionCopy<T> {
-    /// The copy, current or out of date; `None` when missing.
-    pub(super) fn current_or_older(self) -> Option<T> {
+    /// The copy, current or out of date; `None` when missing. A copy written
+    /// after the session's row comes with its [`NewerCopy`].
+    pub(super) fn current_or_older_with_newer(self) -> (Option<T>, Option<NewerCopy>) {
         match self {
-            Self::Current(copy) => Some(copy.into_value()),
-            Self::Older(copy) => Some(copy),
-            Self::Missing => None,
+            Self::Current(copy) => {
+                let (copy, newer) = copy.into_parts();
+                (Some(copy), newer)
+            }
+            Self::Older(copy) => (Some(copy), None),
+            Self::Missing => (None, None),
         }
     }
 }

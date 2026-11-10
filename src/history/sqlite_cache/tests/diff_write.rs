@@ -80,6 +80,30 @@ impl Fixture {
         }
     }
 
+    /// The one session of the Codex home `home`, under the root Codex's
+    /// storage gives the home, as its discovery finds it.
+    fn of_codex_home(home: &Path) -> Self {
+        let storage = Source::Codex.provider().storage();
+        let home_variable = |name: &str| (name == "CODEX_HOME").then(|| home.into());
+        let environment = crate::history::provider::RootEnvironment::new(
+            &home_variable,
+            Some(home.to_path_buf()),
+            None,
+        );
+        let root = storage.roots_in(&environment).unwrap().remove(0);
+        let mut stubs = storage
+            .discover(&root, &crate::history::provider::walk::SystemLister)
+            .unwrap()
+            .stubs;
+        assert_eq!(stubs.len(), 1, "the Codex home holds one session");
+        Self {
+            source: Source::Codex,
+            root,
+            stub: stubs.remove(0),
+            _session: None,
+        }
+    }
+
     fn source(&self) -> Source {
         self.source
     }
@@ -100,11 +124,15 @@ impl Fixture {
         cache
             .connection
             .query_row(
-                "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
+                "SELECT id FROM sessions WHERE storage = ?1 AND cache_key = ?3 \
+                 AND root = (SELECT id FROM roots WHERE key = ?2)",
                 params![
                     self.storage().directory,
-                    path_text(&self.root.path),
-                    CACHE_KEY
+                    cache
+                        .session_roots(&self.root)
+                        .key()
+                        .map(|key| key.as_str()),
+                    self.stub.cache_key
                 ],
                 |row| row.get(0),
             )
@@ -113,7 +141,13 @@ impl Fixture {
 
     fn listed(&self, cache: &CacheWriter) -> Conversation {
         let CatalogueSession::Listed(listed) = cache
-            .catalogue_session(self.storage(), self.source(), &self.root, CACHE_KEY, false)
+            .catalogue_session(
+                self.storage(),
+                self.source(),
+                &self.root,
+                &self.stub.cache_key,
+                false,
+            )
             .unwrap()
             .unwrap()
         else {
@@ -158,7 +192,8 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
     for (table, query) in [
         (
             "sessions",
-            "SELECT storage, source, root, cache_key, locator, file_key, status, file_size, \
+            "SELECT storage, source, (SELECT key FROM roots WHERE id = root), cache_key, \
+             status, file_size, \
              mtime_secs, mtime_nsecs, session_id, session_id_key, handle, project_path, \
              project_name, cwd, timestamp_ms, preview_first, preview_last, summary, custom_title, \
              model, total_tokens, duration_minutes, message_count, assistant_messages, \
@@ -167,13 +202,15 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         ),
         (
             "session_files",
-            "SELECT position, kind, path, key, file_size, mtime_secs, mtime_nsecs \
+            "SELECT position, kind, (SELECT key FROM roots WHERE id = root), path, key, \
+             file_size, mtime_secs, mtime_nsecs \
              FROM session_files WHERE session = ?1 ORDER BY position"
                 .to_owned(),
         ),
         (
             "transcript_reads",
-            "SELECT position, path, cursor, stable_cursor, identity, rewrite_check, parser_state \
+            "SELECT position, (SELECT key FROM roots WHERE id = root), path, cursor, \
+             stable_cursor, identity, rewrite_check, parser_state \
              FROM transcript_reads WHERE session = ?1 ORDER BY position"
                 .to_owned(),
         ),
@@ -193,7 +230,9 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         ),
         (
             "transcripts",
-            "SELECT path FROM transcripts WHERE session = ?1 ORDER BY path".to_owned(),
+            "SELECT (SELECT key FROM roots WHERE id = root) AS root_key, path FROM transcripts \
+             WHERE session = ?1 ORDER BY root_key, path"
+                .to_owned(),
         ),
         (
             "threads",
@@ -264,7 +303,7 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         fixture.label()
     );
     let entries = cache
-        .entries(fixture.storage(), &fixture.root, CACHE_KEY)
+        .entries(fixture.storage(), &fixture.root, &fixture.stub.cache_key)
         .unwrap()
         .unwrap();
     rows.push(format!("read entries {:?}", entries.entries));
@@ -423,8 +462,9 @@ fn without_last_own_entries(record: &mut SessionRecord, count: usize) -> usize {
 }
 
 /// The `transcript_reads` rows of `session`, in position order, each with
-/// its path.
-fn stored_reads(cache: &CacheWriter, session: i64) -> Vec<(PathBuf, TranscriptRead)> {
+/// its path joined with `root`, the root every file of the session sits
+/// under.
+fn stored_reads(cache: &CacheWriter, session: i64, root: &Path) -> Vec<(PathBuf, TranscriptRead)> {
     cache
         .connection
         .prepare(
@@ -434,7 +474,7 @@ fn stored_reads(cache: &CacheWriter, session: i64) -> Vec<(PathBuf, TranscriptRe
         .unwrap()
         .query_map([session], |row| {
             Ok((
-                PathBuf::from(row.get::<_, String>(0)?),
+                root.join(row.get::<_, String>(0)?),
                 TranscriptRead {
                     cursor: row.get(1)?,
                     stable_cursor: row.get(2)?,
@@ -450,12 +490,14 @@ fn stored_reads(cache: &CacheWriter, session: i64) -> Vec<(PathBuf, TranscriptRe
         .unwrap()
 }
 
-fn stored_file_paths(cache: &CacheWriter, session: i64) -> Vec<PathBuf> {
+/// The `session_files` paths of `session`, in position order, each joined
+/// with `root`, the root every file of the session sits under.
+fn stored_file_paths(cache: &CacheWriter, session: i64, root: &Path) -> Vec<PathBuf> {
     cache
         .connection
         .prepare("SELECT path FROM session_files WHERE session = ?1 ORDER BY position")
         .unwrap()
-        .query_map([session], |row| Ok(PathBuf::from(row.get::<_, String>(0)?)))
+        .query_map([session], |row| Ok(root.join(row.get::<_, String>(0)?)))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap()
@@ -476,13 +518,13 @@ fn write_stores_read_of_every_session_file_that_resumes_through_its_agents_reade
         cache.write(&record).unwrap();
 
         let session = fixture.session_id(&cache);
-        let reads = stored_reads(&cache, session);
+        let reads = stored_reads(&cache, session, &fixture.root.path);
         assert_eq!(
             reads
                 .iter()
                 .map(|(path, _)| path.clone())
                 .collect::<Vec<_>>(),
-            stored_file_paths(&cache, session),
+            stored_file_paths(&cache, session, &fixture.root.path),
             "{}: each session file has its read, at its position",
             fixture.label()
         );
@@ -498,6 +540,39 @@ fn write_stores_read_of_every_session_file_that_resumes_through_its_agents_reade
         }
         assert_matches_fresh_write(&cache, &fixture, &record);
     }
+}
+
+/// A Codex session whose rollouts before an edit Codex archived, its own and
+/// its sub-agent's: a write of its parse over a copy missing its last entry
+/// matches a fresh write, with files under the sessions tree and under the
+/// archived tree beside it.
+#[test]
+fn later_write_of_session_with_files_under_two_roots_matches_fresh_write() {
+    let home = tempfile::tempdir().unwrap();
+    crate::history::format::codex::test_support::write_session_with_archived_bases(
+        home.path(),
+        "019f0000-0000-7000-8000-00000000000a",
+        "019f0000-0000-7000-8000-00000000000b",
+    );
+    let fixture = Fixture::of_codex_home(home.path());
+    let mut earlier = fixture.record();
+    entries_of(&mut earlier).entries.pop();
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = cache_holding(base.path(), &fixture, &earlier);
+
+    let record = fixture.record();
+    cache.write(&record).unwrap();
+
+    let roots: i64 = cache
+        .connection
+        .query_row(
+            "SELECT COUNT(DISTINCT root) FROM session_files WHERE session = ?1",
+            [fixture.session_id(&cache)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(roots, 2, "the session's files sit under both trees");
+    assert_matches_fresh_write(&cache, &fixture, &record);
 }
 
 #[test]

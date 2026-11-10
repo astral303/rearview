@@ -1,6 +1,7 @@
 use super::*;
 use crate::clock::{SystemClock, TestClock};
 use crate::history::Source;
+use crate::history::provider::walk::SystemCanonicaliser;
 use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
 use crate::history::sqlite_cache::observer::{Observation, observe};
 use crate::history::sqlite_cache::{
@@ -19,12 +20,18 @@ pub(crate) fn rearview(directory: &Path) -> CacheBase {
         directory,
         ProcessIdentity::default(),
         Arc::new(SystemClock::new()),
+        SystemCanonicaliser::shared(),
     )
 }
 
 /// The cache in `directory` as one rearview reaches it, on `clock`.
 fn rearview_on(directory: &Path, clock: Arc<TestClock>) -> CacheBase {
-    CacheBase::new(directory, ProcessIdentity::default(), clock)
+    CacheBase::new(
+        directory,
+        ProcessIdentity::default(),
+        clock,
+        SystemCanonicaliser::shared(),
+    )
 }
 
 /// The helper process's activity once it owns the refresh, until the test
@@ -345,8 +352,19 @@ fn finds_a_recent_owner(base: &CacheBase, observed: &mut Option<ObservedRefresh>
     )
 }
 
+/// The root of [`record`]'s session, shared by every test: an existing
+/// empty directory, because the cache stores a session only below a root
+/// that canonicalises.
+fn record_root() -> SessionRoot {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    SessionRoot::new(
+        ROOT.get_or_init(|| tempfile::tempdir().expect("a temporary root"))
+            .path(),
+    )
+}
+
 fn record() -> SessionRecord {
-    let root = SessionRoot::new("virtual");
+    let root = record_root();
     let stub = SessionStub {
         locator: root.path.join("session.jsonl"),
         subagents: Vec::new(),
@@ -357,13 +375,18 @@ fn record() -> SessionRecord {
         },
     };
     SessionRecord::unlisted(
-        Source::Pi.provider().storage().cache(),
-        Source::Pi,
-        &root,
+        &crate::history::sqlite_cache::RecordPlace {
+            storage: Source::Pi.provider().storage().cache(),
+            source: Source::Pi,
+            roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
+            directories: &crate::history::path::CanonicalDirectories::of_system(),
+            linker: Source::Pi.provider().storage().thread_linker(),
+        },
         &stub,
         SessionStatus::Empty,
         "skipped transcript has no visible messages".to_owned(),
     )
+    .unwrap()
     .unwrap()
 }
 
@@ -435,7 +458,7 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
     send.send(CacheWrite::Session(Box::new(original))).unwrap();
     send.send(CacheWrite::Removed {
         storage: Source::Pi.provider().storage().cache(),
-        root: SessionRoot::new("virtual"),
+        root: record_root(),
         cache_keys: vec!["session".to_owned()],
     })
     .unwrap();
@@ -443,11 +466,7 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
     super::super::apply_writes(old, receive, None);
     assert_eq!(
         current
-            .current_fingerprints(
-                Source::Pi.provider().storage().cache(),
-                &SessionRoot::new("virtual"),
-                &[]
-            )
+            .current_fingerprints(Source::Pi.provider().storage().cache(), &record_root(), &[])
             .unwrap()["session"]
             .mtime_secs,
         2
@@ -462,8 +481,7 @@ fn takeover_between_batches_prevents_more_entries_and_final_status() {
     let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.mark_admitted().unwrap();
     let record = record();
-    let keys = cache.catalogue_keys(&record.catalogue);
-    let session = cache.write_catalogue(&record, &keys, None).unwrap();
+    let (session, _) = cache.write_catalogue(&record, None).unwrap();
     let replacement = replace_owner(&base);
     assert!(matches!(
         super::super::session_transaction(&mut cache.connection, session, owner.token()),
@@ -815,7 +833,7 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
     send.send(CacheWrite::Session(Box::new(changed))).unwrap();
     send.send(CacheWrite::Removed {
         storage: Source::Pi.provider().storage().cache(),
-        root: original.catalogue.root.clone(),
+        root: record_root(),
         cache_keys: vec![original.catalogue.cache_key.clone()],
     })
     .unwrap();
@@ -826,7 +844,7 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
         cache
             .holds(
                 Source::Pi.provider().storage().cache(),
-                &original.catalogue.root,
+                &record_root(),
                 &SessionStub {
                     locator: PathBuf::new(),
                     subagents: Vec::new(),
@@ -1325,15 +1343,19 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
     let base = rearview(directory.path());
     SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
     let other = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideRebuild);
+    let address = super::super::SessionAddress::new(
+        Source::Pi.provider().storage().cache(),
+        Source::Pi,
+        super::super::SessionRoots::of_system(&crate::history::provider::SessionRoot::new(
+            directory.path(),
+        )),
+        "session.jsonl".to_owned(),
+    );
     let started = Instant::now();
 
     let lookup = super::super::InteractiveCache::at(base.clone())
         .open()
-        .and_then(|cache| {
-            cache
-                .map(|cache| cache.find_session(Source::Pi, Path::new("session.jsonl"), &[]))
-                .transpose()
-        });
+        .and_then(|cache| cache.map(|cache| cache.copy_at(&address)).transpose());
 
     assert!(matches!(lookup, Err(error) if super::super::is_busy_error(&error)));
     assert_eq!(observe(&base).unwrap(), Observation::Unknown);

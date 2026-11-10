@@ -1538,6 +1538,10 @@ impl ConversationBuilder {
 
         Ok(Conversation {
             cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             source,
             subagents: Vec::new(),
             // Set by the caller, from the format's own rule for naming

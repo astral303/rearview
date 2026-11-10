@@ -28,6 +28,7 @@ const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(60 * 60);
 /// unit test build reads a temporary directory of the running test's own,
 /// never the developer's cache, which another rearview may be refreshing
 /// while the tests run.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn user_cache_base() -> Option<PathBuf> {
     #[cfg(test)]
     return Some(test_support::test_cache_directory());
@@ -60,11 +61,14 @@ pub(crate) fn disk_usage(path: &Path) -> std::io::Result<u64> {
 
 /// `disk_usage` of `path`, skipping files and folders in `counted`, the
 /// canonical paths already counted, and adding those it counts.
+#[allow(clippy::disallowed_methods)]
 fn add_disk_usage(path: &Path, counted: &mut HashSet<PathBuf>) -> std::io::Result<u64> {
     let with_path = |error: std::io::Error| {
         std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
     };
     let metadata = std::fs::metadata(path).map_err(with_path)?;
+    // Each file, to count a linked blob once: only `cache clear` and the
+    // model size report measure rearview's own semantic cache.
     if !counted.insert(std::fs::canonicalize(path).map_err(with_path)?) {
         return Ok(0);
     }

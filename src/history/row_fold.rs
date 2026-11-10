@@ -184,6 +184,20 @@ impl FoldCheckpoint {
         self.facts.entry_title.is_some()
     }
 
+    /// This checkpoint with the transcript of each thread it numbers
+    /// renamed by `rename`; `None` when `rename` cannot rename one.
+    pub(crate) fn with_transcripts_renamed(
+        mut self,
+        rename: crate::history::resumed::TranscriptRename<'_>,
+    ) -> Option<Self> {
+        for (thread, _) in &mut self.numbering.threads {
+            if let Some(transcript) = &mut thread.transcript {
+                *transcript = rename(transcript)?;
+            }
+        }
+        Some(self)
+    }
+
     /// This checkpoint with one more leading entry in the session's own
     /// thread, or one fewer for a negative `delta`.
     pub(crate) fn with_leading_entries_moved(mut self, delta: i64) -> Self {

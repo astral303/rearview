@@ -4,6 +4,7 @@
 use super::fingerprint::CachedFingerprint;
 use super::listing::{self, SessionOrigin, SessionTimes};
 use super::loader::{SeenPaths, sessions_not_loaded_term};
+use super::provider::walk::Canonicaliser;
 use super::provider::{
     self, FoundSession, ReadError, RediscoveredSessions, SessionOutcome, SessionRead, SessionStub,
     SessionTitle, SkippedSessions,
@@ -16,6 +17,7 @@ use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Every session the last load or refresh found, by locator, for a refresh to
 /// compare discovery against.
@@ -136,30 +138,39 @@ pub fn refresh_sessions(
         .iter()
         .map(|storage| storage.source())
         .collect::<Vec<_>>();
-    refresh_sources(known, &sources, options, &|source, needs_reading| {
-        let storage = environment
-            .storage_of(source)
-            .expect("a source the environment lists");
-        provider::rediscover_sessions(
-            environment,
-            storage,
-            options.show_last,
-            options.debug_level,
-            needs_reading,
-            operation,
-        )
-    })
+    let canonicaliser = environment.shared_canonicaliser();
+    refresh_sources(
+        known,
+        &sources,
+        options,
+        canonicaliser,
+        &|source, needs_reading| {
+            let storage = environment
+                .storage_of(source)
+                .expect("a source the environment lists");
+            provider::rediscover_sessions(
+                environment,
+                storage,
+                options.show_last,
+                options.debug_level,
+                needs_reading,
+                operation,
+            )
+        },
+    )
 }
 
 /// One agent's discovery, reading the sessions its second argument picks.
 type Rediscover<'a> =
     dyn Fn(Source, &dyn Fn(&SessionStub) -> bool) -> Result<RediscoveredSessions> + 'a;
 
-/// [`refresh_sessions`] over `sources`, in registry order.
+/// [`refresh_sessions`] over `sources`, in registry order. A row's file
+/// outside every root has its directory canonicalised through `canonicaliser`.
 fn refresh_sources(
     known: &KnownSessions,
     sources: &[Source],
     options: RefreshOptions,
+    canonicaliser: &Arc<dyn Canonicaliser>,
     rediscover: &Rediscover<'_>,
 ) -> Result<SessionChanges> {
     let mut changes = SessionChanges::default();
@@ -208,7 +219,7 @@ fn refresh_sources(
             ),
         );
     }
-    changes.drop_rows_listed_elsewhere();
+    changes.drop_rows_listed_elsewhere(canonicaliser);
     Ok(changes)
 }
 
@@ -334,11 +345,13 @@ impl SessionChanges {
     /// A file two agents reach under two spellings of its path lists once,
     /// under the first agent in the registry. Drop a new row whose file an
     /// earlier row in this refresh already names, and record it as unlisted.
-    fn drop_rows_listed_elsewhere(&mut self) {
-        let mut seen = SeenPaths::default();
+    /// Each row's file is identified below the roots of its address.
+    fn drop_rows_listed_elsewhere(&mut self, canonicaliser: &Arc<dyn Canonicaliser>) {
+        let mut seen = SeenPaths::new(canonicaliser);
         let mut listed = Vec::with_capacity(self.updated.len());
         for updated in std::mem::take(&mut self.updated) {
-            let first_to_name_it = seen.insert(&updated.row.path);
+            let first_to_name_it =
+                seen.insert(&updated.row.path, updated.row.cache_address.as_ref());
             if first_to_name_it || updated.replaces_listed_row {
                 listed.push(updated);
             } else {

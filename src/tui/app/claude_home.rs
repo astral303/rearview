@@ -370,10 +370,39 @@ pub(crate) fn app_reading(rows: Vec<Conversation>, environment: Environment) -> 
     )
 }
 
+/// A list `Ctrl+R` of `app` under `window`, run as the background worker
+/// runs it.
+pub(crate) fn serve_list_refresh(app: &mut App, window: crate::time_filter::TimeFilter) {
+    let known = app.begin_refresh().expect("a list refresh begins");
+    let environment = app.environment.clone();
+    let outcome = std::thread::spawn(move || {
+        let operation = crate::history::OperationScope::new(
+            environment.cache_base(),
+            crate::history::Patience::UntilAcquired,
+            Arc::default(),
+        );
+        let options = crate::history::RefreshOptions {
+            time: window,
+            ..Default::default()
+        };
+        let outcome = crate::history::refresh_sessions(&environment, &known, options, &operation)
+            .map(|changes| crate::history::RefreshOutcome::Changes(Box::new(changes)));
+        operation.finish().and(outcome)
+    })
+    .join()
+    .unwrap();
+    app.finish_refresh(outcome);
+}
+
 /// The session cache under `cache_base` as another rearview reaches it, on
 /// `clock`: its refresh ownership reads as another process's.
 pub(crate) fn another_rearview(cache_base: &Path, clock: Arc<dyn Clock>) -> CacheBase {
-    CacheBase::new(cache_base, ProcessIdentity::default(), clock)
+    CacheBase::new(
+        cache_base,
+        ProcessIdentity::default(),
+        clock,
+        crate::history::provider::walk::SystemCanonicaliser::shared(),
+    )
 }
 
 /// A session cache directory holding an admitted database without sessions,

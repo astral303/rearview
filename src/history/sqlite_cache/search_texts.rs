@@ -98,7 +98,7 @@ impl CachedSession {
         window: &TimeFilter,
         mut visit: impl FnMut(SearchText<'_>) -> ControlFlow<()>,
     ) -> Result<Option<()>> {
-        self.read(|connection, session| {
+        self.read(|connection, session, _| {
             let read = SessionRead::new(connection, session, fields, StoredWindow::of(window))?;
             let _ = read.visit_texts(&mut visit)?;
             Ok(())

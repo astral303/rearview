@@ -3,14 +3,18 @@
 //! `agent_progress` shape unconverted, since they index and print it.
 
 use super::format::RecordLine;
-use super::sqlite_cache::{CachedCopy, InteractiveCache, InteractiveRead};
+use super::sqlite_cache::{
+    CachedCopy, CachedSession, Currency, InteractiveCache, InteractiveRead, Publication,
+    SessionAddress,
+};
 use super::{MalformedLine, Source, TranscriptEntries, sniffed_session};
 use crate::error::Result;
 use crate::log_entry::{
     LogEntry, SubagentIdentity, agent_progress_identity, convert_agent_progress,
 };
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
 /// The record an entry was read from, and which of that record's entries it
 /// is. An entry keeps its origin when the session is read again, wherever
@@ -98,48 +102,133 @@ const PRINTOUT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1)
 /// it, with the preview `show_last` selects for its row: refreshed under
 /// refresh ownership when its cached copy is out of date or missing, then
 /// read from `environment`'s cache. While another rearview keeps the cache
-/// past [`PRINTOUT_PATIENCE`], the copy as it is. The TUI reads through
+/// past [`PRINTOUT_PATIENCE`], or once the refresh's writes stop, an older
+/// copy prints as it is, and one line on `notices` names it; a session the
+/// refresh parsed whole prints as parsed. The TUI reads through
 /// [`display_log_entries_interactively`].
 pub fn printed_log_entries(
     environment: &super::Environment,
     source: Source,
     path: &Path,
     show_last: bool,
+    notices: &mut dyn std::io::Write,
 ) -> Result<DisplayEntries> {
     let operation = super::OperationScope::new(
         environment.cache_base(),
         super::Patience::AtMost(PRINTOUT_PATIENCE),
-        std::sync::Arc::default(),
+        Arc::default(),
     );
-    let read = super::provider::cache_sessions(
+    let printed = printed_session(environment, source, path, show_last, &operation);
+    let finished = operation.finish();
+    let printed = printed?;
+    finished?;
+    if let Some(reason) = printed.older_copy_reason {
+        writeln!(
+            notices,
+            "Showing an older cached copy of {}: {reason}",
+            path.display()
+        )?;
+    }
+    Ok(printed.entries)
+}
+
+/// The entries the printout shows, and why they are an older copy's.
+struct PrintedSession {
+    entries: DisplayEntries,
+    /// `None` when the entries are current.
+    older_copy_reason: Option<&'static str>,
+}
+
+/// The session at `path` the printout shows, refreshed and read under
+/// `operation`: the entries the refresh parsed when its copy does not hold
+/// them; otherwise the copy at the refreshed row's address, with a notice
+/// when it is older than the row. Fails when neither exists.
+fn printed_session(
+    environment: &super::Environment,
+    source: Source,
+    path: &Path,
+    show_last: bool,
+    operation: &super::OperationScope,
+) -> Result<PrintedSession> {
+    let mut outcomes = super::provider::cache_sessions(
         environment,
         source,
         &[path],
         show_last,
-        &operation,
+        operation,
         super::load_meter::AgentMeter::UNMETERED,
-    )
-    .map(|mut outcomes| {
-        // The printout is rearview's last output: no later refresh follows
-        // the read's next step.
-        outcomes.pop().map(|outcome| outcome.into_parts().0)
-    });
-    let finished = operation.finish();
-    let subagents = match read? {
-        Some(super::provider::SessionRead::Listed(row)) => row.subagents,
+    )?;
+    // The printout is rearview's last output: no later refresh follows the
+    // read's next step.
+    let Some((super::provider::SessionRead::Listed(row), unwritten_entries)) = outcomes
+        .pop()
+        .map(|outcome| outcome.into_read_and_unwritten_entries())
+    else {
+        return Err(not_in_the_cache(path));
+    };
+    if let Some(entries) = unwritten_entries {
+        return Ok(PrintedSession {
+            entries: entries.into(),
+            older_copy_reason: None,
+        });
+    }
+    let copy = match &row.cache_address {
+        Some(address) => {
+            super::sqlite_cache::find_cached_session_waiting(environment.cache_base(), address)?
+        }
+        None => None,
+    };
+    let currency = match &copy {
+        Some(copy) => currency_for_its_publisher(copy, &row.publication)?,
+        None => None,
+    };
+    let older_copy = match (copy, currency) {
+        (Some(copy), Some(Currency::Current | Currency::Newer { .. })) => {
+            return Ok(PrintedSession {
+                entries: copy_entries(copy, path)?,
+                older_copy_reason: None,
+            });
+        }
+        (Some(copy), Some(Currency::Older)) => copy,
         _ => return Err(not_in_the_cache(path)),
     };
-    finished?;
-    let entries = super::sqlite_cache::find_cached_session_waiting(
-        environment.cache_base(),
-        source,
-        path,
-        &subagents,
-    )?
-    .map(|cached| cached.ignoring_source_changes().entries())
-    .transpose()?
-    .flatten()
-    .ok_or_else(|| not_in_the_cache(path))?;
+    Ok(PrintedSession {
+        entries: copy_entries(older_copy, path)?,
+        older_copy_reason: Some(match operation.stale_cause() {
+            super::StaleCause::AnotherRearview => {
+                "another rearview is refreshing the session cache"
+            }
+            super::StaleCause::WritesStopped => "rearview could not update it in the session cache",
+        }),
+    })
+}
+
+/// `copy`'s currency for the row whose publication is `publication`, read by
+/// the command whose refresh built the row. A copy at or after the
+/// generation the refresh published is current without checking its
+/// transcripts: the refresh read them, and an agent's write after its parse
+/// would otherwise make its own copy older. `None` when the cache no longer
+/// holds the copy of an unpublished row.
+fn currency_for_its_publisher(
+    copy: &CachedSession,
+    publication: &Publication,
+) -> Result<Option<Currency>> {
+    match publication {
+        Publication::Published { generation } if copy.generation() >= *generation => {
+            Ok(Some(Currency::Current))
+        }
+        Publication::Published { .. } => Ok(Some(Currency::Older)),
+        Publication::Unpublished { .. } => copy.currency(publication),
+    }
+}
+
+/// The entries of `copy`, the copy of the session at `path`, as the cache
+/// holds them.
+fn copy_entries(copy: CachedSession, path: &Path) -> Result<DisplayEntries> {
+    let entries = copy
+        .ignoring_source_changes()
+        .entries()?
+        .ok_or_else(|| not_in_the_cache(path))?;
     Ok(entries.into())
 }
 
@@ -152,26 +241,42 @@ fn not_in_the_cache(path: &Path) -> crate::error::AppError {
     }
 }
 
-/// The session's entries as the viewer, exports and the clipboard copy read
-/// them, through `cache`'s interactive read: the copy the cache holds,
-/// current or not.
+/// The entries of the session at `address` as the viewer, exports and the
+/// clipboard copy read them, through `cache`'s interactive read: the newest
+/// copy the cache holds, current or not, for a row whose publication is
+/// `publication`. A copy written after the row comes with its own
+/// publication and catalogue row.
 pub fn display_log_entries_interactively(
     cache: &InteractiveCache,
-    source: Source,
-    path: &Path,
-    subagents: &[PathBuf],
+    address: &SessionAddress,
+    publication: &Publication,
 ) -> InteractiveRead<DisplayEntries> {
     cache.read(|reader| {
-        let Some(session) = reader.find_session(source, path, subagents)? else {
+        let Some(session) = reader.copy_at(address)? else {
             return Ok(None);
         };
-        let is_current = session.matches_source()?;
+        let Some(currency) = session.currency(publication)? else {
+            return Ok(None);
+        };
+        let newer_row = match &currency {
+            Currency::Newer { generation, .. } => reader
+                .catalogue_row_at(address)?
+                .filter(|row| {
+                    row.publication
+                        == Publication::Published {
+                            generation: *generation,
+                        }
+                })
+                .map(Box::new),
+            Currency::Current | Currency::Older => None,
+        };
         Ok(session
             .ignoring_source_changes()
             .entries()?
             .map(|entries| CachedCopy {
                 value: DisplayEntries::from(entries),
-                is_current,
+                currency,
+                newer_row,
             }))
     })
 }
@@ -181,8 +286,9 @@ pub fn display_log_entries_interactively(
 pub fn sniffed_display_log_entries(
     permit: super::ParsePermit<'_>,
     path: &Path,
+    environment: &super::provider::RootEnvironment,
 ) -> Result<DisplayEntries> {
-    Ok(sniffed_session(permit, path)?.into())
+    Ok(sniffed_session(permit, path, environment)?.into())
 }
 
 #[cfg(test)]
@@ -190,6 +296,7 @@ mod tests {
     use super::*;
     use crate::history::normalized_session;
     use std::collections::HashSet;
+    use std::path::PathBuf;
 
     fn user_line(text: &str, second: usize) -> String {
         serde_json::json!({

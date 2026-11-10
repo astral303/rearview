@@ -2,11 +2,11 @@
 //! background worker: a session inside a provider's session roots is read
 //! as the refresh owner and cached; any other file is parsed and not cached.
 
+use super::SessionRoot;
 use super::SessionStorage;
-use super::load::cache_sessions;
+use super::load::cache_canonical_session;
 use super::outcome::SessionOutcome;
 use crate::error::{AppError, Result};
-use crate::history::load_meter::AgentMeter;
 use crate::history::parser::{RowDating, conversation_from_projection};
 use crate::history::{
     Conversation, DisplayEntries, Environment, OperationScope, Source, TranscriptEntries,
@@ -24,7 +24,7 @@ pub enum DirectFileRead {
     },
     /// A file outside every provider's session roots, read by the format of
     /// `source`, which recognises it, and not cached: its row, `None` when
-    /// it holds no conversation, and its entries without sub-agents.
+    /// it does not hold a conversation, and its entries without sub-agents.
     Bare {
         source: Source,
         row: Option<Box<Conversation>>,
@@ -32,11 +32,11 @@ pub enum DirectFileRead {
     },
 }
 
-/// The file at `path` read under `operation`, with the preview `show_last`
-/// selects. A session inside more than one provider's roots is read by the
-/// first provider that lists it, else the first that finds it. Fails with
-/// [`AppError::UnrecognizedTranscript`] for a file outside every root that
-/// no format recognises.
+/// The file at `path`, canonicalised by the caller, read under `operation`, with
+/// the preview `show_last` selects. A session inside more than one
+/// provider's roots is read by the first provider that lists it, else the
+/// first that finds it. Fails with [`AppError::UnrecognizedTranscript`] for
+/// a file outside every root that the formats do not recognise.
 pub fn open_direct_file(
     environment: &Environment,
     path: &Path,
@@ -44,17 +44,11 @@ pub fn open_direct_file(
     operation: &OperationScope,
 ) -> Result<DirectFileRead> {
     let mut found = None;
-    for storage in storages_holding(environment, path) {
+    for (storage, roots) in storages_holding(environment, path) {
         let source = storage.source();
-        let Some(outcome) = cache_sessions(
-            environment,
-            source,
-            &[path],
-            show_last,
-            operation,
-            AgentMeter::UNMETERED,
-        )?
-        .pop() else {
+        let Some(outcome) =
+            cache_canonical_session(environment, source, roots, path, show_last, operation)?.pop()
+        else {
             continue;
         };
         if outcome.is_listed() {
@@ -70,24 +64,29 @@ pub fn open_direct_file(
     }
 }
 
-/// The storages with a session root holding the file at `path`.
+/// The storages with a session root holding the file at `path`, which the
+/// caller canonicalised (`DirectFile::canonical`), each with its roots: below
+/// the root or a directory beside it as spelled, or below its canonical path.
+/// The roots keep the canonical path that matched, so the read of the file
+/// doesn't canonicalise them again.
 fn storages_holding<'a>(
     environment: &'a Environment,
-    path: &Path,
-) -> impl Iterator<Item = &'a dyn SessionStorage> {
-    let file = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    path: &'a Path,
+) -> impl Iterator<Item = (&'a dyn SessionStorage, Vec<SessionRoot>)> {
+    let canonicaliser = environment.canonicaliser();
+    let root_environment = environment.root_environment();
     environment
         .storages()
         .iter()
         .copied()
-        .filter(move |storage| {
-            storage.roots().is_ok_and(|roots| {
-                roots.iter().any(|root| {
-                    root.path
-                        .canonicalize()
-                        .is_ok_and(|root| file.starts_with(root))
+        .filter_map(move |storage| {
+            let roots = storage.roots_in(&root_environment).ok()?;
+            roots
+                .iter()
+                .any(|root| {
+                    root.holds(path) || root.canonical_position_of(path, canonicaliser).is_some()
                 })
-            })
+                .then_some((storage, roots))
         })
 }
 

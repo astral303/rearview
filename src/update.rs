@@ -284,12 +284,14 @@ fn do_update(
     ))
 }
 
+#[allow(clippy::disallowed_methods)]
 pub fn run() -> Result<()> {
     let current_exe = std::env::current_exe()
         .map_err(|e| AppError::UpdateError(format!("Could not determine executable path: {e}")))?;
 
     // Guard: package-manager installs, whose records this update would not
-    // change (canonicalize to resolve symlinks and Scoop's `current` junction)
+    // change (canonicalize to resolve symlinks and Scoop's `current` junction;
+    // rearview's own executable, once per update)
     let canonical_exe = std::fs::canonicalize(&current_exe).unwrap_or(current_exe.clone());
     if is_homebrew_install(&canonical_exe) {
         return Err(AppError::UpdateError(format!(

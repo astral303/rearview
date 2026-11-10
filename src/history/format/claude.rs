@@ -262,6 +262,14 @@ impl ThreadLinker for ClaudeTranscript {
     fn fold(&self, ledger: &[u8], thread: &mut SubagentThread, _threads: &[LinkedThread<'_>]) {
         LaunchLedger::decode(ledger).fold(thread);
     }
+
+    fn with_transcripts_renamed(
+        &self,
+        ledger: &[u8],
+        rename: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<Vec<u8>> {
+        LaunchLedger::with_transcripts_renamed(ledger, rename)
+    }
 }
 
 /// The thread of each sub-agent transcript at `subagents` that reads and

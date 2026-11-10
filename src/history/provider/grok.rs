@@ -109,8 +109,12 @@ impl SessionProvider for GrokProvider {
         Capability::Capable(self)
     }
 
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, &GrokStorage, session_id)
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, &GrokStorage, environment, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -1355,8 +1359,11 @@ pub(super) mod tests {
 
     #[test]
     fn id_that_is_not_uuid_doesnt_resolve() {
-        let resolve =
-            |query| super::super::resolve_in_storage(&GrokProvider, &GrokStorage, query).unwrap();
+        let environment = RootEnvironment::of_process();
+        let resolve = |query| {
+            super::super::resolve_in_storage(&GrokProvider, &GrokStorage, &environment, query)
+                .unwrap()
+        };
         assert_eq!(resolve("../escape"), None);
         assert_eq!(resolve("updates.jsonl"), None);
     }

@@ -1,23 +1,92 @@
-//! A catalogue row's content location; connections stay local to each read.
+//! A session's address in the cache and a catalogue row's content location;
+//! connections stay local to each read.
 
 use super::files::{self, FileKey, RootKey};
-use super::{
-    CacheBase, ReaderWait, SqliteCache, StoredEntries, entries, is_storage_current, path_text,
-};
-use crate::error::Result;
+use super::roots::{Places, SessionRoots, StoredPath};
+use super::{CacheBase, ReaderWait, SqliteCache, StoredEntries, entries, is_storage_current};
+use crate::error::{AppError, Result};
 use crate::history::TranscriptEntries;
+use crate::history::fingerprint::CachedFingerprint;
+use crate::history::path::FileIdentity;
 use crate::history::provider::{SessionCache, SessionRoot};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// A listed session's place in the cache, whichever copy it holds: the
+/// provider's storage, the session's roots in the spelling of the run that
+/// listed it, and its cache key. The viewer, the printout and the agent
+/// commands find the newest copy at a row's address without canonicalising
+/// a path; checking that copy against its transcripts still reads their
+/// metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionAddress {
+    pub(super) storage: SessionCache,
+    pub(super) source: crate::history::Source,
+    /// The session's root and the directories beside it: its files' paths
+    /// join them.
+    pub(super) roots: SessionRoots,
+    pub(super) cache_key: String,
+}
+
+impl SessionAddress {
+    pub(crate) fn new(
+        storage: SessionCache,
+        source: crate::history::Source,
+        roots: SessionRoots,
+        cache_key: String,
+    ) -> Self {
+        Self {
+            storage,
+            source,
+            roots,
+            cache_key,
+        }
+    }
+
+    /// The identity of the session file at `path`, below the session's roots
+    /// as this address spells them; `None` for a path outside them all.
+    pub(crate) fn file_identity(&self, path: &Path) -> Option<FileIdentity> {
+        self.roots.file_identity(path)
+    }
+}
+
+/// A listed row's record of its copy in the cache. It decides whether a copy
+/// at the row's address is current for the row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Publication {
+    /// The row is the copy of this generation: restored from it, or
+    /// written from the read that built the row.
+    Published { generation: i64 },
+    /// No write of the row is known to have landed. The row comes from a
+    /// parse whose write failed or was withheld, a parse whose write the read
+    /// did not wait for, or a copy restored as it is. `discovered` holds the
+    /// sub-agent transcripts discovery found for the session.
+    Unpublished { discovered: Vec<PathBuf> },
+}
+
+/// A copy's currency for a row, as [`CachedSession::currency`] finds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Currency {
+    /// The row's own copy.
+    Current,
+    /// A copy written after a published row, or holding every transcript
+    /// discovery found for an unpublished row: its reader shows it as
+    /// current, with its own generation, sub-agents and catalogue row.
+    Newer {
+        generation: i64,
+        subagents: Vec<PathBuf>,
+    },
+    /// A copy whose transcripts changed since it was written, written
+    /// before the row, or lacking a transcript discovery found.
+    Older,
+}
 
 #[derive(Clone)]
 pub struct CachedSession {
     pub(super) base: CacheBase,
-    pub(super) storage: SessionCache,
-    pub(super) root_key: RootKey,
-    pub(super) cache_key: String,
+    pub(super) address: SessionAddress,
     pub(super) generation: i64,
-    pub(super) source: crate::history::Source,
     /// The wait of this session's reads: the wait of the reader that found
     /// it.
     pub(super) wait: ReaderWait,
@@ -30,7 +99,7 @@ pub struct CachedSession {
 /// copy another key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CopyKey {
-    root_key: RootKey,
+    root_key: Option<RootKey>,
     cache_key: String,
     generation: i64,
 }
@@ -46,10 +115,14 @@ impl CachedSession {
         Self { generation, ..self }
     }
 
+    pub(crate) fn address(&self) -> &SessionAddress {
+        &self.address
+    }
+
     pub(crate) fn copy_key(&self) -> CopyKey {
         CopyKey {
-            root_key: self.root_key.clone(),
-            cache_key: self.cache_key.clone(),
+            root_key: self.address.roots.key().cloned(),
+            cache_key: self.address.cache_key.clone(),
             generation: self.generation,
         }
     }
@@ -61,10 +134,11 @@ impl CachedSession {
         path: &Path,
         range: crate::agent::refs::MessageRange,
     ) -> Result<Option<crate::agent::transcript::AgentTranscript>> {
-        self.read(|connection, session| {
+        self.read(|connection, session, places| {
             entries::read_range(
                 connection,
                 session,
+                places,
                 path,
                 range.start as u64..=range.end as u64,
             )
@@ -90,132 +164,194 @@ impl CachedSession {
         }
     }
 
-    /// True when the copy matches its transcripts as they are now; false when
-    /// they changed since it was written, or the cache no longer holds it.
-    pub(crate) fn matches_source(&self) -> Result<bool> {
-        match self.read(|_, _| Ok(())) {
-            Ok(found) => Ok(found.is_some()),
-            Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// [`Self::matches_source`], and false as well when the copy's sub-agent
-    /// transcripts are not `subagents`, the session's sub-agents now: a
-    /// session that started a sub-agent since its copy was written.
-    pub(crate) fn matches_transcripts(&self, subagents: &[PathBuf]) -> Result<bool> {
-        let lists_subagents =
-            self.read(|connection, session| lists_subagents(connection, session, subagents));
-        match lists_subagents {
-            Ok(found) => Ok(found == Some(true)),
-            Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(false),
-            Err(error) => Err(error),
-        }
+    /// This copy's currency for a row whose publication is `publication`;
+    /// `None` when the cache no longer holds the copy. The copy's
+    /// transcripts are checked whether or not this session reads its copy
+    /// as it is.
+    pub(crate) fn currency(&self, publication: &Publication) -> Result<Option<Currency>> {
+        let checking = Self {
+            checks_source: true,
+            ..self.clone()
+        };
+        let discovered: &[PathBuf] = match publication {
+            Publication::Unpublished { discovered } => discovered,
+            Publication::Published { .. } => &[],
+        };
+        let stored = checking.read(|connection, session, places| {
+            let stored = stored_subagents(connection, session)?;
+            let stored_keys: HashSet<(i64, FileKey)> = stored
+                .iter()
+                .map(|subagent| (subagent.root, subagent.key()))
+                .collect();
+            let holds_discovered = discovered.iter().all(|path| {
+                places
+                    .place(path)
+                    .is_some_and(|place| stored_keys.contains(&(place.root, place.key())))
+            });
+            let paths = stored
+                .into_iter()
+                .map(|subagent| places.path(subagent))
+                .collect::<Result<Vec<PathBuf>>>()?;
+            Ok((paths, holds_discovered))
+        });
+        let (stored, holds_discovered) = match stored {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return Ok(None),
+            Err(error) if error.is_changed_source() => return Ok(Some(Currency::Older)),
+            Err(error) => return Err(error),
+        };
+        let newer = || Currency::Newer {
+            generation: self.generation,
+            subagents: stored,
+        };
+        Ok(Some(match publication {
+            Publication::Published { generation } if self.generation == *generation => {
+                Currency::Current
+            }
+            Publication::Published { generation } if self.generation > *generation => newer(),
+            // A copy before the row's own: the cache was rebuilt since.
+            Publication::Published { .. } => Currency::Older,
+            Publication::Unpublished { .. } if !holds_discovered => Currency::Older,
+            Publication::Unpublished { .. } => newer(),
+        }))
     }
 
     pub(crate) fn entries(&self) -> Result<Option<TranscriptEntries>> {
-        self.read(|connection, session| entries::read(connection, session, None))
+        self.read(|connection, session, places| entries::read(connection, session, places, None))
     }
 
     pub(crate) fn numbered_entries(
         &self,
         messages: Option<std::ops::RangeInclusive<u64>>,
     ) -> Result<Option<StoredEntries>> {
-        self.read(|connection, session| entries::read_numbered(connection, session, messages))
+        self.read(|connection, session, places| {
+            entries::read_numbered(connection, session, places, messages)
+        })
     }
 
+    /// `read`'s result over the copy's row and the places of its roots,
+    /// inside one read snapshot; `None` when the cache does not hold the
+    /// copy, or the copy stores a file below a root this address lacks: a
+    /// directory beside the root that did not canonicalise when the address
+    /// was made. A later read that lists the session with this run's roots
+    /// reads the copy.
     pub(super) fn read<T>(
         &self,
-        read: impl FnOnce(&Connection, i64) -> Result<T>,
+        read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
     ) -> Result<Option<T>> {
         let Some(cache) = self.wait.open(&self.base)? else {
             return Ok(None);
         };
+        let address = &self.address;
         cache.with_read_snapshot(|connection| {
-            if !is_storage_current(connection, self.storage)? {
+            if !is_storage_current(connection, address.storage)? {
                 return Ok(None);
             }
             let Some(stored) = entries::listed_session_of(
                 connection,
-                self.storage.directory,
-                &self.root_key,
-                &self.cache_key,
+                address.storage.directory,
+                address.roots.key(),
+                &address.cache_key,
             )?
             else {
                 return Ok(None);
             };
             let session = stored.id;
             if stored.generation != self.generation {
-                return Err(crate::error::AppError::SessionCacheNotReady {
-                    session: self.cache_key.clone(),
+                return Err(AppError::SessionCacheNotReady {
+                    session: address.cache_key.clone(),
                     reason: "catalogue generation changed".to_owned(),
                 });
             }
-            if self.checks_source {
-                self.validate_source(connection, session)?;
+            let places = Places::stored(connection, &address.roots)?;
+            let result = (|| {
+                if self.checks_source {
+                    self.validate_source(connection, &places, session)?;
+                }
+                let result = read(connection, session, &places)?;
+                if self.checks_source {
+                    self.validate_source(connection, &places, session)?;
+                }
+                Ok(result)
+            })();
+            match result {
+                Ok(result) => Ok(Some(result)),
+                Err(AppError::StoredRootUnknown { .. }) => Ok(None),
+                Err(error) => Err(error),
             }
-            let result = read(connection, session)?;
-            if self.checks_source {
-                self.validate_source(connection, session)?;
-            }
-            Ok(Some(result))
         })
     }
 
-    fn validate_source(&self, connection: &Connection, session: i64) -> Result<()> {
-        files::validate(connection, session)?;
-        // Look the locator up under the stored root, which the write spelled
-        // as it spelled the locator: another spelling lists it under another
-        // path.
-        let logical: Option<(String, String, crate::history::fingerprint::CachedFingerprint)> = connection.query_row(
-            "SELECT s.root, s.locator, s.file_size, s.mtime_secs, s.mtime_nsecs FROM sessions s \
-             JOIN session_files f ON f.session = s.id WHERE s.id = ?1 AND f.kind = 'locator' AND f.file_size IS NULL",
-            [session], |row| Ok((row.get(0)?, row.get(1)?, crate::history::fingerprint::CachedFingerprint { file_size: row.get::<_, i64>(2)? as u64, mtime_secs: row.get::<_, i64>(3)? as u64, mtime_nsecs: row.get(4)? })),
-        ).optional()?;
-        if let Some((root, locator, expected)) = logical {
-            let current = self.source.provider().storage().current_fingerprint(
-                &crate::history::provider::SessionRoot::new(root),
-                Path::new(&locator),
-            )?;
+    fn validate_source(
+        &self,
+        connection: &Connection,
+        places: &Places,
+        session: i64,
+    ) -> Result<()> {
+        files::validate(connection, places, session)?;
+        let logical: Option<(StoredPath, CachedFingerprint)> = connection
+            .query_row(
+                "SELECT f.root, f.path, s.file_size, s.mtime_secs, s.mtime_nsecs FROM sessions s \
+                 JOIN session_files f ON f.session = s.id \
+                 WHERE s.id = ?1 AND f.kind = 'locator' AND f.file_size IS NULL",
+                [session],
+                |row| {
+                    Ok((
+                        StoredPath {
+                            root: row.get(0)?,
+                            path: row.get(1)?,
+                        },
+                        CachedFingerprint {
+                            file_size: row.get::<_, i64>(2)? as u64,
+                            mtime_secs: row.get::<_, i64>(3)? as u64,
+                            mtime_nsecs: row.get(4)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((locator, expected)) = logical {
+            let locator = places.path(locator)?;
+            let current = self
+                .address
+                .source
+                .provider()
+                .storage()
+                .current_fingerprint(&SessionRoot::new(self.address.roots.path()), &locator)?;
             if current != Some(expected) {
-                return Err(crate::error::AppError::SessionCacheSourceChanged(
-                    locator.into(),
-                ));
+                return Err(AppError::SessionCacheSourceChanged(locator));
             }
         }
         Ok(())
     }
 }
 
-/// The listed session at `path` with `subagents` in the cache under `base`,
-/// through [`SqliteCache::open_waiting`]; `None` when the cache does not
-/// hold it.
+/// The newest copy of the listed session at `address` in the cache under
+/// `base`, through [`SqliteCache::open_waiting`]; `None` when the cache does
+/// not hold it.
 pub(crate) fn find_waiting(
     base: &CacheBase,
-    source: crate::history::Source,
-    path: &Path,
-    subagents: &[PathBuf],
+    address: &SessionAddress,
 ) -> Result<Option<CachedSession>> {
     let Some(cache) = SqliteCache::open_waiting(base)? else {
         return Ok(None);
     };
-    cache.find_session(source, path, subagents)
+    cache.copy_at(address)
 }
 
-/// The copy of the listed session `source` stores at `path` in the cache
-/// under `base`, whatever sub-agents it lists; `None` when the cache does
-/// not hold it. The lookup and the copy's reads fail at once with a busy
-/// error while another connection holds an exclusive lock, as a rebuild
-/// does: callers wait through it with [`super::read_when_unlocked`].
+/// The newest copy of the listed session at `address` in the cache under
+/// `base`; `None` when the cache does not hold it. The lookup and the
+/// copy's reads fail at once with a busy error while another connection
+/// holds an exclusive lock, as a rebuild does: callers wait through it with
+/// [`super::read_when_unlocked`].
 pub(crate) fn find_copy_without_waiting(
     base: &CacheBase,
-    source: crate::history::Source,
-    path: &Path,
+    address: &SessionAddress,
 ) -> Result<Option<CachedSession>> {
     let Some(cache) = SqliteCache::open_waiting_at_most(base, std::time::Duration::ZERO)? else {
         return Ok(None);
     };
-    cache.find_copy(source, path)
+    cache.copy_at(address)
 }
 
 /// [`find_copy_without_waiting`], whose reads return the copy as the cache
@@ -223,91 +359,98 @@ pub(crate) fn find_copy_without_waiting(
 /// The reads return the sub-agents the copy lists.
 pub(crate) fn find_as_is_without_waiting(
     base: &CacheBase,
-    source: crate::history::Source,
-    path: &Path,
+    address: &SessionAddress,
 ) -> Result<Option<CachedSession>> {
-    Ok(find_copy_without_waiting(base, source, path)?.map(CachedSession::ignoring_source_changes))
+    Ok(find_copy_without_waiting(base, address)?.map(CachedSession::ignoring_source_changes))
 }
 
 impl SqliteCache {
-    /// The listed session `source` stores at `path` with `subagents`;
-    /// `None` when the database holds none.
-    pub(crate) fn find_session(
-        &self,
-        source: crate::history::Source,
-        path: &Path,
-        subagents: &[PathBuf],
-    ) -> Result<Option<CachedSession>> {
-        self.with_read_snapshot(|connection| {
-            let Some((copy, session)) = self.listed_copy(connection, source, path)? else {
-                return Ok(None);
-            };
-            Ok(lists_subagents(connection, session, subagents)?.then_some(copy))
-        })
+    /// The newest copy of the listed session at `address`; `None` when the
+    /// database holds none.
+    pub(crate) fn copy_at(&self, address: &SessionAddress) -> Result<Option<CachedSession>> {
+        let generation: Option<i64> = self.with_read_snapshot(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT generation FROM sessions WHERE storage = ?1 \
+                     AND root = (SELECT id FROM roots WHERE key = ?2) AND cache_key = ?3 \
+                     AND status = 'listed'",
+                    params![
+                        address.storage.directory,
+                        address.roots.key().map(RootKey::as_str),
+                        address.cache_key
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })?;
+        Ok(generation.map(|generation| CachedSession {
+            base: self.base().clone(),
+            address: address.clone(),
+            generation,
+            wait: self.wait,
+            checks_source: true,
+        }))
     }
 
-    /// The listed session `source` stores at `path`, whatever sub-agents it
-    /// lists; `None` when the database holds none.
-    pub(crate) fn find_copy(
-        &self,
-        source: crate::history::Source,
-        path: &Path,
-    ) -> Result<Option<CachedSession>> {
-        self.with_read_snapshot(|connection| {
-            Ok(self
-                .listed_copy(connection, source, path)?
-                .map(|(copy, _)| copy))
-        })
-    }
-
-    /// The cache key of the listed session `source` stores under `root` at
-    /// `path`, when its copy matches the transcripts as they are now; `None`
-    /// when the database holds no listed session there, or an older copy.
+    /// Finds a listed session by its own transcript: `below_key` is the key
+    /// of the transcript's path below `root`. Returns the session's cache
+    /// key when its copy matches the transcripts as they are now, and `None`
+    /// when the database doesn't hold a listed session there or holds an
+    /// older copy.
     pub(crate) fn current_cache_key(
         &self,
         source: crate::history::Source,
         root: &SessionRoot,
-        path: &Path,
+        below_key: &str,
     ) -> Result<Option<String>> {
-        let root_key = self.root_key(root);
+        let roots = self.session_roots(root);
         self.with_read_snapshot(|connection| {
-            let Some((copy, session)) = self
-                .listed_copy(connection, source, path)?
-                .filter(|(copy, _)| copy.root_key == root_key)
+            let places = Places::stored(connection, &roots)?;
+            let Some(listing) = places.listing_root() else {
+                return Ok(None);
+            };
+            let key = FileKey::of_path_below_root(Path::new(below_key));
+            let Some((copy, session)) =
+                self.listed_copy(connection, source, roots, listing, &key)?
             else {
                 return Ok(None);
             };
-            match copy.validate_source(connection, session) {
-                Ok(()) => Ok(Some(copy.cache_key)),
-                Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(None),
+            match copy.validate_source(connection, &places, session) {
+                Ok(()) => Ok(Some(copy.address.cache_key)),
+                Err(error) if error.is_changed_source() => Ok(None),
                 Err(error) => Err(error),
             }
         })
     }
 
-    /// The listed session `source` stores at `path`, spelled as discovery
-    /// spells the locator or canonical, with its row's id.
+    /// The listed session `source` stores under the root of the row `root`,
+    /// whose own transcript's path below that root has `key`, with its row's
+    /// id. Its files are read through `roots`.
     fn listed_copy(
         &self,
         connection: &Connection,
         source: crate::history::Source,
-        path: &Path,
+        roots: SessionRoots,
+        root: i64,
+        key: &FileKey,
     ) -> Result<Option<(CachedSession, i64)>> {
         let storage = source.provider().storage().cache();
-        let stored: Option<(i64, i64, String, String)> = connection.query_row(
-            "SELECT id, generation, root_key, cache_key FROM sessions WHERE storage = ?1 AND (locator = ?2 OR file_key = ?3) AND status = 'listed' ORDER BY id LIMIT 1",
-            params![storage.directory, path_text(path), FileKey::of_canonical(path).as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).optional()?;
-        Ok(stored.map(|(session, generation, root_key, cache_key)| {
+        let stored: Option<(i64, i64, String)> = connection
+            .query_row(
+                "SELECT s.id, s.generation, s.cache_key FROM session_files f \
+                 JOIN sessions s ON s.id = f.session \
+                 WHERE f.kind = 'locator' AND f.key = ?1 AND f.root = ?2 AND s.root = ?2 \
+                 AND s.storage = ?3 AND s.status = 'listed' ORDER BY s.id LIMIT 1",
+                params![key.as_str(), root, storage.directory],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(stored.map(|(session, generation, cache_key)| {
             (
                 CachedSession {
                     base: self.base().clone(),
-                    storage,
-                    root_key: RootKey::stored(root_key),
-                    cache_key,
+                    address: SessionAddress::new(storage, source, roots, cache_key),
                     generation,
-                    source,
                     wait: self.wait,
                     checks_source: true,
                 },
@@ -317,17 +460,19 @@ impl SqliteCache {
     }
 }
 
-/// True when the copy `session` lists `subagents`, in order: each spelled as
-/// the copy stores it, or canonical.
-fn lists_subagents(connection: &Connection, session: i64, subagents: &[PathBuf]) -> Result<bool> {
-    let stored = connection
+/// The stored path of each sub-agent transcript the copy `session` lists,
+/// in order.
+fn stored_subagents(connection: &Connection, session: i64) -> Result<Vec<StoredPath>> {
+    Ok(connection
         .prepare_cached(
-            "SELECT path, key FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position",
+            "SELECT root, path FROM session_files WHERE session = ?1 AND kind = 'subagent' \
+             ORDER BY position",
         )?
-        .query_map([session], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(stored.len() == subagents.len()
-        && stored.iter().zip(subagents).all(|((path, key), subagent)| {
-            *path == path_text(subagent) || key == FileKey::of_canonical(subagent).as_str()
-        }))
+        .query_map([session], |row| {
+            Ok(StoredPath {
+                root: row.get(0)?,
+                path: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }

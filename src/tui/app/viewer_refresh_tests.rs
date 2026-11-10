@@ -1,9 +1,9 @@
 //! `Ctrl+R` in the viewer: the open session's refresh, and the viewer reading
 //! the refreshed copy from the cache.
 
-use super::claude_home::{ClaudeHome, app_reading};
+use super::claude_home::{ClaudeHome, app_reading, serve_list_refresh};
 use super::commit_failure_tests::launched_app;
-use super::refresh_tests::{refresh_found, serve_list_refresh, serve_session_refresh};
+use super::refresh_tests::{refresh_found, serve_session_refresh};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
@@ -816,7 +816,13 @@ fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refre
     std::fs::write(&path, session).unwrap();
     press_refresh(&mut app);
 
-    assert_eq!(view(&app).subagents, vec![subagent]);
+    let row = &app.conversations()[0];
+    assert_eq!(row.subagents, vec![subagent]);
+    assert_eq!(
+        view(&app).publication,
+        row.publication,
+        "the view reads the refreshed row's copy"
+    );
 }
 
 /// The event loop for a directly opened file waits `idle_wait`, the same rule
@@ -853,6 +859,7 @@ fn cached_titled_session(home: &ClaudeHome) -> (PathBuf, Environment) {
 /// The spellings of `transcript` a user may type: discovery's, one through a
 /// `..` component, and its canonical path when that differs from discovery's
 /// (on Windows the verbatim `\\?\` form).
+#[allow(clippy::disallowed_methods)]
 fn typed_spellings(transcript: &Path) -> Vec<PathBuf> {
     let project = transcript.parent().unwrap();
     let mut spellings = vec![
@@ -871,7 +878,7 @@ fn typed_spellings(transcript: &Path) -> Vec<PathBuf> {
 
 /// The file at `typed` opened directly in `environment`, its read shown.
 fn opened_directly_as(typed: &Path, environment: Environment) -> App {
-    let file = DirectFile::resolve(typed.to_path_buf(), environment.canonicaliser()).unwrap();
+    let file = DirectFile::canonicalise(typed.to_path_buf(), environment.canonicaliser()).unwrap();
     let mut app = App::new_single_file(
         file,
         ToolDisplayMode::Hidden,
@@ -954,4 +961,199 @@ fn refresh_of_cached_session_opened_directly_updates_viewer_whatever_spelling() 
             "the header shows the refreshed message count, opened as {typed:?}"
         );
     }
+}
+
+/// The app viewing session `a` of `home`, whose unpublished row expects a
+/// sub-agent that the cached copy lacks: `a`'s parent transcript is
+/// unchanged since the copy was written, and the write that adds the
+/// sub-agent has not landed.
+fn viewer_over_unwritten_subagent(home: &ClaudeHome) -> App {
+    let environment = home.environment();
+    let transcript = home.write("a", 5, &["first question"]);
+    let mut rows = home.rows(&environment);
+    let subagent = home.write_subagent(&transcript, "worker", 6, &["sub-agent turn"]);
+    rows[0].subagents = vec![subagent.clone()];
+    rows[0].publication = crate::history::sqlite_cache::Publication::Unpublished {
+        discovered: vec![subagent],
+    };
+    let mut app = app_reading(rows, environment);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    app
+}
+
+#[test]
+fn viewer_over_copy_lacking_the_rows_sub_agent_shows_updating() {
+    let home = ClaudeHome::new();
+
+    let app = viewer_over_unwritten_subagent(&home);
+
+    assert!(
+        view_text(&app).contains("first question"),
+        "the viewer shows the copy from before the sub-agent"
+    );
+    assert_eq!(
+        app.open_session_status(),
+        Some(OpenSessionStatus::Updating),
+        "the copy lacks the row's sub-agent, so the viewer shows it as out of date"
+    );
+}
+
+/// Another rearview publishes a copy of session `a` with a sub-agent its
+/// listed row lacks: the viewer and the export read that copy as current.
+#[test]
+fn viewer_and_export_over_copy_newer_than_the_row_read_it_as_current() {
+    let home = ClaudeHome::new();
+    let environment = home.environment();
+    let transcript = home.write("a", 5, &["first question"]);
+    let rows = home.rows(&environment);
+    home.write_subagent(&transcript, "worker", 6, &["sub-agent turn"]);
+    home.append(&transcript, 7, "a follow-up");
+    home.rows(&home.environment());
+    let mut app = app_reading(rows, environment);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+
+    assert!(
+        view_text(&app).contains("a follow-up"),
+        "the viewer shows the newer copy"
+    );
+    assert_eq!(
+        app.open_session_status(),
+        None,
+        "the viewer doesn't mark the newer copy as out of date"
+    );
+    assert_eq!(app.conversations()[0].message_count, 1);
+    assert!(
+        header_line(&app).contains("3 messages"),
+        "the header counts the newer copy's follow-up and sub-agent turn: {}",
+        header_line(&app)
+    );
+    assert!(
+        app.current_export_entries().is_some(),
+        "the export reads the newer copy as current"
+    );
+}
+
+/// Another rearview publishes a copy of session `a` with a message its
+/// listed row lacks and the row's sub-agents: the viewer's header shows the
+/// copy's catalogue row.
+#[test]
+fn viewer_over_newer_copy_with_the_rows_sub_agents_shows_the_copys_header() {
+    let home = ClaudeHome::new();
+    let environment = home.environment();
+    let transcript = home.write("a", 5, &["first question"]);
+    let rows = home.rows(&environment);
+    home.append(&transcript, 6, "a follow-up");
+    home.rows(&home.environment());
+    let mut app = app_reading(rows, environment);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+
+    assert!(
+        view_text(&app).contains("a follow-up"),
+        "the viewer shows the newer copy"
+    );
+    assert_eq!(app.conversations()[0].message_count, 1);
+    assert!(
+        header_line(&app).contains("2 messages"),
+        "the header counts the newer copy's follow-up: {}",
+        header_line(&app)
+    );
+}
+
+#[test]
+fn export_over_copy_lacking_the_rows_sub_agent_is_not_current() {
+    let home = ClaudeHome::new();
+    let mut app = viewer_over_unwritten_subagent(&home);
+
+    assert!(
+        app.current_export_entries().is_none(),
+        "the export doesn't present the older copy as current"
+    );
+}
+
+/// The TUI load of three sessions and `Ctrl+R` in the viewer canonicalise
+/// the cache directory and the root, not a path per session. The test keeps
+/// every call the environment's canonicaliser received.
+#[test]
+fn load_and_ctrl_r_canonicalise_only_the_cache_directory_and_the_root() {
+    use crate::history::provider::walk::test_support::CountingCanonicaliser;
+    let home = ClaudeHome::new();
+    let canonicaliser = Arc::new(CountingCanonicaliser::default());
+    let environment = home
+        .environment_on(Arc::new(TestClock::default()))
+        .with_canonicaliser(canonicaliser.clone());
+    let cache_directory = environment.cache_base().path().to_path_buf();
+    let sessions: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .enumerate()
+        .map(|(index, name)| home.write(name, 5 + index as u32, &["question"]))
+        .collect();
+    let loaded = home.rows(&environment);
+    let canonicalised_by_load = canonicaliser.canonicalised();
+    let mut app = app_reading(loaded, environment);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    home.append(&sessions[2], 20, "follow-up");
+
+    press_refresh(&mut app);
+
+    let canonicalised_by_refresh =
+        canonicaliser.canonicalised()[canonicalised_by_load.len()..].to_vec();
+    let projects = home
+        .storage()
+        .roots_in(&crate::history::provider::RootEnvironment::of_process())
+        .unwrap()[0]
+        .path
+        .clone();
+    assert_eq!(
+        canonicalised_by_load,
+        [cache_directory, projects.clone()],
+        "the load of three sessions canonicalises the cache directory and the root once each"
+    );
+    assert_eq!(
+        canonicalised_by_refresh,
+        [projects],
+        "Ctrl+R canonicalises the root once"
+    );
+}
+
+/// The file opened directly (`rearview <file>`) by its canonical path
+/// canonicalises the root once, for choosing the storage and reading the
+/// session, then the cache directory once. It doesn't canonicalise the file
+/// or its directory.
+#[test]
+fn direct_file_by_canonical_path_canonicalises_only_the_root_and_the_cache_directory() {
+    use crate::history::environment::test_support::waiting_operation;
+    use crate::history::provider::walk::Canonicaliser;
+    use crate::history::provider::walk::test_support::CountingCanonicaliser;
+    let home = ClaudeHome::new();
+    let transcript = home.write("a", 5, &["question"]);
+    let canonicaliser = Arc::new(CountingCanonicaliser::default());
+    let environment = home.environment().with_canonicaliser(canonicaliser.clone());
+    let canonical = canonicaliser.canonicalise(&transcript).unwrap();
+    let before = canonicaliser.canonicalised().len();
+    let cache_directory = environment.cache_base().path().to_path_buf();
+    let operation = waiting_operation(&environment);
+
+    let read =
+        crate::history::provider::open_direct_file(&environment, &canonical, false, &operation);
+
+    operation.finish().unwrap();
+    assert!(matches!(
+        read,
+        Ok(crate::history::provider::DirectFileRead::Session { .. })
+    ));
+    let projects = home
+        .storage()
+        .roots_in(&crate::history::provider::RootEnvironment::of_process())
+        .unwrap()[0]
+        .path
+        .clone();
+    assert_eq!(
+        canonicaliser.canonicalised()[before..],
+        [projects, cache_directory],
+        "the root and the cache directory canonicalise once each"
+    );
 }

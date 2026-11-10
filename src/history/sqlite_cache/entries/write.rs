@@ -5,6 +5,7 @@ use super::parts;
 use super::rows::{EntryRow, SessionRows};
 use crate::agent::sanitize::split_terminal_codes;
 use crate::history::sqlite_cache::SearchField;
+use crate::history::sqlite_cache::roots::WrittenPlaces;
 use rusqlite::{CachedStatement, Connection, ToSql, params};
 
 /// The database id of each of a session's rows, by its index in
@@ -161,6 +162,8 @@ impl SearchPlace {
 pub(super) struct RowWriter<'connection> {
     connection: &'connection Connection,
     session: i64,
+    /// The session's roots, which place each transcript it writes.
+    places: &'connection WrittenPlaces,
     insert_entry: CachedStatement<'connection>,
     update_entry: CachedStatement<'connection>,
     insert_search_text: CachedStatement<'connection>,
@@ -168,10 +171,15 @@ pub(super) struct RowWriter<'connection> {
 }
 
 impl<'connection> RowWriter<'connection> {
-    pub(super) fn new(connection: &'connection Connection, session: i64) -> rusqlite::Result<Self> {
+    pub(super) fn new(
+        connection: &'connection Connection,
+        session: i64,
+        places: &'connection WrittenPlaces,
+    ) -> rusqlite::Result<Self> {
         Ok(Self {
             connection,
             session,
+            places,
             insert_entry: connection.prepare_cached(&insert_sql(
                 "entries",
                 &[ENTRY_PLACE_COLUMNS, ENTRY_CONTENT_COLUMNS],
@@ -196,16 +204,14 @@ impl<'connection> RowWriter<'connection> {
         rows: &SessionRows,
         ids: &mut RowIds,
         index: usize,
-    ) -> rusqlite::Result<i64> {
+    ) -> crate::error::Result<i64> {
         if let Some(id) = ids.transcripts[index] {
             return Ok(id);
         }
+        let place = self.places.place_written(&rows.transcripts[index])?;
         self.connection
-            .prepare_cached("INSERT INTO transcripts (session, path) VALUES (?1, ?2)")?
-            .execute(params![
-                self.session,
-                super::path_text(&rows.transcripts[index])
-            ])?;
+            .prepare_cached("INSERT INTO transcripts (session, root, path) VALUES (?1, ?2, ?3)")?
+            .execute(params![self.session, place.root, place.path])?;
         let id = self.connection.last_insert_rowid();
         ids.transcripts[index] = Some(id);
         Ok(id)
@@ -217,7 +223,7 @@ impl<'connection> RowWriter<'connection> {
         rows: &SessionRows,
         ids: &mut RowIds,
         index: usize,
-    ) -> rusqlite::Result<i64> {
+    ) -> crate::error::Result<i64> {
         if let Some(id) = ids.threads[index] {
             return Ok(id);
         }
@@ -254,7 +260,7 @@ impl<'connection> RowWriter<'connection> {
         rows: &SessionRows,
         ids: &mut RowIds,
         index: usize,
-    ) -> rusqlite::Result<i64> {
+    ) -> crate::error::Result<i64> {
         if let Some(id) = ids.messages[index] {
             return Ok(id);
         }
@@ -306,7 +312,7 @@ impl<'connection> RowWriter<'connection> {
         rows: &SessionRows,
         ids: &mut RowIds,
         index: usize,
-    ) -> rusqlite::Result<i64> {
+    ) -> crate::error::Result<i64> {
         let row = &rows.entries[index];
         if let Some(message) = row.message {
             self.message(rows, ids, message)?;

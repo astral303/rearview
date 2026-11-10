@@ -3,7 +3,7 @@
 //! key, keeps an unchanged one, moves one whose position changed, updates
 //! one whose columns changed, and deletes or inserts the rest.
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use rusqlite::Connection;
 use rusqlite::types::Value;
 use std::collections::HashMap;
@@ -26,6 +26,7 @@ pub(super) const SESSION_FILES: PositionalTable = PositionalTable {
     name: "session_files",
     columns: &[
         "kind",
+        "root",
         "path",
         "key",
         "file_size",
@@ -37,6 +38,7 @@ pub(super) const SESSION_FILES: PositionalTable = PositionalTable {
 pub(super) const TRANSCRIPT_READS: PositionalTable = PositionalTable {
     name: "transcript_reads",
     columns: &[
+        "root",
         "path",
         "cursor",
         "stable_cursor",
@@ -76,6 +78,41 @@ pub(super) const SUBAGENT_SEARCH_PARTS: PositionalTable = PositionalTable {
 };
 
 impl PositionalTable {
+    /// The integer in `column` of `values`, a stored row of this table.
+    /// Fails for a value of another type.
+    pub(super) fn integer(&self, values: &[Value], column: &str) -> Result<i64> {
+        match self.value(values, column) {
+            (_, Value::Integer(integer)) => Ok(*integer),
+            (index, other) => Err(self.unexpected_type(index, column, other)),
+        }
+    }
+
+    /// The text in `column` of `values`, a stored row of this table. Fails
+    /// for a value of another type.
+    pub(super) fn text(&self, values: &[Value], column: &str) -> Result<String> {
+        match self.value(values, column) {
+            (_, Value::Text(text)) => Ok(text.clone()),
+            (index, other) => Err(self.unexpected_type(index, column, other)),
+        }
+    }
+
+    fn value<'v>(&self, values: &'v [Value], column: &str) -> (usize, &'v Value) {
+        let index = self
+            .columns
+            .iter()
+            .position(|candidate| *candidate == column)
+            .unwrap_or_else(|| panic!("{} doesn't have the column {column}", self.name));
+        (index, &values[index])
+    }
+
+    fn unexpected_type(&self, index: usize, column: &str, value: &Value) -> AppError {
+        AppError::SessionCache(rusqlite::Error::InvalidColumnType(
+            index,
+            format!("{}.{column}", self.name),
+            value.data_type(),
+        ))
+    }
+
     /// The stored rows of `session`, each with its position, in position
     /// order.
     pub(super) fn stored(
@@ -107,12 +144,12 @@ impl PositionalTable {
         session: i64,
         rows: &[PositionalRow<K>],
         stored: Vec<(i64, Vec<Value>)>,
-        key_of: impl Fn(&[Value]) -> K,
+        key_of: impl Fn(&[Value]) -> Result<K>,
     ) -> Result<()> {
         let mut by_key: HashMap<(K, usize), (i64, Vec<Value>)> = HashMap::new();
         let mut occurrences: HashMap<K, usize> = HashMap::new();
         for (position, values) in stored {
-            let key = key_of(&values);
+            let key = key_of(&values)?;
             let occurrence = occurrences.entry(key.clone()).or_default();
             by_key.insert((key, *occurrence), (position, values));
             *occurrence += 1;
@@ -182,5 +219,34 @@ impl PositionalTable {
             statement.raw_execute()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_column_of_another_type_fails_naming_the_column() {
+        let stored_row = vec![
+            Value::Text("locator".to_owned()),
+            Value::Null,
+            Value::Text("session.jsonl".to_owned()),
+        ];
+
+        let failure = SESSION_FILES
+            .integer(&stored_row, "root")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            failure.contains("session_files.root"),
+            "the failure names the table and column: {failure}"
+        );
+        assert_eq!(
+            SESSION_FILES.text(&stored_row, "kind").unwrap(),
+            "locator",
+            "a column of the expected type reads as itself"
+        );
     }
 }

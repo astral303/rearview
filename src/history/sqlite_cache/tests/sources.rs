@@ -392,34 +392,3 @@ fn object_result_reads_from_cache_without_its_source() {
         "the object result passes through the cache unchanged"
     );
 }
-
-#[cfg(windows)]
-#[test]
-fn alternate_windows_path_spelling_matches_cached_generation() {
-    use crate::history::format::RecordLine;
-    use std::sync::Arc;
-    let base = tempfile::tempdir().unwrap();
-    let source = base.path().join("source.jsonl");
-    std::fs::write(
-        &source,
-        json!({"type":"user","message":{"role":"user","content":[
-            {"type":"tool_result","tool_use_id":"call","content":{"opaque":"original"}},
-            {"type":"text","text":"question"}
-        ]}})
-        .to_string(),
-    )
-    .unwrap();
-    let (mut record, root) = source_record(Source::Claude, &source);
-    let alternate = base.path().join(".").join("SOURCE.JSONL");
-    record.entries.as_mut().unwrap().as_mut().unwrap().entries[0].0 = RecordLine {
-        transcript: Some(Arc::from(alternate.as_path())),
-        line: 1,
-    };
-    let mut cache = admitted_cache(&base.path().join("cache"));
-    cache.write(&record).unwrap();
-    let read = cache
-        .entries(storage_of(Source::Claude), &root, CACHE_KEY)
-        .unwrap()
-        .unwrap();
-    assert!(format!("{:?}", read.entries).contains("original"));
-}

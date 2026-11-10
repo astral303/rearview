@@ -3,6 +3,7 @@ use crate::clock::{Clock, TestClock};
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
 use crate::history::{Conversation, DisplayEntries, Source, normalized_session};
+use entries::path_text;
 use std::time::{Duration, UNIX_EPOCH};
 
 mod bounded;
@@ -22,6 +23,7 @@ pub(crate) fn rearview_at(directory: &Path) -> CacheBase {
         directory,
         ProcessIdentity::default(),
         std::sync::Arc::new(TestClock::default()),
+        crate::history::provider::walk::SystemCanonicaliser::shared(),
     )
 }
 
@@ -53,15 +55,20 @@ pub(crate) fn parsed_record_and_row(
         .unwrap()
         .expect("the session is listed");
     let record = SessionRecord::listed(
-        storage_of(source),
-        source,
-        root,
+        &crate::history::sqlite_cache::RecordPlace {
+            storage: storage_of(source),
+            source,
+            roots: crate::history::sqlite_cache::SessionRoots::of_system(root),
+            directories: &crate::history::path::CanonicalDirectories::of_system(),
+            linker: source.provider().storage().thread_linker(),
+        },
         stub,
         stamps,
         &listed.row,
         listed.transcripts,
     )
-    .unwrap();
+    .ok()
+    .expect("the session has a record");
     (record, listed.row)
 }
 
@@ -112,8 +119,14 @@ pub(super) fn stub_of(session: &AgentSession, modified_secs: u64) -> SessionStub
     }
 }
 
+/// The root of `session`: the deepest directory holding all its files.
 pub(super) fn root_of(session: &AgentSession) -> SessionRoot {
-    SessionRoot::new(session.row.path.parent().unwrap())
+    SessionRoot::new(
+        crate::history::environment::test_support::directory_holding_files(
+            &session.row.path,
+            &session.row.subagents,
+        ),
+    )
 }
 
 pub(super) fn storage_of(source: Source) -> SessionCache {
@@ -133,28 +146,23 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
         let root = root_of(&session);
         let record = parsed_record(row.source, &root, &stub_of(&session, 1));
         cache.write(&record).unwrap();
-        let subagents = cache
-            .connection
-            .prepare(
-                "SELECT f.path FROM session_files f JOIN sessions s ON s.id=f.session \
-                 WHERE f.kind='subagent' AND s.storage=?1 AND s.root=?2 AND s.cache_key=?3 \
-                 ORDER BY f.position",
-            )
+        let Some(CatalogueSession::Listed(restored)) = cache
+            .catalogue_session(storage, row.source, &root, CACHE_KEY, false)
             .unwrap()
-            .query_map(
-                params![storage.directory, path_text(&root.path), CACHE_KEY],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
+        else {
+            panic!("{:?}'s session is listed", row.source)
+        };
         assert_eq!(
-            subagents,
+            restored
+                .subagents
+                .iter()
+                .map(|path| path_text(path))
+                .collect::<Vec<_>>(),
             row.subagents
                 .iter()
                 .map(|path| path_text(path))
                 .collect::<Vec<_>>(),
-            "{:?}'s sub-agents are stored as discovery spells them",
+            "{:?}'s sub-agents are restored as discovery spells them",
             row.source
         );
         let expected = normalized_session(
@@ -285,10 +293,33 @@ pub(super) fn write_test_entries(
 ) -> (SessionCache, SessionRoot) {
     let session = every_record_sessions().remove(0);
     let storage = storage_of(session.row.source);
-    let root = root_of(&session);
-    let mut record = parsed_record(session.row.source, &root, &stub_of(&session, 1));
-    record.entries = Some(Ok(entries));
+    let mut record = parsed_record(
+        session.row.source,
+        &root_of(&session),
+        &stub_of(&session, 1),
+    );
+    // The entries name their transcripts by relative paths: each is a file
+    // of the session below the root.
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = SessionRoot::new(
+        ROOT.get_or_init(|| tempfile::tempdir().expect("a temporary root"))
+            .path(),
+    );
+    record.catalogue.roots = super::SessionRoots::of_system(&root);
     record.catalogue.files.clear();
+    let mut entries = entries;
+    let mut transcripts = std::collections::BTreeSet::new();
+    for (line, _) in &mut entries.entries {
+        if let Some(transcript) = &mut line.transcript {
+            let path = root.path.join(&**transcript);
+            *transcript = std::sync::Arc::from(path.as_path());
+            transcripts.insert(path);
+        }
+    }
+    for transcript in transcripts {
+        record.catalogue.add_test_file("subagent", transcript, None);
+    }
+    record.entries = Some(Ok(entries));
     cache.mark_admitted().unwrap();
     cache.write(&record).unwrap();
     (storage, root)
@@ -571,8 +602,23 @@ fn subagent_metadata_is_shared_across_transactions_and_preserves_origins() {
         .unwrap();
     assert_eq!(raw_wrappers, 0);
     let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
-    assert_eq!(read.entries[20_000].0.transcript.as_ref(), Some(&first));
-    assert_eq!(read.entries[20_001].0.transcript.as_ref(), Some(&second));
+    let below_root = |path: &Arc<std::path::Path>| Some(root.path.join(&**path));
+    assert_eq!(
+        read.entries[20_000]
+            .0
+            .transcript
+            .as_deref()
+            .map(Path::to_path_buf),
+        below_root(&first)
+    );
+    assert_eq!(
+        read.entries[20_001]
+            .0
+            .transcript
+            .as_deref()
+            .map(Path::to_path_buf),
+        below_root(&second)
+    );
     let LogEntry::Progress { data, extra } = &read.entries[20_002].1 else {
         panic!("a sub-agent turn")
     };
@@ -612,18 +658,19 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
         .find(|session| session.row.source == Source::Claude)
         .unwrap();
     let storage = storage_of(Source::Claude);
-    let root = root_of(&session);
-    let mut record = parsed_record(Source::Claude, &root, &stub_of(&session, 1));
-    record.catalogue.locator = source.to_string_lossy().into_owned();
+    let mut record = parsed_record(Source::Claude, &root_of(&session), &stub_of(&session, 1));
+    let root = SessionRoot::new(base.path());
+    record.catalogue.roots = super::SessionRoots::of_system(&root);
     let metadata = std::fs::metadata(&source).unwrap();
-    record.catalogue.files = vec![catalogue::SessionFile::new(
+    record.catalogue.files.clear();
+    record.catalogue.add_test_file(
         "locator",
         source.clone(),
         Some(CachedFingerprint::of(
             metadata.len(),
             metadata.modified().unwrap(),
         )),
-    )];
+    );
     record.entries = Some(Ok(normalized_session(
         crate::history::FOR_FIXTURES,
         Source::Claude,
@@ -788,7 +835,11 @@ fn removed_session_leaves_no_rows() {
         .remove(storage, &root, &[CACHE_KEY.to_owned()])
         .unwrap();
 
-    for table in schema::TABLES.iter().filter(|table| **table != "meta") {
+    // `roots` keeps the agent directory's row: later sessions under it use it.
+    for table in schema::TABLES
+        .iter()
+        .filter(|table| !["meta", "roots"].contains(*table))
+    {
         let rows: i64 = cache
             .connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {

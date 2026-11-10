@@ -25,9 +25,10 @@ const WITH_TOOLS_AND_THINKING: ExportOptions = ExportOptions {
 };
 
 /// Cache `session` in the test's session cache, where the outputs read it.
-fn cache_every_record_session(session: &AgentSession) {
+/// Returns its row as the load lists it.
+fn cache_every_record_session(session: &AgentSession) -> Conversation {
     let row = &session.row;
-    cache_session(row.source, &row.path, &row.subagents);
+    cache_session(row.source, &row.path, &row.subagents)
 }
 
 /// `row`'s entries as the TUI's exports and clipboard copy read them from the
@@ -35,18 +36,22 @@ fn cache_every_record_session(session: &AgentSession) {
 fn entries_of(row: &Conversation) -> DisplayEntries {
     current_copy(crate::history::display_log_entries_interactively(
         &InteractiveCache::at(test_cache_base()),
-        row.source,
-        &row.path,
-        &row.subagents,
+        address_of(row),
+        &row.publication,
     ))
+}
+
+fn address_of(row: &Conversation) -> &crate::history::sqlite_cache::SessionAddress {
+    row.cache_address
+        .as_ref()
+        .expect("the load lists the row at its address")
 }
 
 fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
     let conversation = current_copy(parse_conversation_file_interactively(
         &InteractiveCache::at(test_cache_base()),
-        row.source,
-        &row.path,
-        &row.subagents,
+        address_of(row),
+        &row.publication,
     ));
     let options = RenderOptions {
         tool_display,
@@ -94,6 +99,7 @@ fn outputs(row: &Conversation) -> Vec<(&'static str, String)> {
             row.source,
             &row.path,
             false,
+            &mut std::io::sink(),
         )
         .unwrap();
         printout(session, &printout_options, format)
@@ -124,9 +130,9 @@ fn outputs(row: &Conversation) -> Vec<(&'static str, String)> {
 /// Each output's dropped record kinds and shown hidden record kinds.
 fn display_gaps(session: &AgentSession) -> Vec<String> {
     let agent = session.row.source;
-    cache_every_record_session(session);
+    let row = cache_every_record_session(session);
     let mut gaps = Vec::new();
-    for (output, text) in outputs(&session.row) {
+    for (output, text) in outputs(&row) {
         for marker in &session.markers {
             if !text.contains(marker.text) {
                 gaps.push(format!(
@@ -159,13 +165,13 @@ fn every_display_output_shows_each_agents_record_kinds_and_no_hidden_one() {
 /// key.
 fn call_gaps(session: &AgentSession) -> Vec<String> {
     let agent = session.row.source;
-    cache_every_record_session(session);
+    let cached = cache_every_record_session(session);
     let calls: Vec<_> = session
         .markers
         .iter()
         .filter_map(|marker| Some((marker, marker.summary_row?)))
         .collect();
-    let summary = viewer_text(&session.row, ToolDisplayMode::Hidden);
+    let summary = viewer_text(&cached, ToolDisplayMode::Hidden);
     let mut gaps: Vec<String> = calls
         .iter()
         .filter(|(_, row)| {
@@ -180,7 +186,7 @@ fn call_gaps(session: &AgentSession) -> Vec<String> {
             )
         })
         .collect();
-    for (output, text) in outputs(&session.row) {
+    for (output, text) in outputs(&cached) {
         for (marker, _) in &calls {
             if text
                 .lines()

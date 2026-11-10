@@ -333,6 +333,7 @@ pub fn clear_semantic_cache_files(hugging_face_cache: &Path) -> std::io::Result<
     clear_semantic_cache_in(&path, hugging_face_cache)
 }
 
+#[allow(clippy::disallowed_methods)]
 fn clear_semantic_cache_in(
     semantic_dir: &Path,
     hugging_face_cache: &Path,
@@ -342,7 +343,8 @@ fn clear_semantic_cache_in(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    // A missing Hugging Face cache is in no entry.
+    // A missing Hugging Face cache isn't in any entry. `cache clear`
+    // canonicalises it and each entry of rearview's own semantic cache once.
     let hugging_face_cache = match std::fs::canonicalize(hugging_face_cache) {
         Ok(path) => Some(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,

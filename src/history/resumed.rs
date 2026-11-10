@@ -68,7 +68,23 @@ impl SessionCheckpoint {
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         serde_json::from_slice(bytes).ok()
     }
+
+    /// This checkpoint with each transcript it names renamed by `rename`;
+    /// `None` when `rename` cannot rename one of them. The cache stores the
+    /// checkpoint with its transcripts named below the session's roots,
+    /// because a later run can spell the roots another way.
+    pub(crate) fn with_transcripts_renamed(mut self, rename: TranscriptRename<'_>) -> Option<Self> {
+        self.fold = self.fold.with_transcripts_renamed(rename)?;
+        if let Some(child) = &mut self.splice.last_child {
+            child.transcript = rename(&child.transcript)?;
+        }
+        Some(self)
+    }
 }
+
+/// A transcript's name in another form, as a path; `None` for a transcript
+/// it cannot name.
+pub(crate) type TranscriptRename<'a> = &'a dyn Fn(&Path) -> Option<PathBuf>;
 
 /// What the entries before a checkpoint bound in the view's order: a new
 /// entry must sort after all of them to be placed after the checkpoint.

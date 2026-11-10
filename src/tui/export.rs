@@ -124,6 +124,7 @@ const CLIPBOARD_TRANSPORT_ENV: &str = "REARVIEW_CLIPBOARD";
 const REMOTE_SESSION_ENV_VARS: [&str; 4] =
     ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "MOSH_CONNECTION"];
 
+#[allow(clippy::disallowed_methods)]
 fn clipboard_transport() -> Result<ClipboardTransport, String> {
     clipboard_transport_from_env(|name| std::env::var_os(name))
 }
@@ -878,7 +879,12 @@ mod tests {
     /// The entries of the transcript at `path`, outside every agent's
     /// session roots, as `--render` reads them.
     fn read_entries(path: &Path) -> DisplayEntries {
-        crate::history::sniffed_display_log_entries(crate::history::FOR_FIXTURES, path).unwrap()
+        crate::history::sniffed_display_log_entries(
+            crate::history::FOR_FIXTURES,
+            path,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .unwrap()
     }
 
     /// [`export_content`] of the transcript at `path`, read by
@@ -909,12 +915,13 @@ mod tests {
             cache_session, current_copy, test_cache_base,
         };
 
-        cache_session(source, path, subagents);
+        let row = cache_session(source, path, subagents);
         current_copy(crate::history::display_log_entries_interactively(
             &InteractiveCache::at(test_cache_base()),
-            source,
-            path,
-            subagents,
+            row.cache_address
+                .as_ref()
+                .expect("the load lists the row at its address"),
+            &row.publication,
         ))
     }
 
@@ -1730,6 +1737,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn test_generate_ledger_wraps_and_renders() {
         // Create a sample JSONL with a long assistant message containing markdown
         let long_text = "This is a **really long** sentence that should definitely wrap because it contains many words and exceeds the content width of the ledger format which is 68 characters.";

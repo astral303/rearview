@@ -151,6 +151,28 @@ impl LaunchLedger {
         serde_json::to_vec(self).expect("a launch ledger serializes")
     }
 
+    /// The encoded ledger `bytes` with each transcript it names renamed by
+    /// `rename`; `None` when it does not decode, or `rename` cannot rename
+    /// one of its transcripts. An empty ledger stays empty.
+    pub(crate) fn with_transcripts_renamed(
+        bytes: &[u8],
+        rename: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<Vec<u8>> {
+        if bytes.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut ledger: Self = serde_json::from_slice(bytes).ok()?;
+        for (place, ..) in &mut ledger.prompts {
+            if let Some(transcript) = &mut place.transcript {
+                *transcript = rename(transcript)?;
+            }
+        }
+        for launch in &mut ledger.launches {
+            launch.transcript = rename(&launch.transcript)?;
+        }
+        Some(ledger.encode())
+    }
+
     /// The ledger of `session`, the session's own entries, and `threads`,
     /// each read whole; drops each thread's opening message that repeats
     /// its launching call's prompt, and gives it that call.

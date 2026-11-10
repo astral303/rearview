@@ -18,7 +18,7 @@ pub(crate) mod splice;
 use super::fingerprint::FileStamp;
 #[cfg(test)]
 use super::parser::RowDating;
-use super::provider::{Capability, TranscriptRead};
+use super::provider::{Capability, RootEnvironment, TranscriptRead};
 use super::{Admitted, ParsePermit};
 #[cfg(test)]
 use super::{Conversation, parser};
@@ -291,12 +291,13 @@ pub(crate) fn report_unreadable_subagent(
 pub fn sniffed_session_entries(
     permit: ParsePermit<'_>,
     path: &Path,
+    environment: &RootEnvironment,
 ) -> Result<Option<TranscriptEntries>> {
     let Some(projection) = parse_transcript(permit, path)? else {
         return Ok(None);
     };
     let source = projection.source;
-    let subagents = bare_file_subagents(source, &projection.header.id, path);
+    let subagents = bare_file_subagents(source, &projection.header.id, path, environment);
     source
         .provider()
         .format()
@@ -325,9 +326,15 @@ pub(crate) fn sniffed_conversation(
 /// when the file is the session its agent stores under `session_id`. A copy
 /// outside the agent's tree has none. Skips the stored check for an agent
 /// declaring `subagents` Not Capable: the check can read every log's header.
-fn bare_file_subagents(source: Source, session_id: &str, path: &Path) -> Vec<PathBuf> {
+/// The agent's roots come from `environment`.
+fn bare_file_subagents(
+    source: Source,
+    session_id: &str,
+    path: &Path,
+    environment: &RootEnvironment,
+) -> Vec<PathBuf> {
     if !source.provider().subagents().is_capable()
-        || !provider::is_stored_session(source, session_id, path)
+        || !provider::is_stored_session(source, session_id, path, environment)
     {
         return Vec::new();
     }
@@ -342,15 +349,6 @@ pub fn stored_session_subagents(source: Source, path: &Path) -> Vec<PathBuf> {
     match source.provider().subagents() {
         Capability::Capable(finder) => finder.subagent_transcripts(path).unwrap_or_default(),
         Capability::NotCapable(_) => Vec::new(),
-    }
-}
-
-/// True when two paths name one file, however each was spelled. A locator
-/// that is not a file compares as written.
-pub(crate) fn same_file(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
     }
 }
 

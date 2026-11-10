@@ -3,6 +3,7 @@
 
 use super::cache_access::DatabaseReader;
 use super::*;
+use crate::history::provider::walk::Canonicaliser;
 
 /// The outcomes of [`SessionLoader::read_stubs`], one per session read, with
 /// the discovery and titles it read the sessions against.
@@ -79,16 +80,17 @@ pub(super) enum StubsAfterRediscovery<'a> {
 }
 
 impl SessionLoader<'_> {
-    /// The sessions at `locators`, one outcome each in order, each answering
-    /// for its locator; `read_under_root` reads each root's picked stubs
-    /// against the root's external titles. [`SessionRead::Missing`] for a
-    /// file neither discovery nor
+    /// The sessions at `named`, files below `roots`, one outcome each in
+    /// order, each answering for its file as named; `read_under_root` reads
+    /// each root's picked stubs against the root's external titles.
+    /// [`SessionRead::Missing`] for a file neither discovery nor
     /// [`SessionStorage::rediscover_unlisted_session`] finds. A file under a
     /// directory discovery could not list reads as its copy, through
     /// `reader`.
     pub(super) fn reread<E>(
         &self,
-        locators: &[&Path],
+        roots: Vec<SessionRoot>,
+        named: &[NamedFile<'_>],
         reader: DatabaseReader,
         read_under_root: impl Fn(
             &SessionRoot,
@@ -96,30 +98,28 @@ impl SessionLoader<'_> {
             Vec<SessionStub>,
         ) -> std::result::Result<SessionReads, E>,
     ) -> std::result::Result<Vec<SessionOutcome>, E> {
-        let Ok(discovered) = self.discover_every_root() else {
-            return Ok(locators
-                .iter()
-                .map(|locator| SessionOutcome::failed_transiently(locator))
-                .collect());
+        let locators: Vec<&Path> = named.iter().map(|file| file.path).collect();
+        let Ok(discovered) = self.discover_roots(roots) else {
+            return Ok(all_failed_transiently(&locators));
         };
         let mut outcomes: Vec<Option<SessionOutcome>> = locators.iter().map(|_| None).collect();
         let mut picked: Vec<Vec<(usize, SessionStub)>> =
             discovered.iter().map(|_| Vec::new()).collect();
-        let mut under_unlisted_directories: Vec<Vec<usize>> =
+        let mut under_unlisted_directories: Vec<Vec<(usize, BelowKey)>> =
             discovered.iter().map(|_| Vec::new()).collect();
         let mut unlisted = Vec::new();
-        for (index, locator) in locators.iter().enumerate() {
+        for (index, locator) in named.iter().enumerate() {
             match find_listed(&discovered, locator) {
                 Some(Listing::Listed(root_index, stub)) => picked[root_index].push((index, stub)),
-                Some(Listing::UnreadableDirectory(root_index)) => {
-                    under_unlisted_directories[root_index].push(index);
+                Some(Listing::UnreadableDirectory(root_index, key)) => {
+                    under_unlisted_directories[root_index].push((index, key));
                 }
                 None => unlisted.push(index),
             }
         }
         for index in unlisted {
             let locator = locators[index];
-            match self.find_unlisted(&discovered, locator) {
+            match self.find_unlisted(&discovered, &named[index]) {
                 Ok(Some((root_index, stub))) => picked[root_index].push((index, stub)),
                 Ok(None) => outcomes[index] = Some(SessionOutcome::missing(locator)),
                 Err(error) => {
@@ -143,10 +143,15 @@ impl SessionLoader<'_> {
                 continue;
             }
             let external_titles = self.storage.external_titles(root);
-            for index in under_unlisted_directories {
+            for (index, key) in under_unlisted_directories {
                 let locator = locators[index];
-                let copy =
-                    self.copy_under_unlisted_directory(reader, root, &external_titles, locator);
+                let copy = self.copy_under_unlisted_directory(
+                    reader,
+                    root,
+                    &external_titles,
+                    locator,
+                    &key,
+                );
                 outcomes[index] = Some(copy.answering(locator));
             }
             if picked.is_empty() {
@@ -179,7 +184,7 @@ impl SessionLoader<'_> {
     fn find_unlisted(
         &self,
         discovered: &[(SessionRoot, DiscoveredSessions)],
-        locator: &Path,
+        locator: &NamedFile,
     ) -> Result<Option<(usize, SessionStub)>> {
         let mut failure = None;
         for (root_index, (root, _)) in discovered.iter().enumerate() {
@@ -192,19 +197,25 @@ impl SessionLoader<'_> {
         failure.map_or(Ok(None), Err)
     }
 
-    /// The copy the database opened through `reader` holds of the session
-    /// at `locator`, under a directory `root`'s discovery could not list,
-    /// settled while it matches the transcripts as they are now. Without a
-    /// current copy, or a database that can be read, a transient failure:
-    /// the session may still be there, and a settled older copy would have
-    /// the viewer request another refresh on every reload.
+    /// The session at `locator`, below a directory `root`'s discovery could
+    /// not list, read from its copy in the database `reader` opens and
+    /// settled, published at the copy's generation, while that copy matches
+    /// the transcripts as they are now.
+    /// `key` is the file's [`key_below`] `root`. Without a current copy or a
+    /// readable database, a transient failure: the session may still be
+    /// there, and a settled older copy would have the viewer request another
+    /// refresh on every reload.
     fn copy_under_unlisted_directory(
         &self,
         reader: DatabaseReader,
         root: &SessionRoot,
         external_titles: &HashMap<String, SessionTitle>,
         locator: &Path,
+        key: &BelowKey,
     ) -> SessionOutcome {
+        if !key.is_below_root_itself() {
+            return SessionOutcome::failed_transiently(locator);
+        }
         let found = self.open_database_reader(reader).and_then(|database| {
             let Some(database) = database else {
                 return Ok(None);
@@ -212,7 +223,7 @@ impl SessionLoader<'_> {
             let cache_key =
                 database
                     .reader()
-                    .current_cache_key(self.storage.source(), root, locator)?;
+                    .current_cache_key(self.storage.source(), root, &key.key)?;
             Ok(cache_key.map(|cache_key| (database, cache_key)))
         });
         let (database, cache_key) = match found {
@@ -232,7 +243,11 @@ impl SessionLoader<'_> {
             cache_key,
             fingerprint: Fingerprint::UNKNOWN,
         };
-        self.cached_copy(Some(&database), root, external_titles, &stub)
+        let place = self.record_place(root);
+        match self.restored_copy(Some(&database), root, &place, external_titles, &stub) {
+            Some(read) => SessionOutcome::settled(&stub, read),
+            None => SessionOutcome::not_cached(&stub),
+        }
     }
 
     /// The stub of the session at `locator` under `root`, found through
@@ -241,12 +256,12 @@ impl SessionLoader<'_> {
     fn rediscover_same_file(
         &self,
         root: &SessionRoot,
-        locator: &Path,
+        locator: &NamedFile,
     ) -> Result<Option<SessionStub>> {
         Ok(self
             .storage
-            .rediscover_unlisted_session(root, locator, self.environment.lister())?
-            .filter(|stub| same_file(&stub.locator, locator)))
+            .rediscover_unlisted_session(root, locator.path, self.environment.lister())?
+            .filter(|stub| locator.is(root, &stub.locator)))
     }
 
     /// One session under `root`, read as the TUI's drawing thread reads it
@@ -284,9 +299,10 @@ impl SessionLoader<'_> {
                 (None, Some(error))
             }
         };
+        let place = self.record_place(root);
         let reads = stubs
             .iter()
-            .map(|stub| self.read_copy(database.as_ref(), root, external_titles, stub))
+            .map(|stub| self.read_copy(database.as_ref(), root, &place, external_titles, stub))
             .collect();
         let outcomes = with_next_steps(reads, || match &open_error {
             Some(error) => NextStep::after_failed_interactive_read(self.cache_base(), error),
@@ -301,11 +317,12 @@ impl SessionLoader<'_> {
         &self,
         database: Option<&CacheDatabase>,
         root: &SessionRoot,
+        place: &RecordPlace<'_>,
         external_titles: &HashMap<String, SessionTitle>,
         stub: &SessionStub,
     ) -> AttemptRead {
         let current = database.and_then(|database| {
-            self.read_from_database(database.reader(), root, external_titles, stub)
+            self.read_from_database(database.reader(), root, place, external_titles, stub)
                 .inspect_err(|error| {
                     debug::warn(
                         self.debug_level,
@@ -321,7 +338,7 @@ impl SessionLoader<'_> {
                 is_current: true,
             },
             None => AttemptRead {
-                outcome: self.cached_copy(database, root, external_titles, stub),
+                outcome: self.cached_copy(database, root, place, external_titles, stub),
                 is_current: false,
             },
         }
@@ -429,22 +446,27 @@ impl SessionLoader<'_> {
         found: &DiscoveredSessions,
         owner: Option<&RefreshToken>,
     ) -> (Vec<SessionStub>, Vec<SessionOutcome>) {
+        // Both discoveries spell their files below `root` as it is spelled.
+        let requested: HashSet<BelowKey> = stubs
+            .iter()
+            .filter_map(|old| key_below(root, &old.locator))
+            .collect();
         let mut picked: Vec<SessionStub> = found
             .stubs
             .iter()
             .filter(|fresh| {
-                stubs
-                    .iter()
-                    .any(|old| same_file(&old.locator, &fresh.locator))
+                key_below(root, &fresh.locator).is_some_and(|key| requested.contains(&key))
             })
             .cloned()
+            .collect();
+        let found_again: HashSet<BelowKey> = picked
+            .iter()
+            .filter_map(|fresh| key_below(root, &fresh.locator))
             .collect();
         let unlisted: Vec<&SessionStub> = stubs
             .iter()
             .filter(|old| {
-                !picked
-                    .iter()
-                    .any(|fresh| same_file(&fresh.locator, &old.locator))
+                key_below(root, &old.locator).is_none_or(|key| !found_again.contains(&key))
             })
             .collect();
         let mut failed = Vec::new();
@@ -453,15 +475,14 @@ impl SessionLoader<'_> {
         }
         self.read_under_writer_lock(owner, || {
             for old in unlisted {
-                if found
-                    .unreadable_directories
-                    .iter()
-                    .any(|directory| old.locator.starts_with(&directory.path))
+                if key_below(root, &old.locator)
+                    .is_some_and(|key| is_beneath_unreadable_directory(root, found, &key))
                 {
                     failed.push(SessionOutcome::failed_transiently(&old.locator));
                     continue;
                 }
-                match self.rediscover_same_file(root, &old.locator) {
+                let named = NamedFile::new(&old.locator, self.environment.canonicaliser());
+                match self.rediscover_same_file(root, &named) {
                     Ok(Some(fresh)) => picked.push(fresh),
                     Ok(None) => {}
                     Err(error) => {
@@ -492,6 +513,7 @@ impl SessionLoader<'_> {
         if stubs.is_empty() {
             return Probe::Read(Vec::new());
         }
+        let place = self.record_place(root);
         let probed = (|| {
             let Some(database) = self.open_database_reader(reader)? else {
                 return Ok(None);
@@ -499,8 +521,13 @@ impl SessionLoader<'_> {
             stubs
                 .iter()
                 .map(|stub| {
-                    let read =
-                        self.read_from_database(database.reader(), root, external_titles, stub)?;
+                    let read = self.read_from_database(
+                        database.reader(),
+                        root,
+                        &place,
+                        external_titles,
+                        stub,
+                    )?;
                     Ok(read.map(|read| SessionOutcome::settled(stub, read)))
                 })
                 .collect::<Result<Option<Vec<_>>>>()
@@ -525,6 +552,7 @@ impl SessionLoader<'_> {
         &self,
         cache: &SqliteCache,
         root: &SessionRoot,
+        place: &RecordPlace<'_>,
         external_titles: &HashMap<String, SessionTitle>,
         stub: &SessionStub,
     ) -> Result<Option<SessionRead>> {
@@ -539,20 +567,43 @@ impl SessionLoader<'_> {
             self.show_last,
         )?;
         Ok(cached.map(|cached| {
-            self.session_read(stub, restore_from_catalogue(&cached, external_titles))
+            self.session_read(
+                place,
+                stub,
+                restore_from_catalogue(&cached, external_titles),
+            )
         }))
     }
 
     /// The copy of `stub`'s session `database` holds, as it is, whether or
-    /// not the transcript changed since; [`SessionRead::NotCached`] when the
-    /// session is missing from it, since nothing may parse the transcript.
+    /// not the transcript changed since, its row unpublished;
+    /// [`SessionRead::NotCached`] when the session is missing from it, since
+    /// nothing may parse the transcript.
     fn cached_copy(
         &self,
         database: Option<&CacheDatabase>,
         root: &SessionRoot,
+        place: &RecordPlace<'_>,
         external_titles: &HashMap<String, SessionTitle>,
         stub: &SessionStub,
     ) -> SessionOutcome {
+        match self.restored_copy(database, root, place, external_titles, stub) {
+            Some(read) => SessionOutcome::settled(stub, read_as_unpublished(read, stub)),
+            None => SessionOutcome::not_cached(stub),
+        }
+    }
+
+    /// The read of the copy of `stub`'s session `database` holds, restored
+    /// from its catalogue row as it is; `None` when the session is missing
+    /// from it or its catalogue cannot be read.
+    fn restored_copy(
+        &self,
+        database: Option<&CacheDatabase>,
+        root: &SessionRoot,
+        place: &RecordPlace<'_>,
+        external_titles: &HashMap<String, SessionTitle>,
+        stub: &SessionStub,
+    ) -> Option<SessionRead> {
         let copy = database.and_then(|database| {
             database
                 .reader()
@@ -572,20 +623,17 @@ impl SessionLoader<'_> {
                 .ok()
                 .flatten()
         });
-        match copy {
-            Some(copy) => SessionOutcome::settled(
-                stub,
-                self.session_read(stub, restore_from_catalogue(&copy, external_titles)),
-            ),
-            None => SessionOutcome::not_cached(stub),
-        }
+        copy.map(|copy| {
+            self.session_read(place, stub, restore_from_catalogue(&copy, external_titles))
+        })
     }
 
     /// `stubs` read through the cache as `access` selects: each from the
     /// database when it holds the session as it is now, the others parsed
     /// from their transcripts, in writer-locked groups while the refresh
-    /// owner is live, and written to the database. A parsed session the
-    /// database did not take is read outside it. A read of the cache as it
+    /// owner is live, and written to the database. A whole parse whose copy
+    /// does not hold its entries keeps them on its outcome; a resumed read
+    /// whose write fails reads as the stored copy. A read of the cache as it
     /// is, and every session left once the owner is no longer live, parses
     /// nothing: see [`Self::cached_copy`].
     fn read_stubs_attempt(
@@ -599,6 +647,7 @@ impl SessionLoader<'_> {
         if stubs.is_empty() {
             return reads;
         }
+        let place = self.record_place(root);
         let mut database = self
             .open_database_for(access)
             .inspect_err(|error| {
@@ -614,7 +663,7 @@ impl SessionLoader<'_> {
             let cached = database
                 .as_ref()
                 .map(|database| {
-                    self.read_from_database(database.reader(), root, external_titles, stub)
+                    self.read_from_database(database.reader(), root, &place, external_titles, stub)
                 })
                 .transpose()
                 .inspect_err(|error| {
@@ -636,7 +685,7 @@ impl SessionLoader<'_> {
         }
         if let CacheAccess::AsIs = access {
             reads.extend(to_parse.into_iter().map(|stub| AttemptRead {
-                outcome: self.cached_copy(database.as_ref(), root, external_titles, stub),
+                outcome: self.cached_copy(database.as_ref(), root, &place, external_titles, stub),
                 is_current: false,
             }));
             return reads;
@@ -662,14 +711,18 @@ impl SessionLoader<'_> {
                     .as_ref()
                     .and_then(|stored| self.read_resumed(permit, root, stub, stored, &|| {}));
                 if let Some(resumed) = resumed {
-                    return SessionParse::Resumed(resumed);
+                    return SessionParse::Resumed(Box::new(resumed));
                 }
                 let stamps = writes_database.then(|| StubStamps::current(stub));
                 let (raw, transcripts) = self.parse(permit, root, stub, &|| {});
-                let record = stamps.and_then(|stamps| {
-                    cache_record(self.storage, root, stub, stamps, &raw, transcripts)
-                });
-                SessionParse::Whole(raw, record)
+                let record = match stamps {
+                    Some(stamps) => self.reported_record(
+                        stub,
+                        cache_record(&place, stub, stamps, &raw, transcripts),
+                    ),
+                    None => ParseRecord::without_database(&raw, transcripts),
+                };
+                SessionParse::Whole(Box::new(raw), record)
             },
             |group, parsed| {
                 for (&(stub, _), parsed) in group.iter().zip(parsed) {
@@ -694,29 +747,41 @@ impl SessionLoader<'_> {
                     };
                     reads.push(match parsed {
                         SessionParse::Whole(raw, record) => {
-                            let is_written = record
-                                .is_some_and(|record| write(&mut database, &record).is_some());
+                            let (generation, unwritten_entries) = match record {
+                                ParseRecord::Record(Some(record)) => {
+                                    let generation = write(&mut database, &record);
+                                    let is_written =
+                                        generation.is_some() && record.writes_its_entries();
+                                    let unwritten =
+                                        (!is_written).then(|| record.into_parsed_entries());
+                                    (generation, unwritten.flatten())
+                                }
+                                ParseRecord::Record(None) => (None, None),
+                                ParseRecord::Unbuilt(unbuilt) => (None, Some(unbuilt.entries)),
+                            };
+                            let raw = match (*raw, generation) {
+                                (RawRead::Parsed(row), Some(generation)) => {
+                                    RawRead::Parsed(published_at(row, generation))
+                                }
+                                (raw, _) => raw,
+                            };
                             AttemptRead {
-                                outcome: SessionOutcome::settled(
+                                outcome: SessionOutcome::settled_with_unwritten_entries(
                                     stub,
-                                    self.session_read(stub, raw),
+                                    self.session_read(&place, stub, raw),
+                                    unwritten_entries,
                                 ),
-                                is_current: is_written,
+                                is_current: generation.is_some(),
                             }
                         }
-                        // A failed write leaves the stored copy, which then
-                        // restores as it is.
                         SessionParse::Resumed(resumed) => {
                             match write(&mut database, &resumed.record) {
                                 Some(generation) => {
-                                    let mut row = resumed.row;
-                                    row.cached_session = row
-                                        .cached_session
-                                        .map(|cached| cached.of_generation(generation));
+                                    let row = published_at(resumed.row, generation);
                                     AttemptRead {
                                         outcome: SessionOutcome::settled(
                                             stub,
-                                            self.session_read(stub, RawRead::Parsed(row)),
+                                            self.session_read(&place, stub, RawRead::Parsed(row)),
                                         ),
                                         is_current: true,
                                     }
@@ -725,6 +790,7 @@ impl SessionLoader<'_> {
                                     outcome: self.cached_copy(
                                         database.as_ref(),
                                         root,
+                                        &place,
                                         external_titles,
                                         stub,
                                     ),
@@ -745,7 +811,7 @@ impl SessionLoader<'_> {
             );
         }
         reads.extend(unparsed.iter().map(|(stub, _)| AttemptRead {
-            outcome: self.cached_copy(database.as_ref(), root, external_titles, stub),
+            outcome: self.cached_copy(database.as_ref(), root, &place, external_titles, stub),
             is_current: false,
         }));
         reads
@@ -783,31 +849,171 @@ enum Listing {
     /// Listed by the root at this index, as this stub.
     Listed(usize, SessionStub),
     /// Beneath a directory the discovery of the root at this index could not
-    /// list.
-    UnreadableDirectory(usize),
+    /// list, with the file's [`key_below`] that root.
+    UnreadableDirectory(usize, BelowKey),
 }
 
 /// `locator` in `discovered`; `None` when every root's discovery leaves it
-/// out.
+/// out. Every root is matched against the file as named before any is
+/// matched against a canonical path, so a file as spelled never has its
+/// directory canonicalised because an earlier root didn't hold it.
 fn find_listed(
     discovered: &[(SessionRoot, DiscoveredSessions)],
-    locator: &Path,
+    locator: &NamedFile,
 ) -> Option<Listing> {
-    discovered
-        .iter()
-        .enumerate()
-        .find_map(|(root_index, (_, found))| {
-            if found
-                .unreadable_directories
-                .iter()
-                .any(|directory| locator.starts_with(&directory.path))
-            {
-                return Some(Listing::UnreadableDirectory(root_index));
+    Spelling::IN_ORDER.into_iter().find_map(|spelling| {
+        discovered
+            .iter()
+            .enumerate()
+            .find_map(|(root_index, (root, found))| {
+                let key = locator.key_below_as(root, spelling)?;
+                if is_beneath_unreadable_directory(root, found, &key) {
+                    return Some(Listing::UnreadableDirectory(root_index, key));
+                }
+                found
+                    .stubs
+                    .iter()
+                    .find(|stub| key_below(root, &stub.locator).as_ref() == Some(&key))
+                    .map(|stub| Listing::Listed(root_index, stub.clone()))
+            })
+    })
+}
+
+/// The ways a file a targeted read names is matched with a root, from the
+/// cheapest to the one that canonicalises its directory.
+#[derive(Clone, Copy)]
+enum Spelling {
+    /// Below the root or a directory beside it, as spelled.
+    AsNamed,
+    /// Below the canonical path of the root or a directory beside it, each
+    /// canonicalised once per root.
+    BelowCanonicalRoot,
+    /// With its own directory canonicalised, at most once per file.
+    ThroughCanonicalDirectory,
+}
+
+impl Spelling {
+    const IN_ORDER: [Self; 3] = [
+        Self::AsNamed,
+        Self::BelowCanonicalRoot,
+        Self::ThroughCanonicalDirectory,
+    ];
+}
+
+/// A file a targeted read names, matched with the files a root's discovery
+/// spells by its [`key_below`] the root, through each [`Spelling`] in order.
+pub(super) struct NamedFile<'a> {
+    path: &'a Path,
+    canonicaliser: &'a dyn Canonicaliser,
+    /// `path` with its directory canonical; `None` when the directory does
+    /// not canonicalise. Set from the start for a canonical path.
+    canonical: std::cell::OnceCell<Option<PathBuf>>,
+}
+
+impl<'a> NamedFile<'a> {
+    pub(super) fn new(path: &'a Path, canonicaliser: &'a dyn Canonicaliser) -> Self {
+        Self {
+            path,
+            canonicaliser,
+            canonical: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The file at `path`, a canonical path: its directory is not
+    /// canonicalised again.
+    pub(super) fn canonical(path: &'a Path, canonicaliser: &'a dyn Canonicaliser) -> Self {
+        Self {
+            path,
+            canonicaliser,
+            canonical: std::cell::OnceCell::from(Some(path.to_path_buf())),
+        }
+    }
+
+    /// The file's [`key_below`] `root` through the first [`Spelling`] that
+    /// places it; `None` outside it. A bare file name names a file in the
+    /// current directory.
+    fn key_below(&self, root: &SessionRoot) -> Option<BelowKey> {
+        Spelling::IN_ORDER
+            .into_iter()
+            .find_map(|spelling| self.key_below_as(root, spelling))
+    }
+
+    /// The file's [`key_below`] `root` through `spelling`.
+    fn key_below_as(&self, root: &SessionRoot, spelling: Spelling) -> Option<BelowKey> {
+        let (position, below) = match spelling {
+            Spelling::AsNamed => root.position_of(self.path),
+            Spelling::BelowCanonicalRoot => {
+                root.canonical_position_of(self.path, self.canonicaliser)
             }
-            found
-                .stubs
-                .iter()
-                .find(|stub| same_file(&stub.locator, locator))
-                .map(|stub| Listing::Listed(root_index, stub.clone()))
+            Spelling::ThroughCanonicalDirectory => {
+                let canonical = self
+                    .canonical
+                    .get_or_init(|| {
+                        let directory = match self.path.parent()? {
+                            directory if directory.as_os_str().is_empty() => Path::new("."),
+                            directory => directory,
+                        };
+                        let canonical = self.canonicaliser.canonicalise(directory).ok()?;
+                        Some(canonical.join(self.path.file_name()?))
+                    })
+                    .as_deref()?;
+                root.canonical_position_of(canonical, self.canonicaliser)
+            }
+        }?;
+        Some(BelowKey {
+            position,
+            key: below.key(),
         })
+    }
+
+    /// True when `discovered`, a file `root`'s discovery spells, is this
+    /// file.
+    fn is(&self, root: &SessionRoot, discovered: &Path) -> bool {
+        self.key_below(root)
+            .is_some_and(|key| key_below(root, discovered) == Some(key))
+    }
+}
+
+/// The key two spellings of a file below a root or a directory beside it
+/// share: the directory's position and the key of the path below it, as
+/// [`SessionRoot::position_of`] places it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BelowKey {
+    position: usize,
+    key: String,
+}
+
+impl BelowKey {
+    /// True for a file below the root, not a directory beside it: true for
+    /// every listed session's own transcript. A directory beside the root
+    /// holds other files of listed sessions, such as Codex's archived
+    /// rollouts from before an edit, and the rollouts of archived threads,
+    /// which discovery doesn't list.
+    fn is_below_root_itself(&self) -> bool {
+        self.position == 0
+    }
+}
+
+/// The [`BelowKey`] of `path`, a file below `root` or a directory beside
+/// it; `None` for a path below neither.
+fn key_below(root: &SessionRoot, path: &Path) -> Option<BelowKey> {
+    root.position_of(path).map(|(position, below)| BelowKey {
+        position,
+        key: below.key(),
+    })
+}
+
+/// True when the file whose [`key_below`] `root` is `key` lies beneath a
+/// directory `found`, `root`'s discovery, could not list.
+fn is_beneath_unreadable_directory(
+    root: &SessionRoot,
+    found: &DiscoveredSessions,
+    key: &BelowKey,
+) -> bool {
+    found.unreadable_directories.iter().any(|directory| {
+        key_below(root, &directory.path).is_some_and(|directory| {
+            directory.position == key.position
+                && Path::new(&key.key).starts_with(Path::new(&directory.key))
+        })
+    })
 }

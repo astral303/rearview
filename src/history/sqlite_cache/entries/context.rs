@@ -5,12 +5,18 @@ use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentMessageRole, AgentPartSource, AgentTranscript,
 };
 use crate::error::Result;
+use crate::history::sqlite_cache::roots::Places;
 use crate::history::task_notification::ReportSender;
 use rusqlite::{Connection, params};
 use std::path::Path;
 
-pub(super) fn read(connection: &Connection, session: i64, path: &Path) -> Result<AgentTranscript> {
-    let threads = threads::read(connection, session)?;
+pub(super) fn read(
+    connection: &Connection,
+    session: i64,
+    places: &Places,
+    path: &Path,
+) -> Result<AgentTranscript> {
+    let threads = threads::read(connection, session, places)?;
     let mut messages = Vec::new();
     let mut statement = connection.prepare(
         "SELECT ordinal, role, reply_id, parent_tool_use_id, thread, first_ms, last_ms, report_has_text, report_task_id, report_launch_call \

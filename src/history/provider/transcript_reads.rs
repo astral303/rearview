@@ -217,6 +217,16 @@ pub trait ThreadLinker: Sync {
         thread: &mut crate::history::format::splice::SubagentThread,
         threads: &[LinkedThread<'_>],
     );
+
+    /// `ledger` with each transcript it names renamed by `rename`; `None`
+    /// when `rename` cannot rename one of them. The cache stores a ledger
+    /// with its transcripts named below the session's roots, and reads it
+    /// back in this run's spelling of them.
+    fn with_transcripts_renamed(
+        &self,
+        ledger: &[u8],
+        rename: &dyn Fn(&Path) -> Option<std::path::PathBuf>,
+    ) -> Option<Vec<u8>>;
 }
 
 /// The linker of a storage whose threads link to nothing.
@@ -250,6 +260,14 @@ impl ThreadLinker for NoLinks {
         _thread: &mut crate::history::format::splice::SubagentThread,
         _threads: &[LinkedThread<'_>],
     ) {
+    }
+
+    fn with_transcripts_renamed(
+        &self,
+        ledger: &[u8],
+        _rename: &dyn Fn(&Path) -> Option<std::path::PathBuf>,
+    ) -> Option<Vec<u8>> {
+        Some(ledger.to_vec())
     }
 }
 

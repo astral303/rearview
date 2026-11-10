@@ -17,13 +17,15 @@ use crate::history::parser::{
     SubagentSearchPart, SubagentShare, adds_search_parts, fold_tail, folded_row,
     parse_errors_of_lines, resumed_thread_fold, session_time, subagent_share,
 };
+use crate::history::path::CanonicalDirectories;
 use crate::history::provider::transcript_reads::resume as resume_read;
 use crate::history::provider::{
     LinkWindow, LinkedThread, ResumedWindow, Resumption, SessionRoot, SessionStorage, SessionStub,
     TranscriptRead,
 };
 use crate::history::sqlite_cache::{
-    InPlaceRow, SessionRecord, SqliteCache, StoredFile, StoredResume, StubStamps, WindowUpdate,
+    InPlaceRow, RecordPlace, SessionRecord, SqliteCache, StoredFile, StoredResume, StubStamps,
+    WindowUpdate,
 };
 use crate::history::{Conversation, MalformedLine, ParsePermit, TranscriptEntries};
 use crate::log_entry::LogEntry;
@@ -46,8 +48,9 @@ pub(crate) type Resumed = std::result::Result<ResumedSession, WholeRead>;
 pub(crate) enum WholeRead {
     /// The stored copy holds no checkpoint.
     NoCheckpoint,
-    /// The stored checkpoint does not decode, or a stored sub-agent turn
-    /// after it names no transcript.
+    /// The stored checkpoint or ledger does not decode, or names a
+    /// transcript outside every root of the session, or a stored sub-agent
+    /// turn after it names no transcript.
     CheckpointUnreadable,
     /// The stored copy is not the one the load listed: another load wrote
     /// the session since.
@@ -120,6 +123,9 @@ pub(crate) struct ResumeContext<'a> {
     pub(crate) on_transcript_read: &'a (dyn Fn() + Sync),
     pub(crate) clock: &'a dyn Clock,
     pub(crate) debug_level: Option<DebugLevel>,
+    /// The directories the reading load canonicalised, for the record's
+    /// reference.
+    pub(crate) project_directories: &'a CanonicalDirectories,
 }
 
 /// One sub-agent transcript of the session, as the resumed read takes it.
@@ -167,11 +173,10 @@ pub(crate) fn read_resumed(
     let Some(cached) = &stored.cached_session else {
         return Ok(Err(WholeRead::NoCheckpoint));
     };
-    let resume =
-        match cache.stored_resume(storage.cache(), root, &stub.cache_key, cached.generation())? {
-            Ok(resume) => resume,
-            Err(whole) => return Ok(Err(whole)),
-        };
+    let resume = match cache.stored_resume(storage, root, &stub.cache_key, cached.generation())? {
+        Ok(resume) => resume,
+        Err(whole) => return Ok(Err(whole)),
+    };
     let stamps = StubStamps::current(stub);
     let reader = storage.transcript_reader();
     // A source without a stamp either time, such as a database's session,
@@ -263,7 +268,7 @@ pub(crate) fn read_resumed(
         Ok(placed) => placed,
         Err(whole) => return Ok(Err(whole)),
     };
-    Ok(finish(context, resume, stamps, own_window, threads, placed))
+    finish(context, resume, stamps, own_window, threads, placed)
 }
 
 /// The share of its session's row `file`, a stored sub-agent transcript,
@@ -692,7 +697,8 @@ fn relink(entry: &mut LogEntry, launch_call: Option<&str>) {
     }
 }
 
-/// The resumed read's row and record.
+/// The resumed read's row and record. Fails for a file of the session
+/// outside every root of it.
 fn finish(
     context: &ResumeContext<'_>,
     resume: StoredResume,
@@ -700,14 +706,16 @@ fn finish(
     own_window: Option<ResumedWindow>,
     threads: Vec<Thread<'_>>,
     placed: Placed,
-) -> Resumed {
+) -> Result<Resumed> {
     let ResumeContext {
         storage,
+        cache,
         root,
         stub,
         stored,
         clock,
         debug_level,
+        project_directories,
         ..
     } = *context;
     let checkpoint = &resume.checkpoint;
@@ -778,10 +786,11 @@ fn finish(
         &subagents,
         place.as_ref().map(|(sequence, _)| *sequence),
     );
-    let folded =
-        folded_row(&fold, &stub.locator, debug_level).map_err(|_| WholeRead::ChangedDuringRead)?;
+    let Ok(folded) = folded_row(&fold, &stub.locator, debug_level) else {
+        return Ok(Err(WholeRead::ChangedDuringRead));
+    };
     if checkpoint.is_headerless && folded.cwd != stored.cwd {
-        return Err(WholeRead::CwdChanged);
+        return Ok(Err(WholeRead::CwdChanged));
     }
     let next_checkpoint = place.zip(next_fold).map(|((sequence, splice), fold)| {
         let sequence = (checkpoint.sequence as i64 + moved) as usize + sequence;
@@ -836,6 +845,10 @@ fn finish(
     row.has_transient_read_error = has_transient_read_error;
     row.is_missing_earlier_turns = is_missing_earlier_turns;
     row.subagents = stub.subagents.clone();
+    // Published once the writer reports the generation it gave the write.
+    row.publication = crate::history::sqlite_cache::Publication::Unpublished {
+        discovered: stub.subagents.clone(),
+    };
     row.message_times = fold.message_times(Some((
         &stored.message_times,
         checkpoint.fold.message_count(),
@@ -855,10 +868,15 @@ fn finish(
             .zip(placed.launch_calls)
             .collect(),
     };
+    let place = RecordPlace {
+        storage: storage.cache(),
+        source: storage.source(),
+        roots: cache.session_roots(root),
+        directories: project_directories,
+        linker: storage.thread_linker(),
+    };
     let record = SessionRecord::resumed(
-        storage.cache(),
-        storage.source(),
-        root,
+        &place,
         stub,
         stamps,
         &row,
@@ -870,13 +888,15 @@ fn finish(
         search_parts,
         next_checkpoint,
         update,
-    )
-    .ok_or(WholeRead::ChangedDuringRead)?;
-    Ok(ResumedSession {
+    )?;
+    let Some(record) = record else {
+        return Ok(Err(WholeRead::ChangedDuringRead));
+    };
+    Ok(Ok(ResumedSession {
         row,
         record,
         bytes_read,
-    })
+    }))
 }
 
 /// The steps of `tail`, entries in the view's order, where a spliced turn

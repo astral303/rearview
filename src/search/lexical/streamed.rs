@@ -299,7 +299,12 @@ mod tests {
         for session in every_record_sessions() {
             let storage = session.row.source.provider().storage().cache();
             cache.admit_storage(storage).unwrap();
-            let root = SessionRoot::new(session.row.path.parent().unwrap());
+            let root = SessionRoot::new(
+                crate::history::environment::test_support::directory_holding_files(
+                    &session.row.path,
+                    &session.row.subagents,
+                ),
+            );
             let stub = SessionStub {
                 locator: session.row.path.clone(),
                 subagents: session.row.subagents.clone(),

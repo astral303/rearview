@@ -45,7 +45,7 @@ pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
 pub use load::{
     DiscoveredSession, FoundSession, LeftOutRows, LoadOptions, ReadError, RecordedSession,
     RediscoveredSessions, SkippedSessions, StaleCopy, apply_external_title, cache_sessions,
-    load_session_by_id, load_sessions, rediscover_sessions,
+    cache_sessions_in_roots, load_session_by_id, load_sessions, rediscover_sessions,
 };
 #[cfg(test)]
 pub use load::{LoadedSessions, read_resolved_session, reread_sessions};
@@ -65,6 +65,7 @@ pub use transcript_reads::{
 use launcher::PathResumeLauncher;
 
 use super::format::SessionFormat;
+use super::path::CanonicalDirectories;
 use super::{ParsePermit, Source, Workspace};
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::error::{AppError, Result};
@@ -208,8 +209,13 @@ pub trait SessionProvider: Sync {
     /// For one-shot commands rather than a keystroke, so it may cost what
     /// [`SessionIdResolver::resolve_session_id`] may not. More than one path
     /// comes back from an agent that does not keep its ids unique, and what an
-    /// ambiguous id means is the caller's to decide.
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>>;
+    /// ambiguous id means is the caller's to decide. The roots come from
+    /// `environment`.
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>>;
 
     /// The session id the locator states, for an agent that names its
     /// transcripts by session id; `None` for an agent whose ids live only
@@ -226,15 +232,12 @@ pub trait SessionProvider: Sync {
     /// or `None` when the session recorded none. It goes into the session's
     /// [`conversation_ref`](Self::conversation_ref) and project id, so
     /// changing it changes references users have written down.
-    fn ref_project(&self, _path: &Path, project_dir: Option<&Path>) -> Option<String> {
-        let project = project_dir?;
-        Some(
-            project
-                .canonicalize()
-                .unwrap_or_else(|_| project.to_path_buf())
-                .to_string_lossy()
-                .into_owned(),
-        )
+    fn ref_project(
+        &self,
+        _path: &Path,
+        project_dir: Option<RecordedDirectory<'_>>,
+    ) -> Option<String> {
+        Some(project_dir?.canonical().to_string_lossy().into_owned())
     }
 
     /// The `ch_` reference the agent CLI names `key` by: a digest of the
@@ -263,6 +266,29 @@ pub trait SessionProvider: Sync {
         project_dir: Option<&Path>,
     ) -> bool {
         project_dir.is_some_and(|directory| workspace.includes(directory))
+    }
+}
+
+/// The directory a session recorded, canonicalised on request through the
+/// directories its command or load canonicalised: the sessions recorded in
+/// one directory share one canonicalisation of it.
+#[derive(Clone, Copy)]
+pub struct RecordedDirectory<'a> {
+    pub path: &'a Path,
+    directories: &'a CanonicalDirectories,
+}
+
+impl<'a> RecordedDirectory<'a> {
+    pub(crate) fn new(path: &'a Path, directories: &'a CanonicalDirectories) -> Self {
+        Self { path, directories }
+    }
+
+    /// The directory's canonical path; as recorded when it doesn't
+    /// canonicalise.
+    pub fn canonical(&self) -> PathBuf {
+        self.directories
+            .canonical(self.path)
+            .unwrap_or_else(|| self.path.to_path_buf())
     }
 }
 
@@ -326,19 +352,20 @@ pub trait SessionIdResolver: Sync {
     ) -> Result<Option<ResolvedSession>>;
 }
 
-/// The session `session_id` names under the first of `storage`'s roots that
-/// holds it, as `resolver` finds it. A query that fails
+/// The session `session_id` names under the first of `storage`'s roots in
+/// `environment` that holds it, as `resolver` finds it. A query that fails
 /// [`SessionIdResolver::is_session_id_shape`] resolves to `None` without a
 /// lookup.
 pub(crate) fn resolve_in_storage(
     resolver: &dyn SessionIdResolver,
     storage: &dyn SessionStorage,
+    environment: &RootEnvironment,
     session_id: &str,
 ) -> Result<Option<ResolvedSession>> {
     if !resolver.is_session_id_shape(session_id) {
         return Ok(None);
     }
-    for root in storage.roots()? {
+    for root in storage.roots_in(environment)? {
         if let Some(resolved) = resolver.resolve_session_id_in(&root, session_id)? {
             return Ok(Some(resolved));
         }
@@ -347,16 +374,20 @@ pub(crate) fn resolve_in_storage(
 }
 
 /// [`SessionProvider::find_sessions_by_id`] for a provider whose ids are
-/// unique: the session `resolver` resolves `session_id` to in `storage`.
+/// unique: the session `resolver` resolves `session_id` to in `storage`'s
+/// roots in `environment`.
 fn resolved_session_paths(
     resolver: &dyn SessionIdResolver,
     storage: &dyn SessionStorage,
+    environment: &RootEnvironment,
     session_id: &str,
 ) -> Result<Vec<PathBuf>> {
-    Ok(resolve_in_storage(resolver, storage, session_id)?
-        .map(|resolved| resolved.stub.locator)
-        .into_iter()
-        .collect())
+    Ok(
+        resolve_in_storage(resolver, storage, environment, session_id)?
+            .map(|resolved| resolved.stub.locator)
+            .into_iter()
+            .collect(),
+    )
 }
 
 static CLAUDE: claude::ClaudeProvider = claude::ClaudeProvider;
@@ -401,12 +432,13 @@ pub fn resolve_session_id(
     environment: &crate::history::Environment,
     session_id: &str,
 ) -> Option<(Source, ResolvedSession)> {
+    let root_environment = environment.root_environment();
     environment.storages().iter().find_map(|storage| {
         let source = storage.source();
         let Capability::Capable(resolver) = source.provider().session_id_lookup() else {
             return None;
         };
-        let resolved = resolve_in_storage(resolver, *storage, session_id)
+        let resolved = resolve_in_storage(resolver, *storage, &root_environment, session_id)
             .ok()
             .flatten()?;
         Some((source, resolved))
@@ -422,13 +454,14 @@ pub fn find_sessions_by_id(
     environment: &crate::history::Environment,
     session_id: &str,
 ) -> Vec<(Source, PathBuf)> {
+    let root_environment = environment.root_environment();
     environment
         .storages()
         .iter()
         .map(|storage| storage.source().provider())
         .flat_map(|provider| {
             provider
-                .find_sessions_by_id(session_id)
+                .find_sessions_by_id(&root_environment, session_id)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|locator| (provider.source(), locator))
@@ -439,13 +472,20 @@ pub fn find_sessions_by_id(
 /// True when `path` is a session `source` stores under `session_id`, not a
 /// copy outside the agent's tree. Asks `find_sessions_by_id`, not
 /// `resolve_session_id`: a provider declaring `session_id_lookup` Not Capable
-/// has no resolver. False when the lookup fails.
-pub fn is_stored_session(source: Source, session_id: &str, path: &Path) -> bool {
+/// doesn't have a resolver. False when the lookup fails. The roots come from
+/// `environment`, and each file's directory is canonicalised through its
+/// directory memo.
+pub fn is_stored_session(
+    source: Source,
+    session_id: &str,
+    path: &Path,
+    environment: &RootEnvironment,
+) -> bool {
     let stored = source
         .provider()
-        .find_sessions_by_id(session_id)
+        .find_sessions_by_id(environment, session_id)
         .unwrap_or_default();
-    contains_file(&stored, path)
+    contains_file(&stored, path, environment.directories())
 }
 
 /// The `current_session_variable` of every provider declaring it Capable.
@@ -491,11 +531,13 @@ pub fn launch_command(
     }
 }
 
-/// True when one of `stored` is the file at `path`, however each was spelled.
-fn contains_file(stored: &[PathBuf], path: &Path) -> bool {
+/// True when one of `stored` is the file at `path`, however each was spelled:
+/// each directory is canonicalised once, through `directories`.
+fn contains_file(stored: &[PathBuf], path: &Path, directories: &CanonicalDirectories) -> bool {
+    let named = directories.file_identity(path);
     stored
         .iter()
-        .any(|locator| super::format::same_file(locator, path))
+        .any(|locator| directories.file_identity(locator) == named)
 }
 
 /// Column width that keeps mixed-source list rows aligned: the widest list
@@ -606,14 +648,22 @@ mod tests {
         let unknown = "019f0000-0000-7000-8000-00000000000a";
         for (source, resolver) in session_id_resolvers() {
             assert!(
-                resolve_in_storage(resolver, source.provider().storage(), unknown).is_ok(),
+                resolve_in_storage(
+                    resolver,
+                    source.provider().storage(),
+                    &RootEnvironment::of_process(),
+                    unknown
+                )
+                .is_ok(),
                 "provider {} failed a lookup for an id it does not hold",
                 source.provider().labels().name
             );
         }
         for provider in providers() {
             assert!(
-                provider.find_sessions_by_id(unknown).is_ok(),
+                provider
+                    .find_sessions_by_id(&RootEnvironment::of_process(), unknown)
+                    .is_ok(),
                 "provider {} failed a search for an id it does not hold",
                 provider.labels().name
             );

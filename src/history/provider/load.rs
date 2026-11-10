@@ -10,16 +10,16 @@ use crate::clock::Clock;
 use crate::debug;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::fingerprint::CachedFingerprint;
-use crate::history::format::same_file;
 use crate::history::load_meter::AgentMeter;
 use crate::history::parser::{ParsedSession, SessionTranscripts, UnlistedReason};
+use crate::history::path::CanonicalDirectories;
 use crate::history::resumed::{ResumeContext, ResumedSession, WholeRead, read_resumed};
 use crate::history::shard_files;
 use crate::history::sqlite_cache::refresh::RefreshToken;
 use crate::history::sqlite_cache::{
     self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, LiveOwner,
-    NextStep, OperationAccess, OperationScope, SessionRecord, SessionStatus, SqliteCache,
-    StubStamps,
+    NextStep, OperationAccess, OperationScope, Publication, RecordPlace, SessionAddress,
+    SessionRecord, SessionStatus, SqliteCache, StubStamps, UnbuiltRecord,
 };
 use crate::history::{
     Conversation, Environment, FilterTerm, ParsePermit, Source, format_short_name_from_path,
@@ -35,7 +35,7 @@ mod cache_access;
 mod targeted;
 
 use cache_access::{CacheAccess, DatabaseReader, Deletions};
-use targeted::StubsAfterRediscovery;
+use targeted::{NamedFile, StubsAfterRediscovery};
 
 /// One provider's sessions, and what its roots hold that it ignores.
 pub struct LoadedSessions {
@@ -55,10 +55,12 @@ pub struct LoadedSessions {
 }
 
 /// A session discovery found, and the directory and id of the row the load
-/// listed for it: `None` when the load listed no row, because the session
-/// holds no conversation or could not be read.
+/// listed for it: `None` when the load did not list a row, because the
+/// session does not hold a conversation or could not be read.
 pub struct DiscoveredSession {
     pub stub: SessionStub,
+    /// The session's address in the cache.
+    pub address: SessionAddress,
     pub recorded: Option<RecordedSession>,
     /// The copy a load that read the cache as it is found older than the
     /// transcript, or did not find; `None` when the load read the session
@@ -406,8 +408,16 @@ pub fn reread_sessions(
         return all_missing(locators);
     };
     let loader = SessionLoader::new(environment, storage, show_last, None, AgentMeter::UNMETERED);
+    let Ok(roots) = loader.storage_roots() else {
+        return all_failed_transiently(locators);
+    };
+    let named: Vec<NamedFile> = locators
+        .iter()
+        .map(|locator| NamedFile::new(locator, environment.canonicaliser()))
+        .collect();
     let reread = loader.reread(
-        locators,
+        roots,
+        &named,
         DatabaseReader::Interactive,
         |root, external_titles, stubs| {
             Ok::<_, std::convert::Infallible>(loader.read_stubs_interactively(
@@ -447,9 +457,71 @@ pub fn cache_sessions(
     let Some(storage) = environment.storage_of(source) else {
         return Ok(all_missing(locators));
     };
+    let Ok(roots) = storage.roots_in(&environment.root_environment()) else {
+        return Ok(all_failed_transiently(locators));
+    };
+    cache_sessions_in_roots(
+        environment,
+        source,
+        roots,
+        locators,
+        show_last,
+        operation,
+        meter,
+    )
+}
+
+/// [`cache_sessions`] below `roots`, `source`'s roots as the caller holds
+/// them: discovery walks `roots`, and a canonical path the caller found for
+/// one of them is not canonicalised again.
+pub fn cache_sessions_in_roots(
+    environment: &Environment,
+    source: Source,
+    roots: Vec<SessionRoot>,
+    locators: &[&Path],
+    show_last: bool,
+    operation: &OperationScope,
+    meter: AgentMeter,
+) -> Result<Vec<SessionOutcome>> {
+    let Some(storage) = environment.storage_of(source) else {
+        return Ok(all_missing(locators));
+    };
     let loader = SessionLoader::new(environment, storage, show_last, None, meter);
+    let canonicaliser = environment.canonicaliser();
+    let named: Vec<NamedFile> = locators
+        .iter()
+        .map(|locator| NamedFile::new(locator, canonicaliser))
+        .collect();
+    cache_sessions_through(&loader, roots, &named, operation)
+}
+
+/// [`cache_sessions`] for the file at `canonical`, a canonical path, in
+/// `source`'s storage whose roots the caller canonicalised: discovery walks
+/// `roots` and does not canonicalise `canonical`'s directory.
+pub(super) fn cache_canonical_session(
+    environment: &Environment,
+    source: Source,
+    roots: Vec<SessionRoot>,
+    canonical: &Path,
+    show_last: bool,
+    operation: &OperationScope,
+) -> Result<Vec<SessionOutcome>> {
+    let Some(storage) = environment.storage_of(source) else {
+        return Ok(all_missing(&[canonical]));
+    };
+    let loader = SessionLoader::new(environment, storage, show_last, None, AgentMeter::UNMETERED);
+    let named = [NamedFile::canonical(canonical, environment.canonicaliser())];
+    cache_sessions_through(&loader, roots, &named, operation)
+}
+
+fn cache_sessions_through(
+    loader: &SessionLoader<'_>,
+    roots: Vec<SessionRoot>,
+    named: &[NamedFile<'_>],
+    operation: &OperationScope,
+) -> Result<Vec<SessionOutcome>> {
     let reader = DatabaseReader::WithoutWaiting;
-    loader.reread(locators, reader, |root, external_titles, stubs| {
+    loader.reread(roots, named, reader, |root, external_titles, stubs| {
         loader.read_stubs(
             root,
             external_titles,
@@ -466,6 +538,15 @@ fn all_missing(locators: &[&Path]) -> Vec<SessionOutcome> {
     locators
         .iter()
         .map(|locator| SessionOutcome::missing(locator))
+        .collect()
+}
+
+/// A transient failure for each of `locators`: a failed discovery kept them
+/// from being read.
+fn all_failed_transiently(locators: &[&Path]) -> Vec<SessionOutcome> {
+    locators
+        .iter()
+        .map(|locator| SessionOutcome::failed_transiently(locator))
         .collect()
 }
 
@@ -525,6 +606,9 @@ struct SessionLoader<'a> {
     show_last: bool,
     debug_level: Option<DebugLevel>,
     meter: AgentMeter<'a>,
+    /// The directories the load's sessions recorded, each canonicalised once
+    /// for the references the cache records.
+    project_directories: std::sync::Arc<CanonicalDirectories>,
 }
 
 impl<'a> SessionLoader<'a> {
@@ -541,6 +625,7 @@ impl<'a> SessionLoader<'a> {
             show_last,
             debug_level,
             meter,
+            project_directories: environment.canonical_directories(),
         }
     }
 
@@ -551,6 +636,46 @@ impl<'a> SessionLoader<'a> {
     /// The session cache base this load reads and writes.
     fn cache_base(&self) -> &'a CacheBase {
         self.environment.cache_base()
+    }
+
+    /// The place every record of `root`'s sessions shares.
+    fn record_place(&self, root: &SessionRoot) -> RecordPlace<'_> {
+        RecordPlace {
+            storage: self.storage.cache(),
+            source: self.storage.source(),
+            roots: sqlite_cache::SessionRoots::of(root, self.environment.canonicaliser()),
+            directories: &self.project_directories,
+            linker: self.storage.thread_linker(),
+        }
+    }
+
+    /// `record`, the record of `stub`'s session, with a failure to build it
+    /// reported as a failed write, as a file of the session outside every
+    /// root of it.
+    fn reported_record(&self, stub: &SessionStub, record: Result<ParseRecord>) -> ParseRecord {
+        let report = |error: &AppError| {
+            debug::warn(
+                self.debug_level,
+                &format!(
+                    "Failed to write {} session {} to the session cache database: {error}",
+                    self.storage.source().display_label(),
+                    stub.locator.display()
+                ),
+            )
+        };
+        match record {
+            Ok(ParseRecord::Unbuilt(unbuilt)) => {
+                if let Some(error) = &unbuilt.error {
+                    report(error);
+                }
+                ParseRecord::Unbuilt(unbuilt)
+            }
+            Ok(record) => record,
+            Err(error) => {
+                report(&error);
+                ParseRecord::Record(None)
+            }
+        }
     }
 }
 
@@ -716,10 +841,24 @@ impl SessionLoader<'_> {
     /// Every root's sessions before any root is loaded, so a progress total
     /// spans the provider instead of restarting at each root.
     fn discover_every_root(&self) -> Result<Vec<(SessionRoot, DiscoveredSessions)>> {
+        self.discover_roots(self.storage_roots()?)
+    }
+
+    /// The storage's roots in the environment's process variables and
+    /// directories.
+    fn storage_roots(&self) -> Result<Vec<SessionRoot>> {
+        self.storage.roots_in(&self.environment.root_environment())
+    }
+
+    /// The sessions of each of `roots`, discovered before any is read.
+    fn discover_roots(
+        &self,
+        roots: Vec<SessionRoot>,
+    ) -> Result<Vec<(SessionRoot, DiscoveredSessions)>> {
         self.meter.discovering();
         let discovering = self.clock().now();
         let mut discovered = Vec::new();
-        for root in self.storage.roots()? {
+        for root in roots {
             let found = self.storage.discover(&root, self.environment.lister())?;
             discovered.push((root, found));
         }
@@ -856,8 +995,10 @@ impl SessionLoader<'_> {
             deletions: Deletions::of(found),
         };
         let loaded = self.load_database_root(root, stubs, left_out, read, snapshot, caches);
-        if owner.is_live() {
-            shard_files::remove(self.cache_base().path(), self.storage.cache(), &root.path);
+        if owner.is_live()
+            && let Some(canonical) = root.canonical_path(self.environment.canonicaliser())
+        {
+            shard_files::remove(self.cache_base().path(), self.storage.cache(), canonical);
         }
         Ok(loaded)
     }
@@ -1103,6 +1244,7 @@ impl SessionLoader<'_> {
         caches: RootCaches<'_>,
     ) -> LoadedRoot {
         let database = caches.database;
+        let place = self.record_place(root);
         let reads_as_is = matches!(caches.access, CacheAccess::AsIs);
         let rows_under_unlisted_directories = match (database, caches.deletions) {
             (Some(database), Deletions::Keep(directories)) => {
@@ -1170,15 +1312,19 @@ impl SessionLoader<'_> {
                         self.read_resumed(permit, root, stub, stored, &on_transcript_read)
                     });
                 let parsed = match resumed {
-                    Some(resumed) => SessionParse::Resumed(resumed),
+                    Some(resumed) => SessionParse::Resumed(Box::new(resumed)),
                     None => {
                         let stamps = database.map(|_| StubStamps::current(stub));
                         let (raw, transcripts) =
                             self.parse(permit, root, stub, &on_transcript_read);
-                        let record = stamps.and_then(|stamps| {
-                            cache_record(self.storage, root, stub, stamps, &raw, transcripts)
-                        });
-                        SessionParse::Whole(raw, record)
+                        let record = match stamps {
+                            Some(stamps) => self.reported_record(
+                                stub,
+                                cache_record(&place, stub, stamps, &raw, transcripts),
+                            ),
+                            None => ParseRecord::Record(None),
+                        };
+                        SessionParse::Whole(Box::new(raw), record)
                     }
                 };
                 let unannounced =
@@ -1193,16 +1339,17 @@ impl SessionLoader<'_> {
                     outcomes[index] = Some(match parsed {
                         SessionParse::Whole(outcome, record) => {
                             if caches.access.owner().is_some()
-                                && let (Some(database), Some(record)) = (database, record)
+                                && let (Some(database), Some(record)) =
+                                    (database, record.into_record())
                             {
                                 database.write(record);
                             }
-                            RootRead::Read(outcome)
+                            RootRead::Read(*outcome)
                         }
                         // A failed write leaves the stored copy, which then
                         // restores as it is.
                         SessionParse::Resumed(resumed) => {
-                            match database.and_then(|database| database.write_resumed(resumed)) {
+                            match database.and_then(|database| database.write_resumed(*resumed)) {
                                 Some(row) => RootRead::Read(RawRead::Parsed(row)),
                                 None => copy_as_it_is(&stubs[index], database, &external_titles),
                             }
@@ -1244,7 +1391,13 @@ impl SessionLoader<'_> {
                 has_transient_read_error: false,
             };
             let mut stale_copy = is_stale.then_some(StaleCopy { cached_until: None });
-            recorded.push(match self.session_read(stub, raw) {
+            let read = self.session_read(&place, stub, raw);
+            let read = if is_stale {
+                read_as_unpublished(read, stub)
+            } else {
+                read
+            };
+            recorded.push(match read {
                 SessionRead::Listed(conversation) => {
                     let session = RecordedSession::of(&conversation);
                     if let Some(stale_copy) = &mut stale_copy {
@@ -1276,6 +1429,7 @@ impl SessionLoader<'_> {
             .zip(stale_copies)
             .zip(warnings)
             .map(|(((stub, recorded), stale), warning)| DiscoveredSession {
+                address: place.address_of(&stub),
                 stub,
                 recorded,
                 stale,
@@ -1286,6 +1440,7 @@ impl SessionLoader<'_> {
             let conversation =
                 self.resolve_preview_and_project(restored_row(row, &external_titles));
             discovered.push(DiscoveredSession {
+                address: place.address_of(&stub),
                 stub,
                 recorded: Some(RecordedSession::of(&conversation)),
                 stale: None,
@@ -1302,25 +1457,44 @@ impl SessionLoader<'_> {
         }
     }
 
-    /// `raw`, the read of the session at `stub`, as the list shows it.
-    fn session_read(&self, stub: &SessionStub, raw: RawRead) -> SessionRead {
+    /// `raw`, the read of the session at `stub` under `place`'s root, as the
+    /// list shows it.
+    fn session_read(
+        &self,
+        place: &RecordPlace<'_>,
+        stub: &SessionStub,
+        raw: RawRead,
+    ) -> SessionRead {
         match raw {
             RawRead::Restored(conversation) => {
                 SessionRead::Listed(Box::new(self.resolve_preview_and_project(conversation)))
             }
             RawRead::Parsed(conversation) => {
-                SessionRead::Listed(Box::new(self.listed_row(stub, conversation)))
+                SessionRead::Listed(Box::new(self.listed_row(place, stub, conversation)))
             }
             RawRead::Empty(_) => SessionRead::Empty,
             RawRead::Failed(error, _) => SessionRead::Failed(error),
         }
     }
 
-    /// `conversation`, parsed from `stub`'s transcripts, as the list shows it,
-    /// carrying the fingerprint of the stub it was read from.
-    fn listed_row(&self, stub: &SessionStub, conversation: Conversation) -> Conversation {
+    /// `conversation`, parsed from `stub`'s transcripts under `place`'s
+    /// root, as the list shows it, carrying the fingerprint of the stub it
+    /// was read from and the address its copy is written at. A row its
+    /// write did not publish expects the sub-agent transcripts `stub` names.
+    fn listed_row(
+        &self,
+        place: &RecordPlace<'_>,
+        stub: &SessionStub,
+        conversation: Conversation,
+    ) -> Conversation {
         let mut conversation = self.resolve_preview_and_project(conversation);
         conversation.fingerprint = stub.fingerprint.stamp();
+        conversation.cache_address = Some(place.address_of(stub));
+        if !matches!(conversation.publication, Publication::Published { .. }) {
+            conversation.publication = Publication::Unpublished {
+                discovered: stub.subagents.clone(),
+            };
+        }
         conversation
     }
 
@@ -1396,6 +1570,7 @@ impl SessionLoader<'_> {
                     on_transcript_read: &count_read,
                     clock: self.clock(),
                     debug_level: self.debug_level,
+                    project_directories: &self.project_directories,
                 },
                 permit,
             ),
@@ -1599,20 +1774,39 @@ impl<'a> DatabaseWrites<'a> {
             .send(CacheWrite::Resumed { record, reply })
             .ok()?;
         let generation = replied.recv().ok()?.ok()?;
-        let mut row = resumed.row;
-        row.cached_session = row
-            .cached_session
-            .map(|cached| cached.of_generation(generation));
-        Some(row)
+        Some(published_at(resumed.row, generation))
+    }
+}
+
+/// `row`, whose write gave its copy `generation`, as that copy.
+fn published_at(mut row: Conversation, generation: i64) -> Conversation {
+    row.cached_session = row
+        .cached_session
+        .map(|cached| cached.of_generation(generation));
+    row.publication = Publication::Published { generation };
+    row
+}
+
+/// `read`, a read of `stub`'s session from a copy as it is, whose row
+/// expects the sub-agent transcripts discovery found.
+fn read_as_unpublished(read: SessionRead, stub: &SessionStub) -> SessionRead {
+    match read {
+        SessionRead::Listed(mut row) => {
+            row.publication = Publication::Unpublished {
+                discovered: stub.subagents.clone(),
+            };
+            SessionRead::Listed(row)
+        }
+        read => read,
     }
 }
 
 /// A session's read in a root load's parse.
 enum SessionParse {
     /// Read whole, with the record of the read for the database.
-    Whole(RawRead, Option<SessionRecord>),
+    Whole(Box<RawRead>, ParseRecord),
     /// Read on from the database's copy.
-    Resumed(ResumedSession),
+    Resumed(Box<ResumedSession>),
 }
 
 /// True when `current`, the database's fingerprints by cache key, holds
@@ -1696,43 +1890,70 @@ fn restored_row(
     row
 }
 
+/// A whole parse's record for the session cache database.
+enum ParseRecord {
+    /// `None` for a read the database does not record.
+    Record(Option<Box<SessionRecord>>),
+    /// A listed session's parse that no record could be built for.
+    Unbuilt(Box<UnbuiltRecord>),
+}
+
+impl ParseRecord {
+    /// `raw`, a whole parse that read `transcripts`, without a database to
+    /// write it to: the entries of a listed session, which only this read
+    /// holds.
+    fn without_database(raw: &RawRead, transcripts: Option<SessionTranscripts>) -> Self {
+        match (raw, transcripts) {
+            (RawRead::Parsed(conversation), Some(transcripts))
+                if !conversation.has_transient_read_error =>
+            {
+                Self::Unbuilt(Box::new(UnbuiltRecord {
+                    entries: transcripts.into_entries_and_search_parts().0,
+                    error: None,
+                }))
+            }
+            _ => Self::Record(None),
+        }
+    }
+
+    /// The record the database writer takes; `None` without one.
+    fn into_record(self) -> Option<SessionRecord> {
+        match self {
+            Self::Record(record) => record.map(|record| *record),
+            Self::Unbuilt(_) => None,
+        }
+    }
+}
+
 /// The session cache database's projection of `raw`, the parse of
-/// `storage`'s session at `stub` under `root`, a listed session's entries
+/// the session at `stub` under `place`'s root, a listed session's entries
 /// from `transcripts`, what that parse read. `stamps` are the stub's files
-/// stamped before the parse. `None` for a transient failure and for a row
-/// built without a transcript after a transient error: the next load reads
-/// the session again. An empty or unreadable session records the warning
-/// the parse built.
+/// stamped before the parse. No record for a transient failure and for a
+/// row built without a transcript after a transient error: the next load
+/// reads the session again. An empty or unreadable session records the
+/// warning the parse built. A listed session's record that cannot be built
+/// keeps the parse's entries. Fails for a file of an unlisted session
+/// outside every root of it.
 fn cache_record(
-    storage: &dyn SessionStorage,
-    root: &SessionRoot,
+    place: &RecordPlace<'_>,
     stub: &SessionStub,
     stamps: StubStamps,
     raw: &RawRead,
     transcripts: Option<SessionTranscripts>,
-) -> Option<SessionRecord> {
+) -> Result<ParseRecord> {
     let unlisted = |status, warning: &AgentWarning| {
-        SessionRecord::unlisted(
-            storage.cache(),
-            storage.source(),
-            root,
-            stub,
-            status,
-            warning.to_recorded(),
-        )
+        SessionRecord::unlisted(place, stub, status, warning.to_recorded())
+            .map(|record| ParseRecord::Record(record.map(Box::new)))
     };
     match (raw, transcripts) {
         (RawRead::Parsed(conversation), Some(transcripts))
             if !conversation.has_transient_read_error =>
         {
-            SessionRecord::listed(
-                storage.cache(),
-                storage.source(),
-                root,
-                stub,
-                stamps,
-                conversation,
-                transcripts,
+            Ok(
+                match SessionRecord::listed(place, stub, stamps, conversation, transcripts) {
+                    Ok(record) => ParseRecord::Record(Some(Box::new(record))),
+                    Err(unbuilt) => ParseRecord::Unbuilt(unbuilt),
+                },
             )
         }
         (RawRead::Empty(Some(warning)), _) => unlisted(SessionStatus::Empty, warning),
@@ -1742,7 +1963,7 @@ fn cache_record(
         (
             RawRead::Parsed(_) | RawRead::Restored(_) | RawRead::Empty(None) | RawRead::Failed(..),
             _,
-        ) => None,
+        ) => Ok(ParseRecord::Record(None)),
     }
 }
 
@@ -2063,21 +2284,13 @@ mod tests {
         /// under an operation of its own.
         fn reread_caching(&self, locators: &[&Path]) -> Vec<SessionOutcome> {
             let operation = waiting_operation(self.environment);
-            let outcomes = self
-                .reread(
-                    locators,
-                    DatabaseReader::WithoutWaiting,
-                    |root, external_titles, stubs| {
-                        self.read_stubs(
-                            root,
-                            external_titles,
-                            stubs,
-                            StubsAfterRediscovery::SameFiles,
-                            &operation,
-                        )
-                    },
-                )
-                .unwrap();
+            let named: Vec<NamedFile> = locators
+                .iter()
+                .map(|locator| NamedFile::new(locator, self.environment.canonicaliser()))
+                .collect();
+            let outcomes =
+                cache_sessions_through(self, self.storage_roots().unwrap(), &named, &operation)
+                    .unwrap();
             operation.finish().unwrap();
             outcomes
         }
@@ -2155,7 +2368,12 @@ mod tests {
         for session in super::super::contract_tests::every_record_sessions() {
             let row = &session.row;
             let storage = row.source.provider().storage();
-            let root = SessionRoot::new(row.path.parent().unwrap());
+            let root = SessionRoot::new(
+                crate::history::environment::test_support::directory_holding_files(
+                    &row.path,
+                    &row.subagents,
+                ),
+            );
             let stub = SessionStub {
                 locator: row.path.clone(),
                 subagents: row.subagents.clone(),
@@ -2182,8 +2400,22 @@ mod tests {
                 environment.clock().as_ref(),
             );
             let (raw, transcripts) = RawRead::of_parse(storage.source(), &stub.locator, parsed);
-            let record = cache_record(storage, &root, &stub, stamps, &raw, transcripts)
-                .unwrap_or_else(|| panic!("{:?}'s session has a record", row.source));
+            let record = cache_record(
+                &crate::history::sqlite_cache::RecordPlace {
+                    storage: storage.cache(),
+                    source: storage.source(),
+                    roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
+                    directories: &crate::history::path::CanonicalDirectories::of_system(),
+                    linker: storage.source().provider().storage().thread_linker(),
+                },
+                &stub,
+                stamps,
+                &raw,
+                transcripts,
+            )
+            .unwrap()
+            .into_record()
+            .unwrap_or_else(|| panic!("{:?}'s session has a record", row.source));
             let mut database = SqliteCache::open_for_refresh(ownership.token()).unwrap();
             database.admit_storage(storage.cache()).unwrap();
             database.write(&record).unwrap();
@@ -2287,13 +2519,19 @@ mod tests {
                 writer
                     .write(
                         &SessionRecord::unlisted(
-                            storage.cache(),
-                            Source::Claude,
-                            &root,
+                            &crate::history::sqlite_cache::RecordPlace {
+                                storage: storage.cache(),
+                                source: Source::Claude,
+                                roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
+                                directories: &crate::history::path::CanonicalDirectories::of_system(
+                                ),
+                                linker: Source::Claude.provider().storage().thread_linker(),
+                            },
                             stub,
                             SessionStatus::Empty,
                             "skipped transcript has no visible messages".to_owned(),
                         )
+                        .unwrap()
                         .unwrap(),
                     )
                     .unwrap();
@@ -2340,13 +2578,18 @@ mod tests {
         database
             .write(
                 &SessionRecord::unlisted(
-                    storage.cache(),
-                    Source::Claude,
-                    &root,
+                    &crate::history::sqlite_cache::RecordPlace {
+                        storage: storage.cache(),
+                        source: Source::Claude,
+                        roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
+                        directories: &crate::history::path::CanonicalDirectories::of_system(),
+                        linker: Source::Claude.provider().storage().thread_linker(),
+                    },
                     &stub,
                     SessionStatus::Empty,
                     "skipped transcript has no visible messages".to_owned(),
                 )
+                .unwrap()
                 .unwrap(),
             )
             .unwrap();
@@ -3104,10 +3347,13 @@ mod tests {
         storage: &dyn SessionStorage,
         root: &Path,
     ) -> PathBuf {
+        use crate::history::provider::walk::SystemCanonicaliser;
         use std::hash::{Hash, Hasher};
-        let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let canonical = SystemCanonicaliser::shared()
+            .canonicalise(root)
+            .unwrap_or_else(|_| root.to_path_buf());
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        resolved.hash(&mut hasher);
+        canonical.hash(&mut hasher);
         base.join(storage.cache().directory)
             .join(format!("root-{:016x}", hasher.finish()))
     }
@@ -3520,6 +3766,48 @@ mod tests {
             next,
             NextStep::AwaitRefresh(AwaitedRefresh::ThisProcess),
             "this rearview's refresh is reported as its own"
+        );
+    }
+
+    /// A read whose write of a session the cache never held fails keeps the
+    /// entries it parsed on its outcome; a read whose write lands does not.
+    #[test]
+    fn read_whose_write_fails_keeps_the_entries_it_parsed() {
+        let base = tempfile::tempdir().unwrap();
+        admit_database(base.path());
+        let home = ClaudeHome::new();
+        home.write("cached", 0, &["a cached question"]);
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
+        let environment = environment_of(base.path());
+        let loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+        let written = home.write("written", 1, &["a written question"]);
+        let unwritten = home.write("unwritten", 2, &["an unwritten question"]);
+
+        let (_, entries_of_written) = loader
+            .cache_one(&home.root(), discovered_stub(&home, &written))
+            .into_read_and_unwritten_entries();
+        let _failing =
+            sqlite_cache::connection::test_hooks::fail_the_first_data_commit(base.path(), || {});
+        let (read, entries_of_unwritten) = loader
+            .cache_one(&home.root(), discovered_stub(&home, &unwritten))
+            .into_read_and_unwritten_entries();
+
+        assert!(entries_of_written.is_none(), "the copy holds the entries");
+        assert!(
+            matches!(read, SessionRead::Listed(_)),
+            "the parse lists the session"
+        );
+        let entries = entries_of_unwritten.expect("the outcome keeps the parsed entries");
+        assert!(
+            format!("{:?}", entries.entries).contains("an unwritten question"),
+            "{:?}",
+            entries.entries
         );
     }
 
@@ -4384,6 +4672,42 @@ mod tests {
             "discovery reports the directory it could not list"
         );
         assert_eq!(stored_keys_in(base.path(), &home), [hidden.cache_key]);
+    }
+
+    /// A targeted read of a session below a directory discovery could not
+    /// list reads its current copy as published at the copy's generation.
+    #[test]
+    fn targeted_read_below_unreadable_directory_reads_copy_as_published() {
+        let base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let transcript = home.write("hidden", 0, &["a question"]);
+        load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
+        home.refuse_project();
+        let environment = environment_listing_home(base.path(), &home);
+        let operation = waiting_operation(&environment);
+
+        let outcome = cache_sessions(
+            &environment,
+            Source::Claude,
+            &[transcript.as_path()],
+            false,
+            &operation,
+            AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .expect("one read");
+        operation.finish().unwrap();
+
+        let (SessionRead::Listed(row), _) = outcome.into_parts() else {
+            panic!("the copy is read");
+        };
+        let generation = row
+            .cached_session
+            .as_ref()
+            .expect("the row reads its copy")
+            .generation();
+        assert_eq!(row.publication, Publication::Published { generation });
     }
 
     /// A load writes a session's entries as `session_entries` reads them.

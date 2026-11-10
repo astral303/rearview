@@ -88,6 +88,7 @@ impl ModelFolderMove {
 
     /// The outcome without a move: `None` while the old model folder exists
     /// and the Hugging Face cache lacks the model folder.
+    #[allow(clippy::disallowed_methods)]
     fn outcome_on_disk(&self) -> Result<Option<OldModelFolder>> {
         if !self.exists(&self.old_model)? {
             return Ok(Some(OldModelFolder::Gone));
@@ -95,6 +96,7 @@ impl ModelFolderMove {
         if !self.exists(&self.target)? {
             return Ok(None);
         }
+        // Two of rearview's own model folders, once per model load.
         let canonical =
             |path: &Path| std::fs::canonicalize(path).map_err(|error| self.error(error));
         if canonical(&self.old_model)? == canonical(&self.target)? {

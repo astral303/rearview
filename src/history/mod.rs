@@ -8,8 +8,6 @@
 //! - `provider` - Each agent's storage, lookup and references
 //! - `format` - Each agent's transcript format
 
-#![deny(clippy::disallowed_methods)]
-
 mod content;
 mod display_entries;
 pub(crate) mod environment;
@@ -122,13 +120,14 @@ pub(crate) fn normalized_session(
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
-/// [`normalized_session`] for a bare file (`--render`, a direct path), read by
-/// the format of the agent its projection names.
+/// A bare file's normalized entries (`--render`, a direct path), read by the
+/// format of the agent its projection names.
 pub(crate) fn sniffed_session(
     permit: ParsePermit<'_>,
     path: &std::path::Path,
+    environment: &provider::RootEnvironment,
 ) -> Result<TranscriptEntries> {
-    format::sniffed_session_entries(permit, path)?
+    format::sniffed_session_entries(permit, path, environment)?
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
@@ -192,6 +191,13 @@ pub struct Conversation {
     /// The persisted content for a catalogue-only row. Parsed rows and
     /// synthetic conversations carry their content in the fields below.
     pub cached_session: Option<sqlite_cache::CachedSession>,
+    /// The address of this row's session in the session cache. The viewer,
+    /// the printout and the agent commands read the session through it.
+    /// `None` for a row neither a load nor a targeted read listed, such as a
+    /// file opened outside every root.
+    pub cache_address: Option<sqlite_cache::SessionAddress>,
+    /// The row's publication of its copy at `cache_address`.
+    pub publication: sqlite_cache::Publication,
     pub source: Source,
     pub session_id: String,
     /// The sub-agent transcripts merged into this row, spliced into its

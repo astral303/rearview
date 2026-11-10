@@ -140,6 +140,49 @@ pub(crate) mod test_hooks {
         Installed { id }
     }
 
+    /// Fail the first commit to the session cache database in `base` that
+    /// changes session data, calling `on_failure` then, until the result
+    /// drops.
+    pub(crate) fn fail_the_first_data_commit(
+        base: &Path,
+        on_failure: impl Fn() + Send + Sync + 'static,
+    ) -> Installed {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let has_failed = Arc::new(AtomicBool::new(false));
+        let on_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(on_failure);
+        on_every_connection(base, move |connection| {
+            if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+                return;
+            }
+            let changes_data = Arc::new(AtomicBool::new(false));
+            let changed = Arc::clone(&changes_data);
+            connection
+                .update_hook(Some(
+                    move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                        if table != "refresh_state" {
+                            changed.store(true, Ordering::SeqCst);
+                        }
+                    },
+                ))
+                .unwrap();
+            let rolled_back = Arc::clone(&changes_data);
+            connection
+                .rollback_hook(Some(move || rolled_back.store(false, Ordering::SeqCst)))
+                .unwrap();
+            let (has_failed, on_failure) = (Arc::clone(&has_failed), Arc::clone(&on_failure));
+            connection
+                .commit_hook(Some(move || {
+                    let fails = changes_data.swap(false, Ordering::SeqCst)
+                        && !has_failed.swap(true, Ordering::SeqCst);
+                    if fails {
+                        on_failure();
+                    }
+                    fails
+                }))
+                .unwrap();
+        })
+    }
+
     /// Holds every commit to the session cache database in a base until
     /// opened or dropped, as a long write batch holds a refresh: the writer
     /// waits inside its commit.
@@ -288,6 +331,9 @@ pub(crate) mod test_hooks {
             return key;
         }
         let directory = path.parent().unwrap_or(path);
+        // Test builds only, once per database path: no environment reaches
+        // a connection's installers.
+        #[allow(clippy::disallowed_methods)]
         let Ok(directory) = std::fs::canonicalize(directory) else {
             return path.to_path_buf();
         };

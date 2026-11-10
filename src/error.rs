@@ -114,8 +114,39 @@ pub enum AppError {
     #[error("Session cache entries need refreshing for {session}: {reason}")]
     SessionCacheNotReady { session: String, reason: String },
 
+    /// A file the session cache cannot store below its session's roots.
+    #[error("Session {}: its file {} {reason}", .session.display(), .file.display())]
+    SessionFileNotPlaced {
+        session: std::path::PathBuf,
+        file: std::path::PathBuf,
+        reason: &'static str,
+    },
+
+    /// A session root whose directory could not be canonicalised.
+    #[error(
+        "Session {}: its root {} could not be canonicalised",
+        .session.display(),
+        .root.display()
+    )]
+    SessionRootNotCanonicalised {
+        session: std::path::PathBuf,
+        root: std::path::PathBuf,
+    },
+
     #[error("Session cache source changed or cannot be validated: {}", .0.display())]
     SessionCacheSourceChanged(std::path::PathBuf),
+
+    /// A stored file of a session listed under `listing_root` lies below
+    /// `roots` row `root`, and none of this run's roots matches that row: a
+    /// directory beside the root can canonicalise to another path now.
+    #[error(
+        "Session cache source changed: a session under {listing_root} stores its file {file} below `roots` row {root}, and none of this run's roots matches that row"
+    )]
+    StoredRootUnknown {
+        listing_root: String,
+        root: i64,
+        file: String,
+    },
 
     /// A write to the session cache found less than the cache's floor free
     /// on its drive: the write stopped and the database was deleted.
@@ -144,6 +175,17 @@ fn gigabytes_down_to_a_tenth(bytes: u64) -> String {
 }
 
 impl AppError {
+    /// True when the session cache's copy of a session no longer matches
+    /// the session's files as this run reads them: a file changed, or a
+    /// stored file lies below a `roots` row that none of this run's roots
+    /// matches.
+    pub(crate) fn is_changed_source(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionCacheSourceChanged(_) | Self::StoredRootUnknown { .. }
+        )
+    }
+
     pub fn home_not_found() -> Self {
         Self::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,

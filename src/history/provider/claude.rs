@@ -7,11 +7,11 @@ use project_folder::{decode_project_dir_name_to_path, is_project_folder_of};
 
 use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
-    Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch, SessionProvider,
-    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
-    SourceLabels, Stored, SubagentFinder, ThreadLinker, TranscriptReader, resolved_session_paths,
-    walk,
+    Capability, Deleted, DiscoveredSessions, RecordedDirectory, RefNamespaces, ResolvedSession,
+    RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
+    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
+    SessionsDirLookup, SourceLabels, Stored, SubagentFinder, ThreadLinker, TranscriptReader,
+    resolved_session_paths, walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -104,8 +104,12 @@ impl SessionProvider for ClaudeProvider {
         Capability::Capable("CLAUDE_CODE_SESSION_ID")
     }
 
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, &ClaudeStorage, session_id)
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, &ClaudeStorage, environment, session_id)
     }
 
     fn session_id_in_locator(&self, locator: &Path) -> Option<String> {
@@ -114,7 +118,11 @@ impl SessionProvider for ClaudeProvider {
 
     /// Claude's references are filed under the project folder's name, not
     /// under the directory the session recorded.
-    fn ref_project(&self, path: &Path, _project_dir: Option<&Path>) -> Option<String> {
+    fn ref_project(
+        &self,
+        path: &Path,
+        _project_dir: Option<RecordedDirectory<'_>>,
+    ) -> Option<String> {
         project_folder_name(path).map(str::to_owned)
     }
 
@@ -288,7 +296,7 @@ impl SessionStorage for ClaudeStorage {
         &CLAUDE_TRANSCRIPT
     }
 
-    fn thread_linker(&self) -> &dyn ThreadLinker {
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
         &CLAUDE_TRANSCRIPT
     }
 }
@@ -863,6 +871,10 @@ pub(crate) mod tests {
     impl ProviderFixture for ClaudeFixture {
         fn provider(&self) -> &'static dyn SessionProvider {
             Source::Claude.provider()
+        }
+
+        fn canonicalises_recorded_directory(&self) -> bool {
+            false
         }
 
         fn ids(&self) -> FixtureIds {
@@ -1522,6 +1534,73 @@ pub(crate) mod tests {
         assert!(foreign.exists());
     }
 
+    /// `agent read` of two sessions by path refreshes both through one
+    /// targeted read: the command lists the projects root and canonicalises
+    /// it once for its keys and once for the refresh, not once for each
+    /// reference.
+    #[test]
+    fn agent_read_of_two_sessions_refreshes_both_in_one_targeted_read() {
+        use crate::agent::service::AgentService;
+        use crate::agent::test_support::agent_command;
+        use crate::history::provider::walk::test_support::{CountingCanonicaliser, ScriptedLister};
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let user = json!({
+            "type": "user", "timestamp": "2026-07-26T06:30:00.000Z",
+            "cwd": project.path(),
+            "message": {"role": "user", "content": "a question"}
+        });
+        let sessions = [
+            "3a000000-0000-4000-8000-000000000001",
+            "3a000000-0000-4000-8000-000000000002",
+        ]
+        .map(|session| write_session_in(root.path(), "-tmp-project", session, user.clone()));
+        let storage: &'static dyn SessionStorage =
+            Box::leak(Box::new(crate::history::provider::WatchedStorage {
+                inner: &ClaudeStorage,
+                roots: vec![SessionRoot::new(root.path())],
+                watch: Default::default(),
+            }));
+        let canonicaliser = std::sync::Arc::new(CountingCanonicaliser::default());
+        let lister = std::sync::Arc::new(ScriptedLister::default());
+        let environment = crate::history::Environment::new(
+            vec![storage],
+            cache.path().to_path_buf(),
+            crate::history::ProcessIdentity::default(),
+            std::sync::Arc::new(crate::clock::TestClock::default()),
+            lister.clone(),
+        )
+        .with_canonicaliser(canonicaliser.clone());
+        crate::history::environment::test_support::load_rows_in(&environment, storage);
+        let canonicalised_by_load = canonicaliser.canonicalised().len();
+        let listed_by_load = lister.times_listed(root.path());
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&[
+                "read",
+                &sessions[0].to_string_lossy(),
+                &sessions[1].to_string_lossy(),
+            ]))
+            .unwrap();
+
+        assert_eq!(
+            output.matches("an answer").count(),
+            2,
+            "the command reads both sessions: {output}"
+        );
+        assert_eq!(
+            canonicaliser.canonicalised()[canonicalised_by_load..],
+            [root.path().to_path_buf()],
+            "key discovery canonicalises the root once, and the refresh reads below it"
+        );
+        assert_eq!(
+            lister.times_listed(root.path()) - listed_by_load,
+            2,
+            "key discovery and the refresh each list the root once"
+        );
+    }
+
     /// A transcript written as `user`, in the project folder `project`.
     fn write_session_in(root: &Path, project: &str, session: &str, user: Value) -> PathBuf {
         let transcript = root.join(project).join(format!("{session}.jsonl"));
@@ -1650,8 +1729,16 @@ pub(crate) mod tests {
             PathBuf::from("/projects/-tmp-project/12345678-1234-4234-9234-123456789abc.jsonl");
         conversation.session_id = "12345678-1234-4234-9234-123456789abc".to_owned();
         conversation.project_path = Some(PathBuf::from("/somewhere/else"));
+        conversation.cache_address = Some(AgentConversationKey::address_for_test(
+            Source::Claude,
+            &conversation.path,
+        ));
 
-        let key = AgentConversationKey::from_conversation(&conversation).unwrap();
+        let key = AgentConversationKey::from_conversation(
+            &conversation,
+            &crate::history::path::CanonicalDirectories::of_system(),
+        )
+        .unwrap();
 
         assert_eq!(key.project_dir_name, "-tmp-project");
         assert_eq!(key.conversation_ref().canonical(), "ch_2eb29a5ff6fe");

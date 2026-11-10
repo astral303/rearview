@@ -177,14 +177,15 @@ fn scanned_sessions(
 
 /// The row id of the session `copy` reads.
 fn stored_session(connection: &Connection, copy: &CachedSession) -> Result<i64> {
-    if !super::is_storage_current(connection, copy.storage)? {
+    let address = copy.address();
+    if !super::is_storage_current(connection, address.storage)? {
         return Err(not_in_cache(copy));
     }
     let stored = entries::listed_session_of(
         connection,
-        copy.storage.directory,
-        &copy.root_key,
-        &copy.cache_key,
+        address.storage.directory,
+        address.roots.key(),
+        &address.cache_key,
     )?
     .ok_or_else(|| not_in_cache(copy))?;
     if stored.generation != copy.generation {
@@ -195,14 +196,14 @@ fn stored_session(connection: &Connection, copy: &CachedSession) -> Result<i64> 
 
 fn not_in_cache(copy: &CachedSession) -> AppError {
     AppError::SessionCacheNotReady {
-        session: copy.cache_key.clone(),
+        session: copy.address().cache_key.clone(),
         reason: "the session is not in the session cache".to_owned(),
     }
 }
 
 fn generation_changed(copy: &CachedSession) -> AppError {
     AppError::SessionCacheNotReady {
-        session: copy.cache_key.clone(),
+        session: copy.address().cache_key.clone(),
         reason: "catalogue generation changed".to_owned(),
     }
 }
@@ -1000,14 +1001,14 @@ mod tests {
                     assert!(
                         !from_scan.is_empty(),
                         "{:?}, window {window:?}: the scan finds texts",
-                        copy.source
+                        copy.address().source
                     );
                     assert_eq!(
                         read_by_range(copy, fields, &window),
                         from_scan,
                         "{:?}, window {window:?}: the range reads return the scan's texts, \
                          places and fields",
-                        copy.source
+                        copy.address().source
                     );
                 }
             }

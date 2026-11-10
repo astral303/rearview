@@ -1,9 +1,11 @@
 use super::session_store::FinishedRefresh;
 use super::{
-    App, AppMode, CountHighlight, DialogMode, Focus, OpenSessionStatus, ViewSearchMode, ViewState,
+    App, AppMode, CopyRow, CountHighlight, DialogMode, Focus, OpenSessionStatus, ViewSearchMode,
+    ViewState,
 };
 use crate::history::Conversation;
 use crate::history::provider::SessionRead;
+use crate::history::sqlite_cache::{NewerCopy, Publication, SessionAddress};
 use crate::tui::ui;
 use crate::tui::viewer::{
     CallArea, CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderOptions,
@@ -11,14 +13,17 @@ use crate::tui::viewer::{
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// The open session's row as its finished refresh read it, for the viewer's
 /// read of the session from the cache.
 pub(super) struct ReloadedSession {
-    subagents: Vec<PathBuf>,
+    publication: Publication,
     session_id: Option<String>,
+    /// The row's address in the cache; `None` for a file outside every
+    /// provider's session roots.
+    address: Option<SessionAddress>,
     /// The conversation a file outside every provider's session roots parsed
     /// into; `None` for a session the viewer reads from the cache.
     parsed: Option<Arc<ParsedConversation>>,
@@ -29,9 +34,31 @@ impl ReloadedSession {
     /// the background worker parsed it, its row naming `session_id`.
     pub(super) fn parsed(conversation: ParsedConversation, session_id: Option<String>) -> Self {
         Self {
-            subagents: Vec::new(),
+            publication: Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             session_id,
+            address: None,
             parsed: Some(Arc::new(conversation)),
+        }
+    }
+}
+
+impl ViewState {
+    /// Read the open session's copies against `publication`, its row's, and
+    /// show the row's header, or `newer`'s when the read found one.
+    fn show_copy_of_row(&mut self, publication: Publication, newer: Option<NewerCopy>) {
+        self.publication = publication;
+        self.copy_row = None;
+        self.adopt(newer);
+    }
+
+    /// Read the open session's copies against `newer`'s publication and
+    /// show its catalogue row as the header, when the read found one.
+    fn adopt(&mut self, newer: Option<NewerCopy>) {
+        if let Some(newer) = newer {
+            self.publication = newer.publication;
+            self.copy_row = newer.row.map(CopyRow);
         }
     }
 }
@@ -92,8 +119,9 @@ impl OpenSessionRead {
 
     fn listed(row: &Conversation) -> Self {
         Self::Listed(ReloadedSession {
-            subagents: row.subagents.clone(),
+            publication: row.publication.clone(),
             session_id: Some(row.session_id.clone()),
+            address: row.cache_address.clone(),
             parsed: None,
         })
     }
@@ -128,15 +156,21 @@ impl App {
         let path = self.conversations[conv_idx].path.clone();
         let source = self.conversations[conv_idx].source;
         let session_id = Some(self.conversations[conv_idx].session_id.clone());
-        let subagents = self.conversations[conv_idx].subagents.clone();
+        let publication = self.conversations[conv_idx].publication.clone();
+        let cache_address = self.conversations[conv_idx].cache_address.clone();
 
-        let read = parse_conversation_file_interactively(
-            &self.interactive_cache(),
-            source,
-            &path,
-            &subagents,
-        );
-        let copy = self.take_interactive(&path, read).current_or_older();
+        let (copy, newer) = match &cache_address {
+            Some(address) => {
+                let read = parse_conversation_file_interactively(
+                    &self.interactive_cache(),
+                    address,
+                    &publication,
+                );
+                self.take_interactive(&path, read)
+                    .current_or_older_with_newer()
+            }
+            None => (None, None),
+        };
         let is_copy_missing = copy.is_none();
         let conversation = Arc::new(copy.unwrap_or_else(ParsedConversation::empty));
         let options = RenderOptions {
@@ -155,11 +189,13 @@ impl App {
             message_index: 0,
             call_index: None,
         });
-        self.app_mode = AppMode::View(ViewState {
+        let mut state = ViewState {
             conversation_path: path,
             conversation_source: Some(source),
+            cache_address,
             session_id,
-            subagents,
+            publication,
+            copy_row: None,
             parsed_conversation: Some(conversation),
             scroll_offset: 0,
             rendered_lines: rendered.lines,
@@ -180,7 +216,9 @@ impl App {
             hovered_tool_output: None,
             count_highlight: None,
             is_copy_missing,
-        });
+        };
+        state.adopt(newer);
+        self.app_mode = AppMode::View(state);
     }
 
     /// Ask for the open session to be read again (`Ctrl+R`): through a
@@ -295,26 +333,29 @@ impl App {
         };
         let path = state.conversation_path.clone();
         let is_first_read_of_opened_file = self.single_file_mode && state.is_copy_missing;
-        let conversation = match (reloaded.parsed, state.conversation_source) {
-            (Some(conversation), _) => Some(conversation),
-            (None, Some(source)) => {
+        let (conversation, newer) = match (reloaded.parsed, &reloaded.address) {
+            (Some(conversation), _) => (Some(conversation), None),
+            (None, Some(address)) => {
                 let read = parse_conversation_file_interactively(
                     &self.interactive_cache(),
-                    source,
-                    &path,
-                    &reloaded.subagents,
+                    address,
+                    &reloaded.publication,
                 );
-                self.take_interactive(&path, read)
-                    .current_or_older()
-                    .map(Arc::new)
+                let (conversation, newer) = self
+                    .take_interactive(&path, read)
+                    .current_or_older_with_newer();
+                (conversation.map(Arc::new), newer)
             }
-            (None, None) => None,
+            (None, None) => (None, None),
         };
+        if let AppMode::View(state) = &mut self.app_mode {
+            state.cache_address = reloaded.address;
+        }
         if let Some(conversation) = conversation {
             if is_first_read_of_opened_file {
                 if let AppMode::View(state) = &mut self.app_mode {
                     state.parsed_conversation = Some(conversation);
-                    state.subagents = reloaded.subagents;
+                    state.show_copy_of_row(reloaded.publication, newer);
                     state.session_id = reloaded.session_id;
                 }
                 self.render_view(viewport_height, None, false);
@@ -322,7 +363,8 @@ impl App {
                 self.show_reread_conversation(
                     viewport_height,
                     conversation,
-                    reloaded.subagents,
+                    reloaded.publication,
+                    newer,
                     reloaded.session_id,
                 );
             }
@@ -520,12 +562,14 @@ impl App {
     /// otherwise the same message stays at the top. Expanded rows stay
     /// expanded where their entry is still there. A changed message count,
     /// counted as message navigation steps through them, sets the view's
-    /// `CountHighlight`.
+    /// `CountHighlight`. The header is `newer`'s, the read's newer copy, or
+    /// the row's, whose publication is `publication`.
     fn show_reread_conversation(
         &mut self,
         viewport_height: usize,
         conversation: Arc<crate::tui::viewer::ParsedConversation>,
-        subagents: Vec<std::path::PathBuf>,
+        publication: Publication,
+        newer: Option<NewerCopy>,
         session_id: Option<String>,
     ) {
         let AppMode::View(state) = &mut self.app_mode else {
@@ -545,7 +589,7 @@ impl App {
                 .collect();
         }
         state.hovered_tool_output = None;
-        state.subagents = subagents;
+        state.show_copy_of_row(publication, newer);
         state.session_id = session_id;
         state.parsed_conversation = Some(conversation);
         self.render_view(viewport_height, relocation.as_ref(), is_at_bottom);
@@ -603,20 +647,16 @@ impl App {
                 });
             let old_scroll = state.scroll_offset;
 
-            let conversation = match (state.parsed_conversation.clone(), state.conversation_source)
-            {
+            let conversation = match (state.parsed_conversation.clone(), &state.cache_address) {
                 (Some(conversation), _) => conversation,
-                (None, Some(source)) => {
-                    let read = parse_conversation_file_interactively(
-                        cache,
-                        source,
-                        &state.conversation_path,
-                        &state.subagents,
-                    );
-                    let copy = self
+                (None, Some(address)) => {
+                    let read =
+                        parse_conversation_file_interactively(cache, address, &state.publication);
+                    let (copy, newer) = self
                         .store
                         .take_interactive(&state.conversation_path, read, clock.now())
-                        .current_or_older();
+                        .current_or_older_with_newer();
+                    state.adopt(newer);
                     state.is_copy_missing = copy.is_none();
                     let conversation = Arc::new(copy.unwrap_or_else(ParsedConversation::empty));
                     state.parsed_conversation = Some(conversation.clone());

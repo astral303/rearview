@@ -92,8 +92,12 @@ impl SessionProvider for CodexProvider {
         Capability::Capable(self)
     }
 
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, &CodexStorage, session_id)
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, &CodexStorage, environment, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -560,7 +564,7 @@ impl SessionStorage for CodexStorage {
         &codex::CODEX_ROLLOUT
     }
 
-    fn thread_linker(&self) -> &dyn ThreadLinker {
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
         &codex::CODEX_ROLLOUT
     }
 
@@ -683,7 +687,19 @@ fn sessions_root_from(codex_home: Option<&str>, home: &Path) -> SessionRoot {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
-    SessionRoot::new(base.join("sessions")).in_agent_tree()
+    sessions_root_at(base.join("sessions"))
+}
+
+/// The sessions tree at `sessions`, with the archived tree beside it: a
+/// session's fork, continuation or sub-agent can be archived while the
+/// session is not.
+fn sessions_root_at(sessions: PathBuf) -> SessionRoot {
+    let archived = codex::archived_tree_beside(&sessions);
+    let root = SessionRoot::new(sessions).in_agent_tree();
+    match archived {
+        Some(archived) => root.with_directory_beside(archived),
+        None => root,
+    }
 }
 
 /// Codex resumes and forks by thread id, not by path. The id is in the
@@ -1838,7 +1854,531 @@ pub(super) mod tests {
     }
 
     fn sessions_root(home: &Path) -> SessionRoot {
-        SessionRoot::new(home.join("sessions")).in_agent_tree()
+        sessions_root_at(home.join("sessions"))
+    }
+
+    /// A session whose rollout before an edit Codex archived, as it did its
+    /// sub-agent's: the cache stores each file below its own root, the
+    /// restored row names each and the viewer reads them all, and a load
+    /// after the files are deleted deletes the session's rows.
+    #[test]
+    fn archived_rollouts_are_stored_below_archived_tree_and_read_with_session() {
+        use crate::history::environment::test_support::{
+            current_copy, load_rows, test_environment,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let written = codex::test_support::write_session_with_archived_bases(
+            home.path(),
+            THREAD,
+            SUBAGENT_THREAD,
+        );
+        let storage: &'static dyn SessionStorage =
+            Box::leak(Box::new(crate::history::provider::WatchedStorage {
+                inner: &CodexStorage,
+                roots: vec![sessions_root(home.path())],
+                watch: Default::default(),
+            }));
+        load_rows(storage, base.path());
+        let rows = load_rows(storage, base.path());
+
+        assert_eq!(rows.len(), 1, "the load lists the thread alone");
+        let row = &rows[0];
+        assert!(
+            row.cached_session.is_some(),
+            "the second load restores the session"
+        );
+        assert_eq!(
+            (&row.path, &row.subagents),
+            (&written.session, &vec![written.subagent.clone()]),
+            "the restored row names the newest rollouts"
+        );
+        let below = |tree: &str, path: &Path| {
+            let below = path.strip_prefix(home.path().join(tree)).unwrap();
+            let below = crate::history::path::with_platform_separators(below);
+            (tree.to_owned(), below.to_string_lossy().into_owned())
+        };
+        let mut expected = vec![
+            below("sessions", &written.session),
+            below("sessions", &written.subagent),
+            below("archived_sessions", &written.session_base),
+            below("archived_sessions", &written.subagent_base),
+        ];
+        expected.sort();
+        let files = stored_places(base.path(), "session_files");
+        assert_eq!(
+            files, expected,
+            "each file is stored below the tree holding it"
+        );
+        let read_from = stored_places(base.path(), "transcripts");
+        assert!(
+            read_from.contains(&below("archived_sessions", &written.session_base))
+                && read_from.iter().all(|place| files.contains(place)),
+            "the entries read from the archived rollout name it below the archived tree, as \
+             the session's files place it: {read_from:?}"
+        );
+        let cache = crate::history::InteractiveCache::at(
+            test_environment(Vec::new(), Some(base.path()))
+                .cache_base()
+                .clone(),
+        );
+        let viewed = current_copy(crate::history::display_log_entries_interactively(
+            &cache,
+            row.cache_address
+                .as_ref()
+                .expect("the load lists the row at its address"),
+            &row.publication,
+        ));
+        let viewed = format!("{:?}", viewed.entries);
+        assert!(
+            viewed.contains("alpha") && viewed.contains(&format!("{SUBAGENT_THREAD} first report")),
+            "the viewer reads the archived rollouts' turns: {viewed}"
+        );
+
+        for file in [
+            &written.session,
+            &written.session_base,
+            &written.subagent,
+            &written.subagent_base,
+        ] {
+            std::fs::remove_file(file).unwrap();
+        }
+        assert!(load_rows(storage, base.path()).is_empty());
+        assert_eq!(
+            (
+                stored_places(base.path(), "session_files"),
+                stored_places(base.path(), "transcripts"),
+            ),
+            (Vec::new(), Vec::new()),
+            "the cache deletes the files of both trees with the session"
+        );
+    }
+
+    /// The storage of Codex sessions under `home`'s sessions tree, with its
+    /// archived tree beside it.
+    fn storage_under(home: &Path) -> &'static dyn SessionStorage {
+        Box::leak(Box::new(crate::history::provider::WatchedStorage {
+            inner: &CodexStorage,
+            roots: vec![sessions_root(home)],
+            watch: Default::default(),
+        }))
+    }
+
+    /// The viewer's, agent `read`'s and the printout's text of `row`, a
+    /// row a load through `environment` listed.
+    fn texts_read(
+        environment: &crate::history::Environment,
+        row: &crate::history::Conversation,
+    ) -> [String; 3] {
+        use crate::history::environment::test_support::current_copy;
+        let address = row
+            .cache_address
+            .as_ref()
+            .expect("a listed row has its address");
+        let viewed = current_copy(crate::history::display_log_entries_interactively(
+            &crate::history::InteractiveCache::at(environment.cache_base().clone()),
+            address,
+            &row.publication,
+        ));
+        let read = crate::agent::transcript::AgentTranscript::load_cached_as_is(
+            environment.cache_base(),
+            address,
+            &row.path,
+        )
+        .unwrap()
+        .into_copy(&row.session_id)
+        .unwrap();
+        let printed = crate::history::printed_log_entries(
+            environment,
+            Source::Codex,
+            &row.path,
+            false,
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        [
+            format!("{:?}", viewed.entries),
+            format!("{:?}", read.messages),
+            format!("{:?}", printed.entries),
+        ]
+    }
+
+    /// A rearview that loaded Codex's sessions before Codex created its
+    /// archived tree reads a session whose earlier rollouts Codex archived
+    /// since, once a later load in the same process lists it: the viewer,
+    /// agent `read` and the printout read the archived rollouts' turns.
+    #[test]
+    fn session_archived_after_earlier_load_in_process_reads_its_archived_turns() {
+        use crate::history::environment::test_support::{load_rows_in, test_environment};
+        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        write_rollout(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
+        let storage = storage_under(home.path());
+        let environment = test_environment(vec![storage], Some(base.path()));
+        load_rows_in(&environment, storage);
+        assert!(!home.path().join("archived_sessions").exists());
+
+        let written = codex::test_support::write_session_with_archived_bases(
+            home.path(),
+            THREAD,
+            SUBAGENT_THREAD,
+        );
+        let rows = load_rows_in(&environment, storage);
+
+        let row = rows
+            .iter()
+            .find(|row| row.path == written.session)
+            .expect("the later load lists the session");
+        for text in texts_read(&environment, row) {
+            assert!(
+                text.contains("alpha") && text.contains(&format!("{SUBAGENT_THREAD} first report")),
+                "each read shows the archived rollouts' turns: {text}"
+            );
+        }
+    }
+
+    /// A session whose earlier rollouts Codex archived, opened by `agent read`,
+    /// the printout and the TUI's open of a named file, through its path as
+    /// typed and through its canonical path. The archived tree is a
+    /// directory beside the sessions root, canonicalised with it. `agent
+    /// read`'s refresh reads below the roots its key discovery canonicalised.
+    /// Each route starts from a cache its own load filled.
+    #[test]
+    fn session_with_archived_rollouts_opens_canonicalising_each_root_once_per_route() {
+        use crate::history::environment::test_support::{
+            agent_read_of, canonicalised_by_opening, direct_open_of, printout_of,
+        };
+        use crate::history::provider::walk::test_support::{
+            OpeningCanonicalisations, assert_canonicalised,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let written = codex::test_support::write_session_with_archived_bases(
+            home.path(),
+            THREAD,
+            SUBAGENT_THREAD,
+        );
+        let storage = storage_under(home.path());
+        let canonical_session = crate::history::provider::walk::SystemCanonicaliser::shared()
+            .canonicalise(&written.session)
+            .unwrap();
+        let canonical_directory = canonical_session.parent().unwrap().to_path_buf();
+        let spelled_alike = canonical_session == written.session;
+        let sessions = home.path().join("sessions");
+        let archived = home.path().join("archived_sessions");
+        let project = Path::new("/tmp/project");
+        let expected = OpeningCanonicalisations {
+            key_discovery: vec![
+                (sessions.as_path(), "key discovery: the sessions root"),
+                (
+                    archived.as_path(),
+                    "key discovery: the archived tree beside it",
+                ),
+                (
+                    project,
+                    "key discovery: the session's recorded project directory",
+                ),
+            ],
+            canonical_directory: (!spelled_alike).then_some((
+                canonical_directory.as_path(),
+                "the canonical path's directory, compared with each key's file because the \
+                 path doesn't match a key's text",
+            )),
+            canonicalised_again: Vec::new(),
+            record_placement: vec![
+                (
+                    sessions.as_path(),
+                    "the record placement: the sessions root",
+                ),
+                (
+                    archived.as_path(),
+                    "the record placement: the archived tree beside it",
+                ),
+            ],
+        };
+
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &agent_read_of(&written.session)),
+            &expected.agent_read(),
+        );
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &printout_of(Source::Codex, &written.session)),
+            &expected.printout(),
+        );
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &agent_read_of(&canonical_session)),
+            &expected.agent_read_by_canonical_path(),
+        );
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &printout_of(Source::Codex, &canonical_session)),
+            &expected.printout(),
+        );
+        let direct_open = [
+            (sessions.as_path(), "the TUI's open: the sessions root"),
+            (
+                archived.as_path(),
+                "the TUI's open: the archived tree beside it",
+            ),
+        ];
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &direct_open_of(&written.session)),
+            &direct_open,
+        );
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &direct_open_of(&canonical_session)),
+            &direct_open,
+        );
+    }
+
+    /// A row a load listed before Codex created its archived tree, read
+    /// after another rearview cached a copy whose earlier rollouts Codex
+    /// archived since: the viewer finds that copy missing at the row's
+    /// address and asks for a refresh, and the refreshed row's viewer,
+    /// agent `read` and printout read the archived turns.
+    #[test]
+    fn live_row_reads_copy_naming_archived_tree_created_after_its_load_once_refreshed() {
+        use crate::history::environment::test_support::{load_rows_in, test_environment};
+        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let written = codex::test_support::write_session_with_archived_bases(
+            home.path(),
+            THREAD,
+            SUBAGENT_THREAD,
+        );
+        let archived = home.path().join("archived_sessions");
+        let bases: Vec<(PathBuf, Vec<u8>)> = [&written.session_base, &written.subagent_base]
+            .into_iter()
+            .map(|base| (base.clone(), std::fs::read(base).unwrap()))
+            .collect();
+        std::fs::remove_dir_all(&archived).unwrap();
+        let storage = storage_under(home.path());
+        let environment = test_environment(vec![storage], Some(base.path()));
+        let row = load_rows_in(&environment, storage)
+            .into_iter()
+            .find(|row| row.path == written.session)
+            .expect("the load lists the session");
+        std::fs::create_dir_all(&archived).unwrap();
+        for (base, text) in &bases {
+            std::fs::write(base, text).unwrap();
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&written.session)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+        load_rows_in(&test_environment(vec![storage], Some(base.path())), storage);
+        let address = row.cache_address.as_ref().unwrap();
+
+        let viewed = crate::history::display_log_entries_interactively(
+            &crate::history::InteractiveCache::at(environment.cache_base().clone()),
+            address,
+            &row.publication,
+        );
+        let next = match viewed.into_read() {
+            crate::history::CachedRead::Missing { next } => next,
+            _ => panic!("the copy naming a root the row's address lacks reads as missing"),
+        };
+        assert_eq!(
+            next,
+            crate::history::sqlite_cache::NextStep::CacheInBackground,
+            "the viewer asks for a refresh of the session"
+        );
+        let refreshed = load_rows_in(&environment, storage)
+            .into_iter()
+            .find(|row| row.path == written.session)
+            .expect("the refresh lists the session");
+
+        for text in texts_read(&environment, &refreshed) {
+            assert!(
+                text.contains("alpha"),
+                "each read shows the archived rollouts' turns: {text}"
+            );
+        }
+    }
+
+    /// Codex archives a session's earlier rollouts after `agent read` has
+    /// listed the sessions by path and before the command refreshes the
+    /// changed session: the command reads the archived rollouts' turns
+    /// through the refreshed row's address, not the one the first listing
+    /// gave the target.
+    #[test]
+    fn agent_read_of_session_archived_between_key_discovery_and_refresh_shows_archived_turns() {
+        use crate::agent::service::AgentService;
+        use crate::agent::test_support::agent_command;
+        use crate::history::provider::walk::test_support::ScriptedLister;
+        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let written = codex::test_support::write_session_with_archived_bases(
+            home.path(),
+            THREAD,
+            SUBAGENT_THREAD,
+        );
+        let archived = home.path().join("archived_sessions");
+        let bases: Vec<(PathBuf, Vec<u8>)> = [&written.session_base, &written.subagent_base]
+            .into_iter()
+            .map(|base| (base.clone(), std::fs::read(base).unwrap()))
+            .collect();
+        std::fs::remove_dir_all(&archived).unwrap();
+        let storage = storage_under(home.path());
+        let lister = std::sync::Arc::new(ScriptedLister::default());
+        let environment = crate::history::Environment::new(
+            vec![storage],
+            base.path().to_path_buf(),
+            crate::history::ProcessIdentity::default(),
+            std::sync::Arc::new(TestClock::default()),
+            lister.clone(),
+        );
+        AgentService::new(environment.clone())
+            .execute(agent_command(&["sessions", "--all"]))
+            .unwrap();
+        let session: PathBuf = written.session.components().collect();
+        std::fs::File::options()
+            .write(true)
+            .open(&session)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+        let sessions_tree = home.path().join("sessions");
+        let key_discovery = lister.times_listed(&sessions_tree) + 1;
+        lister.run_before_listing(&sessions_tree, key_discovery + 1, move || {
+            std::fs::create_dir_all(&archived).unwrap();
+            for (base, text) in &bases {
+                std::fs::write(base, text).unwrap();
+            }
+        });
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&["read", &session.to_string_lossy()]))
+            .unwrap();
+
+        assert!(
+            output.contains("alpha"),
+            "the command reads the archived rollouts' turns: {output}"
+        );
+    }
+
+    /// A sessions tree reached through a link, beside an archived tree that
+    /// is not: the printout of the canonical path of a session whose earlier
+    /// rollouts Codex archived reads their turns through the archived tree
+    /// beside the link, as discovery through the link places it.
+    #[test]
+    fn canonical_path_through_linked_sessions_tree_prints_archived_turns() {
+        use crate::history::environment::test_support::{load_rows_in, test_environment};
+        let home = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let sessions = elsewhere.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        crate::history::provider::walk::test_support::link_directory(
+            &sessions,
+            &home.path().join("sessions"),
+        );
+        let written = codex::test_support::write_session_with_archived_bases(
+            home.path(),
+            THREAD,
+            SUBAGENT_THREAD,
+        );
+        let storage = storage_under(home.path());
+        let environment = test_environment(vec![storage], Some(base.path()));
+        load_rows_in(&environment, storage);
+        let canonical = crate::history::provider::walk::SystemCanonicaliser::shared()
+            .canonicalise(&written.session)
+            .unwrap();
+        assert!(
+            canonical.starts_with(
+                crate::history::provider::walk::SystemCanonicaliser::shared()
+                    .canonicalise(&sessions)
+                    .unwrap()
+            ),
+            "the canonical path lies below the link's target"
+        );
+
+        let printed = crate::history::printed_log_entries(
+            &environment,
+            Source::Codex,
+            &canonical,
+            false,
+            &mut std::io::sink(),
+        )
+        .unwrap();
+
+        let printed = format!("{:?}", printed.entries);
+        assert!(
+            printed.contains("alpha")
+                && printed.contains(&format!("{SUBAGENT_THREAD} first report")),
+            "the printout shows the archived rollouts' turns: {printed}"
+        );
+    }
+
+    /// A session without archived rollouts, written while the archived tree
+    /// is missing: the cache keeps a `roots` row for the sessions tree
+    /// alone, and doesn't keep one for the directory that didn't
+    /// canonicalise.
+    #[test]
+    fn missing_archived_tree_doesnt_get_root_row() {
+        use crate::history::environment::test_support::load_rows;
+        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        codex::test_support::write_edited_thread_with_subagents(home.path(), THREAD);
+        let storage: &'static dyn SessionStorage =
+            Box::leak(Box::new(crate::history::provider::WatchedStorage {
+                inner: &CodexStorage,
+                roots: vec![sessions_root(home.path())],
+                watch: Default::default(),
+            }));
+        assert!(!home.path().join("archived_sessions").exists());
+
+        load_rows(storage, base.path());
+
+        let database = base
+            .path()
+            .join(crate::history::sqlite_cache::DATABASE_FILE_NAME);
+        let roots: Vec<String> = rusqlite::Connection::open(database)
+            .unwrap()
+            .prepare("SELECT key FROM roots")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let trees: Vec<String> = roots
+            .iter()
+            .map(|key| {
+                Path::new(key)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            trees,
+            ["sessions"],
+            "the cache keeps a row for the sessions tree alone: {roots:?}"
+        );
+    }
+
+    /// Each path `table` of the session cache under `base` stores, as the
+    /// name of its root's directory and the path below it, sorted.
+    fn stored_places(base: &Path, table: &str) -> Vec<(String, String)> {
+        let database = base.join(crate::history::sqlite_cache::DATABASE_FILE_NAME);
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT r.key, t.path FROM {table} t JOIN roots r ON r.id = t.root"
+            ))
+            .unwrap();
+        let mut places: Vec<(String, String)> = statement
+            .query_map([], |row| {
+                let root: String = row.get(0)?;
+                let tree = Path::new(&root).file_name().unwrap().to_string_lossy();
+                Ok((tree.into_owned(), row.get(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        places.sort();
+        places
     }
 
     fn resolved_stub(home: &Path, thread_id: &str) -> Option<SessionStub> {

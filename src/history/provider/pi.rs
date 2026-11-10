@@ -83,8 +83,12 @@ impl SessionProvider for PiProvider {
     /// The id is in the header, so finding a session means reading the header
     /// of every log under the root — affordable once, not per keystroke. Two
     /// logs in one project may state the same id, so more than one can match.
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        sessions_pi_owns_with_id(&pi_loader::session_root()?, session_id)
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        sessions_pi_owns_with_id(&pi_loader::session_root_in(environment)?, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -225,7 +229,11 @@ pub(super) mod tests {
         AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
         fixture_with_lines,
     };
+    use crate::history::provider::walk::test_support::{
+        CountingCanonicaliser, assert_canonicalised,
+    };
     use std::ffi::OsString;
+    use std::sync::Arc;
 
     /// The working directory `tests/fixtures/pi/v1.jsonl` is recorded in.
     const PROJECT: &str = "/tmp/pi-v1";
@@ -431,6 +439,24 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn find_by_id_searches_the_root_the_callers_environment_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, untitled) = pi_log::test_support::write_titled_and_untitled(directory.path());
+        let sessions = directory.path().as_os_str().to_owned();
+        let variable = move |name: &str| {
+            (name == crate::history::pi_loader::SESSION_DIR_VARIABLE).then(|| sessions.clone())
+        };
+        let home = tempfile::tempdir().unwrap();
+        let environment = RootEnvironment::new(&variable, Some(home.path().to_path_buf()), None);
+
+        let found = PiProvider
+            .find_sessions_by_id(&environment, "omp_session_custom_id")
+            .unwrap();
+
+        assert_eq!(found, vec![untitled]);
+    }
+
+    #[test]
     fn log_under_pis_root_is_stored_and_its_copy_elsewhere_is_not() {
         let directory = tempfile::tempdir().unwrap();
         let (_, untitled) = pi_log::test_support::write_titled_and_untitled(directory.path());
@@ -448,7 +474,20 @@ pub(super) mod tests {
             .path()
             .join(".")
             .join(untitled.file_name().unwrap());
-        assert!(super::super::contains_file(&stored, &respelled));
-        assert!(!super::super::contains_file(&stored, &copy));
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let directories = crate::history::path::CanonicalDirectories::new(canonicaliser.clone());
+        assert!(super::super::contains_file(
+            &stored,
+            &respelled,
+            &directories
+        ));
+        assert!(!super::super::contains_file(&stored, &copy, &directories));
+        assert_canonicalised(
+            &canonicaliser.canonicalised(),
+            &[
+                (directory.path(), "the respelled log's directory"),
+                (elsewhere.path(), "the copy's directory"),
+            ],
+        );
     }
 }

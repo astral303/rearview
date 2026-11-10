@@ -41,14 +41,15 @@ impl CachedSession {
         window: &crate::time_filter::TimeFilter,
         mut visit: impl FnMut(SearchPart),
     ) -> Result<Option<()>> {
-        self.read(|connection, session| {
-            // The copy spells its sub-agents and its entries' transcripts alike.
+        self.read(|connection, session, places| {
+            // The copy's places spell its sub-agents and its entries'
+            // transcripts alike.
             let subagents: HashSet<&Path> = row.subagents.iter().map(PathBuf::as_path).collect();
             let mut after = -1;
             let mut summary = None;
             let mut title = None;
             loop {
-                let batch = entries::read_search_batch(connection, session, after, window)?;
+                let batch = entries::read_search_batch(connection, session, places, after, window)?;
                 let Some(last) = batch.last_sequence else {
                     break;
                 };

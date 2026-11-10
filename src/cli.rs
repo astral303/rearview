@@ -548,6 +548,7 @@ pub struct Args {
     #[arg(
         long,
         value_name = "FILE",
+        value_parser = platform_path(),
         help = "Render a JSONL file in ledger format and exit"
     )]
     pub render: Option<PathBuf>,
@@ -619,10 +620,16 @@ pub struct Args {
     /// Input JSONL file to view directly (skips conversation selection)
     #[arg(
         value_name = "FILE",
+        value_parser = platform_path(),
         help = "JSONL conversation file to view directly",
         conflicts_with_all = ["global", "local"]
     )]
     pub input_file: Option<PathBuf>,
+}
+
+/// A path argument, spelled with the platform's separator.
+fn platform_path() -> impl TypedValueParser<Value = PathBuf> {
+    clap::builder::OsStringValueParser::new().map(crate::history::path::with_platform_separators)
 }
 
 /// An agent `--show-dir` accepts: one declaring `workspace_sessions_dir`

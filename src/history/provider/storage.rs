@@ -187,12 +187,7 @@ pub trait SessionStorage: Sync {
     fn cache(&self) -> SessionCache;
 
     /// Every root this provider stores sessions under, in the order they
-    /// should be searched.
-    fn roots(&self) -> Result<Vec<SessionRoot>> {
-        self.roots_in(&RootEnvironment::of_process())
-    }
-
-    /// [`roots`](Self::roots) as resolved from `environment`. Read only the
+    /// should be searched, as resolved from `environment`. Read only the
     /// variables the provider's
     /// [`storage_env_vars`](super::SessionProvider::storage_env_vars) lists.
     fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>>;
@@ -291,7 +286,7 @@ pub trait SessionStorage: Sync {
 
     /// The linker of this provider's sub-agent threads, which a resumed
     /// read relinks them through. The default links nothing.
-    fn thread_linker(&self) -> &dyn ThreadLinker {
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
         &NoLinks
     }
 }
@@ -365,7 +360,7 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         self.inner.transcript_reader()
     }
 
-    fn thread_linker(&self) -> &dyn ThreadLinker {
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
         self.inner.thread_linker()
     }
 }
@@ -440,7 +435,7 @@ impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
         self.inner.transcript_reader()
     }
 
-    fn thread_linker(&self) -> &dyn ThreadLinker {
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
         self.inner.thread_linker()
     }
 }
@@ -516,7 +511,7 @@ impl SessionStorage for WatchedStorage {
         self.inner.transcript_reader()
     }
 
-    fn thread_linker(&self) -> &dyn ThreadLinker {
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
         self.inner.thread_linker()
     }
 }
@@ -702,7 +697,7 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
         (**self).transcript_reader()
     }
 
-    fn thread_linker(&self) -> &dyn ThreadLinker {
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
         (**self).thread_linker()
     }
 }

@@ -24,6 +24,8 @@
 //! REARVIEW_WRITE_OUTPUT_CONTRACT=1 cargo test --lib output_contract
 //! ```
 
+#![allow(clippy::disallowed_methods)]
+
 use crate::agent::test_support::atom;
 use crate::clock::{TestClock, Zone};
 use crate::history::provider::contract_tests::{AgentSession, registered_fixtures};

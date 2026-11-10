@@ -288,6 +288,14 @@ impl ThreadLinker for CodexRolloutFormat {
             fold_delivered_final_answers(&mut thread.entries, &reports_by_thread[index]);
         }
     }
+
+    fn with_transcripts_renamed(
+        &self,
+        ledger: &[u8],
+        rename: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<Vec<u8>> {
+        LinkLedger::with_transcripts_renamed(ledger, rename)
+    }
 }
 
 /// Where a ledger item came from: its transcript, `None` for the session's
@@ -334,6 +342,31 @@ impl LinkLedger {
 
     fn encode(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("a link ledger serializes")
+    }
+
+    /// The encoded ledger `bytes` with each transcript it names renamed by
+    /// `rename`; `None` when it does not decode, or `rename` cannot rename
+    /// one of its transcripts. An empty ledger stays empty.
+    fn with_transcripts_renamed(
+        bytes: &[u8],
+        rename: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<Vec<u8>> {
+        if bytes.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut ledger: Self = serde_json::from_slice(bytes).ok()?;
+        let places = ledger
+            .calls
+            .iter_mut()
+            .map(|(place, ..)| place)
+            .chain(ledger.results.iter_mut().map(|(place, ..)| place))
+            .chain(ledger.reports.iter_mut().map(|(place, ..)| place));
+        for place in places {
+            if let Some(transcript) = &mut place.transcript {
+                *transcript = rename(transcript)?;
+            }
+        }
+        Some(ledger.encode())
     }
 
     /// Add the calls, results and reports of `entries`, read from
@@ -1461,7 +1494,7 @@ impl ReplacedRollouts {
 /// `sessions` tree.
 const ARCHIVED_SESSIONS_DIRECTORY: &str = "archived_sessions";
 
-fn archived_tree_beside(sessions_tree: &Path) -> Option<PathBuf> {
+pub(crate) fn archived_tree_beside(sessions_tree: &Path) -> Option<PathBuf> {
     sessions_tree
         .parent()
         .map(|home| home.join(ARCHIVED_SESSIONS_DIRECTORY))
@@ -2601,6 +2634,82 @@ pub(crate) mod test_support {
                 Some("/root/outside"),
                 "2026-10-12T10:02:30.000Z",
             ),
+        }
+    }
+
+    /// A thread edited once, and its sub-agent, edited once: each newest
+    /// rollout in the sessions tree, each rollout before the edit archived.
+    pub(crate) struct ArchivedBases {
+        pub(crate) session: PathBuf,
+        pub(crate) session_base: PathBuf,
+        pub(crate) subagent: PathBuf,
+        pub(crate) subagent_base: PathBuf,
+    }
+
+    /// Writes [`ArchivedBases`] of `thread_id` and `subagent_id` under
+    /// `home`. The session's base asks `alpha`, its edit `echo`; the
+    /// sub-agent's base answers `<subagent_id> first report`, its edit
+    /// `<subagent_id> report`.
+    pub(crate) fn write_session_with_archived_bases(
+        home: &Path,
+        thread_id: &str,
+        subagent_id: &str,
+    ) -> ArchivedBases {
+        let continuing = |thread_id: &str, text: &str| json!({"thread_id": thread_id, "end_byte_offset": text.len()});
+        let session_base_text = header_line(thread_id, json!({}))
+            + &message_line("user", "alpha")
+            + &spawn_lines("call_kept", json!({"task_name": "/root/kept"}));
+        let session_base =
+            write_rollout_text(home, "2026-10-12T10-00-00", thread_id, &session_base_text);
+        let session = write_rollout_text(
+            home,
+            "2026-10-12T10-02-00",
+            &format!("{thread_id}_{FIRST_EDIT}"),
+            &(header_line(
+                thread_id,
+                json!({
+                    "timestamp": "2026-10-12T10:02:00.000Z",
+                    "history_base": continuing(thread_id, &session_base_text),
+                }),
+            ) + &message_line("user", "echo")),
+        );
+        let subagent_fields = |started: &str| {
+            json!({
+                "timestamp": started,
+                "parent_thread_id": thread_id,
+                "agent_path": "/root/kept",
+            })
+        };
+        let subagent_base_text =
+            header_line(subagent_id, subagent_fields("2026-10-12T10:00:30.000Z"))
+                + &message_line("assistant", &format!("{subagent_id} first report"));
+        let subagent_base = write_rollout_text(
+            home,
+            "2026-10-12T10-01-00",
+            subagent_id,
+            &subagent_base_text,
+        );
+        let mut edit_fields = subagent_fields("2026-10-12T10:03:00.000Z");
+        edit_fields["history_base"] = continuing(subagent_id, &subagent_base_text);
+        let subagent = write_rollout_text(
+            home,
+            "2026-10-12T10-03-00",
+            &format!("{subagent_id}_{SECOND_EDIT}"),
+            &(header_line(subagent_id, edit_fields)
+                + &message_line("assistant", &format!("{subagent_id} report"))),
+        );
+        let archived = home.join(super::ARCHIVED_SESSIONS_DIRECTORY);
+        std::fs::create_dir_all(&archived).unwrap();
+        let archive = |rollout: PathBuf| {
+            let moved = archived.join(rollout.file_name().unwrap());
+            std::fs::rename(&rollout, &moved).unwrap();
+            moved
+        };
+        ArchivedBases {
+            session,
+            session_base: archive(session_base),
+            subagent,
+            subagent_base: archive(subagent_base),
         }
     }
 

@@ -9,7 +9,7 @@ use crate::history::{DisplayEntries, EntryOrigin};
 use crate::log_entry::LogEntry;
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::tui::theme::{self, Theme};
 
@@ -298,27 +298,27 @@ pub fn day_at_line(
     })
 }
 
-/// A conversation the list already attributed to a source, read through
-/// `cache`'s interactive read, as the TUI's drawing thread reads it: only
-/// that provider's format reads the file, and the row's sub-agent
-/// transcripts splice in.
+/// The conversation the cache keeps at `address`, its newest copy read
+/// through `cache`'s interactive read, as the TUI's drawing thread reads it,
+/// for a row whose publication is `publication`.
 pub fn parse_conversation_file_interactively(
     cache: &crate::history::InteractiveCache,
-    source: crate::history::Source,
-    file_path: &Path,
-    subagents: &[PathBuf],
+    address: &crate::history::sqlite_cache::SessionAddress,
+    publication: &crate::history::sqlite_cache::Publication,
 ) -> crate::history::InteractiveRead<ParsedConversation> {
-    crate::history::display_log_entries_interactively(cache, source, file_path, subagents)
+    crate::history::display_log_entries_interactively(cache, address, publication)
         .map(parsed_conversation)
 }
 
-/// A bare file the user handed us (`--render`, a direct path argument), read
-/// by whichever registered format recognizes it.
+/// A bare file the user names (`--render`, a direct path argument), read by
+/// whichever registered format recognises it. The agent's roots come from
+/// `environment`, which canonicalises its directory and a stored copy's.
 pub fn parse_unattributed_conversation_file(
     permit: crate::history::ParsePermit<'_>,
     file_path: &Path,
+    environment: &crate::history::provider::RootEnvironment,
 ) -> std::io::Result<ParsedConversation> {
-    let displayed = crate::history::sniffed_display_log_entries(permit, file_path)
+    let displayed = crate::history::sniffed_display_log_entries(permit, file_path, environment)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(parsed_conversation(displayed))
 }

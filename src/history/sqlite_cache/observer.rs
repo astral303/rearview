@@ -138,7 +138,8 @@ fn observe_waiting(base: &CacheBase, lock_wait: Duration) -> Result<Observation>
     })();
     match observed {
         Err(AppError::SessionCache(error)) if is_busy(&error) => {
-            let is_rebuilding_here = std::fs::canonicalize(base.path())
+            let is_rebuilding_here = base
+                .canonical_path()
                 .is_ok_and(|canonical| base.process().is_rebuilding(&canonical));
             Ok(if is_rebuilding_here {
                 Observation::RebuildingHere

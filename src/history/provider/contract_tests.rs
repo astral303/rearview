@@ -19,7 +19,9 @@
 //! each provider's [`ProviderFixture::every_record_session`] through
 //! [`every_record_sessions`]. It fails for a provider without a fixture.
 
-use super::walk::test_support::ScriptedLister;
+use super::walk::test_support::{
+    CountingCanonicaliser, OpeningCanonicalisations, ScriptedLister, assert_canonicalised,
+};
 use super::walk::{DirectoryLister, SystemLister};
 use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
@@ -31,6 +33,7 @@ use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
 use crate::history::environment::test_support::waiting_operation;
 use crate::history::load_meter::AgentMeter;
+use crate::history::path::with_platform_separators;
 use crate::history::sqlite_cache::SqliteCache;
 use crate::history::{Conversation, Environment, NextStep, ProcessIdentity, Source};
 use runner::run_contract;
@@ -237,6 +240,13 @@ impl AgentSession {
         subagents: Vec<PathBuf>,
         markers: Vec<Marker>,
     ) -> Self {
+        // Spelled as a path entering rearview is: fixtures join their
+        // directories with `/`.
+        let path = with_platform_separators(path);
+        let subagents: Vec<PathBuf> = subagents
+            .into_iter()
+            .map(with_platform_separators)
+            .collect();
         Self {
             row: list_row(source, &path, &subagents),
             markers,
@@ -460,6 +470,13 @@ pub(crate) trait ProviderFixture: Sync {
     /// `locator`, launched with [`CONFIGURED_ARGUMENT`].
     fn expected_fork(&self, _locator: &Path) -> ExpectedCommand {
         self.cannot_run("state its fork command")
+    }
+
+    /// True when building a session reference canonicalises the directory
+    /// the session recorded. Claude's references name the project folder
+    /// instead.
+    fn canonicalises_recorded_directory(&self) -> bool {
+        true
     }
 
     /// A working directory. [`write_session`](Self::write_session) writes
@@ -770,6 +787,21 @@ pub(crate) fn kept_storage_under(
 ) -> &'static dyn SessionStorage {
     let home: &'static Path = Box::leak(home.to_path_buf().into_boxed_path());
     Box::leak(Box::new(FixtureStorage { fixture, home }))
+}
+
+/// The provider's root under `home`, then each directory beside it.
+fn root_with_directories_beside(
+    fixture: &'static dyn ProviderFixture,
+    home: &Path,
+) -> Vec<PathBuf> {
+    let root = fixture.root_under(home);
+    std::iter::once(root.path.clone())
+        .chain(
+            root.directories_beside()
+                .iter()
+                .map(|beside| beside.path.clone()),
+        )
+        .collect()
 }
 
 fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1258,7 +1290,13 @@ fn query_without_id_shape_resolves_to_nothing() {
         let resolver = fixture.session_id_resolver();
         assert!(!resolver.is_session_id_shape("deployment"));
         assert_eq!(
-            super::resolve_in_storage(resolver, fixture.storage(), "deployment").unwrap(),
+            super::resolve_in_storage(
+                resolver,
+                fixture.storage(),
+                &RootEnvironment::of_process(),
+                "deployment"
+            )
+            .unwrap(),
             None
         );
     });
@@ -1451,6 +1489,40 @@ fn listed_environment_variables_decide_every_root() {
     });
 }
 
+/// The home directory and every listed variable given with forward slashes
+/// name the roots they name with the platform's separator.
+#[test]
+fn forward_slashes_in_variables_name_roots_with_platform_separator() {
+    run_contract(Contract::StorageEnvVars, |fixture| {
+        let provider = fixture.provider();
+        let listed: BTreeSet<&str> = provider.storage_env_vars().iter().copied().collect();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let redirected = directory.path().join("redirected");
+        let roots_spelled = |spell: &dyn Fn(&Path) -> PathBuf| {
+            let variable = |name: &str| {
+                listed
+                    .contains(name)
+                    .then(|| spell(&redirected.join(name)).into_os_string())
+            };
+            let environment = RootEnvironment::new(&variable, Some(spell(&home)), None);
+            provider
+                .storage()
+                .roots_in(&environment)
+                .unwrap()
+                .into_iter()
+                .map(|root| root.path.into_os_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            roots_spelled(&with_forward_slashes),
+            roots_spelled(&Path::to_path_buf),
+            "directories named with forward slashes name the roots the platform's spelling names"
+        );
+    });
+}
+
 /// The agent's directory named another way, as a user who sets the agent's
 /// variable in two shells names it, keys the sessions the first name cached:
 /// the load restores each of them, parses none, and the cache keeps one copy
@@ -1486,15 +1558,468 @@ fn other_spelling_of_root_restores_sessions_first_spelling_cached() {
     });
 }
 
+/// Two storages reaching one directory through two spellings list each
+/// session once, under the first. The first load canonicalises the cache
+/// directory, each storage's root with the directories beside it, and the
+/// directory the sessions recorded; a later load, which restores the cache the
+/// first one filled, canonicalises the roots alone. No load canonicalises a
+/// session's file or its directory.
+#[test]
+fn session_reached_through_two_spellings_of_root_lists_once() {
+    run_contract(Contract::RootSpelling, |fixture| {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let ids = fixture.ids();
+        let first = fixture.write_session(&home, ids.session);
+        fixture.write_session(&home, ids.other);
+
+        for (load, spelling) in other_spellings(directory.path(), &home)
+            .into_iter()
+            .enumerate()
+        {
+            let canonicaliser = Arc::new(CountingCanonicaliser::default());
+            let environment = Environment::new(
+                vec![
+                    kept_storage_under(fixture, &home),
+                    kept_storage_under(fixture, &spelling),
+                ],
+                cache.path().to_path_buf(),
+                ProcessIdentity::default(),
+                Arc::new(TestClock::default()),
+                Arc::new(SystemLister),
+            )
+            .with_canonicaliser(canonicaliser.clone());
+
+            let rows = crate::history::load_all_conversations(&environment, false, None).unwrap();
+
+            assert_eq!(
+                rows.len(),
+                2,
+                "each session lists once through {}",
+                spelling.display()
+            );
+            assert!(
+                rows.iter().any(|row| row.path == first),
+                "the first storage keeps its row through {}",
+                spelling.display()
+            );
+            let first_load = load == 0;
+            let first_root = root_with_directories_beside(fixture, &home);
+            let second_root = root_with_directories_beside(fixture, &spelling);
+            let recorded_directory = rows
+                .iter()
+                .find_map(|row| row.cwd.clone())
+                .filter(|_| first_load && fixture.canonicalises_recorded_directory());
+            let expected: Vec<(&Path, &str)> = first_load
+                .then_some((cache.path(), "the first load: the cache directory"))
+                .into_iter()
+                .chain(first_root.iter().map(|path| {
+                    (
+                        path.as_path(),
+                        "the first storage's root and directories beside it",
+                    )
+                }))
+                .chain(recorded_directory.iter().map(|path| {
+                    (
+                        path.as_path(),
+                        "the first load: the directory the sessions recorded",
+                    )
+                }))
+                .chain(second_root.iter().map(|path| {
+                    (
+                        path.as_path(),
+                        "the second storage's root and directories beside it",
+                    )
+                }))
+                .collect();
+            assert_canonicalised(&canonicaliser.canonicalised(), &expected);
+        }
+    });
+}
+
+/// The viewer and agent `read` read a listed row's copy at its address:
+/// once the load lists the row, neither canonicalises a path. Each agent's
+/// fixture writes the session's files below the root itself.
+#[test]
+fn reads_of_listed_row_dont_canonicalise_a_path() {
+    run_contract(Contract::RootSpelling, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+        let canonicaliser = Arc::new(
+            crate::history::provider::walk::test_support::CountingCanonicaliser::default(),
+        );
+        let environment = fixture_environment(fixture, home.path(), cache.path())
+            .with_canonicaliser(canonicaliser.clone());
+        let rows = rows_loaded_through(&environment);
+        let canonicalised_by_load = canonicaliser.canonicalised().len();
+
+        for row in &rows {
+            let address = row
+                .cache_address
+                .as_ref()
+                .expect("a listed row has its address");
+            let viewed = crate::history::display_log_entries_interactively(
+                &crate::history::InteractiveCache::at(environment.cache_base().clone()),
+                address,
+                &row.publication,
+            );
+            assert!(
+                matches!(viewed.into_read(), crate::history::CachedRead::Current(_)),
+                "the viewer reads the row's copy"
+            );
+            let read = crate::agent::transcript::AgentTranscript::load_cached_as_is(
+                environment.cache_base(),
+                address,
+                &row.path,
+            )
+            .unwrap();
+            assert!(
+                matches!(read, crate::agent::transcript::CachedTranscript::Copy(_)),
+                "agent `read` reads the row's copy"
+            );
+        }
+        assert!(!rows.is_empty(), "the load lists the session");
+        assert_eq!(
+            canonicaliser.canonicalised()[canonicalised_by_load..],
+            [] as [PathBuf; 0],
+            "the reads don't canonicalise a path"
+        );
+    });
+}
+
+/// `agent read` and the printout of a session by its path, from a cache its
+/// own load filled, canonicalise each root once: `agent read`'s refresh
+/// reads below the roots its key discovery canonicalised. Each agent's
+/// fixture has one root. Kimi's legacy second root and Codex's archived
+/// rollouts have tests of their own in those agents' modules.
+#[test]
+fn reads_of_session_by_path_canonicalise_each_root_once_per_route() {
+    use crate::history::environment::test_support::{
+        agent_read_of, canonicalised_by_opening, printout_of,
+    };
+    run_contract(Contract::RootSpelling, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+        let environment = fixture_environment(fixture, home.path(), cache.path());
+        let rows = rows_loaded_through(&environment);
+        let row = rows.first().expect("the load lists the session");
+        if !row.path.is_file() {
+            // A session an agent keeps in a database is read by its id, not its path.
+            return;
+        }
+        let canonical = crate::history::provider::walk::SystemCanonicaliser::shared()
+            .canonicalise(&row.path)
+            .unwrap();
+        let canonical_directory = canonical.parent().unwrap().to_path_buf();
+        let spelled_alike = canonical == row.path;
+        let storage = kept_storage_under(fixture, home.path());
+        let roots = root_with_directories_beside(fixture, home.path());
+        let recorded_directory = row
+            .cwd
+            .clone()
+            .filter(|_| fixture.canonicalises_recorded_directory());
+        let expected = OpeningCanonicalisations {
+            key_discovery: roots
+                .iter()
+                .map(|path| {
+                    (
+                        path.as_path(),
+                        "key discovery: the root and directories beside it",
+                    )
+                })
+                .chain(recorded_directory.iter().map(|path| {
+                    (
+                        path.as_path(),
+                        "key discovery: the directory the session recorded",
+                    )
+                }))
+                .collect(),
+            canonical_directory: (!spelled_alike).then_some((
+                canonical_directory.as_path(),
+                "the canonical path's directory, compared with each key's file because the \
+                 path doesn't match a key's text",
+            )),
+            canonicalised_again: roots
+                .iter()
+                .filter(|path| !path.exists())
+                .map(|path| {
+                    (
+                        path.as_path(),
+                        "the refresh: a directory beside the root that key discovery could \
+                         not canonicalise",
+                    )
+                })
+                .collect(),
+            record_placement: roots
+                .iter()
+                .map(|path| {
+                    (
+                        path.as_path(),
+                        "the record placement: the root and directories beside it",
+                    )
+                })
+                .collect(),
+        };
+
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &agent_read_of(&row.path)),
+            &expected.agent_read(),
+        );
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &printout_of(row.source, &row.path)),
+            &expected.printout(),
+        );
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &agent_read_of(&canonical)),
+            &expected.agent_read_by_canonical_path(),
+        );
+        assert_canonicalised(
+            &canonicalised_by_opening(storage, &printout_of(row.source, &canonical)),
+            &expected.printout(),
+        );
+    });
+}
+
+/// A session cached through one name of the agent's directory and restored
+/// through another shows the second name in its transcript's path and in
+/// each sub-agent transcript's, as discovery through that name spells them.
+#[test]
+fn session_restored_through_other_spelling_shows_its_paths_in_that_spelling() {
+    run_contract(Contract::RootSpelling, |fixture| {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        fixture.write_every_record_session(&home, &fixture.every_record_session());
+        load_under(fixture, &home, cache.path());
+
+        for spelling in other_spellings(directory.path(), &home) {
+            let environment = fixture_environment(fixture, &spelling, cache.path());
+            let rows = rows_loaded_through(&environment);
+            let discovered = fixture.discover_under(&spelling);
+
+            assert!(
+                !rows.is_empty() && rows.iter().all(|row| row.cached_session.is_some()),
+                "a load through {} restores the session",
+                spelling.display()
+            );
+            for row in &rows {
+                let viewed = crate::history::display_log_entries_interactively(
+                    &crate::history::InteractiveCache::at(environment.cache_base().clone()),
+                    row.cache_address
+                        .as_ref()
+                        .expect("a listed row has its address"),
+                    &row.publication,
+                );
+                assert!(
+                    matches!(viewed.into_read(), crate::history::CachedRead::Current(_)),
+                    "the viewer reads the copy of the row restored through {}",
+                    spelling.display()
+                );
+            }
+            assert_eq!(
+                spelled_transcripts(rows.into_iter().map(|row| (row.path, row.subagents))),
+                spelled_transcripts(
+                    discovered
+                        .into_iter()
+                        .map(|stub| (stub.locator, stub.subagents))
+                ),
+                "the restored paths are spelled as discovery through {} spells them",
+                spelling.display()
+            );
+        }
+    });
+}
+
+/// Each session's transcript then its sub-agent transcripts, as the text
+/// each path is spelled with, sorted by session. `PathBuf` equality would
+/// ignore a separator's spelling on Windows.
+fn spelled_transcripts(
+    sessions: impl IntoIterator<Item = (PathBuf, Vec<PathBuf>)>,
+) -> Vec<Vec<OsString>> {
+    let mut spelled: Vec<Vec<OsString>> = sessions
+        .into_iter()
+        .map(|(transcript, subagents)| {
+            std::iter::once(transcript)
+                .chain(subagents)
+                .map(PathBuf::into_os_string)
+                .collect()
+        })
+        .collect();
+    spelled.sort();
+    spelled
+}
+
+/// Rows restored through another name of the agent's directory keep their
+/// places in the list: a list refresh finds each by its path and reports no
+/// change. While discovery cannot list the directory of one of them, the
+/// load and the list refresh keep its row.
+#[test]
+fn rows_restored_through_other_spelling_are_found_by_their_paths() {
+    run_contract(Contract::RootSpelling, |fixture| {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let ids = fixture.ids();
+        let hidden = fixture.write_session(&home, ids.session);
+        fixture.write_session_in_another_directory(&home, ids.other);
+        load_under(fixture, &home, cache.path());
+
+        for spelling in other_spellings(directory.path(), &home) {
+            let lister = Arc::new(ScriptedLister::default());
+            let environment =
+                fixture_environment_listed_by(fixture, &spelling, cache.path(), lister.clone());
+            let mut app = crate::tui::claude_home::app_reading(
+                rows_loaded_through(&environment),
+                environment.clone(),
+            );
+
+            crate::tui::claude_home::serve_list_refresh(&mut app, Default::default());
+            assert_eq!(
+                app.status_message(),
+                None,
+                "a list refresh through {} finds both restored rows by their paths",
+                spelling.display()
+            );
+
+            let refused =
+                fixture.listed_directory_of(&spelling.join(hidden.strip_prefix(&home).unwrap()));
+            if let Some(refused) = &refused {
+                lister.refuse(refused);
+            }
+            assert_eq!(
+                rows_loaded_through(&environment).len(),
+                2,
+                "a load through {} keeps the row under the directory it cannot list",
+                spelling.display()
+            );
+            crate::tui::claude_home::serve_list_refresh(&mut app, Default::default());
+            assert_eq!(
+                app.conversations().len(),
+                2,
+                "a list refresh through {} keeps the row under the directory it cannot list",
+                spelling.display()
+            );
+            // The app marks this thread as the TUI's drawing thread, which
+            // agent commands refuse to run on.
+            drop(app);
+            let agent = |arguments: &[&str]| {
+                crate::agent::service::execute(
+                    crate::agent::test_support::agent_command(arguments),
+                    environment.clone(),
+                )
+            };
+            let sessions = agent(&["sessions", "--all"]).unwrap_or_else(crate::error_report);
+            let references: BTreeSet<&str> = sessions
+                .split_whitespace()
+                .filter_map(|atom| atom.strip_prefix("ref="))
+                .collect();
+            assert_eq!(
+                references.len(),
+                2,
+                "agent sessions through {} lists the session under the directory it cannot \
+                 list:\n{sessions}",
+                spelling.display()
+            );
+            for reference in references {
+                let outline = agent(&["outline", reference]);
+                assert!(
+                    outline.is_ok(),
+                    "agent outline through {} resolves {reference}, the reference agent \
+                     sessions printed: {outline:?}",
+                    spelling.display()
+                );
+            }
+        }
+    });
+}
+
+/// The agent's directory named with forward slashes: a load parsing its
+/// sessions and a load restoring them show every transcript path with the
+/// platform's separator, and the cache stores none spelled otherwise.
+#[test]
+fn directory_named_with_forward_slashes_stores_and_shows_platform_separators() {
+    run_contract(Contract::RootSpelling, |fixture| {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        fixture.write_every_record_session(&home, &fixture.every_record_session());
+        let spelling = with_forward_slashes(&home);
+
+        let parsed = load_under(fixture, &spelling, cache.path());
+        let restored = load_under(fixture, &spelling, cache.path());
+
+        assert!(
+            !restored.is_empty() && restored.iter().all(|row| row.cached_session.is_some()),
+            "the second load restores the session"
+        );
+        let shown: Vec<&Path> = parsed
+            .iter()
+            .chain(&restored)
+            .flat_map(|row| std::iter::once(&row.path).chain(&row.subagents))
+            .map(PathBuf::as_path)
+            .collect();
+        assert!(
+            shown.iter().all(|path| is_platform_spelled(path)),
+            "every shown path has the platform's separator: {shown:?}"
+        );
+        let stored = stored_paths(cache.path());
+        assert!(
+            !stored.is_empty()
+                && stored
+                    .iter()
+                    .all(|path| is_platform_spelled(Path::new(path))),
+            "every stored path has the platform's separator: {stored:?}"
+        );
+    });
+}
+
+/// `path` with forward slashes on Windows, where it reads as with
+/// backslashes; `path` itself elsewhere.
+fn with_forward_slashes(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    return PathBuf::from(path.to_string_lossy().replace('\\', "/"));
+    #[cfg(not(windows))]
+    path.to_path_buf()
+}
+
+/// False for a path with a forward slash on Windows.
+fn is_platform_spelled(path: &Path) -> bool {
+    !cfg!(windows) || !path.to_string_lossy().contains('/')
+}
+
+/// Every path the session cache under `cache_base` stores for a session's
+/// files and the transcripts its entries came from.
+fn stored_paths(cache_base: &Path) -> Vec<String> {
+    let database = cache_base.join(crate::history::sqlite_cache::DATABASE_FILE_NAME);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let mut statement = connection
+        .prepare("SELECT path FROM session_files UNION ALL SELECT path FROM transcripts")
+        .unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 /// Other names of `home`, a directory in `directory`, that the file system
-/// resolves to it: through `..`, with forward slashes on Windows, and
-/// through a symbolic link on Unix.
+/// canonicalises to it: through `..`, with forward slashes on Windows, in upper
+/// case where file names ignore case, and through a symbolic link on Unix.
 fn other_spellings(directory: &Path, home: &Path) -> Vec<PathBuf> {
     let elsewhere = directory.join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
     let mut spellings = vec![elsewhere.join("..").join(home.file_name().unwrap())];
     #[cfg(windows)]
-    spellings.push(PathBuf::from(home.to_string_lossy().replace('\\', "/")));
+    spellings.push(with_forward_slashes(home));
+    #[cfg(any(windows, target_os = "macos"))]
+    spellings.push(home.with_file_name(home.file_name().unwrap().to_string_lossy().to_uppercase()));
     #[cfg(unix)]
     {
         let link = directory.join("link");

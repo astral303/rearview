@@ -12,13 +12,16 @@ const SCOUT_CALL: &str = "toolu_01SCOUTAAAAAAAAAAAAAAAA";
 /// A Claude session's files under a project directory, and the cache
 /// holding the last write of the session.
 struct ClaudeSession {
-    _home: tempfile::TempDir,
+    home: tempfile::TempDir,
     base: tempfile::TempDir,
     cache: OwnedCache,
     own: PathBuf,
     subagents: Vec<PathBuf>,
     /// The stub's modification time, in seconds, moved on with each update.
     updates: u64,
+    /// Another spelling of `home`, which later reads name the session's
+    /// files through; `None` for `home` as it is.
+    home_spelling: Option<PathBuf>,
 }
 
 impl ClaudeSession {
@@ -35,12 +38,13 @@ impl ClaudeSession {
         let cache = admitted_cache(base.path());
         cache.admit_storage(storage_of(Source::Claude)).unwrap();
         let mut session = Self {
-            _home: home,
+            home,
             base,
             cache,
             own: own_path,
             subagents: Vec::new(),
             updates: 1,
+            home_spelling: None,
         };
         for (agent, lines) in subagents {
             session.add_subagent(agent, lines);
@@ -50,9 +54,13 @@ impl ClaudeSession {
     }
 
     fn fixture(&self) -> Fixture {
+        let spelled = |path: &Path| match &self.home_spelling {
+            Some(home) => home.join(path.strip_prefix(self.home.path()).unwrap()),
+            None => path.to_path_buf(),
+        };
         let stub = SessionStub {
-            locator: self.own.clone(),
-            subagents: self.subagents.clone(),
+            locator: spelled(&self.own),
+            subagents: self.subagents.iter().map(|path| spelled(path)).collect(),
             cache_key: CACHE_KEY.to_owned(),
             fingerprint: Fingerprint {
                 size: 1_000,
@@ -61,10 +69,19 @@ impl ClaudeSession {
         };
         Fixture {
             source: Source::Claude,
-            root: SessionRoot::new(self.own.parent().unwrap()),
+            root: SessionRoot::new(spelled(self.own.parent().unwrap())),
             stub,
             _session: None,
         }
+    }
+
+    /// Name the session's files from now on through `home` spelled through
+    /// a directory inside it and `..`, which the file system canonicalises
+    /// to `home`.
+    fn spell_home_through_parent(&mut self) {
+        let elsewhere = self.home.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        self.home_spelling = Some(elsewhere.join(".."));
     }
 
     /// Adds the transcript of sub-agent `agent`, launched by
@@ -367,6 +384,32 @@ fn new_subagent_transcript_resumes() {
     assert_eq!(
         update.transcripts_read, 1,
         "the read opens the new sub-agent transcript alone"
+    );
+}
+
+/// A session cached through one spelling of its project directory, read on
+/// through another after its sub-agent and its own transcript grew: the read
+/// resumes with the stored launch ledger, opens the two changed transcripts
+/// alone, and writes what a fresh parse holds.
+#[test]
+fn append_after_root_spelling_changes_resumes_as_fresh_parse() {
+    let mut session = ClaudeSession::stored(&opening(), &[(SCOUT, scout(&[]))]);
+    write_lines(
+        &session.subagent(SCOUT),
+        &scout(&[reply("10:00:40", "msg_s2", "The notes list the steps.")]),
+    );
+    write_lines(
+        &session.own.clone(),
+        &with(&opening(), &[reply("10:01:01", "msg_a3", "Run the tests.")]),
+    );
+    session.spell_home_through_parent();
+
+    let update = session.update();
+
+    assert_eq!(update.outcome, Ok(()), "the session resumes");
+    assert_eq!(
+        update.transcripts_read, 2,
+        "the read opens the session's transcript and the changed sub-agent's"
     );
 }
 

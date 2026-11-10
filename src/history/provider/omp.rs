@@ -84,8 +84,12 @@ impl SessionProvider for OmpProvider {
 
     /// Read from the header, as Pi's is, and just as capable of repeating
     /// across two logs in one project.
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        sessions_omp_owns_with_id(&omp_loader::session_root()?, session_id)
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        sessions_omp_owns_with_id(&omp_loader::session_root_in(environment)?, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -833,5 +837,112 @@ pub(super) mod tests {
             Source::Pi,
             "a directory the user redirected OMP to can hold Pi's transcripts"
         );
+    }
+
+    /// `found_sessions_dir` for a subdirectory of a repository whose own
+    /// sessions directory is empty: the first candidate's miss falls through to
+    /// the top level's.
+    #[test]
+    fn sessions_dir_search_canonicalises_each_candidate_directory_and_the_home_once() {
+        use crate::history::provider::walk::test_support::{
+            CountingCanonicaliser, assert_canonicalised,
+        };
+        use std::sync::Arc;
+        let home = tempfile::tempdir().unwrap();
+        let repository = home.path().join("project");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        let subdirectory = repository.join("src");
+        std::fs::create_dir(&subdirectory).unwrap();
+        let sessions = home.path().join("sessions");
+        write_session(&sessions.join("-project"), "session");
+        std::fs::create_dir(sessions.join("-project-src")).unwrap();
+        let agent_directory = home.path().as_os_str().to_owned();
+        let variable = move |name: &str| {
+            (name == crate::history::pi_loader::AGENT_DIR_VARIABLE).then(|| agent_directory.clone())
+        };
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let environment = RootEnvironment::new(&variable, Some(home.path().to_path_buf()), None)
+            .with_canonicaliser(canonicaliser.clone());
+
+        let found = super::super::found_sessions_dir(&OmpProvider, &environment, &subdirectory);
+
+        assert_eq!(found.unwrap(), Some(sessions.join("-project")));
+        assert_canonicalised(
+            &canonicaliser.canonicalised(),
+            &[
+                (
+                    home.path(),
+                    "first candidate: the home, to name the directory below it",
+                ),
+                (&subdirectory, "first candidate: the directory itself"),
+                (&repository, "second candidate: the repository's top level"),
+            ],
+        );
+    }
+
+    /// `found_sessions_dir` for the home directory finds the `-tmp`
+    /// directory OMP files a session started there under: OMP moves to
+    /// `~/tmp`, or without it to the temporary directory, inside the home or
+    /// outside it.
+    #[test]
+    fn sessions_dir_search_from_home_finds_tmp_directory_canonicalising_each_directory_once() {
+        use crate::history::provider::walk::test_support::{
+            CountingCanonicaliser, assert_canonicalised,
+        };
+        use std::sync::Arc;
+        enum Launch {
+            HomeTmp,
+            TempOutsideHome,
+            TempInsideHome,
+        }
+        let search_from_home = |launch: Launch| {
+            let home = tempfile::tempdir().unwrap();
+            let outside_home = tempfile::tempdir().unwrap();
+            let temp = match launch {
+                Launch::TempInsideHome => home.path().join("AppData").join("Local").join("Temp"),
+                Launch::HomeTmp | Launch::TempOutsideHome => outside_home.path().to_path_buf(),
+            };
+            std::fs::create_dir_all(&temp).unwrap();
+            let home_tmp = home.path().join("tmp");
+            let with_home_tmp = matches!(launch, Launch::HomeTmp);
+            if with_home_tmp {
+                std::fs::create_dir(&home_tmp).unwrap();
+            }
+            let sessions = home.path().join("sessions");
+            write_session(&sessions.join("-tmp"), "session");
+            let agent_directory = home.path().as_os_str().to_owned();
+            let variable = move |name: &str| {
+                (name == crate::history::pi_loader::AGENT_DIR_VARIABLE)
+                    .then(|| agent_directory.clone())
+            };
+            let canonicaliser = Arc::new(CountingCanonicaliser::default());
+            let environment =
+                RootEnvironment::new(&variable, Some(home.path().to_path_buf()), None)
+                    .with_temp_dir(temp.clone())
+                    .with_canonicaliser(canonicaliser.clone());
+
+            let found = super::super::found_sessions_dir(&OmpProvider, &environment, home.path());
+
+            assert_eq!(found.unwrap(), Some(sessions.join("-tmp")));
+            let launch_directory = if with_home_tmp {
+                vec![(home_tmp.as_path(), "the launch directory, `~/tmp`")]
+            } else {
+                Vec::new()
+            };
+            let mut expected = vec![(
+                home.path(),
+                "the directory searched from, which is the home",
+            )];
+            expected.extend(launch_directory);
+            expected.push((&temp, "the temporary directory"));
+            assert_canonicalised(&canonicaliser.canonicalised(), &expected);
+        };
+
+        search_from_home(Launch::HomeTmp);
+        // Outside Windows, OMP moves to `/tmp` before the temporary directory.
+        if cfg!(windows) {
+            search_from_home(Launch::TempOutsideHome);
+            search_from_home(Launch::TempInsideHome);
+        }
     }
 }

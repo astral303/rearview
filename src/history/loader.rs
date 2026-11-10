@@ -2,12 +2,15 @@
 
 use super::listing::{self, SessionOrigin, SessionTimes};
 use super::load_meter::{AgentMeter, LoadMeter};
+use super::path::{CanonicalDirectories, FileIdentity};
+use super::provider::walk::Canonicaliser;
 use super::provider::{
     Deleted, DiscoveredSession, FoundSession, LeftOutRows, LoadOptions, SkippedSessions,
     UnreadableDirectory,
 };
 use super::sqlite_cache::{
     AwaitedRefresh, Cancellation, Observation, OperationScope, OtherRearview, Patience,
+    SessionAddress,
 };
 use super::{
     Conversation, Environment, FilterTerm, KnownSessions, LoadProgress, LoaderMessage,
@@ -99,9 +102,11 @@ impl ProviderHistory {
     /// every session, so a caller can show the load as it happens rather than
     /// after the slowest provider. An `Ignored` precedes the batch for each
     /// reason the provider ignored sessions for, and a `SkippedSessions` for
-    /// the sessions that hold no conversation and the unreadable ones.
-    /// `meter` records what each provider's load read. A changed session
-    /// whose cached row `left_out` holds keeps that row unread.
+    /// the sessions that do not hold a conversation, the unreadable ones and
+    /// each file an earlier provider listed: the first provider to list a
+    /// file keeps its row. `meter` records what each provider's load read. A
+    /// changed session whose cached row `left_out` holds keeps that row
+    /// unread.
     ///
     /// Fails when a write finds the cache's drive short of space; any other
     /// provider failure is the provider's.
@@ -120,9 +125,11 @@ impl ProviderHistory {
             discovered: Vec::new(),
             unreadable_directories: Vec::new(),
         };
+        let mut seen = SeenPaths::new(environment.shared_canonicaliser());
+        let root_environment = environment.root_environment();
         for &storage in environment.storages() {
             let root_on_disk = storage
-                .roots()
+                .roots_in(&root_environment)
                 .is_ok_and(|roots| roots.iter().any(|root| root.path.exists()));
             let source = storage.source();
             let options = LoadOptions {
@@ -146,17 +153,24 @@ impl ProviderHistory {
             );
             match loaded {
                 Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
-                Ok(loaded) => {
+                Ok(mut loaded) => {
                     history.usable |= root_on_disk;
                     for term in loaded.ignored {
                         debug::warn(debug_level, &term.to_string());
                         report(LoaderMessage::Ignored(term));
                     }
+                    let conversations = seen.keep_first_of_each_file(loaded.conversations);
+                    loaded.skipped.unlisted.extend(
+                        conversations
+                            .listed_elsewhere
+                            .iter()
+                            .map(|row| (row.path.clone(), FoundSession::of(row))),
+                    );
                     if !loaded.skipped.is_empty() {
                         report(LoaderMessage::SkippedSessions(loaded.skipped));
                     }
-                    if !loaded.conversations.is_empty() {
-                        report(LoaderMessage::Batch(loaded.conversations));
+                    if !conversations.first.is_empty() {
+                        report(LoaderMessage::Batch(conversations.first));
                     }
                     history.discovered.push((source, loaded.discovered));
                     history.unreadable_directories.extend(
@@ -321,43 +335,57 @@ pub fn load_history(
     })
 }
 
-fn finalize_conversations(conversations: &mut Vec<Conversation>) {
-    deduplicate_conversations(conversations);
+fn finalize_conversations(conversations: &mut [Conversation]) {
     conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
     for (index, conversation) in conversations.iter_mut().enumerate() {
         conversation.index = index;
     }
 }
 
-fn deduplicate_conversations(conversations: &mut Vec<Conversation>) {
-    SeenPaths::default().retain_unseen(conversations);
-}
-
 /// The files already listed, so a session reachable through two roots, or
 /// through two providers sharing a redirected directory, appears once: the
 /// first to load keeps the row.
-#[derive(Default)]
-pub(crate) struct SeenPaths(HashSet<PathBuf>);
+pub(crate) struct SeenPaths {
+    directories: CanonicalDirectories,
+    seen: HashSet<FileIdentity>,
+}
+
+/// A provider's rows split by whether an earlier provider listed their file.
+struct FirstOfEachFile {
+    first: Vec<Conversation>,
+    listed_elsewhere: Vec<Conversation>,
+}
 
 impl SeenPaths {
-    fn retain_unseen(&mut self, conversations: &mut Vec<Conversation>) {
-        conversations.retain(|conversation| self.insert(&conversation.path));
+    /// No file seen yet. A file without an identity has its directory
+    /// canonicalised through `canonicaliser`.
+    pub(crate) fn new(canonicaliser: &Arc<dyn Canonicaliser>) -> Self {
+        Self {
+            directories: CanonicalDirectories::new(Arc::clone(canonicaliser)),
+            seen: HashSet::new(),
+        }
     }
 
-    /// The conversations whose file was not seen earlier, then the rest.
-    fn partition_unseen(
-        &mut self,
-        conversations: Vec<Conversation>,
-    ) -> (Vec<Conversation>, Vec<Conversation>) {
-        conversations
-            .into_iter()
-            .partition(|conversation| self.insert(&conversation.path))
+    /// `conversations` split by whether their file was seen earlier.
+    fn keep_first_of_each_file(&mut self, conversations: Vec<Conversation>) -> FirstOfEachFile {
+        let (first, listed_elsewhere) = conversations.into_iter().partition(|conversation| {
+            self.insert(&conversation.path, conversation.cache_address.as_ref())
+        });
+        FirstOfEachFile {
+            first,
+            listed_elsewhere,
+        }
     }
 
-    /// True when no earlier path named the file at `path`.
-    pub(crate) fn insert(&mut self, path: &Path) -> bool {
-        self.0
-            .insert(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+    /// True when no earlier file had the identity of the file at `path`:
+    /// its identity below the roots of `address`, the session's address in
+    /// the cache, or for a file outside them all, `path` with its directory
+    /// canonical.
+    pub(crate) fn insert(&mut self, path: &Path, address: Option<&SessionAddress>) -> bool {
+        let identity = address
+            .and_then(|address| address.file_identity(path))
+            .unwrap_or_else(|| self.directories.file_identity(path));
+        self.seen.insert(identity)
     }
 }
 
@@ -500,7 +528,6 @@ fn stream_history(
     operation: &OperationScope,
 ) -> Result<(ProviderHistory, KnownSessions)> {
     let clock = environment.clock().as_ref();
-    let mut seen = SeenPaths::default();
     let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
     let mut known = KnownSessions::default();
     let history = ProviderHistory::load(
@@ -513,16 +540,14 @@ fn stream_history(
         &mut |message| {
             let message = match message {
                 LoaderMessage::Batch(conversations) => {
-                    let (unseen, mut unlisted) = seen.partition_unseen(conversations);
-                    let (listed, outside_time): (Vec<_>, Vec<_>) =
-                        unseen.into_iter().partition(|conversation| {
+                    let (listed, unlisted): (Vec<_>, Vec<_>) =
+                        conversations.into_iter().partition(|conversation| {
                             listing::is_listed(
                                 SessionOrigin::Discovered,
                                 SessionTimes::Messages(&conversation.message_times),
                                 &options.time,
                             )
                         });
-                    unlisted.extend(outside_time);
                     if !unlisted.is_empty() {
                         let skipped = SkippedSessions {
                             unlisted: unlisted
@@ -729,21 +754,23 @@ mod tests {
     /// dropped from the later batch, not only within one.
     #[test]
     fn path_seen_in_earlier_batch_is_dropped_from_later_one() {
-        let mut seen = SeenPaths::default();
-        let mut first = vec![
+        let canonicaliser = super::super::provider::walk::SystemCanonicaliser::shared();
+        let mut seen = SeenPaths::new(&canonicaliser);
+        let first = vec![
             conversation_at("first.jsonl"),
             conversation_at("shared.jsonl"),
         ];
-        let mut second = vec![
+        let second = vec![
             conversation_at("shared.jsonl"),
             conversation_at("second.jsonl"),
         ];
 
-        seen.retain_unseen(&mut first);
-        seen.retain_unseen(&mut second);
+        let first = seen.keep_first_of_each_file(first);
+        let second = seen.keep_first_of_each_file(second);
 
-        assert_eq!(file_names(&first), ["first.jsonl", "shared.jsonl"]);
-        assert_eq!(file_names(&second), ["second.jsonl"]);
+        assert_eq!(file_names(&first.first), ["first.jsonl", "shared.jsonl"]);
+        assert_eq!(file_names(&second.first), ["second.jsonl"]);
+        assert_eq!(file_names(&second.listed_elsewhere), ["shared.jsonl"]);
     }
 
     fn empty_session(session_id: &str) -> EmptySession {

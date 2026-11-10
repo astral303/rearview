@@ -131,6 +131,10 @@ impl SemanticConversationFixture {
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
             cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
         }
     }
 }

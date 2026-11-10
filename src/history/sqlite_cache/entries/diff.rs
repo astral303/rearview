@@ -7,13 +7,14 @@
 //! the same line, and the same index among the entries read from that line.
 //! A message matches the stored message its first entry matched; a thread
 //! matches the stored thread of the same origin; a transcript the stored
-//! transcript of the same path.
+//! transcript of the same place: its root and its path below it.
 
 use super::rows::{LeadingTexts, SessionRows};
 use super::threads::ThreadOrigin;
 use super::write::{EntryPlace, RowIds, RowWriter, SearchPlace};
 use crate::error::Result;
 use crate::history::sqlite_cache::SearchField;
+use crate::history::sqlite_cache::roots::{StoredPath, WrittenPlaces};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,9 +25,10 @@ use std::sync::Arc;
 pub(in super::super) fn update(
     connection: &Connection,
     session: i64,
+    places: &WrittenPlaces,
     rows: &SessionRows,
 ) -> Result<()> {
-    update_scope(connection, session, rows, Scope::Session)
+    update_scope(connection, session, places, rows, Scope::Session)
 }
 
 /// Makes the stored entries of `session` from `rows`' first sequence on the
@@ -36,9 +38,10 @@ pub(in super::super) fn update(
 pub(in super::super) fn update_tail(
     connection: &Connection,
     session: i64,
+    places: &WrittenPlaces,
     rows: &SessionRows,
 ) -> Result<()> {
-    update_scope(connection, session, rows, Scope::Tail)?;
+    update_scope(connection, session, places, rows, Scope::Tail)?;
     for sequence in &rows.superseded_leading {
         connection
             .prepare_cached(
@@ -85,6 +88,7 @@ pub(in super::super) fn stored_leading(
 pub(in super::super) fn replace_leading(
     connection: &Connection,
     session: i64,
+    places: &WrittenPlaces,
     rows: &SessionRows,
     stored_count: usize,
 ) -> Result<()> {
@@ -104,7 +108,7 @@ pub(in super::super) fn replace_leading(
             .prepare_cached("DELETE FROM entries WHERE id = ?1")?
             .execute([id])?;
     }
-    let mut writer = RowWriter::new(connection, session)?;
+    let mut writer = RowWriter::new(connection, session, places)?;
     let delta = rows.entries.len() as i64 - stored_count as i64;
     if delta != 0 {
         // Through negative sequences, so no two entries hold one at once.
@@ -152,10 +156,11 @@ pub(in super::super) fn replace_leading(
 pub(in super::super) fn rewrite_in_place(
     connection: &Connection,
     session: i64,
+    places: &WrittenPlaces,
     rows: &SessionRows,
     stored: &[(i64, Option<i64>, i64)],
 ) -> Result<()> {
-    let mut writer = RowWriter::new(connection, session)?;
+    let mut writer = RowWriter::new(connection, session, places)?;
     for (index, (row, &(id, message, digest))) in rows.entries.iter().zip(stored).enumerate() {
         if row.digest == digest {
             continue;
@@ -184,12 +189,13 @@ enum Scope {
 fn update_scope(
     connection: &Connection,
     session: i64,
+    places: &WrittenPlaces,
     rows: &SessionRows,
     scope: Scope,
 ) -> Result<()> {
     let mut ids = RowIds::new(rows);
-    let mut writer = RowWriter::new(connection, session)?;
-    let stored_transcripts = match_transcripts(connection, session, rows, &mut ids)?;
+    let mut writer = RowWriter::new(connection, session, places)?;
+    let stored_transcripts = match_transcripts(connection, session, places, rows, &mut ids)?;
     for index in 0..rows.transcripts.len() {
         writer.transcript(rows, &mut ids, index)?;
     }
@@ -235,38 +241,49 @@ struct StoredTranscripts {
     gone: Vec<i64>,
 }
 
-/// Matches each of the new transcripts with the stored one of the same path,
-/// giving it that one's id in `ids`.
+/// Matches each of the new transcripts with the stored one of the same
+/// place among `places`, giving it that one's id in `ids`.
 fn match_transcripts(
     connection: &Connection,
     session: i64,
+    places: &WrittenPlaces,
     rows: &SessionRows,
     ids: &mut RowIds,
 ) -> Result<StoredTranscripts> {
-    let new: HashMap<&Path, usize> = rows
+    let new: HashMap<StoredPath, usize> = rows
         .transcripts
         .iter()
         .enumerate()
-        .map(|(index, path)| (path.as_ref(), index))
-        .collect();
+        .map(|(index, path)| Ok((places.place_written(path)?, index)))
+        .collect::<Result<_>>()?;
     let mut stored = StoredTranscripts {
         paths: HashMap::new(),
         matches: HashMap::new(),
         gone: Vec::new(),
     };
     let mut statement =
-        connection.prepare_cached("SELECT id, path FROM transcripts WHERE session = ?1")?;
+        connection.prepare_cached("SELECT id, root, path FROM transcripts WHERE session = ?1")?;
     let mut found = statement.query([session])?;
     while let Some(row) = found.next()? {
         let id: i64 = row.get(0)?;
-        let path: Arc<Path> = Arc::from(PathBuf::from(row.get::<_, String>(1)?));
-        match new.get(path.as_ref()) {
+        let place = StoredPath {
+            root: row.get(1)?,
+            path: row.get(2)?,
+        };
+        let path = match new.get(&place) {
             Some(&index) => {
                 ids.transcripts[index] = Some(id);
                 stored.matches.insert(id, index);
+                rows.transcripts[index].clone()
             }
-            None => stored.gone.push(id),
-        }
+            None => {
+                stored.gone.push(id);
+                // A gone transcript's threads must match no new thread:
+                // the path below an unknown root matches no new path.
+                let unplaced = PathBuf::from(&place.path);
+                Arc::from(places.path(place).unwrap_or(unplaced))
+            }
+        };
         stored.paths.insert(id, path);
     }
     Ok(stored)

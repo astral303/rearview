@@ -9,30 +9,37 @@ fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() 
     let storage = storage_of(row.source);
     let root = root_of(&session);
     let stub = stub_of(&session, 1);
+    let address = crate::history::sqlite_cache::SessionAddress::new(
+        storage,
+        row.source,
+        crate::history::sqlite_cache::SessionRoots::of_system(&root),
+        stub.cache_key.clone(),
+    );
     for status in [SessionStatus::Empty, SessionStatus::Unreadable] {
         let reason = "skipped transcript has no visible messages".to_owned();
         cache
             .write(
-                &SessionRecord::unlisted(storage, row.source, &root, &stub, status, reason)
-                    .unwrap(),
+                &SessionRecord::unlisted(
+                    &crate::history::sqlite_cache::RecordPlace {
+                        storage,
+                        source: row.source,
+                        roots: crate::history::sqlite_cache::SessionRoots::of_system(&root),
+                        directories: &crate::history::path::CanonicalDirectories::of_system(),
+                        linker: row.source.provider().storage().thread_linker(),
+                    },
+                    &stub,
+                    status,
+                    reason,
+                )
+                .unwrap()
+                .unwrap(),
             )
             .unwrap();
-        assert!(
-            cache
-                .find_session(row.source, &row.path, &row.subagents)
-                .unwrap()
-                .is_none()
-        );
+        assert!(cache.copy_at(&address).unwrap().is_none());
     }
     let record = parsed_record(row.source, &root, &stub);
-    let keys = cache.catalogue_keys(&record.catalogue);
-    cache.write_catalogue(&record, &keys, None).unwrap();
-    assert!(
-        cache
-            .find_session(row.source, &row.path, &row.subagents)
-            .unwrap()
-            .is_none()
-    );
+    cache.write_catalogue(&record, None).unwrap();
+    assert!(cache.copy_at(&address).unwrap().is_none());
 }
 
 #[test]
@@ -98,13 +105,12 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     new.entries = Some(Ok(message_schema::transcript(vec![
         serde_json::json!({"type":"user","message":{"role":"user","content":"winning generation"}}),
     ])));
-    let keys = older.catalogue_keys(&old.catalogue);
-    let previous = older.write_catalogue(&old, &keys, None).unwrap();
+    let (previous, keys) = older.write_catalogue(&old, None).unwrap();
     newer.write(&new).unwrap();
     let replacement = entries::listed_session_of(
         &newer.connection,
         storage.directory,
-        &newer.root_key(&root),
+        newer.session_roots(&root).key(),
         CACHE_KEY,
     )
     .unwrap()
@@ -116,7 +122,7 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
         &std::collections::HashSet::new(),
     );
     assert!(
-        matches!(entries::insert(&mut older.connection, previous, &old_rows, &|| Ok(()), &owner), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
+        matches!(entries::insert(&mut older.connection, previous, &keys.places, &old_rows, &|| Ok(()), &owner), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
     );
     assert!(
         matches!(older.set_final_status(previous, SessionStatus::Listed, None), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
@@ -164,13 +170,14 @@ fn read_snapshot_survives_replacement_between_identity_and_reconstruction() {
             serde_json::json!({"type":"user","message":{"role":"user","content":"old content"}}),
         ]),
     );
-    let root_key = reader.root_key(&root);
+    let roots = reader.session_roots(&root);
     let old = reader.with_read_snapshot(|connection| {
-        let id = entries::listed_session_of(connection, storage.directory, &root_key, CACHE_KEY)?.unwrap().id;
+        let id = entries::listed_session_of(connection, storage.directory, roots.key(), CACHE_KEY)?.unwrap().id;
+        let places = super::super::roots::Places::stored(connection, &roots)?;
         write_test_entries(&mut writer, message_schema::transcript(vec![
             serde_json::json!({"type":"user","message":{"role":"user","content":"new content"}}),
         ]));
-        entries::read(connection, id, None)
+        entries::read(connection, id, &places, None)
     }).unwrap();
     assert!(format!("{:?}", old.entries).contains("old content"));
     let new = reader.entries(storage, &root, CACHE_KEY).unwrap().unwrap();

@@ -133,7 +133,14 @@ fn malformed_lines(entries: &TranscriptEntries) -> Vec<(usize, Option<String>)> 
 /// The root and stub of the Codex session at `locator`, with its sub-agent
 /// transcripts `subagents`.
 fn codex_stub(locator: &Path, subagents: Vec<PathBuf>) -> (SessionRoot, SessionStub) {
-    let root = SessionRoot::new(locator.parent().unwrap());
+    // The deepest directory holding every file, so the record places each
+    // below the root.
+    let root = locator
+        .ancestors()
+        .skip(1)
+        .find(|directory| subagents.iter().all(|path| path.starts_with(directory)))
+        .unwrap();
+    let root = SessionRoot::new(root);
     let stub = SessionStub {
         locator: locator.to_path_buf(),
         subagents,
@@ -173,15 +180,20 @@ fn codex_record_changed_after_parse(
         .expect("the session is listed");
     after_parse();
     let record = SessionRecord::listed(
-        storage_of(Source::Codex),
-        Source::Codex,
-        root,
+        &crate::history::sqlite_cache::RecordPlace {
+            storage: storage_of(Source::Codex),
+            source: Source::Codex,
+            roots: crate::history::sqlite_cache::SessionRoots::of_system(root),
+            directories: &crate::history::path::CanonicalDirectories::of_system(),
+            linker: Source::Codex.provider().storage().thread_linker(),
+        },
         stub,
         stamps,
         &listed.row,
         listed.transcripts,
     )
-    .unwrap();
+    .ok()
+    .expect("the session has a record");
     (record, reads.into_inner())
 }
 
@@ -313,7 +325,7 @@ fn record_holds_its_parses_text_and_parse_reads_each_transcript_once() {
 type ThreadTranscript = fn(&EditedThreadWithSubagents) -> PathBuf;
 
 #[test]
-fn transcript_changed_after_parse_fails_record() {
+fn transcript_changed_after_parse_fails_record_and_keeps_the_parsed_entries() {
     let changes: [(&str, ThreadTranscript); 3] = [
         ("the session's own transcript", |thread| {
             thread.newest.clone()
@@ -352,6 +364,13 @@ fn transcript_changed_after_parse_fails_record() {
             *error,
             AppError::SessionCacheSourceChanged(listed.path.clone()).to_string(),
             "{name} changed after the parse fails the record"
+        );
+        let kept = record
+            .into_parsed_entries()
+            .unwrap_or_else(|| panic!("the record of {name} changed keeps the parsed entries"));
+        assert!(
+            format!("{:?}", kept.entries).contains("alpha"),
+            "the kept entries are the parse's"
         );
     }
 }

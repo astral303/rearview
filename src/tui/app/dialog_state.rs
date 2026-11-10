@@ -306,9 +306,8 @@ impl App {
         let path = state.conversation_path.clone();
         let read = crate::history::display_log_entries_interactively(
             &self.interactive_cache(),
-            state.conversation_source?,
-            &path,
-            &state.subagents,
+            state.cache_address.as_ref()?,
+            &state.publication,
         );
         match self.take_interactive(&path, read) {
             SessionCopy::Current(copy) => Some(copy.into_value()),
