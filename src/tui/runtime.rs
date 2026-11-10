@@ -28,6 +28,10 @@ type TerminalBackend = ShowAfterMove<CrosstermBackend<BufWriter<Stderr>>>;
 /// write.
 const FRAME_BUFFER_BYTES: usize = 256 * 1024;
 
+/// The longest a pass waits for the viewer's read before drawing the next
+/// frame. Terminal events stay unread until the viewer shows.
+const OPENING_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
+
 struct TerminalGuard {
     terminal: Terminal<TerminalBackend>,
 }
@@ -299,7 +303,9 @@ impl Runtime {
         self.app.receive_search_results();
         self.app.receive_fork_read();
         draw_frame(&self.app, terminal)?;
-        if self.app.complete_pending_open(frame_state.frame_width())
+        if self
+            .app
+            .complete_pending_open(frame_state.frame_width(), OPENING_REDRAW_INTERVAL)
             || self
                 .app
                 .complete_pending_view_refresh(frame_state.viewport_height)
@@ -389,7 +395,10 @@ impl Runtime {
     /// The longest the next poll waits for input: briefly while work runs in
     /// the background, until the next timed redraw otherwise.
     fn poll_timeout(&self) -> Duration {
-        if self.app.is_loading() || self.supervisor.is_running_a_job() || self.app.is_reading_fork()
+        if self.app.is_loading()
+            || self.supervisor.is_running_a_job()
+            || self.app.is_reading_fork()
+            || self.app.is_reading_search_texts()
         {
             Duration::from_millis(50)
         } else if self.app.has_search_work_in_flight() {

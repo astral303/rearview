@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 26;
+pub(super) const SCHEMA_VERSION: u32 = 27;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Tables an earlier version held, dropped before [`TABLES`] when the schema
@@ -338,6 +338,11 @@ CREATE TABLE IF NOT EXISTS parts (
     -- to it. Search places the text by these without reading the entry.
     entry_sequence INTEGER,
     message_ordinal INTEGER,
+    -- Set with `search_field` on an entry's part: the text's position among
+    -- the entry's search texts as the parse lays them out, so a read of the
+    -- session's search texts in `(entry_sequence, search_position)` order
+    -- lays them out as the parse does.
+    search_position INTEGER,
     -- A `subagent-metadata` part's `session_files` position of the
     -- sub-agent transcript holding the text.
     file_position INTEGER,

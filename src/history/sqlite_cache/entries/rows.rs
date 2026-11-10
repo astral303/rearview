@@ -81,7 +81,8 @@ impl EntryRow<'_> {
         parts::digest(&mut digest, columns.parts.blocks(), &self.search.blocks);
         digest.number(Some(self.search.derived.len() as i64));
         for derived in &self.search.derived {
-            digest.number(Some(derived.field.code()));
+            digest.number(Some(derived.place.field.code()));
+            digest.number(Some(derived.place.position));
             digest.text(Some(&derived.text));
         }
         digest.finish()

@@ -7,6 +7,7 @@ use crate::search::separated_texts::SeparatedTexts;
 use crate::text_match::{is_word_start, normalize_for_search};
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -121,9 +122,9 @@ pub fn build_session_list_evidence<C: Borrow<Conversation>>(
 }
 
 /// The evidence for `conversation` in its search texts: its row's title and
-/// summary, then `texts`, those held in memory, or else the texts its copy
-/// in the session cache holds, read now. A conversation the cache doesn't
-/// hold reads its `full_text` in place of `texts`.
+/// summary, then `texts`, those held in memory. A conversation the cache
+/// doesn't hold reads its `full_text` in place of `texts`; a cached one
+/// without texts held reads its title and summary alone.
 pub fn build_lexical_evidence(
     conversation: &Conversation,
     texts: Option<&SessionSearchTexts>,
@@ -133,15 +134,6 @@ pub fn build_lexical_evidence(
     if specs.is_empty() {
         return None;
     }
-    let read;
-    let texts = match (texts, &conversation.cached_session) {
-        (Some(texts), _) => Some(texts),
-        (None, Some(cached)) => {
-            read = SessionSearchTexts::read(cached).ok()??;
-            Some(&read)
-        }
-        (None, None) => None,
-    };
     let mut evidence = LexicalEvidence {
         title_and_summary: conversation
             .title_and_summary_texts()
@@ -366,17 +358,68 @@ fn find_first_normalized_match(text: &str, term: &str) -> Option<(usize, usize)>
 /// overlapping. Each text character matches `term`'s character it
 /// normalises to. A term starting with an alphanumeric character matches
 /// only at the start of a word.
+///
+/// A term of ASCII characters that normalise to themselves is found by a
+/// byte search, except in the whitespace-bounded span around each character
+/// outside ASCII that normalises to one of the term's letters: that span is
+/// read character by character. The ranges are those of reading the whole
+/// text character by character, because such a term holds no whitespace, so
+/// no match crosses a span's edge, and a span starts after whitespace, so its
+/// first character starts a word as it does in the whole text.
 fn find_normalized_term_ranges(text: &str, term: &str) -> Vec<(usize, usize)> {
     let is_found_by_bytes = term.bytes().all(|byte| {
         byte.is_ascii_graphic() && normalize_evidence_char(char::from(byte)) == char::from(byte)
-    }) && NonAsciiCapitals::matchable_by(term.as_bytes())
-        .first_in(text)
-        .is_none();
-    if is_found_by_bytes {
-        find_ascii_term_ranges(text, term)
-    } else {
-        find_term_ranges_each_char(text, term)
+    });
+    if !is_found_by_bytes {
+        return find_term_ranges_each_char(text, term);
     }
+    let capitals = NonAsciiCapitals::matchable_by(term.as_bytes());
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(capital) = capitals.first_in(&text[from..]).map(|at| from + at) {
+        let span = whitespace_bounded_span(text, from, capital);
+        push_ranges_at(
+            &mut ranges,
+            from,
+            find_ascii_term_ranges(&text[from..span.start], term),
+        );
+        push_ranges_at(
+            &mut ranges,
+            span.start,
+            find_term_ranges_each_char(&text[span.clone()], term),
+        );
+        from = span.end;
+    }
+    push_ranges_at(
+        &mut ranges,
+        from,
+        find_ascii_term_ranges(&text[from..], term),
+    );
+    ranges
+}
+
+/// The span of `text` around byte `at` without whitespace: from just after
+/// the last whitespace character between `from` and `at`, or from `from`,
+/// to the next whitespace character, or the end.
+fn whitespace_bounded_span(text: &str, from: usize, at: usize) -> Range<usize> {
+    let start = text[from..at]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(from, |(index, ch)| from + index + ch.len_utf8());
+    let end = text[at..]
+        .find(char::is_whitespace)
+        .map_or(text.len(), |index| at + index);
+    start..end
+}
+
+/// Adds `found`, ranges in a slice starting at byte `offset`, to `ranges`.
+fn push_ranges_at(ranges: &mut Vec<(usize, usize)>, offset: usize, found: Vec<(usize, usize)>) {
+    ranges.extend(
+        found
+            .into_iter()
+            .map(|(start, end)| (offset + start, offset + end)),
+    );
 }
 
 /// [`find_normalized_term_ranges`] for a term of ASCII characters that
@@ -559,6 +602,42 @@ mod tests {
             ] {
                 assert_term_ranges_match_reading_each_character(text, row.source.label());
             }
+        }
+    }
+
+    #[test]
+    fn term_ranges_around_capitals_outside_ascii_are_those_reading_each_character_finds() {
+        let separator = crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
+        let bodies = [
+            "\u{130}s is IS kit cache".to_owned(),
+            "cache kit is \u{130}".to_owned(),
+            "cache kit\u{212A} is k".to_owned(),
+            format!("cache is{separator}\u{130}s kit"),
+            format!("is \u{212A}it{separator}kit cache"),
+            "x\u{130}s\u{212A}it\u{130}cache\u{212A} is kit".to_owned(),
+            "\u{130}\u{130} \u{212A}\u{212A} session tool \u{130}s".to_owned(),
+            "session.rs\u{130}cache-kit_\u{212A}it".to_owned(),
+            "is kit cache session answer 1st".to_owned(),
+        ];
+        for body in &bodies {
+            assert_term_ranges_match_reading_each_character(body, &format!("{body:?}"));
+        }
+    }
+
+    #[test]
+    fn every_providers_fixture_with_capitals_outside_ascii_gives_ranges_reading_each_character_finds()
+     {
+        for session in crate::history::provider::contract_tests::every_record_sessions() {
+            let text = &session.row.full_text;
+            let middle = (text.len() / 2..=text.len())
+                .find(|index| text.is_char_boundary(*index))
+                .unwrap_or(text.len());
+            let body = format!(
+                "\u{130}s {}\u{212A}it\u{130}{} kit\u{212A}",
+                &text[..middle],
+                &text[middle..]
+            );
+            assert_term_ranges_match_reading_each_character(&body, session.row.source.label());
         }
     }
 

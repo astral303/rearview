@@ -1320,8 +1320,17 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         LoadingState::Ready => match (app.search_status_text(), app.selected()) {
             (Some(status), _) => status,
             (None, _) if app.is_refreshing() => REFRESHING_LABEL.to_owned(),
-            (None, Some(selected)) => format!("{}/{}", selected + 1, app.filtered().len()),
-            (None, None) => format!("0/{}", app.filtered().len()),
+            (None, Some(selected)) => format!(
+                "{}/{}{}",
+                selected + 1,
+                app.filtered().len(),
+                app.sessions_without_texts_text()
+            ),
+            (None, None) => format!(
+                "0/{}{}",
+                app.filtered().len(),
+                app.sessions_without_texts_text()
+            ),
         },
     };
     let status_text = if app.list_search_mode() == ListSearchMode::Semantic {

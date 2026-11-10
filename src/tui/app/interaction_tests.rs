@@ -683,8 +683,11 @@ fn enter_on_row_leaves_open_pending_for_next_frame() {
     assert!(app.is_opening());
 }
 
+/// The viewer's read runs off the drawing thread: the pass that starts it
+/// leaves the list opening, and a later pass shows the viewer once the read
+/// lands.
 #[test]
-fn completing_pending_open_enters_viewer() {
+fn pending_open_reads_session_off_drawing_thread_then_enters_viewer() {
     let home = ClaudeHome::new();
     let path = home.transcript("plain");
     write_conversation(&path, None);
@@ -692,11 +695,16 @@ fn completing_pending_open_enters_viewer() {
     app.selected = Some(0);
     press(&mut app, KeyCode::Enter);
 
-    assert!(app.complete_pending_open(80));
+    assert!(app.complete_pending_open(80, Duration::ZERO));
+    assert!(
+        matches!(app.app_mode(), AppMode::List) && app.is_opening(),
+        "the list shows Opening… while the read runs"
+    );
 
+    assert!(app.finish_pending_open_for_test(80));
     assert!(matches!(app.app_mode(), AppMode::View(_)));
     assert!(!app.is_opening());
-    assert!(!app.complete_pending_open(80));
+    assert!(!app.complete_pending_open(80, Duration::ZERO));
 }
 
 #[test]
@@ -719,16 +727,16 @@ fn pending_open_opens_requested_session_after_list_reorders() {
     press(&mut app, KeyCode::Enter);
 
     tx.send(SearchResponse {
-        error: None,
         filtered: vec![0, 1],
         generation: app.search_generation,
         mode: ListSearchMode::Lexical,
         evidence: std::collections::HashMap::new(),
+        exact_literal_results: None,
     })
     .unwrap();
     assert!(app.receive_search_results());
     assert_eq!(app.selected(), Some(0));
-    assert!(app.complete_pending_open(80));
+    assert!(app.finish_pending_open_for_test(80));
 
     let AppMode::View(view) = app.app_mode() else {
         panic!("the pending open did not enter the viewer");

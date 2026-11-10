@@ -3,18 +3,19 @@ use super::{
     App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, OpenSessionStatus, ViewSearchMode,
     ViewState,
 };
-use crate::history::Conversation;
 use crate::history::provider::{SessionRead, SessionTitle};
 use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
+use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
 use crate::tui::viewer::{
     CallArea, CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderOptions,
-    ToolOutputId, find_matches,
+    ToolOutputId, ViewedConversation, find_matches, parse_conversation_file_interactively,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 /// The open session's row as its finished refresh read it, for the viewer's
 /// read of the session from the cache.
@@ -102,6 +103,79 @@ pub(super) enum DeferredCopy {
     Focused { viewport_height: usize },
 }
 
+/// A row the viewer opens, as the list held it when the open began.
+pub(super) struct OpenedRow {
+    path: PathBuf,
+    source: Source,
+    session_id: String,
+    publication: Publication,
+    cache_address: Option<SessionAddress>,
+    external_title: Option<SessionTitle>,
+    header: HeaderRow,
+}
+
+impl OpenedRow {
+    pub(super) fn of(row: &Conversation) -> Self {
+        Self {
+            path: row.path.clone(),
+            source: row.source,
+            session_id: row.session_id.clone(),
+            publication: row.publication.clone(),
+            cache_address: row.cache_address.clone(),
+            external_title: row.external_title.clone(),
+            header: HeaderRow::of(row),
+        }
+    }
+
+    /// The viewer's read of the row's copy in `cache`; `None` for a row
+    /// without an address in the cache.
+    fn read(&self, cache: &InteractiveCache) -> Option<InteractiveRead<ViewedConversation>> {
+        let address = self.cache_address.as_ref()?;
+        Some(parse_conversation_file_interactively(
+            cache,
+            address,
+            &self.publication,
+        ))
+    }
+}
+
+/// The viewer's read of a row's copy, running on a thread of its own so the
+/// drawing thread keeps drawing while it runs.
+pub(super) struct OpeningRead {
+    read: mpsc::Receiver<RowRead>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// A row the viewer opens, with the viewer's read of its copy.
+pub(super) type RowRead = (OpenedRow, Option<InteractiveRead<ViewedConversation>>);
+
+impl OpeningRead {
+    pub(super) fn start(row: OpenedRow, cache: InteractiveCache) -> Self {
+        let (send, read) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("viewer-read".into())
+            .spawn(move || {
+                let read = row.read(&cache);
+                let _ = send.send((row, read));
+            })
+            .expect("failed to spawn the viewer's read thread");
+        Self { read, thread }
+    }
+
+    /// The row and its read, once the read lands within `wait`; `Err(self)`
+    /// while it runs. A panic on the read's thread resumes here.
+    pub(super) fn finish(self, wait: Duration) -> Result<RowRead, Self> {
+        match self.read.recv_timeout(wait) {
+            Ok(read) => Ok(read),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(self),
+            Err(mpsc::RecvTimeoutError::Disconnected) => match self.thread.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(()) => panic!("the viewer's read thread ended without its read"),
+            },
+        }
+    }
+}
+
 /// A finished refresh's read of the open session.
 enum OpenSessionRead {
     Listed(Box<ReloadedSession>),
@@ -177,32 +251,33 @@ impl App {
         let Some(&conv_idx) = self.filtered.get(selected) else {
             return;
         };
-        self.open_conversation(conv_idx, frame_width);
+        let row = OpenedRow::of(&self.conversations[conv_idx]);
+        let read = row.read(&self.interactive_cache());
+        self.show_opened(row, read, frame_width);
     }
 
-    pub(super) fn open_conversation(&mut self, conv_idx: usize, frame_width: usize) {
-        use crate::tui::viewer::{
-            content_width, parse_conversation_file_interactively, render_parsed_conversation,
-        };
+    /// Show `row` in the viewer, from `read`, the viewer's read of its copy.
+    pub(super) fn show_opened(
+        &mut self,
+        row: OpenedRow,
+        read: Option<InteractiveRead<ViewedConversation>>,
+        frame_width: usize,
+    ) {
+        use crate::tui::viewer::{content_width, render_parsed_conversation};
 
-        let path = self.conversations[conv_idx].path.clone();
-        let source = self.conversations[conv_idx].source;
-        let session_id = Some(self.conversations[conv_idx].session_id.clone());
-        let publication = self.conversations[conv_idx].publication.clone();
-        let cache_address = self.conversations[conv_idx].cache_address.clone();
-        let external_title = self.conversations[conv_idx].external_title.clone();
-        let header = HeaderRow::of(&self.conversations[conv_idx]);
-
-        let (copy, adopted) = match &cache_address {
-            Some(address) => {
-                let read = parse_conversation_file_interactively(
-                    &self.interactive_cache(),
-                    address,
-                    &publication,
-                );
-                self.take_interactive(&path, read)
-                    .current_or_older_with_adopted()
-            }
+        let OpenedRow {
+            path,
+            source,
+            session_id,
+            publication,
+            cache_address,
+            external_title,
+            header,
+        } = row;
+        let (copy, adopted) = match read {
+            Some(read) => self
+                .take_interactive(&path, read)
+                .current_or_older_with_adopted(),
             None => (None, None),
         };
         let is_copy_missing = copy.is_none();
@@ -231,7 +306,7 @@ impl App {
             conversation_path: path,
             conversation_source: Some(source),
             cache_address,
-            session_id,
+            session_id: Some(session_id),
             publication,
             header: Some(header),
             external_title,

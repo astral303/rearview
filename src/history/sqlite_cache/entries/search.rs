@@ -13,15 +13,23 @@ use std::borrow::Cow;
 
 /// One entry's search texts.
 pub(super) struct EntrySearch {
-    /// For each of the entry's blocks, the field search reads its stored
-    /// text in.
-    pub(super) blocks: Vec<Option<SearchField>>,
-    /// The texts no block holds as written, each with its field.
+    /// For each of the entry's blocks, where search reads its stored text.
+    pub(super) blocks: Vec<Option<TextPlace>>,
+    /// The texts no block holds as written, each with its place.
     pub(super) derived: Vec<DerivedText>,
 }
 
-pub(super) struct DerivedText {
+/// Where search reads one of an entry's texts: its field, and its position
+/// among the entry's search texts in the order the parse lays them out, so
+/// a read of the cache lays them out as the parse does.
+#[derive(Clone, Copy)]
+pub(super) struct TextPlace {
     pub(super) field: SearchField,
+    pub(super) position: i64,
+}
+
+pub(super) struct DerivedText {
+    pub(super) place: TextPlace,
     pub(super) text: String,
 }
 
@@ -43,25 +51,28 @@ pub(super) fn entry_search(
     }
     let block_texts: Vec<Option<BlockText>> = blocks.iter().map(BlockText::of).collect();
     let fields = [SearchField::Full, SearchField::Agent, SearchField::Thinking];
-    for (field, texts) in fields.into_iter().zip(parts) {
-        for text in texts {
-            let searched = searched_text(&text, &block_texts);
-            if searched.is_empty() {
-                continue;
-            }
-            let holder = block_texts
-                .iter()
-                .zip(&search.blocks)
-                .position(|(block, held)| {
-                    held.is_none()
-                        && block
-                            .as_ref()
-                            .is_some_and(|block| block.searched == searched)
-                });
-            match holder {
-                Some(index) => search.blocks[index] = Some(field),
-                None => search.derived.push(DerivedText { field, text }),
-            }
+    let texts = fields
+        .into_iter()
+        .zip(parts)
+        .flat_map(|(field, texts)| texts.into_iter().map(move |text| (field, text)));
+    for (position, (field, text)) in (0..).zip(texts) {
+        let searched = searched_text(&text, &block_texts);
+        if searched.is_empty() {
+            continue;
+        }
+        let place = TextPlace { field, position };
+        let holder = block_texts
+            .iter()
+            .zip(&search.blocks)
+            .position(|(block, held)| {
+                held.is_none()
+                    && block
+                        .as_ref()
+                        .is_some_and(|block| block.searched == searched)
+            });
+        match holder {
+            Some(index) => search.blocks[index] = Some(place),
+            None => search.derived.push(DerivedText { place, text }),
         }
     }
     search

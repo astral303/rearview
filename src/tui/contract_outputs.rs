@@ -126,12 +126,13 @@ fn searched_frame(app: &mut App, query: &str) -> String {
     frame
 }
 
-/// Waits for the search worker to answer the latest query.
+/// Waits for the search worker to answer the latest query over every
+/// session's texts.
 fn settle_search(app: &mut App) {
     let started = Instant::now();
     loop {
         app.receive_search_results();
-        if !app.has_search_work_in_flight() {
+        if !app.has_search_work_in_flight() && !app.is_reading_search_texts() {
             return;
         }
         assert!(
@@ -149,7 +150,7 @@ fn viewer_text(app: &mut App, heading: &str) -> String {
     press(app, KeyCode::Home);
     for row in 0..app.filtered().len() {
         assert!(app.request_open(), "row {row} opens");
-        app.complete_pending_open(FRAME_WIDTH as usize);
+        app.finish_pending_open_for_test(FRAME_WIDTH as usize);
         let AppMode::View(state) = app.app_mode() else {
             panic!("row {row} opens a viewer");
         };

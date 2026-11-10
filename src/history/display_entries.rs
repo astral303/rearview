@@ -232,10 +232,10 @@ pub fn display_log_entries_interactively(
     publication: &Publication,
 ) -> InteractiveRead<DisplayEntries> {
     cache.read(|reader| {
-        let Some((session, currency)) = newest_copy(reader, address, publication)? else {
+        let Some((_, entries, currency)) = newest_copy(reader, address, publication)? else {
             return Ok(None);
         };
-        Ok(session.entries()?.map(|entries| CachedCopy {
+        Ok(Some(CachedCopy {
             value: DisplayEntries::from(entries),
             currency,
         }))
@@ -258,7 +258,7 @@ pub fn viewed_copy_interactively(
     publication: &Publication,
 ) -> InteractiveRead<ViewedCopy> {
     cache.read(|reader| {
-        let Some((session, currency)) = newest_copy(reader, address, publication)? else {
+        let Some((session, entries, currency)) = newest_copy(reader, address, publication)? else {
             return Ok(None);
         };
         let generation = Publication::Published {
@@ -268,7 +268,7 @@ pub fn viewed_copy_interactively(
             .catalogue_row_at(address)?
             .filter(|row| row.publication == generation)
             .map(Box::new);
-        Ok(session.entries()?.map(|entries| CachedCopy {
+        Ok(Some(CachedCopy {
             value: ViewedCopy {
                 entries: DisplayEntries::from(entries),
                 row,
@@ -278,20 +278,21 @@ pub fn viewed_copy_interactively(
     })
 }
 
-/// The newest copy `reader` holds of the session at `address`, read as it
-/// is, with its currency for a row whose publication is `publication`;
-/// `None` when the cache does not hold it.
+/// The newest copy `reader` holds of the session at `address`, its entries
+/// read as it holds them, with its currency for a row whose publication is
+/// `publication`, on `reader`'s connection; `None` when the cache does not
+/// hold it.
 fn newest_copy(
     reader: &super::sqlite_cache::SqliteCache,
     address: &SessionAddress,
     publication: &Publication,
-) -> Result<Option<(CachedSession, Currency)>> {
+) -> Result<Option<(CachedSession, TranscriptEntries, Currency)>> {
     let Some(session) = reader.copy_at(address)? else {
         return Ok(None);
     };
     Ok(session
-        .currency(publication)?
-        .map(|currency| (session.ignoring_source_changes(), currency)))
+        .entries_with_currency(reader, publication)?
+        .map(|(entries, currency)| (session, entries, currency)))
 }
 
 /// A bare file's [`sniffed_session`] as the viewer and the terminal printout

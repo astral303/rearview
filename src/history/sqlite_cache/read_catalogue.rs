@@ -469,8 +469,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let rows = [*current];
         let searchable = crate::search::precompute_search_text(&rows);
-        assert!(
-            crate::search::try_search(&rows, &searchable, "original", Local::now()).is_ok(),
+        let texts = crate::search::SearchTextsInMemory::read(&rows);
+        assert_eq!(
+            crate::search::search_with_texts(&rows, &searchable, &texts, "original", Local::now()),
+            vec![0],
             "a row whose transcript is gone is searched in its copy"
         );
     }
@@ -507,17 +509,6 @@ mod tests {
             assert_eq!(cached.subagents.len(), original.subagents.len());
             assert!(cached.full_text.is_empty());
             assert!(cached.semantic_turns.is_empty());
-            let mut parts = 0;
-            assert_eq!(
-                cached
-                    .cached_session
-                    .as_ref()
-                    .unwrap()
-                    .search_parts(&cached, |_| parts += 1)
-                    .unwrap(),
-                Some(())
-            );
-            assert!(parts > 0);
             let content = cached.load_content().unwrap();
             for (actual, expected) in [
                 (&content.full_text, &original.full_text),

@@ -1,10 +1,9 @@
 use super::digest::Digest;
-use super::search::EntrySearch;
+use super::search::{EntrySearch, TextPlace};
 use super::write::SearchPlace;
-use super::{ReadPurpose, Selection};
+use super::{Selection, text_with_codes};
 use crate::agent::sanitize::{split_terminal_codes, without_terminal_codes};
 use crate::agent::transcript::tool_result_item_text;
-use crate::history::sqlite_cache::SearchField;
 use crate::log_entry::{ContentBlock, Tool};
 use rusqlite::{Connection, Row, Statement, params};
 use serde_json::{Value, json};
@@ -21,8 +20,9 @@ impl<'connection> Writer<'connection> {
         Ok(Self {
             part: connection.prepare(
                 "INSERT INTO parts (session, entry, part, kind, search_field, entry_sequence, \
-                 message_ordinal, text, text_codes, call_id, name, tool, json, result_shape) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 message_ordinal, search_position, text, text_codes, call_id, name, tool, json, \
+                 result_shape) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?,
             item: connection.prepare(
                 "INSERT INTO result_items (part, position, kind, text, text_codes, item_type) \
@@ -45,16 +45,17 @@ impl<'connection> Writer<'connection> {
     ) -> rusqlite::Result<()> {
         for (position, block) in blocks.iter().enumerate() {
             let columns = Columns::of(block);
-            let field = block_field(&columns, search.blocks[position]);
+            let searched = block_place(&columns, search.blocks[position]);
             let text = columns.text.map(split_terminal_codes);
             self.part.execute(params![
                 session,
                 entry,
                 position as i64,
                 columns.kind,
-                field.map(SearchField::code),
-                field.map(|_| place.sequence),
-                field.and(place.ordinal),
+                searched.map(|searched| searched.field.code()),
+                searched.map(|_| place.sequence),
+                searched.and(place.ordinal),
+                searched.map(|searched| searched.position),
                 text.as_ref().map(|text| &*text.text),
                 text.as_ref().and_then(|text| text.codes.as_deref()),
                 columns.call_id,
@@ -76,16 +77,17 @@ impl<'connection> Writer<'connection> {
                 ])?;
             }
         }
-        for (offset, (kind, field, text)) in search_only_parts(blocks, search).enumerate() {
+        for (offset, (kind, searched, text)) in search_only_parts(blocks, search).enumerate() {
             let (kind, text) = kind.columns(&text);
             self.part.execute(params![
                 session,
                 entry,
                 (blocks.len() + offset) as i64,
                 kind,
-                field.code(),
+                searched.field.code(),
                 place.sequence,
                 place.ordinal,
+                searched.position,
                 text,
                 None::<&str>,
                 None::<&str>,
@@ -100,40 +102,40 @@ impl<'connection> Writer<'connection> {
 }
 
 /// The parts search alone reads, numbered after the entry's blocks, each as
-/// its kind, field and text: a [`SearchOnlyKind::ResultText`] part for each
+/// its kind, place and text: a [`SearchOnlyKind::ResultText`] part for each
 /// searched result with items in `result_items`, in block order, then a
 /// [`SearchOnlyKind::Derived`] part for each derived text.
 fn search_only_parts<'a>(
     blocks: &'a [ContentBlock],
     search: &'a EntrySearch,
-) -> impl Iterator<Item = (SearchOnlyKind, SearchField, Cow<'a, str>)> {
+) -> impl Iterator<Item = (SearchOnlyKind, TextPlace, Cow<'a, str>)> {
     let results = blocks
         .iter()
         .zip(&search.blocks)
-        .filter_map(|(block, field)| {
-            let field = (*field)?;
+        .filter_map(|(block, place)| {
+            let place = (*place)?;
             let items = stored_items(block, &Columns::of(block))?;
             Some((
                 SearchOnlyKind::ResultText,
-                field,
+                place,
                 Cow::Owned(searched_items_text(items)),
             ))
         });
     let derived = search.derived.iter().map(|derived| {
         (
             SearchOnlyKind::Derived,
-            derived.field,
+            derived.place,
             Cow::Borrowed(derived.text.as_str()),
         )
     });
     results.chain(derived)
 }
 
-/// The field a block's own part is read in: `None` for a result with items
-/// in `result_items`. Search reads that result through its
+/// Where search reads a block's own part: `None` for a result with items in
+/// `result_items`. Search reads that result through its
 /// [`SearchOnlyKind::ResultText`] part.
-fn block_field(columns: &Columns<'_>, field: Option<SearchField>) -> Option<SearchField> {
-    field.filter(|_| columns.result_shape != Some(LOSSLESS_ARRAY))
+fn block_place(columns: &Columns<'_>, place: Option<TextPlace>) -> Option<TextPlace> {
+    place.filter(|_| columns.result_shape != Some(LOSSLESS_ARRAY))
 }
 
 /// The search text of a result with `items`: each text item without
@@ -148,13 +150,14 @@ pub(super) fn searched_items_text(items: &[Value]) -> String {
 }
 
 /// Feeds `digest` what [`Writer::write`] stores of `blocks` and `search`'s
-/// fields of them.
-pub(super) fn digest(digest: &mut Digest, blocks: &[ContentBlock], search: &[Option<SearchField>]) {
+/// places of them.
+pub(super) fn digest(digest: &mut Digest, blocks: &[ContentBlock], search: &[Option<TextPlace>]) {
     digest.number(Some(blocks.len() as i64));
-    for (block, field) in blocks.iter().zip(search) {
+    for (block, place) in blocks.iter().zip(search) {
         let columns = Columns::of(block);
         digest.text(Some(columns.kind));
-        digest.number(field.map(SearchField::code));
+        digest.number(place.map(|place| place.field.code()));
+        digest.number(place.map(|place| place.position));
         for text in [
             columns.text,
             columns.call_id,
@@ -327,11 +330,6 @@ impl SearchOnlyKind {
     }
 }
 
-/// [`SearchOnlyKind::Derived`]'s `kind` column.
-pub(in crate::history::sqlite_cache) const DERIVED: &str = SearchOnlyKind::Derived.name();
-/// [`SearchOnlyKind::ResultText`]'s `kind` column.
-pub(in crate::history::sqlite_cache) const RESULT_TEXT: &str = SearchOnlyKind::ResultText.name();
-
 /// A result array whose every item is a string or a text item:
 /// `result_items` holds it.
 const LOSSLESS_ARRAY: &str = "array";
@@ -363,11 +361,7 @@ fn tool_text(tool: Tool) -> String {
 
 pub(super) type Blocks = HashMap<i64, Vec<ContentBlock>>;
 
-pub(super) fn read(
-    connection: &Connection,
-    selected: &Selection,
-    purpose: ReadPurpose,
-) -> rusqlite::Result<Blocks> {
+pub(super) fn read(connection: &Connection, selected: &Selection) -> rusqlite::Result<Blocks> {
     let mut items: HashMap<i64, Vec<Value>> = HashMap::new();
     let mut statement = connection.prepare(&format!(
         "SELECT i.part, i.kind, i.text, i.text_codes, i.item_type FROM result_items i \
@@ -378,7 +372,7 @@ pub(super) fn read(
     let mut rows = statement.query(rusqlite::params_from_iter(&selected.parameters))?;
     while let Some(row) = rows.next()? {
         let kind: String = row.get(1)?;
-        let text = purpose.text(row, 2, 3)?;
+        let text = text_with_codes(row, 2, 3)?;
         let item_type: Option<String> = row.get(4)?;
         let value = if kind == "string" {
             json!(text.unwrap_or_default())
@@ -407,7 +401,7 @@ pub(super) fn read(
     let mut rows = statement.query(rusqlite::params_from_iter(&selected.parameters))?;
     while let Some(row) = rows.next()? {
         let array = items.remove(&row.get::<_, i64>(1)?);
-        let text = purpose.text(row, 3, 4)?;
+        let text = text_with_codes(row, 3, 4)?;
         blocks
             .entry(row.get(0)?)
             .or_default()

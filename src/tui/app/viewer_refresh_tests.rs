@@ -180,7 +180,7 @@ fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
         .iter()
         .position(|&index| app.conversations()[index].path != opened_first);
     assert!(app.request_open());
-    assert!(app.complete_pending_open(80));
+    assert!(app.finish_pending_open_for_test(80));
     let next_session = view(&app).conversation_path.clone();
     serve_session_refresh(&mut app);
 
@@ -1239,18 +1239,20 @@ fn list_search_misses(
 ) -> Vec<String> {
     let mut wrong = Vec::new();
     let in_memory = crate::search::SearchTextsInMemory::read(conversations);
-    for (texts, read) in [
-        (&in_memory, "with the texts held in memory"),
+    let without_texts = crate::search::SearchTextsInMemory::default();
+    let name_queries = [("yakety".to_owned(), 1), ("zebrafish".to_owned(), 0)];
+    let body_query = (format!("yakety {body_word}"), 1);
+    // A row without held texts is searched on its title, summary and
+    // project name: whether its body word matches depends on its summary.
+    for (texts, read, queries) in [
         (
-            &crate::search::SearchTextsInMemory::default(),
-            "without held texts",
+            &in_memory,
+            "with the texts held in memory",
+            [name_queries.as_slice(), std::slice::from_ref(&body_query)].concat(),
         ),
+        (&without_texts, "without held texts", name_queries.to_vec()),
     ] {
-        for (query, expected) in [
-            ("yakety".to_owned(), 1),
-            (format!("yakety {body_word}"), 1),
-            ("zebrafish".to_owned(), 0),
-        ] {
+        for (query, expected) in queries {
             let found = crate::search::try_debug_search(
                 conversations,
                 searchable,
@@ -1275,7 +1277,7 @@ fn list_search_misses(
 /// The misses of the readers other than the list's search, for the session
 /// of `conversations` renamed from "Zebrafish plans" to "Yakety release":
 /// the list's evidence and context lines, `agent search`'s ranking and exact
-/// filter, the agent's semantic route and the semantic worker's exact
+/// filter, the agent's semantic route and the semantic search's exact
 /// preview.
 fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
     use crate::search::lexical::{RetrievalTerms, precompute_agent_search_text, try_agent_search};
@@ -1361,15 +1363,12 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
         .cloned()
         .map(std::sync::Arc::new)
         .collect::<Vec<_>>();
-    let preview = crate::tui::semantic_worker::exact_literal_semantic_response(
-        0,
-        false,
+    let preview = super::exact_literal::exact_literal_results(
         &shared,
+        &in_memory,
         &[0],
         &ParsedQuery::parse("\"yakety\""),
-        chrono::Local::now(),
     )
-    .metadata
     .remove(&0)
     .map(|metadata| metadata.explanation.evidence_preview);
     if !preview
@@ -1377,7 +1376,7 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
         .is_some_and(|preview| preview.contains("Yakety"))
     {
         wrong.push(format!(
-            "the semantic worker's exact preview shows the new name: {preview:?}"
+            "the semantic search's exact preview shows the new name: {preview:?}"
         ));
     }
     wrong

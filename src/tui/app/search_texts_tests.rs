@@ -1,8 +1,9 @@
 use super::claude_home::{ClaudeHome, admitted_cache};
 use crate::clock::TestClock;
+use crate::history::sqlite_cache::CachedSession;
 use crate::history::{Conversation, Environment, ProcessIdentity};
-use crate::search::SearchTextsInMemory;
 use crate::search::lexical::SessionSearchTexts;
+use crate::search::{SearchTextsInMemory, SessionsWithoutTexts};
 use chrono::Local;
 use std::sync::Arc;
 
@@ -19,8 +20,7 @@ fn read_missing(texts: &mut SearchTextsInMemory, rows: &[Conversation]) -> usize
 
 fn found(rows: &[Conversation], texts: &SearchTextsInMemory, query: &str) -> Vec<String> {
     let searchable = crate::search::precompute_search_text(rows);
-    crate::search::try_search_with_texts(rows, &searchable, texts, query, Local::now())
-        .unwrap()
+    crate::search::search_with_texts(rows, &searchable, texts, query, Local::now())
         .into_iter()
         .map(|index| rows[index].session_id.clone())
         .collect()
@@ -51,8 +51,16 @@ fn cached_rows(home: &ClaudeHome, environment: &Environment) -> Vec<Conversation
     rows
 }
 
+/// Holds the read of each of `copies`.
+fn finish_reads(texts: &mut SearchTextsInMemory, copies: &[CachedSession]) {
+    for cached in copies {
+        let read = SessionSearchTexts::read(cached).unwrap().map(Arc::new);
+        texts.finish_read(cached.copy_key(), read);
+    }
+}
+
 #[test]
-fn rewritten_session_replaces_its_texts_in_memory_and_deleted_session_drops_them() {
+fn rewritten_session_keeps_its_texts_until_new_copys_read_and_deleted_session_drops_them() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["original wording"]);
     let b = home.write("b", 10, &["unrelated"]);
@@ -64,15 +72,22 @@ fn rewritten_session_replaces_its_texts_in_memory_and_deleted_session_drops_them
 
     home.append(&a, 6, "revised wording");
     let rewritten = cached_rows(&home, &environment);
+    let reading = texts.keep_copies_of(&rewritten).copies;
+    assert_eq!(reading.len(), 1, "only the rewritten session is read again");
     assert_eq!(
-        read_missing(&mut texts, &rewritten),
-        1,
-        "only the rewritten session is read again"
+        (
+            found(&rewritten, &texts, "original"),
+            found(&rewritten, &texts, "revised")
+        ),
+        (vec!["a".to_owned()], Vec::new()),
+        "until its new copy is read, the rewritten session is searched in its previous texts"
     );
-    assert!(
-        texts.get(row(&first, "a")).is_none(),
-        "the old copy's texts are dropped"
+    assert_eq!(
+        texts.sessions_without_texts(),
+        SessionsWithoutTexts::default(),
+        "a session searched in its previous texts doesn't count as loading"
     );
+    finish_reads(&mut texts, &reading);
     assert_eq!(found(&rewritten, &texts, "revised"), ["a"]);
 
     std::fs::remove_file(&b).unwrap();
@@ -121,27 +136,63 @@ fn first_read_covers_every_row_and_read_after_change_covers_changed_row() {
 }
 
 #[test]
-fn search_before_texts_are_read_returns_cache_paths_results() {
+fn search_reads_held_texts_alone_and_counts_sessions_still_loading() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["shared needle", "only in a"]);
     home.write("b", 10, &["shared needle twice needle"]);
     let (_cache, environment) = caching_environment(&home);
     let rows = cached_rows(&home, &environment);
-    let not_read = SearchTextsInMemory::default();
     let mut partly_read = SearchTextsInMemory::default();
     let copies = partly_read.keep_copies_of(&rows).copies;
-    let first = &copies[0];
-    partly_read.finish_read(
-        first.copy_key(),
-        SessionSearchTexts::read(first).unwrap().map(Arc::new),
-    );
+    finish_reads(&mut partly_read, &copies[..1]);
+    let held = &rows[0].session_id;
     let mut all_read = SearchTextsInMemory::default();
     read_missing(&mut all_read, &rows);
 
+    assert_eq!(
+        partly_read.sessions_without_texts(),
+        SessionsWithoutTexts {
+            loading: 1,
+            unreadable: 0
+        },
+        "the session whose texts are being read counts as loading"
+    );
     for query in ["needle", "shared needle", "only", "\"twice needle\""] {
-        let from_cache = found(&rows, &not_read, query);
-        assert!(!from_cache.is_empty(), "{query:?} finds a session");
-        assert_eq!(found(&rows, &partly_read, query), from_cache, "{query:?}");
-        assert_eq!(found(&rows, &all_read, query), from_cache, "{query:?}");
+        let every_text = found(&rows, &all_read, query);
+        assert!(!every_text.is_empty(), "{query:?} finds a session");
+        assert_eq!(
+            found(&rows, &partly_read, query),
+            every_text
+                .into_iter()
+                .filter(|found| found == held)
+                .collect::<Vec<_>>(),
+            "{query:?}: the search finds the session whose texts are held alone"
+        );
     }
+}
+
+#[test]
+fn failed_read_counts_as_unreadable_and_is_read_again_when_rows_change() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["needle"]);
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    let mut texts = SearchTextsInMemory::default();
+    let copies = texts.keep_copies_of(&rows).copies;
+    texts.finish_read(copies[0].copy_key(), None);
+
+    assert_eq!(
+        texts.sessions_without_texts(),
+        SessionsWithoutTexts {
+            loading: 0,
+            unreadable: 1
+        },
+        "a failed read counts as unreadable, not loading"
+    );
+    assert_eq!(
+        read_missing(&mut texts, &rows),
+        1,
+        "the next change of the rows reads the session again"
+    );
+    assert_eq!(found(&rows, &texts, "needle"), ["a"]);
 }

@@ -4,7 +4,6 @@
 //! of the window's messages through `parts_by_message`. A text's row holds
 //! its session, its place and its message number.
 
-use super::entries::{DERIVED, RESULT_TEXT};
 use super::{CachedSession, SearchedFields, SqliteCache, entries};
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
@@ -24,13 +23,13 @@ pub(crate) struct ScannedRow {
 }
 
 /// A text's place in its session's order: its layout group, then its
-/// entry's place in the session, then its part's place in the entry, or
-/// among the parts outside every entry.
+/// entry's place in the session, then its position among the entry's search
+/// texts, or its part's place among the parts outside every entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ReadOrder {
     pub(super) group: LayoutGroup,
     pub(super) sequence: i64,
-    pub(super) part: i64,
+    pub(super) position: i64,
 }
 
 /// The caller's side of a scan, one per task.
@@ -50,30 +49,15 @@ pub(crate) trait TextVisitor: Send {
 /// joined search text lays them out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum LayoutGroup {
-    /// Blocks' parts.
-    Block,
-    /// Parts of kind `result-text`.
-    ResultText,
-    /// Parts of kind `derived`.
-    Derived,
+    /// An entry's parts.
+    Entry,
     /// Parts of kind `subagent-metadata`, outside every entry.
     SubagentMetadata,
 }
 
-impl LayoutGroup {
-    /// The group of a part of `kind` holding search text. A part of any kind
-    /// but a search-only one holds a block.
-    pub(super) fn of_part(kind: &str) -> Self {
-        match kind {
-            DERIVED => Self::Derived,
-            RESULT_TEXT => Self::ResultText,
-            _ => Self::Block,
-        }
-    }
-}
-
 /// The columns a scan reads of each part holding search text.
-const SCANNED_PART_COLUMNS: &str = "session, entry_sequence, message_ordinal, part, kind, text";
+const SCANNED_PART_COLUMNS: &str =
+    "session, entry_sequence, message_ordinal, search_position, text";
 
 /// The parts holding search text in `fields` with ids from `?1` to `?2`, of
 /// the sessions `only` keeps.
@@ -511,7 +495,7 @@ impl KeySplit {
     }
 }
 
-/// A search text's place, as its part's row stores it.
+/// An entry's search text's place, as its part's row stores it.
 #[derive(Clone, Copy)]
 pub(super) struct StoredPlace {
     /// The entry's `sequence`.
@@ -519,15 +503,21 @@ pub(super) struct StoredPlace {
     /// The number of the message the entry contributes to; `None` for text
     /// outside every message.
     pub(super) ordinal: Option<i64>,
+    /// The text's `search_position` in its entry.
+    position: i64,
 }
 
 impl StoredPlace {
-    /// The place in the columns `entry_sequence` and `message_ordinal` at
-    /// `columns`.
-    pub(super) fn at(row: &rusqlite::Row<'_>, columns: (usize, usize)) -> rusqlite::Result<Self> {
+    /// The place in the columns `entry_sequence`, `message_ordinal` and
+    /// `search_position` at `columns`.
+    pub(super) fn at(
+        row: &rusqlite::Row<'_>,
+        columns: (usize, usize, usize),
+    ) -> rusqlite::Result<Self> {
         Ok(Self {
             sequence: row.get(columns.0)?,
             ordinal: row.get(columns.1)?,
+            position: row.get(columns.2)?,
         })
     }
 
@@ -535,6 +525,15 @@ impl StoredPlace {
     pub(super) fn message(self) -> Option<usize> {
         self.ordinal
             .and_then(|ordinal| usize::try_from(ordinal).ok())
+    }
+
+    /// The text's place in its session's order.
+    pub(super) fn order(self) -> ReadOrder {
+        ReadOrder {
+            group: LayoutGroup::Entry,
+            sequence: self.sequence,
+            position: self.position,
+        }
     }
 }
 
@@ -575,14 +574,13 @@ impl TaskScan<'_> {
         let mut statement = self.connection.prepare_cached(sql)?;
         let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         while let Some(row) = rows.next()? {
-            let (session, text) = (row.get(0)?, text_at(row, 5)?);
+            let (session, text) = (row.get(0)?, text_at(row, 4)?);
             let examined = visitor.examine(text);
             let shows_text = self.shows_text(session, text);
             if !examined && !shows_text {
                 continue;
             }
-            let order = (LayoutGroup::of_part(text_at(row, 4)?), row.get(3)?);
-            if let Some(scanned) = self.entry_row(session, StoredPlace::at(row, (1, 2))?, order) {
+            if let Some(scanned) = self.entry_row(session, StoredPlace::at(row, (1, 2, 3))?) {
                 self.visit(visitor, session, &scanned, text, (examined, shows_text));
             }
         }
@@ -609,7 +607,7 @@ impl TaskScan<'_> {
                     order: ReadOrder {
                         group: LayoutGroup::SubagentMetadata,
                         sequence: 0,
-                        part: row.get(1)?,
+                        position: row.get(1)?,
                     },
                 };
                 self.visit(visitor, session, &scanned, text, (examined, shows_text));
@@ -644,15 +642,9 @@ impl TaskScan<'_> {
         }
     }
 
-    /// The row of a text of `session` at `place`, in `group` at `part` in its
-    /// entry; `None` when its session is not scanned, or the window leaves
-    /// the text out.
-    fn entry_row(
-        &self,
-        session: i64,
-        place: StoredPlace,
-        (group, part): (LayoutGroup, i64),
-    ) -> Option<ScannedRow> {
+    /// The row of an entry's text of `session` at `place`; `None` when its
+    /// session is not scanned, or the window leaves the text out.
+    fn entry_row(&self, session: i64, place: StoredPlace) -> Option<ScannedRow> {
         let copy = self.copy_of(session)?;
         if let Some(window) = &self.scan.window
             && !window.holds(session, place.ordinal)
@@ -662,11 +654,7 @@ impl TaskScan<'_> {
         Some(ScannedRow {
             copy,
             ordinal: place.message(),
-            order: ReadOrder {
-                group,
-                sequence: place.sequence,
-                part,
-            },
+            order: place.order(),
         })
     }
 
@@ -763,8 +751,8 @@ mod tests {
             .connection
             .execute(
                 "INSERT INTO parts (session, entry, part, kind, search_field, entry_sequence, \
-                 text) SELECT session, id, 1000, 'text', 0, sequence, 'outside every message' \
-                 FROM entries WHERE message IS NULL",
+                 search_position, text) SELECT session, id, 1000, 'text', 0, sequence, 1000, \
+                 'outside every message' FROM entries WHERE message IS NULL",
                 [],
             )
             .unwrap();
@@ -809,31 +797,44 @@ mod tests {
     }
 
     #[test]
-    fn every_layout_group_contributes_texts() {
+    fn every_layout_group_and_kind_of_part_holding_search_text_contributes_texts() {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies(base.path());
-        let copies = copies.iter().collect::<Vec<_>>();
+        let references = copies.iter().collect::<Vec<_>>();
 
-        let kept = kept_rows(&copies, SearchedFields::Agent, &TimeFilter::default());
+        let kept = kept_rows(&references, SearchedFields::Agent, &TimeFilter::default());
         let groups = kept
             .iter()
             .map(|(_, (order, ..))| order.group)
             .collect::<BTreeSet<_>>();
         assert_eq!(
             groups,
-            BTreeSet::from([
-                LayoutGroup::Block,
-                LayoutGroup::ResultText,
-                LayoutGroup::Derived,
-                LayoutGroup::SubagentMetadata
-            ]),
-            "block parts, result texts, derived parts and sub-agent metadata parts each hold a text"
+            BTreeSet::from([LayoutGroup::Entry, LayoutGroup::SubagentMetadata]),
+            "entries' parts and sub-agent metadata parts each hold a text"
         );
         assert!(
             kept.iter()
-                .any(|(_, (order, ordinal, _))| order.group == LayoutGroup::Block
+                .any(|(_, (order, ordinal, _))| order.group == LayoutGroup::Entry
                     && ordinal.is_none()),
             "a part outside every message holds a text"
+        );
+        let cache = SqliteCache::open_waiting(&copies[0].base).unwrap().unwrap();
+        let kinds = cache
+            .connection
+            .prepare(
+                "SELECT DISTINCT kind FROM parts WHERE search_field IS NOT NULL AND text <> ''",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap();
+        assert!(
+            ["text", "result-text", "derived", "subagent-metadata"]
+                .iter()
+                .all(|kind| kinds.contains(*kind)),
+            "block parts, result texts, derived parts and sub-agent metadata parts each hold a \
+             text: {kinds:?}"
         );
     }
 
@@ -894,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_read_holds_texts_of_session_replaced_since_its_row() {
+    fn launch_read_and_read_per_copy_hold_texts_of_session_replaced_since_its_row() {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies(base.path());
         let alone = |copy: &CachedSession| {
@@ -906,20 +907,22 @@ mod tests {
         };
         let expected = alone(&copies[1]);
         super::super::tests::replace_copy(&copies[1]);
-        let read = crate::search::CopiesToRead {
-            copies: copies.clone(),
-            are_every_row: true,
+        for (are_every_row, read) in [(true, "the launch read"), (false, "a read per copy")] {
+            let texts = crate::search::CopiesToRead {
+                copies: copies.clone(),
+                are_every_row,
+            }
+            .read();
+            assert!(
+                texts.iter().all(|(_, texts)| texts.is_some()),
+                "{read}: every row holds texts"
+            );
+            assert_eq!(
+                texts[1].1.as_ref().unwrap().joined(),
+                &expected,
+                "{read}: the replaced row holds the texts of the copy the cache holds"
+            );
         }
-        .read();
-        assert!(
-            read.iter().all(|(_, texts)| texts.is_some()),
-            "every row holds texts"
-        );
-        assert_eq!(
-            read[1].1.as_ref().unwrap().joined(),
-            &expected,
-            "the replaced row holds the texts of the copy the cache holds"
-        );
     }
 
     #[test]

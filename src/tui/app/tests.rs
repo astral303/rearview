@@ -328,11 +328,11 @@ fn stale_response_with_current_generation_but_old_mode_is_ignored() {
     app.selected = None;
 
     tx.send(SearchResponse {
-        error: None,
         filtered: vec![0],
         generation: 7,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
+        exact_literal_results: None,
     })
     .unwrap();
 
@@ -816,7 +816,8 @@ fn semantic_search_worker_returns_lexical_fallback() {
             default_mode: ListSearchMode::Semantic,
         },
     );
-    let (tx, rx) = spawn_search_worker(Arc::new(TestClock::default()));
+    let worker = spawn_search_worker(Arc::new(TestClock::default()));
+    let (tx, rx) = (worker.commands, worker.results);
     tx.send(SearchCommand::UpdateData {
         conversations: app.conversations_snapshot.clone(),
         searchable: Arc::new(app.searchable.clone()),
@@ -834,6 +835,74 @@ fn semantic_search_worker_returns_lexical_fallback() {
     assert_eq!(response.filtered, vec![0]);
     assert_eq!(response.generation, 7);
     assert_eq!(response.mode, ListSearchMode::Semantic);
+}
+
+/// A semantic query of quoted phrases alone: the search worker answers it
+/// as exact matches, newest first within the list's filters, and the
+/// semantic worker gets no search.
+#[test]
+fn quoted_only_semantic_query_shows_search_workers_exact_matches_newest_first() {
+    let row = |project, uuid, text, day| {
+        let mut row = conversation(Some(project), &format!("-tmp-{project}"), uuid, text);
+        row.timestamp = Local.with_ymd_and_hms(2026, 5, day, 12, 0, 0).unwrap();
+        row
+    };
+    let mut app = app_with_options(
+        vec![
+            row(
+                "old",
+                "11111111-1111-4111-8111-111111111111",
+                "a title sentinel",
+                1,
+            ),
+            row(
+                "new",
+                "22222222-2222-4222-8222-222222222222",
+                "a title sentinel",
+                2,
+            ),
+            row(
+                "hidden",
+                "33333333-3333-4333-8333-333333333333",
+                "a title sentinel",
+                3,
+            ),
+            row(
+                "other",
+                "44444444-4444-4444-8444-444444444444",
+                "unrelated",
+                4,
+            ),
+        ],
+        vec!["hidden"],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    let (request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
+    drop(request_tx);
+
+    app.query = "\"title sentinel\"".to_string();
+    app.dispatch_search();
+    app.settle_search_for_test();
+
+    assert_eq!(app.filtered, vec![1, 0], "the hits in scope, newest first");
+    for index in [0, 1] {
+        let explanation = &app.semantic_result_metadata(index).unwrap().explanation;
+        assert_eq!(
+            (
+                explanation.quality_label,
+                explanation.evidence_preview.as_str()
+            ),
+            ("exact", "a title sentinel"),
+            "each hit is an exact match showing its phrase"
+        );
+    }
+    assert!(
+        last_semantic_search(&drain_semantic_commands(&request_rx)).is_none(),
+        "the semantic worker gets no search"
+    );
+    assert!(!app.has_search_work_in_flight());
 }
 
 #[test]
@@ -866,11 +935,11 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
     app.filtered = vec![1];
     app.selected = Some(0);
     tx.send(SearchResponse {
-        error: None,
         filtered: vec![0],
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
+        exact_literal_results: None,
     })
     .unwrap();
 
@@ -896,11 +965,11 @@ fn empty_lexical_fallback_doesnt_clear_rows_while_semantic_search_is_pending() {
     app.filtered = vec![0];
     app.selected = Some(0);
     tx.send(SearchResponse {
-        error: None,
         filtered: Vec::new(),
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
+        exact_literal_results: None,
     })
     .unwrap();
 
@@ -926,10 +995,10 @@ fn semantic_search_ignores_lexical_fallback_after_completion() {
     app.selected = Some(0);
     tx.send(SearchResponse {
         filtered: Vec::new(),
-        error: None,
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
+        exact_literal_results: None,
     })
     .unwrap();
 
@@ -1218,10 +1287,10 @@ fn send_semantic_fallback(fallback_tx: &mpsc::Sender<SearchResponse>, filtered: 
     fallback_tx
         .send(SearchResponse {
             filtered,
-            error: None,
             generation: 7,
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
+            exact_literal_results: None,
         })
         .unwrap();
 }
@@ -1293,9 +1362,9 @@ fn rows_answer_previous_query_until_new_results_land() {
         .send(SearchResponse {
             filtered: vec![],
             generation: app.search_generation(),
-            error: None,
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
+            exact_literal_results: None,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -1331,9 +1400,9 @@ fn lexical_app_showing_needle() -> (
         .send(SearchResponse {
             filtered: vec![0],
             generation: app.search_generation(),
-            error: None,
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
+            exact_literal_results: None,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -1363,9 +1432,9 @@ fn backspacing_to_shown_results_query_abandons_search_and_keeps_rows() {
         .send(SearchResponse {
             filtered: vec![],
             generation: abandoned,
-            error: None,
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
+            exact_literal_results: None,
         })
         .unwrap();
     assert!(!app.receive_search_results());
@@ -1421,9 +1490,9 @@ fn backspacing_to_shown_results_query_abandons_semantic_search_too() {
         .send(SearchResponse {
             filtered: vec![0, 1],
             generation: abandoned,
-            error: None,
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
+            exact_literal_results: None,
         })
         .unwrap();
     send_semantic_complete_response(
@@ -1467,8 +1536,8 @@ fn backspacing_to_semantic_placeholder_doesnt_abandon_search() {
             filtered: vec![0],
             generation: app.search_generation(),
             mode: ListSearchMode::Semantic,
-            error: None,
             evidence: HashMap::new(),
+            exact_literal_results: None,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -2051,10 +2120,10 @@ fn uuid_dispatch_invalidates_stale_search_response() {
 
     tx.send(SearchResponse {
         filtered: vec![1],
-        error: None,
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
+        exact_literal_results: None,
     })
     .unwrap();
 
@@ -2090,9 +2159,9 @@ fn finish_loading_invalidates_stale_loading_search_response() {
     tx.send(SearchResponse {
         filtered: vec![],
         generation: 1,
-        error: None,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
+        exact_literal_results: None,
     })
     .unwrap();
 
@@ -2216,4 +2285,26 @@ fn single_file_mode_has_no_project_exclusions() {
     );
     assert!(!app.excluded_projects.excludes(&row));
     assert!(app.is_single_file_mode());
+}
+
+#[test]
+fn search_bar_counts_sessions_loading_then_sessions_unreadable() {
+    let mut app = app(Vec::new(), Vec::new());
+    let mut shown = |loading, unreadable| {
+        app.texts_held.without = SessionsWithoutTexts {
+            loading,
+            unreadable,
+        };
+        app.sessions_without_texts_text()
+    };
+
+    assert_eq!(shown(0, 0), "", "every session's texts are held");
+    assert_eq!(shown(37, 0), " · 37 sessions loading");
+    assert_eq!(shown(0, 1), " · 1 session unreadable");
+    assert_eq!(
+        shown(37, 1),
+        " · 37 sessions loading · 1 session unreadable",
+        "the unreadable count follows the loading text"
+    );
+    assert_eq!(shown(1, 2), " · 1 session loading · 2 sessions unreadable");
 }

@@ -2,7 +2,7 @@
 
 use super::Conversation;
 use super::message_texts::{MessageTextBuilder, push_separated};
-use super::sqlite_cache::{SearchField, SearchPart};
+use super::sqlite_cache::{CachedSession, SearchField, SearchPart};
 use crate::agent::refs::MessageRange;
 use crate::error::{AppError, Result};
 use std::borrow::Cow;
@@ -14,12 +14,25 @@ impl Conversation {
     /// refresh owner parses transcripts, so a copy missing from the cache, or
     /// replaced since the row was read, is a miss.
     pub(crate) fn load_content(&self) -> Result<Cow<'_, Self>> {
+        self.read_from_copy(|copy, parts| copy.stored_search_parts(|part| parts.push(part)))
+    }
+
+    /// [`Self::load_content`] with the semantic turns alone: the search
+    /// texts stay empty.
+    pub(crate) fn load_semantic_turns(&self) -> Result<Cow<'_, Self>> {
+        self.read_from_copy(|copy, parts| copy.stored_semantic_turns(|part| parts.push(part)))
+    }
+
+    fn read_from_copy(
+        &self,
+        read: impl FnOnce(&CachedSession, &mut ContentBuilder) -> Result<Option<()>>,
+    ) -> Result<Cow<'_, Self>> {
         let Some(cached) = &self.cached_session else {
             return Ok(Cow::Borrowed(self));
         };
         let mut parts = ContentBuilder::default();
         let copy = cached.clone().ignoring_source_changes().waiting();
-        match copy.search_parts(self, |part| parts.push(part))? {
+        match read(&copy, &mut parts)? {
             Some(()) => {
                 let mut row = self.clone();
                 parts.finish(&mut row);

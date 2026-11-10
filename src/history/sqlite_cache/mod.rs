@@ -36,13 +36,13 @@ mod window;
 pub use base::{CacheBase, ProcessIdentity};
 #[cfg(test)]
 pub(crate) use base::{DiskSpace, DriveRunningOut};
-pub(crate) use cached_session::CopyKey;
 pub(crate) use cached_session::CopyRead;
 pub(crate) use cached_session::Currency;
 pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
 pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
 pub use cached_session::{CachedSession, Publication, SessionAddress};
+pub(crate) use cached_session::{CopyKey, SessionKey};
 #[cfg(test)]
 pub(crate) use catalogue::RecordEntries;
 pub(crate) use catalogue::{ListedRecord, RecordPlace, SessionRecord, SessionStatus, StubStamps};

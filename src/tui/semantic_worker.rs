@@ -1,6 +1,7 @@
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::Conversation;
+use crate::history::sqlite_cache::CopyKey;
 use crate::search::query::ParsedQuery;
 use crate::semantic::cache::write_embedding_cache;
 use crate::semantic::fastembed::FastembedEmbedder;
@@ -8,10 +9,7 @@ use crate::semantic::index::{
     SemanticIndexCandidate, SemanticIndexProgress, SemanticIndexRequest, SemanticIndexResponse,
     SemanticIndexState,
 };
-use crate::semantic::types::{
-    ChunkHits, SemanticCancellationToken, SemanticChunkIdentity, SemanticExplanation,
-    SemanticQuality, SemanticRationaleKind, SemanticScoreBreakdown,
-};
+use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 use crate::tui::app::{SemanticProgress, SemanticResultMetadata};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -128,18 +126,6 @@ fn run_semantic_worker(
             }));
             continue;
         }
-        if request.query.is_quoted_only() {
-            let response = exact_literal_semantic_response(
-                request.generation,
-                request.prewarm,
-                worker.corpus.as_ref(),
-                worker.scope.as_ref(),
-                &request.query,
-                state.clock().wall().with_timezone(&chrono::Local),
-            );
-            let _ = res_tx.send(SemanticSearchMessage::Complete(response));
-            continue;
-        }
         let full_corpus = match worker.loaded_corpus_candidates() {
             Ok(corpus) => corpus,
             Err(error) => {
@@ -222,6 +208,42 @@ struct SemanticWorkerState {
     corpus: Arc<Vec<Arc<Conversation>>>,
     scope: Arc<Vec<usize>>,
     pending_search: Option<SemanticSearchRequest>,
+    /// The semantic turns of the copies the corpus's rows read, by copy.
+    semantic_turns: HashMap<CopyKey, HeldTurns>,
+}
+
+/// A row with the semantic turns read from its copy, and the row it was
+/// built from.
+struct HeldTurns {
+    row: Arc<Conversation>,
+    loaded: Arc<Conversation>,
+}
+
+impl HeldTurns {
+    /// Reads `row`'s semantic turns from its copy.
+    fn read(row: &Arc<Conversation>) -> Result<Self> {
+        Ok(Self {
+            row: row.clone(),
+            loaded: Arc::new(row.load_semantic_turns()?.into_owned()),
+        })
+    }
+
+    /// These turns on `row`, a row reading the same copy. A refresh can
+    /// replace a row without writing its session, such as for a name kept
+    /// beside the transcript.
+    fn for_row(self, row: &Arc<Conversation>) -> Self {
+        if Arc::ptr_eq(&self.row, row) {
+            return self;
+        }
+        let mut loaded = row.as_ref().clone();
+        loaded.semantic_turns = self.loaded.semantic_turns.clone();
+        loaded.semantic_turn_ranges = self.loaded.semantic_turn_ranges.clone();
+        loaded.cached_session = None;
+        Self {
+            row: row.clone(),
+            loaded: Arc::new(loaded),
+        }
+    }
 }
 
 enum VersionState {
@@ -320,17 +342,30 @@ impl SemanticWorkerState {
             .collect()
     }
 
-    fn loaded_corpus_candidates(&self) -> Result<Vec<SemanticIndexCandidate>> {
-        self.full_corpus_candidates()
+    /// The corpus's rows as candidates, each cached row with its semantic
+    /// turns. A copy's turns are read once, and held while a row of the
+    /// corpus reads that copy.
+    fn loaded_corpus_candidates(&mut self) -> Result<Vec<SemanticIndexCandidate>> {
+        let mut held = std::mem::take(&mut self.semantic_turns);
+        let mut kept = HashMap::with_capacity(held.len());
+        let candidates = self
+            .full_corpus_candidates()
             .into_iter()
             .map(|mut candidate| {
-                if candidate.conversation.cached_session.is_some() {
-                    let loaded = candidate.conversation.load_content()?.into_owned();
-                    candidate.conversation = Arc::new(loaded);
+                if let Some(cached) = &candidate.conversation.cached_session {
+                    let key = cached.copy_key();
+                    let turns = match held.remove(&key).or_else(|| kept.remove(&key)) {
+                        Some(turns) => turns.for_row(&candidate.conversation),
+                        None => HeldTurns::read(&candidate.conversation)?,
+                    };
+                    candidate.conversation = turns.loaded.clone();
+                    kept.insert(key, turns);
                 }
                 Ok(candidate)
             })
-            .collect()
+            .collect();
+        self.semantic_turns = kept;
+        candidates
     }
 
     #[cfg(test)]
@@ -427,138 +462,6 @@ fn empty_semantic_response(generation: u64, prewarm: bool) -> SemanticSearchResp
     }
 }
 
-pub(in crate::tui) fn exact_literal_semantic_response(
-    generation: u64,
-    prewarm: bool,
-    conversations: &[Arc<Conversation>],
-    scope: &[usize],
-    parsed: &ParsedQuery,
-    now: chrono::DateTime<chrono::Local>,
-) -> SemanticSearchResponse {
-    let scope = scope
-        .iter()
-        .copied()
-        .collect::<std::collections::HashSet<_>>();
-    let searchable = conversations
-        .iter()
-        .enumerate()
-        .map(|(index, row)| crate::search::searchable_conversation(row, index))
-        .collect::<Vec<_>>();
-    let filtered =
-        match crate::search::try_search(conversations, &searchable, parsed.lexical_text(), now) {
-            Ok(filtered) => filtered
-                .into_iter()
-                .filter(|index| scope.contains(index))
-                .collect::<Vec<_>>(),
-            Err(error) => return failed_semantic_response(generation, prewarm, error.to_string()),
-        };
-
-    let metadata = filtered
-        .iter()
-        .filter_map(|&index| {
-            conversations.get(index).and_then(|conversation| {
-                conversation
-                    .load_content()
-                    .ok()
-                    .map(|content| (index, exact_literal_metadata(&content, index, parsed)))
-            })
-        })
-        .collect();
-
-    SemanticSearchResponse {
-        generation,
-        filtered,
-        metadata,
-        error: None,
-        progress: SemanticProgress::Complete,
-        prewarm,
-    }
-}
-
-fn literal_evidence_preview(
-    conversation: &Conversation,
-    parsed: &ParsedQuery,
-    visible_preview: &str,
-) -> String {
-    let full_text = conversation.full_text_after_title_and_summary();
-    parsed
-        .literals()
-        .iter()
-        .filter(|literal| !literal.matches(visible_preview))
-        .chain(parsed.literals().iter())
-        .find_map(|literal| {
-            literal
-                .match_ranges(&full_text)
-                .first()
-                .map(|range| evidence_window(&full_text, *range))
-                .or_else(|| {
-                    conversation.project_name.as_deref().and_then(|project| {
-                        literal
-                            .match_ranges(project)
-                            .first()
-                            .map(|range| evidence_window(project, *range))
-                    })
-                })
-        })
-        .unwrap_or_else(|| conversation.preview.clone())
-}
-
-fn evidence_window(text: &str, range: (usize, usize)) -> String {
-    const CONTEXT_CHARS: usize = 80;
-    let (start, end) = range;
-    let prefix_start = text[..start]
-        .char_indices()
-        .rev()
-        .nth(CONTEXT_CHARS)
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-    let suffix_end = text[end..]
-        .char_indices()
-        .nth(CONTEXT_CHARS)
-        .map(|(index, _)| end + index)
-        .unwrap_or(text.len());
-    let mut preview = String::new();
-    if prefix_start > 0 {
-        preview.push('…');
-    }
-    preview.push_str(text[prefix_start..suffix_end].trim());
-    if suffix_end < text.len() {
-        preview.push('…');
-    }
-    preview
-}
-
-/// `conversation_index` is the conversation's position in the corpus: a
-/// refresh shares unchanged rows between corpus versions, so the row's own
-/// `index` can name its position in an earlier one.
-fn exact_literal_metadata(
-    conversation: &Conversation,
-    conversation_index: usize,
-    parsed: &ParsedQuery,
-) -> SemanticResultMetadata {
-    SemanticResultMetadata {
-        score_breakdown: SemanticScoreBreakdown::new(0.0, 0.0),
-        explanation: SemanticExplanation {
-            quality: SemanticQuality::Strong,
-            quality_label: "exact",
-            matched_terms: parsed
-                .literals()
-                .iter()
-                .map(|literal| literal.text().to_string())
-                .collect(),
-            evidence_preview: literal_evidence_preview(conversation, parsed, ""),
-            rationale_kind: SemanticRationaleKind::LexicalBoosted,
-            chunk: SemanticChunkIdentity {
-                conversation_index,
-                source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                session: conversation.session_id.clone(),
-                chunk_index: 0,
-                message_range: crate::agent::refs::MessageRange::single(1),
-            },
-        },
-    }
-}
-
 fn failed_semantic_response(
     generation: u64,
     prewarm: bool,
@@ -591,7 +494,6 @@ mod tests {
     use super::*;
     use crate::history::Conversation;
     use crate::semantic::test_fixtures::{SemanticConversationFixture, beta_hit_metadata};
-    use chrono::{Duration as ChronoDuration, Local};
     use std::time::Duration;
 
     const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -725,88 +627,6 @@ mod tests {
     }
 
     #[test]
-    fn quoted_only_search_uses_literal_fallback_without_embedding() {
-        let (tx, rx, _cancellation) =
-            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
-        send_worker_setup(&tx, vec![], "\"title sentinel\"", false);
-        let message = rx
-            .recv_timeout(WORKER_RESPONSE_TIMEOUT)
-            .expect("literal response");
-
-        match message {
-            SemanticSearchMessage::Complete(response) => {
-                assert_eq!(response.filtered, vec![0]);
-                assert!(
-                    response.metadata[&0]
-                        .explanation
-                        .evidence_preview
-                        .contains("title sentinel")
-                );
-                assert_eq!(response.error, None);
-                assert_eq!(response.progress, SemanticProgress::Complete);
-            }
-            SemanticSearchMessage::Progress { progress, .. } => {
-                panic!("unexpected progress before literal response: {progress:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn quoted_only_search_respects_scope_and_orders_newest_first() {
-        let mut old = conversation("/projects/project-a/session-a.jsonl", vec![]);
-        old.timestamp = Local::now() - ChronoDuration::days(1);
-        let mut newest = conversation("/projects/project-a/session-b.jsonl", vec![]);
-        newest.timestamp = Local::now();
-        let mut hidden = conversation("/projects/project-a/session-c.jsonl", vec![]);
-        hidden.timestamp = Local::now() + ChronoDuration::days(1);
-        let (tx, rx, _cancellation) =
-            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
-        tx.send(SemanticWorkerCommand::UpdateCorpus {
-            corpus_version: 1,
-            conversations: corpus(vec![old, newest, hidden]),
-        })
-        .expect("send corpus");
-        tx.send(SemanticWorkerCommand::UpdateScope {
-            corpus_version: 1,
-            scope_version: 1,
-            indices: Arc::new(vec![0, 1]),
-        })
-        .expect("send scope");
-        tx.send(SemanticWorkerCommand::Search {
-            generation: 1,
-            query: ParsedQuery::parse("\"title sentinel\""),
-            corpus_version: 1,
-            scope_version: 1,
-            prewarm: false,
-        })
-        .expect("send semantic request");
-
-        match rx
-            .recv_timeout(WORKER_RESPONSE_TIMEOUT)
-            .expect("literal response")
-        {
-            SemanticSearchMessage::Complete(response) => {
-                assert_eq!(response.filtered, vec![1, 0]);
-                assert!(
-                    response.metadata[&1]
-                        .explanation
-                        .evidence_preview
-                        .contains("title sentinel")
-                );
-                assert!(
-                    response.metadata[&0]
-                        .explanation
-                        .evidence_preview
-                        .contains("title sentinel")
-                );
-            }
-            SemanticSearchMessage::Progress { progress, .. } => {
-                panic!("unexpected progress before literal response: {progress:?}");
-            }
-        }
-    }
-
-    #[test]
     fn worker_builds_distinct_full_corpus_and_scoped_candidates() {
         let mut worker = SemanticWorkerState::default();
         let cancellation = SemanticCancellationToken::new();
@@ -838,6 +658,59 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].index, 1);
         assert_eq!(candidates[0].conversation.semantic_turns, vec!["visible"]);
+    }
+
+    /// A copy's semantic turns are read once while a row reads it: the next
+    /// search reuses the row built from them, and a row replaced without a
+    /// new copy keeps the turns with its own fields.
+    #[test]
+    fn cached_rows_semantic_turns_are_read_once_per_copy() {
+        let time = crate::search::test_fixtures::october(20, 9);
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[(
+            "turns",
+            vec![crate::search::test_fixtures::claude_user_record(
+                "held question",
+                time,
+            )],
+        )]);
+        let row = Arc::new(sessions.rows[0].clone());
+        let mut worker = SemanticWorkerState::default();
+        let cancellation = SemanticCancellationToken::new();
+        let update = |worker: &mut SemanticWorkerState, version, row: &Arc<Conversation>| {
+            worker.apply_command(
+                SemanticWorkerCommand::UpdateCorpus {
+                    corpus_version: version,
+                    conversations: Arc::new(vec![row.clone()]),
+                },
+                &cancellation,
+            );
+        };
+        update(&mut worker, 1, &row);
+
+        let first = worker.loaded_corpus_candidates().unwrap();
+        let second = worker.loaded_corpus_candidates().unwrap();
+        let mut renamed = row.as_ref().clone();
+        renamed.custom_title = Some("renamed".to_owned());
+        update(&mut worker, 2, &Arc::new(renamed));
+        let after_rename = worker.loaded_corpus_candidates().unwrap();
+
+        assert_eq!(
+            first[0].conversation.semantic_turns,
+            vec!["held question"],
+            "the candidate holds the copy's semantic turns"
+        );
+        assert!(
+            Arc::ptr_eq(&first[0].conversation, &second[0].conversation),
+            "the next search reuses the row read for the copy"
+        );
+        assert_eq!(
+            (
+                after_rename[0].conversation.custom_title.as_deref(),
+                &after_rename[0].conversation.semantic_turns
+            ),
+            (Some("renamed"), &first[0].conversation.semantic_turns),
+            "a replaced row keeps its copy's turns with its own fields"
+        );
     }
 
     #[test]

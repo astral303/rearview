@@ -27,7 +27,7 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 
 pub(super) use diff::{replace_leading, rewrite_in_place, update, update_tail};
-pub(super) use parts::{DERIVED, RESULT_TEXT, SearchOnlyKind};
+pub(super) use parts::SearchOnlyKind;
 pub(super) use rows::{RowsStart, SessionRows};
 #[cfg(test)]
 pub(super) use write::SHIFT_SEARCH_PLACES;
@@ -323,47 +323,35 @@ pub(super) fn read(
     messages: Option<RangeInclusive<u64>>,
 ) -> Result<TranscriptEntries> {
     let selected = Selection::new(session, messages);
-    Ok(read_selected(connection, session, places, &selected, ReadPurpose::Display)?.transcript)
+    Ok(read_selected(connection, session, places, &selected)?.transcript)
 }
 
 pub(crate) struct StoredEntries {
     pub(crate) transcript: TranscriptEntries,
     pub(crate) numbers: Vec<Option<crate::agent::message_numbering::Numbered>>,
-    pub(super) last_sequence: Option<i64>,
     /// The session row's title and summary: a title the agent keeps outside
     /// the transcript doesn't have an entry.
     pub(crate) custom_title: Option<String>,
     pub(crate) summary: Option<String>,
 }
 
-/// A read's purpose: the viewer's texts, with their terminal codes and the
-/// lines that did not parse, or search's, without either.
-#[derive(Clone, Copy)]
-pub(super) enum ReadPurpose {
-    Display,
-    Search,
-}
-
-impl ReadPurpose {
-    /// The stored text in column `text` of `row`; for display, with the
-    /// terminal codes in column `codes` back in place.
-    fn text(self, row: &Row, text: usize, codes: usize) -> rusqlite::Result<Option<String>> {
-        let stored: Option<String> = row.get(text)?;
-        match (self, stored) {
-            (Self::Display, Some(stored)) => match row.get_ref(codes)?.as_blob_or_null()? {
-                Some(stored_codes) => join_terminal_codes(&stored, stored_codes)
-                    .map(Some)
-                    .map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            codes,
-                            rusqlite::types::Type::Blob,
-                            Box::new(error),
-                        )
-                    }),
-                None => Ok(Some(stored)),
-            },
-            (_, stored) => Ok(stored),
-        }
+/// The stored text in column `text` of `row`, with the terminal codes in
+/// column `codes` back in place.
+fn text_with_codes(row: &Row, text: usize, codes: usize) -> rusqlite::Result<Option<String>> {
+    let Some(stored) = row.get::<_, Option<String>>(text)? else {
+        return Ok(None);
+    };
+    match row.get_ref(codes)?.as_blob_or_null()? {
+        Some(stored_codes) => join_terminal_codes(&stored, stored_codes)
+            .map(Some)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    codes,
+                    rusqlite::types::Type::Blob,
+                    Box::new(error),
+                )
+            }),
+        None => Ok(Some(stored)),
     }
 }
 
@@ -378,7 +366,6 @@ pub(super) fn read_numbered(
         session,
         places,
         &Selection::new(session, messages),
-        ReadPurpose::Display,
     )
 }
 
@@ -403,7 +390,123 @@ pub(super) fn read_messages(
          WHERE m.session = ?1 AND m.ordinal IN (SELECT value FROM json_each(?2))",
         vec![session.into(), ordinals.into()],
     );
-    read_selected(connection, session, places, &selected, ReadPurpose::Display)
+    read_selected(connection, session, places, &selected)
+}
+
+/// Each contributing user, assistant and metadata entry of `session` that
+/// takes a message number, in order, with its text parts, without terminal
+/// codes: everything [`crate::history::parser::semantic_text_of_entry`]
+/// reads of an entry.
+const SEMANTIC_ENTRIES: &str = "SELECT e.sequence, m.ordinal, e.kind, e.content, e.text, e.label, \
+     p.text FROM entries e JOIN messages m ON m.id = e.message \
+     LEFT JOIN parts p ON p.entry = e.id AND p.kind = 'text' \
+     WHERE e.session = ?1 AND e.contributes AND m.ordinal IS NOT NULL \
+     AND e.kind IN ('user', 'assistant', 'pi-metadata') ORDER BY e.sequence, p.part";
+
+/// Calls `visit` with the message number and the semantic text of each
+/// entry of `session` holding one, in the session's order, from the entry's
+/// text blocks alone: [`crate::history::parser::semantic_text_of_entry`]
+/// reads nothing else.
+pub(super) fn read_semantic_texts(
+    connection: &Connection,
+    session: i64,
+    mut visit: impl FnMut(usize, String),
+) -> Result<()> {
+    let mut statement = connection.prepare_cached(SEMANTIC_ENTRIES)?;
+    let mut rows = statement.query([session])?;
+    let mut entry: Option<(i64, usize, SemanticEntry)> = None;
+    let mut finish = |entry: Option<(i64, usize, SemanticEntry)>| {
+        if let Some((_, ordinal, semantic)) = entry
+            && let Some(text) =
+                crate::history::parser::semantic_text_of_entry(&semantic.into_entry())
+        {
+            visit(ordinal, text);
+        }
+    };
+    while let Some(row) = rows.next()? {
+        let sequence: i64 = row.get(0)?;
+        let block = row.get::<_, Option<String>>(6)?;
+        if let Some((current, _, semantic)) = &mut entry
+            && *current == sequence
+        {
+            semantic.blocks.extend(block);
+            continue;
+        }
+        finish(entry.take());
+        entry = Some((
+            sequence,
+            row.get::<_, i64>(1)? as usize,
+            SemanticEntry {
+                kind: row.get(2)?,
+                string_content: row.get::<_, Option<String>>(3)?.as_deref() == Some(CONTENT_STRING),
+                text: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                label: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                blocks: block.into_iter().collect(),
+            },
+        ));
+    }
+    finish(entry);
+    Ok(())
+}
+
+/// What a semantic text reads of one entry: its kind, its own text and
+/// label, and its text blocks.
+struct SemanticEntry {
+    kind: String,
+    string_content: bool,
+    text: String,
+    label: String,
+    blocks: Vec<String>,
+}
+
+impl SemanticEntry {
+    /// The entry, holding its text blocks alone.
+    fn into_entry(self) -> LogEntry {
+        let blocks = || {
+            self.blocks
+                .iter()
+                .map(|text| ContentBlock::Text { text: text.clone() })
+                .collect::<Vec<_>>()
+        };
+        match self.kind.as_str() {
+            "user" => LogEntry::User {
+                message: UserMessage {
+                    role: String::new(),
+                    content: if self.string_content {
+                        UserContent::String(self.blocks.first().cloned().unwrap_or_default())
+                    } else {
+                        UserContent::Blocks(blocks())
+                    },
+                },
+                timestamp: None,
+                uuid: None,
+                cwd: None,
+                parent_tool_use_id: None,
+                source_tool_use_id: None,
+                usage: None,
+            },
+            "assistant" => LogEntry::Assistant {
+                message: AssistantMessage {
+                    role: String::new(),
+                    content: blocks(),
+                    model: None,
+                    usage: None,
+                    id: None,
+                },
+                agent: None,
+                timestamp: None,
+                uuid: None,
+                parent_tool_use_id: None,
+            },
+            _ => LogEntry::PiMetadata {
+                label: self.label,
+                text: self.text,
+                timestamp: None,
+                searchable: true,
+                usage: None,
+            },
+        }
+    }
 }
 
 /// Render the returned transcript only within `messages`; other bodies
@@ -430,51 +533,14 @@ pub(super) fn read_range(
     Ok(transcript)
 }
 
-pub(super) fn read_search_batch(
-    connection: &Connection,
-    session: i64,
-    places: &Places,
-    after: i64,
-    window: &crate::time_filter::TimeFilter,
-) -> Result<StoredEntries> {
-    let selected = if window.is_active() {
-        Selection {
-            ids: "SELECT e.id FROM messages m JOIN entries e ON e.message = m.id \
-              WHERE m.session = ?1 AND e.sequence > ?2 AND m.ordinal IS NOT NULL AND e.contributes \
-              AND m.last_ms >= ?3 AND m.first_ms <= ?4 ORDER BY e.sequence LIMIT 512",
-            parameters: vec![
-                session.into(),
-                after.into(),
-                window
-                    .after
-                    .map_or(i64::MIN, |after| after.timestamp().saturating_mul(1000))
-                    .into(),
-                window
-                    .before
-                    .map_or(i64::MAX, |before| {
-                        before.timestamp().saturating_mul(1000).saturating_add(999)
-                    })
-                    .into(),
-            ],
-        }
-    } else {
-        Selection {
-            ids: "SELECT id FROM entries WHERE session = ?1 AND sequence > ?2 ORDER BY sequence LIMIT 512",
-            parameters: vec![session.into(), after.into()],
-        }
-    };
-    read_selected(connection, session, places, &selected, ReadPurpose::Search)
-}
-
 pub(super) fn read_selected(
     connection: &Connection,
     session: i64,
     places: &Places,
     selected: &Selection,
-    purpose: ReadPurpose,
 ) -> Result<StoredEntries> {
     let stored = threads::read(connection, session, places)?;
-    let mut parts = parts::read(connection, selected, purpose)?;
+    let mut parts = parts::read(connection, selected)?;
     let sql = format!(
         "SELECT m.thread, e.id, e.record_transcript, e.record_line, e.kind, e.timestamp_ms, m.role, \
          e.content, e.text, e.label, e.uuid, m.cwd, m.parent_tool_use_id, m.source_tool_use_id, \
@@ -482,7 +548,7 @@ pub(super) fn read_selected(
          COALESCE(e.usage_output, m.usage_output), \
          COALESCE(e.usage_cache_creation, m.usage_cache_creation), \
          COALESCE(e.usage_cache_read, m.usage_cache_read), e.level, e.duration_ms, e.parent_uuid, e.flag, \
-         m.ordinal, e.contributes, e.sequence, e.text_codes \
+         m.ordinal, e.contributes, e.text_codes \
          FROM entries e LEFT JOIN messages m ON m.id = e.message WHERE e.id IN ({}) \
          ORDER BY e.sequence",
         selected.ids,
@@ -492,7 +558,6 @@ pub(super) fn read_selected(
     let mut entries = Vec::new();
     let mut numbers = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut last_sequence = None;
     while let Some(row) = rows.next()? {
         let ordinal = row
             .get::<_, Option<i64>>(25)?
@@ -504,7 +569,6 @@ pub(super) fn read_selected(
                 starts_message: seen.insert(ordinal),
             }
         }));
-        last_sequence = Some(row.get(27)?);
         let thread = row.get::<_, Option<i64>>(0)?.map(|id| &stored.threads[&id]);
         let record = RecordLine {
             transcript: row
@@ -515,14 +579,10 @@ pub(super) fn read_selected(
         };
         let entry = row.get::<_, i64>(1)?;
         let blocks = parts.remove(&entry).unwrap_or_default();
-        let entry_text = purpose.text(row, 8, 28)?;
+        let entry_text = text_with_codes(row, 8, 27)?;
         entries.push((record, entry_of(row, thread, entry_text, blocks)?));
     }
-    let malformed_lines = if matches!(purpose, ReadPurpose::Display) {
-        read_malformed_lines(connection, session)?
-    } else {
-        Vec::new()
-    };
+    let malformed_lines = read_malformed_lines(connection, session)?;
     let (custom_title, summary) = connection
         .prepare_cached("SELECT custom_title, summary FROM sessions WHERE id = ?1")?
         .query_row([session], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -537,7 +597,6 @@ pub(super) fn read_selected(
             malformed_lines,
         },
         numbers,
-        last_sequence,
         custom_title,
         summary,
     })

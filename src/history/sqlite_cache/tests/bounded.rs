@@ -163,15 +163,18 @@ fn sql_windows_keep_full_message_spans_and_final_millisecond() {
         .cached_session
         .as_ref()
         .unwrap()
-        .search_parts_within(&cached, &window, |part| {
-            if part.field == super::super::SearchField::Full {
-                selected.push((part.ordinal, part.text));
-            }
+        .read_search_texts(SearchedFields::List, &window, |text| {
+            selected.push((text.order, text.ordinal, text.text.to_owned()));
+            std::ops::ControlFlow::Continue(())
         })
         .unwrap()
         .unwrap();
+    selected.sort();
     assert_eq!(
-        selected,
+        selected
+            .into_iter()
+            .map(|(_, ordinal, text)| (ordinal, text))
+            .collect::<Vec<_>>(),
         [
             (Some(2), "opening fragment".to_owned()),
             (Some(2), "closing fragment".to_owned()),

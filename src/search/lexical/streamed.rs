@@ -24,11 +24,12 @@ impl Counts {
 }
 
 /// `query`'s counts over the search texts of each conversation at `indices`,
-/// each of which the session cache holds, by index: from the texts held in
-/// memory, or else from the cache. Without a time window, the counts also
-/// hold the row's title and summary, and a literal in a conversation's
-/// project name counts as found. With `retrieval`, also the hit messages of
-/// each conversation read from the cache.
+/// each of which the session cache holds, by index: for the session list,
+/// from the texts held in memory, and none for a session without texts
+/// held; for `agent search`, from the cache. Without a time window, the
+/// counts also hold the row's title and summary, and a literal in a
+/// conversation's project name counts as found. With `retrieval`, also the
+/// hit messages of each conversation read from the cache.
 pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     indices: &[usize],
@@ -52,9 +53,19 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
         .into_iter()
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let (stored_counts, hit_messages) =
-        count_stored(conversations, &stored, surface, query, retrieval)?;
-    counts.extend(stored_counts);
+    let hit_messages = match surface {
+        SearchSurface::List(_) => {
+            let matcher = query.matcher();
+            counts.extend(stored.iter().map(|&index| (index, matcher.counts())));
+            HitMessages::default()
+        }
+        SearchSurface::Agent(_) => {
+            let (stored_counts, hit_messages) =
+                count_stored(conversations, &stored, surface, query, retrieval)?;
+            counts.extend(stored_counts);
+            hit_messages
+        }
+    };
     let (_, window) = surface.stored_fields();
     if !window.is_active() {
         let mut matcher = query.matcher();
@@ -474,14 +485,12 @@ mod tests {
             ];
             let original = [original];
             let cached = [*cached];
-            let not_read = SearchTextsInMemory::default();
             let in_memory = SearchTextsInMemory::read(&cached);
             let held = in_memory
                 .get(&cached[0])
                 .expect("the texts are read into memory");
             for window in &windows {
                 for surface in [
-                    SearchSurface::List(&not_read),
                     SearchSurface::List(&in_memory),
                     SearchSurface::Agent(window),
                 ] {
@@ -551,15 +560,8 @@ mod tests {
             let mut queries_with_evidence = 0;
             for query in QUERIES {
                 let parsed = ParsedQuery::parse(query);
-                let read_from_cache = build_lexical_evidence(&cached[0], None, &parsed);
                 let read_from_memory = build_lexical_evidence(&cached[0], Some(held), &parsed);
                 queries_with_evidence += usize::from(read_from_memory.is_some());
-                assert_eq!(
-                    read_from_memory,
-                    read_from_cache,
-                    "{} {query:?}: the evidence in memory is the evidence in the cache",
-                    session.row.source.label()
-                );
                 assert_eq!(
                     context_line(&cached[0], read_from_memory),
                     context_line(
@@ -656,71 +658,24 @@ mod tests {
             try_debug_search(
                 rows,
                 &searchable,
-                &SearchTextsInMemory::default(),
+                &SearchTextsInMemory::read(rows),
                 "zebrafish swim",
-                october(20, 12),
-                |_| true,
-            )
-            .map(|search| {
-                search
-                    .results
-                    .into_iter()
-                    .map(|(index, score)| (index, score.total.to_bits()))
-                    .collect::<Vec<_>>()
-            })
-        };
-        let before = ranked().unwrap();
-        crate::history::sqlite_cache::tests::replace_copy(rows[0].cached_session.as_ref().unwrap());
-        assert_eq!(
-            ranked().expect("a replaced session doesn't fail the search"),
-            before,
-            "the replaced session ranks on its new copy's texts"
-        );
-    }
-
-    #[test]
-    fn session_matching_only_its_project_name_scores_its_body_as_held_texts_do() {
-        use crate::search::test_fixtures::{cached_claude_sessions, claude_user_record, october};
-        let sessions = cached_claude_sessions(&[(
-            "talk",
-            vec![claude_user_record("plain words", october(10, 12))],
-        )]);
-        let mut rows = sessions.rows.clone();
-        for row in &mut rows {
-            row.project_name = Some("zebrafish".to_owned());
-        }
-        let searchable = precompute_search_text(&rows);
-        let fields = |texts: &SearchTextsInMemory| {
-            try_debug_search(
-                &rows,
-                &searchable,
-                texts,
-                "zebrafish",
                 october(20, 12),
                 |_| true,
             )
             .unwrap()
             .results
             .into_iter()
-            .map(|(index, score)| {
-                let names = score
-                    .fields
-                    .iter()
-                    .map(|field| field.name)
-                    .collect::<Vec<_>>();
-                (index, names)
-            })
+            .map(|(index, score)| (index, score.total.to_bits()))
             .collect::<Vec<_>>()
         };
-        let from_cache = fields(&SearchTextsInMemory::default());
+        let before = ranked();
+        crate::history::sqlite_cache::tests::replace_copy(rows[0].cached_session.as_ref().unwrap());
+        assert!(!before.is_empty(), "the query finds the sessions");
         assert_eq!(
-            from_cache,
-            fields(&SearchTextsInMemory::read(&rows)),
-            "the scan's sessions score the fields their held texts score"
-        );
-        assert!(
-            from_cache.contains(&(0, vec!["project", "body"])),
-            "a session holding text scores its body: {from_cache:?}"
+            ranked(),
+            before,
+            "the replaced session ranks on its new copy's texts"
         );
     }
 

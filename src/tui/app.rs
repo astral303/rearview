@@ -4,7 +4,7 @@ use crate::history::{
     Conversation, DrawingThread, Environment, ExcludedProjects, FilterTerm, InteractiveCache,
     LoadProgress, SkippedSessions, Workspace,
 };
-use crate::search::{self, SearchableConversation};
+use crate::search::{self, SearchableConversation, SessionsWithoutTexts};
 #[cfg(test)]
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::time_filter::TimeFilter;
@@ -29,6 +29,7 @@ use std::time::Duration;
 
 mod actions_state;
 mod dialog_state;
+mod exact_literal;
 mod input_controller;
 mod list_state;
 mod refresh_state;
@@ -38,7 +39,8 @@ mod types;
 mod view_state;
 #[allow(unused_imports)]
 use search_state::{
-    SearchCommand, SearchResponse, SemanticSearchState, SessionIdQuery, spawn_search_worker,
+    SearchCommand, SearchResponse, SearchWorker, SemanticSearchState, SessionIdQuery, TextsHeld,
+    spawn_search_worker,
 };
 #[allow(unused_imports)]
 pub use types::{
@@ -111,6 +113,14 @@ pub struct App {
     search_tx: mpsc::Sender<SearchCommand>,
     /// Channel to receive results from the background search worker
     search_rx: mpsc::Receiver<SearchResponse>,
+    /// The search worker's count of sessions without texts held, whenever it
+    /// may have changed
+    texts_held_rx: mpsc::Receiver<TextsHeld>,
+    /// The sessions the list's search reads without their texts, their first
+    /// read running or failed, as the worker last counted them
+    texts_held: TextsHeld,
+    /// The `UpdateData` commands sent to the search worker
+    search_data_sent: u64,
     /// Monotonic generation counter for search requests
     search_generation: u64,
     /// When the search in flight on the worker thread was dispatched; `None`
@@ -211,6 +221,8 @@ fn known_fork(source: crate::history::Source) -> Option<bool> {
 struct PendingOpen {
     path: PathBuf,
     source: crate::history::Source,
+    /// The viewer's read of the row's copy, once started.
+    read: Option<view_state::OpeningRead>,
 }
 
 type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
@@ -242,8 +254,7 @@ struct AppParts {
     workspace_filter: bool,
     workspace: Option<Workspace>,
     excluded_projects: ExcludedProjects,
-    search_tx: mpsc::Sender<SearchCommand>,
-    search_rx: mpsc::Receiver<SearchResponse>,
+    search_worker: SearchWorker,
     list_search_mode: ListSearchMode,
     semantic_search: SemanticSearchState,
     environment: Environment,
@@ -280,8 +291,14 @@ impl App {
             workspace_filter: parts.workspace_filter,
             workspace: parts.workspace,
             excluded_projects: parts.excluded_projects,
-            search_tx: parts.search_tx,
-            search_rx: parts.search_rx,
+            search_tx: parts.search_worker.commands,
+            search_rx: parts.search_worker.results,
+            texts_held_rx: parts.search_worker.texts_held,
+            texts_held: TextsHeld {
+                updates_applied: 0,
+                without: SessionsWithoutTexts::default(),
+            },
+            search_data_sent: 0,
             search_generation: 0,
             search_started_at: None,
             dispatched_query: None,
@@ -340,17 +357,6 @@ impl App {
         Arc::new(conversations.iter().cloned().map(Arc::new).collect())
     }
 
-    fn send_initial_search_data(
-        search_tx: &mpsc::Sender<SearchCommand>,
-        conversations: Arc<Vec<Arc<Conversation>>>,
-        searchable: &[SearchableConversation],
-    ) {
-        let _ = search_tx.send(SearchCommand::UpdateData {
-            conversations,
-            searchable: Arc::new(searchable.to_vec()),
-        });
-    }
-
     fn list_search_mode_from_options(search_options: TuiSearchOptions) -> ListSearchMode {
         search_options.default_mode
     }
@@ -384,12 +390,10 @@ impl App {
             None,
         );
         let selected = if filtered.is_empty() { None } else { Some(0) };
-        let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
+        let search_worker = spawn_search_worker(environment.clock().clone());
         let conversations_snapshot = Self::conversation_snapshot(&conversations);
 
-        Self::send_initial_search_data(&search_tx, conversations_snapshot.clone(), &searchable);
-
-        Self::from_parts(AppParts {
+        let mut app = Self::from_parts(AppParts {
             conversations_snapshot,
             conversations,
             searchable,
@@ -404,12 +408,13 @@ impl App {
             workspace_filter: false,
             workspace: None,
             excluded_projects,
-            search_tx,
-            search_rx,
+            search_worker,
             list_search_mode: Self::list_search_mode_from_options(search_options),
             semantic_search: Self::semantic_search_state(true),
             environment,
-        })
+        });
+        app.send_search_data();
+        app
     }
 
     /// Create a new app in loading state, reading `environment`
@@ -422,7 +427,7 @@ impl App {
         environment: Environment,
     ) -> Self {
         let conversations = Vec::new();
-        let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
+        let search_worker = spawn_search_worker(environment.clock().clone());
 
         Self::from_parts(AppParts {
             conversations_snapshot: Self::conversation_snapshot(&conversations),
@@ -442,8 +447,7 @@ impl App {
             workspace_filter: scope.workspace_filter,
             workspace: scope.workspace,
             excluded_projects: scope.exclude_projects.into_iter().collect(),
-            search_tx,
-            search_rx,
+            search_worker,
             list_search_mode: Self::list_search_mode_from_options(search_options),
             semantic_search: Self::semantic_search_state(true),
             environment,
@@ -460,7 +464,7 @@ impl App {
         keys: KeyBindings,
         environment: Environment,
     ) -> Self {
-        let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
+        let search_worker = spawn_search_worker(environment.clock().clone());
         let mut view = ViewState::initial(file.canonical, None, None, tool_display, show_thinking);
         view.parsed_conversation = Some(Arc::new(crate::tui::viewer::ParsedConversation::empty()));
         view.is_copy_missing = true;
@@ -480,8 +484,7 @@ impl App {
             workspace_filter: false,
             workspace: None,
             excluded_projects: ExcludedProjects::default(),
-            search_tx,
-            search_rx,
+            search_worker,
             list_search_mode: ListSearchMode::Lexical,
             semantic_search: Self::semantic_search_state(false),
             environment,
@@ -768,6 +771,25 @@ impl App {
         })
     }
 
+    /// The search bar's text after the result count while the list's search
+    /// reads some sessions without their texts: ` · 37 sessions loading`
+    /// while their first read runs, then ` · 1 session unreadable` while a
+    /// read has failed. Empty once every session's texts are held.
+    pub fn sessions_without_texts_text(&self) -> String {
+        let SessionsWithoutTexts {
+            loading,
+            unreadable,
+        } = self.texts_held.without;
+        [(loading, "loading"), (unreadable, "unreadable")]
+            .into_iter()
+            .filter(|&(count, _)| count > 0)
+            .map(|(count, state)| match count {
+                1 => format!(" · 1 session {state}"),
+                count => format!(" · {count} sessions {state}"),
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn set_search_started_at_for_test(&mut self, started_at: Moment) {
         self.search_started_at = Some(started_at);
@@ -865,30 +887,71 @@ impl App {
         self.pending_open = Some(PendingOpen {
             path: row.path.clone(),
             source: row.source,
+            read: None,
         });
         true
     }
 
-    /// True between the open request and the load that answers it.
+    /// True between the open request and the viewer showing the session.
     pub fn is_opening(&self) -> bool {
         self.pending_open.is_some()
     }
 
-    /// Run the load a pending open asked for. True when one ran, so the
-    /// caller draws the next frame.
-    pub fn complete_pending_open(&mut self, frame_width: usize) -> bool {
-        let Some(PendingOpen { path, source }) = self.pending_open.take() else {
+    /// Advance a pending open: start the viewer's read of the session on a
+    /// thread of its own, or wait up to `wait` for it and show the viewer
+    /// once it lands. True while an open is pending, so the caller draws the
+    /// next frame before reading any terminal event.
+    pub fn complete_pending_open(&mut self, frame_width: usize, wait: Duration) -> bool {
+        let Some(pending) = self.pending_open.take() else {
             return false;
         };
-        match self
-            .conversations
-            .iter()
-            .position(|row| row.path == path && row.source == source)
-        {
-            Some(index) => self.open_conversation(index, frame_width),
-            None => self.set_status("Session not found".to_owned()),
+        let Some(read) = pending.read else {
+            match self
+                .conversations
+                .iter()
+                .position(|row| row.path == pending.path && row.source == pending.source)
+            {
+                Some(index) => {
+                    let row = view_state::OpenedRow::of(&self.conversations[index]);
+                    self.pending_open = Some(PendingOpen {
+                        read: Some(view_state::OpeningRead::start(
+                            row,
+                            self.interactive_cache(),
+                        )),
+                        ..pending
+                    });
+                }
+                None => self.set_status("Session not found".to_owned()),
+            }
+            return true;
+        };
+        match read.finish(wait) {
+            Ok((row, read)) => self.show_opened(row, read, frame_width),
+            Err(read) => {
+                self.pending_open = Some(PendingOpen {
+                    read: Some(read),
+                    ..pending
+                });
+            }
         }
         true
+    }
+
+    /// [`Self::complete_pending_open`] until the viewer shows the session,
+    /// or the open fails, failing after ten seconds. True when an open was
+    /// pending.
+    #[cfg(test)]
+    pub fn finish_pending_open_for_test(&mut self, frame_width: usize) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut advanced = false;
+        while self.complete_pending_open(frame_width, Duration::from_millis(10)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the viewer's read lands"
+            );
+            advanced = true;
+        }
+        advanced
     }
 
     /// True while the file opened directly, already shown, is read again:

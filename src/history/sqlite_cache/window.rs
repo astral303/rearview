@@ -4,7 +4,7 @@
 //! rows the read of a changed sub-agent transcript changes in place.
 
 use super::SqliteCache;
-use super::entries::{self, ReadPurpose, Selection};
+use super::entries::{self, Selection};
 use super::roots::{Places, StoredPath};
 use crate::error::{AppError, Result};
 use crate::history::MalformedLine;
@@ -153,13 +153,8 @@ impl SqliteCache {
                 "SELECT id FROM entries WHERE session = ?1 AND sequence >= ?2",
                 vec![resume.session.into(), (sequence as i64).into()],
             );
-            let read = entries::read_selected(
-                connection,
-                resume.session,
-                &resume.places,
-                &selected,
-                ReadPurpose::Display,
-            )?;
+            let read =
+                entries::read_selected(connection, resume.session, &resume.places, &selected)?;
             let mut statement = connection.prepare_cached(
                 "SELECT splice_key, child IS NOT NULL FROM entries \
                  WHERE session = ?1 AND sequence >= ?2 ORDER BY sequence",

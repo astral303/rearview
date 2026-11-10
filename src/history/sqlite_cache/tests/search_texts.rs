@@ -1,102 +1,11 @@
-//! The search texts a cache write stores, against the texts the session's
-//! content rebuilds from its stored entries.
+//! The search texts a cache write stores, against the texts the parse
+//! lays out.
 
 use super::*;
 use crate::history::Conversation;
 use crate::history::parser::normalize_whitespace;
 use crate::history::provider::Capability;
 use crate::history::provider::contract_tests::registered_fixtures;
-use crate::time_filter::TimeFilter;
-use std::ops::ControlFlow;
-
-/// A search text's message number and normalised text.
-type PlacedText = (Option<usize>, String);
-
-#[test]
-fn write_stores_each_text_content_rebuilds_once_for_every_provider() {
-    let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
-    for session in every_record_sessions() {
-        let row = &session.row;
-        let storage = storage_of(row.source);
-        cache.admit_storage(storage).unwrap();
-        let root = root_of(&session);
-        let stub = stub_of(&session, 1);
-        cache
-            .write(&parsed_record(row.source, &root, &stub))
-            .unwrap();
-        let CatalogueSession::Listed(listed) = cache
-            .catalogue_session(storage, row.source, &root, &stub.cache_key, false)
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("listed fixture")
-        };
-        let copy = listed.cached_session.as_ref().unwrap();
-
-        for (fields, search) in [
-            (SearchedFields::List, "the list's search"),
-            (SearchedFields::Agent, "`agent search`"),
-        ] {
-            let rebuilt = sorted(rebuilt_texts(copy, &listed, fields));
-            let stored = sorted(stored_texts(copy, fields));
-
-            assert!(
-                !rebuilt.is_empty(),
-                "{}: the content rebuilds the texts {search} reads",
-                row.source.label()
-            );
-            assert_eq!(
-                stored,
-                rebuilt,
-                "{}: each text {search} reads in the content is stored once, with its message \
-                 number",
-                row.source.label()
-            );
-        }
-    }
-}
-
-/// Rebuilds the texts in `fields` from the entries of `copy`, `listed`'s
-/// copy, as `Conversation::load_content` reads them. Semantic text is not
-/// stored.
-fn rebuilt_texts(
-    copy: &CachedSession,
-    listed: &Conversation,
-    fields: SearchedFields,
-) -> Vec<PlacedText> {
-    let reads = |field| match (fields, field) {
-        (_, SearchField::Semantic) => false,
-        (SearchedFields::List, field) => field == SearchField::Full,
-        (SearchedFields::Agent, _) => true,
-    };
-    let mut texts = Vec::new();
-    copy.search_parts(listed, |part| {
-        if reads(part.field) {
-            texts.push((part.ordinal, part.text));
-        }
-    })
-    .unwrap()
-    .expect("the cache holds the copy");
-    texts
-}
-
-/// The texts `copy` stores in `fields`, normalised as search reads them:
-/// whitespace collapsed. Text left empty is dropped, as the content drops
-/// it.
-fn stored_texts(copy: &CachedSession, fields: SearchedFields) -> Vec<PlacedText> {
-    let mut texts = Vec::new();
-    copy.read_search_texts(fields, &TimeFilter::default(), |text| {
-        let normalised = normalize_whitespace(text.text);
-        if !normalised.is_empty() {
-            texts.push((text.ordinal, normalised));
-        }
-        ControlFlow::Continue(())
-    })
-    .unwrap()
-    .expect("the cache holds the copy");
-    texts
-}
 
 /// The lines of a Claude session holding a text of each layout group the
 /// list's search reads: a title and a summary, a reply written as two
@@ -143,32 +52,18 @@ fn after_title_and_summary(row: &Conversation, body: &str) -> String {
     text
 }
 
-/// The parse lays out a row's list search texts in block order, whitespace
-/// collapsed; the cache keeps them as written and groups each message's
-/// texts by kind: blocks, results' items, then derived texts. Only a
-/// context line's snippets differ: scores and `agent search` read each text
-/// alone. The derived text is a message of its own, which leaves its place
-/// after the blocks unpinned.
+/// The parse and the cache lay out a row's list search texts in block
+/// order; the parse collapses whitespace, the cache keeps each text as
+/// written. A context line's snippets read this layout.
 #[test]
-fn parse_lays_out_texts_in_block_order_and_cache_groups_them_by_kind() {
-    let laid_out_by_kind = [
+fn parse_and_cache_lay_out_texts_in_block_order() {
+    let laid_out = [
         "Layout title",
         "Layout summary",
         "first question",
         "answer part one",
         "answer part two",
-        "after the result",
         "item one\nitem two",
-        "/model opus",
-    ]
-    .join(" \u{1e} ");
-    let laid_out_in_block_order = [
-        "Layout title",
-        "Layout summary",
-        "first question",
-        "answer part one",
-        "answer part two",
-        "item one item two",
         "after the result",
         "/model opus",
     ]
@@ -182,14 +77,14 @@ fn parse_lays_out_texts_in_block_order_and_cache_groups_them_by_kind() {
         parsed_record_and_row(Source::Claude, &root_of(&session), &stub_of(&session, 1));
     assert_eq!(
         parsed.full_text_after_title_and_summary(),
-        laid_out_in_block_order,
-        "the parse lays out the texts in block order"
+        normalize_whitespace(&laid_out),
+        "the parse lays out the texts in block order, whitespace collapsed"
     );
 
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     cache.admit_storage(storage_of(Source::Claude)).unwrap();
-    let mut laid_out = Vec::new();
+    let mut reads = Vec::new();
     for (written, read) in [(lines.len(), "a write"), (4, "an update")] {
         std::fs::write(&path, lines[..written].join("\n")).unwrap();
         let (record, root) = source_record(Source::Claude, &path);
@@ -225,20 +120,61 @@ fn parse_lays_out_texts_in_block_order_and_cache_groups_them_by_kind() {
         let cached = crate::search::lexical::SessionSearchTexts::read(copy)
             .unwrap()
             .expect("the cache holds the copy");
-        laid_out.push((
+        reads.push((
             format!("the copy {read} left"),
             after_title_and_summary(&listed, cached.joined()),
         ));
         let rows = [*listed];
         let scanned = crate::search::SearchTextsInMemory::read(&rows);
-        laid_out.push((
+        reads.push((
             format!("a scan of the copy {read} left"),
             after_title_and_summary(&rows[0], scanned.get(&rows[0]).unwrap().joined()),
         ));
     }
-    for (read, text) in laid_out {
-        assert_eq!(text, laid_out_by_kind, "{read} groups the texts by kind");
+    for (read, text) in reads {
+        assert_eq!(
+            text, laid_out,
+            "{read} lays out the texts in block order, as written"
+        );
     }
+}
+
+/// The content a copy gives its row lays out each message's texts as the
+/// parse does when a result's items come ahead of a text block in their
+/// entry: semantic route text reads that layout.
+#[test]
+fn content_read_from_copy_lays_out_texts_in_block_order_as_parse_does() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("layout.jsonl");
+    std::fs::write(&path, every_layout_kind_lines().join("\n")).unwrap();
+    let session = AgentSession::new(Source::Claude, path, Vec::new(), Vec::new());
+    let root = root_of(&session);
+    let (record, parsed) = parsed_record_and_row(Source::Claude, &root, &stub_of(&session, 1));
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = admitted_cache(base.path());
+    cache.admit_storage(storage_of(Source::Claude)).unwrap();
+    cache.write(&record).unwrap();
+    let CatalogueSession::Listed(listed) = cache
+        .catalogue_session(
+            storage_of(Source::Claude),
+            Source::Claude,
+            &root,
+            CACHE_KEY,
+            false,
+        )
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("the session is listed")
+    };
+
+    let content = listed.load_content().unwrap();
+
+    assert_eq!(
+        (&content.full_text, &content.agent_search_text),
+        (&parsed.full_text, &parsed.agent_search_text),
+        "the copy's content lays out the texts as the parse does"
+    );
 }
 
 #[test]
@@ -469,9 +405,4 @@ fn code_inside_word_doesnt_split_it_in_any_field_and_display_reads_it_back() {
         [SearchField::Full, SearchField::Thinking].map(SearchField::code),
         "each field reads the word whole"
     );
-}
-
-fn sorted(mut texts: Vec<PlacedText>) -> Vec<PlacedText> {
-    texts.sort();
-    texts
 }

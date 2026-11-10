@@ -22,7 +22,7 @@ mod raw;
 mod streamed;
 
 pub use hit_messages::{HitMessages, RetrievalTerms, SessionHitMessages};
-pub(crate) use in_memory::{CopiesToRead, TextsRead};
+pub(crate) use in_memory::{CopiesToRead, SessionsWithoutTexts, TextsRead};
 pub use in_memory::{SearchTextsInMemory, SessionSearchTexts};
 use raw::RawQuery;
 
@@ -245,16 +245,7 @@ pub fn search<C: Borrow<Conversation> + Sync>(
     query: &str,
     now: DateTime<Local>,
 ) -> Vec<usize> {
-    try_search(conversations, searchable, query, now).expect("in-memory search")
-}
-
-pub fn try_search<C: Borrow<Conversation> + Sync>(
-    conversations: &[C],
-    searchable: &[SearchableConversation],
-    query: &str,
-    now: DateTime<Local>,
-) -> Result<Vec<usize>> {
-    try_search_with_texts(
+    search_with_texts(
         conversations,
         searchable,
         &SearchTextsInMemory::default(),
@@ -263,15 +254,15 @@ pub fn try_search<C: Borrow<Conversation> + Sync>(
     )
 }
 
-/// [`try_search`], scanning the texts `texts` holds in memory; a session
-/// whose texts it does not hold yet reads them from the session cache.
-pub fn try_search_with_texts<C: Borrow<Conversation> + Sync>(
+/// The session list's search, over the texts `texts` holds and the rows'
+/// own fields. It does not read the session cache.
+pub fn search_with_texts<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     searchable: &[SearchableConversation],
     texts: &SearchTextsInMemory,
     query: &str,
     now: DateTime<Local>,
-) -> Result<Vec<usize>> {
+) -> Vec<usize> {
     search_with_surface(
         conversations,
         searchable,
@@ -279,6 +270,7 @@ pub fn try_search_with_texts<C: Borrow<Conversation> + Sync>(
         now,
         SearchSurface::List(texts),
     )
+    .expect("the session list's search reads memory alone")
 }
 
 #[cfg(test)]

@@ -1762,6 +1762,53 @@ fn session_reached_through_two_spellings_of_root_lists_once() {
     });
 }
 
+/// The viewer opens a listed row's current copy, its catalogue row and its
+/// currency on one connection to the session cache.
+#[test]
+fn viewer_reads_listed_rows_copy_on_one_connection() {
+    run_contract(Contract::RootSpelling, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+        let environment = fixture_environment(fixture, home.path(), cache.path());
+        let rows = rows_loaded_through(&environment);
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _counting = crate::history::sqlite_cache::connection::test_hooks::on_every_connection(
+            environment.cache_base().path(),
+            {
+                let opened = Arc::clone(&opened);
+                move |_| {
+                    opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        );
+
+        for row in &rows {
+            let address = row
+                .cache_address
+                .as_ref()
+                .expect("a listed row has its address");
+            let before = opened.load(std::sync::atomic::Ordering::SeqCst);
+            let viewed = crate::history::viewed_copy_interactively(
+                &crate::history::InteractiveCache::at(environment.cache_base().clone()),
+                address,
+                &row.publication,
+            );
+
+            assert!(
+                matches!(viewed.into_read(), crate::history::CachedRead::Current(_)),
+                "the viewer reads the row's copy"
+            );
+            assert_eq!(
+                opened.load(std::sync::atomic::Ordering::SeqCst) - before,
+                1,
+                "the viewer's read opens one connection"
+            );
+        }
+        assert!(!rows.is_empty(), "the load lists the session");
+    });
+}
+
 /// The viewer and agent `read` read a listed row's copy at its address:
 /// once the load lists the row, neither canonicalises a path. Each agent's
 /// fixture writes the session's files below the root itself.

@@ -6,10 +6,11 @@
 use super::text_scan::{
     LayoutGroup, MessagesInWindow, ReadOrder, StoredPlace, StoredWindow, text_at,
 };
-use super::{CachedSession, SearchField};
+use super::{CachedSession, CopyRead, SearchField};
 use crate::error::Result;
 use crate::time_filter::TimeFilter;
 use rusqlite::Connection;
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use std::ops::ControlFlow;
 
 impl SearchField {
@@ -22,6 +23,17 @@ impl SearchField {
             Self::Supplement => 4,
             Self::Semantic => unreachable!("semantic text has no stored field"),
         }
+    }
+}
+
+/// A `search_field` column's field.
+impl FromSql for SearchField {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let code = value.as_i64()?;
+        [Self::Full, Self::Agent, Self::Thinking, Self::Supplement]
+            .into_iter()
+            .find(|field| field.code() == code)
+            .ok_or(FromSqlError::OutOfRange(code))
     }
 }
 
@@ -61,8 +73,21 @@ pub(crate) struct SearchText<'a> {
     pub(crate) ordinal: Option<usize>,
     /// The text's place in its session.
     pub(crate) order: ReadOrder,
+    pub(crate) field: SearchField,
     /// A text, or the text items of one tool result joined by line breaks.
     pub(crate) text: &'a str,
+}
+
+/// Calls `visit` with each search text in `fields` of the session row
+/// `session`, as [`CachedSession::read_search_texts`] does without a window.
+pub(super) fn visit_session_texts(
+    connection: &Connection,
+    session: i64,
+    fields: SearchedFields,
+    visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+) -> Result<()> {
+    let _ = SessionRead::new(connection, session, fields, None)?.visit_texts(visit)?;
+    Ok(())
 }
 
 impl CachedSession {
@@ -83,6 +108,28 @@ impl CachedSession {
             Ok(())
         })
     }
+
+    /// [`Self::read_search_texts`] without a window, of the copy the cache
+    /// holds at this copy's address: when another write replaced this copy,
+    /// the texts of the copy that replaced it. A second replacement during
+    /// the read fails it.
+    pub(crate) fn read_search_texts_of_held_copy(
+        &self,
+        fields: SearchedFields,
+        mut visit: impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    ) -> Result<Option<()>> {
+        let read = self.read_copy(|connection, session, _| {
+            visit_session_texts(connection, session, fields, &mut visit)
+        })?;
+        match read {
+            Some(CopyRead::Read(())) => Ok(Some(())),
+            Some(CopyRead::Replaced { generation }) => self
+                .clone()
+                .of_generation(generation)
+                .read_search_texts(fields, &TimeFilter::default(), visit),
+            None => Ok(None),
+        }
+    }
 }
 
 /// The session `?1`'s sub-agent metadata parts, outside every entry.
@@ -95,7 +142,7 @@ const SUBAGENT_METADATA_READ: &str =
 /// The session `?1`'s parts holding search text in `fields`.
 fn parts_query(fields: SearchedFields) -> String {
     format!(
-        "SELECT part, kind, entry_sequence, message_ordinal, text FROM parts \
+        "SELECT entry_sequence, message_ordinal, search_position, search_field, text FROM parts \
          WHERE session = ?1 AND search_field IN ({})",
         fields.part_field_codes()
     )
@@ -152,7 +199,7 @@ impl<'c> SessionRead<'c> {
         let mut statement = self.connection.prepare_cached(&parts_query(self.fields))?;
         let mut rows = statement.query([self.session])?;
         while let Some(row) = rows.next()? {
-            let place = StoredPlace::at(row, (2, 3))?;
+            let place = StoredPlace::at(row, (0, 1, 2))?;
             if let Some(window) = &self.window
                 && !window.holds(self.session, place.ordinal)
             {
@@ -160,11 +207,8 @@ impl<'c> SessionRead<'c> {
             }
             let text = SearchText {
                 ordinal: place.message(),
-                order: ReadOrder {
-                    group: LayoutGroup::of_part(text_at(row, 1)?),
-                    sequence: place.sequence,
-                    part: row.get(0)?,
-                },
+                order: place.order(),
+                field: row.get(3)?,
                 text: text_at(row, 4)?,
             };
             if visit(text).is_break() {
@@ -186,8 +230,9 @@ impl<'c> SessionRead<'c> {
                 order: ReadOrder {
                     group: LayoutGroup::SubagentMetadata,
                     sequence: 0,
-                    part: row.get(0)?,
+                    position: row.get(0)?,
                 },
+                field: SearchField::Supplement,
                 text: text_at(row, 1)?,
             };
             if visit(text).is_break() {

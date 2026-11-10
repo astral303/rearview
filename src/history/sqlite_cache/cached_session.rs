@@ -1,5 +1,6 @@
 //! A session's address in the cache and a catalogue row's content location;
-//! connections stay local to each read.
+//! each read opens a connection of its own, unless it is handed the cache
+//! to read on.
 
 use super::files::{self, FileKey, RootKey};
 use super::roots::{Places, SessionRoots, StoredPath};
@@ -133,9 +134,15 @@ pub(crate) struct MessagesRead {
 /// copy another key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CopyKey {
+    pub(crate) session: SessionKey,
+    pub(crate) generation: i64,
+}
+
+/// A session in the cache, whichever copy it holds.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SessionKey {
     root_key: Option<RootKey>,
     cache_key: String,
-    generation: i64,
 }
 
 impl CachedSession {
@@ -155,8 +162,10 @@ impl CachedSession {
 
     pub(crate) fn copy_key(&self) -> CopyKey {
         CopyKey {
-            root_key: self.address.roots.key().cloned(),
-            cache_key: self.address.cache_key.clone(),
+            session: SessionKey {
+                root_key: self.address.roots.key().cloned(),
+                cache_key: self.address.cache_key.clone(),
+            },
             generation: self.generation,
         }
     }
@@ -219,10 +228,63 @@ impl CachedSession {
     /// transcripts are checked whether or not this session reads its copy
     /// as it is.
     pub(crate) fn currency(&self, publication: &Publication) -> Result<Option<Currency>> {
-        let checking = Self {
-            checks_source: true,
+        let Some(cache) = self.wait.open(&self.base)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .read_with_currency(&cache, publication, |_, _, _| Ok(()))?
+            .map(|((), currency)| currency))
+    }
+
+    /// The copy's entries as it holds them, with its currency for a row whose
+    /// publication is `publication`, in one read snapshot of `cache`: the
+    /// viewer's read.
+    pub(crate) fn entries_with_currency(
+        &self,
+        cache: &SqliteCache,
+        publication: &Publication,
+    ) -> Result<Option<(TranscriptEntries, Currency)>> {
+        self.read_with_currency(cache, publication, |connection, session, places| {
+            entries::read(connection, session, places, None)
+        })
+    }
+
+    /// `read`'s result over the copy, as it holds it, and the copy's currency
+    /// for a row whose publication is `publication`, in one read snapshot of
+    /// `cache`. The copy's transcripts are checked once, whether or not this
+    /// session reads its copy as it is. `None` as for [`Self::read`].
+    fn read_with_currency<T>(
+        &self,
+        cache: &SqliteCache,
+        publication: &Publication,
+        read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
+    ) -> Result<Option<(T, Currency)>> {
+        let as_is = Self {
+            checks_source: false,
             ..self.clone()
         };
+        let read = cache.with_read_snapshot(|connection| {
+            as_is.read_copy_in(connection, |connection, session, places| {
+                let currency = match self.validate_source(connection, places, session) {
+                    Ok(()) => self.stored_currency(connection, session, places, publication)?,
+                    Err(error) if error.is_changed_source() => Currency::Older,
+                    Err(error) => return Err(error),
+                };
+                Ok((read(connection, session, places)?, currency))
+            })
+        })?;
+        self.read_result(read)
+    }
+
+    /// The copy's currency for a row whose publication is `publication`,
+    /// once its transcripts are found unchanged.
+    fn stored_currency(
+        &self,
+        connection: &Connection,
+        session: i64,
+        places: &Places,
+        publication: &Publication,
+    ) -> Result<Currency> {
         let discovered: &[PathBuf] = match publication {
             Publication::Unpublished { discovered } => discovered,
             Publication::Published { .. } => &[],
@@ -231,49 +293,41 @@ impl CachedSession {
             Publication::Published { generation } => self.generation > *generation,
             Publication::Unpublished { .. } => true,
         };
-        let stored = checking.read(|connection, session, places| {
-            let stored = if may_adopt {
-                stored_subagents(connection, session)?
-            } else {
-                Vec::new()
-            };
-            let holds_discovered = discovered.is_empty() || {
-                let stored_keys: HashSet<(i64, FileKey)> = stored
-                    .iter()
-                    .map(|subagent| (subagent.root, subagent.key()))
-                    .collect();
-                discovered.iter().all(|path| {
-                    places
-                        .place(path)
-                        .is_some_and(|place| stored_keys.contains(&(place.root, place.key())))
-                })
-            };
-            let paths = stored
-                .into_iter()
-                .map(|subagent| places.path(subagent))
-                .collect::<Result<Vec<PathBuf>>>()?;
-            Ok((paths, holds_discovered))
-        });
-        let (stored, holds_discovered) = match stored {
-            Ok(Some(stored)) => stored,
-            Ok(None) => return Ok(None),
-            Err(error) if error.is_changed_source() => return Ok(Some(Currency::Older)),
-            Err(error) => return Err(error),
+        let stored = if may_adopt {
+            stored_subagents(connection, session)?
+        } else {
+            Vec::new()
         };
-        let adopted = || Currency::Adopt {
-            generation: self.generation,
-            subagents: stored,
+        let holds_discovered = discovered.is_empty() || {
+            let stored_keys: HashSet<(i64, FileKey)> = stored
+                .iter()
+                .map(|subagent| (subagent.root, subagent.key()))
+                .collect();
+            discovered.iter().all(|path| {
+                places
+                    .place(path)
+                    .is_some_and(|place| stored_keys.contains(&(place.root, place.key())))
+            })
         };
-        Ok(Some(match publication {
+        let adopted = || -> Result<Currency> {
+            Ok(Currency::Adopt {
+                generation: self.generation,
+                subagents: stored
+                    .into_iter()
+                    .map(|subagent| places.path(subagent))
+                    .collect::<Result<Vec<PathBuf>>>()?,
+            })
+        };
+        Ok(match publication {
             Publication::Published { generation } if self.generation == *generation => {
                 Currency::Current
             }
-            Publication::Published { generation } if self.generation > *generation => adopted(),
+            Publication::Published { generation } if self.generation > *generation => adopted()?,
             // A copy before the row's own: the cache was rebuilt since.
             Publication::Published { .. } => Currency::Older,
             Publication::Unpublished { .. } if !holds_discovered => Currency::Older,
-            Publication::Unpublished { .. } => adopted(),
-        }))
+            Publication::Unpublished { .. } => adopted()?,
+        })
     }
 
     pub(crate) fn entries(&self) -> Result<Option<TranscriptEntries>> {
@@ -299,7 +353,12 @@ impl CachedSession {
         &self,
         read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
     ) -> Result<Option<T>> {
-        match self.read_copy(read)? {
+        self.read_result(self.read_copy(read)?)
+    }
+
+    /// [`Self::read`]'s result of `read`: a replaced copy fails it.
+    fn read_result<T>(&self, read: Option<CopyRead<T>>) -> Result<Option<T>> {
+        match read {
             Some(CopyRead::Read(result)) => Ok(Some(result)),
             Some(CopyRead::Replaced { .. }) => Err(AppError::SessionCacheNotReady {
                 session: self.address.cache_key.clone(),
@@ -331,50 +390,57 @@ impl CachedSession {
 
     /// [`Self::read`], reporting a copy another write replaced at the
     /// address.
-    fn read_copy<T>(
+    pub(super) fn read_copy<T>(
         &self,
         read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
     ) -> Result<Option<CopyRead<T>>> {
         let Some(cache) = self.wait.open(&self.base)? else {
             return Ok(None);
         };
+        cache.with_read_snapshot(|connection| self.read_copy_in(connection, read))
+    }
+
+    /// [`Self::read_copy`] on `connection`, inside its read snapshot.
+    fn read_copy_in<T>(
+        &self,
+        connection: &Connection,
+        read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
+    ) -> Result<Option<CopyRead<T>>> {
         let address = &self.address;
-        cache.with_read_snapshot(|connection| {
-            if !is_storage_current(connection, address.storage)? {
-                return Ok(None);
+        if !is_storage_current(connection, address.storage)? {
+            return Ok(None);
+        }
+        let Some(stored) = entries::listed_session_of(
+            connection,
+            address.storage.directory,
+            address.roots.key(),
+            &address.cache_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let session = stored.id;
+        if stored.generation != self.generation {
+            return Ok(Some(CopyRead::Replaced {
+                generation: stored.generation,
+            }));
+        }
+        let places = Places::stored(connection, &address.roots)?;
+        let result = (|| {
+            if self.checks_source {
+                self.validate_source(connection, &places, session)?;
             }
-            let Some(stored) = entries::listed_session_of(
-                connection,
-                address.storage.directory,
-                address.roots.key(),
-                &address.cache_key,
-            )?
-            else {
-                return Ok(None);
-            };
-            let session = stored.id;
-            if stored.generation != self.generation {
-                return Ok(Some(CopyRead::Replaced {
-                    generation: stored.generation,
-                }));
+            let result = read(connection, session, &places)?;
+            if self.checks_source {
+                self.validate_source(connection, &places, session)?;
             }
-            let places = Places::stored(connection, &address.roots)?;
-            let result = (|| {
-                if self.checks_source {
-                    self.validate_source(connection, &places, session)?;
-                }
-                let result = read(connection, session, &places)?;
-                if self.checks_source {
-                    self.validate_source(connection, &places, session)?;
-                }
-                Ok(result)
-            })();
-            match result {
-                Ok(result) => Ok(Some(CopyRead::Read(result))),
-                Err(AppError::StoredRootUnknown { .. }) => Ok(None),
-                Err(error) => Err(error),
-            }
-        })
+            Ok(result)
+        })();
+        match result {
+            Ok(result) => Ok(Some(CopyRead::Read(result))),
+            Err(AppError::StoredRootUnknown { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn validate_source(

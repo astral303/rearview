@@ -1,13 +1,11 @@
-//! Bounded entry batches projected onto the existing search surfaces.
+//! A session's search texts and semantic turns, read from its stored parts
+//! for [`crate::history::Conversation::load_content`].
 
-use super::{CachedSession, entries};
+use super::search_texts::visit_session_texts;
+use super::{CachedSession, SearchedFields, entries};
 use crate::error::Result;
-use crate::history::Conversation;
-use crate::history::parser::{
-    normalize_full_text, normalize_whitespace, search_parts_of_entry, semantic_text_of_entry,
-};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use crate::history::parser::{normalize_full_text, normalize_whitespace};
+use std::ops::ControlFlow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchField {
@@ -25,86 +23,58 @@ pub(crate) struct SearchPart {
 }
 
 impl CachedSession {
-    pub(crate) fn search_parts(
+    /// Calls `visit` with each search text the copy stores in the fields
+    /// `agent search` reads, as the parse lays them out and normalises them,
+    /// then each message's semantic text. Text left empty is dropped.
+    pub(crate) fn stored_search_parts(
         &self,
-        row: &Conversation,
-        visit: impl FnMut(SearchPart),
-    ) -> Result<Option<()>> {
-        self.search_parts_within(row, &crate::time_filter::TimeFilter::default(), visit)
-    }
-
-    pub(crate) fn search_parts_within(
-        &self,
-        row: &Conversation,
-        window: &crate::time_filter::TimeFilter,
         mut visit: impl FnMut(SearchPart),
     ) -> Result<Option<()>> {
-        self.read(|connection, session, places| {
-            // The copy's places spell its sub-agents and its entries'
-            // transcripts alike.
-            let subagents: HashSet<&Path> = row.subagents.iter().map(PathBuf::as_path).collect();
-            let mut after = -1;
-            loop {
-                let batch = entries::read_search_batch(connection, session, places, after, window)?;
-                let Some(last) = batch.last_sequence else {
-                    break;
+        self.read(|connection, session, _| {
+            let mut texts = Vec::new();
+            visit_session_texts(connection, session, SearchedFields::Agent, &mut |text| {
+                let normalised = match text.field {
+                    SearchField::Supplement => normalize_whitespace(text.text),
+                    _ => normalize_full_text(text.text),
                 };
-                for ((record, entry), number) in
-                    batch.transcript.entries.into_iter().zip(batch.numbers)
-                {
-                    let ordinal = number.map(|number| number.ordinal);
-                    let spliced = record
-                        .transcript
-                        .as_deref()
-                        .is_some_and(|path| subagents.contains(path));
-                    // The entries are read without terminal codes; texts the parser builds from
-                    // a call's JSON input can still hold them.
-                    for (field, texts) in
-                        [SearchField::Full, SearchField::Agent, SearchField::Thinking]
-                            .into_iter()
-                            .zip(search_parts_of_entry(&entry, spliced))
-                    {
-                        for text in texts {
-                            let text = normalize_full_text(&text);
-                            if !text.is_empty() {
-                                visit(SearchPart {
-                                    ordinal,
-                                    field,
-                                    text,
-                                });
-                            }
-                        }
-                    }
-                    if ordinal.is_some()
-                        && let Some(text) = semantic_text_of_entry(&entry)
-                    {
-                        visit(SearchPart {
-                            ordinal,
-                            field: SearchField::Semantic,
-                            text,
-                        });
-                    }
+                if !normalised.is_empty() {
+                    let part = SearchPart {
+                        ordinal: text.ordinal,
+                        field: text.field,
+                        text: normalised,
+                    };
+                    texts.push((text.order, part));
                 }
-                after = last;
+                ControlFlow::Continue(())
+            })?;
+            texts.sort_by_key(|(order, _)| *order);
+            for (_, part) in texts {
+                visit(part);
             }
-            if window.is_active() {
-                return Ok(());
-            }
-            let mut statement = connection.prepare(
-                "SELECT text FROM parts WHERE session = ?1 AND entry IS NULL ORDER BY part",
-            )?;
-            let mut parts = statement.query([session])?;
-            while let Some(part) = parts.next()? {
-                let text = normalize_whitespace(&part.get::<_, String>(0)?);
-                if !text.is_empty() {
-                    visit(SearchPart {
-                        ordinal: None,
-                        field: SearchField::Supplement,
-                        text,
-                    });
-                }
-            }
-            Ok(())
+            visit_semantic_turns(connection, session, &mut visit)
         })
     }
+
+    /// Calls `visit` with each message's semantic text the copy stores, as
+    /// [`Self::stored_search_parts`] does, without the search texts.
+    pub(crate) fn stored_semantic_turns(
+        &self,
+        mut visit: impl FnMut(SearchPart),
+    ) -> Result<Option<()>> {
+        self.read(|connection, session, _| visit_semantic_turns(connection, session, &mut visit))
+    }
+}
+
+fn visit_semantic_turns(
+    connection: &rusqlite::Connection,
+    session: i64,
+    visit: &mut impl FnMut(SearchPart),
+) -> Result<()> {
+    entries::read_semantic_texts(connection, session, |ordinal, text| {
+        visit(SearchPart {
+            ordinal: Some(ordinal),
+            field: SearchField::Semantic,
+            text,
+        });
+    })
 }
