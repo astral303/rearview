@@ -1762,7 +1762,7 @@ impl<'a> DatabaseWrites<'a> {
         self.writes
             .send(CacheWrite::Resumed { record, reply })
             .ok()?;
-        let generation = replied.recv().ok()?.ok()?;
+        let generation = replied.recv().ok()?.ok()??;
         Some(published_at(resumed.row, generation))
     }
 }
@@ -5514,6 +5514,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A whole parse kept out, because its transcript was shortened during
+    /// it, leaves the copy an earlier load stored as it is.
+    #[test]
+    fn transcript_shortened_during_its_parse_keeps_the_earlier_copy() {
+        let cache_base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        let transcript = home.write("kept", 0, &["a question"]);
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+        let stored = generations(cache_base.path());
+        home.write("kept", 0, &["another question", "and one more"]);
+        let shortened = transcript.clone();
+        home.watch().run_after_each_transcript_read(move || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&shortened)
+                .unwrap();
+            let length = file.metadata().unwrap().len();
+            file.set_len(length - 1).unwrap();
+        });
+        home.watch().mark();
+
+        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+
+        assert_eq!(
+            home.watch().sessions_parsed_after_mark(),
+            [transcript],
+            "the rewritten transcript is parsed whole"
+        );
+        assert_eq!(
+            (
+                entries_errors(cache_base.path()),
+                generations(cache_base.path())
+            ),
+            (vec![None], stored),
+            "the earlier copy stays with its entries, unwritten"
+        );
     }
 
     /// A read of a home's sessions into the session cache under a base.

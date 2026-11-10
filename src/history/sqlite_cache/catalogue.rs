@@ -255,6 +255,13 @@ impl SessionRecord {
         matches!(self.entries, Some(RecordEntries::Written(_)))
     }
 
+    /// True for a listed session's record whose entries are kept out: a
+    /// file changed during the read other than by growing. No copy holds the
+    /// parse's entries; the cache keeps an earlier copy, if it holds one.
+    pub(crate) fn keeps_entries_out(&self) -> bool {
+        matches!(self.entries, Some(RecordEntries::Unwritten { .. }))
+    }
+
     /// The entries of this record's whole parse, written or not; `None` for
     /// a session that is not listed and for a resumed read, whose entries
     /// are the stored copy's tail.

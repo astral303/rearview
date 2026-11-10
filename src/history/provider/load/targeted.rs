@@ -743,6 +743,7 @@ impl SessionLoader<'_> {
                                         );
                                     })
                                     .ok()
+                                    .flatten()
                             }
                             _ => None,
                         }

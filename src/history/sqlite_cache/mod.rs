@@ -700,18 +700,40 @@ impl CacheWriter {
     }
 
     /// Replaces the rows of `record`'s session with `record`, and returns the
-    /// generation the write gave the session's row. Each step of the write
-    /// checks the free space on the cache's drive, and fails once it is
-    /// below the floor (see [`refresh::RefreshToken::check_space`]).
-    pub(crate) fn write(&mut self, record: &SessionRecord) -> Result<i64> {
+    /// generation the write gave the session's row. `None`, without writing,
+    /// for a record whose entries were kept out while the cache holds a
+    /// listed copy of the session with its entries: that copy stays as it
+    /// is, older than the transcript, and the next load reads the session
+    /// again. Each step of the write checks the free space on the cache's
+    /// drive, and fails once it is below the floor (see
+    /// [`refresh::RefreshToken::check_space`]).
+    pub(crate) fn write(&mut self, record: &SessionRecord) -> Result<Option<i64>> {
         if !self.is_admitted()? {
             return Err(AppError::SessionCacheNotReady {
                 session: record.catalogue.cache_key.clone(),
                 reason: "the database is not admitted".to_owned(),
             });
         }
+        if record.keeps_entries_out() && self.holds_listed_copy(&record.catalogue)? {
+            return Ok(None);
+        }
         let owner = self.owner.clone();
         self.write_checked(record, &|| owner.check_space())
+            .map(Some)
+    }
+
+    /// True when the cache holds a listed copy of `row`'s session with its
+    /// entries.
+    fn holds_listed_copy(&self, row: &catalogue::CatalogueRow) -> Result<bool> {
+        Ok(matches!(
+            copy_state::RowState::of_session(
+                &self.connection,
+                row.storage,
+                row.roots.key(),
+                &row.cache_key
+            )?,
+            copy_state::RowState::Listed(_)
+        ))
     }
 
     fn write_checked(
@@ -1248,11 +1270,11 @@ fn session_transaction<'a>(
 /// A change the writer applies to a cache base's database.
 pub(crate) enum CacheWrite {
     Session(Box<SessionRecord>),
-    /// A resumed read's record, whose writer reports the generation it gave
-    /// the session's row, or why the write failed.
+    /// A resumed read's record, whose writer reports what
+    /// [`CacheWriter::write`] returned, or why the write failed.
     Resumed {
         record: Box<SessionRecord>,
-        reply: std::sync::mpsc::Sender<std::result::Result<i64, String>>,
+        reply: std::sync::mpsc::Sender<std::result::Result<Option<i64>, String>>,
     },
     /// The sessions `storage` no longer finds at these cache keys under the
     /// root.
@@ -1299,6 +1321,7 @@ pub(crate) fn apply_writes(
             CacheWrite::Resumed { record, reply } => {
                 let outcome = write_logged(record);
                 let _ = reply.send(outcome.as_ref().copied().map_err(ToString::to_string));
+
                 outcome.map(|_| ())
             }
             CacheWrite::Removed {
