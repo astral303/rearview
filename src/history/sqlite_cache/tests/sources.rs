@@ -93,8 +93,7 @@ fn resumed_childs_earlier_files_are_dependencies_before_splicing() {
             .catalogue
             .files
             .iter()
-            .any(|file| Path::new(&file.path) == files::key(&child.root)
-                && file.kind == "continuation")
+            .any(|file| file.path == child.root && file.kind == "continuation")
     );
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
@@ -127,7 +126,7 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
             .catalogue
             .files
             .iter()
-            .any(|file| Path::new(&file.path) == files::key(&thread.root)
+            .any(|file| file.path == thread.root
                 && file.fingerprint.is_some()
                 && file.kind == "continuation")
     );

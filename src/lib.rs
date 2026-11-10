@@ -575,13 +575,10 @@ fn run_with(
                 format!("Not a file: {}", input_file.display()),
             )));
         }
-        tui::run_single_file(
-            input_file.clone(),
-            tool_display,
-            show_thinking,
-            keys,
-            user_environment()?,
-        )?;
+        let environment = user_environment()?;
+        // The cache finds the copy of a session by its canonical path.
+        let input_file = environment.canonicaliser().canonicalise(input_file)?;
+        tui::run_single_file(input_file, tool_display, show_thinking, keys, environment)?;
         return Ok(());
     }
 

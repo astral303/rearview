@@ -539,7 +539,7 @@ impl SessionLoader<'_> {
             self.show_last,
         )?;
         Ok(cached.map(|cached| {
-            self.session_read(stub, restore_from_catalogue(&cached, stub, external_titles))
+            self.session_read(stub, restore_from_catalogue(&cached, external_titles))
         }))
     }
 
@@ -575,7 +575,7 @@ impl SessionLoader<'_> {
         match copy {
             Some(copy) => SessionOutcome::settled(
                 stub,
-                self.session_read(stub, restore_from_catalogue(&copy, stub, external_titles)),
+                self.session_read(stub, restore_from_catalogue(&copy, external_titles)),
             ),
             None => SessionOutcome::not_cached(stub),
         }

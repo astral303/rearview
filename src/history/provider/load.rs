@@ -1127,11 +1127,11 @@ impl SessionLoader<'_> {
                 let restored = match source {
                     RowSource::Transcripts => return None,
                     RowSource::Database(catalogue) => {
-                        RootRead::Read(restore_from_catalogue(catalogue, stub, &external_titles))
+                        RootRead::Read(restore_from_catalogue(catalogue, &external_titles))
                     }
                     RowSource::LeftOut(row) => RootRead::Read(RawRead::Restored(*row)),
                     RowSource::Stale(catalogue) => {
-                        RootRead::Stale(restore_from_catalogue(catalogue, stub, &external_titles))
+                        RootRead::Stale(restore_from_catalogue(catalogue, &external_titles))
                     }
                     RowSource::NotCached => RootRead::NotCached,
                 };
@@ -1250,7 +1250,7 @@ impl SessionLoader<'_> {
             .collect();
         for (stub, row) in rows_under_unlisted_directories {
             let conversation =
-                self.resolve_preview_and_project(restored_row(row, &stub, &external_titles));
+                self.resolve_preview_and_project(restored_row(row, &external_titles));
             discovered.push(DiscoveredSession {
                 stub,
                 recorded: Some(RecordedSession::of(&conversation)),
@@ -1383,7 +1383,7 @@ fn row_source<'a>(
     if let Some(leaves_out) = left_out.0
         && let Some(CatalogueSession::Listed(row)) = database.catalogue.get(&stub.cache_key)
     {
-        let row = restored_row(row, stub, external_titles);
+        let row = restored_row(row, external_titles);
         if leaves_out(&row) {
             return RowSource::LeftOut(Box::new(row));
         }
@@ -1405,9 +1405,7 @@ fn copy_as_it_is(
     external_titles: &HashMap<String, SessionTitle>,
 ) -> RootRead {
     match database.and_then(|database| database.catalogue.get(&stub.cache_key)) {
-        Some(catalogue) => {
-            RootRead::Stale(restore_from_catalogue(catalogue, stub, external_titles))
-        }
+        Some(catalogue) => RootRead::Stale(restore_from_catalogue(catalogue, external_titles)),
         None => RootRead::NotCached,
     }
 }
@@ -1507,17 +1505,14 @@ fn holds_session(
     database_holds(current, stub) && catalogue.contains_key(&stub.cache_key)
 }
 
-/// The read `catalogue`, the database's catalogue row of the session at
-/// `stub`, restores, as [`restored_row`] restores a listed row.
+/// The read `catalogue`, the database's catalogue row of a session,
+/// restores, as [`restored_row`] restores a listed row.
 fn restore_from_catalogue(
     catalogue: &CatalogueSession,
-    stub: &SessionStub,
     external_titles: &HashMap<String, SessionTitle>,
 ) -> RawRead {
     match catalogue {
-        CatalogueSession::Listed(row) => {
-            RawRead::Restored(restored_row(row, stub, external_titles))
-        }
+        CatalogueSession::Listed(row) => RawRead::Restored(restored_row(row, external_titles)),
         CatalogueSession::Empty(warning) => RawRead::Empty(warning.clone()),
         CatalogueSession::Unreadable(warning) => {
             RawRead::Failed(ReadError::Permanent, warning.clone())
@@ -1561,16 +1556,13 @@ fn listed_rows_under<'c>(
     rows
 }
 
-/// `row`, the database's catalogue row of the session at `stub`, with the
-/// title stored beside the transcript when `external_titles` holds one, and
-/// its sub-agent transcripts spelled as `stub` lists them.
+/// `row`, the database's catalogue row of a session, with the title stored
+/// beside the transcript when `external_titles` holds one.
 fn restored_row(
     row: &Conversation,
-    stub: &SessionStub,
     external_titles: &HashMap<String, SessionTitle>,
 ) -> Conversation {
     let mut row = row.clone();
-    row.subagents = sqlite_cache::subagents_as_listed(stub, std::mem::take(&mut row.subagents));
     if let Some(title) = external_titles.get(&row.session_id) {
         apply_external_title(&mut row, title);
     }
@@ -2081,6 +2073,11 @@ mod tests {
             assert_eq!(
                 loaded.conversations[0].session_id, row.session_id,
                 "{:?}",
+                row.source
+            );
+            assert_eq!(
+                loaded.conversations[0].subagents, stub.subagents,
+                "{:?}'s restored sub-agents keep discovery's spelling",
                 row.source
             );
         }

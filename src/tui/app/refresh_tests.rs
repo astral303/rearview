@@ -610,6 +610,76 @@ pub(super) fn serve_list_refresh(app: &mut App, window: TimeFilter) {
     app.finish_refresh(outcome);
 }
 
+#[test]
+fn load_and_refresh_canonicalise_root_alone_whatever_sub_agent_count() {
+    let single = directories_canonicalised(1);
+    let multiple = directories_canonicalised(4);
+
+    let root = std::slice::from_ref(&single.root);
+    assert_eq!(single.cold_load, root, "a cold load resolves the root once");
+    assert!(single.warm_load.is_empty(), "a warm load resolves nothing");
+    assert_eq!(single.refresh, root, "a refresh resolves the root once");
+    assert_eq!(
+        (
+            multiple.cold_load.len(),
+            multiple.warm_load.len(),
+            multiple.refresh.len()
+        ),
+        (1, 0, 1),
+        "four sessions of four sub-agents each resolve no more: {multiple:?}"
+    );
+}
+
+/// The directories one session root's loads and refresh canonicalise.
+#[derive(Debug)]
+struct Canonicalised {
+    root: PathBuf,
+    cold_load: Vec<PathBuf>,
+    warm_load: Vec<PathBuf>,
+    refresh: Vec<PathBuf>,
+}
+
+/// The directories a cold load, a warm load, and a list refresh after one
+/// session gained a message canonicalise, in a home of `sessions` sessions
+/// with `sessions` sub-agents each.
+fn directories_canonicalised(sessions: usize) -> Canonicalised {
+    use crate::history::provider::walk::test_support::CountingCanonicaliser;
+    let home = ClaudeHome::new();
+    let transcripts: Vec<PathBuf> = (0..sessions)
+        .map(|session| {
+            let transcript = home.write(&format!("s{session}"), 1, &["a question"]);
+            for agent in 0..sessions {
+                home.write_subagent(&transcript, &format!("a{agent}"), 1, &["a task"]);
+            }
+            transcript
+        })
+        .collect();
+    let canonicaliser = Arc::new(CountingCanonicaliser::default());
+    let environment = home.environment().with_canonicaliser(canonicaliser.clone());
+    let since = |earlier: usize| canonicaliser.resolved()[earlier..].to_vec();
+
+    let rows = home.rows(&environment);
+    let cold_load = since(0);
+    assert!(rows.iter().all(|row| row.subagents.len() == sessions));
+    home.rows(&environment);
+    let warm_load = since(cold_load.len());
+    home.append(&transcripts[0], 2, "a follow-up");
+    let mut app = app_reading(rows, environment);
+    serve_list_refresh(&mut app, TimeFilter::default());
+    let refresh = since(cold_load.len() + warm_load.len());
+    assert_eq!(
+        app.conversations().len(),
+        sessions,
+        "the refresh lists every session"
+    );
+    Canonicalised {
+        root: home.root().path,
+        cold_load,
+        warm_load,
+        refresh,
+    }
+}
+
 /// Messages from 12:30 on the day [`ClaudeHome::write`] writes them.
 pub(super) fn window_from_half_past_noon() -> TimeFilter {
     TimeFilter {

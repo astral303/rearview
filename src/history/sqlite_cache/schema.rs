@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 9;
+pub(super) const SCHEMA_VERSION: u32 = 10;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Every table, dropped in this order when the schema changes.
@@ -39,9 +39,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     source TEXT NOT NULL,
     root TEXT NOT NULL,
     cache_key TEXT NOT NULL,
+    -- As discovery spells it.
     locator TEXT NOT NULL,
-    -- The locator canonicalized, or as given when it names no file.
-    canonical_path TEXT NOT NULL,
+    -- The locator's `FileKey`: the root's canonical path joined with the
+    -- locator's path beneath the root, lowercased on a file system that
+    -- ignores case.
+    file_key TEXT NOT NULL,
     -- `writing` until every row of the session is written, then `listed`,
     -- `empty` or `unreadable`.
     status TEXT NOT NULL,
@@ -74,7 +77,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     UNIQUE (storage, root, cache_key)
 );
 CREATE INDEX IF NOT EXISTS sessions_by_session_id ON sessions (session_id_key);
-CREATE INDEX IF NOT EXISTS sessions_by_path ON sessions (canonical_path);
+CREATE INDEX IF NOT EXISTS sessions_by_locator ON sessions (locator);
+CREATE INDEX IF NOT EXISTS sessions_by_file_key ON sessions (file_key);
 CREATE INDEX IF NOT EXISTS sessions_by_handle ON sessions (handle);
 CREATE INDEX IF NOT EXISTS sessions_by_time ON sessions (timestamp_ms);
 
@@ -84,7 +88,10 @@ CREATE TABLE IF NOT EXISTS session_files (
     session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('locator', 'subagent', 'continuation')),
+    -- As discovery, or the transcript that names the file, spells it.
     path TEXT NOT NULL,
+    -- The file's `FileKey`, as `sessions.file_key` keys the locator.
+    key TEXT NOT NULL,
     file_size INTEGER,
     mtime_secs INTEGER,
     mtime_nsecs INTEGER,

@@ -35,6 +35,22 @@ impl DirectoryLister for SystemLister {
     }
 }
 
+/// Resolves a directory to its canonical path: links followed, `.` and `..`
+/// removed, and on Windows the verbatim `\\?\` form.
+pub trait Canonicaliser: Send + Sync {
+    fn canonicalise(&self, path: &Path) -> std::io::Result<PathBuf>;
+}
+
+/// The file system's own resolution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemCanonicaliser;
+
+impl Canonicaliser for SystemCanonicaliser {
+    fn canonicalise(&self, path: &Path) -> std::io::Result<PathBuf> {
+        std::fs::canonicalize(path)
+    }
+}
+
 /// The lister one discovery walks a session root through. The root must
 /// list: its error fails the discovery. A directory beneath the root that
 /// cannot be listed, such as one an agent is deleting on Windows, lists as
@@ -156,6 +172,26 @@ pub(crate) mod test_support {
                 .iter()
                 .filter(|listed| listed.as_path() == directory)
                 .count()
+        }
+    }
+
+    /// The file system's resolution, counting each path it resolves.
+    #[derive(Default)]
+    pub(crate) struct CountingCanonicaliser {
+        resolved: Mutex<Vec<PathBuf>>,
+    }
+
+    impl CountingCanonicaliser {
+        /// Every path resolved so far, in order.
+        pub(crate) fn resolved(&self) -> Vec<PathBuf> {
+            self.resolved.lock().unwrap().clone()
+        }
+    }
+
+    impl Canonicaliser for CountingCanonicaliser {
+        fn canonicalise(&self, path: &Path) -> std::io::Result<PathBuf> {
+            self.resolved.lock().unwrap().push(path.to_path_buf());
+            SystemCanonicaliser.canonicalise(path)
         }
     }
 

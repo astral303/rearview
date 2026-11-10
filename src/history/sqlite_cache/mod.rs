@@ -33,7 +33,7 @@ pub use cached_session::CachedSession;
 pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
 pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
-pub(crate) use catalogue::{SessionRecord, SessionStatus, subagents_as_listed};
+pub(crate) use catalogue::{SessionRecord, SessionStatus};
 pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
 pub(crate) use entries::StoredEntries;
@@ -61,6 +61,7 @@ use entries::path_text;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -155,6 +156,8 @@ pub(crate) struct SqliteCache {
 pub(crate) struct CacheWriter {
     cache: SqliteCache,
     owner: refresh::RefreshToken,
+    /// Boxed, so a load's reader-or-writer value stays the size of a reader.
+    file_keys: Box<files::FileKeys>,
 }
 
 impl std::ops::Deref for CacheWriter {
@@ -438,6 +441,7 @@ impl CacheWriter {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        let file_keys = Box::new(files::FileKeys::new(Arc::clone(base.canonicaliser())));
         Ok(Self {
             cache: SqliteCache {
                 connection,
@@ -445,6 +449,7 @@ impl CacheWriter {
                 wait: ReaderWait::Waiting(WAITING_BUSY_TIMEOUT),
             },
             owner,
+            file_keys,
         })
     }
 
@@ -636,13 +641,20 @@ impl CacheWriter {
 
     fn write_catalogue(&mut self, record: &SessionRecord) -> Result<i64> {
         let row = &record.catalogue;
-        let batch = refresh::transaction(&self.connection, &self.owner)?;
+        let root = Path::new(&row.root);
+        let locator_key = self.file_keys.of_file_under(root, Path::new(&row.locator));
+        let file_keys: Vec<files::FileKey> = row
+            .files
+            .iter()
+            .map(|file| self.file_keys.of_file_under(root, &file.path))
+            .collect();
+        let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
         batch.execute(
             "DELETE FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
             params![row.storage, row.root, row.cache_key],
         )?;
         batch.execute(
-            "INSERT INTO sessions (storage, source, root, cache_key, locator, canonical_path, \
+            "INSERT INTO sessions (storage, source, root, cache_key, locator, file_key, \
              status, file_size, mtime_secs, mtime_nsecs, session_id, session_id_key, handle, \
              project_path, project_name, cwd, timestamp_ms, preview_first, preview_last, \
              summary, custom_title, model, total_tokens, duration_minutes, message_count, \
@@ -655,7 +667,7 @@ impl CacheWriter {
                 row.root,
                 row.cache_key,
                 row.locator,
-                row.canonical_path,
+                locator_key.as_str(),
                 catalogue::WRITING,
                 row.fingerprint.file_size as i64,
                 row.fingerprint.mtime_secs as i64,
@@ -682,15 +694,16 @@ impl CacheWriter {
         let session = batch.last_insert_rowid();
         {
             let mut statement = batch.prepare_cached(
-                "INSERT INTO session_files (session, position, kind, path, file_size, mtime_secs, \
-                 mtime_nsecs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO session_files (session, position, kind, path, key, file_size, \
+                 mtime_secs, mtime_nsecs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
-            for (position, file) in row.files.iter().enumerate() {
+            for (position, (file, key)) in row.files.iter().zip(&file_keys).enumerate() {
                 statement.execute(params![
                     session,
                     position as i64,
                     file.kind,
-                    file.path,
+                    path_text(&file.path),
+                    key.as_str(),
                     file.fingerprint
                         .map(|fingerprint| fingerprint.file_size as i64),
                     file.fingerprint

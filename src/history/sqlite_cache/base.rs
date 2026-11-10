@@ -1,6 +1,7 @@
 //! A session cache directory as one rearview reaches it.
 
 use crate::clock::Clock;
+use crate::history::provider::walk::{Canonicaliser, SystemCanonicaliser};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -189,24 +190,40 @@ impl ProcessIdentity {
 
 /// The session cache directory as one rearview reaches it: with that
 /// rearview's [`ProcessIdentity`], the clock its waits and commit times run
-/// on, and the free space its writes check.
+/// on, the free space its writes check, and the canonicaliser its writes key
+/// session files with.
 #[derive(Clone)]
 pub struct CacheBase {
     path: PathBuf,
     process: ProcessIdentity,
     clock: Arc<dyn Clock>,
     disk: Arc<dyn DiskSpace>,
+    canonicaliser: Arc<dyn Canonicaliser>,
 }
 
 impl CacheBase {
-    /// The base at `path`, its writes checking the system's free space.
+    /// The base at `path`, its writes checking the system's free space and
+    /// keying session files through the file system's canonicalisation.
     pub fn new(path: impl Into<PathBuf>, process: ProcessIdentity, clock: Arc<dyn Clock>) -> Self {
         Self {
             path: path.into(),
             process,
             clock,
             disk: Arc::new(SystemDiskSpace),
+            canonicaliser: Arc::new(SystemCanonicaliser),
         }
+    }
+
+    /// This base, its writes keying session files through `canonicaliser`.
+    pub(crate) fn with_canonicaliser(self, canonicaliser: Arc<dyn Canonicaliser>) -> Self {
+        Self {
+            canonicaliser,
+            ..self
+        }
+    }
+
+    pub(crate) fn canonicaliser(&self) -> &Arc<dyn Canonicaliser> {
+        &self.canonicaliser
     }
 
     /// This base on a drive with `free_bytes` free, whatever its writes add.

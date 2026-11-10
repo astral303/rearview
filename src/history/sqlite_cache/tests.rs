@@ -6,6 +6,7 @@ use crate::history::{DisplayEntries, Source, normalized_session};
 use std::time::{Duration, UNIX_EPOCH};
 
 mod bounded;
+mod file_keys;
 mod lifecycle;
 mod message_schema;
 mod sources;
@@ -120,8 +121,10 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
             subagents,
             row.subagents
                 .iter()
-                .map(|path| path_text(&files::key(path)))
-                .collect::<Vec<_>>()
+                .map(|path| path_text(path))
+                .collect::<Vec<_>>(),
+            "{:?}'s sub-agents are stored as discovery spells them",
+            row.source
         );
         let expected = normalized_session(
             crate::history::FOR_FIXTURES,
@@ -609,7 +612,7 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
     let metadata = std::fs::metadata(&source).unwrap();
     record.catalogue.files = vec![catalogue::SessionFile {
         kind: "locator",
-        path: record.catalogue.locator.clone(),
+        path: source.clone(),
         fingerprint: Some(CachedFingerprint::of(
             metadata.len(),
             metadata.modified().unwrap(),

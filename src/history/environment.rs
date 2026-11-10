@@ -1,13 +1,13 @@
 //! The inputs one rearview reads: the providers' session storages, the
-//! session cache base, the clock, the directory lister and the working
-//! directory. Every production entry point takes an [`Environment`]; `lib.rs`
+//! session cache base, the clock, the directory lister, the canonicaliser
+//! and the working directory. Every production entry point takes an [`Environment`]; `lib.rs`
 //! passes the user's, and a test passes its own fixtures, cache directory,
 //! clock, lister and working directory.
 
 use super::Source;
 use super::Workspace;
 use super::provider::SessionStorage;
-use super::provider::walk::{DirectoryLister, SystemLister};
+use super::provider::walk::{Canonicaliser, DirectoryLister, SystemCanonicaliser, SystemLister};
 use super::sqlite_cache::{CacheBase, ProcessIdentity};
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
@@ -21,6 +21,9 @@ pub struct Environment {
     cache_base: CacheBase,
     clock: Arc<dyn Clock>,
     lister: Arc<dyn DirectoryLister>,
+    /// Shared with the session cache base, whose writes key session files
+    /// through it.
+    canonicaliser: Arc<dyn Canonicaliser>,
     /// Or the error reading it: only a command scoped to the workspace fails
     /// on that error.
     working_directory: std::result::Result<PathBuf, Arc<std::io::Error>>,
@@ -55,11 +58,14 @@ impl Environment {
         clock: Arc<dyn Clock>,
         lister: Arc<dyn DirectoryLister>,
     ) -> Self {
+        let canonicaliser: Arc<dyn Canonicaliser> = Arc::new(SystemCanonicaliser);
         Self {
             storages,
-            cache_base: CacheBase::new(cache_base, process, Arc::clone(&clock)),
+            cache_base: CacheBase::new(cache_base, process, Arc::clone(&clock))
+                .with_canonicaliser(Arc::clone(&canonicaliser)),
             clock,
             lister,
+            canonicaliser,
             working_directory: std::env::current_dir().map_err(Arc::new),
         }
     }
@@ -87,6 +93,22 @@ impl Environment {
 
     pub fn lister(&self) -> &dyn DirectoryLister {
         self.lister.as_ref()
+    }
+
+    pub fn canonicaliser(&self) -> &dyn Canonicaliser {
+        self.canonicaliser.as_ref()
+    }
+
+    /// This environment, resolving paths through `canonicaliser`.
+    #[cfg(test)]
+    pub(crate) fn with_canonicaliser(self, canonicaliser: Arc<dyn Canonicaliser>) -> Self {
+        Self {
+            cache_base: self
+                .cache_base
+                .with_canonicaliser(Arc::clone(&canonicaliser)),
+            canonicaliser,
+            ..self
+        }
     }
 
     /// The workspace of the working directory. Fails when the process could

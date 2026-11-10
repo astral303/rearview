@@ -6,7 +6,7 @@ use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::{RecordedSession, SessionCache, SessionRoot, SessionStub};
 use crate::history::{Conversation, ParseError, ParsePermit, Source, TranscriptEntries};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionStatus {
@@ -152,7 +152,6 @@ pub(super) struct CatalogueRow {
     pub(super) root: String,
     pub(super) cache_key: String,
     pub(super) locator: String,
-    pub(super) canonical_path: String,
     pub(super) status: SessionStatus,
     pub(super) fingerprint: CachedFingerprint,
     pub(super) session_id: Option<String>,
@@ -180,7 +179,8 @@ pub(super) struct CatalogueRow {
 
 pub(super) struct SessionFile {
     pub(super) kind: &'static str,
-    pub(super) path: String,
+    /// As discovery, or the transcript that names the file, spells it.
+    pub(super) path: PathBuf,
     pub(super) fingerprint: Option<CachedFingerprint>,
 }
 
@@ -195,17 +195,12 @@ impl CatalogueRow {
         status: SessionStatus,
     ) -> Option<Self> {
         let fingerprint = stub.fingerprint.stamp()?;
-        let canonical_path = stub
-            .locator
-            .canonicalize()
-            .unwrap_or_else(|_| stub.locator.clone());
         Some(Self {
             storage: storage.directory,
             source: source.label(),
             root: path_text(&root.path),
             cache_key: stub.cache_key.clone(),
             locator: path_text(&stub.locator),
-            canonical_path: path_text(&canonical_path),
             status,
             fingerprint,
             session_id: None,
@@ -230,7 +225,7 @@ impl CatalogueRow {
                 .enumerate()
                 .map(|(index, file)| SessionFile {
                     kind: if index == 0 { "locator" } else { "subagent" },
-                    path: path_text(&super::files::key(file)),
+                    path: file.clone(),
                     fingerprint: file_fingerprint(file),
                 })
                 .collect(),
@@ -254,13 +249,12 @@ impl CatalogueRow {
             .into_iter()
             .chain(child_sources.iter().map(std::path::PathBuf::as_path))
         {
-            let key = path_text(&super::files::key(path));
-            if !self.files.iter().any(|file| file.path == key) {
+            if !self.lists_file(path) {
                 let stamp = super::files::fingerprint(path)?
                     .ok_or_else(|| AppError::SessionCacheSourceChanged(path.to_path_buf()))?;
                 self.files.push(SessionFile {
                     kind: "continuation",
-                    path: key,
+                    path: path.to_path_buf(),
                     fingerprint: Some(stamp),
                 });
                 added_dependency = true;
@@ -275,17 +269,22 @@ impl CatalogueRow {
             .into_iter()
             .chain(child_sources.iter().map(std::path::PathBuf::as_path))
         {
-            let key = path_text(&super::files::key(path));
-            if !self.files.iter().any(|file| file.path == key) {
+            if !self.lists_file(path) {
                 return Err(AppError::SessionCacheSourceChanged(path.to_path_buf()));
             }
         }
         for file in &self.files {
-            if super::files::fingerprint(Path::new(&file.path))? != file.fingerprint {
-                return Err(AppError::SessionCacheSourceChanged((&file.path).into()));
+            if super::files::fingerprint(&file.path)? != file.fingerprint {
+                return Err(AppError::SessionCacheSourceChanged(file.path.clone()));
             }
         }
         Ok((entries, search_parts))
+    }
+
+    /// True when the row's files hold `path`, as the parse that names it
+    /// spells it.
+    fn lists_file(&self, path: &Path) -> bool {
+        self.files.iter().any(|file| file.path == path)
     }
 
     fn describe(&mut self, stub: &SessionStub, conversation: &Conversation) {
@@ -325,30 +324,10 @@ impl CatalogueRow {
         self.files
             .extend(conversation.subagents.iter().map(|file| SessionFile {
                 kind: "subagent",
-                path: path_text(&super::files::key(file)),
+                path: file.clone(),
                 fingerprint: file_fingerprint(file),
             }));
     }
-}
-
-/// `restored`, the sub-agent transcripts of a row the database restored for
-/// the session at `stub`, spelled as `stub` lists them: the database keys
-/// each by its canonical path. A transcript `stub` does not list keeps the
-/// database's spelling.
-pub(crate) fn subagents_as_listed(
-    stub: &SessionStub,
-    restored: Vec<std::path::PathBuf>,
-) -> Vec<std::path::PathBuf> {
-    restored
-        .into_iter()
-        .map(|key| {
-            stub.subagents
-                .iter()
-                .find(|listed| super::files::key(listed) == key)
-                .cloned()
-                .unwrap_or(key)
-        })
-        .collect()
 }
 
 fn transcript_paths(entries: &TranscriptEntries) -> BTreeSet<&Path> {

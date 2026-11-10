@@ -1,13 +1,14 @@
 //! Bounded entry batches projected onto the existing search surfaces.
 
-use super::{CachedSession, entries, files};
+use super::{CachedSession, entries};
 use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::parser::{
     normalize_full_text, normalize_whitespace, search_parts_of_entry, semantic_text_of_entry,
 };
 use crate::log_entry::LogEntry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SearchField {
@@ -41,8 +42,8 @@ impl CachedSession {
         mut visit: impl FnMut(SearchPart),
     ) -> Result<Option<()>> {
         self.read(|connection, session| {
-            let subagents: HashSet<_> = row.subagents.iter().map(|path| files::key(path)).collect();
-            let mut spliced_transcripts = HashMap::new();
+            // The copy spells its sub-agents and its entries' transcripts alike.
+            let subagents: HashSet<&Path> = row.subagents.iter().map(PathBuf::as_path).collect();
             let mut after = -1;
             let mut summary = None;
             let mut title = None;
@@ -57,9 +58,7 @@ impl CachedSession {
                         LogEntry::CustomTitle { custom_title } => title = (!custom_title.trim().is_empty()).then(|| custom_title.trim().to_owned()),
                         _ => {}
                     }
-                    let spliced = record.transcript.as_ref().is_some_and(|path| {
-                        *spliced_transcripts.entry(path.clone()).or_insert_with(|| subagents.contains(&files::key(path)))
-                    });
+                    let spliced = record.transcript.as_deref().is_some_and(|path| subagents.contains(path));
                     for (field, texts) in [SearchField::Full, SearchField::Agent, SearchField::Thinking].into_iter().zip(search_parts_of_entry(&entry, spliced)) {
                         for text in texts {
                             let text = if field == SearchField::Full { normalize_full_text(&text) } else { normalize_whitespace(&text) };

@@ -1,8 +1,8 @@
 //! A catalogue row's content location; connections stay local to each read.
 
+use super::files::{self, FileKey};
 use super::{
-    CacheBase, ReaderWait, SqliteCache, StoredEntries, entries, files, is_storage_current,
-    path_text,
+    CacheBase, ReaderWait, SqliteCache, StoredEntries, entries, is_storage_current, path_text,
 };
 use crate::error::Result;
 use crate::history::TranscriptEntries;
@@ -77,9 +77,8 @@ impl CachedSession {
     /// transcripts are not `subagents`, the session's sub-agents now: a
     /// session that started a sub-agent since its copy was written.
     pub(crate) fn matches_transcripts(&self, subagents: &[PathBuf]) -> Result<bool> {
-        let lists_subagents = self.read(|connection, session| {
-            Ok(stored_subagents(connection, session)? == subagent_keys(subagents))
-        });
+        let lists_subagents =
+            self.read(|connection, session| lists_subagents(connection, session, subagents));
         match lists_subagents {
             Ok(found) => Ok(found == Some(true)),
             Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(false),
@@ -212,9 +211,7 @@ impl SqliteCache {
             let Some(copy) = self.listed_copy(connection, source, path)? else {
                 return Ok(None);
             };
-            let lists_subagents =
-                stored_subagents(connection, copy.generation)? == subagent_keys(subagents);
-            Ok(lists_subagents.then_some(copy))
+            Ok(lists_subagents(connection, copy.generation, subagents)?.then_some(copy))
         })
     }
 
@@ -252,6 +249,8 @@ impl SqliteCache {
         })
     }
 
+    /// The listed session `source` stores at `path`: spelled as discovery
+    /// spells the locator, or canonical.
     fn listed_copy(
         &self,
         connection: &Connection,
@@ -260,8 +259,8 @@ impl SqliteCache {
     ) -> Result<Option<CachedSession>> {
         let storage = source.provider().storage().cache();
         let stored: Option<(i64, String, String)> = connection.query_row(
-            "SELECT id, root, cache_key FROM sessions WHERE storage = ?1 AND canonical_path = ?2 AND status = 'listed' ORDER BY id LIMIT 1",
-            params![storage.directory, path_text(&files::key(path))],
+            "SELECT id, root, cache_key FROM sessions WHERE storage = ?1 AND (locator = ?2 OR file_key = ?3) AND status = 'listed' ORDER BY id LIMIT 1",
+            params![storage.directory, path_text(path), FileKey::of_canonical(path).as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
         Ok(stored.map(|(generation, root, cache_key)| CachedSession {
@@ -277,17 +276,17 @@ impl SqliteCache {
     }
 }
 
-/// The sub-agent transcripts the copy `session` lists, in order, by
-/// [`files::key`].
-fn stored_subagents(connection: &Connection, session: i64) -> Result<Vec<PathBuf>> {
-    Ok(connection
-        .prepare(
-            "SELECT path FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position",
+/// True when the copy `session` lists `subagents`, in order: each spelled as
+/// the copy stores it, or canonical.
+fn lists_subagents(connection: &Connection, session: i64, subagents: &[PathBuf]) -> Result<bool> {
+    let stored = connection
+        .prepare_cached(
+            "SELECT path, key FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position",
         )?
-        .query_map([session], |row| row.get::<_, String>(0).map(PathBuf::from))?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-fn subagent_keys(subagents: &[PathBuf]) -> Vec<PathBuf> {
-    subagents.iter().map(|path| files::key(path)).collect()
+        .query_map([session], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(stored.len() == subagents.len()
+        && stored.iter().zip(subagents).all(|((path, key), subagent)| {
+            *path == path_text(subagent) || key == FileKey::of_canonical(subagent).as_str()
+        }))
 }
