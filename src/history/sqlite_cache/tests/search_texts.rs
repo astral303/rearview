@@ -230,7 +230,17 @@ fn semantic_turns_read_from_copy_keep_terminal_codes_as_parse_does() {
     for (read, content) in [
         (
             "semantic turns",
-            listed.load_held_semantic_turns().unwrap().unwrap().row,
+            std::borrow::Cow::Owned(
+                Conversation::load_held_semantic_turns_of(&[(
+                    &listed,
+                    listed.cached_session.as_ref().unwrap(),
+                )])
+                .unwrap()
+                .remove(0)
+                .unwrap()
+                .unwrap()
+                .row,
+            ),
         ),
         ("content", listed.load_held_content().unwrap().unwrap().row),
     ] {

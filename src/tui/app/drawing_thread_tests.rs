@@ -137,31 +137,9 @@ fn workspace_toggle_with_active_query_doesnt_wait_for_another_processs_rebuild()
     drop(rebuild);
 }
 
-/// Room for a drawing-thread read's own work and the system timer's jitter
-/// beside its busy wait. Shorter than the observation's 100 ms lock wait,
-/// which sleeps about 180 ms on the system clock.
-const READ_WORK_ALLOWANCE: Duration = Duration::from_millis(80);
-
-/// The shortest of three runs of `run`, and the last run's result. One run
-/// behind a lock can sleep tens of milliseconds longer than another under
-/// load.
-fn fastest_of_three<T>(mut run: impl FnMut() -> T) -> (Duration, T) {
-    let mut fastest = Duration::MAX;
-    let mut result = None;
-    for _ in 0..3 {
-        let started = Instant::now();
-        result = Some(run());
-        fastest = fastest.min(started.elapsed());
-    }
-    (fastest, result.unwrap())
-}
-
 /// Behind a rebuild's exclusive lock, each drawing-thread read waits for its
 /// busy timeout once, then observes the refresh state without a second wait
-/// and reports the rebuild. Timed on the system clock, the fastest of three
-/// runs of each read against the fastest of three busy waits of the
-/// interactive reader's open behind the same lock: SQLite sleeps in steps of
-/// the system timer, so that wait ends past its busy timeout.
+/// and reports the rebuild. The waits are recorded, not slept.
 #[test]
 fn drawing_thread_reads_behind_rebuild_wait_out_single_busy_timeout() {
     let home = tempfile::tempdir().unwrap();
@@ -171,19 +149,12 @@ fn drawing_thread_reads_behind_rebuild_wait_out_single_busy_timeout() {
     let rebuilding =
         NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Rebuilding));
     let rebuild = exclusive_lock(base.path());
-    let (single_busy_wait, opened) =
-        fastest_of_three(|| InteractiveCache::at(rearview(base.path())).open());
-    assert!(
-        matches!(&opened, Err(error) if crate::history::sqlite_cache::is_busy_error(error)),
-        "the interactive reader doesn't open behind a rebuild"
-    );
+    let busy_waits = test_hooks::BusyWaits::record_on_this_thread();
 
-    let (read_waited, read) = fastest_of_three(|| {
-        InteractiveCache::at(rearview(base.path())).read(|_| Ok(None::<CachedCopy<()>>))
-    });
-    let (reread_waited, reread) = fastest_of_three(|| {
-        reread_sessions(&environment, row.source, &[row.path.as_path()], false)
-    });
+    let read = InteractiveCache::at(rearview(base.path())).read(|_| Ok(None::<CachedCopy<()>>));
+    let read_waits = busy_waits.take();
+    let reread = reread_sessions(&environment, row.source, &[row.path.as_path()], false);
+    let reread_waits = busy_waits.take();
     drop(rebuild);
 
     assert!(
@@ -199,14 +170,14 @@ fn drawing_thread_reads_behind_rebuild_wait_out_single_busy_timeout() {
         [rebuilding],
         "the session reread behind a rebuild names the rebuild"
     );
-    for (read, waited) in [
-        ("the interactive read", read_waited),
-        ("the session reread", reread_waited),
+    for (read, waits) in [
+        ("the interactive read", read_waits),
+        ("the session reread", reread_waits),
     ] {
-        assert!(
-            waited <= single_busy_wait + READ_WORK_ALLOWANCE,
-            "{read} behind a rebuild waits at most one busy wait of {single_busy_wait:?} \
-             plus its own work (fastest: {waited:?})"
+        assert_eq!(
+            waits,
+            [INTERACTIVE_BUSY_TIMEOUT],
+            "{read} behind a rebuild waits out one busy timeout"
         );
     }
 }

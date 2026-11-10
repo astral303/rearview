@@ -23,11 +23,21 @@ const ENTRY_TABLES: &[&str] = &[
     "result_items",
 ];
 
+/// The operation [`watch_row_writes`] counts for an update of a part's
+/// content: an update setting its digest, unlike an update of its search
+/// position alone.
+const CONTENT_UPDATE: &str = "UPDATE CONTENT";
+
 /// Counts each row inserted, updated or deleted in [`ENTRY_TABLES`] through
-/// `connection`, cascades included, until [`take_row_writes`].
+/// `connection`, cascades included, and each part update of
+/// [`CONTENT_UPDATE`], until [`take_row_writes`].
 fn watch_row_writes(connection: &Connection) {
     connection
-        .execute_batch("CREATE TEMP TABLE row_writes (row_table TEXT, operation TEXT)")
+        .execute_batch(&format!(
+            "CREATE TEMP TABLE row_writes (row_table TEXT, operation TEXT); \
+             CREATE TEMP TRIGGER parts_content AFTER UPDATE OF digest ON main.parts \
+             BEGIN INSERT INTO row_writes VALUES ('parts', '{CONTENT_UPDATE}'); END"
+        ))
         .unwrap();
     for table in ENTRY_TABLES {
         for operation in ["INSERT", "UPDATE", "DELETE"] {
@@ -572,6 +582,14 @@ fn later_write_of_session_with_files_under_two_roots_matches_fresh_write() {
     assert_matches_fresh_write(&cache, &fixture, &record);
 }
 
+/// The entries `write` builds part rows for.
+fn part_row_builds(write: impl FnOnce()) -> usize {
+    use crate::history::sqlite_cache::entries::PART_ROW_BUILDS;
+    PART_ROW_BUILDS.with(|builds| builds.set(0));
+    write();
+    PART_ROW_BUILDS.with(std::cell::Cell::get)
+}
+
 #[test]
 fn parse_equal_to_stored_session_writes_no_entry_rows_for_every_agent() {
     for session in every_record_sessions() {
@@ -581,8 +599,16 @@ fn parse_equal_to_stored_session_writes_no_entry_rows_for_every_agent() {
         let session = fixture.session_id(&cache);
 
         let record = fixture.record();
-        cache.write(&record).unwrap();
+        let builds = part_row_builds(|| {
+            cache.write(&record).unwrap();
+        });
 
+        assert_eq!(
+            builds,
+            0,
+            "{}: comparing unchanged entries doesn't build any part rows",
+            fixture.label()
+        );
         assert_eq!(
             take_row_writes(&cache.connection),
             BTreeMap::new(),
@@ -1050,7 +1076,9 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
             .unwrap();
 
         let record = fixture.record();
-        cache.write(&record).unwrap();
+        let builds = part_row_builds(|| {
+            cache.write(&record).unwrap();
+        });
 
         let writes = take_row_writes(&cache.connection);
         assert_eq!(
@@ -1061,6 +1089,12 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
             ),
             (1, 0, 0),
             "{}: the write updates the changed entry alone: {writes:?}",
+            fixture.label()
+        );
+        assert_eq!(
+            builds,
+            1,
+            "{}: the write builds the changed entry's part rows alone",
             fixture.label()
         );
         assert!(
@@ -1195,7 +1229,7 @@ fn without_last_block_of_entry_with_call(record: &mut SessionRecord) -> Option<u
 }
 
 #[test]
-fn block_appended_to_entry_with_call_inserts_its_parts_alone_for_every_agent() {
+fn block_appended_to_entry_with_call_inserts_its_parts_alone_for_claude_codex_kimi_pi_and_omp() {
     let mut tested = Vec::new();
     for session in every_record_sessions() {
         let fixture = Fixture::of(session);
@@ -1294,16 +1328,19 @@ fn text_filled_in_before_another_moves_the_later_texts_search_position_alone_for
         assert_eq!(
             (
                 writes_of(&writes, "parts", "INSERT") + writes_of(&writes, "parts", "DELETE"),
+                writes_of(&writes, "parts", CONTENT_UPDATE),
+                writes_of(&writes, "result_items", "INSERT")
+                    + writes_of(&writes, "result_items", "DELETE"),
                 parts_after.len(),
                 kept,
             ),
-            (0, parts_before.len(), parts_before.len() - 1),
-            "{}: the filled-in text's part alone changes its row: {writes:?}",
+            (0, 1, 0, parts_before.len(), parts_before.len() - 1),
+            "{}: the filled-in text's part alone changes its content: {writes:?}",
             fixture.label()
         );
         assert!(
             writes_of(&writes, "parts", "UPDATE") > 1,
-            "{}: the write moves the later text's search position: {writes:?}",
+            "{}: the write moves the later text's search position alone: {writes:?}",
             fixture.label()
         );
         assert_matches_fresh_write(&cache, &fixture, &record);
@@ -1312,6 +1349,221 @@ fn text_filled_in_before_another_moves_the_later_texts_search_position_alone_for
     assert!(
         tested.contains(&Source::OpenCode),
         "OpenCode has an entry holding two texts: {tested:?}"
+    );
+}
+
+/// The number, id and digest of each part of the entry at `sequence`.
+fn numbered_parts_of_entry_at(cache: &CacheWriter, sequence: usize) -> Vec<(i64, i64, i64)> {
+    cache
+        .connection
+        .prepare(
+            "SELECT p.part, p.id, p.digest FROM parts p JOIN entries e ON e.id = p.entry \
+             WHERE e.sequence = ?1 ORDER BY p.part",
+        )
+        .unwrap()
+        .query_map([sequence as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn block_removed_from_entry_with_call_deletes_its_parts_alone_for_every_agent() {
+    let mut tested = Vec::new();
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let before = fixture.record();
+        let mut record = fixture.record();
+        let Some(changed) = without_last_block_of_entry_with_call(&mut record) else {
+            continue;
+        };
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let parts_before = parts_of_entry_at(&cache, changed);
+
+        cache.write(&record).unwrap();
+
+        let writes = take_row_writes(&cache.connection);
+        let parts_after = parts_of_entry_at(&cache, changed);
+        assert_eq!(
+            (
+                writes_of(&writes, "parts", "INSERT"),
+                writes_of(&writes, "parts", CONTENT_UPDATE),
+            ),
+            (0, 0),
+            "{}: the write doesn't insert or rewrite any part: {writes:?}",
+            fixture.label()
+        );
+        let kept: BTreeSet<_> = parts_before.iter().collect();
+        assert!(
+            parts_after.len() < parts_before.len()
+                && parts_after.iter().all(|part| kept.contains(part)),
+            "{}: the removed block's parts are deleted, and every other part keeps its id and \
+             its row: {parts_before:?} then {parts_after:?}",
+            fixture.label()
+        );
+        assert_matches_fresh_write(&cache, &fixture, &record);
+        tested.push(fixture.source());
+    }
+    assert!(
+        tested.contains(&Source::Kimi),
+        "Kimi has an entry holding a call and another block: {tested:?}"
+    );
+}
+
+/// Swaps the first two blocks of the last entry of `record` whose first two
+/// blocks differ; returns the entry's index.
+fn with_first_two_blocks_swapped(record: &mut SessionRecord) -> Option<usize> {
+    let entries = &mut entries_of(record).entries;
+    let index = entries.iter_mut().rposition(|(_, entry)| {
+        blocks_of(entry).is_some_and(|blocks| {
+            blocks.len() > 1
+                && serde_json::to_value(&blocks[0]).unwrap()
+                    != serde_json::to_value(&blocks[1]).unwrap()
+        })
+    })?;
+    blocks_of(&mut entries[index].1)?.swap(0, 1);
+    Some(index)
+}
+
+#[test]
+fn blocks_reordered_in_entry_rewrite_the_swapped_blocks_parts_alone_for_every_agent() {
+    let mut tested = Vec::new();
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let mut before = fixture.record();
+        let Some(changed) = with_first_two_blocks_swapped(&mut before) else {
+            continue;
+        };
+        let mut record = fixture.record();
+        for record in [&mut before, &mut record] {
+            with_trailing_text(record, changed);
+        }
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let parts_before = numbered_parts_of_entry_at(&cache, changed);
+
+        cache.write(&record).unwrap();
+
+        let writes = take_row_writes(&cache.connection);
+        let parts_after = numbered_parts_of_entry_at(&cache, changed);
+        let digest_before = |number: i64| {
+            parts_before
+                .iter()
+                .find(|&&(part, _, _)| part == number)
+                .map(|&(_, _, digest)| digest)
+        };
+        let rewritten: Vec<i64> = parts_after
+            .iter()
+            .filter(|&&(part, _, digest)| digest_before(part) != Some(digest))
+            .map(|&(part, _, _)| part)
+            .collect();
+        let unchanged = |parts: &[(i64, i64, i64)]| -> Vec<(i64, i64, i64)> {
+            parts
+                .iter()
+                .copied()
+                .filter(|(part, _, _)| !rewritten.contains(part))
+                .collect()
+        };
+        assert!(
+            rewritten.contains(&0) && rewritten.contains(&1),
+            "{}: the swapped blocks' parts change: {rewritten:?}",
+            fixture.label()
+        );
+        assert!(
+            rewritten.iter().all(|&part| part < 2),
+            "{}: the parts of the blocks after the swapped two keep their content: \
+             {rewritten:?}",
+            fixture.label()
+        );
+        assert_eq!(
+            unchanged(&parts_after),
+            unchanged(&parts_before),
+            "{}: every part whose content is unchanged, search-only parts included, keeps its \
+             id and row",
+            fixture.label()
+        );
+        assert_eq!(
+            (
+                writes_of(&writes, "parts", CONTENT_UPDATE),
+                writes_of(&writes, "parts", "INSERT"),
+                writes_of(&writes, "parts", "DELETE"),
+            ),
+            (rewritten.len() as i64, 0, 0),
+            "{}: the write rewrites the changed parts alone: {writes:?}",
+            fixture.label()
+        );
+        assert_matches_fresh_write(&cache, &fixture, &record);
+        tested.push(fixture.source());
+    }
+    assert!(
+        tested.contains(&Source::OpenCode),
+        "OpenCode has an entry holding two different blocks: {tested:?}"
+    );
+}
+
+/// Appends a text block to the entry at `index` of `record`, after the
+/// blocks a test changes.
+fn with_trailing_text(record: &mut SessionRecord, index: usize) {
+    let blocks = blocks_of(&mut entries_of(record).entries[index].1)
+        .expect("the changed entry holds blocks");
+    blocks.push(ContentBlock::Text {
+        text: "A trailing block the change leaves alone.".to_owned(),
+    });
+}
+
+/// Removes the last block of the last entry of `record` holding a thinking
+/// block and ending in a text; returns the entry's index.
+fn without_text_after_thinking(record: &mut SessionRecord) -> Option<usize> {
+    let entries = &mut entries_of(record).entries;
+    let index = entries.iter_mut().rposition(|(_, entry)| {
+        blocks_of(entry).is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Thinking { .. }))
+                && matches!(blocks.last(), Some(ContentBlock::Text { text }) if !text.trim().is_empty())
+        })
+    })?;
+    blocks_of(&mut entries[index].1)?.pop();
+    Some(index)
+}
+
+#[test]
+fn text_appended_after_thinking_leaves_the_thinking_search_position_for_every_agent() {
+    let mut tested = Vec::new();
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let mut before = fixture.record();
+        if without_text_after_thinking(&mut before).is_none() {
+            continue;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &before);
+
+        let record = fixture.record();
+        cache.write(&record).unwrap();
+
+        let writes = take_row_writes(&cache.connection);
+        assert_eq!(
+            writes_of(&writes, "parts", "UPDATE"),
+            0,
+            "{}: the appended text's field is searched before thinking, and the stored parts \
+             keep their positions: {writes:?}",
+            fixture.label()
+        );
+        assert!(
+            writes_of(&writes, "parts", "INSERT") > 0,
+            "{}: the appended text inserts its part: {writes:?}",
+            fixture.label()
+        );
+        assert_matches_fresh_write(&cache, &fixture, &record);
+        tested.push(fixture.source());
+    }
+    assert!(
+        !tested.is_empty(),
+        "an agent has an entry holding thinking and then a text"
     );
 }
 

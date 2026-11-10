@@ -818,15 +818,17 @@ fn semantic_search_worker_returns_lexical_fallback() {
     );
     let worker = spawn_search_worker(Arc::new(TestClock::default()));
     let (tx, rx) = (worker.commands, worker.results);
-    assert!(tx.send(SearchCommand::UpdateData {
+    tx.send(SearchCommand::UpdateData {
         conversations: app.conversations_snapshot.clone(),
         searchable: Arc::new(app.searchable.clone()),
-    }));
-    assert!(tx.send(SearchCommand::Search {
+    })
+    .unwrap();
+    tx.send(SearchCommand::Search {
         query: "emoji".to_string(),
         generation: 7,
         mode: ListSearchMode::Semantic,
-    }));
+    })
+    .unwrap();
 
     let response = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
 
@@ -898,7 +900,7 @@ fn quoted_only_semantic_query_shows_search_workers_exact_matches_newest_first() 
     }
     assert!(
         app.semantic_result_metadata(2).is_none(),
-        "the hit the list's filters hide gets no preview"
+        "the hit the list's filters hide doesn't get a preview"
     );
     assert!(
         last_semantic_search(&drain_semantic_commands(&request_rx)).is_none(),

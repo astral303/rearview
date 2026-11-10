@@ -79,6 +79,16 @@ impl CachedClaudeSessions {
         self.writer(index).remove();
     }
 
+    /// Stores `bytes`, whether or not they are UTF-8, as the text of each
+    /// text part of row `index`'s session, keeping its copy's generation.
+    pub fn store_texts(&self, index: usize, bytes: &[u8]) {
+        crate::history::sqlite_cache::tests::store_text_parts_of(
+            self.cache.path(),
+            &self.names[index],
+            bytes,
+        );
+    }
+
     /// Row `index`'s session as the cache lists it now.
     pub fn listed_row(&self, index: usize) -> Conversation {
         use crate::history::Source;

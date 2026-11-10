@@ -198,7 +198,11 @@ fn reload_keeps_old_copy_under_updating_until_its_read_lands() {
         landed && view_text(&app).contains("message 30"),
         "the reload shows once its read lands"
     );
-    assert_eq!(app.open_session_status(), None);
+    assert_eq!(
+        app.open_session_status(),
+        None,
+        "the viewer stops showing the session as updating"
+    );
 }
 
 #[test]
@@ -436,6 +440,58 @@ fn deferred_export_still_out_of_date_after_its_refresh_reports_failed_read() {
     assert_eq!(
         status_text(&app),
         Some("Refresh failed: the session could not be read")
+    );
+}
+
+/// A message copy asked for while a refresh's read runs waits for that read
+/// even when a newer refresh fails to read the session, then copies the
+/// message from what the read shows once no refresh is pending.
+#[test]
+fn message_copy_during_read_waits_for_it_though_newer_refresh_fails() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    let message_index = scroll_to_message(&mut app, "message 1");
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.message_nav_active = true;
+        state.focus = Some(Focus {
+            message_index,
+            call_index: None,
+        });
+    }
+    COPIED.with(|copied| copied.borrow_mut().clear());
+    let gate = ConnectionGate::closed(app.environment.cache_base().path(), |thread| {
+        thread.name() == Some("viewer-read")
+    });
+    write_messages(&path, &numbered(0..5));
+    request_refresh(&mut app);
+    assert!(
+        !app.complete_pending_view_refresh(VIEWPORT, Duration::ZERO),
+        "the first refresh's read runs"
+    );
+    write_messages(&path, &numbered(0..7));
+    home.refuse_project();
+
+    app.handle_key(KeyCode::Char('y'), KeyModifiers::empty(), VIEWPORT);
+    request_refresh(&mut app);
+    let copied_during_read = COPIED.with(|copied| copied.borrow().clone());
+    gate.open();
+    let landed = app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+    // The read found its copy older than the file and asked for a refresh,
+    // which fails as the newer one did.
+    serve_session_refresh(&mut app);
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+
+    assert!(
+        copied_during_read.is_empty(),
+        "the copy waits for the running read: {copied_during_read:?}"
+    );
+    assert!(landed, "the first refresh's read lands");
+    assert!(
+        copied.len() == 1 && copied[0].contains("message 1"),
+        "the copy runs once the read lands: {copied:?}"
     );
 }
 

@@ -2,6 +2,7 @@
 //! In test builds, [`test_hooks`] installs a test's SQLite hooks on each of
 //! them.
 
+use super::base::CacheBase;
 use rusqlite::{Connection, FileControl, OpenFlags};
 use std::path::Path;
 use std::time::Duration;
@@ -28,6 +29,56 @@ pub(super) fn open(
     access: Access,
     busy_timeout: Duration,
 ) -> rusqlite::Result<Connection> {
+    let mut connection = open_file(path, access)?;
+    configure(&mut connection, access, busy_timeout)?;
+    Ok(connection)
+}
+
+/// [`open`] for `base`'s database, as a [`CacheConnection`] from before its
+/// first statement: a setup statement that fails after the write-ahead log
+/// opened closes it under `base`'s low-space close setting too.
+pub(super) fn open_cache(
+    base: &CacheBase,
+    access: Access,
+    busy_timeout: Duration,
+) -> rusqlite::Result<CacheConnection> {
+    let mut connection = CacheConnection {
+        connection: open_file(&super::database_path(base.path()), access)?,
+        base: base.clone(),
+    };
+    configure(&mut connection.connection, access, busy_timeout)?;
+    Ok(connection)
+}
+
+/// A connection to a cache base's database. Once a write of the base found
+/// its drive short of space, it closes without copying the write-ahead log
+/// into the database (see [`super::low_space::Latch::keep_log_on_close`]).
+pub(super) struct CacheConnection {
+    connection: Connection,
+    base: CacheBase,
+}
+
+impl std::ops::Deref for CacheConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for CacheConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+}
+
+impl Drop for CacheConnection {
+    fn drop(&mut self) {
+        self.base.low_space().keep_log_on_close(&self.connection);
+    }
+}
+
+fn open_file(path: &Path, access: Access) -> rusqlite::Result<Connection> {
     let connection = match access {
         // Without SQLite's lock on each call: rusqlite's `Connection` is not
         // `Sync`, which keeps two threads from using one connection at once.
@@ -43,8 +94,18 @@ pub(super) fn open(
     // starting then does.
     #[cfg(test)]
     let connection = test_hooks::install(connection, path);
+    Ok(connection)
+}
+
+fn configure(
+    connection: &mut Connection,
+    access: Access,
+    busy_timeout: Duration,
+) -> rusqlite::Result<()> {
     connection.busy_timeout(busy_timeout)?;
-    set_persistent_wal(&connection, true)?;
+    #[cfg(test)]
+    test_hooks::record_busy_waits(connection, busy_timeout)?;
+    set_persistent_wal(connection, true)?;
     if !matches!(access, Access::ReadOnly) {
         // Without a journal size limit, a writable connection that closes
         // last leaves the persistent write-ahead log at its full size.
@@ -55,7 +116,7 @@ pub(super) fn open(
         // (`CacheWriter::checkpoint_after_writes`).
         connection.pragma_update(None, "wal_autocheckpoint", 0)?;
     }
-    Ok(connection)
+    Ok(())
 }
 
 /// Turn off SQLite's memory statistics: while they are on, every allocation
@@ -102,6 +163,7 @@ pub(crate) mod test_hooks {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
 
     type Install = Arc<dyn Fn(&mut Connection) + Send + Sync>;
 
@@ -159,10 +221,9 @@ pub(crate) mod test_hooks {
         at_the_first_data_commit(base, FirstDataCommit::Lands, action)
     }
 
-    /// Call `action` once, when the reader `opens` names opens its read-only
-    /// connection to the session cache database in `base`, before that
-    /// reader runs a statement. The hook stays installed until the returned
-    /// `ReaderAction` drops.
+    /// Call `action` once, as the read-only connection `opens` picks opens to
+    /// the session cache database in `base`, before it runs a statement. The
+    /// hook stays installed until the returned `ReaderAction` drops.
     pub(crate) fn run_as_a_reader_opens(
         base: &Path,
         opens: ReaderOpening,
@@ -390,6 +451,67 @@ pub(crate) mod test_hooks {
             *is_open.lock().unwrap_or_else(PoisonError::into_inner) = true;
             opened.notify_all();
         }
+    }
+
+    std::thread_local! {
+        /// The busy waits of the [`BusyWaits`] recording on this thread.
+        static RECORDED_BUSY_WAITS: std::cell::RefCell<Option<Arc<Mutex<Vec<Duration>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Records a busy wait for each lock met by a connection [`super::open`]
+    /// opens on this thread, until dropped. The connection gives up at once
+    /// instead of sleeping, and the wait it would have slept, its busy
+    /// timeout, is recorded: a test counts waits without timing them.
+    pub(crate) struct BusyWaits {
+        waits: Arc<Mutex<Vec<Duration>>>,
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    impl BusyWaits {
+        pub(crate) fn record_on_this_thread() -> Self {
+            let waits = Arc::new(Mutex::new(Vec::new()));
+            RECORDED_BUSY_WAITS.with(|recorded| *recorded.borrow_mut() = Some(Arc::clone(&waits)));
+            Self {
+                waits,
+                _not_send: std::marker::PhantomData,
+            }
+        }
+
+        /// The waits recorded since the last call, oldest first.
+        pub(crate) fn take(&self) -> Vec<Duration> {
+            std::mem::take(&mut *self.waits.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    impl Drop for BusyWaits {
+        fn drop(&mut self) {
+            RECORDED_BUSY_WAITS.with(|recorded| *recorded.borrow_mut() = None);
+        }
+    }
+
+    /// Replace `connection`'s busy wait of `busy_timeout` with a recorded one
+    /// while a [`BusyWaits`] records on this thread. A connection that does
+    /// not wait records nothing.
+    pub(super) fn record_busy_waits(
+        connection: &mut Connection,
+        busy_timeout: Duration,
+    ) -> rusqlite::Result<()> {
+        let Some(waits) = RECORDED_BUSY_WAITS.with(|recorded| recorded.borrow().clone()) else {
+            return Ok(());
+        };
+        if busy_timeout.is_zero() {
+            return Ok(());
+        }
+        connection.busy_handler(Some(move |attempt: i32| {
+            if attempt == 0 {
+                waits
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(busy_timeout);
+            }
+            false
+        }))
     }
 
     pub(super) fn install(mut connection: Connection, path: &Path) -> Connection {

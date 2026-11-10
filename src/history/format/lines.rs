@@ -22,7 +22,7 @@ const LINES_PER_TASK: usize = 64;
 
 /// The bytes just before a cursor that its rewrite check hashes: about one
 /// record's worth.
-const REWRITE_CHECK_BYTES: u64 = 4096;
+pub(crate) const REWRITE_CHECK_BYTES: u64 = 4096;
 
 /// A place between two lines of a transcript: the byte just past a line
 /// ending, and the number of the line that starts there.

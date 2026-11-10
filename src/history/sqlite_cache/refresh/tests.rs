@@ -3,6 +3,7 @@ use crate::clock::{SystemClock, TestClock};
 use crate::history::Source;
 use crate::history::provider::walk::SystemCanonicaliser;
 use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
+use crate::history::sqlite_cache::low_space::run_deletion;
 use crate::history::sqlite_cache::observer::{Observation, observe};
 use crate::history::sqlite_cache::{
     CacheWrite, CacheWriter, ProcessIdentity, SessionRecord, SessionStatus, SqliteCache,
@@ -566,8 +567,9 @@ fn committed_batch_restarts_takeover_window() {
 }
 
 /// An operation's parse runs as one write batch of its ownership: another
-/// rearview finds the writer lock held and takes nothing over, though the
-/// last commit stands past the takeover window, until the parse ends.
+/// rearview finds the writer lock held and doesn't take the cache over
+/// until the parse ends, though the last commit is older than the takeover
+/// window.
 #[test]
 fn owners_parse_blocks_takeover_until_it_ends() {
     use crate::history::sqlite_cache::{OperationScope, Patience};
@@ -628,17 +630,88 @@ fn owners_parse_whose_batch_cant_start_fails_with_its_cause() {
     );
 }
 
-/// A parse that takes its owner's turn again would wait forever behind its
-/// own batch; debug builds panic.
+/// A parse whose batch commit fails, here refused by a commit hook, fails
+/// with the commit's own error, not as lost ownership, once the parse ran.
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "took the owner's turn")]
-fn owners_parse_taking_its_owners_turn_panics() {
+fn owners_parse_whose_commit_fails_fails_with_commits_error() {
+    use crate::history::sqlite_cache::{OperationScope, Patience};
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
-    let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+    let operation = OperationScope::new(&base, Patience::UntilAcquired, Arc::default());
+    operation.wait_to_parse_as_owner(|_| ()).unwrap();
+    let _refused_commits =
+        connection::test_hooks::on_every_connection(directory.path(), |connection| {
+            connection.commit_hook(Some(|| true)).unwrap();
+        });
+    let has_parsed = AtomicBool::new(false);
 
-    let _ = owner.token.parse_batch(|_| owner.token.check_space());
+    let parsed = operation.wait_to_parse_as_owner(|_| has_parsed.store(true, Ordering::SeqCst));
+
+    assert!(has_parsed.load(Ordering::SeqCst), "the parse runs");
+    assert!(
+        matches!(parsed, Err(AppError::SessionCache(_))),
+        "the parse fails with the commit's error: {parsed:?}"
+    );
+}
+
+/// The panic message of a parse of an owner's batch that runs `take_turn`
+/// with the owner's token, on a thread of its own. Fail the test after ten
+/// seconds instead of hanging it: a parse that takes the turn waits forever
+/// behind its own batch.
+#[cfg(debug_assertions)]
+fn panic_of_parse_running(take_turn: fn(&RefreshToken)) -> String {
+    let (ended, has_ended) = mpsc::channel();
+    thread::spawn(move || {
+        let directory = tempfile::tempdir().unwrap();
+        let base = rearview(directory.path());
+        let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.token.parse_batch(|_| take_turn(&owner.token))
+        }));
+        let message = parsed.err().map(|panic| {
+            panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default()
+        });
+        let _ = ended.send(message);
+    });
+    has_ended
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the parse ends instead of waiting for its owner's turn")
+        .expect("the parse panics")
+}
+
+/// A parse that takes its owner's turn again, on its own thread or on a
+/// thread of the pool it spreads over, would wait forever behind its own
+/// batch; debug builds panic. The pool is the test's own: without the check,
+/// its threads wait forever, and the suite's global pool stays free.
+#[test]
+#[cfg(debug_assertions)]
+fn owners_parse_taking_its_owners_turn_panics() {
+    use rayon::prelude::*;
+    let on_its_thread = panic_of_parse_running(|token| {
+        let _ = token.check_space();
+    });
+    let on_the_pool = panic_of_parse_running(|token| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            [0, 1].par_iter().for_each(|_| {
+                let _ = token.check_space();
+            });
+        });
+    });
+
+    for message in [on_its_thread, on_the_pool] {
+        assert!(
+            message.contains("took the owner's turn"),
+            "the parse panics on taking the turn: {message}"
+        );
+    }
 }
 
 #[test]
@@ -1078,7 +1151,7 @@ fn low_space_deletion_keeps_ownership_past_takeover_window_and_empties_database_
     }
     assert!(
         !base.process().holds(&identity),
-        "the ownership ends with its database"
+        "this process no longer holds the deletion's ownership"
     );
     assert!(
         matches!(
@@ -1090,13 +1163,17 @@ fn low_space_deletion_keeps_ownership_past_takeover_window_and_empties_database_
 }
 
 #[test]
-fn low_space_deletion_that_fails_reports_the_database_as_spelled_and_the_cause() {
+fn low_space_deletion_that_fails_reports_the_database_without_verbatim_prefix_and_the_cause() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let mut owner = owner_of_written_cache(&base);
     // A directory where the emptying writes its rollback journal: on every
     // platform, SQLite can't create the journal file there.
-    std::fs::create_dir(&side_files(base.path())[2]).unwrap();
+    let journal = side_files(base.path())
+        .into_iter()
+        .find(|file| file.to_string_lossy().ends_with("-journal"))
+        .unwrap();
+    std::fs::create_dir(&journal).unwrap();
 
     let deletion = owner.delete_database(ExclusiveWait::of(POLL_EVERY));
 
@@ -1115,6 +1192,487 @@ fn low_space_deletion_that_fails_reports_the_database_as_spelled_and_the_cause()
         "the database is spelled without the verbatim prefix: {file}"
     );
     assert!(!error.is_empty(), "the failure carries its cause");
+}
+
+/// A low-space deletion over a write-ahead log that holds a load's writes
+/// empties the database before it leaves WAL mode: leaving it copies the log
+/// up to the emptied database's size, the file doesn't grow by any of the
+/// load's pages, and VACUUM shrinks it to a few pages.
+#[test]
+fn low_space_deletion_over_full_log_leaves_wal_without_growing_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let mut owner = owner_of_written_cache(&base);
+    let database = super::super::database_path(base.path());
+    leave_a_load_in_the_log(base.path());
+    let size_before = file_size(&database);
+    SIZES_AFTER_LEAVING_WAL.with_borrow_mut(Vec::clear);
+
+    let deletion = owner.delete_database(ExclusiveWait::of(POLL_EVERY));
+
+    assert_eq!(deletion, CacheDeletion::Deleted);
+    let sizes = SIZES_AFTER_LEAVING_WAL.with_borrow(Clone::clone);
+    assert!(
+        !sizes.is_empty() && sizes.iter().all(|&size| size <= size_before),
+        "leaving WAL mode copies none of the log's load into the database: {sizes:?} against \
+         {size_before} bytes before"
+    );
+    let size_after = file_size(&database);
+    assert!(
+        size_after <= 16 * u64::from(super::super::PAGE_SIZE),
+        "VACUUM shrinks the emptied database: {size_after} bytes"
+    );
+}
+
+/// Writes of 4 MB to the database in `base`, left in its write-ahead log:
+/// the connection making them closes without copying the log.
+fn leave_a_load_in_the_log(base: &Path) {
+    let writer = connect(base, POLL_EVERY).unwrap();
+    writer
+        .set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO meta (key, value) VALUES ('filler', ?1)",
+            ["x".repeat(4_000_000)],
+        )
+        .unwrap();
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+/// Once a write found the drive short of space, the checkpoint after the
+/// writes, the cache writer's close, the ownership's release and a refresh
+/// connection closing last leave the write-ahead log uncopied: copying it
+/// would grow the database by the load's pages.
+#[test]
+fn checkpoints_after_drive_found_short_of_space_leave_log_uncopied() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path()).with_free_space(900_000_000);
+    let owner = owner_of_written_cache(&base);
+    let database = super::super::database_path(base.path());
+    let writer = SqliteCache::open_for_refresh(owner.token()).unwrap();
+    leave_a_load_in_the_log(base.path());
+    let size_before = file_size(&database);
+    owner.token().check_space().unwrap_err();
+
+    writer.checkpoint_after_writes().unwrap();
+    let after_checkpoint = file_size(&database);
+    drop(writer);
+    let after_writer = file_size(&database);
+    drop(owner);
+    let after_release = file_size(&database);
+    drop(connect_writable(&base, POLL_EVERY).unwrap());
+    let after_refresh_connection = file_size(&database);
+
+    assert_eq!(
+        (
+            after_checkpoint,
+            after_writer,
+            after_release,
+            after_refresh_connection
+        ),
+        (size_before, size_before, size_before, size_before),
+        "the checkpoint, the writer, the release and a refresh connection leave the database at \
+         its size"
+    );
+}
+
+/// A low-space deletion whose emptying fails, here at its DROP, leaves the
+/// database at its size: its connection closes without copying the
+/// write-ahead log's load into the database.
+#[test]
+fn failed_low_space_deletion_leaves_database_at_its_size() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path())
+        .with_free_space(900_000_000)
+        .with_low_space_wait(Duration::from_secs(5));
+    let database = super::super::database_path(base.path());
+    let owner = owner_of_written_cache(&base);
+    leave_a_load_in_the_log(base.path());
+    let size_before = file_size(&database);
+    owner.token().check_space().unwrap_err();
+    drop(owner);
+    let _refused_drop =
+        connection::test_hooks::on_every_connection(directory.path(), |connection| {
+            connection
+                .authorizer(Some(|context: AuthContext<'_>| {
+                    if matches!(context.action, AuthAction::DropTable { .. }) {
+                        Authorization::Deny
+                    } else {
+                        Authorization::Allow
+                    }
+                }))
+                .unwrap();
+        });
+
+    let outcome = run_deletion(&base);
+
+    assert!(
+        matches!(outcome, Some(CacheDeletion::Failed { .. })),
+        "the emptying fails: {outcome:?}"
+    );
+    assert_eq!(
+        file_size(&database),
+        size_before,
+        "the failed deletion leaves the database at its size"
+    );
+}
+
+/// Once a write found the drive short of space, a cache writer whose setup
+/// fails after `journal_mode = WAL` opened the write-ahead log, here at
+/// `foreign_keys`, leaves the database at its size: its connection closes
+/// without copying the log into the database.
+#[test]
+fn writer_setup_failing_after_log_opens_leaves_database_at_its_size() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path()).with_free_space(900_000_000);
+    let owner = owner_of_written_cache(&base);
+    let database = super::super::database_path(base.path());
+    leave_a_load_in_the_log(base.path());
+    let size_before = file_size(&database);
+    owner.token().check_space().unwrap_err();
+    let _refused_foreign_keys =
+        connection::test_hooks::on_every_connection(directory.path(), |connection| {
+            connection
+                .authorizer(Some(|context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Pragma {
+                            pragma_name: "foreign_keys",
+                            ..
+                        }
+                    ) {
+                        Authorization::Deny
+                    } else {
+                        Authorization::Allow
+                    }
+                }))
+                .unwrap();
+        });
+
+    let opened = SqliteCache::open_for_refresh(owner.token());
+
+    assert!(opened.is_err(), "the writer's setup fails");
+    assert_eq!(
+        file_size(&database),
+        size_before,
+        "the writer's connection leaves the database at its size"
+    );
+}
+
+/// A low-space deletion whose emptying outlasts the takeover window commits
+/// its ownership again before its exclusive lock ends: a competing rearview
+/// takes the emptied cache over only once the deletion's ownership ends.
+#[test]
+fn low_space_deletion_outlasting_takeover_window_keeps_ownership_until_it_ends() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let base = rearview_on(directory.path(), Arc::clone(&clock));
+    let mut owner = owner_of_written_cache(&base);
+    let competing = rearview_on(directory.path(), Arc::clone(&clock));
+    let aging = Arc::clone(&clock);
+    let _slow_emptying =
+        connection::test_hooks::on_every_connection(directory.path(), move |connection| {
+            let aging = Arc::clone(&aging);
+            connection
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(context.action, AuthAction::DropTable { .. }) {
+                        aging.advance(STALE_AFTER);
+                    }
+                    Authorization::Allow
+                }))
+                .unwrap();
+        });
+
+    let deletion = owner.delete_database(ExclusiveWait::of(POLL_EVERY));
+
+    assert_eq!(deletion, CacheDeletion::Deleted);
+    assert!(
+        !matches!(
+            try_acquire(&competing, STALE_AFTER, &mut None).unwrap(),
+            Attempt::Acquired(_)
+        ),
+        "a competing rearview doesn't take the cache over while the deletion's ownership holds"
+    );
+    drop(owner);
+    assert!(
+        matches!(
+            RefreshOwnership::try_acquire_now(&competing).unwrap(),
+            Acquisition::Acquired(_)
+        ),
+        "the competing rearview acquires the emptied cache once the ownership ends"
+    );
+}
+
+/// A low-space deletion of one cache doesn't wait for this rearview's
+/// connections to another cache, and doesn't refuse its new ones.
+#[test]
+fn low_space_deletion_of_one_cache_leaves_this_rearviews_other_cache_alone() {
+    let process = ProcessIdentity::default();
+    let directories = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let [deleted, other] = directories.each_ref().map(|directory| {
+        CacheBase::new(
+            directory.path(),
+            process.clone(),
+            Arc::new(SystemClock::new()),
+            SystemCanonicaliser::shared(),
+        )
+        .with_free_space(900_000_000)
+        .with_low_space_wait(Duration::from_secs(30))
+    });
+    drop(owner_of_written_cache(&other));
+    latch_low_space_as_first_write_does(&deleted);
+    let held_open = SqliteCache::open_waiting(&other).unwrap().unwrap();
+
+    let (outcome, opened_meanwhile) = thread::scope(|scope| {
+        let running = scope.spawn(|| run_deletion(&deleted));
+        let opened = SqliteCache::open_waiting(&other);
+        (running.join().unwrap(), opened)
+    });
+
+    assert_eq!(
+        outcome,
+        Some(CacheDeletion::Deleted),
+        "the deletion empties its cache while the other cache's connection stays open"
+    );
+    assert!(
+        matches!(opened_meanwhile, Ok(Some(_))),
+        "the other cache opens during the deletion"
+    );
+    drop(held_open);
+}
+
+/// A low-space deletion that finds the database file gone reports it
+/// deleted, and doesn't create it again.
+#[test]
+fn low_space_deletion_of_missing_database_reports_it_deleted_without_creating_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path())
+        .with_free_space(900_000_000)
+        .with_low_space_wait(Duration::from_secs(1));
+    latch_low_space_as_first_write_does(&base);
+    let database = super::super::database_path(&base.canonical_path().unwrap());
+    std::fs::remove_file(&database).unwrap();
+    for file in side_files(base.path()) {
+        let _ = std::fs::remove_file(file);
+    }
+
+    assert_eq!(run_deletion(&base), Some(CacheDeletion::Deleted));
+    assert!(
+        !database.exists(),
+        "the deletion doesn't create the database"
+    );
+}
+
+/// A low-space deletion on a thread that holds one of this rearview's
+/// connections to the cache fails its debug check: it would wait for that
+/// connection to the end of its wait.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "the thread refusing connections holds none of them open")]
+fn low_space_deletion_on_thread_holding_its_connection_fails_debug_check() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path())
+        .with_free_space(900_000_000)
+        .with_low_space_wait(Duration::from_secs(1));
+    latch_low_space_as_first_write_does(&base);
+    let _held_open = SqliteCache::open_waiting(&base).unwrap().unwrap();
+
+    run_deletion(&base);
+}
+
+/// Sets `base`'s low-space latch as a first write on a drive short of
+/// space does: the write's ownership checks the space, fails, and is
+/// released.
+fn latch_low_space_as_first_write_does(base: &CacheBase) {
+    let owner = owner_of_written_cache(base);
+    owner.token().check_space().unwrap_err();
+}
+
+/// A free-space check on a drive short of space waits for its owner's turn
+/// while a parse group holds it, and the TUI's quit revokes the write
+/// permission meanwhile. The check fails without setting the low-space
+/// latch, so the quit's read of the latch is final.
+#[test]
+fn space_check_waiting_for_turn_when_quit_revokes_permission_leaves_latch_clear() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path()).with_free_space(900_000_000);
+    let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+    let token = owner.token();
+    let parse_group = token.take_turn();
+
+    let checked = thread::scope(|scope| {
+        let check = scope.spawn(|| token.check_space());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while token.threads_waiting_for_turn() == 0 {
+            assert!(Instant::now() < deadline, "the check waits for the turn");
+            thread::yield_now();
+        }
+        token.revoke();
+        drop(parse_group);
+        check.join().unwrap()
+    });
+
+    assert!(
+        matches!(checked, Err(AppError::SessionCacheRefreshLost)),
+        "the check fails as revoked: {checked:?}"
+    );
+    assert!(!base.low_space().is_set(), "the latch stays clear");
+}
+
+/// The TUI's shutdown while this rearview's own write batch holds SQLite's
+/// writer lock tries the ownership's release once, without a busy wait: the
+/// batch keeps the lock until it ends.
+#[test]
+fn shutdown_during_own_write_batch_releases_without_busy_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+    let (in_batch, is_in_batch) = mpsc::channel();
+    let (end_batch, batch_may_end) = mpsc::channel::<()>();
+
+    let waits = thread::scope(|scope| {
+        scope.spawn(move || {
+            owner.token().write_batch(|| {
+                in_batch.send(()).unwrap();
+                let _ = batch_may_end.recv_timeout(Duration::from_secs(10));
+            })
+        });
+        is_in_batch
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the write batch begins");
+        let busy_waits = connection::test_hooks::BusyWaits::record_on_this_thread();
+        super::super::coordinator::Coordinator::of(&base).shutdown();
+        let waits = busy_waits.take();
+        end_batch.send(()).unwrap();
+        waits
+    });
+
+    assert_eq!(
+        waits,
+        Vec::<Duration>::new(),
+        "the release doesn't wait for the writer lock"
+    );
+}
+
+/// While its low-space deletion runs, this rearview's new connections to the
+/// cache are refused. A reader opening each connection before closing the
+/// one it holds closes it on the refusal, so the deletion empties the
+/// database; the reader's next open finds the emptied cache.
+#[test]
+fn low_space_deletion_refuses_this_rearviews_new_connections_and_empties_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path())
+        .with_free_space(900_000_000)
+        .with_low_space_wait(Duration::from_secs(5));
+    latch_low_space_as_first_write_does(&base);
+    let (reader_started, has_reader_started) = mpsc::channel();
+    let reader_base = base.clone();
+
+    let (outcome, (refused, opened_after_deletion)) = thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut held = SqliteCache::open_waiting(&reader_base).unwrap();
+            reader_started.send(()).unwrap();
+            let mut refused = false;
+            while Instant::now() < deadline {
+                match SqliteCache::open_waiting(&reader_base) {
+                    Ok(Some(next)) => held = Some(next),
+                    Ok(None) => return (refused, true),
+                    Err(AppError::SessionCacheBeingDeleted) => {
+                        refused = true;
+                        held = None;
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("the reader opens the cache: {error}"),
+                }
+            }
+            drop(held);
+            (refused, false)
+        });
+        has_reader_started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader opens the cache");
+        let outcome = run_deletion(&base);
+        (outcome, reader.join().unwrap())
+    });
+
+    assert_eq!(
+        outcome,
+        Some(CacheDeletion::Deleted),
+        "the deletion empties the database once the reader's connection closes"
+    );
+    assert!(refused, "the reader's open is refused during the deletion");
+    assert!(
+        opened_after_deletion,
+        "the reader's next open finds the emptied cache"
+    );
+    assert_eq!(table_names(base.path()), ["refresh_state"]);
+}
+
+/// Wait until `base`'s low-space deletion refuses this rearview's new
+/// connections: from then on it waits for the open ones to close.
+fn wait_for_refusal(base: &CacheBase) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while base.open_connection().is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "the deletion refuses new connections"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// While a low-space deletion waits for this rearview's reader, held open
+/// past the takeover window, it holds no ownership to lapse: a competing
+/// rearview takes the cache over and writes, and once both are done the
+/// deletion acquires the ownership and empties the database.
+#[test]
+fn low_space_deletion_waiting_for_reader_past_takeover_window_empties_database_competitor_wrote() {
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let base = rearview_on(directory.path(), Arc::clone(&clock))
+        .with_free_space(900_000_000)
+        .with_low_space_wait(Duration::from_secs(10));
+    latch_low_space_as_first_write_does(&base);
+    let reader = SqliteCache::open_waiting(&base).unwrap().unwrap();
+    let competing = rearview_on(directory.path(), Arc::clone(&clock));
+
+    let outcome = thread::scope(|scope| {
+        let running = scope.spawn(|| run_deletion(&base));
+        wait_for_refusal(&base);
+        clock.advance(STALE_AFTER);
+        let competitor = RefreshOwnership::acquire_for_test(&competing).unwrap();
+        connect(competing.path(), POLL_EVERY)
+            .unwrap()
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('competitor', 'wrote')",
+                [],
+            )
+            .unwrap();
+        drop(competitor);
+        drop(reader);
+        running.join().unwrap()
+    });
+
+    assert_eq!(outcome, Some(CacheDeletion::Deleted));
+    assert_eq!(table_names(base.path()), ["refresh_state"]);
+    assert!(
+        matches!(
+            RefreshOwnership::try_acquire_now(&competing).unwrap(),
+            Acquisition::Acquired(_)
+        ),
+        "the competing rearview acquires the emptied cache at once"
+    );
 }
 
 #[test]

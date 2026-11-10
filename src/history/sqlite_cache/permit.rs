@@ -6,8 +6,9 @@
 
 use std::marker::PhantomData;
 
-/// Permission to parse transcripts, for as long as the owner token or the
-/// bare file it was built from lives.
+/// Permission to parse transcripts during `'a`: one write batch's work (see
+/// [`RefreshToken::parse_batch`](super::refresh::RefreshToken::parse_batch)),
+/// or the life of the file it was built from.
 #[derive(Clone, Copy)]
 pub struct ParsePermit<'a> {
     _grant: PhantomData<&'a ()>,
@@ -39,9 +40,10 @@ fn record_admission(transcript: &std::path::Path) -> Admitted {
 }
 
 impl<'a> ParsePermit<'a> {
-    /// The permit of a refresh owner's write batch: only
+    /// The permit of a refresh owner's write batch, for
     /// [`RefreshToken::parse_batch`](super::refresh::RefreshToken::parse_batch)
-    /// makes one, for the batch's work alone.
+    /// to hand to the batch's work. Its lifetime is unbound: that method's
+    /// closure limits it to the work.
     pub(super) fn owner() -> Self {
         Self {
             _grant: PhantomData,

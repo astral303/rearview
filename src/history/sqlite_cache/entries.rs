@@ -32,6 +32,8 @@ use std::path::Path;
 pub(super) use context::CALLS_AND_RESULTS;
 pub(super) use diff::{replace_leading, rewrite_in_place, update, update_tail};
 pub(super) use parts::SearchOnlyKind;
+#[cfg(test)]
+pub(super) use rows::PART_ROW_BUILDS;
 pub(super) use rows::{RowsStart, SessionRows};
 #[cfg(test)]
 pub(super) use write::SHIFT_SEARCH_PLACES;
@@ -407,14 +409,14 @@ pub(super) fn read_messages(
 }
 
 /// Each contributing user and assistant entry of `session` with a message
-/// number, with each of its text parts, and each such metadata entry, in
-/// order: everything [`semantic_turn`] reads of an entry. A
-/// message entry without a text part has no semantic turn.
-const SEMANTIC_ENTRIES: &str = "SELECT e.sequence, m.ordinal, e.kind, e.content, e.text, \
-     e.text_codes, p.text, p.text_codes FROM entries e JOIN messages m ON m.id = e.message \
+/// number and a sequence from `?2` to `?3`, with each of its text parts, and
+/// each such metadata entry, in order: everything [`semantic_turn`] reads of
+/// an entry. A message entry without a text part has no semantic turn.
+pub(super) const SEMANTIC_ENTRIES: &str = "SELECT e.sequence, m.ordinal, e.kind, e.content, \
+     e.text, e.text_codes, p.text, p.text_codes FROM entries e JOIN messages m ON m.id = e.message \
      LEFT JOIN parts p ON p.entry = e.id AND p.kind = 'text' \
-     WHERE e.session = ?1 AND e.contributes AND m.ordinal IS NOT NULL \
-     AND e.kind IN ('user', 'assistant', 'pi-metadata') \
+     WHERE e.session = ?1 AND e.sequence BETWEEN ?2 AND ?3 AND e.contributes \
+     AND m.ordinal IS NOT NULL AND e.kind IN ('user', 'assistant', 'pi-metadata') \
      AND (p.id IS NOT NULL OR e.kind = 'pi-metadata') ORDER BY e.sequence, p.part";
 
 /// Calls `visit` with the message number and the semantic text of each
@@ -423,10 +425,21 @@ const SEMANTIC_ENTRIES: &str = "SELECT e.sequence, m.ordinal, e.kind, e.content,
 pub(super) fn read_semantic_texts(
     connection: &Connection,
     session: i64,
+    visit: impl FnMut(usize, String),
+) -> Result<()> {
+    read_semantic_texts_of_entries(connection, session, i64::MIN..=i64::MAX, visit)
+}
+
+/// [`read_semantic_texts`] of the entries of `session` with a sequence in
+/// `sequences`.
+pub(super) fn read_semantic_texts_of_entries(
+    connection: &Connection,
+    session: i64,
+    sequences: RangeInclusive<i64>,
     mut visit: impl FnMut(usize, String),
 ) -> Result<()> {
     let mut statement = connection.prepare_cached(SEMANTIC_ENTRIES)?;
-    let mut rows = statement.query([session])?;
+    let mut rows = statement.query([session, *sequences.start(), *sequences.end()])?;
     let mut entry: Option<(i64, SemanticEntry)> = None;
     let mut finish = |entry: Option<(i64, SemanticEntry)>| {
         if let Some((_, entry)) = entry
@@ -477,7 +490,7 @@ struct SemanticEntry {
     string_content: bool,
     /// A metadata row's own text; a message's text blocks, joined.
     text: String,
-    /// The text blocks read.
+    /// The count of text blocks read.
     block_count: usize,
 }
 

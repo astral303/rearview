@@ -462,6 +462,44 @@ pub(crate) fn another_rearview(cache_base: &Path, clock: Arc<dyn Clock>) -> Cach
     )
 }
 
+/// Claude Code and Codex sessions over an admitted, empty session cache, as
+/// a first fill finds them, on the system clock; with the cache's directory
+/// and the agents' homes.
+pub(crate) fn two_agents_first_fill() -> (Environment, tempfile::TempDir, Vec<tempfile::TempDir>) {
+    use crate::history::provider::contract_tests::{kept_storage_under, registered_fixtures};
+    let mut homes = Vec::new();
+    let mut storages = Vec::new();
+    for source in [Source::Claude, Source::Codex] {
+        let fixture = registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == source)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fixture.write_session(home.path(), fixture.ids().session);
+        storages.push(kept_storage_under(fixture, home.path()));
+        homes.push(home);
+    }
+    let cache = admitted_cache();
+    let environment = crate::history::environment::test_support::real_time_environment(
+        storages,
+        Some(cache.path()),
+    );
+    (environment, cache, homes)
+}
+
+/// A read connection of another rearview to the session cache database in
+/// `cache_base`, open until it drops.
+pub(crate) fn held_open_by_another_rearview(cache_base: &Path) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(
+        cache_base.join(crate::history::sqlite_cache::DATABASE_FILE_NAME),
+    )
+    .unwrap();
+    connection
+        .query_row("SELECT COUNT(*) FROM meta", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    connection
+}
+
 /// A session cache directory holding an admitted database without sessions,
 /// as a first build admits it: a load through it caches what it reads.
 pub(crate) fn admitted_cache() -> tempfile::TempDir {

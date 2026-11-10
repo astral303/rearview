@@ -1,7 +1,7 @@
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::Conversation;
-use crate::history::sqlite_cache::{CopyKey, SessionKey};
+use crate::history::sqlite_cache::{CachedSession, CopyKey, SessionKey};
 use crate::search::ReadFailure;
 use crate::search::query::ParsedQuery;
 use crate::semantic::cache::write_embedding_cache;
@@ -12,7 +12,6 @@ use crate::semantic::index::{
 };
 use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 use crate::tui::app::{SemanticProgress, SemanticResultMetadata};
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -217,9 +216,9 @@ struct SemanticWorkerState {
 struct HeldTurns {
     /// The newest turns read; `None` until a read of the session lands.
     turns: Option<TurnsRead>,
-    /// The failed read of the copy the row reads, and the corpus version it
-    /// failed in: the copy is read again once the corpus changes.
-    failure: Option<(ReadFailure, u64)>,
+    /// The corpus version the last read of the row's copy failed in. Read
+    /// the copy again once the corpus changes.
+    failed_in: Option<u64>,
 }
 
 /// A copy's semantic turns.
@@ -245,11 +244,7 @@ impl HeldTurns {
     /// True when `copy`'s turns are to be read in corpus version
     /// `corpus_version`.
     fn needs_read(&self, copy: &CopyKey, corpus_version: u64) -> bool {
-        self.of_copy(copy).is_none()
-            && self
-                .failure
-                .as_ref()
-                .is_none_or(|(_, failed_in)| *failed_in != corpus_version)
+        self.of_copy(copy).is_none() && self.failed_in != Some(corpus_version)
     }
 
     /// Holds `read`, the read of a row's turns in corpus version
@@ -258,32 +253,43 @@ impl HeldTurns {
         match read {
             Ok(turns) => {
                 self.turns = Some(turns);
-                self.failure = None;
+                self.failed_in = None;
             }
-            Err(failure) => self.failure = Some((failure, corpus_version)),
+            Err(_) => self.failed_in = Some(corpus_version),
         }
     }
 }
 
 type TurnsReadResult = std::result::Result<TurnsRead, ReadFailure>;
 
-/// Reads `row`'s semantic turns from the copy the cache holds now.
-fn read_turns(row: &Conversation) -> TurnsReadResult {
-    match row.load_held_semantic_turns() {
-        Ok(Some(held)) => Ok(TurnsRead {
-            generation: held.generation.unwrap_or_default(),
-            loaded: Arc::new(held.row.into_owned()),
-        }),
-        Ok(None) => Err(ReadFailure::NotInCache),
-        Err(error) => Err(ReadFailure::of(&error)),
-    }
+/// Reads the semantic turns of each of `rows`, each a row and its copy, from
+/// the copy the cache holds now: one result per row, in order.
+fn read_turns(rows: &[(&Conversation, &CachedSession)]) -> Vec<TurnsReadResult> {
+    let reads = match Conversation::load_held_semantic_turns_of(rows) {
+        Ok(reads) => reads,
+        Err(error) => {
+            let failure = ReadFailure::of(&error);
+            return rows.iter().map(|_| Err(failure.clone())).collect();
+        }
+    };
+    reads
+        .into_iter()
+        .map(|read| match read {
+            Ok(Some(copy)) => Ok(TurnsRead {
+                generation: copy.generation,
+                loaded: Arc::new(copy.row),
+            }),
+            Ok(None) => Err(ReadFailure::NoLongerCached),
+            Err(error) => Err(ReadFailure::of(&error)),
+        })
+        .collect()
 }
 
 /// The corpus's rows as the semantic stage searches them.
 struct LoadedCorpus {
     candidates: Vec<SemanticIndexCandidate>,
-    /// The cached rows without semantic turns: their read failed, and none
-    /// of an earlier copy are held.
+    /// The count of cached rows without semantic turns: their read failed,
+    /// and the worker doesn't hold any of an earlier copy.
     unreadable: usize,
 }
 
@@ -384,14 +390,15 @@ impl SemanticWorkerState {
     }
 
     /// The corpus's rows as candidates, each cached row with its semantic
-    /// turns. A session's turns are read once for its copy, the sessions
-    /// not held in parallel, and held while a row of the corpus lists the
-    /// session. A row whose read fails keeps its session's earlier turns;
-    /// without them it has no turns and counts as unreadable.
+    /// turns. Read each session's turns once for its copy, reading the
+    /// sessions not held yet together, and hold them while a row of the
+    /// corpus lists the session. A row whose read fails keeps its session's
+    /// earlier turns; a row without earlier turns counts as unreadable.
     fn loaded_corpus_candidates(&mut self) -> LoadedCorpus {
         let mut held = std::mem::take(&mut self.semantic_turns);
         let mut kept = HashMap::with_capacity(held.len());
-        let mut to_read = Vec::new();
+        let mut sessions_to_read = Vec::new();
+        let mut rows_to_read = Vec::new();
         for row in self.corpus.iter() {
             let Some(cached) = &row.cached_session else {
                 continue;
@@ -402,14 +409,12 @@ impl SemanticWorkerState {
             }
             let turns = held.remove(&copy.session).unwrap_or_default();
             if turns.needs_read(&copy, self.corpus_version) {
-                to_read.push((copy.session.clone(), row));
+                sessions_to_read.push(copy.session.clone());
+                rows_to_read.push((row.as_ref(), cached));
             }
             kept.insert(copy.session, turns);
         }
-        let reads = to_read
-            .into_par_iter()
-            .map(|(session, row)| (session, read_turns(row)))
-            .collect::<Vec<_>>();
+        let reads = sessions_to_read.into_iter().zip(read_turns(&rows_to_read));
         for (session, read) in reads {
             if let Some(turns) = kept.get_mut(&session) {
                 turns.finish_read(read, self.corpus_version);
@@ -567,7 +572,10 @@ mod tests {
     use crate::semantic::test_fixtures::{SemanticConversationFixture, beta_hit_metadata};
     use std::time::Duration;
 
-    const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The longest a test waits for the worker's next message before it
+    /// fails. The model's first load sends none, and beside a full test run
+    /// it runs many times slower than alone.
+    const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn conversation(path: &str, semantic_turns: Vec<&str>) -> Conversation {
         SemanticConversationFixture::new(path, semantic_turns)
@@ -793,8 +801,9 @@ mod tests {
     }
 
     /// A row whose copy another write replaced searches the copy the cache
-    /// holds; a row whose session left the cache has no turns and counts as
-    /// unreadable, and the other rows still search theirs.
+    /// holds; a row whose session is no longer in the session cache doesn't
+    /// have any turns and counts as unreadable, and the other rows search
+    /// theirs.
     #[test]
     fn replaced_copy_is_searched_and_removed_session_counts_unreadable() {
         let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
@@ -853,6 +862,87 @@ mod tests {
                 &corpus.candidates[1].conversation
             ),
             "the other session's turns stay held"
+        );
+    }
+
+    /// A failed read is not retried in its corpus version, and is retried in
+    /// the next one.
+    #[test]
+    fn failed_read_is_retried_once_the_corpus_changes() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("returning", vec![question("first wording")]),
+            ("kept", vec![question("kept question")]),
+        ]);
+        let mut worker = SemanticWorkerState::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+        sessions.remove(0);
+        assert_eq!(
+            worker.loaded_corpus_candidates().unreadable,
+            1,
+            "the read of the removed session fails"
+        );
+        sessions.rewrite(0, &[question("written again")]);
+
+        let same_version = worker.loaded_corpus_candidates();
+        update_corpus(&mut worker, 2, &sessions.rows);
+        let next_version = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            (turns_of(&same_version)[0].clone(), same_version.unreadable),
+            (Vec::<String>::new(), 1),
+            "the failed read isn't retried in its corpus version"
+        );
+        assert_eq!(
+            (turns_of(&next_version)[0].clone(), next_version.unreadable),
+            (vec!["written again".to_owned()], 0),
+            "the next corpus version reads the session again"
+        );
+    }
+
+    /// A read that fails for one session of the batch fails that session
+    /// alone: it keeps its earlier turns, isn't read again in its corpus
+    /// version, and is read again in the next one.
+    #[test]
+    fn failed_read_of_one_session_in_batch_keeps_its_earlier_turns_until_next_corpus() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("failing", vec![question("first wording")]),
+            ("read", vec![question("first question")]),
+        ]);
+        let mut worker = SemanticWorkerState::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+        let first = worker.loaded_corpus_candidates();
+        sessions.rewrite(0, &[question("second wording")]);
+        sessions.rewrite(1, &[question("second question")]);
+        sessions.store_texts(0, &[0xff]);
+        let newer = [sessions.listed_row(0), sessions.listed_row(1)];
+        update_corpus(&mut worker, 2, &newer);
+
+        let failed = worker.loaded_corpus_candidates();
+        sessions.store_texts(0, b"second wording");
+        let same_version = worker.loaded_corpus_candidates();
+        update_corpus(&mut worker, 3, &newer);
+        let next_version = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            (turns_of(&failed), failed.unreadable),
+            (
+                vec![
+                    turns_of(&first)[0].clone(),
+                    vec!["second question".to_owned()]
+                ],
+                0
+            ),
+            "the failing session keeps its earlier turns; the other reads its new ones"
+        );
+        assert_eq!(
+            turns_of(&same_version)[0],
+            turns_of(&first)[0],
+            "the failed read isn't retried in its corpus version"
+        );
+        assert_eq!(
+            turns_of(&next_version)[0],
+            ["second wording"],
+            "the next corpus version reads the session again"
         );
     }
 

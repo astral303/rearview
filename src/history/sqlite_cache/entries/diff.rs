@@ -96,13 +96,12 @@ pub(in super::super) fn replace_leading(
         let row = &rows.entries[index];
         match stored.get(index) {
             Some(&(id, digest)) => {
-                let parts = row.parts();
-                if digest == parts.digest() {
+                if digest == row.digest() {
                     continue;
                 }
                 let place = EntryPlace::of(row, rows.sequence_of(index), &ids);
                 let search = SearchPlace::of(rows, index);
-                writer.update_content(row, &parts, id, search)?;
+                writer.update_content(row, id, search)?;
                 writer.place_entry(row, &place, search, id)?;
             }
             None => {
@@ -126,11 +125,10 @@ pub(in super::super) fn rewrite_in_place(
 ) -> Result<()> {
     let mut writer = RowWriter::new(connection, session, places)?;
     for (index, (row, &(id, message, digest))) in rows.entries.iter().zip(stored).enumerate() {
-        let parts = row.parts();
-        if parts.digest() == digest {
+        if row.digest() == digest {
             continue;
         }
-        writer.rewrite_content(row, &parts, id)?;
+        writer.rewrite_content(row, id)?;
         if let (Some(new), Some(message)) = (row.message, message)
             && rows.messages[new].first_entry == index
         {
@@ -601,9 +599,8 @@ fn update_entries(
         let row = &rows.entries[index];
         let place = EntryPlace::of(row, rows.sequence_of(index), ids);
         let search = SearchPlace::of(rows, index);
-        let parts = row.parts();
-        if entry.digest != parts.digest() {
-            writer.update_content(row, &parts, entry.id, search)?;
+        if entry.digest != row.digest() {
+            writer.update_content(row, entry.id, search)?;
         }
         if entry.sequence != place.sequence
             || entry.message != place.message

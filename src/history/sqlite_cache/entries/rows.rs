@@ -1,14 +1,13 @@
 //! A session's entry rows as a write stores them, built in memory before
 //! any is written: its transcripts, threads, messages and entries, each
-//! entry with its search texts and the digest of its columns; a write
-//! builds an entry's parts as it writes the entry. A first write inserts them all;
-//! a later write compares them with the stored rows and writes the
-//! differences.
+//! entry with its search texts and its digests; a write builds an entry's
+//! parts as it writes the entry. A first write inserts them all; a later
+//! write compares them with the stored rows and writes the differences.
 
 use super::EntryColumns;
 use super::digest::Digest;
 use super::messages::{MessageRow, Messages};
-use super::parts::EntryParts;
+use super::parts::{EntryDigests, EntryParts};
 use super::search::{self, EntrySearch};
 use super::threads::{Numbering, ThreadRow};
 use crate::agent::message_numbering::NumberingCheckpoint;
@@ -18,6 +17,14 @@ use crate::log_entry::{LogEntry, TokenUsage};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+
+#[cfg(test)]
+thread_local! {
+    /// The entries [`EntryRow::build_parts`] built part rows for on this
+    /// thread.
+    pub(in super::super) static PART_ROW_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 pub(in super::super) struct SessionRows<'a> {
     pub(super) transcripts: Vec<Arc<Path>>,
@@ -47,6 +54,7 @@ pub(super) struct EntryRow<'a> {
     pub(super) child: Option<usize>,
     /// The hash of the columns the row stores besides its place and parts.
     pub(super) columns_digest: i64,
+    pub(super) digests: EntryDigests,
 }
 
 impl EntryRow<'_> {
@@ -59,14 +67,18 @@ impl EntryRow<'_> {
             .flatten()
     }
 
-    /// The row's part rows and its digest, built once for each write of the
-    /// row: a write keeps them only while it writes the entry.
-    pub(super) fn parts(&self) -> EntryParts<'_> {
-        EntryParts::of(
-            self.columns.parts.blocks(),
-            &self.search,
-            self.columns_digest,
-        )
+    /// The digest of the whole row: a stored entry whose digest equals it is
+    /// not written.
+    pub(super) fn digest(&self) -> i64 {
+        self.digests.entry
+    }
+
+    /// Builds the row's part rows. A write builds them for an entry it
+    /// writes, and drops them once the entry is written.
+    pub(super) fn build_parts(&self) -> EntryParts<'_> {
+        #[cfg(test)]
+        PART_ROW_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        EntryParts::of(self.columns.parts.blocks(), &self.search, &self.digests)
     }
 
     /// A hash of the columns the row stores besides its place and parts.
@@ -150,8 +162,11 @@ impl<'a> SessionRows<'a> {
                 splice_key,
                 child,
                 columns_digest: 0,
+                digests: EntryDigests::default(),
             };
             row.columns_digest = row.columns_digest();
+            row.digests =
+                EntryDigests::of(row.columns.parts.blocks(), &row.search, row.columns_digest);
             rows.push(row);
         }
         Self {

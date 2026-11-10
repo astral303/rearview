@@ -1,8 +1,12 @@
 //! Lexical search's read of many sessions' search texts: `parts` is
 //! scanned without joins, in tasks across threads, each task on a read
-//! connection of its own: row ranges, or under an active window, runs of each
+//! connection of its own: row ranges, read through `parts_by_session` when
+//! the scan names its sessions, or under an active window, runs of each
 //! session's messages through `parts_by_message`. A text's row holds its
 //! session, its place and its message number.
+//!
+//! [`scan_copies`] runs the tasks and rechecks the sessions read, for this
+//! scan and for [`super::semantic_scan`]'s.
 
 use super::{CachedSession, SearchedFields, SqliteCache};
 use crate::error::{AppError, Result};
@@ -66,7 +70,7 @@ fn parts_in_rows(fields: SearchedFields, only: &SessionFilter) -> String {
         "SELECT {SCANNED_PART_COLUMNS} FROM parts WHERE id BETWEEN ?1 AND ?2 \
          AND search_field IN ({}) AND text IS NOT NULL{}",
         fields.part_field_codes(),
-        only.seeking_rows(),
+        only.session_filter_through_index(),
     )
 }
 
@@ -105,106 +109,157 @@ const RANGES_PER_THREAD: i64 = 16;
 /// The fewest rows a range holds, so a small table is one range.
 const MIN_ROWS_PER_RANGE: i64 = 4096;
 
-/// A scan's visitors, one per task, and the copies it could not read.
-pub(crate) struct ScannedTexts<V> {
-    pub(crate) visitors: Vec<V>,
-    /// The position of each copy whose session left the cache.
-    pub(crate) left_cache: Vec<usize>,
+/// A scan's reads, one per task, and the copies it could not read.
+pub(crate) struct ScannedCopies<R> {
+    pub(crate) reads: Vec<R>,
+    /// The position of each copy whose session is no longer in the session
+    /// cache.
+    pub(crate) no_longer_cached: Vec<usize>,
     /// The position of each copy another write replaced before the scan
     /// ended, with the generation of the copy the cache holds now. The
-    /// visitors may hold texts of either copy: callers drop them.
+    /// reads may hold content of either copy: callers drop it.
     pub(crate) replaced: Vec<(usize, i64)>,
 }
 
-/// Calls `visitor()`'s methods for each search text in `fields` of the
-/// sessions `copies` read, within `window`: with `window` active, only the
-/// texts of messages inside it, without the title, the summary or text
-/// outside every message. `scope` is the selection `copies` came from.
-/// Reads each copy as the cache holds it, whether or not its transcripts
-/// changed since.
+/// One cache base's part of a scan of many sessions' copies, split into
+/// tasks that threads read, each in a snapshot of its own.
+pub(super) trait CopiesScan: Sync {
+    type Task: Send;
+    type Read: Send;
+    /// The scan's tasks, planned on `connection` in the snapshot that found
+    /// the scanned sessions.
+    fn tasks(&self, connection: &Connection) -> Result<Vec<Self::Task>>;
+    /// `task`'s read on `connection`, inside a snapshot of its own.
+    fn read(&self, connection: &Connection, task: Self::Task) -> Result<Self::Read>;
+}
+
+/// The reads of the tasks `plan` makes of the sessions `copies` read, on
+/// the rayon pool, each thread on a read connection of its own. `plan`
+/// receives the sessions the cache holds as each copy read them; a copy
+/// another write replaced, or no longer in the session cache, is reported
+/// and not scanned. Reads each copy as the cache holds it, whether or not
+/// its transcripts changed since.
 ///
-/// Each task reads in a snapshot of its own. Once every task ends, each
-/// scanned session's generation is read again: a session another write
-/// replaced during the scan is reported in `replaced`.
-pub(crate) fn scan_search_texts<V: TextVisitor>(
+/// Once every task ends, each scanned session's generation is read again: a
+/// session another write replaced during the scan is reported in
+/// `replaced`.
+pub(super) fn scan_copies<S: CopiesScan>(
     copies: &[&CachedSession],
-    fields: SearchedFields,
-    window: &TimeFilter,
-    scope: ScanScope,
-    visitor: impl Fn() -> V + Sync,
-) -> Result<ScannedTexts<V>> {
+    plan: impl Fn(&Connection, SessionsById) -> Result<S>,
+) -> Result<ScannedCopies<S::Read>> {
     let mut by_base: HashMap<&std::path::Path, Vec<usize>> = HashMap::new();
     for (position, copy) in copies.iter().enumerate() {
         by_base.entry(copy.base.path()).or_default().push(position);
     }
-    let mut scanned = ScannedTexts {
-        visitors: Vec::new(),
-        left_cache: Vec::new(),
+    let mut scanned = ScannedCopies {
+        reads: Vec::new(),
+        no_longer_cached: Vec::new(),
         replaced: Vec::new(),
     };
     for positions in by_base.into_values() {
         let first = copies[positions[0]];
         let Some(cache) = SqliteCache::open_waiting(&first.base)? else {
-            scanned.left_cache.extend(positions);
+            scanned.no_longer_cached.extend(positions);
             continue;
         };
-        let (found, scan, tasks) = cache.with_read_snapshot(|connection| {
+        let (found, planned) = cache.with_read_snapshot(|connection| {
             let mut found = ScannedSessions::of(connection, copies, positions.iter().copied())?;
             let sessions = std::mem::take(&mut found.current);
-            let window = StoredWindow::of(window)
-                .map(|window| MessagesInWindow::of_sessions(connection, window, &sessions, scope))
-                .transpose()?;
-            let scan = Scan {
-                only: SessionFilter::of(connection, &sessions)?,
-                sessions,
-                fields,
-                window,
-            };
+            if sessions.is_empty() {
+                return Ok((found, None));
+            }
+            let scanned_positions = sessions
+                .values()
+                .map(|&(position, _)| position)
+                .collect::<Vec<_>>();
+            let scan = plan(connection, sessions)?;
             let tasks = scan.tasks(connection)?;
-            Ok((found, scan, tasks))
+            Ok((found, Some((scan, tasks, scanned_positions))))
         })?;
-        scanned.left_cache.extend(found.left_cache);
+        scanned.no_longer_cached.extend(found.no_longer_cached);
         scanned.replaced.extend(found.replaced);
-        if scan.sessions.is_empty() {
+        let Some((scan, tasks, scanned_positions)) = planned else {
             continue;
-        }
-        scanned.visitors.extend(
+        };
+        scanned.reads.extend(
             tasks
                 .into_par_iter()
                 .map_init(
                     || None,
                     |reader: &mut Option<SqliteCache>, task| {
                         let cache = open_once(reader, &first.base, first)?;
-                        let mut visitor = visitor();
-                        cache.with_read_snapshot(|connection| {
-                            let mut range = TaskScan {
-                                scan: &scan,
-                                connection,
-                                with_text: HashSet::new(),
-                            };
-                            range.scan(task, &mut visitor)
-                        })?;
-                        Ok(visitor)
+                        cache.with_read_snapshot(|connection| scan.read(connection, task))
                     },
                 )
                 .collect::<Result<Vec<_>>>()?,
         );
         let rechecked = cache.with_read_snapshot(|connection| {
-            ScannedSessions::of(
-                connection,
-                copies,
-                scan.sessions.values().map(|&(position, _)| position),
-            )
+            ScannedSessions::of(connection, copies, scanned_positions.into_iter())
         })?;
-        scanned.left_cache.extend(rechecked.left_cache);
+        scanned.no_longer_cached.extend(rechecked.no_longer_cached);
         scanned.replaced.extend(rechecked.replaced);
     }
     Ok(scanned)
 }
 
+/// Calls `visitor()`'s methods for each search text in `fields` of the
+/// sessions `copies` read, within `window`: with `window` active, only the
+/// texts of messages inside it, without the title, the summary or text
+/// outside every message. `scope` is the selection `copies` came from.
+/// Scans as [`scan_copies`] does, one visitor per task.
+pub(crate) fn scan_search_texts<V: TextVisitor>(
+    copies: &[&CachedSession],
+    fields: SearchedFields,
+    window: &TimeFilter,
+    scope: ScanScope,
+    visitor: impl Fn() -> V + Sync,
+) -> Result<ScannedCopies<V>> {
+    scan_copies(copies, |connection, sessions| {
+        let window = StoredWindow::of(window)
+            .map(|window| MessagesInWindow::of_sessions(connection, window, &sessions, scope))
+            .transpose()?;
+        Ok(TextScan {
+            scan: Scan {
+                only: SessionFilter::of(connection, &sessions)?,
+                sessions,
+                fields,
+                window,
+            },
+            visitor: &visitor,
+        })
+    })
+}
+
+/// A [`Scan`] whose tasks each call the methods of a visitor `visitor`
+/// makes.
+struct TextScan<'v, F> {
+    scan: Scan,
+    visitor: &'v F,
+}
+
+impl<V: TextVisitor, F: Fn() -> V + Sync> CopiesScan for TextScan<'_, F> {
+    type Task = ScanTask;
+    type Read = V;
+
+    fn tasks(&self, connection: &Connection) -> Result<Vec<ScanTask>> {
+        self.scan.tasks(connection)
+    }
+
+    fn read(&self, connection: &Connection, task: ScanTask) -> Result<V> {
+        let mut visitor = (self.visitor)();
+        TaskScan {
+            scan: &self.scan,
+            connection,
+            with_text: HashSet::new(),
+        }
+        .scan(task, &mut visitor)?;
+        Ok(visitor)
+    }
+}
+
 /// The scanned copies by their session's row id: each copy's position and
 /// generation.
-type SessionsById = HashMap<i64, (usize, i64)>;
+pub(super) type SessionsById = HashMap<i64, (usize, i64)>;
 
 /// One cache base's part of a scan.
 struct Scan {
@@ -215,15 +270,15 @@ struct Scan {
 }
 
 /// The copies the cache holds at the addresses of some scanned copies, and
-/// the scanned copies that left the cache or were replaced, by the copies'
-/// positions.
+/// the scanned copies no longer in the session cache or replaced, by the
+/// copies' positions.
 #[derive(Default)]
 struct ScannedSessions {
     /// The copies the cache holds, by their session's row id.
     current: SessionsById,
-    /// As [`ScannedTexts::left_cache`].
-    left_cache: Vec<usize>,
-    /// As [`ScannedTexts::replaced`].
+    /// As [`ScannedCopies::no_longer_cached`].
+    no_longer_cached: Vec<usize>,
+    /// As [`ScannedCopies::replaced`].
     replaced: Vec<(usize, i64)>,
 }
 
@@ -241,7 +296,7 @@ impl ScannedSessions {
                     found.current.insert(stored.id, (position, copy.generation));
                 }
                 Some(stored) => found.replaced.push((position, stored.generation)),
-                None => found.left_cache.push(position),
+                None => found.no_longer_cached.push(position),
             }
         }
         Ok(found)
@@ -282,7 +337,7 @@ impl SessionFilter {
     /// The condition appended to a `WHERE` clause that SQLite reads through
     /// `parts_by_session`: each row range reads only the scanned sessions'
     /// rows.
-    fn seeking_rows(&self) -> String {
+    fn session_filter_through_index(&self) -> String {
         self.ids
             .as_ref()
             .map_or_else(String::new, |ids| format!(" AND session IN ({ids})"))
@@ -292,7 +347,7 @@ impl SessionFilter {
     /// clause. `+` keeps SQLite from reading every part of the scanned
     /// sessions through `parts_by_session` to find the few outside every
     /// entry.
-    fn filtering_subagent_metadata(&self) -> String {
+    fn session_filter_without_index(&self) -> String {
         self.ids
             .as_ref()
             .map_or_else(String::new, |ids| format!(" AND +session IN ({ids})"))
@@ -487,9 +542,9 @@ fn open_once<'r>(
     reader.as_ref().ok_or_else(|| not_in_cache(copy))
 }
 
-/// A table's key, from its least to its greatest value, split into ranges of
-/// equal width across threads.
-struct KeySplit {
+/// A key, from its least to its greatest value, split into ranges of equal
+/// width: a table's across threads, or one session's rows.
+pub(super) struct KeySplit {
     least: i64,
     greatest: i64,
     width: i64,
@@ -531,16 +586,24 @@ impl KeySplit {
     /// The split of the keys from the least to the greatest of `bounds`; no
     /// range without bounds.
     fn spanning(bounds: Option<(i64, i64)>) -> Self {
-        let (least, greatest) = bounds.unwrap_or((1, 0));
-        let span = (greatest - least).saturating_add(1).max(0);
+        let span = bounds.map_or(0, |(least, greatest)| {
+            (greatest - least).saturating_add(1).max(0)
+        });
         let threads = i64::try_from(rayon::current_num_threads()).unwrap_or(1);
         let count = (span / MIN_ROWS_PER_RANGE)
             .clamp(1, threads * RANGES_PER_THREAD)
             .min(span.max(1));
+        Self::of_width(bounds, (span + count - 1) / count)
+    }
+
+    /// The split of the keys from the least to the greatest of `bounds`
+    /// into ranges of at most `width` keys; no range without bounds.
+    pub(super) fn of_width(bounds: Option<(i64, i64)>, width: i64) -> Self {
+        let (least, greatest) = bounds.unwrap_or((1, 0));
         Self {
             least,
             greatest,
-            width: ((span + count - 1) / count).max(1),
+            width: width.max(1),
         }
     }
 
@@ -551,7 +614,7 @@ impl KeySplit {
         format!("SELECT (SELECT MIN({key}) FROM {table}), (SELECT MAX({key}) FROM {table})")
     }
 
-    fn ranges(&self) -> impl Iterator<Item = RangeInclusive<i64>> + use<> {
+    pub(super) fn ranges(&self) -> impl Iterator<Item = RangeInclusive<i64>> + use<> {
         let (least, greatest, width) = (self.least, self.greatest, self.width);
         (0..)
             .map(move |index| least + index * width)
@@ -659,7 +722,7 @@ impl TaskScan<'_> {
     fn scan_subagent_metadata(&mut self, visitor: &mut impl TextVisitor) -> Result<()> {
         let mut statement = self.connection.prepare_cached(&format!(
             "{SUBAGENT_METADATA_SCAN}{}",
-            self.scan.only.filtering_subagent_metadata()
+            self.scan.only.session_filter_without_index()
         ))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
@@ -744,10 +807,8 @@ pub(super) fn text_at<'r>(row: &'r rusqlite::Row<'_>, index: usize) -> rusqlite:
 
 #[cfg(test)]
 mod tests {
-    use super::super::CatalogueSession;
-    use super::super::tests::{admitted_cache, parsed_record, root_of, storage_of, stub_of};
+    use super::super::tests::admitted_cache;
     use super::*;
-    use crate::history::provider::contract_tests::every_record_sessions;
     use chrono::TimeZone;
     use std::collections::BTreeSet;
     use std::ops::ControlFlow;
@@ -775,33 +836,12 @@ mod tests {
         }
     }
 
-    /// Each agent's every-record session cached in one database, as their
-    /// copies. The first session gets a sub-agent metadata part, and each
-    /// entry without a message a searched part, written directly: the
-    /// fixtures don't hold either.
+    /// [`super::super::tests::every_record_copies`]. The first session gets a
+    /// sub-agent metadata part, and each entry without a message a searched
+    /// part, written directly: the fixtures don't hold either.
     fn every_record_copies(base: &std::path::Path) -> Vec<CachedSession> {
-        let mut cache = admitted_cache(base);
-        let copies = every_record_sessions()
-            .iter()
-            .map(|session| {
-                let row = &session.row;
-                let storage = storage_of(row.source);
-                cache.admit_storage(storage).unwrap();
-                let root = root_of(session);
-                let stub = stub_of(session, 1);
-                cache
-                    .write(&parsed_record(row.source, &root, &stub))
-                    .unwrap();
-                let CatalogueSession::Listed(listed) = cache
-                    .catalogue_session(storage, row.source, &root, &stub.cache_key, false)
-                    .unwrap()
-                    .unwrap()
-                else {
-                    panic!("listed fixture")
-                };
-                listed.cached_session.unwrap()
-            })
-            .collect::<Vec<_>>();
+        let copies = super::super::tests::every_record_copies(base);
+        let cache = admitted_cache(base);
         cache
             .connection
             .execute(
@@ -831,9 +871,12 @@ mod tests {
         scope: ScanScope,
     ) -> Vec<(usize, PlacedText)> {
         let scanned = scan_search_texts(copies, fields, window, scope, KeepEvery::default).unwrap();
-        assert!(scanned.left_cache.is_empty(), "the cache holds every copy");
+        assert!(
+            scanned.no_longer_cached.is_empty(),
+            "the cache holds every copy"
+        );
         let mut kept = scanned
-            .visitors
+            .reads
             .into_iter()
             .flat_map(|visitor| visitor.kept)
             .collect::<Vec<_>>();
@@ -948,7 +991,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            scanned.left_cache.is_empty(),
+            scanned.no_longer_cached.is_empty(),
             "the cache holds every session"
         );
         assert_eq!(
@@ -957,7 +1000,7 @@ mod tests {
             "the replaced session is reported with the generation the cache holds"
         );
         let kept = scanned
-            .visitors
+            .reads
             .iter()
             .flat_map(|visitor| visitor.kept.kept.iter().map(|(copy, _)| *copy))
             .collect::<BTreeSet<_>>();
@@ -1016,7 +1059,7 @@ mod tests {
                 KeepEvery::default,
             )
             .unwrap()
-            .visitors;
+            .reads;
             let examined = visitors
                 .iter()
                 .map(|visitor| visitor.examined)
@@ -1139,11 +1182,14 @@ mod tests {
             .join("\n")
     }
 
-    /// Each scan statement costs what the scanned rows hold, not what the
-    /// cache holds, only while it reads through its index: a scan of every
-    /// listed session reads row ranges by id, a scan of some reads each
-    /// range's rows of theirs through `parts_by_session`, and their bounds
-    /// come from its ends.
+    /// Each scan statement reads through its index, so it costs what the
+    /// scanned rows hold, not what the cache holds:
+    /// - a scan of every listed session reads row ranges by id;
+    /// - a scan of some sessions reads their rows in each range through
+    ///   `parts_by_session`;
+    /// - each session's row bounds come from `parts_by_session`;
+    /// - the sub-agent metadata scan reads parts by entry, with or without
+    ///   a session filter.
     #[test]
     fn each_scan_statement_reads_through_its_index_without_scanning_parts() {
         let connection = Connection::open_in_memory().unwrap();
@@ -1186,7 +1232,7 @@ mod tests {
             (
                 format!(
                     "{SUBAGENT_METADATA_SCAN}{}",
-                    some.filtering_subagent_metadata()
+                    some.session_filter_without_index()
                 ),
                 "SEARCH parts USING INDEX sqlite_autoindex_parts_1 (entry=?)",
             ),

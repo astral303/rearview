@@ -248,6 +248,44 @@ fn shell_command_answered_in_later_update_resumes() {
     );
 }
 
+/// Kimi adds a shell command's output to the entry holding the command,
+/// as a result block: the resumed write inserts that block's parts alone.
+#[test]
+fn shell_command_output_adds_its_result_to_the_commands_entry_alone() {
+    let command = message(
+        20,
+        "<bash-input>\ncargo test\n</bash-input>",
+        "shell_command",
+        json!({"phase": "input"}),
+    );
+    let mut session = KimiSession::stored(&with(&opening(), std::slice::from_ref(&command)), &[]);
+    let output = message(
+        30,
+        "<bash-stdout>ok\n</bash-stdout>",
+        "shell_command",
+        json!({"phase": "output"}),
+    );
+    write_lines(&session.own, &with(&opening(), &[command, output]));
+    watch_row_writes(&session.cache.connection);
+
+    let update = session.update();
+
+    assert_eq!(update.outcome, Ok(()), "the session resumes");
+    let writes = take_row_writes(&session.cache.connection);
+    assert_eq!(
+        (
+            writes_of(&writes, "entries", "INSERT") + writes_of(&writes, "entries", "DELETE"),
+            writes_of(&writes, "parts", CONTENT_UPDATE) + writes_of(&writes, "parts", "DELETE"),
+        ),
+        (0, 0),
+        "the command's entry keeps its row and its call's part: {writes:?}"
+    );
+    assert!(
+        writes_of(&writes, "parts", "INSERT") > 0,
+        "the result's parts are inserted: {writes:?}"
+    );
+}
+
 #[test]
 fn rewritten_state_changes_row_as_full_read_does() {
     let mut session = KimiSession::stored(&opening(), &[]);

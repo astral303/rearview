@@ -25,6 +25,17 @@ impl Digest {
         }
     }
 
+    /// Hashes `value`'s JSON text as one field without building the text:
+    /// the field holds the text's own hash.
+    pub(super) fn json(&mut self, value: Option<&serde_json::Value>) {
+        let Some(value) = value else {
+            return self.bytes(None);
+        };
+        let mut text = blake3::Hasher::new();
+        serde_json::to_writer(&mut text, value).expect("a JSON value writes to a hasher");
+        self.bytes(Some(text.finalize().as_bytes()));
+    }
+
     pub(super) fn number(&mut self, number: Option<i64>) {
         match number {
             Some(number) => {
@@ -61,5 +72,44 @@ impl Digest {
             .try_into()
             .expect("a hash holds 8 bytes");
         i64::from_le_bytes(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Digest;
+
+    fn json_digest(record: &str) -> i64 {
+        let value: serde_json::Value = serde_json::from_str(record).unwrap();
+        let mut digest = Digest::default();
+        digest.json(Some(&value));
+        digest.finish()
+    }
+
+    #[test]
+    fn two_parses_of_one_record_hash_alike() {
+        let record =
+            r#"{"command":"cargo test","timeout":120000,"nested":{"b":[1,2.5,null],"a":"x"}}"#;
+
+        assert_eq!(json_digest(record), json_digest(record));
+    }
+
+    /// One object written with its keys in two orders hashes alike: the hash
+    /// follows the object's content, not the order of its keys. Turning on
+    /// `serde_json`'s `preserve_order` feature fails this test.
+    #[test]
+    fn one_object_in_two_key_orders_hashes_alike() {
+        assert_eq!(
+            json_digest(r#"{"command":"cargo test","nested":{"b":[1,null],"a":"x"}}"#),
+            json_digest(r#"{"nested":{"a":"x","b":[1,null]},"command":"cargo test"}"#)
+        );
+    }
+
+    #[test]
+    fn json_digest_differs_from_an_absent_value() {
+        let mut absent = Digest::default();
+        absent.json(None);
+
+        assert_ne!(json_digest("null"), absent.finish());
     }
 }

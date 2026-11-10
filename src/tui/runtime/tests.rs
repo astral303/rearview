@@ -12,12 +12,15 @@ use crate::history::sqlite_cache::refresh::tests::{
 use crate::history::{CacheBase, InteractiveCache, ProcessIdentity};
 use crate::tui::SessionAction;
 use crate::tui::app::AppMode;
-use crate::tui::app::claude_home::{ClaudeHome, admitted_cache, another_rearview};
+use crate::tui::app::claude_home::{
+    ClaudeHome, admitted_cache, another_rearview, held_open_by_another_rearview,
+    two_agents_first_fill,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::time::Instant;
 
 /// The longest a test ticks while the load or a refresh runs.
@@ -207,8 +210,35 @@ fn ctrl_r_lists_session_written_after_launch() {
     assert_eq!(listed_ids(runtime.app()), ["b", "a"]);
 }
 
+/// The error `runtime` leaves the TUI with, ticking without terminal input.
+fn tick_until_error(runtime: &mut Runtime, terminal: &mut Terminal<TestBackend>) -> AppError {
+    let started = Instant::now();
+    loop {
+        let tick = runtime.tick(terminal, &mut |wait| {
+            std::thread::sleep(wait.min(Duration::from_millis(10)));
+            Ok(Vec::new())
+        });
+        match tick {
+            Err(error) => return error,
+            Ok(_) => assert!(started.elapsed() < BACKGROUND_WORK_LIMIT, "the TUI stops"),
+        }
+    }
+}
+
+/// Finish the command whose TUI over the session cache `base` stopped with
+/// `error`, as rearview does: delete the cache database when a write found
+/// its drive short of space. The stderr it writes.
+fn finish_tui_command(error: AppError, base: &crate::history::CacheBase) -> String {
+    let mut report = Vec::new();
+    let (failed, written) = crate::finish_command(Err(error), Some(base), &mut report);
+    written.unwrap();
+    assert!(failed, "rearview exits with failure");
+    String::from_utf8(report).unwrap()
+}
+
 /// A launch whose cache write finds less than 1 GB free on the cache's drive
-/// leaves the TUI with the free space, and the cache database is deleted.
+/// leaves the TUI with the free space, and its report deletes the cache
+/// database.
 #[test]
 fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space() {
     let home = ClaudeHome::new();
@@ -221,27 +251,215 @@ fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space(
             Arc::new(SystemClock::new()),
         )
         .with_free_space(950_000_000);
+    let base = environment.cache_base().clone();
     let mut runtime = launched_in(environment);
     let mut terminal = terminal();
 
-    let started = Instant::now();
-    let error = loop {
-        let tick = runtime.tick(&mut terminal, &mut |wait| {
-            std::thread::sleep(wait.min(Duration::from_millis(10)));
-            Ok(Vec::new())
-        });
-        match tick {
-            Err(error) => break error,
-            Ok(_) => assert!(
-                started.elapsed() < BACKGROUND_WORK_LIMIT,
-                "the launch stops"
-            ),
-        }
-    };
+    let error = tick_until_error(&mut runtime, &mut terminal);
+    drop(runtime);
+    let report = finish_tui_command(error, &base);
 
     assert_eq!(
-        error.to_string(),
-        "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again."
+        report,
+        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
+    );
+    assert!(
+        crate::history::sqlite_cache::is_emptied(cache.path()),
+        "the cache database's contents are deleted"
+    );
+}
+
+/// On a first fill of two agents' sessions, a write of the first agent's
+/// load finds the drive short of space, and the launch returns early at the
+/// second agent's. Once the TUI stops, the report runs the deletion and
+/// prints its outcome: deferred while another rearview holds the database
+/// open.
+#[test]
+fn launch_returning_early_short_of_space_reports_deletion_another_rearview_defers() {
+    let (environment, cache, _homes) = two_agents_first_fill();
+    let environment = environment
+        .with_disk_space(Arc::new(
+            crate::history::sqlite_cache::DriveRunningOut::after(0, || {}),
+        ))
+        .with_low_space_wait(Duration::from_millis(300));
+    let base = environment.cache_base().clone();
+    let another_rearview = held_open_by_another_rearview(cache.path());
+    let mut runtime = launched_in(environment);
+    let mut terminal = terminal();
+
+    let error = tick_until_error(&mut runtime, &mut terminal);
+    drop(runtime);
+    let report = finish_tui_command(error, &base);
+
+    assert_eq!(
+        report,
+        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+         The session cache was not deleted: another rearview has it open. Free some space and run \
+         rearview again.\n"
+    );
+    drop(another_rearview);
+}
+
+/// The user quits while the launch's first cache write is finding the drive
+/// short of space. The TUI exits without the error, and once that check
+/// ends, rearview reports the low-space message and deletes the cache
+/// database.
+#[test]
+fn quit_while_launch_finds_drive_short_reports_low_space_once_check_ends() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["a"]);
+    let cache = tempfile::tempdir().unwrap();
+    let (checking, is_checking) = std::sync::mpsc::channel::<()>();
+    let (quit, has_quit) = std::sync::mpsc::channel::<()>();
+    // The launch's first free-space check waits for the quit, then answers
+    // late enough that rearview reads the latch too early unless it waits
+    // for the check to end; later checks answer at once.
+    let first_check = std::sync::Mutex::new(Some((checking, has_quit)));
+    let drive = crate::history::sqlite_cache::DriveRunningOut::after(0, move || {
+        if let Some((checking, has_quit)) = first_check.lock().unwrap().take() {
+            checking.send(()).unwrap();
+            let _ = has_quit.recv_timeout(BACKGROUND_WORK_LIMIT);
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    });
+    let environment = home
+        .environment_with_cache(
+            cache.path(),
+            ProcessIdentity::default(),
+            Arc::new(SystemClock::new()),
+        )
+        .with_disk_space(Arc::new(drive));
+    let base = environment.cache_base().clone();
+    let mut runtime = launched_in(environment);
+    let mut terminal = terminal();
+    is_checking
+        .recv_timeout(BACKGROUND_WORK_LIMIT)
+        .expect("the launch checks the drive's free space");
+
+    let tick = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Esc, KeyModifiers::NONE)],
+    );
+    assert!(matches!(tick, Tick::Exit(Action::Quit)), "the TUI quits");
+    quit.send(()).unwrap();
+    drop(runtime);
+    let mut report = Vec::new();
+    let (failed, written) =
+        crate::finish_command(Err(AppError::SelectionCancelled), Some(&base), &mut report);
+
+    written.unwrap();
+    assert!(failed, "rearview exits with failure");
+    assert_eq!(
+        String::from_utf8(report).unwrap(),
+        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
+    );
+    assert!(
+        crate::history::sqlite_cache::is_emptied(cache.path()),
+        "the cache database's contents are deleted"
+    );
+}
+
+/// A drive with room until `run_out` is called, then 0.9 GB free. The
+/// first check on the short drive reports that it is checking on `checking`,
+/// then answers once `answer` receives.
+struct DriveRunningOutOnCall {
+    is_short: AtomicBool,
+    first_short_check: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+}
+
+impl DriveRunningOutOnCall {
+    fn new(checking: mpsc::Sender<()>, answer: mpsc::Receiver<()>) -> Self {
+        Self {
+            is_short: AtomicBool::new(false),
+            first_short_check: Mutex::new(Some((checking, answer))),
+        }
+    }
+
+    fn run_out(&self) {
+        self.is_short.store(true, Ordering::SeqCst);
+    }
+}
+
+impl crate::history::sqlite_cache::DiskSpace for DriveRunningOutOnCall {
+    fn available_bytes(&self, _path: &Path) -> Option<u64> {
+        if !self.is_short.load(Ordering::SeqCst) {
+            return Some(10 * crate::history::sqlite_cache::FREE_SPACE_FLOOR);
+        }
+        if let Some((checking, answer)) = self.first_short_check.lock().unwrap().take() {
+            checking.send(()).unwrap();
+            let _ = answer.recv_timeout(BACKGROUND_WORK_LIMIT);
+        }
+        Some(900_000_000)
+    }
+}
+
+/// The user resumes a listed session while a list refresh's cache write is
+/// finding the drive short of space. Once the TUI stops, rearview doesn't
+/// launch the agent: it reports the low-space message and deletes the cache
+/// database.
+#[test]
+fn resume_while_refresh_finds_drive_short_reports_low_space_without_launching_agent() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["a"]);
+    let cache = tempfile::tempdir().unwrap();
+    let (checking, is_checking) = mpsc::channel();
+    let (answer, answered) = mpsc::channel();
+    let drive = Arc::new(DriveRunningOutOnCall::new(checking, answered));
+    let environment = home
+        .environment_with_cache(
+            cache.path(),
+            ProcessIdentity::default(),
+            Arc::new(SystemClock::new()),
+        )
+        .with_disk_space(drive.clone());
+    let base = environment.cache_base().clone();
+    let mut runtime = launched_in(environment);
+    let mut terminal = terminal();
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
+    drive.run_out();
+    home.write("b", 10, &["b"]);
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+    assert!(
+        ticks_reach(&mut runtime, &mut terminal, BACKGROUND_WORK_LIMIT, |_| {
+            is_checking.try_recv().is_ok()
+        }),
+        "the refresh's cache write checks the drive's free space"
+    );
+
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('x'), KeyModifiers::CONTROL)],
+    );
+    let Tick::Exit(action) = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::NONE)],
+    ) else {
+        panic!("the TUI exits");
+    };
+    assert!(matches!(action, Action::Resume(_)), "the user resumes");
+    answer.send(()).unwrap();
+    let conversations = runtime.into_conversations();
+    let launched = std::cell::Cell::new(false);
+    let exit = crate::act_on_tui_exit(action, conversations, &base, |_, _| {
+        launched.set(true);
+        Ok(())
+    });
+    let mut report = Vec::new();
+    let (failed, written) = crate::finish_command(exit.map(|_| ()), Some(&base), &mut report);
+
+    written.unwrap();
+    assert!(!launched.get(), "rearview doesn't launch the agent");
+    assert!(failed, "rearview exits with failure");
+    assert_eq!(
+        String::from_utf8(report).unwrap(),
+        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
     );
     assert!(
         crate::history::sqlite_cache::is_emptied(cache.path()),
@@ -267,7 +485,7 @@ fn launch_behind_another_rearviews_rebuild_shows_wait_at_once() {
     let showed_the_wait = ticks_show(
         &mut runtime,
         &mut terminal,
-        Duration::from_secs(2),
+        BACKGROUND_WORK_LIMIT,
         "Another rearview is rebuilding the session cache…",
     );
     drop(rebuild);
@@ -577,11 +795,85 @@ fn quitting_releases_refresh_ownership_this_process_holds() {
 /// ends.
 #[test]
 fn quitting_during_launch_stops_it_before_its_next_parse() {
+    let cache = admitted_cache();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let mut terminal = terminal();
+    let (mut runtime, watch, _roots) =
+        launched_with_first_parse_held(cache.path(), clock.clone(), &mut terminal);
+
+    let tick = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Esc, KeyModifiers::NONE)],
+    );
+    watch.mark();
+    watch.release();
+
+    assert!(matches!(tick, Tick::Exit(Action::Quit)));
+    wait_until_another_rearview_acquires(cache.path(), clock);
+    assert_eq!(
+        watch.parses_after_mark(),
+        0,
+        "the launch doesn't parse the next root after the TUI quits"
+    );
+}
+
+/// The longest a quit during a parse may take: the shutdown's release of
+/// refresh ownership waits up to a second behind the parse's writer lock.
+const QUIT_DURING_PARSE_LIMIT: Duration = Duration::from_secs(3);
+
+/// Quitting while the launch's parse runs leaves the TUI without waiting
+/// for the parse to end.
+#[test]
+fn quitting_during_parse_returns_without_waiting_for_it() {
+    let cache = admitted_cache();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let mut terminal = terminal();
+    let (mut runtime, watch, _roots) =
+        launched_with_first_parse_held(cache.path(), clock.clone(), &mut terminal);
+    // Release the parse once the quit returns, or after the limit should the
+    // quit wait for the parse.
+    let (quit_returned, has_quit_returned) = mpsc::channel::<()>();
+    let releaser = watch.clone();
+    std::thread::spawn(move || {
+        let _ = has_quit_returned.recv_timeout(BACKGROUND_WORK_LIMIT);
+        releaser.release();
+    });
+
+    let quitting = Instant::now();
+    let tick = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Esc, KeyModifiers::NONE)],
+    );
+    drop(runtime);
+    let quit_took = quitting.elapsed();
+    let _ = quit_returned.send(());
+
+    assert!(matches!(tick, Tick::Exit(Action::Quit)));
+    assert!(
+        quit_took < QUIT_DURING_PARSE_LIMIT,
+        "the quit returns while the parse runs: {quit_took:?}"
+    );
+    wait_until_another_rearview_acquires(cache.path(), clock);
+}
+
+/// The TUI launched over two Claude Code roots with the session cache in
+/// `cache`, ticked on `terminal` until the launch's first parse begins,
+/// which the returned watch holds; and the roots.
+fn launched_with_first_parse_held(
+    cache: &Path,
+    clock: Arc<dyn Clock>,
+    terminal: &mut Terminal<TestBackend>,
+) -> (
+    Runtime,
+    crate::history::provider::ParseWatch,
+    [ClaudeHome; 2],
+) {
     let (first_root, second_root) = (ClaudeHome::new(), ClaudeHome::new());
     first_root.write("0f000000-0000-4000-8000-000000000001", 5, &["first root"]);
     second_root.write("0f000000-0000-4000-8000-000000000002", 6, &["second root"]);
     second_root.write("0f000000-0000-4000-8000-000000000003", 7, &["second root"]);
-    let cache = admitted_cache();
     let watch = crate::history::provider::ParseWatch::default();
     let storage: &'static dyn crate::history::provider::SessionStorage =
         Box::leak(Box::new(crate::history::provider::WatchedStorage {
@@ -593,32 +885,26 @@ fn quitting_during_launch_stops_it_before_its_next_parse() {
                 .to_vec(),
             watch: watch.clone(),
         }));
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let mut runtime = launched_in(Environment::new(
         vec![storage],
-        cache.path().to_path_buf(),
+        cache.to_path_buf(),
         ProcessIdentity::default(),
-        clock.clone(),
+        clock,
         Arc::new(crate::history::provider::walk::SystemLister),
     ));
-    let mut terminal = terminal();
     watch.hold();
     let deadline = Instant::now() + BACKGROUND_WORK_LIMIT;
     while watch.parses_begun() == 0 {
         assert!(Instant::now() < deadline, "the launch begins parsing");
-        tick_with(&mut runtime, &mut terminal, Vec::new());
+        tick_with(&mut runtime, terminal, Vec::new());
     }
+    (runtime, watch, [first_root, second_root])
+}
 
-    let tick = tick_with(
-        &mut runtime,
-        &mut terminal,
-        vec![key(KeyCode::Esc, KeyModifiers::NONE)],
-    );
-    watch.mark();
-    watch.release();
-
-    assert!(matches!(tick, Tick::Exit(Action::Quit)));
-    let other = another_rearview(cache.path(), clock);
+/// Wait until another rearview acquires refresh ownership of the cache in
+/// `cache`: the quit TUI's launch releases it once its held parse ends.
+fn wait_until_another_rearview_acquires(cache: &Path, clock: Arc<dyn Clock>) {
+    let other = another_rearview(cache, clock);
     let deadline = Instant::now() + BACKGROUND_WORK_LIMIT;
     while !matches!(
         RefreshOwnership::try_acquire_now(&other).unwrap(),
@@ -630,11 +916,6 @@ fn quitting_during_launch_stops_it_before_its_next_parse() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(
-        watch.parses_after_mark(),
-        0,
-        "the launch doesn't parse the next root after the TUI quits"
-    );
 }
 
 /// While this rearview's own launch rebuilds an outdated cache, a session
@@ -888,7 +1169,7 @@ fn assert_an_opened_changed_session_shows_its_copy_under(
         ticks_show(
             &mut runtime,
             &mut terminal,
-            Duration::from_secs(2),
+            BACKGROUND_WORK_LIMIT,
             label(&hold)
         ),
         "the viewer shows {}",
@@ -948,7 +1229,7 @@ fn assert_an_opened_uncached_session_shows(hold: impl FnOnce(&Path) -> Hold, lab
     open_the_selected_session(&mut runtime, &mut terminal);
 
     assert!(
-        ticks_show(&mut runtime, &mut terminal, Duration::from_secs(2), label),
+        ticks_show(&mut runtime, &mut terminal, BACKGROUND_WORK_LIMIT, label),
         "the viewer shows {label}"
     );
     assert!(
@@ -1036,7 +1317,7 @@ fn search_for_text_newer_than_cached_copy_doesnt_match_session() {
             .map(|character| key(KeyCode::Char(character), KeyModifiers::NONE))
             .collect(),
     );
-    ticks_reach(&mut runtime, &mut terminal, Duration::from_secs(2), |app| {
+    ticks_reach(&mut runtime, &mut terminal, BACKGROUND_WORK_LIMIT, |app| {
         !app.has_search_work_in_flight()
     });
 
@@ -1194,7 +1475,7 @@ fn stored_session_opened_directly_shows_loading_then_its_messages_from_cache() {
         ticks_show(
             &mut runtime,
             &mut terminal,
-            Duration::from_secs(2),
+            BACKGROUND_WORK_LIMIT,
             "Loading…"
         ),
         "the file opened directly shows Loading…"
@@ -1308,7 +1589,7 @@ fn assert_ctrl_r_in_the_viewer_shows_the_newest_messages(hold: impl FnOnce(&Path
 
     let label = updating_label(&hold);
     assert!(
-        ticks_show(&mut runtime, &mut terminal, Duration::from_secs(2), label),
+        ticks_show(&mut runtime, &mut terminal, BACKGROUND_WORK_LIMIT, label),
         "the viewer shows {label}"
     );
     assert!(
@@ -1441,7 +1722,7 @@ fn assert_an_id_lookup_lists_the_session_once_its_refresh_lands(hold: impl FnOnc
     assert!(ticks_show(
         &mut runtime,
         &mut terminal,
-        Duration::from_secs(2),
+        BACKGROUND_WORK_LIMIT,
         "Loading…"
     ));
     assert!(
@@ -1558,7 +1839,7 @@ fn rename_and_delete_dont_wait_while_launch_waits_for_another_rearviews_rebuild(
     assert!(ticks_show(
         &mut runtime,
         &mut terminal,
-        Duration::from_secs(2),
+        BACKGROUND_WORK_LIMIT,
         "Another rearview is rebuilding"
     ));
 
@@ -1594,7 +1875,7 @@ fn rename_and_delete_stay_available_while_launch_waits_for_another_rearviews_ref
     let mut runtime = launched_in(environment);
     let mut terminal = terminal();
     assert!(
-        ticks_reach(&mut runtime, &mut terminal, Duration::from_secs(2), |app| {
+        ticks_reach(&mut runtime, &mut terminal, BACKGROUND_WORK_LIMIT, |app| {
             app.is_waiting_for_another_rearview() && listed_ids(app) == ["a"]
         }),
         "the launch lists the cached session while it waits for another rearview's refresh"

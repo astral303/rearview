@@ -38,6 +38,9 @@ pub enum Stage {
     /// Matching inside one transcript, for `within`.
     Search,
     Render,
+    /// Deleting the session cache database after a write found its drive
+    /// short of space.
+    CacheDeletion,
 }
 
 impl Stage {
@@ -55,6 +58,7 @@ impl Stage {
             Self::Transcript => "transcript",
             Self::Search => "search",
             Self::Render => "render",
+            Self::CacheDeletion => "cache-deletion",
         }
     }
 }
@@ -86,6 +90,7 @@ pub enum ProgressStage {
     Transcript,
     Search,
     Render,
+    CacheDeletion,
 }
 
 impl ProgressStage {
@@ -97,6 +102,7 @@ impl ProgressStage {
             Self::Transcript => "transcript",
             Self::Search => "search",
             Self::Render => "render",
+            Self::CacheDeletion => "cache-deletion",
         }
     }
 }
@@ -280,6 +286,7 @@ impl CommandPerf {
                 | Stage::Search,
             ) => CommandProgress::uncounted(ProgressStage::Search),
             Some(Stage::Render) => CommandProgress::uncounted(ProgressStage::Render),
+            Some(Stage::CacheDeletion) => CommandProgress::uncounted(ProgressStage::CacheDeletion),
         }
     }
 

@@ -113,7 +113,7 @@ pub enum AppError {
 
     /// Under SQLite's exclusive lock, the database kept the journal mode
     /// `mode` when switched out of WAL mode.
-    #[error("the session cache could not leave WAL mode: {mode}")]
+    #[error("Session cache could not leave WAL mode: {mode}")]
     SessionCacheStuckInWal { mode: String },
 
     #[error("Session cache entries need refreshing for {session}: {reason}")]
@@ -154,20 +154,24 @@ pub enum AppError {
     },
 
     /// A write to the session cache found less than the cache's floor free
-    /// on its drive: the write stopped, and the operation deletes the
-    /// database as `deletion` reports.
+    /// on its drive: the write stopped, and the cache base's low-space latch
+    /// is set. `outcome` stays pending until the command reporting the error
+    /// runs the cache database's deletion.
     #[error(
-        "not enough disk space for the session cache ({} GB free, needs at least {} GB).{} \
-         Free some space and run rearview again.",
-        gigabytes_down_to_a_tenth(*.free_bytes),
-        .floor_bytes / 1_000_000_000,
-        .deletion.sentence()
+        "{}{}",
+        low_space_lead(*.free_bytes, *.floor_bytes),
+        low_space_rest(.outcome)
     )]
-    SessionCacheOutOfSpace {
+    SessionCacheLowSpace {
         free_bytes: u64,
         floor_bytes: u64,
-        deletion: CacheDeletion,
+        outcome: CacheDeletion,
     },
+
+    /// The session cache's low-space deletion refused a new connection of
+    /// this rearview.
+    #[error("The session cache is being deleted")]
+    SessionCacheBeingDeleted,
 
     /// Neither `REARVIEW_CACHE_DIR` nor a home directory names where the
     /// session cache goes: nothing runs.
@@ -182,12 +186,14 @@ pub enum AppError {
 /// short of space.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CacheDeletion {
-    /// Not attempted yet: the operation deletes the database when it ends.
+    /// Not run yet.
     Pending,
     Deleted,
-    /// Another rearview kept the database open past the deletion's wait.
+    /// Another rearview, or a connection of this one, kept the database open
+    /// past the deletion's wait.
     Deferred,
-    /// Removing `file` failed with `error`.
+    /// Emptying the database `file` or removing the side file `file` failed
+    /// with `error`; a lost refresh ownership fails the emptying.
     Failed {
         file: String,
         error: String,
@@ -195,7 +201,7 @@ pub enum CacheDeletion {
 }
 
 impl CacheDeletion {
-    /// The sentence the out-of-space message gives this deletion, with its
+    /// The sentence the low-space message gives this deletion, with its
     /// leading space; empty when the database is deleted or soon will be.
     fn sentence(&self) -> String {
         match self {
@@ -208,6 +214,24 @@ impl CacheDeletion {
             }
         }
     }
+}
+
+/// The low-space message's first sentence.
+pub(crate) fn low_space_lead(free_bytes: u64, floor_bytes: u64) -> String {
+    format!(
+        "not enough disk space for the session cache ({} GB free, needs at least {} GB).",
+        gigabytes_down_to_a_tenth(free_bytes),
+        floor_bytes / 1_000_000_000
+    )
+}
+
+/// The low-space message after its first sentence: the deletion's
+/// `outcome`, then the remedy.
+pub(crate) fn low_space_rest(outcome: &CacheDeletion) -> String {
+    format!(
+        "{} Free some space and run rearview again.",
+        outcome.sentence()
+    )
 }
 
 /// `bytes` in gigabytes, rounded down to one decimal place, so a drive
@@ -270,19 +294,19 @@ pub type Result<T> = std::result::Result<T, AppError>;
 mod tests {
     use super::*;
 
-    fn out_of_space(deletion: CacheDeletion) -> String {
-        AppError::SessionCacheOutOfSpace {
+    fn low_space_message(outcome: CacheDeletion) -> String {
+        AppError::SessionCacheLowSpace {
             free_bytes: 950_000_000,
             floor_bytes: 1_000_000_000,
-            deletion,
+            outcome,
         }
         .to_string()
     }
 
     #[test]
-    fn out_of_space_message_reports_a_deferred_deletion() {
+    fn low_space_message_reports_a_deferred_deletion() {
         assert_eq!(
-            out_of_space(CacheDeletion::Deferred),
+            low_space_message(CacheDeletion::Deferred),
             "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
              The session cache was not deleted: another rearview has it open. Free some space \
              and run rearview again."
@@ -290,9 +314,9 @@ mod tests {
     }
 
     #[test]
-    fn out_of_space_message_reports_a_failed_deletion_with_its_file_and_cause() {
+    fn low_space_message_reports_a_failed_deletion_with_its_file_and_cause() {
         assert_eq!(
-            out_of_space(CacheDeletion::Failed {
+            low_space_message(CacheDeletion::Failed {
                 file: r"C:\cache\history.sqlite3".to_owned(),
                 error: "Access is denied. (os error 5)".to_owned(),
             }),

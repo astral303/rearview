@@ -68,6 +68,25 @@ pub(crate) fn remove_sessions_where(base: &Path, column: &str, value: &str) {
     );
 }
 
+/// Stores `bytes`, whether or not they are UTF-8, as the text of each text
+/// part of the sessions under `cache_key` in the session cache in `base`.
+pub(crate) fn store_text_parts_of(base: &Path, cache_key: &str, bytes: &[u8]) {
+    let connection = connection::open(
+        &database_path(base),
+        connection::Access::ReadWrite,
+        WAITING_BUSY_TIMEOUT,
+    )
+    .unwrap();
+    let stored = connection
+        .execute(
+            "UPDATE parts SET text = CAST(?2 AS TEXT) WHERE kind = 'text' \
+             AND session IN (SELECT id FROM sessions WHERE cache_key = ?1)",
+            params![cache_key, bytes],
+        )
+        .unwrap();
+    assert!(stored > 0, "the cache holds text parts under {cache_key}");
+}
+
 pub(super) fn admitted_cache(base: &Path) -> super::OwnedCache {
     let cache = SqliteCache::open(&rearview_at(base)).unwrap();
     cache.mark_admitted().unwrap();
@@ -141,6 +160,33 @@ pub(crate) fn cached_row(base: &Path, session: &AgentSession) -> Conversation {
         panic!("listed fixture")
     };
     *listed
+}
+
+/// Each agent's every-record session cached in one database in `base`, as
+/// their copies.
+pub(super) fn every_record_copies(base: &Path) -> Vec<super::CachedSession> {
+    let mut cache = admitted_cache(base);
+    every_record_sessions()
+        .iter()
+        .map(|session| {
+            let row = &session.row;
+            let storage = storage_of(row.source);
+            cache.admit_storage(storage).unwrap();
+            let root = root_of(session);
+            let stub = stub_of(session, 1);
+            cache
+                .write(&parsed_record(row.source, &root, &stub))
+                .unwrap();
+            let CatalogueSession::Listed(listed) = cache
+                .catalogue_session(storage, row.source, &root, &stub.cache_key, false)
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("listed fixture")
+            };
+            listed.cached_session.unwrap()
+        })
+        .collect()
 }
 
 fn source_record(source: Source, path: &Path) -> (SessionRecord, SessionRoot) {

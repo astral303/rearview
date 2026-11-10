@@ -162,8 +162,8 @@ pub(crate) fn is_clear_only(user_messages: &[String]) -> bool {
 }
 
 /// A fold as a checkpoint stores it: everything but the reply ids it
-/// numbered, so a fold resumed from it continues no reply started before
-/// the checkpoint. A resumed read whose new records continue such a reply
+/// numbered. A fold resumed from it cannot continue a reply started before
+/// the checkpoint: a resumed read whose new records continue such a reply
 /// reads the transcript whole instead.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct FoldCheckpoint {

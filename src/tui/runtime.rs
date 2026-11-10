@@ -358,7 +358,7 @@ impl Runtime {
         let Some(outcome) = self.supervisor.finished_refresh() else {
             return Ok(());
         };
-        if let Err(error @ AppError::SessionCacheOutOfSpace { .. }) = outcome {
+        if let Err(error @ AppError::SessionCacheLowSpace { .. }) = outcome {
             return Err(error);
         }
         self.app.finish_refresh(outcome);
@@ -480,9 +480,17 @@ pub fn run_with_loader(
     app.set_show_last(refresh_options.show_last);
     app.set_list_window(refresh_options.time);
     let mut runtime = Runtime::listing(app, environment, load_meter, refresh_options);
+    let exit = run_until_exit(&mut runtime, &mut guard);
+    // Restore the terminal before the runtime waits for its free-space checks.
+    drop(guard);
+    let conversations = runtime.into_conversations();
+    exit.map(|action| (action, conversations))
+}
+
+fn run_until_exit(runtime: &mut Runtime, guard: &mut TerminalGuard) -> Result<Action> {
     loop {
         if let Tick::Exit(action) = runtime.tick(&mut guard.terminal, &mut drain_events)? {
-            return Ok((action, runtime.into_conversations()));
+            return Ok(action);
         }
     }
 }
@@ -503,9 +511,9 @@ pub fn run_single_file(
     let mut guard = TerminalGuard::new()?;
     let app = App::new_single_file(file, tool_display, show_thinking, keys, environment.clone());
     let mut runtime = Runtime::single_file(app, environment);
-    loop {
-        if let Tick::Exit(_) = runtime.tick(&mut guard.terminal, &mut drain_events)? {
-            return Ok(());
-        }
-    }
+    let exit = run_until_exit(&mut runtime, &mut guard);
+    // Restore the terminal before the runtime waits for its free-space checks.
+    drop(guard);
+    drop(runtime);
+    exit.map(|_| ())
 }

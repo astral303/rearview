@@ -92,9 +92,9 @@ pub(crate) enum RoutesStored {
 
 /// Store each of `routes` whose copy the cache under `base` still holds, as
 /// the refresh owner. Takes refresh ownership without waiting, and writes
-/// nothing while another refresh owns the cache. Fails as
-/// [`OperationScope::finish`] fails when the drive is short of space, even
-/// when the write itself failed first.
+/// nothing while another refresh owns the cache. When the drive is short of
+/// space, fails with [`OperationScope::finish`]'s error, in place of any
+/// error of the write itself.
 pub(crate) fn store_routes(base: &CacheBase, routes: &[SemanticRoute]) -> Result<RoutesStored> {
     let operation = OperationScope::new(
         base,
@@ -117,8 +117,9 @@ fn store_as_owner(operation: &OperationScope, routes: &[SemanticRoute]) -> Resul
 }
 
 impl CacheWriter {
-    /// Store each of `routes` whose copy the cache still holds, in one batch,
-    /// once the drive holds the free space a write needs.
+    /// Store each of `routes` whose copy the cache still holds, in one batch.
+    /// Fails without writing when the drive is short of the free space a
+    /// write needs.
     pub(super) fn store_semantic_routes(&self, routes: &[SemanticRoute]) -> Result<()> {
         self.owner.check_space()?;
         let batch = refresh::transaction(&self.connection, &self.owner)?;

@@ -507,7 +507,8 @@ fn key_of_row<'k>(
 /// with its failure worded for the agent protocol. When another write
 /// replaced the copy the ranking counted, the hit messages of the copy the
 /// cache holds are counted and read, in one read snapshot. `None` when the
-/// session left the cache. A query without terms reads nothing.
+/// session is no longer in the session cache. A query without terms reads
+/// nothing.
 pub(crate) fn read_hit_messages(
     clock: &dyn Clock,
     wait: &history::WaitStatus,
@@ -1275,11 +1276,28 @@ impl AgentService {
 
     /// Runs `command`, writing `protocol agent-progress` records to stderr
     /// while it runs and, with `--perf-stats`, its `perf` records after.
+    /// Once a write of the command found the cache's drive short of space,
+    /// the command deletes the cache database and fails with the low-space
+    /// error, whatever it returned, so its record reports the deletion's
+    /// outcome.
     pub fn execute(&self, command: AgentCommand) -> Result<String> {
         let output = run_reporting_progress(
             ProgressRecords::new(command.name(), &self.perf, ProgressSchedule::DEFAULT),
             std::io::stderr(),
-            || self.execute_inner(&command),
+            || {
+                let output = self.execute_inner(&command);
+                let base = self.environment.cache_base();
+                if !base.low_space().is_set() {
+                    return output;
+                }
+                self.perf.time(Stage::CacheDeletion, || {
+                    history::sqlite_cache::low_space::run_deletion(base);
+                });
+                Err(base
+                    .low_space()
+                    .error()
+                    .expect("the cache base's low-space latch is set"))
+            },
         );
         if command.reports_perf_stats() {
             eprint!("{}", self.perf.records(agent::peak_memory::peak_bytes()));
@@ -1392,7 +1410,7 @@ impl AgentService {
             let ranking = rank()?;
             self.cover_sessions_changed_while_read(
                 ranking
-                    .left_cache
+                    .no_longer_cached
                     .iter()
                     .filter_map(|&index| key_of_row(&keys, &conversations[index])),
                 &keys,
@@ -1432,7 +1450,7 @@ impl AgentService {
             for (key, error) in &run.failed_reads {
                 report_read_error(key, error);
             }
-            self.cover_sessions_changed_while_read(run.left_cache.iter(), &keys);
+            self.cover_sessions_changed_while_read(run.no_longer_cached.iter(), &keys);
             Ok(run)
         };
         match mode {
@@ -2454,6 +2472,8 @@ fn target_error(error: AppError, resolved: &agent::refs::ResolvedConversation) -
             error.reference = Some(resolved.reference.canonical());
             error.into()
         }
+        // Formatted once `execute` has run its low-space deletion.
+        error @ AppError::SessionCacheLowSpace { .. } => error,
         error => structured_agent_error(error),
     }
 }
@@ -2527,7 +2547,7 @@ fn structured_agent_error(error: AppError) -> AppError {
         AppError::TimeFilter(error) => {
             AgentError::out_of_range(Some("command"), error.to_string()).into()
         }
-        error @ (AppError::SessionCacheOutOfSpace { .. } | AppError::NoSessionCacheDirectory) => {
+        error @ (AppError::SessionCacheLowSpace { .. } | AppError::NoSessionCacheDirectory) => {
             AgentError::io(None, format!("{}: {error}", crate::APP_NAME)).into()
         }
         error => AgentError::io(None, error.to_string()).into(),
@@ -2579,9 +2599,9 @@ struct SemanticReads {
     /// semantic stage read it, by input index, its messages counted and
     /// timed as the copy read holds them.
     replaced_rows: HashMap<usize, history::Conversation>,
-    /// The sessions the cache no longer held when the semantic stage read
-    /// them. They have no semantic hits.
-    left_cache: Vec<agent::refs::AgentConversationKey>,
+    /// The sessions no longer in the session cache when the semantic stage
+    /// read them, without semantic hits.
+    no_longer_cached: Vec<agent::refs::AgentConversationKey>,
 }
 
 impl AgentService {
@@ -2589,11 +2609,12 @@ impl AgentService {
     /// hit given the anchors and times of its focus messages in the copy its
     /// session's semantic hits number. A session's semantic hits are dropped,
     /// and the session added to the command's stale sessions, when the
-    /// lexical hits number another copy of it (`lexical_copies`), or when the
-    /// cache no longer holds that copy as the anchors are read. The sessions
-    /// the semantic stage did not find are added too. Returns a warning for
-    /// each session whose anchor read failed; its hits keep no anchors. The
-    /// anchor reads, not the fusion, are timed as the `hit-metadata` stage.
+    /// lexical hits number another copy of it (`lexical_copies`), or when
+    /// that copy is no longer in the session cache as the anchors are read.
+    /// The sessions no longer in the session cache at the semantic stage are
+    /// added too. Returns a warning for each session whose anchor read
+    /// failed; its hits don't keep any anchors. The anchor reads, not the
+    /// fusion, are timed as the `hit-metadata` stage.
     fn fuse_semantic_hits(
         &self,
         semantic: SemanticHalf,
@@ -2611,7 +2632,7 @@ impl AgentService {
                 SemanticReads {
                     copies,
                     replaced_rows,
-                    left_cache,
+                    no_longer_cached,
                 },
         } = semantic;
         let inputs: Vec<agent::search::AgentConversationInput<'_>> = inputs
@@ -2642,16 +2663,16 @@ impl AgentService {
             let started = self.clock().now();
             let reads = attach_semantic_hit_anchors(self, &mut output, &inputs, &copies);
             anchor_read += self.clock().elapsed_since(started);
-            if reads.left_cache.is_empty() {
+            if reads.no_longer_cached.is_empty() {
                 break (output, reads.failed);
             }
             // Fuse again without them, so the output fills their places from
             // the other sessions' hits.
-            changed.extend(reads.left_cache);
+            changed.extend(reads.no_longer_cached);
         };
         self.perf.record(Stage::HitMetadata, anchor_read);
         self.cover_sessions_changed_while_read(
-            left_cache
+            no_longer_cached
                 .iter()
                 .chain(changed.iter().map(|input| &input.resolved.key)),
             keys,
@@ -2662,8 +2683,9 @@ impl AgentService {
 
 /// The sessions [`attach_semantic_hit_anchors`] found without anchors.
 struct AnchorReads<'i, 'c> {
-    /// The sessions whose copy left the cache, in `inputs`' order.
-    left_cache: Vec<&'i agent::search::AgentConversationInput<'c>>,
+    /// The sessions whose copy is no longer in the session cache, in
+    /// `inputs`' order.
+    no_longer_cached: Vec<&'i agent::search::AgentConversationInput<'c>>,
     /// One warning per session whose read failed.
     failed: Vec<AgentWarning>,
 }
@@ -2688,7 +2710,7 @@ fn attach_semantic_hit_anchors<'i, 'c>(
             .extend(hit.focus_range.start..=hit.focus_range.end);
     }
     let mut reads = AnchorReads {
-        left_cache: Vec::new(),
+        no_longer_cached: Vec::new(),
         failed: Vec::new(),
     };
     for input in inputs {
@@ -2701,7 +2723,7 @@ fn attach_semantic_hit_anchors<'i, 'c>(
             Ok(transcript) => {
                 agent::search::attach_semantic_hit_metadata(output, &input.resolved, &transcript);
             }
-            Err(UnreadMessages::CopyLeftCache) => reads.left_cache.push(input),
+            Err(UnreadMessages::NoLongerCached) => reads.no_longer_cached.push(input),
             Err(UnreadMessages::Failed(error)) => reads
                 .failed
                 .push(AgentWarning::from_app_error(&error, Some(&reference))),
@@ -2712,8 +2734,8 @@ fn attach_semantic_hit_anchors<'i, 'c>(
 
 /// A read of a semantic hit's messages that found none to attach.
 enum UnreadMessages {
-    /// The copy the hits number left the cache.
-    CopyLeftCache,
+    /// The copy the hits number is no longer in the session cache.
+    NoLongerCached,
     Failed(AppError),
 }
 
@@ -2744,7 +2766,7 @@ fn read_semantic_messages(
             .map_err(UnreadMessages::Failed)?
             .flatten()
             .map(|read| read.transcript)
-            .ok_or(UnreadMessages::CopyLeftCache)
+            .ok_or(UnreadMessages::NoLongerCached)
     })
 }
 
@@ -2767,7 +2789,7 @@ fn run_hybrid_halves<S, L>(
     lexical: impl FnOnce(HybridLexicalPass) -> Result<L>,
 ) -> Result<(Result<S>, L)> {
     let semantic = match semantic() {
-        Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
+        Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
         semantic => semantic,
     };
     let pass = if semantic.is_ok() {
@@ -2809,7 +2831,7 @@ fn run_agent_semantic_hits(
 impl AgentService {
     /// Stores `routes`, the route texts the semantic stage computed, when
     /// this command can take refresh ownership without waiting. Fails when
-    /// the drive is short of space, as every cache write does. Any other
+    /// the drive is short of space. Any other
     /// skipped or failed write leaves the output as it is: the next semantic
     /// search computes those routes again. `--perf-stats` reports what was
     /// stored, or why nothing was.
@@ -2822,7 +2844,7 @@ impl AgentService {
             Ok(history::RoutesStored::NotOwner) => {
                 Some(agent::perf::RoutesSkipped::AnotherRearview)
             }
-            Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
+            Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
             Err(error) => Some(agent::perf::RoutesSkipped::WriteFailed(error.to_string())),
         };
         self.perf.record_semantic_routes(routes.len(), skipped);
@@ -2854,7 +2876,7 @@ fn semantic_candidates(
     let mut computed_routes = Vec::new();
     for (input, session) in inputs.iter().zip(sessions) {
         let Some(session) = session? else {
-            reads.left_cache.push(input.resolved.key.clone());
+            reads.no_longer_cached.push(input.resolved.key.clone());
             continue;
         };
         if let Some(generation) = session.generation {
@@ -2888,7 +2910,7 @@ struct SessionCandidates {
 }
 
 /// `input`'s semantic candidates from the copy the cache holds now; `None`
-/// when the cache no longer holds the session.
+/// when the session is no longer in the session cache.
 fn session_candidates(
     input: &agent::search::AgentConversationInput<'_>,
 ) -> Result<Option<SessionCandidates>> {
@@ -3870,10 +3892,10 @@ mod tests {
 
         let halves = run_hybrid_halves(
             || -> Result<()> {
-                Err(AppError::SessionCacheOutOfSpace {
+                Err(AppError::SessionCacheLowSpace {
                     free_bytes: 0,
                     floor_bytes: 1,
-                    deletion: crate::error::CacheDeletion::Deleted,
+                    outcome: crate::error::CacheDeletion::Pending,
                 })
             },
             |pass| {
@@ -3883,7 +3905,7 @@ mod tests {
         );
 
         assert!(
-            matches!(halves, Err(AppError::SessionCacheOutOfSpace { .. })),
+            matches!(halves, Err(AppError::SessionCacheLowSpace { .. })),
             "the search fails with the free space: {halves:?}"
         );
         assert!(passes.is_empty(), "no lexical pass runs: {passes:?}");
@@ -5984,7 +6006,8 @@ mod tests {
     }
 
     /// A route write on a drive short of space fails with the free space and
-    /// deletes the cache database, as every cache write short of space does.
+    /// sets the cache's low-space latch. The low-space deletion then empties
+    /// the cache database.
     #[test]
     fn semantic_route_write_short_of_space_fails_and_deletes_cache() {
         use crate::search::test_fixtures::cached_claude_sessions;
@@ -5999,8 +6022,12 @@ mod tests {
         let stored = service.store_semantic_routes(&routes);
 
         assert!(
-            matches!(stored, Err(AppError::SessionCacheOutOfSpace { .. })),
+            matches!(&stored, Err(AppError::SessionCacheLowSpace { .. })),
             "the write fails with the free space: {stored:?}"
+        );
+        assert_eq!(
+            history::sqlite_cache::low_space::run_deletion(service.environment.cache_base()),
+            Some(crate::error::CacheDeletion::Deleted)
         );
         assert!(
             history::sqlite_cache::is_emptied(sessions.cache_path()),
@@ -6101,7 +6128,7 @@ mod tests {
             "the removed session isn't a candidate"
         );
         assert_eq!(
-            reads.left_cache,
+            reads.no_longer_cached,
             [keys[2].clone()],
             "the removed session is named"
         );
@@ -6675,6 +6702,28 @@ mod tests {
         assert!(
             history::sqlite_cache::is_emptied(sessions.cache_base.path()),
             "the cache database's contents are deleted"
+        );
+    }
+
+    /// A command whose cache write finds the drive short of space records
+    /// the cache database's deletion as its `cache-deletion` stage.
+    #[test]
+    fn command_whose_cache_write_finds_drive_short_records_cache_deletion_stage() {
+        let sessions = CachedClaudeSessions::new();
+        sessions.append_to_the_changed_session();
+        let service = AgentService::new(
+            test_environment(vec![sessions.storage], Some(sessions.cache_base.path()))
+                .with_free_space(950_000_000),
+        );
+
+        service
+            .execute(agent_command(&["sessions", "--all"]))
+            .unwrap_err();
+
+        let records = service.perf.records(None);
+        assert!(
+            records.contains("perf stage=cache-deletion ms="),
+            "the deletion's stage is recorded:\n{records}"
         );
     }
 
@@ -7312,6 +7361,71 @@ mod tests {
                 sessions.watch.parses_after_mark(),
                 0,
                 "running out after {roomy_checks} checks stops parsing"
+            );
+        }
+    }
+
+    /// On a first fill of two agents' sessions, a write of the first agent's
+    /// load finds the drive short of space, and the command returns early at
+    /// the second agent's. Its record reports the deletion's outcome:
+    /// deferred while another rearview holds the database open.
+    #[test]
+    fn command_returning_early_short_of_space_reports_deletion_another_rearview_defers() {
+        use crate::tui::claude_home::{held_open_by_another_rearview, two_agents_first_fill};
+        let (environment, cache, _homes) = two_agents_first_fill();
+        let environment = environment
+            .with_disk_space(Arc::new(history::sqlite_cache::DriveRunningOut::after(
+                0,
+                || {},
+            )))
+            .with_low_space_wait(std::time::Duration::from_millis(300));
+        let another_rearview = held_open_by_another_rearview(cache.path());
+
+        let outcome = AgentService::new(environment).execute(agent_command(&["sessions", "--all"]));
+
+        let Err(AppError::AgentProtocol(record)) = &outcome else {
+            panic!("the command fails with its record: {outcome:?}");
+        };
+        assert!(
+            record.contains(
+                "The%20session%20cache%20was%20not%20deleted:%20another%20rearview%20has%20it%20open."
+            ),
+            "the record reports the deferred deletion: {record}"
+        );
+        drop(another_rearview);
+    }
+
+    /// A `within`, `read` or `outline` of an unknown session ID fails with
+    /// the low-space record, not the reference's, once the first fill found
+    /// the drive short of space, and deletes the cache database.
+    #[test]
+    fn reference_command_whose_session_isnt_found_after_fill_short_of_space_deletes_cache() {
+        use crate::tui::claude_home::two_agents_first_fill;
+        let unknown = "00000000-0000-4000-8000-000000000000";
+        for arguments in [
+            vec!["within", unknown, "question"],
+            vec!["read", unknown],
+            vec!["outline", unknown],
+        ] {
+            let (environment, cache, _homes) = two_agents_first_fill();
+            let environment = environment.with_disk_space(Arc::new(
+                history::sqlite_cache::DriveRunningOut::after(0, || {}),
+            ));
+
+            let outcome = AgentService::new(environment).execute(agent_command(&arguments));
+
+            let Err(AppError::AgentProtocol(record)) = &outcome else {
+                panic!("{arguments:?} fails with its record: {outcome:?}");
+            };
+            assert!(
+                record.starts_with(
+                    "protocol agent-error kind=io detail=rearview:%20not%20enough%20disk%20space"
+                ),
+                "{arguments:?} reports the low-space message: {record}"
+            );
+            assert!(
+                history::sqlite_cache::is_emptied(cache.path()),
+                "{arguments:?} deletes the cache database"
             );
         }
     }

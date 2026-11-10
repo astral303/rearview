@@ -61,7 +61,7 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
             StoredCounts {
                 counts,
                 hit_messages: HitMessages::default(),
-                left_cache: HashSet::new(),
+                no_longer_cached: HashSet::new(),
             }
         }
         SearchSurface::Agent { retrieval, .. } => {
@@ -92,10 +92,11 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
 pub(super) struct StoredCounts {
     pub(super) counts: HashMap<usize, Counts>,
     pub(super) hit_messages: HitMessages,
-    /// The conversations whose session left the cache while it was counted:
+    /// The conversations whose session was no longer in the session cache
+    /// while it was counted:
     /// another rearview removed it, or was writing it again. Nothing of them
     /// is counted.
-    pub(super) left_cache: HashSet<usize>,
+    pub(super) no_longer_cached: HashSet<usize>,
 }
 
 /// `query`'s counts over the search texts of each conversation at `indices`,
@@ -119,7 +120,7 @@ fn count_stored<C: Borrow<Conversation>>(
             .map(|&index| (index, matcher.counts()))
             .collect(),
         hit_messages: HitMessages::default(),
-        left_cache: HashSet::new(),
+        no_longer_cached: HashSet::new(),
     };
     if indices.is_empty() {
         return Ok(stored);
@@ -134,13 +135,13 @@ fn count_stored<C: Borrow<Conversation>>(
     })?;
     let counts = &mut stored.counts;
     let hit_messages = &mut stored.hit_messages;
-    for copy in scanned.left_cache {
+    for copy in scanned.no_longer_cached {
         counts.remove(&indices[copy]);
-        stored.left_cache.insert(indices[copy]);
+        stored.no_longer_cached.insert(indices[copy]);
     }
     let replaced = scanned.replaced.into_iter().collect::<HashMap<_, _>>();
     let mut message_terms: HashMap<usize, HashMap<usize, MessageTerms>> = HashMap::new();
-    for counter in scanned.visitors {
+    for counter in scanned.reads {
         for (copy, found) in counter.bodies {
             if !replaced.contains_key(&copy)
                 && let Some(session) = counts.get_mut(&indices[copy])
@@ -191,7 +192,7 @@ fn count_stored<C: Borrow<Conversation>>(
             }
             None => {
                 counts.remove(&index);
-                stored.left_cache.insert(index);
+                stored.no_longer_cached.insert(index);
             }
         }
     }

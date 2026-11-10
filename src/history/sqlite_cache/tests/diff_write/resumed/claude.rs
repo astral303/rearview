@@ -667,11 +667,11 @@ fn answered_prompts(count: usize) -> Vec<String> {
         .collect()
 }
 
-/// The bytes of the session checkpoint stored after `history` answered
+/// The bytes of the session checkpoint stored after `reply_count` answered
 /// prompts and one more appended.
-fn checkpoint_bytes_after_append(history: usize) -> usize {
-    let mut session = ClaudeSession::stored(&answered_prompts(history), &[]);
-    write_lines(&session.own.clone(), &answered_prompts(history + 1));
+fn checkpoint_bytes_after_append(reply_count: usize) -> usize {
+    let mut session = ClaudeSession::stored(&answered_prompts(reply_count), &[]);
+    write_lines(&session.own.clone(), &answered_prompts(reply_count + 1));
     assert_eq!(session.update().outcome, Ok(()), "the session resumes");
     session
         .cache
@@ -691,18 +691,17 @@ fn session_checkpoint_size_stays_flat_as_replies_grow() {
 
     assert!(
         long < short + 32,
-        "the checkpoint holds no state per earlier reply: {short} bytes after 10 replies, \
+        "the checkpoint doesn't grow with each earlier reply: {short} bytes after 10 replies, \
          {long} after 400"
     );
 }
 
 /// Claude Code continues a reply after a `Read` of an image: the call, its
-/// result, a user record describing the image, then the reply's next call
-/// under the same message id. 97 of the 929 Claude transcripts of one real
-/// corpus hold such a reply. A sub-agent reply whose next call is appended
+/// result, a meta user record describing the image, then the reply's next call
+/// under the same message id. A sub-agent reply whose next call is appended
 /// after that record was stored reads the sub-agent whole: the sub-agent's
 /// stored share holds one token total for the replies before its stable
-/// cursor, and the reply's last usage counts once.
+/// cursor, and the reply's usage counts once.
 #[test]
 fn subagent_reply_continued_after_an_image_record_reads_subagent_whole() {
     let checked = [
@@ -715,9 +714,9 @@ fn subagent_reply_continued_after_an_image_record_reads_subagent_whole() {
             json!({"file_path": "/tmp/project/screen.png"}),
         ),
         result("10:03:02", "toolu_read", "Read the image"),
-        prompt(
+        record(
             "10:03:02",
-            "[Image: original 3200x1008, displayed at 2000x630. Multiply coordinates by 1.60 to map to original image.]",
+            json!({"type": "user", "isMeta": true, "turnCompanion": true, "message": {"role": "user", "content": "[Image: original 3200x1008, displayed at 2000x630. Multiply coordinates by 1.60 to map to original image.]"}}),
         ),
     ];
     let mut session = ClaudeSession::stored(&opening_past_subagent(), &[(SCOUT, scout(&checked))]);
@@ -742,6 +741,46 @@ fn subagent_reply_continued_after_an_image_record_reads_subagent_whole() {
         update.bytes_read,
         std::fs::metadata(session.subagent(SCOUT)).unwrap().len(),
         "the sub-agent transcript is read whole"
+    );
+    assert_eq!(
+        session.fixture().listed(&session.cache).total_tokens,
+        75,
+        "each of the five replies' 15 tokens counts once"
+    );
+}
+
+/// Claude Code writes each block of a reply as a record of its own under the
+/// reply's message id. A sub-agent window holding a new reply of two
+/// records, after the open reply the window starts at, looks each of its two
+/// reply ids up once, finds neither stored before it, and resumes.
+#[test]
+fn subagent_window_looks_each_reply_id_up_once() {
+    let mut session = ClaudeSession::stored(&opening_past_subagent(), &[(SCOUT, scout(&[]))]);
+    write_lines(
+        &session.subagent(SCOUT),
+        &scout(&[
+            prompt("10:03:00", "Check the tests too"),
+            reply("10:03:01", "msg_s3", "Running them."),
+            call(
+                "10:03:02",
+                "msg_s3",
+                "toolu_tests",
+                "Bash",
+                json!({"command": "cargo test"}),
+            ),
+        ]),
+    );
+
+    let update = session.update();
+
+    assert_eq!(update.outcome, Ok(()), "the session resumes");
+    assert!(
+        update.bytes_read < std::fs::metadata(session.subagent(SCOUT)).unwrap().len(),
+        "the sub-agent transcript is read from its stable cursor"
+    );
+    assert_eq!(
+        update.reply_lookups, 2,
+        "each of the window's two reply ids is looked up once"
     );
 }
 

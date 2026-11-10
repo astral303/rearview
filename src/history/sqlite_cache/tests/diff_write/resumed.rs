@@ -43,6 +43,9 @@ pub(in crate::history::sqlite_cache::tests) struct Update {
     bytes_read: u64,
     /// The entries a resumed read derives from the checkpoint on.
     tail_entries: usize,
+    /// The runs of the lookup of a sub-agent reply's stored turns
+    /// ([`window::SUBAGENT_REPLY_STORED`]).
+    reply_lookups: i32,
 }
 
 impl CodexSession {
@@ -178,6 +181,11 @@ pub(in crate::history::sqlite_cache::tests) fn update_stored(
         project_directories: &crate::history::path::CanonicalDirectories::of_system(),
     };
     let resumed = read_resumed(&context, crate::history::FOR_FIXTURES).unwrap();
+    let reply_lookups = reader
+        .connection
+        .prepare_cached(window::SUBAGENT_REPLY_STORED)
+        .unwrap()
+        .get_status(rusqlite::StatementStatus::Run);
     let (record, row) = parsed_record_and_row(source, &fixture.root, &fixture.stub);
     let mut bytes_read = 0;
     let mut tail_entries = 0;
@@ -206,6 +214,7 @@ pub(in crate::history::sqlite_cache::tests) fn update_stored(
         transcripts_read: reads.into_inner(),
         bytes_read,
         tail_entries,
+        reply_lookups,
     }
 }
 
@@ -445,10 +454,10 @@ fn turn_appended_to_subagent_is_read_as_its_window() {
     );
 }
 
-/// The stored turns of `/root/scout`, after `history` replies, read from
-/// its last line, and the SQLite program steps the read took.
-fn last_stored_turn_and_steps(history: usize) -> (usize, u64) {
-    let replies = (0..history)
+/// The count of stored turns of `/root/scout`, after `reply_count` replies,
+/// read from its last line, and the SQLite program steps the read took.
+fn stored_turn_count_and_steps_from_last_line(reply_count: usize) -> (usize, u64) {
+    let replies = (0..reply_count)
         .map(|index| {
             reply(
                 &format!("10:{:02}:{:02}.000", 6 + index / 60, index % 60),
@@ -492,7 +501,7 @@ fn last_stored_turn_and_steps(history: usize) -> (usize, u64) {
 
     let turns = session
         .cache
-        .stored_turns_from(&resume, &session.subagent(SCOUT), history + 1)
+        .stored_turns_from(&resume, &session.subagent(SCOUT), reply_count + 1)
         .unwrap();
 
     session
@@ -505,8 +514,8 @@ fn last_stored_turn_and_steps(history: usize) -> (usize, u64) {
 
 #[test]
 fn subagents_stored_turns_read_from_line_cost_same_however_long_its_history() {
-    let (short_turns, short_steps) = last_stored_turn_and_steps(10);
-    let (long_turns, long_steps) = last_stored_turn_and_steps(400);
+    let (short_turns, short_steps) = stored_turn_count_and_steps_from_last_line(10);
+    let (long_turns, long_steps) = stored_turn_count_and_steps_from_last_line(400);
 
     assert_eq!(
         (short_turns, long_turns),
@@ -630,8 +639,8 @@ fn edit_early_in_place(path: &Path, from: &str, to: &str) {
     let text = std::fs::read_to_string(path).unwrap();
     let at = text.find(from).unwrap();
     assert!(
-        at + 4096 < text.len(),
-        "the edit stands more than 4 KiB before the end: {at} of {}",
+        at + (crate::history::format::REWRITE_CHECK_BYTES as usize) < text.len(),
+        "the edit stands before the bytes the rewrite check hashes: {at} of {}",
         text.len()
     );
     let modified = std::fs::metadata(path).unwrap().modified().unwrap();

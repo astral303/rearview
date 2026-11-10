@@ -1,7 +1,7 @@
 //! `agent search` over sessions another rearview writes again or removes
 //! while the search reads them: the ranking and the hit read each read the
-//! copy the cache holds when they read it, and a session that left the cache
-//! leaves the results.
+//! copy the cache holds when they read it, and a session no longer in the
+//! session cache drops out of the results.
 
 use crate::agent::refs::AgentConversationKey;
 use crate::agent::search::SearchedTranscript;
@@ -180,13 +180,13 @@ fn session_removed_during_search_leaves_ranking_or_hit_read() {
     assert!(remove.has_run(), "the removal runs as a reader opens");
     assert_eq!(ranking.ranked, [1], "the removed session is not ranked");
     assert_eq!(
-        ranking.left_cache,
+        ranking.no_longer_cached,
         [0],
         "the ranking names the removed session"
     );
     assert!(
         ranking.hit_messages.of(0).is_none(),
-        "the removed session has no hit messages"
+        "the removed session doesn't have any hit messages"
     );
 
     let sessions = both();
@@ -194,7 +194,7 @@ fn session_removed_during_search_leaves_ranking_or_hit_read() {
     sessions.remove(0);
     assert!(
         read_hits(&sessions, &ranking, 0).is_none(),
-        "the hit read finds the session left the cache"
+        "the hit read finds the session no longer in the session cache"
     );
     assert!(
         read_hits(&sessions, &ranking, 1).is_some(),

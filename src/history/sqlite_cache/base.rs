@@ -1,10 +1,13 @@
 //! A session cache directory as one rearview reaches it.
 
+use super::low_space;
 use crate::clock::Clock;
+use crate::error::AppError;
 use crate::history::provider::walk::Canonicaliser;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 /// The refresh owner identities one rearview holds, by canonical cache base,
 /// from acquisition until release or a confirmed replacement, write
@@ -21,6 +24,78 @@ struct Held {
     owners: Vec<HeldOwner>,
     /// Canonical bases this rearview's own rebuild holds exclusively locked.
     rebuilding: Vec<PathBuf>,
+}
+
+/// The state a [`CacheBase`] shares with its clones: the base's low-space
+/// latch and the connections this rearview has open through it. Each
+/// [`CacheBase::new`] makes its own, keeping apart two bases a test makes in
+/// one process.
+#[derive(Default)]
+struct BaseState {
+    low_space: low_space::Latch,
+    connections: Mutex<Connections>,
+    /// Notified whenever a connection of [`Self::connections`] closes.
+    closed: Condvar,
+}
+
+#[derive(Default)]
+struct Connections {
+    open: usize,
+    /// True while the low-space deletion refuses new connections. The
+    /// deletion's own connections are not counted.
+    refusing: bool,
+    /// The thread that opened each of the `open` connections.
+    #[cfg(debug_assertions)]
+    opened_on: Vec<std::thread::ThreadId>,
+}
+
+impl BaseState {
+    fn connections(&self) -> MutexGuard<'_, Connections> {
+        self.connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One session cache connection this rearview has open, counted until it
+/// drops.
+pub(crate) struct OpenConnection {
+    state: Arc<BaseState>,
+    #[cfg(debug_assertions)]
+    opened_on: std::thread::ThreadId,
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        let mut connections = self.state.connections();
+        connections.open -= 1;
+        #[cfg(debug_assertions)]
+        {
+            let index = connections
+                .opened_on
+                .iter()
+                .position(|thread| *thread == self.opened_on)
+                .expect("an open connection records its thread");
+            connections.opened_on.swap_remove(index);
+        }
+        drop(connections);
+        self.state.closed.notify_all();
+    }
+}
+
+/// The low-space deletion's refusal of this rearview's new connections to a
+/// base, until it drops.
+pub(super) struct RefusedConnections {
+    state: Arc<BaseState>,
+    /// True when every connection open at the refusal closed within its
+    /// wait.
+    pub(super) all_closed: bool,
+}
+
+impl Drop for RefusedConnections {
+    fn drop(&mut self) {
+        self.state.connections().refusing = false;
+    }
 }
 
 /// This rearview's rebuild of one cache base, marked from before it takes
@@ -50,6 +125,16 @@ struct HeldOwner {
     identity: String,
     /// The write permission every copy of the owner's token shares.
     writable: Arc<AtomicBool>,
+    /// The owner's turn, held by each of its write batches.
+    turn: Arc<Mutex<()>>,
+}
+
+/// An ownership [`ProcessIdentity::revoke_every_owner_of`] revoked.
+pub(crate) struct RevokedOwner {
+    pub(crate) identity: String,
+    /// True when one of the owner's write batches held its turn at the
+    /// revocation, and so may hold SQLite's writer lock.
+    pub(crate) is_writing: bool,
 }
 
 /// The free space on the drive a path is on, as rearview asks for it.
@@ -136,12 +221,19 @@ impl ProcessIdentity {
     }
 
     /// Record `owner` as this rearview's ownership of `canonical_base`, with
-    /// the write permission its tokens share.
-    pub(crate) fn hold(&self, canonical_base: &Path, owner: &str, writable: Arc<AtomicBool>) {
+    /// the write permission and the turn its tokens share.
+    pub(crate) fn hold(
+        &self,
+        canonical_base: &Path,
+        owner: &str,
+        writable: Arc<AtomicBool>,
+        turn: Arc<Mutex<()>>,
+    ) {
         self.held().owners.push(HeldOwner {
             canonical_base: canonical_base.to_path_buf(),
             identity: owner.to_owned(),
             writable,
+            turn,
         });
     }
 
@@ -173,16 +265,22 @@ impl ProcessIdentity {
     }
 
     /// Revoke the write permission of every ownership this rearview holds of
-    /// `canonical_base`, and return their identities for the caller to
-    /// release. They stay held until the caller forgets them.
-    pub(crate) fn revoke_every_owner_of(&self, canonical_base: &Path) -> Vec<String> {
+    /// `canonical_base`, and return them for the caller to release. They
+    /// stay held until the caller forgets them.
+    pub(crate) fn revoke_every_owner_of(&self, canonical_base: &Path) -> Vec<RevokedOwner> {
         self.held()
             .owners
             .iter()
             .filter(|owner| owner.canonical_base == canonical_base)
             .map(|owner| {
                 owner.writable.store(false, Ordering::Release);
-                owner.identity.clone()
+                RevokedOwner {
+                    identity: owner.identity.clone(),
+                    is_writing: matches!(
+                        owner.turn.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                }
             })
             .collect()
     }
@@ -202,6 +300,8 @@ pub struct CacheBase {
     /// `path` canonical, once it was asked for. Held while it canonicalises,
     /// so concurrent first callers canonicalise it once.
     canonical_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Made by [`Self::new`] and kept by clones and [`Self::canonical`].
+    state: Arc<BaseState>,
 }
 
 impl CacheBase {
@@ -221,7 +321,73 @@ impl CacheBase {
             disk: Arc::new(SystemDiskSpace),
             canonicaliser,
             canonical_path: Arc::default(),
+            state: Arc::default(),
         }
+    }
+
+    /// Count a new connection of this rearview to this base's database until
+    /// the result drops. Fails with [`AppError::SessionCacheBeingDeleted`]
+    /// while the low-space deletion refuses new connections.
+    pub(crate) fn open_connection(&self) -> crate::error::Result<OpenConnection> {
+        let mut connections = self.state.connections();
+        if connections.refusing {
+            return Err(AppError::SessionCacheBeingDeleted);
+        }
+        connections.open += 1;
+        #[cfg(debug_assertions)]
+        connections.opened_on.push(std::thread::current().id());
+        Ok(OpenConnection {
+            state: Arc::clone(&self.state),
+            #[cfg(debug_assertions)]
+            opened_on: std::thread::current().id(),
+        })
+    }
+
+    /// Refuse this rearview's new connections to this base (see
+    /// [`Self::open_connection`]) until the result drops, and wait up to
+    /// `wait` for the open ones to close. Call on a thread that opened none
+    /// of them: the wait would end only at `wait`.
+    pub(super) fn refuse_connections(&self, wait: Duration) -> RefusedConnections {
+        let mut connections = self.state.connections();
+        #[cfg(debug_assertions)]
+        assert!(
+            !connections.opened_on.contains(&std::thread::current().id()),
+            "the thread refusing connections holds none of them open"
+        );
+        connections.refusing = true;
+        let deadline = Instant::now() + wait;
+        while connections.open > 0 {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            connections = self
+                .state
+                .closed
+                .wait_timeout(connections, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        RefusedConnections {
+            state: Arc::clone(&self.state),
+            all_closed: connections.open == 0,
+        }
+    }
+
+    /// This base's low-space latch: set once a write of the base found its
+    /// drive short of space (see [`low_space::run_deletion`]).
+    pub(crate) fn low_space(&self) -> &low_space::Latch {
+        &self.state.low_space
+    }
+
+    /// This base, each step of its low-space deletion waiting at most
+    /// `wait`. Call before the base is cloned.
+    #[cfg(test)]
+    pub(crate) fn with_low_space_wait(mut self, wait: Duration) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("a base's low-space wait is set before the base is cloned")
+            .low_space
+            .set_wait(wait);
+        self
     }
 
     /// This base, keying session roots and files through `canonicaliser`.

@@ -79,15 +79,22 @@ impl Coordinator {
     /// End this rearview's use of the cache: revoke the write permission of
     /// every refresh ownership it holds, revoked ones included, and release
     /// each, waiting at most [`SHUTDOWN_RELEASE_WAIT`] for a busy writer
-    /// lock. An ownership whose release fails stays this rearview's until
+    /// lock. Release an ownership whose write batch is running with one
+    /// attempt, without waiting: that batch holds the writer lock until it
+    /// ends. An ownership whose release fails stays this rearview's until
     /// its operation ends or another rearview takes it over.
     pub(crate) fn shutdown(&self) {
         let Ok(base) = self.base.canonical() else {
             return;
         };
-        for identity in base.process().revoke_every_owner_of(base.path()) {
-            if refresh::release(&base, &identity, SHUTDOWN_RELEASE_WAIT) != Release::Failed {
-                base.process().forget(&identity);
+        for owner in base.process().revoke_every_owner_of(base.path()) {
+            let wait = if owner.is_writing {
+                Duration::ZERO
+            } else {
+                SHUTDOWN_RELEASE_WAIT
+            };
+            if refresh::release(&base, &owner.identity, wait) != Release::Failed {
+                base.process().forget(&owner.identity);
             }
         }
     }

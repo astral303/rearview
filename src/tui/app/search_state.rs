@@ -26,8 +26,8 @@ pub(super) struct SemanticSearchState {
     pub(super) last_status: SemanticProgress,
     pub(super) error: Option<String>,
     pub(super) results: HashMap<usize, SemanticResultMetadata>,
-    /// The sessions the semantic results on screen searched without semantic
-    /// turns; `None` while no semantic results are on screen.
+    /// The count of sessions the semantic results on screen searched without
+    /// semantic turns; `None` while semantic results aren't on screen.
     pub(super) unreadable: Option<usize>,
     pub(super) worker_tx: Option<mpsc::Sender<SemanticWorkerCommand>>,
     pub(super) worker_rx: Option<mpsc::Receiver<SemanticSearchMessage>>,
@@ -40,7 +40,6 @@ impl SemanticSearchState {
         self.unreadable = None;
     }
 
-    /// Shows `response`'s results.
     fn show_results(&mut self, response: SemanticSearchResponse) {
         self.last_status = response.progress;
         self.error = response.error;
@@ -121,7 +120,7 @@ impl App {
             conversations: self.conversations_snapshot.clone(),
             searchable: Arc::new(self.searchable.clone()),
         });
-        if sent {
+        if sent.is_ok() {
             self.search_data_sent += 1;
         }
     }
@@ -438,8 +437,8 @@ impl App {
                                 }
                                 applied = true;
                             } else if response.generation == active_generation {
-                                // The semantic results replace the lexical
-                                // fallback, so texts read stop rerunning it.
+                                // Stop texts read from rerunning the lexical
+                                // fallback: the semantic results replace it.
                                 self.search_generation.stop_awaiting();
                                 self.search_started_at = None;
                                 self.semantic_search.pending_generation = None;

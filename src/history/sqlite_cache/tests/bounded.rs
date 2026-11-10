@@ -127,17 +127,27 @@ fn bounded_transcript_doesnt_load_unrelated_large_call_and_result_bodies() {
     assert!(format!("{:?}", transcript.messages[0]).contains("small requested message"));
 }
 
-/// A bounded read takes each call's sub-agent link fields from the stored
-/// context, without reading the call's input: one no read can parse leaves
-/// the read whole.
+/// A bounded read reads each call's sub-agent link fields from the stored
+/// context, without reading the call's input: with every stored input
+/// replaced by text that is not JSON, the read is unchanged. The calls are
+/// Claude Code's: a foreground and a background `Agent` launch, and a
+/// `SendMessage` to a sub-agent.
 #[test]
 fn bounded_read_doesnt_read_unselected_call_inputs() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     let records = [
         serde_json::json!({"type":"user", "message":{"role":"user", "content":"small requested message"}}),
-        serde_json::json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":"scout", "name":"Agent", "input":{"description":"Scout", "subagent_type":"explorer", "prompt":"Look around"}}]}}),
-        serde_json::json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"scout", "content":"Done"}]}}),
+        serde_json::json!({"type":"assistant", "message":{"role":"assistant", "content":[
+            {"type":"tool_use", "id":"scout", "name":"Agent", "input":{"description":"Scout", "subagent_type":"explorer", "prompt":"Look around"}},
+            {"type":"tool_use", "id":"watcher", "name":"Agent", "input":{"description":"Watch the build", "subagent_type":"general-purpose", "prompt":"Watch the build", "run_in_background":true}},
+            {"type":"tool_use", "id":"nudge", "name":"SendMessage", "input":{"recipient":"worker-1", "message":"Start with src.", "summary":"nudge"}},
+        ]}}),
+        serde_json::json!({"type":"user", "message":{"role":"user", "content":[
+            {"type":"tool_result", "tool_use_id":"scout", "content":"Done"},
+            {"type":"tool_result", "tool_use_id":"watcher", "content":"Started"},
+            {"type":"tool_result", "tool_use_id":"nudge", "content":"Sent"},
+        ]}}),
     ].map(|record| record.to_string()).join("\n");
     std::fs::write(&source, records).unwrap();
     let (record, root) = source_record(Source::Claude, &source);
@@ -174,11 +184,17 @@ fn bounded_read_doesnt_read_unselected_call_inputs() {
         format!("{before:?}"),
         "the read gives the call its link fields without its input"
     );
-    assert!(
-        format!("{:?}", after.messages[1]).contains("explorer"),
-        "the call's context holds its sub-agent type: {:?}",
-        after.messages[1]
-    );
+    let calls = format!("{:?}", after.messages[1]);
+    for (field, value) in [
+        ("subagent type", "explorer"),
+        ("background launch", "run_in_background"),
+        ("message recipient", "worker-1"),
+    ] {
+        assert!(
+            calls.contains(value),
+            "the calls' context holds the {field}: {calls}"
+        );
+    }
 }
 
 #[test]
@@ -274,14 +290,14 @@ fn calls_and_results_page_reads(body_bytes: usize) -> i32 {
 }
 
 #[test]
-fn bounded_read_of_calls_reads_the_same_pages_however_large_their_inputs_and_results() {
+fn bounded_read_of_calls_doesnt_read_the_overflow_pages_of_large_inputs_and_results() {
     let small = calls_and_results_page_reads(16);
     let large = calls_and_results_page_reads(1 << 20);
 
     assert!(
         large <= small + 4,
-        "the read reaches no overflow page of a 1 MiB prompt or result: {small} pages for \
-         16 bytes, {large} for 1 MiB"
+        "the read doesn't reach the overflow pages of a 1 MiB prompt or result, within 4 \
+         pages: {small} pages for 16 bytes, {large} for 1 MiB"
     );
 }
 

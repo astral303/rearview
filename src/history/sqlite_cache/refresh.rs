@@ -2,7 +2,7 @@
 //! their commits. A recent unfinished refresh keeps ownership between batches.
 
 use super::base::CacheBase;
-use super::connection::{self, Access};
+use super::connection::{self, Access, CacheConnection};
 use super::coordinator::WaitStatus;
 use super::is_busy;
 use super::observer::{CommitAge, OtherRearview, REBUILD_LOCK_THRESHOLD};
@@ -195,6 +195,7 @@ impl RefreshOwnership {
             token.base.path(),
             &token.identity,
             Arc::clone(&token.writable),
+            Arc::clone(&token.turn),
         );
         Self { token }
     }
@@ -203,91 +204,118 @@ impl RefreshOwnership {
         &self.token
     }
 
-    /// Delete the cache database's contents while this ownership keeps
-    /// every other writer and reader out: under SQLite's exclusive lock
-    /// (see [`take_exclusive_lock`]), waiting as `wait` allows, drop every
-    /// table but `refresh_state` and shrink the file, then remove the
-    /// write-ahead log, shared-memory file and rollback journal beside it.
-    /// The database file stays, so no reader opening it meanwhile is
-    /// unlinked under or makes the removal fail. The ownership keeps writers
-    /// out until it drops and releases the emptied cache.
+    /// Delete the cache database's contents under SQLite's exclusive lock
+    /// (see [`take_exclusive_lock`]), waiting as `wait` allows: drop every
+    /// table but `refresh_state`, shrink the file and leave WAL mode, then
+    /// remove the files SQLite keeps beside it. Keep the database file: a
+    /// reader opening it meanwhile is then neither unlinked under nor a
+    /// cause of a failed removal. Other rearviews cannot write the emptied
+    /// cache until the ownership drops.
     pub(super) fn delete_database(&mut self, wait: ExclusiveWait) -> CacheDeletion {
         let turn = self.token.take_turn();
         let database = super::database_path(self.token.base.path());
-        let failed = |error: AppError| match error {
-            error if super::is_busy_error(&error) => CacheDeletion::Deferred,
-            error => CacheDeletion::Failed {
-                file: without_verbatim_prefix(&database).display().to_string(),
-                error: error.to_string(),
-            },
-        };
         if database.exists()
             && let Err(error) = self.empty_database(&turn, wait)
         {
-            return failed(error);
+            return deletion_failure(&database, error);
         }
         remove_side_files(&database)
     }
 
-    /// Drop every table of the database but `refresh_state` and shrink its
-    /// file, under SQLite's exclusive lock, which the connection keeps until
-    /// it closes on return.
+    /// Drop every table of the database but `refresh_state`, shrink its file
+    /// and leave WAL mode, under SQLite's exclusive lock. The connection
+    /// holds the lock until it closes on return.
     fn empty_database(&self, turn: &Turn<'_>, wait: ExclusiveWait) -> Result<()> {
-        let connection = connect(self.token.base.path(), wait.total)?;
-        // The out-of-space check revoked the write permission, so the
-        // ownership is matched by its stored identity alone.
+        let connection = connect_writable(&self.token.base, wait.total)?;
         take_exclusive_lock(&connection, &self.token, turn, wait, |batch| {
-            let owns: bool = batch.query_row(
-                "SELECT EXISTS (SELECT 1 FROM refresh_state WHERE singleton = 1 AND owner = ?1)",
-                [&self.token.identity],
-                |row| row.get(0),
-            )?;
-            if !owns {
-                return Err(AppError::SessionCacheRefreshLost);
-            }
+            record_commit(&batch, &self.token)?;
             batch.transaction.commit()?;
             Ok(())
         })?;
+        // Empty the database before leaving WAL mode: leaving it copies the
+        // log into the database only up to the database's size at its last
+        // commit, so none of a load's pages in the log grow the file.
         let batch = connection.unchecked_transaction()?;
-        super::drop_every_table(&batch)?;
+        super::drop_session_tables(&batch)?;
         batch.commit()?;
         connection.execute_batch("VACUUM")?;
-        Ok(())
+        // Commit the ownership again before the lock ends, so a waiter
+        // finds it held after an emptying that outlasts the takeover window,
+        // and takes over only once the side files are removed.
+        let batch = connection.unchecked_transaction()?;
+        record_commit(&batch, &self.token)?;
+        batch.commit()?;
+        leave_wal(&connection)
     }
 }
 
+/// The outcome of a low-space deletion of `database` that failed with
+/// `error`: deferred when another connection kept the database busy.
+pub(super) fn deletion_failure(database: &Path, error: AppError) -> CacheDeletion {
+    if super::is_busy_error(&error) {
+        return CacheDeletion::Deferred;
+    }
+    CacheDeletion::Failed {
+        file: without_verbatim_prefix(database).display().to_string(),
+        error: error.to_string(),
+    }
+}
+
+/// Record a commit of `owner`'s ownership now on `connection`, whether or
+/// not its write permission stands, so a rearview waiting for the ownership
+/// finds it held. Fails with [`AppError::SessionCacheRefreshLost`] once
+/// another identity owns the cache.
+fn record_commit(connection: &Connection, owner: &RefreshToken) -> Result<()> {
+    let changed = connection.execute(
+        "UPDATE refresh_state SET last_commit_ms = ?1 WHERE singleton = 1 AND owner = ?2",
+        params![now_ms(owner.clock()), owner.identity],
+    )?;
+    if changed != 1 {
+        return Err(AppError::SessionCacheRefreshLost);
+    }
+    Ok(())
+}
+
 /// A wait for SQLite's exclusive lock: `total` in all, in attempts of at
-/// most `attempt`, after each of which the owner commits again.
+/// most `attempt`. The owner commits again after each attempt that fails.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ExclusiveWait {
     pub(super) total: Duration,
     pub(super) attempt: Duration,
 }
 
+/// The attempt of an [`ExclusiveWait::of`]. Keep it well under
+/// [`STALE_AFTER`]: a rearview waiting for the ownership between the
+/// owner's commits must not find it stale.
+const EXCLUSIVE_LOCK_ATTEMPT: Duration = Duration::from_secs(3);
+
 impl ExclusiveWait {
-    /// A wait of `total` in attempts of 3 seconds: well under
-    /// [`STALE_AFTER`], so no rearview waiting for the ownership finds it
-    /// stale meanwhile.
+    /// A wait of `total` in attempts of [`EXCLUSIVE_LOCK_ATTEMPT`].
     pub(super) const fn of(total: Duration) -> Self {
         Self {
             total,
-            attempt: Duration::from_secs(3),
+            attempt: EXCLUSIVE_LOCK_ATTEMPT,
         }
     }
 
+    /// The busy timeout of one attempt.
+    fn attempt_timeout(self) -> Duration {
+        self.total.min(self.attempt)
+    }
+
     fn attempts(self) -> u128 {
-        let attempt = self.total.min(self.attempt).as_millis().max(1);
+        let attempt = self.attempt_timeout().as_millis().max(1);
         self.total.as_millis().div_ceil(attempt).max(1)
     }
 }
 
 /// Take SQLite's exclusive lock on `connection`'s database inside `turn`,
-/// commit its first batch with `commit`, and leave WAL mode; the lock lasts
-/// until the connection closes. Waits for every other connection to close
-/// as `wait` allows, committing `owner`'s ownership after each attempt that
-/// fails. Fails with a busy error once the wait ends, with
+/// and commit its first batch with `commit`; the lock lasts until the
+/// connection closes. Waits for every other connection to close as `wait`
+/// allows, committing `owner`'s ownership after each attempt that fails.
+/// Fails with a busy error once the wait ends, and with
 /// [`AppError::SessionCacheRefreshLost`] once another identity owns the
-/// cache, and with [`AppError::SessionCacheStuckInWal`].
+/// cache.
 pub(super) fn take_exclusive_lock(
     connection: &Connection,
     owner: &RefreshToken,
@@ -298,12 +326,13 @@ pub(super) fn take_exclusive_lock(
     // With exclusive locking in WAL mode, BEGIN EXCLUSIVE waits up to the
     // busy timeout for every other connection to close, and keeps the lock
     // across commits and VACUUM until this connection closes. A failed
-    // attempt leaves this connection's shared lock alone, so the commit
-    // between attempts opens and writes: in WAL mode the pager asks for the
-    // exclusive lock from the shared one, and both the Unix and the Windows
-    // VFS take the pending byte only on the way from a reserved lock.
+    // attempt keeps this connection's shared lock and doesn't take any
+    // other, and the commit between attempts writes through it: in WAL mode
+    // the pager asks for the exclusive lock from the shared one, and both
+    // the Unix and the Windows VFS take the pending byte only on the way
+    // from a reserved lock.
     connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
-    connection.busy_timeout(wait.total.min(wait.attempt))?;
+    connection.busy_timeout(wait.attempt_timeout())?;
     let attempts = wait.attempts();
     let mut attempt = 1;
     let batch = loop {
@@ -317,37 +346,48 @@ pub(super) fn take_exclusive_lock(
         }
     };
     connection.busy_timeout(wait.total)?;
-    commit(batch)?;
-    // Delete the write-ahead log on leaving WAL mode: SQLite opens a `-wal`
-    // file beside a database out of WAL mode as its log again.
+    commit(batch)
+}
+
+/// Switch `connection`'s database, held under SQLite's exclusive lock, out
+/// of WAL mode, deleting its write-ahead log. Fails with
+/// [`AppError::SessionCacheStuckInWal`] when the database keeps another
+/// mode.
+pub(super) fn leave_wal(connection: &Connection) -> Result<()> {
+    // Delete the log on the way out: SQLite opens a `-wal` file it finds
+    // beside a database out of WAL mode as its log again.
     connection::set_persistent_wal(connection, false)?;
     let mode: String =
         connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("delete") {
         return Err(AppError::SessionCacheStuckInWal { mode });
     }
-    Ok(())
-}
-
-/// Commit `owner`'s ownership now, on a connection of its own waiting up to
-/// `wait` for the writer lock, though its write permission may be revoked:
-/// a rearview waiting for the ownership finds it held. Fails with
-/// [`AppError::SessionCacheRefreshLost`] once another identity owns the
-/// cache.
-fn keep_ownership(owner: &RefreshToken, wait: Duration) -> Result<()> {
-    let connection = connect(owner.base.path(), wait)?;
-    let changed = connection.execute(
-        "UPDATE refresh_state SET last_commit_ms = ?1 WHERE singleton = 1 AND owner = ?2",
-        params![now_ms(owner.clock()), owner.identity],
-    )?;
-    if changed != 1 {
-        return Err(AppError::SessionCacheRefreshLost);
+    #[cfg(test)]
+    if let Some(database) = connection.path() {
+        let size = std::fs::metadata(database).map_or(0, |metadata| metadata.len());
+        SIZES_AFTER_LEAVING_WAL.with_borrow_mut(|sizes| sizes.push(size));
     }
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The database file's size each time a connection on this thread left
+    /// WAL mode, for a test of what leaving it copies.
+    static SIZES_AFTER_LEAVING_WAL: std::cell::RefCell<Vec<u64>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// [`record_commit`] on a connection of its own, waiting up to `wait` for
+/// the writer lock.
+fn keep_ownership(owner: &RefreshToken, wait: Duration) -> Result<()> {
+    let connection = connect_writable(&owner.base, wait)?;
+    record_commit(&connection, owner)
+}
+
 /// Remove the files SQLite keeps beside `database`.
-fn remove_side_files(database: &Path) -> CacheDeletion {
+pub(super) fn remove_side_files(database: &Path) -> CacheDeletion {
     for suffix in super::DATABASE_SIDE_FILE_SUFFIXES {
         let mut path = database.to_path_buf().into_os_string();
         path.push(suffix);
@@ -373,13 +413,14 @@ impl Drop for RefreshOwnership {
     /// identity this process's, so its shutdown can release it.
     fn drop(&mut self) {
         self.token.revoke();
-        if release(&self.token.base, &self.token.identity, STALE_AFTER) != Release::Failed {
+        let released = release(&self.token.base, &self.token.identity, STALE_AFTER);
+        if released != Release::Failed {
             self.token.forget();
         }
     }
 }
 
-/// What one release of an owner identity found.
+/// The outcome of one release of an owner identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Release {
     /// The identity owned the cache, and no longer does.
@@ -392,9 +433,13 @@ pub(super) enum Release {
 
 /// Clear `identity`'s ownership of `base`, a canonical cache base, when it
 /// still owns the cache, retrying a busy writer lock for up to `wait`. A
-/// release that fails leaves the ownership to the takeover window.
+/// release that fails leaves the ownership to the takeover window. A missing
+/// database file has no owner to clear.
 pub(super) fn release(base: &CacheBase, identity: &str, wait: Duration) -> Release {
-    let released = connect(base.path(), wait).and_then(|connection| {
+    if !super::database_path(base.path()).is_file() {
+        return Release::NotOwner;
+    }
+    let released = connect_writable(base, wait).and_then(|connection| {
         connection.execute(
             "UPDATE refresh_state SET owner = NULL, last_commit_ms = ?1
              WHERE singleton = 1 AND owner = ?2",
@@ -416,18 +461,20 @@ pub(crate) struct RefreshToken {
     writable: Arc<AtomicBool>,
     /// True once a write found another identity owning the cache.
     replaced: Arc<AtomicBool>,
-    /// The free bytes a write found below [`FREE_SPACE_FLOOR`]; `None` while
-    /// no write has.
-    out_of_space: Arc<Mutex<Option<u64>>>,
     /// Taken before SQLite's writer lock by each write batch for this owner,
     /// and released after its commit or rollback, so this owner's threads
     /// wait for each other without a time limit.
     turn: Arc<Mutex<()>>,
     /// The thread running a parse of [`Self::parse_batch`] inside the turn.
-    /// A take of the turn from that thread, or from the thread pool its
-    /// parse spreads over, waits forever, so debug builds panic instead.
+    /// While it is set, debug builds panic on a take of the turn from that
+    /// thread or from any rayon thread: a parse spreads over rayon's pool,
+    /// and a take from the parse waits forever behind its own batch.
     #[cfg(debug_assertions)]
     parsing: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    /// The threads waiting in [`Self::take_turn`], for tests that order a
+    /// step after a thread starts waiting.
+    #[cfg(test)]
+    waiting_for_turn: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The least free space a write leaves on the cache's drive: 1 GB.
@@ -441,10 +488,11 @@ impl RefreshToken {
             identity,
             writable: Arc::new(AtomicBool::new(true)),
             replaced: Arc::new(AtomicBool::new(false)),
-            out_of_space: Arc::new(Mutex::new(None)),
             turn: Arc::new(Mutex::new(())),
             #[cfg(debug_assertions)]
             parsing: Arc::default(),
+            #[cfg(test)]
+            waiting_for_turn: Arc::default(),
         }
     }
 
@@ -460,9 +508,18 @@ impl RefreshToken {
                 "a parse inside the owner's batch took the owner's turn, which its batch holds"
             );
         }
-        Turn {
-            _guard: self.turn.lock().unwrap_or_else(PoisonError::into_inner),
-        }
+        #[cfg(test)]
+        self.waiting_for_turn.fetch_add(1, Ordering::SeqCst);
+        let guard = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        self.waiting_for_turn.fetch_sub(1, Ordering::SeqCst);
+        Turn { _guard: guard }
+    }
+
+    /// The threads waiting for this owner's turn.
+    #[cfg(test)]
+    pub(super) fn threads_waiting_for_turn(&self) -> usize {
+        self.waiting_for_turn.load(Ordering::SeqCst)
     }
 
     /// This owner's cache base as its rearview reaches it.
@@ -484,13 +541,24 @@ impl RefreshToken {
     }
 
     /// Fail a write when the cache's drive has less than
-    /// [`FREE_SPACE_FLOOR`] free: record the free bytes and revoke write
-    /// permission for every copy of this token, so no write follows. A drive
-    /// whose free space the system does not report passes. Call outside this
-    /// owner's turn: the check takes it, so a parse group of this owner runs
-    /// wholly before the check or finds the write permission revoked.
+    /// [`FREE_SPACE_FLOOR`] free: set the base's low-space latch and revoke
+    /// write permission for every copy of this token, so no write follows.
+    /// The command reporting the error deletes the cache database once it
+    /// reads the latch. A drive whose free space the system does not report
+    /// passes.
+    /// Fail without checking once the write permission is revoked, as when
+    /// the TUI quits, including while this check waits for the turn. Call
+    /// outside this owner's turn: the check takes it, so a parse group of
+    /// this owner runs wholly before the check or finds the write permission
+    /// revoked.
     pub(crate) fn check_space(&self) -> Result<()> {
+        if !self.can_publish() {
+            return Err(AppError::SessionCacheRefreshLost);
+        }
         let _turn = self.take_turn();
+        let Some(_check) = self.base.low_space().begin_check(|| self.can_publish()) else {
+            return Err(AppError::SessionCacheRefreshLost);
+        };
         let Some(free_bytes) = self
             .base
             .disk()
@@ -499,25 +567,19 @@ impl RefreshToken {
         else {
             return Ok(());
         };
-        *self
-            .out_of_space
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(free_bytes);
+        self.base.low_space().set(free_bytes);
         self.revoke();
-        Err(AppError::SessionCacheOutOfSpace {
-            free_bytes,
-            floor_bytes: FREE_SPACE_FLOOR,
-            deletion: CacheDeletion::Pending,
-        })
+        Err(self
+            .base
+            .low_space()
+            .error()
+            .expect("the low-space latch was just set"))
     }
 
-    /// The free bytes a write of this owner found below the floor; `None`
-    /// while no write has.
-    pub(crate) fn out_of_space(&self) -> Option<u64> {
-        *self
-            .out_of_space
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// True once a write of this owner's base found its drive short of
+    /// space.
+    pub(crate) fn is_low_space(&self) -> bool {
+        self.base.low_space().is_set()
     }
 
     /// Revoke write permission for every copy of this token. The identity
@@ -570,7 +632,7 @@ impl RefreshToken {
                 return Err(AppError::SessionCacheRefreshLost);
             }
             let connection = retry_busy(LOCK_WAIT_LIMIT, self.clock(), || {
-                connect(self.base.path(), POLL_EVERY)
+                connect_writable(&self.base, POLL_EVERY)
             })?;
             let batch = transaction(&connection, self)?;
             let result = work();
@@ -584,22 +646,25 @@ impl RefreshToken {
     }
 
     /// Run `work` as one write batch, as [`Self::write_batch`] does, and
-    /// return its result, `None` when the batch could not start, so `work`
-    /// never ran, with the batch's.
-    pub(crate) fn batch_returning<T>(&self, work: impl FnOnce() -> T) -> (Option<T>, Result<()>) {
+    /// return what became of it.
+    pub(crate) fn batch_returning<T>(&self, work: impl FnOnce() -> T) -> Batch<T> {
         let mut result = None;
         let coordinated = self.write_batch(|| result = Some(work()));
-        (result, coordinated)
+        match (result, coordinated) {
+            (Some(result), committed) => Batch::Ran(result, committed),
+            (None, Err(error)) => Batch::NotStarted(error),
+            (None, Ok(())) => unreachable!("a committed batch ran its work"),
+        }
     }
 
     /// Run `parse` with the permit to parse transcripts as one write batch,
-    /// as [`Self::batch_returning`] does. The permit lives only inside
-    /// `parse`, so every parse of this owner runs holding the writer lock,
-    /// which no takeover passes.
+    /// as [`Self::batch_returning`] does. Each parse of this owner then
+    /// holds the writer lock: a takeover cannot commit until it ends. The
+    /// permit does not outlive `parse`.
     pub(crate) fn parse_batch<T>(
         &self,
         parse: impl for<'p> FnOnce(super::ParsePermit<'p>) -> T,
-    ) -> (Option<T>, Result<()>) {
+    ) -> Batch<T> {
         self.batch_returning(|| {
             #[cfg(debug_assertions)]
             let _parsing = Parsing::during(&self.parsing);
@@ -621,6 +686,16 @@ impl RefreshToken {
             coordinated,
         )
     }
+}
+
+/// The outcome of one write batch of [`RefreshToken::batch_returning`].
+#[derive(Debug)]
+pub(crate) enum Batch<T> {
+    /// The batch could not start with this error; its work did not run.
+    NotStarted(AppError),
+    /// The work returned this, and the batch committed or failed as the
+    /// result reports.
+    Ran(T, Result<()>),
 }
 
 /// [`RefreshToken::parsing`] naming this thread until this drops.
@@ -673,7 +748,7 @@ fn try_acquire(
 ) -> Result<Attempt> {
     let clock = base.clock().as_ref();
     let attempt = (|| {
-        let connection = connect_waiter(base.path())?;
+        let connection = connect_waiter(base)?;
         let Some(transaction) = begin_without_waiting(&connection)? else {
             return Ok(Attempt::WriterBusy(owner_behind_writer_lock(&connection)));
         };
@@ -712,12 +787,8 @@ fn refuse_once_cancelled(cancellation: &Cancellation) -> Result<()> {
 /// the database's exclusive lock, and its later statements do not wait. Close it
 /// before polling again: an open WAL connection keeps an owner's exclusive
 /// rebuild waiting at `BEGIN EXCLUSIVE`.
-fn connect_waiter(base: &Path) -> Result<Connection> {
-    let connection = connection::open(
-        &super::database_path(base),
-        Access::Create,
-        REBUILD_LOCK_THRESHOLD,
-    )?;
+fn connect_waiter(base: &CacheBase) -> Result<CacheConnection> {
+    let connection = connection::open_cache(base, Access::Create, REBUILD_LOCK_THRESHOLD)?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.busy_timeout(Duration::ZERO)?;
     Ok(connection)
@@ -813,8 +884,19 @@ fn retry_busy<T>(
     }
 }
 
+/// A refresh connection to the database in `base` without this rearview's
+/// low-space close setting, as another rearview's connection opens.
+#[cfg(test)]
 fn connect(base: &Path, timeout: Duration) -> rusqlite::Result<Connection> {
     let connection = connection::open(&super::database_path(base), Access::ReadWrite, timeout)?;
+    connection.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(connection)
+}
+
+/// A refresh connection to `base`'s database, as this rearview's refreshes
+/// open it.
+fn connect_writable(base: &CacheBase, timeout: Duration) -> rusqlite::Result<CacheConnection> {
+    let connection = connection::open_cache(base, Access::ReadWrite, timeout)?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(connection)
 }
@@ -881,6 +963,10 @@ fn transaction_during<'a>(
     _turn: &Turn<'_>,
     lock_wait_limit: Duration,
 ) -> Result<WriteBatch<'a>> {
+    // A revoked owner, as after the TUI quits, does not wait for the lock.
+    if !owner.can_publish() {
+        return Err(AppError::SessionCacheRefreshLost);
+    }
     let transaction = retry_busy(lock_wait_limit, owner.clock(), || {
         Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
     })

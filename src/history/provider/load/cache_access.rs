@@ -1,6 +1,7 @@
 //! A read's access to the session cache, and the groups sessions parse in.
 
 use super::*;
+use crate::history::sqlite_cache::refresh::Batch;
 
 /// A read's access to the session cache.
 #[derive(Clone, Copy)]
@@ -214,19 +215,23 @@ impl SessionLoader<'_> {
         let mut rest = items;
         while !rest.is_empty() {
             let (group, remaining) = rest.split_at(READ_BATCH_LENGTH.min(rest.len()));
-            let Some((parsed, coordinated)) = owner.parse_batch(|permit| {
+            let batch = owner.parse_batch(|permit| {
                 group
                     .par_iter()
                     .map(|item| parse(permit, item))
                     .collect::<Vec<_>>()
-            }) else {
-                return rest;
-            };
-            self.report_read_coordination(coordinated);
-            let Some(parsed) = parsed else {
-                return rest;
-            };
-            after_group(group, parsed);
+            });
+            match batch {
+                Some(Batch::Ran(parsed, committed)) => {
+                    self.report_read_coordination(committed);
+                    after_group(group, parsed);
+                }
+                Some(Batch::NotStarted(error)) => {
+                    self.report_read_coordination(Err(error));
+                    return rest;
+                }
+                None => return rest,
+            }
             rest = remaining;
         }
         rest

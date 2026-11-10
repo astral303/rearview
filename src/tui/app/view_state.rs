@@ -580,9 +580,7 @@ impl App {
                 state.is_copy_missing = false;
             }
         }
-        if !self.store.is_refresh_pending(&path) && self.pending_view_reload.is_none() {
-            self.run_deferred_copy();
-        }
+        self.run_deferred_copy();
     }
 
     /// True when a copy or export of the open session waits for its
@@ -592,9 +590,18 @@ impl App {
     }
 
     /// Run the copy or export asked for while the open session's refresh
-    /// was pending. An export whose copy is still out of date or missing
-    /// reports the failed read.
+    /// was pending, once no refresh or reload of the open session is
+    /// pending. An export whose copy is still out of date or missing reports
+    /// the failed read.
     fn run_deferred_copy(&mut self) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        if self.store.is_refresh_pending(&state.conversation_path)
+            || self.pending_view_reload.is_some()
+        {
+            return;
+        }
         match self.deferred_copy.take() {
             Some(DeferredCopy::Export {
                 option,

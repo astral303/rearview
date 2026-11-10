@@ -5,7 +5,7 @@ use super::{Selection, text_with_codes};
 use crate::agent::sanitize::{split_terminal_codes, without_terminal_codes};
 use crate::agent::transcript::tool_result_item_text;
 use crate::log_entry::{ContentBlock, Tool};
-use rusqlite::types::{ToSqlOutput, ValueRef};
+use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
 use rusqlite::{Connection, Row, Statement, ToSql, params};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -18,15 +18,15 @@ pub(super) struct Writer<'connection> {
     item: Statement<'connection>,
 }
 
-/// The entry row a write's parts belong to.
+/// The ids of the session and the entry row a write's parts belong to.
 #[derive(Clone, Copy)]
-pub(super) struct PartsOf {
+pub(super) struct EntryIds {
     pub(super) session: i64,
     pub(super) entry: i64,
 }
 
-/// The columns [`bind_row`] binds: a part's search place, its digest, then
-/// [`StoredValues::values`].
+/// The columns [`bind_row`] binds: a part's search place and digest, then
+/// [`StoredValues::values`], then the text and its terminal codes.
 const ROW_COLUMNS: [&str; 14] = [
     "entry_sequence",
     "message_ordinal",
@@ -34,14 +34,14 @@ const ROW_COLUMNS: [&str; 14] = [
     "digest",
     "kind",
     "search_field",
-    "text",
-    "text_codes",
     "call_id",
     "name",
     "tool",
     "json",
     "result_shape",
     "call_context",
+    "text",
+    "text_codes",
 ];
 
 /// `INSERT` of a part's session (`?1`), entry (`?2`), number (`?3`) and
@@ -74,41 +74,40 @@ impl<'connection> Writer<'connection> {
             insert: connection.prepare(&insert_sql())?,
             update: connection.prepare(&update_sql())?,
             item: connection.prepare(
-                "INSERT INTO result_items (part, position, kind, text, text_codes, item_type) \
+                "INSERT INTO result_items (part, position, kind, item_type, text, text_codes) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?,
         })
     }
 
-    /// Inserts `parts`, the parts of `owner`, at `place`.
     pub(super) fn write(
         &mut self,
-        owner: PartsOf,
+        ids: EntryIds,
         parts: &EntryParts<'_>,
         place: SearchPlace,
     ) -> rusqlite::Result<()> {
-        for part in &parts.rows {
-            self.insert(owner, part, place)?;
+        for part in parts.rows() {
+            self.insert(ids, part, place)?;
         }
         Ok(())
     }
 
-    /// Makes the stored parts of `owner` `parts` at `place`, matching each
-    /// stored part with the new part of its number. A matched part whose
-    /// digest is unchanged keeps its row and its result items; its search
-    /// position is updated when it moved. A changed one is updated in place
-    /// with its result items replaced. A new part is inserted, and a stored
-    /// part matching none is deleted.
+    /// Replaces the stored parts of the entry `ids` with `parts`, writing
+    /// only what changed: a part whose digest is unchanged keeps its row and
+    /// result items, with its search position updated when it moved; a
+    /// changed part is updated in place, its result items replaced; a new
+    /// part is inserted, and a stored part without a new part of its number
+    /// is deleted.
     pub(super) fn update(
         &mut self,
-        owner: PartsOf,
+        ids: EntryIds,
         parts: &EntryParts<'_>,
         place: SearchPlace,
     ) -> rusqlite::Result<()> {
         let mut stored: HashMap<i64, StoredPart> = self
             .connection
             .prepare_cached("SELECT part, id, digest, search_position FROM parts WHERE entry = ?1")?
-            .query_map([owner.entry], |row| {
+            .query_map([ids.entry], |row| {
                 Ok((
                     row.get(0)?,
                     StoredPart {
@@ -119,13 +118,13 @@ impl<'connection> Writer<'connection> {
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        for part in &parts.rows {
-            match stored.remove(&part.number) {
+        for part in parts.rows() {
+            match stored.remove(&part.row.number) {
                 Some(kept) if kept.digest == part.digest => {
-                    if kept.position != part.position() {
+                    if kept.position != part.row.position() {
                         self.connection
                             .prepare_cached("UPDATE parts SET search_position = ?2 WHERE id = ?1")?
-                            .execute(params![kept.id, part.position()])?;
+                            .execute(params![kept.id, part.row.position()])?;
                     }
                 }
                 Some(changed) => {
@@ -135,9 +134,9 @@ impl<'connection> Writer<'connection> {
                     self.update.raw_bind_parameter(1, changed.id)?;
                     bind_row(&mut self.update, 2, part, place)?;
                     self.update.raw_execute()?;
-                    self.insert_items(changed.id, part)?;
+                    self.insert_items(changed.id, part.row)?;
                 }
-                None => self.insert(owner, part, place)?,
+                None => self.insert(ids, part, place)?,
             }
         }
         for gone in stored.into_values() {
@@ -150,23 +149,26 @@ impl<'connection> Writer<'connection> {
 
     fn insert(
         &mut self,
-        owner: PartsOf,
-        part: &PartRow<'_>,
+        ids: EntryIds,
+        part: WrittenPart<'_, '_>,
         place: SearchPlace,
     ) -> rusqlite::Result<()> {
-        self.insert.raw_bind_parameter(1, owner.session)?;
-        self.insert.raw_bind_parameter(2, owner.entry)?;
-        self.insert.raw_bind_parameter(3, part.number)?;
+        self.insert.raw_bind_parameter(1, ids.session)?;
+        self.insert.raw_bind_parameter(2, ids.entry)?;
+        self.insert.raw_bind_parameter(3, part.row.number)?;
         bind_row(&mut self.insert, 4, part, place)?;
         self.insert.raw_execute()?;
-        self.insert_items(self.connection.last_insert_rowid(), part)
+        self.insert_items(self.connection.last_insert_rowid(), part.row)
     }
 
     fn insert_items(&mut self, id: i64, part: &PartRow<'_>) -> rusqlite::Result<()> {
         for (position, item) in (0_i64..).zip(&part.items) {
-            let [kind, text, codes, item_type] = item.values();
+            let [kind, item_type] = item.values();
+            let split = item.text.map(split_terminal_codes);
+            let text = split.as_ref().map(|split| split.text.as_ref());
+            let codes = split.as_ref().and_then(|split| split.codes.as_deref());
             self.item
-                .execute(params![id, position, kind, text, codes, item_type])?;
+                .execute(params![id, position, kind, item_type, text, codes])?;
         }
         Ok(())
     }
@@ -183,17 +185,24 @@ struct StoredPart {
 fn bind_row(
     statement: &mut Statement<'_>,
     first: usize,
-    part: &PartRow<'_>,
+    part: WrittenPart<'_, '_>,
     place: SearchPlace,
 ) -> rusqlite::Result<()> {
-    let searched = part.searched;
+    let row = part.row;
+    let searched = row.searched;
     let placed = [
-        Stored::Integer(searched.map(|_| place.sequence)),
-        Stored::Integer(searched.and(place.ordinal)),
-        Stored::Integer(part.position()),
-        Stored::Integer(Some(part.digest)),
+        ColumnValue::Integer(searched.map(|_| place.sequence)),
+        ColumnValue::Integer(searched.and(place.ordinal)),
+        ColumnValue::Integer(row.position()),
+        ColumnValue::Integer(Some(part.digest)),
     ];
-    for (offset, value) in placed.into_iter().chain(part.stored.values()).enumerate() {
+    let text = row.stored.text.map(PartText::stored);
+    let text = [
+        ColumnValue::Text(text.as_ref().map(|(text, _)| text.as_ref())),
+        ColumnValue::Blob(text.as_ref().and_then(|(_, codes)| codes.as_deref())),
+    ];
+    let values = placed.into_iter().chain(row.stored.values()).chain(text);
+    for (offset, value) in values.enumerate() {
         statement.raw_bind_parameter(first + offset, value)?;
     }
     Ok(())
@@ -202,70 +211,110 @@ fn bind_row(
 /// One stored column's value, as a write binds it and a part's digest
 /// hashes it.
 #[derive(Clone, Copy)]
-enum Stored<'v> {
+enum ColumnValue<'v> {
     Text(Option<&'v str>),
     Integer(Option<i64>),
     Blob(Option<&'v [u8]>),
+    /// Stored as its JSON text. Only a write builds the text.
+    Json(Option<&'v Value>),
 }
 
-impl Stored<'_> {
+impl ColumnValue<'_> {
     fn add_to(self, digest: &mut Digest) {
         match self {
             Self::Text(text) => digest.text(text),
             Self::Integer(number) => digest.number(number),
             Self::Blob(bytes) => digest.bytes(bytes),
+            Self::Json(value) => digest.json(value),
         }
     }
 }
 
-impl ToSql for Stored<'_> {
+impl ToSql for ColumnValue<'_> {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(match *self {
-            Self::Text(Some(text)) => ValueRef::Text(text.as_bytes()),
-            Self::Integer(Some(number)) => ValueRef::Integer(number),
-            Self::Blob(Some(bytes)) => ValueRef::Blob(bytes),
-            Self::Text(None) | Self::Integer(None) | Self::Blob(None) => ValueRef::Null,
-        }))
+        Ok(match *self {
+            Self::Json(Some(value)) => ToSqlOutput::Owned(SqlValue::Text(value.to_string())),
+            Self::Text(Some(text)) => ToSqlOutput::Borrowed(ValueRef::Text(text.as_bytes())),
+            Self::Integer(Some(number)) => ToSqlOutput::Borrowed(ValueRef::Integer(number)),
+            Self::Blob(Some(bytes)) => ToSqlOutput::Borrowed(ValueRef::Blob(bytes)),
+            Self::Text(None) | Self::Integer(None) | Self::Blob(None) | Self::Json(None) => {
+                ToSqlOutput::Borrowed(ValueRef::Null)
+            }
+        })
     }
 }
 
-/// An entry's part rows, in the order a write inserts them, and the digest
-/// of the entry row holding them.
+/// The digests of an entry row and of each of its part rows, computed before
+/// the write's transaction from the values a write binds. A compare reads
+/// them; only a written entry builds its part rows again.
+#[derive(Default)]
+pub(super) struct EntryDigests {
+    /// The hash of `columns_digest` and of each part's number, search
+    /// position and digest. A write skips an entry whose stored digest
+    /// equals it.
+    pub(super) entry: i64,
+    /// Each part row's digest, in [`part_rows`] order.
+    parts: Vec<i64>,
+}
+
+impl EntryDigests {
+    /// The digests of an entry whose content is `blocks`, with `search`'s
+    /// places of their texts, and whose other columns hash to
+    /// `columns_digest`.
+    pub(super) fn of(blocks: &[ContentBlock], search: &EntrySearch, columns_digest: i64) -> Self {
+        let rows = part_rows(blocks, search);
+        let parts: Vec<i64> = rows.iter().map(PartRow::digest).collect();
+        let mut entry = Digest::default();
+        entry.number(Some(columns_digest));
+        entry.number(Some(rows.len() as i64));
+        for (row, &part) in rows.iter().zip(&parts) {
+            entry.number(Some(row.number));
+            entry.number(row.position());
+            entry.number(Some(part));
+        }
+        Self {
+            entry: entry.finish(),
+            parts,
+        }
+    }
+}
+
+/// An entry's part rows, in the order a write inserts them, each with its
+/// digest from [`EntryDigests`].
 pub(super) struct EntryParts<'a> {
     rows: Vec<PartRow<'a>>,
-    digest: i64,
+    digests: &'a [i64],
 }
 
 impl<'a> EntryParts<'a> {
     /// The part rows of an entry whose content is `blocks`, with `search`'s
-    /// places of their texts, and the entry row's digest: of
-    /// `columns_digest`, the hash of its other columns, and of each part's
-    /// number, search position and digest.
+    /// places of their texts, and whose digests are `digests`.
     pub(super) fn of(
         blocks: &'a [ContentBlock],
         search: &'a EntrySearch,
-        columns_digest: i64,
+        digests: &'a EntryDigests,
     ) -> Self {
         let rows = part_rows(blocks, search);
-        let mut digest = Digest::default();
-        digest.number(Some(columns_digest));
-        digest.number(Some(rows.len() as i64));
-        for row in &rows {
-            digest.number(Some(row.number));
-            digest.number(row.position());
-            digest.number(Some(row.digest));
-        }
+        debug_assert_eq!(rows.len(), digests.parts.len(), "one digest per part row");
         Self {
             rows,
-            digest: digest.finish(),
+            digests: &digests.parts,
         }
     }
 
-    /// The digest of the entry row holding these parts: an entry whose
-    /// stored digest equals it is not written.
-    pub(super) fn digest(&self) -> i64 {
-        self.digest
+    fn rows(&self) -> impl Iterator<Item = WrittenPart<'_, 'a>> {
+        self.rows
+            .iter()
+            .zip(self.digests)
+            .map(|(row, &digest)| WrittenPart { row, digest })
     }
+}
+
+/// A part row a write binds, with its digest.
+#[derive(Clone, Copy)]
+struct WrittenPart<'p, 'a> {
+    row: &'p PartRow<'a>,
+    digest: i64,
 }
 
 /// One part row of an entry as a write stores it: one of the entry's
@@ -274,40 +323,32 @@ struct PartRow<'a> {
     /// The part's `part` column: a block's index in its entry, or for a
     /// part only search reads, [`search_only_number`].
     number: i64,
-    /// Where search reads the part's text.
+    /// The place search reads the part's text at.
     searched: Option<TextPlace>,
     stored: StoredValues<'a>,
     items: Vec<ItemValues<'a>>,
-    /// The hash of `stored` and `items`.
-    digest: i64,
 }
 
 impl<'a> PartRow<'a> {
-    fn new(
-        number: i64,
-        searched: Option<TextPlace>,
-        stored: StoredValues<'a>,
-        items: Vec<ItemValues<'a>>,
-    ) -> Self {
+    /// The hash of `stored` and `items`.
+    fn digest(&self) -> i64 {
         let mut digest = Digest::default();
-        for value in stored.values() {
+        for value in self.stored.values() {
             value.add_to(&mut digest);
         }
-        digest.number(Some(items.len() as i64));
-        for value in items.iter().flat_map(ItemValues::values) {
-            value.add_to(&mut digest);
+        PartText::add_to(self.stored.text, &mut digest);
+        digest.number(Some(self.items.len() as i64));
+        for item in &self.items {
+            for value in item.values() {
+                value.add_to(&mut digest);
+            }
+            digest.text(item.text);
         }
-        Self {
-            number,
-            searched,
-            stored,
-            items,
-            digest: digest.finish(),
-        }
+        digest.finish()
     }
 
-    /// The part of the block at `index` in its entry, whose part's columns
-    /// are `columns`, read by search at `place`.
+    /// The part of the block at `index` in its entry, with the part columns
+    /// `columns`; search reads it at `place`.
     fn of_block(
         index: usize,
         block: &'a ContentBlock,
@@ -320,16 +361,10 @@ impl<'a> PartRow<'a> {
             .map(ItemValues::of)
             .collect();
         let searched = block_place(&columns, place);
-        let text = columns.text.map(split_terminal_codes);
-        let (text, text_codes) = match text {
-            Some(text) => (Some(text.text), text.codes),
-            None => (None, None),
-        };
         let stored = StoredValues {
             kind: columns.kind,
             search_field: searched.map(|place| place.field.code()),
-            text,
-            text_codes,
+            text: columns.text.map(PartText::Block),
             call_id: columns.call_id,
             name: columns.name,
             tool: columns.tool,
@@ -337,22 +372,26 @@ impl<'a> PartRow<'a> {
             result_shape: columns.result_shape,
             call_context: columns.call_context,
         };
-        Self::new(index as i64, searched, stored, items)
+        Self {
+            number: index as i64,
+            searched,
+            stored,
+            items,
+        }
     }
 
     /// The part numbered `number` only search reads, of `kind`, holding
-    /// `text` at `place`, without its terminal codes.
+    /// `text` at `place`.
     fn search_only(
         number: i64,
         kind: SearchOnlyKind,
         place: TextPlace,
-        text: Cow<'a, str>,
+        text: PartText<'a>,
     ) -> Self {
         let stored = StoredValues {
             kind: kind.name(),
             search_field: Some(place.field.code()),
-            text: Some(without_codes(text)),
-            text_codes: None,
+            text: Some(text),
             call_id: None,
             name: None,
             tool: None,
@@ -360,7 +399,12 @@ impl<'a> PartRow<'a> {
             result_shape: None,
             call_context: None,
         };
-        Self::new(number, Some(place), stored, Vec::new())
+        Self {
+            number,
+            searched: Some(place),
+            stored,
+            items: Vec::new(),
+        }
     }
 
     fn position(&self) -> Option<i64> {
@@ -368,50 +412,81 @@ impl<'a> PartRow<'a> {
     }
 }
 
-/// `text` without its terminal codes.
-fn without_codes(text: Cow<'_, str>) -> Cow<'_, str> {
-    match text {
-        Cow::Borrowed(text) => split_terminal_codes(text).text,
-        Cow::Owned(text) => {
-            let stripped = match split_terminal_codes(&text).text {
-                Cow::Owned(stripped) => Some(stripped),
-                Cow::Borrowed(_) => None,
-            };
-            Cow::Owned(stripped.unwrap_or(text))
+/// A part's text as the parse holds it. A part's digest hashes it as held:
+/// the held text determines the stored text and its terminal codes. A write
+/// splits the codes off only for a part it writes.
+#[derive(Clone, Copy)]
+enum PartText<'a> {
+    /// A block's text: its part stores the codes in `text_codes`.
+    Block(&'a str),
+    /// A search-only part's text, stored without its codes.
+    Searched(&'a str),
+    /// A result's items: its search-only part stores their
+    /// [`searched_items_text`].
+    Items(&'a [Value]),
+}
+
+impl<'a> PartText<'a> {
+    fn add_to(text: Option<Self>, digest: &mut Digest) {
+        match text {
+            None => digest.number(None),
+            Some(Self::Block(text)) => {
+                digest.number(Some(0));
+                digest.text(Some(text));
+            }
+            Some(Self::Searched(text)) => {
+                digest.number(Some(1));
+                digest.text(Some(text));
+            }
+            Some(Self::Items(items)) => {
+                digest.number(Some(2));
+                digest.number(Some(items.len() as i64));
+                for item in items {
+                    digest.text(tool_result_item_text(item));
+                }
+            }
+        }
+    }
+
+    /// The stored text and its terminal codes.
+    fn stored(self) -> (Cow<'a, str>, Option<Vec<u8>>) {
+        match self {
+            Self::Block(text) => {
+                let split = split_terminal_codes(text);
+                (split.text, split.codes)
+            }
+            Self::Searched(text) => (split_terminal_codes(text).text, None),
+            Self::Items(items) => (Cow::Owned(searched_items_text(items)), None),
         }
     }
 }
 
-/// What a part row stores besides its entry, number, search place and
-/// digest.
+/// A part row's columns besides its entry, number, search place and digest.
 struct StoredValues<'a> {
     kind: &'static str,
     search_field: Option<i64>,
-    /// Without terminal codes; `text_codes` holds them.
-    text: Option<Cow<'a, str>>,
-    text_codes: Option<Vec<u8>>,
+    text: Option<PartText<'a>>,
     call_id: Option<&'a str>,
     name: Option<&'a str>,
     tool: Option<String>,
-    json: Option<String>,
+    json: Option<&'a Value>,
     result_shape: Option<&'static str>,
     call_context: Option<String>,
 }
 
 impl StoredValues<'_> {
-    /// The values of the last ten of [`ROW_COLUMNS`], in their order.
-    fn values(&self) -> [Stored<'_>; 10] {
+    /// The values of [`ROW_COLUMNS`] from `kind` to `call_context`, in their
+    /// order.
+    fn values(&self) -> [ColumnValue<'_>; 8] {
         [
-            Stored::Text(Some(self.kind)),
-            Stored::Integer(self.search_field),
-            Stored::Text(self.text.as_deref()),
-            Stored::Blob(self.text_codes.as_deref()),
-            Stored::Text(self.call_id),
-            Stored::Text(self.name),
-            Stored::Text(self.tool.as_deref()),
-            Stored::Text(self.json.as_deref()),
-            Stored::Text(self.result_shape),
-            Stored::Text(self.call_context.as_deref()),
+            ColumnValue::Text(Some(self.kind)),
+            ColumnValue::Integer(self.search_field),
+            ColumnValue::Text(self.call_id),
+            ColumnValue::Text(self.name),
+            ColumnValue::Text(self.tool.as_deref()),
+            ColumnValue::Json(self.json),
+            ColumnValue::Text(self.result_shape),
+            ColumnValue::Text(self.call_context.as_deref()),
         ]
     }
 }
@@ -419,9 +494,8 @@ impl StoredValues<'_> {
 /// A `result_items` row's columns besides its part and position.
 struct ItemValues<'a> {
     kind: &'static str,
-    /// Without terminal codes; `text_codes` holds them.
-    text: Option<Cow<'a, str>>,
-    text_codes: Option<Vec<u8>>,
+    /// Held with its terminal codes; a write stores them in `text_codes`.
+    text: Option<&'a str>,
     item_type: Option<&'a str>,
 }
 
@@ -436,34 +510,26 @@ impl<'a> ItemValues<'a> {
             ),
             _ => ("external", None, None),
         };
-        let (text, text_codes) = match text.map(split_terminal_codes) {
-            Some(text) => (Some(text.text), text.codes),
-            None => (None, None),
-        };
         Self {
             kind,
             text,
-            text_codes,
             item_type,
         }
     }
 
-    /// The values of `kind`, `text`, `text_codes` and `item_type`.
-    fn values(&self) -> [Stored<'_>; 4] {
+    fn values(&self) -> [ColumnValue<'_>; 2] {
         [
-            Stored::Text(Some(self.kind)),
-            Stored::Text(self.text.as_deref()),
-            Stored::Blob(self.text_codes.as_deref()),
-            Stored::Text(self.item_type),
+            ColumnValue::Text(Some(self.kind)),
+            ColumnValue::Text(self.item_type),
         ]
     }
 }
 
 /// The number of the part only search reads at `index` in the group
 /// `group` of [`SEARCH_ONLY_GROUPS`]: below zero, apart from the blocks'
-/// parts, each group in its own residue. A block appended to the entry
-/// leaves every other part's number, so a later write matches each stored
-/// part with the new part of its number.
+/// parts, with each group's numbers equal modulo [`SEARCH_ONLY_GROUPS`]. A
+/// block appended to the entry keeps every other part's number: a later
+/// write then matches each stored part with the new part of its number.
 fn search_only_number(group: usize, index: usize) -> i64 {
     -1 - (index * SEARCH_ONLY_GROUPS + group) as i64
 }
@@ -489,7 +555,7 @@ fn part_rows<'a>(blocks: &'a [ContentBlock], search: &'a EntrySearch) -> Vec<Par
                 search_only_number(0, index),
                 SearchOnlyKind::ResultText,
                 place,
-                Cow::Owned(searched_items_text(items)),
+                PartText::Items(items),
             ));
         }
         rows.push(PartRow::of_block(index, block, columns, place));
@@ -507,14 +573,14 @@ fn part_rows<'a>(blocks: &'a [ContentBlock], search: &'a EntrySearch) -> Vec<Par
             search_only_number(1 + rank, index),
             SearchOnlyKind::Derived,
             derived.place,
-            Cow::Borrowed(derived.text.as_str()),
+            PartText::Searched(&derived.text),
         ));
     }
     rows
 }
 
 /// The search place of a block's own part; `None` for a result with items
-/// in `result_items`, which search reads through its
+/// in `result_items`. Search reads such a result through its
 /// [`SearchOnlyKind::ResultText`] part.
 fn block_place(columns: &Columns<'_>, place: Option<TextPlace>) -> Option<TextPlace> {
     place.filter(|_| columns.result_shape != Some(LOSSLESS_ARRAY))
@@ -550,7 +616,7 @@ struct Columns<'a> {
     call_id: Option<&'a str>,
     name: Option<&'a str>,
     tool: Option<String>,
-    json: Option<String>,
+    json: Option<&'a Value>,
     result_shape: Option<&'static str>,
     call_context: Option<String>,
 }
@@ -578,7 +644,7 @@ impl<'a> Columns<'a> {
                 call_id: Some(id),
                 name: Some(name),
                 tool: Some(tool_text(*tool)),
-                json: Some(input.to_string()),
+                json: Some(input),
                 call_context: super::context::stored_call_context(*tool, input),
                 ..Self::default()
             },
@@ -592,7 +658,7 @@ impl<'a> Columns<'a> {
                     Some(Value::Array(items)) if stores_items(items) => {
                         (None, None, Some(LOSSLESS_ARRAY))
                     }
-                    Some(other) => (None, Some(other.to_string()), Some(VERBATIM_JSON)),
+                    Some(other) => (None, Some(other), Some(VERBATIM_JSON)),
                     None => (None, None, None),
                 };
                 Self {

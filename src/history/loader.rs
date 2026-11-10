@@ -152,7 +152,7 @@ impl ProviderHistory {
                 },
             );
             match loaded {
-                Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
+                Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
                 Ok(mut loaded) => {
                     history.usable |= root_on_disk;
                     for term in loaded.ignored {
@@ -829,7 +829,8 @@ mod tests {
     }
 
     /// A cache write that finds less than 1 GB free on the cache's drive
-    /// stops the command, which prints the free space.
+    /// stops the command. Its report prints the free space and deletes the
+    /// cache database.
     #[test]
     fn load_whose_cache_write_finds_less_than_gigabyte_free_deletes_cache_and_fails() {
         use crate::tui::claude_home::ClaudeHome;
@@ -847,9 +848,14 @@ mod tests {
         let Err(error) = load_all_conversations(&environment, false, None) else {
             panic!("the load fails");
         };
+        let mut report = Vec::new();
+        let (failed, written) =
+            crate::finish_command(Err(error), Some(environment.cache_base()), &mut report);
+        written.unwrap();
 
+        assert!(failed, "rearview exits with failure");
         assert_eq!(
-            crate::error_report(error),
+            String::from_utf8(report).unwrap(),
             "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
         );
         assert!(
@@ -898,7 +904,7 @@ mod tests {
             assert!(
                 matches!(
                     ending,
-                    LoaderMessage::Fatal(AppError::SessionCacheOutOfSpace { .. })
+                    LoaderMessage::Fatal(AppError::SessionCacheLowSpace { .. })
                 ),
                 "running out after {roomy_checks} checks stops the launch"
             );

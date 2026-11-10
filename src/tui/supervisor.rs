@@ -15,6 +15,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::Duration;
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -232,11 +233,30 @@ impl TaskSupervisor {
 
     /// Take no more jobs, stop the running one before its next parse, and
     /// give up this rearview's refresh ownership of the session cache: the
-    /// running job writes nothing more, and a job waiting for ownership
-    /// fails instead of acquiring it.
+    /// running job writes nothing more, and a job waiting for ownership fails
+    /// instead of acquiring it.
     pub(crate) fn shutdown(&mut self) {
         self.worker = None;
         self.cancellation.cancel();
         Coordinator::of(self.environment.cache_base()).shutdown();
+    }
+}
+
+/// The longest the supervisor's drop waits for a free-space check begun
+/// before the shutdown.
+const SPACE_CHECK_WAIT: Duration = Duration::from_secs(1);
+
+impl Drop for TaskSupervisor {
+    /// Shut the worker down, then wait up to [`SPACE_CHECK_WAIT`] for a
+    /// free-space check begun before the shutdown, so the cache base's
+    /// low-space latch is final when rearview reads it. The running job is
+    /// not joined: a parse group can run for seconds, and it ends with the
+    /// process.
+    fn drop(&mut self) {
+        self.shutdown();
+        self.environment
+            .cache_base()
+            .low_space()
+            .wait_for_checks(SPACE_CHECK_WAIT);
     }
 }

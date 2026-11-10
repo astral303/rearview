@@ -196,6 +196,16 @@ impl Environment {
             ..self
         }
     }
+
+    /// This environment, each step of its session cache's low-space
+    /// deletion waiting at most `wait`.
+    #[cfg(test)]
+    pub(crate) fn with_low_space_wait(self, wait: std::time::Duration) -> Self {
+        Self {
+            cache_base: self.cache_base.with_low_space_wait(wait),
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]

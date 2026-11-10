@@ -28,6 +28,8 @@ use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::{LogEntry, SubagentIdentity};
 use dropped::DroppedRecords;
+#[cfg(test)]
+pub(crate) use lines::REWRITE_CHECK_BYTES;
 use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};

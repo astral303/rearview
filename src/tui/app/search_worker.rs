@@ -1,7 +1,7 @@
 //! The list's search worker and the reader of the rows' search texts. The
 //! app reaches the worker through [`SearchCommands`] alone: the text
-//! reader's replies and the worker's stop travel on the same channel, as
-//! inputs only this module builds.
+//! reader's replies and the worker's stop arrive on the commands' channel,
+//! as inputs only this module builds.
 
 use super::ListSearchMode;
 use super::search_generation::{AwaitedSearch, SearchGeneration};
@@ -64,14 +64,18 @@ impl WorkerInput {
 /// worker.
 pub(super) struct SearchCommands(mpsc::Sender<WorkerInput>);
 
+/// The search worker has ended and did not accept the command.
+#[derive(Debug)]
+pub(super) struct WorkerGone;
+
 impl SearchCommands {
-    /// True when the worker took `command`; false once it is gone.
-    pub(super) fn send(&self, command: SearchCommand) -> bool {
-        self.0.send(command.into()).is_ok()
+    /// Hand `command` to the worker. Fails once the worker is gone.
+    pub(super) fn send(&self, command: SearchCommand) -> Result<(), WorkerGone> {
+        self.0.send(command.into()).map_err(|_| WorkerGone)
     }
 
-    /// Commands that no worker reads, and the receiver a test reads them
-    /// from.
+    /// Commands for a test to read from the returned receiver, in place of
+    /// a worker.
     #[cfg(test)]
     pub(super) fn observed() -> (Self, ObservedCommands) {
         let (input, observed) = mpsc::channel();
@@ -127,7 +131,7 @@ pub(super) struct SearchWorkerState {
     searchable: Arc<Vec<SearchableConversation>>,
     pub(super) texts: SearchTextsInMemory,
     copies_to_read: mpsc::Sender<TextsToRead>,
-    /// The worker's own channel, which the text reader replies on.
+    /// The worker's own channel. The text reader replies on it.
     texts_reply: mpsc::Sender<WorkerInput>,
     /// The search last run, run again when texts arrive while the app awaits
     /// its generation.
@@ -189,8 +193,10 @@ impl SearchWorkerState {
         }
     }
 
-    /// Adds `input` to `pending`. Texts read run the last search again over
-    /// them unless a newer one waits, while the app awaits it.
+    /// Applies `input`: new rows and texts read change the worker's state
+    /// at once, and `pending` collects the search to run and whether to
+    /// stop. Texts read run the last search again over them unless a newer
+    /// one waits, while the app awaits it.
     pub(super) fn apply(&mut self, input: WorkerInput, pending: &mut PendingWork) {
         match input.0 {
             Input::Command(SearchCommand::UpdateData {
@@ -236,8 +242,9 @@ impl SearchWorkerState {
         }
     }
 
-    /// Sends `batch` to the text reader. A reader gone leaves the batch's
-    /// copies failed, not being read for good.
+    /// Sends `batch` to the text reader. When the reader has stopped, the
+    /// batch's copies are recorded as failed reads instead of staying
+    /// marked as being read.
     fn send_to_reader(&mut self, batch: TextsToRead) {
         if let Err(mpsc::SendError(unsent)) = self.copies_to_read.send(batch) {
             let failure = ReadFailure::Error("the search text reader stopped".into());
@@ -303,9 +310,9 @@ pub(super) fn spawn_search_worker(clock: Arc<dyn Clock>) -> SearchWorker {
                 if pending.stop {
                     return;
                 }
-                // The results go first: once the app counts no session
-                // loading, the results over every session's texts are on
-                // their channel.
+                // Send the results first: once the app's count of sessions
+                // loading reaches zero, the results over every session's
+                // texts are on their channel.
                 if let Some(request) = pending.search {
                     let now = clock.wall().with_timezone(&Local);
                     if res_tx.send(state.search(request, now)).is_err() {

@@ -754,9 +754,9 @@ struct ReadState {
     /// The last [`CONTEXT_LINES`] lines before the stable cursor holding more
     /// than whitespace: the context a malformed line just after it shows.
     lines_before: Vec<LineSpan>,
-    /// The calls hook attachments before the stable cursor name, the
-    /// transcript holding none of them: a later call or result with one of
-    /// these ids would show the attachment's text.
+    /// The calls hook attachments before the stable cursor name, when the
+    /// transcript doesn't hold any of them: a later call or result with one
+    /// of these ids would show the attachment's text.
     unplaced_hooks: Vec<String>,
 }
 

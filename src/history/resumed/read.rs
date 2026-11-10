@@ -116,10 +116,10 @@ impl WholeRead {
 /// A stored transcript file's change since the stored copy, by its stamp.
 enum FileChange {
     Unchanged,
-    /// Grown, or changed in a way only its reader can judge: the read
-    /// resumes from the stored cursor when its reader's checks pass.
-    Grown,
-    /// Changed without growing: read whole.
+    /// Grown, or a source without a stamp its reader found changed. The
+    /// read resumes from the stored cursor when its reader's checks pass.
+    Resumable,
+    /// Rewritten in place without growing. Read whole.
     Rewritten,
 }
 
@@ -194,17 +194,17 @@ pub(crate) fn read_resumed(
         let stamp = stamps.fingerprint_of(&file.path);
         Ok(match (stamp, file.fingerprint) {
             // A source without a stamp either time, such as a database's
-            // session, is unchanged only when its reader says so.
+            // session, is unchanged only when its reader reports it unchanged.
             (None, None) if reader.is_unchanged_since(&file.path, &file.read)? => {
                 FileChange::Unchanged
             }
-            (None, None) => FileChange::Grown,
+            (None, None) => FileChange::Resumable,
             (stamp, stored) if stamp == stored => FileChange::Unchanged,
             // The rewrite check sees only the bytes just before the cursor.
             (Some(stamp), Some(stored)) if stamp.file_size <= stored.file_size => {
                 FileChange::Rewritten
             }
-            _ => FileChange::Grown,
+            _ => FileChange::Resumable,
         })
     };
     let Some(own) = resume
@@ -231,7 +231,7 @@ pub(crate) fn read_resumed(
     let own_window = match change_of(own)? {
         FileChange::Unchanged => None,
         FileChange::Rewritten => return Ok(Err(WholeRead::OwnRewritten)),
-        FileChange::Grown => {
+        FileChange::Resumable => {
             on_transcript_read();
             match resume_read(reader, permit, &own.path, &own.read)? {
                 Resumption::Window(window) => Some(window),
@@ -269,9 +269,9 @@ pub(crate) fn read_resumed(
                         on_transcript_read();
                         whole_change(reader, permit, path)?
                     }
-                    FileChange::Grown => {
+                    FileChange::Resumable => {
                         on_transcript_read();
-                        resumed_change(reader, permit, path, &file.read, &fold, (cache, &resume))?
+                        resumed_change(reader, permit, path, &file.read, &fold, cache, &resume)?
                     }
                 };
                 Thread {
@@ -340,7 +340,8 @@ fn resumed_change(
     path: &Path,
     stored: &TranscriptRead,
     fold: &ThreadFold,
-    (cache, resume): (&SqliteCache, &StoredResume),
+    cache: &SqliteCache,
+    resume: &StoredResume,
 ) -> Result<Change> {
     if let Resumption::Window(window) = resume_read(reader, permit, path, stored)? {
         let title = leading_title(&reader.leading_entries(path, &window.read)?);

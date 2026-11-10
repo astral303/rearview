@@ -16,6 +16,14 @@ use crate::log_entry::LogEntry;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
+/// True when the session `?1` stores a turn of the sub-agent transcript at
+/// root `?3` and path `?4`, read from before line `?5`, in a message
+/// carrying the reply id `?2`.
+pub(super) const SUBAGENT_REPLY_STORED: &str = "SELECT EXISTS (SELECT 1 FROM messages m \
+     JOIN entries e ON e.message = m.id \
+     WHERE m.session = ?1 AND m.reply_id = ?2 AND e.record_line < ?5 AND e.child = \
+     (SELECT id FROM transcripts WHERE session = ?1 AND root = ?3 AND path = ?4))";
+
 /// What a resumed read of a stored session starts from.
 pub(crate) struct StoredResume {
     pub(crate) session: i64,
@@ -65,7 +73,7 @@ pub(crate) struct StoredTurn {
 
 /// The stored turns of session `?1`'s sub-agent transcript at root `?2` and
 /// path `?3`, from line `?4` on, through `entries_by_child`.
-pub(super) const STORED_TURNS_FROM_LINE: &str = "SELECT e.record_line, e.sequence, e.splice_key, \
+const STORED_TURNS_FROM_LINE: &str = "SELECT e.record_line, e.sequence, e.splice_key, \
      m.ordinal IS NOT NULL AND e.contributes, m.reply_id, e.digest, e.id, e.message \
      FROM entries e LEFT JOIN messages m ON m.id = e.message \
      WHERE e.child = (SELECT id FROM transcripts WHERE session = ?1 AND root = ?2 AND path = ?3) \
@@ -191,9 +199,9 @@ impl SqliteCache {
     }
 
     /// The stored turns of the sub-agent transcript at `path` in `resume`'s
-    /// session read from `from_line` of it on, in sequence order. The read
-    /// starts at the line, so an append costs the same however long the
-    /// sub-agent's history grew.
+    /// session from `from_line` of it on, in sequence order. The read seeks
+    /// `from_line` through `entries_by_child`: its cost grows with the turns
+    /// after the line, not with the sub-agent's whole history.
     pub(crate) fn stored_turns_from(
         &self,
         resume: &StoredResume,
@@ -203,7 +211,8 @@ impl SqliteCache {
         self.with_read_snapshot(|connection| {
             check_generation(connection, resume)?;
             let mut statement = connection.prepare_cached(STORED_TURNS_FROM_LINE)?;
-            // A transcript outside the session's roots holds no stored turn.
+            // A transcript outside the session's roots doesn't hold any
+            // stored turn.
             let Some(place) = resume.places.place(path) else {
                 return Ok(Vec::new());
             };
@@ -227,9 +236,9 @@ impl SqliteCache {
         })
     }
 
-    /// True when a stored turn of the sub-agent transcript at `path` in
-    /// `resume`'s session, read from before `line` of it, belongs to a
-    /// message carrying one of `reply_ids`.
+    /// True when a stored turn before `line` of the sub-agent transcript at
+    /// `path` in `resume`'s session belongs to a message carrying one of
+    /// `reply_ids`.
     pub(crate) fn continues_subagent_reply(
         &self,
         resume: &StoredResume,
@@ -241,11 +250,7 @@ impl SqliteCache {
             return Ok(false);
         };
         self.with_read_snapshot(|connection| {
-            let mut statement = connection.prepare_cached(
-                "SELECT EXISTS (SELECT 1 FROM messages m JOIN entries e ON e.message = m.id \
-                 WHERE m.session = ?1 AND m.reply_id = ?2 AND e.record_line < ?5 AND e.child = \
-                 (SELECT id FROM transcripts WHERE session = ?1 AND root = ?3 AND path = ?4))",
-            )?;
+            let mut statement = connection.prepare_cached(SUBAGENT_REPLY_STORED)?;
             for reply_id in reply_ids {
                 let exists: bool = statement.query_row(
                     params![

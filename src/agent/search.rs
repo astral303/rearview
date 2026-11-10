@@ -175,9 +175,9 @@ pub struct LexicalSearchRun {
     pub output: AgentSearchOutput,
     /// The sessions whose transcript failed to load, in rank order.
     pub failed_reads: Vec<(AgentConversationKey, AppError)>,
-    /// The sessions that left the session cache before their transcript was
+    /// The sessions no longer in the session cache when their transcript was
     /// read, in rank order. They count as failed.
-    pub left_cache: Vec<AgentConversationKey>,
+    pub no_longer_cached: Vec<AgentConversationKey>,
     /// The generation of the cached copy each searched session's hit
     /// messages were read from, by conversation reference: its hits number
     /// that copy's messages. A transcript read whole is missing.
@@ -667,7 +667,7 @@ pub fn run_within_search(
 /// index in the conversations and its key.
 pub struct SessionReader<Read, Bytes> {
     /// The session's hit messages, or its whole transcript; `None` when its
-    /// session left the session cache.
+    /// session is no longer in the session cache.
     pub read: Read,
     /// About how many bytes `read` reads, for the read-ahead limit; `None`
     /// when unknown.
@@ -703,7 +703,6 @@ pub fn run_global_lexical_search(
 /// With a window, a session without hits inside it does not take a place on
 /// the page: the next-ranked session is searched in its place. `reads`, when
 /// collecting, records the time spent matching the searched transcripts.
-/// `reader` reads the ranked sessions.
 ///
 /// Transcripts are read and searched on several threads, each as soon as it
 /// is read, but their hits are taken in rank order, so the stop rule and the
@@ -758,7 +757,7 @@ pub fn run_global_lexical_search_reporting(
     let mut hits = Vec::new();
     let mut conversations_with_hits = std::collections::HashSet::new();
     let mut failed_reads = Vec::new();
-    let mut left_cache = Vec::new();
+    let mut no_longer_cached = Vec::new();
     let mut copies_read = HashMap::new();
     let mut retrieval_time = std::time::Duration::ZERO;
     let mut failed = 0;
@@ -778,7 +777,7 @@ pub fn run_global_lexical_search_reporting(
             };
             let searched = match read {
                 Ok(Some(searched)) => searched,
-                Ok(None) => return SessionSearch::LeftCache { resolved },
+                Ok(None) => return SessionSearch::NoLongerCached { resolved },
                 Err(error) => return SessionSearch::Failed { resolved, error },
             };
             let (hits, retrieval_time) = time_retrieval(reads, || {
@@ -809,9 +808,9 @@ pub fn run_global_lexical_search_reporting(
                     failed += 1;
                     failed_reads.push((resolved.key.clone(), error));
                 }
-                SessionSearch::LeftCache { resolved } => {
+                SessionSearch::NoLongerCached { resolved } => {
                     failed += 1;
-                    left_cache.push(resolved.key.clone());
+                    no_longer_cached.push(resolved.key.clone());
                 }
                 SessionSearch::Searched {
                     resolved,
@@ -863,7 +862,7 @@ pub fn run_global_lexical_search_reporting(
             }),
         },
         failed_reads,
-        left_cache,
+        no_longer_cached,
         copies_read,
     })
 }
@@ -901,9 +900,9 @@ enum SessionSearch<'a> {
         resolved: &'a ResolvedConversation,
         error: AppError,
     },
-    /// The session left the session cache before its transcript was read.
-    /// Counted as failed.
-    LeftCache { resolved: &'a ResolvedConversation },
+    /// The session was no longer in the session cache when its transcript
+    /// was read. Counted as failed.
+    NoLongerCached { resolved: &'a ResolvedConversation },
     Searched {
         resolved: &'a ResolvedConversation,
         hits: Vec<AgentOutputHit>,
@@ -919,7 +918,7 @@ impl SessionSearch<'_> {
     fn takes_a_place(&self, window: TimeFilter) -> bool {
         match self {
             Self::Searched { hits, .. } => !window.is_active() || !hits.is_empty(),
-            Self::Unsearchable | Self::Failed { .. } | Self::LeftCache { .. } => true,
+            Self::Unsearchable | Self::Failed { .. } | Self::NoLongerCached { .. } => true,
         }
     }
 }
@@ -3576,12 +3575,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_read_and_session_left_cache_are_reported_apart_and_count_as_failed() {
+    fn failed_read_and_session_no_longer_cached_are_reported_apart_and_count_as_failed() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Lexical, 3, false);
         let unreadable = conversations[1].path.clone();
-        let left_cache = conversations[2].path.clone();
+        let no_longer_cached = conversations[2].path.clone();
 
         let run = run_global_lexical_search_reporting(
             &request,
@@ -3592,7 +3591,7 @@ mod tests {
                 read: |_, key: &AgentConversationKey| {
                     if key.path == unreadable {
                         Err(AppError::Io(std::io::Error::other("unreadable")))
-                    } else if key.path == left_cache {
+                    } else if key.path == no_longer_cached {
                         Ok(None)
                     } else {
                         Ok(Some(needle_transcript().into()))
@@ -3614,12 +3613,12 @@ mod tests {
             "the unreadable session is a failed read"
         );
         assert_eq!(
-            run.left_cache
+            run.no_longer_cached
                 .iter()
                 .map(|key| &key.path)
                 .collect::<Vec<_>>(),
-            [&left_cache],
-            "the session that left the cache is reported apart"
+            [&no_longer_cached],
+            "the session no longer in the session cache is reported apart"
         );
         assert_eq!(
             output.coverage,

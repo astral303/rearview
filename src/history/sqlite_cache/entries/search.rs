@@ -21,14 +21,14 @@ pub(super) struct EntrySearch {
 
 /// The place of one of an entry's search texts: its field, and its position
 /// among the entry's search texts in the order the parse lays them out. A
-/// read of the cache lays them out by it as the parse does.
+/// read of the cache orders the texts by it.
 #[derive(Clone, Copy)]
 pub(super) struct TextPlace {
     pub(super) field: SearchField,
     /// The field's rank in [`ENTRY_SEARCH_FIELDS`] in the high bits, the
-    /// text's index among the field's texts in the low
-    /// [`FIELD_POSITION_BITS`]: a text appended to one field moves no text
-    /// of a later field.
+    /// text's index among the field's texts in the low bits (see
+    /// [`field_position_bits`]): a text appended to one field leaves the
+    /// texts of a later field where they are.
     pub(super) position: i64,
 }
 
@@ -37,9 +37,17 @@ pub(super) struct TextPlace {
 pub(super) const ENTRY_SEARCH_FIELDS: [SearchField; 3] =
     [SearchField::Full, SearchField::Agent, SearchField::Thinking];
 
-/// The bits of a [`TextPlace::position`] holding the text's index in its
-/// field.
-const FIELD_POSITION_BITS: u32 = 32;
+/// The bits of a [`TextPlace::position`] holding a text's index in its field,
+/// for an entry whose fields hold `texts`: 16, so a position fits SQLite's
+/// 3-byte integer, or 32 when a field holds more than 65,536 texts.
+fn field_position_bits(texts: &[Vec<String>]) -> u32 {
+    const NARROW: u32 = 16;
+    if texts.iter().all(|field| field.len() <= 1 << NARROW) {
+        NARROW
+    } else {
+        u32::BITS
+    }
+}
 
 pub(super) struct DerivedText {
     pub(super) place: TextPlace,
@@ -63,13 +71,14 @@ pub(super) fn entry_search(
         return search;
     }
     let block_texts: Vec<Option<BlockText>> = blocks.iter().map(BlockText::of).collect();
+    let bits = field_position_bits(&parts);
     let texts = (0_i64..)
         .zip(ENTRY_SEARCH_FIELDS)
         .zip(parts)
         .flat_map(|((rank, field), texts)| {
             (0_i64..)
                 .zip(texts)
-                .map(move |(index, text)| (field, (rank << FIELD_POSITION_BITS) | index, text))
+                .map(move |(index, text)| (field, (rank << bits) | index, text))
         });
     for (field, position, text) in texts {
         let searched = searched_text(&text, &block_texts);
@@ -134,5 +143,26 @@ impl<'a> BlockText<'a> {
         };
         let searched = normalize_full_text(&stored);
         Some(Self { stored, searched })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::field_position_bits;
+
+    #[test]
+    fn position_index_widens_to_32_bits_past_65536_texts_in_a_field() {
+        let texts = |count: usize| vec![String::new(); count];
+
+        assert_eq!(
+            field_position_bits(&[texts(1 << 16), texts(1)]),
+            16,
+            "a field of 65,536 texts numbers them in 16 bits"
+        );
+        assert_eq!(
+            field_position_bits(&[texts(1), texts((1 << 16) + 1)]),
+            32,
+            "one field of 65,537 texts widens every field's index to 32 bits"
+        );
     }
 }

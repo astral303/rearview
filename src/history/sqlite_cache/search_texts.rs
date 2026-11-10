@@ -14,7 +14,7 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use std::ops::ControlFlow;
 
 /// Each stored field with its number in the `search_field` columns. Semantic
-/// text has no stored field.
+/// text isn't stored in any field.
 const STORED_FIELDS: [(SearchField, i64); 4] = [
     (SearchField::Full, 0),
     (SearchField::Agent, 1),
@@ -28,7 +28,7 @@ impl SearchField {
         STORED_FIELDS
             .iter()
             .find_map(|&(field, code)| (field == self).then_some(code))
-            .expect("semantic text has no stored field")
+            .expect("every field but semantic text is stored")
     }
 }
 

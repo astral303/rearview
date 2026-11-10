@@ -30,9 +30,9 @@ pub struct SessionSearchTexts {
 impl SessionSearchTexts {
     /// The texts of `cached`'s copy as the cache holds it, whether or not its
     /// transcripts changed since, or of the copy another write replaced it
-    /// with; `None` when the cache no longer holds the session. The row of a
-    /// replaced copy holds the new copy's texts until the rows next change
-    /// and name that copy.
+    /// with; `None` when the session is no longer in the session cache. The
+    /// row of a replaced copy holds the new copy's texts until the rows next
+    /// change and name that copy.
     pub(crate) fn read(cached: &CachedSession) -> Result<Option<Self>> {
         let copy = cached.clone().ignoring_source_changes().waiting();
         let mut read = TextsInReadOrder::default();
@@ -196,11 +196,11 @@ fn read_copies(copies: &[CachedSession]) -> Vec<TextsRead> {
         .collect()
 }
 
-/// [`SessionSearchTexts::read`] of `cached`, or why it read none.
+/// [`SessionSearchTexts::read`] of `cached`, or the cause of its failure.
 fn read_texts(cached: &CachedSession) -> TextsReadResult {
     match SessionSearchTexts::read(cached) {
         Ok(Some(texts)) => Ok(Arc::new(texts)),
-        Ok(None) => Err(ReadFailure::NotInCache),
+        Ok(None) => Err(ReadFailure::NoLongerCached),
         Err(error) => Err(ReadFailure::of(&error)),
     }
 }
@@ -228,12 +228,12 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
         }
     };
     let mut pieces = copies.iter().map(|_| Vec::new()).collect::<Vec<_>>();
-    for collector in scanned.visitors {
+    for collector in scanned.reads {
         for (copy, texts) in collector.by_copy {
             pieces[copy].push(texts);
         }
     }
-    let left_cache = scanned.left_cache.into_iter().collect::<HashSet<_>>();
+    let no_longer_cached = scanned.no_longer_cached.into_iter().collect::<HashSet<_>>();
     let replaced = scanned
         .replaced
         .into_iter()
@@ -246,8 +246,8 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
             let cached = &copies[copy];
             let texts = if replaced.contains(&copy) {
                 read_texts(cached)
-            } else if left_cache.contains(&copy) {
-                Err(ReadFailure::NotInCache)
+            } else if no_longer_cached.contains(&copy) {
+                Err(ReadFailure::NoLongerCached)
             } else {
                 Ok(Arc::new(laid_out(pieces)))
             };
@@ -259,13 +259,14 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
 /// A read of a copy's search texts.
 pub(crate) type TextsRead = (CopyKey, TextsReadResult);
 
-/// The texts a read of a copy read, or why it read none.
+/// The texts a read of a copy found, or the cause of its failure.
 pub(crate) type TextsReadResult = std::result::Result<Arc<SessionSearchTexts>, ReadFailure>;
 
-/// The cause of a read of a copy's search texts that read none.
+/// The cause of a failed read of a copy's search texts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadFailure {
-    NotInCache,
+    /// The session is no longer in the session cache.
+    NoLongerCached,
     Error(Arc<str>),
 }
 
@@ -278,7 +279,7 @@ impl ReadFailure {
 impl std::fmt::Display for ReadFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotInCache => formatter.write_str("not in the session cache"),
+            Self::NoLongerCached => formatter.write_str("no longer in the session cache"),
             Self::Error(error) => formatter.write_str(error),
         }
     }
@@ -363,8 +364,9 @@ struct HeldTexts {
 enum CopyReadState {
     Held,
     Reading,
-    /// The read failed, or the session left the cache: the search bar counts
-    /// the session as unreadable. The copy is read again when the rows next
+    /// The read failed, or the session is no longer in the session cache.
+    /// While none of the session's earlier texts are held, the search bar
+    /// counts it as unreadable. The copy is read again when the rows next
     /// change.
     Unreadable(ReadFailure),
 }
@@ -380,8 +382,8 @@ pub struct SessionsWithoutTexts {
 
 impl SearchTextsInMemory {
     /// The texts of each of `conversations` the session cache holds. A
-    /// session whose read fails, or whose copy the cache no longer holds, has
-    /// none.
+    /// session whose read fails, or whose copy is no longer in the session
+    /// cache, doesn't get any.
     pub fn read<C: Borrow<Conversation> + Sync>(conversations: &[C]) -> Self {
         let copies = conversations
             .iter()
@@ -490,8 +492,8 @@ impl SearchTextsInMemory {
         }
     }
 
-    /// Holds `texts`, the read of `copy`, when they are newer than the texts
-    /// its session holds. A read of the copy the row reads ends that read;
+    /// Holds the texts of `read`, a read of `copy`, when they are newer than
+    /// the texts its session holds. A read of the copy the row reads ends that read;
     /// the session stays being read after a read of an earlier copy. A failed
     /// read keeps the texts held before it.
     pub(crate) fn finish_read(&mut self, copy: CopyKey, read: TextsReadResult) {

@@ -1,8 +1,7 @@
 use super::{Conversation, MESSAGE_SEPARATOR, SEMANTIC_ROUTE_VERSION};
 use crate::semantic::test_fixtures::SemanticConversationFixture;
 
-/// A row with `title`, `summary`, the messages `messages` and the agent
-/// search text `agent_text`, the inputs of its route text.
+/// A row holding exactly the inputs of its route text.
 fn row(
     title: Option<&str>,
     summary: Option<&str>,

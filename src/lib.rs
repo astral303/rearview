@@ -59,26 +59,72 @@ use tui::ListSearchMode;
 /// Run `rearview` with the process's arguments on the system clock, print any
 /// error to stderr, and return the exit status.
 pub fn run() -> ExitCode {
+    let reached = ReachedBase::default();
     let result = history::sqlite_cache::connection::turn_off_memory_statistics()
         .map_err(AppError::from)
-        .and_then(|()| try_run(Arc::new(SystemClock::new())));
-    let Err(error) = result else {
-        return ExitCode::SUCCESS;
-    };
-    if matches!(error, AppError::SelectionCancelled) {
-        return ExitCode::SUCCESS;
+        .and_then(|()| try_run(Arc::new(SystemClock::new()), &reached));
+    // A failed write to stderr leaves rearview nowhere to report it.
+    let (failed, _stderr_write) = finish_command(result, reached.base(), &mut std::io::stderr());
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
-    eprint!("{}", error_report(error));
-    ExitCode::FAILURE
+}
+
+/// The session cache base a command reached. [`run`] reads its low-space
+/// latch after the command returns.
+#[derive(Default)]
+struct ReachedBase(std::cell::OnceCell<history::CacheBase>);
+
+impl ReachedBase {
+    fn record(&self, base: &history::CacheBase) {
+        let first = self.0.set(base.clone());
+        debug_assert!(first.is_ok(), "a command reaches one session cache base");
+    }
+
+    fn base(&self) -> Option<&history::CacheBase> {
+        self.0.get()
+    }
+}
+
+/// End a command that returned `result` over the session cache `base`:
+/// write its error to `stderr`, and return true when rearview exits with
+/// failure, with the result of the writes to `stderr`. Once a write of
+/// `base` found the drive short of space, and the low-space deletion has
+/// not run, the deletion decides the exit, whatever `result` holds: write
+/// the low-space message's first sentence, delete the cache database, then
+/// write the deletion's outcome. A failed first write still runs the
+/// deletion.
+fn finish_command(
+    result: Result<()>,
+    base: Option<&history::CacheBase>,
+    stderr: &mut dyn std::io::Write,
+) -> (bool, std::io::Result<()>) {
+    let low_space = base.and_then(|base| {
+        base.low_space()
+            .free_bytes_awaiting_deletion()
+            .map(|free_bytes| (base, free_bytes))
+    });
+    if let Some((base, free_bytes)) = low_space {
+        let lead = error::low_space_lead(free_bytes, history::sqlite_cache::FREE_SPACE_FLOOR);
+        let first = write!(stderr, "{APP_NAME}: {lead}").and_then(|()| stderr.flush());
+        let outcome = history::sqlite_cache::low_space::run_deletion(base)
+            .expect("a base with a pending deletion has its low-space latch set");
+        let rest = writeln!(stderr, "{}", error::low_space_rest(&outcome));
+        return (true, first.and(rest));
+    }
+    match result {
+        Ok(()) | Err(AppError::SelectionCancelled) => (false, Ok(())),
+        Err(error) => (true, write!(stderr, "{}", error_report(error))),
+    }
 }
 
 fn error_report(error: AppError) -> String {
     match error {
         AppError::AgentProtocol(output) => output,
         AppError::Agent(error) => agent::diagnostic::format_error(&error),
-        error @ (AppError::SessionCacheOutOfSpace { .. } | AppError::NoSessionCacheDirectory) => {
-            format!("{APP_NAME}: {error}\n")
-        }
+        error @ AppError::NoSessionCacheDirectory => format!("{APP_NAME}: {error}\n"),
         error => format!("Error: {error}\n"),
     }
 }
@@ -277,28 +323,35 @@ fn truncate_delete_empty_preview(preview: &str) -> String {
     }
 }
 
-fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
+fn try_run(clock: Arc<dyn Clock>, reached: &ReachedBase) -> Result<()> {
     run_with(
         Args::parse(),
         clock,
         cache_file::user_cache_base(),
         update::run,
+        reached,
     )
 }
 
 /// Run `args` on `clock`, with the session cache under `cache_base`, updating
-/// rearview through `update`. A test passes its own `update`: the real one
-/// downloads a release and replaces the running executable.
+/// rearview through `update`, and recording each session cache base the
+/// command reaches in `reached`. A test passes its own `update`: the real
+/// one downloads a release and replaces the running executable.
 fn run_with(
     args: Args,
     clock: Arc<dyn Clock>,
     cache_base: Option<PathBuf>,
     update: fn() -> Result<()>,
+    reached: &ReachedBase,
 ) -> Result<()> {
     config::migrate_pre_rename_config()?;
     // Only the commands that read sessions through the session cache build
     // it, so the others run without a cache directory.
-    let user_environment = || history::Environment::of_user(cache_base.clone(), Arc::clone(&clock));
+    let user_environment = || {
+        let environment = history::Environment::of_user(cache_base.clone(), Arc::clone(&clock))?;
+        reached.record(environment.cache_base());
+        Ok::<_, AppError>(environment)
+    };
 
     // Handle subcommands
     if let Some(command) = args.command {
@@ -444,11 +497,7 @@ fn run_with(
             }
         }
         eprintln!();
-        for conversation in &conversations {
-            if let Some(failure) = texts.read_failure(conversation) {
-                eprintln!("unreadable: {} ({failure})", conversation.path.display());
-            }
-        }
+        write_unreadable_sessions(&mut std::io::stderr(), &conversations, &texts)?;
 
         for (rank, (idx, debug)) in results.iter().take(30).enumerate() {
             let conv = &conversations[*idx];
@@ -652,7 +701,7 @@ fn run_with(
         other => other,
     };
 
-    let (conversations, selected_path) = match tui::run_with_loader(
+    let (action, conversations) = tui::run_with_loader(
         load_meter,
         history::RefreshOptions {
             show_last,
@@ -669,36 +718,24 @@ fn run_with(
         history::active_load_filters(&[&time_filter]),
         environment.clone(),
     )
-    .map_err(describe_empty)?
-    {
-        (tui::Action::Select(path), convs) => (convs, path),
-        (tui::Action::Resume(path), convs) => {
-            let conv = listed_conversation(&convs, &path)?;
-            resume_with_agent(
-                conv.source,
-                &path,
-                conv.project_path.as_ref(),
-                default_args,
-                false,
-            )?;
-            return Ok(());
-        }
-        (tui::Action::ForkResume(path), convs) => {
-            let conv = listed_conversation(&convs, &path)?;
-            resume_with_agent(
-                conv.source,
-                &path,
-                conv.project_path.as_ref(),
-                default_args,
-                true,
-            )?;
-            return Ok(());
-        }
-        (tui::Action::Quit, _) => return Err(AppError::SelectionCancelled),
-        (tui::Action::Delete(_) | tui::Action::Refresh, _) => {
-            unreachable!("the TUI handles delete and refresh itself")
-        }
+    .map_err(describe_empty)?;
+    let resume = |conversation: &history::Conversation, fork_session| {
+        resume_with_agent(
+            conversation.source,
+            &conversation.path,
+            conversation.project_path.as_ref(),
+            default_args,
+            fork_session,
+        )
     };
+    let (conversations, selected_path) =
+        match act_on_tui_exit(action, conversations, environment.cache_base(), resume)? {
+            TuiExit::Selected {
+                conversations,
+                path,
+            } => (conversations, path),
+            TuiExit::Resumed => return Ok(()),
+        };
 
     if args.show_path {
         println!("{}", selected_path.display());
@@ -790,6 +827,49 @@ fn run_with(
     Ok(())
 }
 
+/// The TUI's exit once [`act_on_tui_exit`] acted on it.
+enum TuiExit {
+    /// The list selected the session at `path` among `conversations`.
+    Selected {
+        conversations: Vec<history::Conversation>,
+        path: PathBuf,
+    },
+    /// The selected session's agent resumed it.
+    Resumed,
+}
+
+/// Act on `action`, which the TUI over the session cache `base` exited with
+/// over the listed `conversations`, resuming a session through `resume`
+/// (with true to fork it). Once a write of the TUI found the cache's drive
+/// short of space, fail with the low-space error instead, without acting:
+/// rearview then deletes the cache and stops (see [`finish_command`]).
+fn act_on_tui_exit(
+    action: tui::Action,
+    conversations: Vec<history::Conversation>,
+    base: &history::CacheBase,
+    resume: impl FnOnce(&history::Conversation, bool) -> Result<()>,
+) -> Result<TuiExit> {
+    if let Some(error) = base.low_space().error() {
+        return Err(error);
+    }
+    let (path, fork_session) = match action {
+        tui::Action::Select(path) => {
+            return Ok(TuiExit::Selected {
+                conversations,
+                path,
+            });
+        }
+        tui::Action::Resume(path) => (path, false),
+        tui::Action::ForkResume(path) => (path, true),
+        tui::Action::Quit => return Err(AppError::SelectionCancelled),
+        tui::Action::Delete(_) | tui::Action::Refresh => {
+            unreachable!("the TUI handles delete and refresh itself")
+        }
+    };
+    resume(listed_conversation(&conversations, &path)?, fork_session)?;
+    Ok(TuiExit::Resumed)
+}
+
 fn tui_search_mode(mode: TuiSearchMode) -> ListSearchMode {
     match mode {
         TuiSearchMode::Lexical => ListSearchMode::Lexical,
@@ -826,6 +906,53 @@ fn resume_with_agent(
         agent: source.display_label(),
         detail,
     })
+}
+
+/// One `unreadable:` line on `out` for each of `conversations` whose search
+/// texts `texts` failed to read, with the failure.
+fn write_unreadable_sessions(
+    out: &mut impl std::io::Write,
+    conversations: &[history::Conversation],
+    texts: &search::SearchTextsInMemory,
+) -> Result<()> {
+    for conversation in conversations {
+        if let Some(failure) = texts.read_failure(conversation) {
+            writeln!(
+                out,
+                "unreadable: {} ({failure})",
+                conversation.path.display()
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod debug_search_tests {
+    use super::*;
+    use crate::search::test_fixtures::{cached_claude_sessions, october_messages};
+
+    #[test]
+    fn unreadable_line_names_session_no_longer_in_the_session_cache() {
+        let sessions = cached_claude_sessions(&[
+            ("removed", october_messages(&["removed question"])),
+            ("kept", october_messages(&["kept question"])),
+        ]);
+        sessions.remove(0);
+        let texts = search::SearchTextsInMemory::read(&sessions.rows);
+        let mut written = Vec::new();
+
+        write_unreadable_sessions(&mut written, &sessions.rows, &texts).unwrap();
+
+        assert_eq!(
+            String::from_utf8(written).unwrap(),
+            format!(
+                "unreadable: {} (no longer in the session cache)\n",
+                sessions.rows[0].path.display()
+            ),
+            "one line names the removed session and why; the kept one has none"
+        );
+    }
 }
 
 fn format_debug_age(age: chrono::Duration) -> String {
@@ -1042,7 +1169,13 @@ mod agent_command_tests {
         let run_without_cache_directory = |arguments: &[&str]| {
             let args = Args::try_parse_from(std::iter::once("rearview").chain(arguments.to_vec()))
                 .unwrap();
-            run_with(args, Arc::new(clock::TestClock::default()), None, || Ok(()))
+            run_with(
+                args,
+                Arc::new(clock::TestClock::default()),
+                None,
+                || Ok(()),
+                &ReachedBase::default(),
+            )
         };
         let transcripts = tempfile::tempdir().unwrap();
         let transcript = write_jsonl(
@@ -2960,5 +3093,65 @@ mod agent_command_tests {
         let err = run_agent_read(&args, Some(&keys)).unwrap_err();
 
         assert!(err.to_string().contains("exceeds transcript length"));
+    }
+
+    /// A stderr whose write or flush fails, as a closed pipe's does.
+    struct FailingStderr {
+        fails_on_flush: bool,
+    }
+
+    impl std::io::Write for FailingStderr {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fails_on_flush {
+                Ok(buf.len())
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fails_on_flush {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A load whose cache write finds the drive short of space, reported to
+    /// a stderr whose first write or flush fails: the cache database is
+    /// still deleted, and the write's error returned.
+    #[test]
+    fn low_space_report_whose_first_write_fails_deletes_cache_and_returns_write_error() {
+        use crate::tui::claude_home::ClaudeHome;
+        for fails_on_flush in [false, true] {
+            let home = ClaudeHome::new();
+            home.write("first", 5, &["hello"]);
+            let cache = tempfile::tempdir().unwrap();
+            let environment = home
+                .environment_with_cache(
+                    cache.path(),
+                    history::ProcessIdentity::default(),
+                    Arc::new(clock::TestClock::default()),
+                )
+                .with_free_space(950_000_000);
+            let result = history::load_all_conversations(&environment, false, None).map(|_| ());
+
+            let (failed, written) = finish_command(
+                result,
+                Some(environment.cache_base()),
+                &mut FailingStderr { fails_on_flush },
+            );
+
+            assert!(failed, "rearview exits with failure");
+            assert!(
+                written.is_err(),
+                "the write's error is returned (failing on flush: {fails_on_flush})"
+            );
+            assert!(
+                history::sqlite_cache::is_emptied(cache.path()),
+                "the cache database's contents are deleted (failing on flush: {fails_on_flush})"
+            );
+        }
     }
 }

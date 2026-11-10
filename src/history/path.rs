@@ -34,8 +34,8 @@ pub(crate) fn with_platform_separators(path: impl Into<OsString>) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// A Windows path without the `\\?\` prefix `canonicalize` adds, as the
-/// user and OMP spell it.
+/// A Windows path without the `\\?\` or `\\?\UNC\` prefix `canonicalize`
+/// adds. OMP writes paths without it.
 pub(crate) fn without_verbatim_prefix(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(share) = text.strip_prefix(r"\\?\UNC\") {

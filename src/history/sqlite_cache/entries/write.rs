@@ -1,7 +1,7 @@
 //! The statements that write a session's entry rows, for a first write and
 //! for the changes a later write makes.
 
-use super::parts::{self, EntryParts, PartsOf};
+use super::parts::{self, EntryIds};
 use super::rows::{EntryRow, SessionRows};
 use crate::agent::sanitize::split_terminal_codes;
 use crate::history::sqlite_cache::roots::WrittenPlaces;
@@ -312,29 +312,27 @@ impl<'connection> RowWriter<'connection> {
             self.transcript(rows, ids, transcript)?;
         }
         let place = EntryPlace::of(row, rows.sequence_of(index), ids);
-        let parts = row.parts();
-        bind_entry(&mut self.insert_entry, self.session, row, &parts, &place)?;
+        bind_entry(&mut self.insert_entry, self.session, row, &place)?;
         self.insert_entry.raw_execute()?;
         let id = self.connection.last_insert_rowid();
         self.parts.write(
-            PartsOf {
+            EntryIds {
                 session: self.session,
                 entry: id,
             },
-            &parts,
+            &row.build_parts(),
             SearchPlace::of(rows, index),
         )?;
         Ok(id)
     }
 
-    /// Makes the content of the stored entry `id` `row`'s, whose parts are
-    /// `parts`, keeping its place: its columns when their digest changed,
-    /// else its digest alone, and its parts as [`parts::Writer::update`]
-    /// does, a changed or new part at `search`.
+    /// Writes `row`'s content over the stored entry `id`, keeping its place:
+    /// the columns when their digest changed, else the digest alone, and the
+    /// parts through [`parts::Writer::update`], a changed or new part at
+    /// `search`.
     pub(super) fn update_content(
         &mut self,
         row: &EntryRow,
-        parts: &EntryParts<'_>,
         id: i64,
         search: SearchPlace,
     ) -> rusqlite::Result<()> {
@@ -345,34 +343,29 @@ impl<'connection> RowWriter<'connection> {
         if stored_columns == row.columns_digest {
             self.connection
                 .prepare_cached("UPDATE entries SET digest = ?2 WHERE id = ?1")?
-                .execute(params![id, parts.digest()])?;
+                .execute(params![id, row.digest()])?;
         } else {
             let mut statement = self
                 .connection
                 .prepare_cached(&update_sql("entries", &[ENTRY_CONTENT_COLUMNS]))?;
             statement.raw_bind_parameter(1, self.session)?;
-            bind_content(&mut statement, row, parts, 2)?;
+            bind_content(&mut statement, row, 2)?;
             statement.raw_bind_parameter(ENTRY_CONTENT_COLUMNS.len() + 2, id)?;
             statement.raw_execute()?;
         }
         self.parts.update(
-            PartsOf {
+            EntryIds {
                 session: self.session,
                 entry: id,
             },
-            parts,
+            &row.build_parts(),
             search,
         )
     }
 
     /// [`Self::update_content`] at the place the stored entry `id` and its
     /// message give. The row keeps its place and its message.
-    pub(super) fn rewrite_content(
-        &mut self,
-        row: &EntryRow,
-        parts: &EntryParts<'_>,
-        id: i64,
-    ) -> rusqlite::Result<()> {
+    pub(super) fn rewrite_content(&mut self, row: &EntryRow, id: i64) -> rusqlite::Result<()> {
         let search = self
             .connection
             .prepare_cached(
@@ -385,7 +378,7 @@ impl<'connection> RowWriter<'connection> {
                     ordinal: stored.get(1)?,
                 })
             })?;
-        self.update_content(row, parts, id, search)
+        self.update_content(row, id, search)
     }
 
     /// Sets every column of the stored message `id` but its thread and its
@@ -486,25 +479,21 @@ fn bind_place(
     Ok(())
 }
 
-/// Binds `session` and every column of `row`, whose parts are `parts`, at
-/// `place`.
+/// Binds `session` and every column of `row` at `place`.
 fn bind_entry(
     statement: &mut CachedStatement,
     session: i64,
     row: &EntryRow,
-    parts: &EntryParts<'_>,
     place: &EntryPlace,
 ) -> rusqlite::Result<()> {
     bind_place(statement, session, row, place)?;
-    bind_content(statement, row, parts, ENTRY_PLACE_COLUMNS.len() + 2)
+    bind_content(statement, row, ENTRY_PLACE_COLUMNS.len() + 2)
 }
 
-/// Binds `row`'s [`ENTRY_CONTENT_COLUMNS`], its parts being `parts`, from
-/// parameter `first` on.
+/// Binds `row`'s [`ENTRY_CONTENT_COLUMNS`] from parameter `first` on.
 fn bind_content(
     statement: &mut CachedStatement,
     row: &EntryRow,
-    parts: &EntryParts<'_>,
     first: usize,
 ) -> rusqlite::Result<()> {
     let columns = &row.columns;
@@ -531,7 +520,7 @@ fn bind_content(
         &columns.flag,
         &row.splice_key,
         &row.columns_digest,
-        &parts.digest(),
+        &row.digest(),
     ];
     for (offset, value) in values.into_iter().enumerate() {
         statement.raw_bind_parameter(first + offset, value)?;

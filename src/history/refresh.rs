@@ -193,7 +193,7 @@ fn refresh_sources(
             Ok(rediscovered) => {
                 changes.absorb(source, rediscovered, known, &mut claimed, options.time);
             }
-            Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
+            Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
             Err(error) => {
                 changes
                     .ignored

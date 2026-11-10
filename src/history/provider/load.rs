@@ -4172,6 +4172,90 @@ mod tests {
         }
     }
 
+    /// Refuse every read of the stored refresh owner on a writable connection
+    /// to the cache in `base`, from the one numbered `refused_from` on: the
+    /// write batch or parse batch whose ownership check makes it cannot
+    /// start. Mark `watch` at the first refusal. The reads counted until the
+    /// result drops.
+    fn refuse_batches_from(
+        base: &Path,
+        refused_from: Option<usize>,
+        watch: &crate::history::provider::ParseWatch,
+    ) -> (
+        sqlite_cache::connection::test_hooks::Installed,
+        std::sync::Arc<AtomicUsize>,
+    ) {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let owner_reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let (counted, watch) = (std::sync::Arc::clone(&owner_reads), watch.clone());
+        let hooks =
+            sqlite_cache::connection::test_hooks::on_every_connection(base, move |connection| {
+                if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+                    return;
+                }
+                let (counted, watch) = (std::sync::Arc::clone(&counted), watch.clone());
+                connection
+                    .authorizer(Some(move |context: AuthContext<'_>| {
+                        if !matches!(
+                            context.action,
+                            AuthAction::Read {
+                                table_name: "refresh_state",
+                                column_name: "owner"
+                            }
+                        ) {
+                            return Authorization::Allow;
+                        }
+                        let number = counted.fetch_add(1, Ordering::SeqCst);
+                        if refused_from.is_some_and(|first| number >= first) {
+                            if Some(number) == refused_from {
+                                watch.mark();
+                            }
+                            Authorization::Deny
+                        } else {
+                            Authorization::Allow
+                        }
+                    }))
+                    .unwrap();
+            });
+        (hooks, owner_reads)
+    }
+
+    /// A refresh owner's batch that cannot start, at each read of the stored
+    /// owner a full load makes, stops the load's parsing: no parse begins
+    /// after it, and every session is listed, parsed before it or from its
+    /// copy.
+    #[test]
+    fn every_owner_batch_that_cant_start_stops_load_and_keeps_every_session_listed() {
+        let template = crate::tui::claude_home::ChangedSessionsTemplate::new();
+        let load = |refused_from| {
+            let sessions = template.case();
+            let (_hooks, begins) =
+                refuse_batches_from(sessions.cache.path(), refused_from, &sessions.watch);
+            let environment = sessions.environment();
+            let operation = waiting_operation(&environment);
+            let listed = sessions.load(&environment, &operation).len();
+            let _ = operation.finish();
+            (sessions, listed, begins.load(Ordering::SeqCst))
+        };
+        let (sessions, _, owner_reads) = load(None);
+        let session_count = sessions.transcripts.len();
+
+        // Read 0 is the acquisition's: refusing it fails the load.
+        for refused_from in 1..owner_reads {
+            let (sessions, listed, _) = load(Some(refused_from));
+
+            assert_eq!(
+                sessions.watch.parses_after_mark(),
+                0,
+                "refused from owner read {refused_from}: parsing stops at the refusal"
+            );
+            assert_eq!(
+                listed, session_count,
+                "refused from owner read {refused_from}: every session is listed"
+            );
+        }
+    }
+
     #[test]
     fn refresh_reapplies_selection_to_fresh_discovery() {
         let base = tempfile::tempdir().unwrap();

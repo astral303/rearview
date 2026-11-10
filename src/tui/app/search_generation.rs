@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The atomic's value while the app awaits no search. Generations start at 1.
+/// The atomic's value while the app isn't awaiting any search. Generations
+/// start at 1.
 const NONE_AWAITED: u64 = 0;
 
 /// The app's search generation: responses to an earlier one are stale. The
@@ -14,8 +15,8 @@ pub(super) struct SearchGeneration {
 }
 
 impl SearchGeneration {
-    /// Generation 0, awaiting no search, and the worker's view of the
-    /// generation it awaits.
+    /// Generation 0, not awaiting any search, and the worker's view of the
+    /// generation the app awaits.
     pub(super) fn start() -> (Self, AwaitedSearch) {
         let awaited = Arc::new(AtomicU64::new(NONE_AWAITED));
         let generation = Self {

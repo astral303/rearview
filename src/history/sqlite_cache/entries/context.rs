@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 /// Each call and result of the session `?1`'s numbered messages, without
-/// its input or content: those columns come after the ones read, so the
-/// read reaches none of their overflow pages.
+/// its input or content. Keep those columns after the ones read: the read
+/// then doesn't reach any of their overflow pages.
 pub(in crate::history::sqlite_cache) const CALLS_AND_RESULTS: &str = "SELECT m.ordinal, p.kind, p.call_id, p.name, p.tool, p.call_context \
      FROM messages m JOIN entries e ON e.message = m.id JOIN parts p ON p.entry = e.id \
      WHERE m.session = ?1 AND m.ordinal IS NOT NULL AND e.contributes \
@@ -125,9 +125,9 @@ pub(super) fn read(
 }
 
 /// The `call_context` a write stores for a call of `tool` with `input`: the
-/// fields of the input the sub-agent links read, which read them from
+/// fields of the input the sub-agent links read. The links read them from
 /// `Agent` and `AgentMessage` calls alone. `None` for any other call, and
-/// for an input holding none of the fields; a bounded read gives such a
+/// for an input without any of the fields; a bounded read gives such a
 /// call an empty context.
 pub(super) fn stored_call_context(tool: Tool, input: &Value) -> Option<String> {
     if !matches!(tool, Tool::Agent | Tool::AgentMessage) {
@@ -138,7 +138,6 @@ pub(super) fn stored_call_context(tool: Tool, input: &Value) -> Option<String> {
         "description",
         "recipient",
         "run_in_background",
-        "agent_type",
         "subagent_type",
     ] {
         if let Some(value) = input.get(key) {

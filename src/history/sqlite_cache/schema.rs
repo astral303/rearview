@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 34;
+pub(super) const SCHEMA_VERSION: u32 = 37;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Tables an earlier version held, dropped before [`TABLES`] when the schema
@@ -328,13 +328,14 @@ CREATE INDEX IF NOT EXISTS entries_by_time ON entries (timestamp_ms)
     WHERE timestamp_ms IS NOT NULL;
 
 -- Each content part retains its original position, including reference-only
--- images and unknown blocks. Numbered below zero come the parts search
--- alone reads, each with only its search field, its search place and its
--- text, without terminal codes: a part of kind `result-text` for each
--- searched result with items in `result_items`, the text items joined by
--- line breaks, then a part of kind `derived` for each search text of the
--- entry not held as written by a block, such as a tool call's header or a
--- task report's text. A part of kind `subagent-metadata`, outside every
+-- images and unknown blocks. Parts numbered below zero are read by search
+-- alone, and hold only their search field, search place and text, without
+-- terminal codes:
+-- - `result-text`: a searched result with items in `result_items`, the
+--   text items joined by line breaks;
+-- - `derived`: a search text of the entry not held as written by a block,
+--   such as a tool call's header or a task report's text.
+-- A part of kind `subagent-metadata`, outside every
 -- entry, holds a sub-agent transcript's text outside its spliced turns.
 -- `agent search` reads it without an active time window.
 CREATE TABLE IF NOT EXISTS parts (
@@ -359,7 +360,8 @@ CREATE TABLE IF NOT EXISTS parts (
     -- the entry's search texts as the parse lays them out, so a read of the
     -- session's search texts in `(entry_sequence, search_position)` order
     -- lays them out as the parse does. Its field's rank fills the high
-    -- bits, the text's index in its field the low 32.
+    -- bits, the text's index in its field the low 16, or the low 32 in an
+    -- entry with a field of more than 65,536 texts.
     search_position INTEGER,
     -- A `subagent-metadata` part's `session_files` position of the
     -- sub-agent transcript holding the text.
@@ -380,8 +382,8 @@ CREATE TABLE IF NOT EXISTS parts (
     -- The fields of an `Agent` or `AgentMessage` call's input that link
     -- sub-agents to the calls launching and addressing them, as a JSON
     -- object of the fields the input holds; null for any other call and
-    -- for one holding none. A bounded read reads them for every call of the
-    -- session without its input.
+    -- for one without any of them. A bounded read reads them for every
+    -- call of the session without its input.
     call_context TEXT,
     -- The long columns last: a read of the columns above does not read
     -- their overflow pages.

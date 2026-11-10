@@ -324,7 +324,7 @@ impl CachedSession {
     }
 
     /// This copy's currency for a row whose publication is `publication`;
-    /// `None` when the cache no longer holds the copy. The copy's
+    /// `None` when the copy is no longer in the session cache. The copy's
     /// transcripts are checked whether or not this session reads its copy
     /// as it is.
     pub(crate) fn currency(&self, publication: &Publication) -> Result<Option<Currency>> {

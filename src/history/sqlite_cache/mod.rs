@@ -19,6 +19,7 @@ mod entries;
 mod files;
 mod free_space;
 mod interactive;
+pub(crate) mod low_space;
 mod next_step;
 mod observer;
 mod permit;
@@ -31,6 +32,7 @@ mod scope;
 mod search_parts;
 mod search_texts;
 mod semantic_routes;
+mod semantic_scan;
 mod text_scan;
 mod window;
 
@@ -60,6 +62,7 @@ pub use permit::{Admitted, ParsePermit};
 #[cfg(test)]
 pub(crate) use permit::{FOR_FIXTURES, admitted_reads};
 pub(crate) use read_catalogue::CatalogueSession;
+pub(crate) use refresh::FREE_SPACE_FLOOR;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart};
@@ -67,6 +70,7 @@ pub(crate) use search_texts::SearchedFields;
 pub(crate) use semantic_routes::{
     RouteKey, RoutesStored, SemanticRoute, store_routes as store_semantic_routes,
 };
+pub(crate) use semantic_scan::{ScannedTurns, scan_semantic_turns};
 pub(crate) use text_scan::{ReadOrder, ScanScope, ScannedRow, TextVisitor, scan_search_texts};
 pub(crate) use window::{InPlaceRow, StoredFile, StoredResume, StoredTurn, WindowUpdate};
 
@@ -140,8 +144,8 @@ fn database_path(base: &Path) -> PathBuf {
 /// shared-memory file and rollback journal, named by these suffixes.
 const DATABASE_SIDE_FILE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
-/// True when the database under `base` holds no session table and no
-/// file beside it, as a low-space deletion leaves it.
+/// True when the database under `base` holds neither a `sessions` table
+/// nor a file beside it, as a low-space deletion leaves it.
 #[cfg(test)]
 pub(crate) fn is_emptied(base: &Path) -> bool {
     let database = database_path(base);
@@ -161,8 +165,9 @@ pub(crate) fn is_emptied(base: &Path) -> bool {
     !side_file && !sessions_table
 }
 
-/// Drop every table this release or an earlier one created.
-fn drop_every_table(connection: &Connection) -> rusqlite::Result<()> {
+/// Drop every table this release or an earlier one created, but
+/// `refresh_state`.
+fn drop_session_tables(connection: &Connection) -> rusqlite::Result<()> {
     for table in schema::RETIRED_TABLES.iter().chain(schema::TABLES) {
         connection.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
     }
@@ -184,13 +189,16 @@ pub(crate) fn is_busy_error(error: &AppError) -> bool {
 /// A reader connection to a cache base's database. It never creates,
 /// rebuilds or invalidates a cache; [`CacheWriter`] holds every write.
 pub(crate) struct SqliteCache {
-    connection: Connection,
+    connection: connection::CacheConnection,
     /// The base this connection's database lives in, as the rearview that
     /// opened it reaches it.
     base: CacheBase,
     /// The wait of this connection, and of the reads of each session it
     /// finds.
     wait: ReaderWait,
+    /// Declared after `connection`, so the count drops once it closes: a
+    /// low-space deletion waits for it.
+    _open: base::OpenConnection,
 }
 
 /// A connection that writes a cache base's database for a refresh owner.
@@ -248,11 +256,13 @@ impl SqliteCache {
         if !path.is_file() {
             return Ok(None);
         }
-        let connection = connection::open(&path, Access::ReadOnly, wait.busy_timeout())?;
+        let open = base.open_connection()?;
+        let connection = connection::open_cache(base, Access::ReadOnly, wait.busy_timeout())?;
         let cache = Self {
             connection,
             base: base.clone(),
             wait,
+            _open: open,
         };
         if cache.stored_layout()? != StoredLayout::Current || !cache.is_admitted()? {
             return Ok(None);
@@ -510,11 +520,8 @@ impl CacheWriter {
         interactive::refuse_the_drawing_thread("open a session cache writer");
         let base = owner.cache_base();
         std::fs::create_dir_all(base.path())?;
-        let connection = connection::open(
-            &database_path(base.path()),
-            Access::Create,
-            WAITING_BUSY_TIMEOUT,
-        )?;
+        let open = base.open_connection()?;
+        let connection = connection::open_cache(&base, Access::Create, WAITING_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "page_size", PAGE_SIZE)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
@@ -527,6 +534,7 @@ impl CacheWriter {
                 connection,
                 base,
                 wait: ReaderWait::Waiting(WAITING_BUSY_TIMEOUT),
+                _open: open,
             },
             owner,
         })
@@ -546,7 +554,8 @@ impl CacheWriter {
             turn,
             refresh::ExclusiveWait::of(WAITING_BUSY_TIMEOUT),
             |batch| refresh::commit(batch, &self.owner),
-        )
+        )?;
+        refresh::leave_wal(&self.connection)
     }
 
     /// Empty the database into this release's layout, holding the owner's
@@ -558,7 +567,7 @@ impl CacheWriter {
         // Do not discard the existing cache until exclusion and the journal
         // transition have succeeded. Interrupted rebuilds remain retryable.
         let batch = refresh::transaction_in_turn(&self.connection, &self.owner, &turn)?;
-        drop_every_table(&batch)?;
+        drop_session_tables(&batch)?;
         refresh::commit(batch, &self.owner)?;
         self.connection
             .pragma_update(None, "page_size", PAGE_SIZE)?;
@@ -629,8 +638,12 @@ impl CacheWriter {
     /// page a reader still needs, without waiting for readers or writers.
     /// Call it once a batch of writes ends. Connections that write do not
     /// checkpoint automatically, and a long-running TUI's log grows until a
-    /// checkpoint runs.
+    /// checkpoint runs. Skipped once a write found the drive short of space:
+    /// the copy would grow the database the low-space deletion empties.
     pub(crate) fn checkpoint_after_writes(&self) -> Result<()> {
+        if self.owner.is_low_space() {
+            return Ok(());
+        }
         self.connection
             .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
         Ok(())
@@ -710,6 +723,38 @@ impl CacheWriter {
         entries: &TranscriptEntries,
         subagents: &HashSet<&Path>,
     ) -> Result<i64> {
+        // Build the rows before the transaction: hashing them inside it
+        // would keep other rearviews' writes waiting.
+        let leading =
+            entries::SessionRows::from(&update.leading, subagents, &entries::RowsStart::default());
+        let moved = update.leading.len() as i64 - update.stored_leading_rows as i64;
+        let fold = update
+            .checkpoint
+            .fold
+            .clone()
+            .with_leading_entries_moved(moved);
+        let sequence = (update.checkpoint.sequence as i64 + moved) as usize;
+        let start = entries::RowsStart {
+            numbering: fold.numbering().clone(),
+            positions: fold.positions(),
+            sequence,
+        };
+        let tail = entries::SessionRows::from(&entries.entries, subagents, &start);
+        let in_place_entries: Vec<(RecordLine, LogEntry)> = update
+            .in_place
+            .iter()
+            .map(|row| (row.record.clone(), row.entry.clone()))
+            .collect();
+        let in_place = entries::SessionRows::from(
+            &in_place_entries,
+            subagents,
+            &entries::RowsStart::default(),
+        );
+        let stored_in_place: Vec<(i64, Option<i64>, i64)> = update
+            .in_place
+            .iter()
+            .map(|row| (row.id, row.message, row.digest))
+            .collect();
         let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
         let keys = &catalogue_keys(&batch, &record.catalogue)?;
         let places = &keys.places;
@@ -742,8 +787,6 @@ impl CacheWriter {
                 )?
                 .execute(params![session, place.root, place.path, launch_call])?;
         }
-        let leading =
-            entries::SessionRows::from(&update.leading, subagents, &entries::RowsStart::default());
         entries::replace_leading(
             &batch,
             session,
@@ -751,35 +794,7 @@ impl CacheWriter {
             &leading,
             update.stored_leading_rows,
         )?;
-        let moved = update.leading.len() as i64 - update.stored_leading_rows as i64;
-        let fold = update
-            .checkpoint
-            .fold
-            .clone()
-            .with_leading_entries_moved(moved);
-        let sequence = (update.checkpoint.sequence as i64 + moved) as usize;
-        let start = entries::RowsStart {
-            numbering: fold.numbering().clone(),
-            positions: fold.positions(),
-            sequence,
-        };
-        let tail = entries::SessionRows::from(&entries.entries, subagents, &start);
         entries::update_tail(&batch, session, places, &tail)?;
-        let in_place_entries: Vec<(RecordLine, LogEntry)> = update
-            .in_place
-            .iter()
-            .map(|row| (row.record.clone(), row.entry.clone()))
-            .collect();
-        let in_place = entries::SessionRows::from(
-            &in_place_entries,
-            subagents,
-            &entries::RowsStart::default(),
-        );
-        let stored_in_place: Vec<(i64, Option<i64>, i64)> = update
-            .in_place
-            .iter()
-            .map(|row| (row.id, row.message, row.digest))
-            .collect();
         entries::rewrite_in_place(&batch, session, places, &in_place, &stored_in_place)?;
         write_malformed_lines(&batch, session, entries)?;
         refresh::commit(batch, &self.owner)?;
