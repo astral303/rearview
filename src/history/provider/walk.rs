@@ -291,7 +291,8 @@ pub(crate) mod test_support {
                 .collect()
         }
 
-        /// The printout of the path as typed.
+        /// The printout of a path the cache finds by its text: the record
+        /// placement.
         pub(crate) fn printout(&self) -> Vec<ExpectedCall<'a>> {
             self.record_placement.clone()
         }

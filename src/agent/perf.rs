@@ -29,6 +29,9 @@ pub enum Stage {
     /// Discovering every agent's sessions to key them, for `read`, `outline`
     /// and `within`.
     Keys,
+    /// One round of the targeted refresh of the sessions a `read`,
+    /// `outline` or `within` reads.
+    Refresh,
     /// Parsing the transcripts a `read`, `outline` or `within` reads.
     Transcript,
     /// Matching inside one transcript, for `within`.
@@ -47,6 +50,7 @@ impl Stage {
             Self::Semantic => "semantic",
             Self::HitMetadata => "hit-metadata",
             Self::Keys => "keys",
+            Self::Refresh => "refresh",
             Self::Transcript => "transcript",
             Self::Search => "search",
             Self::Render => "render",
@@ -120,6 +124,9 @@ pub struct CommandPerf {
     current: Mutex<Option<Stage>>,
     load: LoadMeter,
     transcripts: Mutex<Vec<TranscriptParse>>,
+    /// The number of distinct sessions each round of the targeted refresh
+    /// read. A round without a session to read is not recorded.
+    refresh_rounds: Mutex<Vec<usize>>,
     /// `None` until a global search starts.
     search: OnceLock<SearchReads>,
 }
@@ -141,8 +148,18 @@ impl CommandPerf {
             current: Mutex::default(),
             load: LoadMeter::default(),
             transcripts: Mutex::default(),
+            refresh_rounds: Mutex::default(),
             search: OnceLock::new(),
         }
+    }
+
+    /// Records one round of the targeted refresh, reading `sessions`
+    /// distinct sessions.
+    pub fn record_refresh_round(&self, sessions: usize) {
+        self.refresh_rounds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(sessions);
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -199,7 +216,7 @@ impl CommandPerf {
     pub fn progress(&self) -> CommandProgress {
         let current = *self.current.lock().unwrap_or_else(PoisonError::into_inner);
         match current {
-            None | Some(Stage::Load | Stage::Keys) => self.load_progress(),
+            None | Some(Stage::Load | Stage::Keys | Stage::Refresh) => self.load_progress(),
             Some(Stage::Discovery) => CommandProgress::uncounted(ProgressStage::Discovery),
             Some(Stage::SkippedTranscripts | Stage::Transcript) => {
                 CommandProgress::uncounted(ProgressStage::Transcript)
@@ -227,8 +244,9 @@ impl CommandPerf {
         }
     }
 
-    /// One `perf` record per stage in the order they ran; each agent's
-    /// discovery, cache and refresh, agents in the order they loaded; each
+    /// One `perf` record per stage in the order they ran; one per round of
+    /// the targeted refresh, in order; each agent's discovery, cache and
+    /// refresh, agents in the order they loaded; each
     /// transcript parsed; a global search's reads and retrieval; the
     /// `peak_memory` in bytes when the platform reports it; then the total.
     pub fn records(&self, peak_memory: Option<u64>) -> String {
@@ -245,6 +263,14 @@ impl CommandPerf {
                 stage.name(),
                 time.as_millis()
             );
+        }
+        for sessions in self
+            .refresh_rounds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(records, "perf refresh-round sessions={sessions}");
         }
         for agent in self.load.agents() {
             write_agent_load(&mut records, &agent);

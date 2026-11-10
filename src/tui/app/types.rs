@@ -104,10 +104,14 @@ pub struct ViewState {
     /// The open session's row's publication of its copy. It decides whether
     /// the view and its exports read a copy as current.
     pub publication: crate::history::sqlite_cache::Publication,
-    /// The catalogue row of a copy newer than the list's row. The header
-    /// shows it in place of the list's row; `None` while the view shows the
-    /// list's row.
-    pub copy_row: Option<CopyRow>,
+    /// The header's fields, and the source of its height: the catalogue row
+    /// of the copy the view shows, or the open session's row while the view
+    /// shows no copy. `None` shows the file name alone.
+    pub header: Option<HeaderRow>,
+    /// The title stored beside the transcript that the open session's row
+    /// shows, as the list or the last refresh read it. The header shows it
+    /// over the copy's catalogue row, which holds the title from its parse.
+    pub external_title: Option<crate::history::provider::SessionTitle>,
     /// The open view's conversation as parsed.
     pub parsed_conversation: Option<Arc<ParsedConversation>>,
     /// Current scroll position (line offset)
@@ -153,16 +157,44 @@ pub struct ViewState {
     pub is_copy_missing: bool,
 }
 
-/// The catalogue row of a copy written after the list's row.
-#[derive(Clone)]
-pub struct CopyRow(pub Box<crate::history::Conversation>);
+/// The fields of a session's row that the view's header shows. The row's
+/// text stays with the row.
+#[derive(Clone, Debug)]
+pub struct HeaderRow {
+    pub project_name: Option<String>,
+    pub custom_title: Option<String>,
+    pub summary: Option<String>,
+    pub model: Option<String>,
+    pub message_count: usize,
+    pub duration_minutes: Option<u64>,
+    pub total_tokens: u64,
+    pub timestamp: chrono::DateTime<chrono::Local>,
+}
 
-impl std::fmt::Debug for CopyRow {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_tuple("CopyRow")
-            .field(&self.0.path)
-            .finish()
+impl HeaderRow {
+    pub fn of(row: &crate::history::Conversation) -> Self {
+        Self {
+            project_name: row.project_name.clone(),
+            custom_title: row.custom_title.clone(),
+            summary: row.summary.clone(),
+            model: row.model.clone(),
+            message_count: row.message_count,
+            duration_minutes: row.duration_minutes,
+            total_tokens: row.total_tokens,
+            timestamp: row.timestamp,
+        }
+    }
+
+    /// The header of `copy_row`, a copy's catalogue row, showing `title`,
+    /// the title stored beside the transcript, in place of its parse's.
+    pub fn of_copy(
+        mut copy_row: crate::history::Conversation,
+        title: Option<&crate::history::provider::SessionTitle>,
+    ) -> Self {
+        if let Some(title) = title {
+            crate::history::provider::apply_external_title(&mut copy_row, title);
+        }
+        Self::of(&copy_row)
     }
 }
 
@@ -259,7 +291,8 @@ impl ViewState {
             publication: crate::history::sqlite_cache::Publication::Unpublished {
                 discovered: Vec::new(),
             },
-            copy_row: None,
+            header: None,
+            external_title: None,
             parsed_conversation: None,
             scroll_offset: 0,
             rendered_lines: Vec::new(),

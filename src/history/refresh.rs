@@ -286,7 +286,7 @@ impl SessionChanges {
                         });
                     }
                 }
-                SessionRead::Empty => {
+                SessionRead::Empty(_) => {
                     self.skipped.unlisted.insert(locator.clone(), found);
                     if is_listed {
                         self.removed.push(locator);
@@ -297,7 +297,7 @@ impl SessionChanges {
                         self.removed.push(locator);
                     }
                 }
-                SessionRead::Failed(error) => {
+                SessionRead::Failed(error, _) => {
                     if error == ReadError::Permanent {
                         self.skipped.unreadable.insert(locator.clone(), found);
                     }

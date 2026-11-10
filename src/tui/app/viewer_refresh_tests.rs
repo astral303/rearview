@@ -894,17 +894,27 @@ fn opened_directly_as(typed: &Path, environment: Environment) -> App {
 
 /// The viewer header's first line, as the frame draws it.
 fn header_line(app: &App) -> String {
+    header_rows(app, 1)
+}
+
+/// The frame's first `rows` rows, as it draws them, one line each.
+fn header_rows(app: &App, rows: u16) -> String {
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, VIEWPORT as u16)).unwrap();
     terminal
         .draw(|frame| crate::tui::ui::render(frame, app))
         .unwrap();
     let buffer = terminal.backend().buffer();
-    (0..buffer.area.width)
-        .map(|x| buffer[(x, 0)].symbol())
-        .collect::<String>()
-        .trim_end()
-        .to_owned()
+    (0..rows)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -1058,6 +1068,159 @@ fn viewer_over_newer_copy_with_the_rows_sub_agents_shows_the_copys_header() {
     assert!(
         header_line(&app).contains("2 messages"),
         "the header counts the newer copy's follow-up: {}",
+        header_line(&app)
+    );
+}
+
+/// A Codex thread renamed in `session_index.jsonl` after its load: the list
+/// refresh retitles its row, and the viewer's header shows the new title
+/// over the copy's catalogue row, which holds the parse's.
+#[test]
+fn viewer_over_codex_thread_renamed_in_its_index_shows_the_new_name() {
+    let fixture = crate::history::provider::contract_tests::registered_fixtures()
+        .into_iter()
+        .find(|fixture| fixture.provider().source() == Source::Codex)
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fixture.write_session(home.path(), fixture.ids().session);
+    let storage =
+        crate::history::provider::contract_tests::kept_storage_under(fixture, home.path());
+    let cache = super::claude_home::admitted_cache();
+    let environment = test_environment(vec![storage], Some(cache.path()));
+    let rows = rows_of(&environment, storage);
+    let session_id = rows[0].session_id.clone();
+    let mut app = app_reading(rows, environment);
+    std::fs::write(
+        home.path().join("session_index.jsonl"),
+        serde_json::json!({
+            "id": session_id,
+            "thread_name": "Renamed thread",
+            "updated_at": "2026-08-19T10:00:00Z",
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    serve_list_refresh(&mut app, crate::time_filter::TimeFilter::default());
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+
+    assert!(
+        header_line(&app).contains("Renamed thread"),
+        "the header shows the name in the index: {}",
+        header_line(&app)
+    );
+}
+
+/// Every session `storage` stores, as a load through `environment` lists
+/// them.
+fn rows_of(
+    environment: &crate::history::Environment,
+    storage: &'static dyn crate::history::provider::SessionStorage,
+) -> Vec<Conversation> {
+    let operation = crate::history::environment::test_support::waiting_operation(environment);
+    let rows = crate::history::provider::load_sessions(
+        environment,
+        storage,
+        crate::history::provider::LoadOptions::default(),
+        &operation,
+        &mut |_, _| {},
+    )
+    .unwrap()
+    .conversations;
+    operation.finish().unwrap();
+    rows
+}
+
+/// `Ctrl+R` over session `a`, whose transcript gained a summary too long
+/// for the header's first line: the layout gives the header the line the
+/// summary is drawn on.
+#[test]
+fn viewer_refresh_that_adds_a_long_summary_lays_out_its_header_line() {
+    let home = ClaudeHome::new();
+    let transcript = home.write("a", 5, &["first question"]);
+    let mut app = viewer_on(&home);
+    let summary = "a summary long enough to need the header's second line ".repeat(3);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    std::io::Write::write_all(
+        &mut file,
+        format!(
+            "{}\n",
+            serde_json::json!({"type": "summary", "summary": summary, "leafUuid": "leaf"})
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    drop(file);
+
+    press_refresh(&mut app);
+
+    let area = ratatui::layout::Rect::new(0, 0, 100, VIEWPORT as u16);
+    let layout = crate::tui::ui::view_layout_rects(area, &app, view(&app));
+    assert_eq!(
+        layout.header.height, 3,
+        "the header's height with the summary on its own line"
+    );
+    assert!(
+        header_rows(&app, 3).contains("a summary long enough"),
+        "the header draws the summary: {}",
+        header_rows(&app, 3)
+    );
+}
+
+/// `Ctrl+R` over session `a`, whose transcript was rewritten, so the
+/// refresh reads it whole, and whose write fails: the viewer shows the
+/// older copy, and its header counts that copy's messages, not the parse's.
+#[test]
+fn viewer_refresh_whose_whole_write_fails_shows_older_copys_header() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["first question"]);
+    let mut app = viewer_on(&home);
+    home.write("a", 5, &["rewritten question", "another question"]);
+    let _failing = crate::history::sqlite_cache::connection::test_hooks::fail_the_first_data_commit(
+        app.environment.cache_base().path(),
+        || {},
+    );
+
+    press_refresh(&mut app);
+
+    assert!(
+        view_text(&app).contains("first question"),
+        "the viewer shows the older copy: {}",
+        view_text(&app)
+    );
+    assert!(
+        header_line(&app).contains("1 message"),
+        "the header counts the older copy's messages: {}",
+        header_line(&app)
+    );
+}
+
+/// `Ctrl+R` in the viewer over session `a`, whose transcript gained a
+/// message: the header counts the refreshed row's messages, though the
+/// list's row stays as it was until the viewer closes.
+#[test]
+fn viewer_refresh_shows_refreshed_rows_header() {
+    let home = ClaudeHome::new();
+    let environment = home.environment();
+    let transcript = home.write("a", 5, &["first question"]);
+    let rows = home.rows(&environment);
+    let mut app = app_reading(rows, environment);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    home.append(&transcript, 6, "a follow-up");
+
+    press_refresh(&mut app);
+
+    assert!(view_text(&app).contains("a follow-up"));
+    assert_eq!(app.conversations()[0].message_count, 1);
+    assert!(
+        header_line(&app).contains("2 messages"),
+        "the header counts the refreshed row's messages: {}",
         header_line(&app)
     );
 }

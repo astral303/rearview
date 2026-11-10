@@ -1,6 +1,6 @@
 //! The load loop shared by every provider that stores sessions under roots.
 
-use super::outcome::{SessionOutcome, SessionRead};
+use super::outcome::{SessionOutcome, SessionRead, UnwrittenParse};
 use super::storage::{DiscoveredSessions, ResolvedSession, SessionStub, UnreadableDirectory};
 use super::{Fingerprint, SessionRoot, SessionStorage, SessionTitle};
 use crate::agent::diagnostic::AgentWarning;
@@ -11,18 +11,19 @@ use crate::debug;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::load_meter::AgentMeter;
-use crate::history::parser::{ParsedSession, SessionTranscripts, UnlistedReason};
+use crate::history::parser::{ParsedSession, SessionTranscripts, UnlistedSession};
 use crate::history::path::CanonicalDirectories;
 use crate::history::resumed::{ResumeContext, ResumedSession, WholeRead, read_resumed};
 use crate::history::shard_files;
 use crate::history::sqlite_cache::refresh::RefreshToken;
 use crate::history::sqlite_cache::{
-    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, LiveOwner,
-    NextStep, OperationAccess, OperationScope, Publication, RecordPlace, SessionAddress,
-    SessionRecord, SessionStatus, SqliteCache, StubStamps, UnbuiltRecord,
+    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, ListedRecord,
+    LiveOwner, NextStep, OperationAccess, OperationScope, Publication, RecordPlace, SessionAddress,
+    SessionRecord, SessionStatus, SqliteCache, StubStamps,
 };
 use crate::history::{
-    Conversation, Environment, FilterTerm, ParsePermit, Source, format_short_name_from_path,
+    Conversation, Environment, FilterTerm, ParsePermit, Source, TranscriptEntries,
+    format_short_name_from_path,
 };
 use chrono::{DateTime, Local, TimeZone};
 use rayon::prelude::*;
@@ -32,6 +33,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 mod cache_access;
+#[cfg(test)]
+pub(crate) use cache_access::READ_BATCH_LENGTH;
 mod targeted;
 
 use cache_access::{CacheAccess, DatabaseReader, Deletions};
@@ -90,7 +93,7 @@ pub struct RecordedSession {
 }
 
 impl RecordedSession {
-    fn of(row: &Conversation) -> Self {
+    pub(crate) fn of(row: &Conversation) -> Self {
         Self {
             project_dir: row.cwd.clone(),
             session_id: row.session_id.clone(),
@@ -649,33 +652,17 @@ impl<'a> SessionLoader<'a> {
         }
     }
 
-    /// `record`, the record of `stub`'s session, with a failure to build it
-    /// reported as a failed write, as a file of the session outside every
-    /// root of it.
-    fn reported_record(&self, stub: &SessionStub, record: Result<ParseRecord>) -> ParseRecord {
-        let report = |error: &AppError| {
-            debug::warn(
-                self.debug_level,
-                &format!(
-                    "Failed to write {} session {} to the session cache database: {error}",
-                    self.storage.source().display_label(),
-                    stub.locator.display()
-                ),
-            )
-        };
-        match record {
-            Ok(ParseRecord::Unbuilt(unbuilt)) => {
-                if let Some(error) = &unbuilt.error {
-                    report(error);
-                }
-                ParseRecord::Unbuilt(unbuilt)
-            }
-            Ok(record) => record,
-            Err(error) => {
-                report(&error);
-                ParseRecord::Record(None)
-            }
-        }
+    /// Report `error`, the failure to build the record of `stub`'s session,
+    /// as a failed write.
+    fn report_unbuilt_record(&self, stub: &SessionStub, error: &AppError) {
+        debug::warn(
+            self.debug_level,
+            &format!(
+                "Failed to write {} session {} to the session cache database: {error}",
+                self.storage.source().display_label(),
+                stub.locator.display()
+            ),
+        )
     }
 }
 
@@ -1318,11 +1305,12 @@ impl SessionLoader<'_> {
                         let (raw, transcripts) =
                             self.parse(permit, root, stub, &on_transcript_read);
                         let record = match stamps {
-                            Some(stamps) => self.reported_record(
-                                stub,
-                                cache_record(&place, stub, stamps, &raw, transcripts),
-                            ),
-                            None => ParseRecord::Record(None),
+                            Some(stamps) => {
+                                cache_record(&place, stub, stamps, &raw, transcripts, &|error| {
+                                    self.report_unbuilt_record(stub, error)
+                                })
+                            }
+                            None => ParseRecord::NotRecorded,
                         };
                         SessionParse::Whole(Box::new(raw), record)
                     }
@@ -1409,15 +1397,15 @@ impl SessionLoader<'_> {
                 // A stale copy stays out of the skipped sessions, so a
                 // refresh reads the session again.
                 _ if is_stale => None,
-                SessionRead::Empty => {
+                SessionRead::Empty(_) => {
                     skipped.unlisted.insert(stub.locator.clone(), found);
                     None
                 }
-                SessionRead::Failed(ReadError::Permanent) => {
+                SessionRead::Failed(ReadError::Permanent, _) => {
                     skipped.unreadable.insert(stub.locator.clone(), found);
                     None
                 }
-                SessionRead::Failed(ReadError::Transient)
+                SessionRead::Failed(ReadError::Transient, _)
                 | SessionRead::Missing
                 | SessionRead::NotCached => None,
             });
@@ -1472,8 +1460,8 @@ impl SessionLoader<'_> {
             RawRead::Parsed(conversation) => {
                 SessionRead::Listed(Box::new(self.listed_row(place, stub, conversation)))
             }
-            RawRead::Empty(_) => SessionRead::Empty,
-            RawRead::Failed(error, _) => SessionRead::Failed(error),
+            RawRead::Empty { warning, .. } => SessionRead::Empty(warning),
+            RawRead::Failed(error, warning) => SessionRead::Failed(error, warning),
         }
     }
 
@@ -1834,7 +1822,10 @@ fn restore_from_catalogue(
 ) -> RawRead {
     match catalogue {
         CatalogueSession::Listed(row) => RawRead::Restored(restored_row(row, external_titles)),
-        CatalogueSession::Empty(warning) => RawRead::Empty(warning.clone()),
+        CatalogueSession::Empty(warning) => RawRead::Empty {
+            warning: warning.clone(),
+            parsed: UnwrittenParse::Nothing,
+        },
         CatalogueSession::Unreadable(warning) => {
             RawRead::Failed(ReadError::Permanent, warning.clone())
         }
@@ -1892,35 +1883,34 @@ fn restored_row(
 
 /// A whole parse's record for the session cache database.
 enum ParseRecord {
-    /// `None` for a read the database does not record.
-    Record(Option<Box<SessionRecord>>),
-    /// A listed session's parse that no record could be built for.
-    Unbuilt(Box<UnbuiltRecord>),
+    Record(Box<SessionRecord>),
+    /// A listed session's parse that no record was built for, with its
+    /// entries.
+    Unbuilt(TranscriptEntries),
+    /// A read the database does not record.
+    NotRecorded,
 }
 
 impl ParseRecord {
     /// `raw`, a whole parse that read `transcripts`, without a database to
-    /// write it to: the entries of a listed session, which only this read
-    /// holds.
+    /// write it to. A listed session keeps its entries, since no copy holds
+    /// them.
     fn without_database(raw: &RawRead, transcripts: Option<SessionTranscripts>) -> Self {
         match (raw, transcripts) {
             (RawRead::Parsed(conversation), Some(transcripts))
                 if !conversation.has_transient_read_error =>
             {
-                Self::Unbuilt(Box::new(UnbuiltRecord {
-                    entries: transcripts.into_entries_and_search_parts().0,
-                    error: None,
-                }))
+                Self::Unbuilt(transcripts.into_entries_and_search_parts().0)
             }
-            _ => Self::Record(None),
+            _ => Self::NotRecorded,
         }
     }
 
-    /// The record the database writer takes; `None` without one.
+    /// The record the database writer writes; `None` without one.
     fn into_record(self) -> Option<SessionRecord> {
         match self {
-            Self::Record(record) => record.map(|record| *record),
-            Self::Unbuilt(_) => None,
+            Self::Record(record) => Some(*record),
+            Self::Unbuilt(_) | Self::NotRecorded => None,
         }
     }
 }
@@ -1932,38 +1922,59 @@ impl ParseRecord {
 /// row built without a transcript after a transient error: the next load
 /// reads the session again. An empty or unreadable session records the
 /// warning the parse built. A listed session's record that cannot be built
-/// keeps the parse's entries. Fails for a file of an unlisted session
-/// outside every root of it.
+/// keeps the parse's entries. `report` receives the error of a record that
+/// fails to build, as for a file outside every root of the session.
 fn cache_record(
     place: &RecordPlace<'_>,
     stub: &SessionStub,
     stamps: StubStamps,
     raw: &RawRead,
     transcripts: Option<SessionTranscripts>,
-) -> Result<ParseRecord> {
-    let unlisted = |status, warning: &AgentWarning| {
-        SessionRecord::unlisted(place, stub, status, warning.to_recorded())
-            .map(|record| ParseRecord::Record(record.map(Box::new)))
+    report: &dyn Fn(&AppError),
+) -> ParseRecord {
+    let unlisted = |status, warning: &AgentWarning| match SessionRecord::unlisted(
+        place,
+        stub,
+        status,
+        warning.to_recorded(),
+    ) {
+        Ok(Some(record)) => ParseRecord::Record(Box::new(record)),
+        Ok(None) => ParseRecord::NotRecorded,
+        Err(error) => {
+            report(&error);
+            ParseRecord::NotRecorded
+        }
     };
     match (raw, transcripts) {
         (RawRead::Parsed(conversation), Some(transcripts))
             if !conversation.has_transient_read_error =>
         {
-            Ok(
-                match SessionRecord::listed(place, stub, stamps, conversation, transcripts) {
-                    Ok(record) => ParseRecord::Record(Some(Box::new(record))),
-                    Err(unbuilt) => ParseRecord::Unbuilt(unbuilt),
-                },
-            )
+            match SessionRecord::listed(place, stub, stamps, conversation, transcripts) {
+                ListedRecord::Built(record) => ParseRecord::Record(record),
+                ListedRecord::WithoutFingerprint(entries) => ParseRecord::Unbuilt(entries),
+                ListedRecord::Failed { error, entries } => {
+                    report(&error);
+                    ParseRecord::Unbuilt(entries)
+                }
+            }
         }
-        (RawRead::Empty(Some(warning)), _) => unlisted(SessionStatus::Empty, warning),
+        (
+            RawRead::Empty {
+                warning: Some(warning),
+                ..
+            },
+            _,
+        ) => unlisted(SessionStatus::Empty, warning),
         (RawRead::Failed(ReadError::Permanent, Some(warning)), _) => {
             unlisted(SessionStatus::Unreadable, warning)
         }
         (
-            RawRead::Parsed(_) | RawRead::Restored(_) | RawRead::Empty(None) | RawRead::Failed(..),
+            RawRead::Parsed(_)
+            | RawRead::Restored(_)
+            | RawRead::Empty { warning: None, .. }
+            | RawRead::Failed(..),
             _,
-        ) => Ok(ParseRecord::Record(None)),
+        ) => ParseRecord::NotRecorded,
     }
 }
 
@@ -1984,8 +1995,13 @@ enum RawRead {
     /// already records it as such. Cached against the fingerprint, so the next
     /// load skips it unopened. A change to a provider's parser therefore needs
     /// a `SessionCache::schema_version` bump to be seen, as it already does for
-    /// a session that parsed into a row.
-    Empty(Option<AgentWarning>),
+    /// a session that parsed into a row. `parsed` holds the parse's entries,
+    /// as an agent command reads them, or its rejection of a foreign
+    /// transcript; [`UnwrittenParse::Nothing`] for a restored session.
+    Empty {
+        warning: Option<AgentWarning>,
+        parsed: UnwrittenParse,
+    },
     /// Could not be read or parsed, or the cache records it as unreadable. A
     /// transient failure is not cached: the next refresh reads the session
     /// again. A permanent failure is cached against the fingerprint, and the
@@ -2003,7 +2019,15 @@ impl RawRead {
     ) -> (Self, Option<SessionTranscripts>) {
         match parsed {
             Ok(Ok(listed)) => (Self::Parsed(listed.row), Some(listed.transcripts)),
-            Ok(Err(reason)) => (Self::Empty(Some(unlisted_warning(source, reason))), None),
+            Ok(Err(unlisted)) => (
+                Self::Empty {
+                    warning: Some(unlisted_warning(source, unlisted.reason)),
+                    parsed: unlisted
+                        .entries
+                        .map_or(UnwrittenParse::Rejected, UnwrittenParse::Entries),
+                },
+                None,
+            ),
             Err(error) => (
                 Self::Failed(
                     ReadError::of(&error),
@@ -2018,8 +2042,16 @@ impl RawRead {
     /// conversation or failing to read; `None` for a listed session.
     fn warning(&self) -> Option<&AgentWarning> {
         match self {
-            Self::Empty(warning) | Self::Failed(_, warning) => warning.as_ref(),
+            Self::Empty { warning, .. } | Self::Failed(_, warning) => warning.as_ref(),
             Self::Restored(_) | Self::Parsed(_) => None,
+        }
+    }
+
+    /// Removes an empty session's parse from this read and returns it.
+    fn take_unlisted_parse(&mut self) -> UnwrittenParse {
+        match self {
+            Self::Empty { parsed, .. } => std::mem::replace(parsed, UnwrittenParse::Nothing),
+            Self::Restored(_) | Self::Parsed(_) | Self::Failed(..) => UnwrittenParse::Nothing,
         }
     }
 }
@@ -2037,6 +2069,7 @@ fn project_path_of(conversation: &Conversation) -> PathBuf {
 /// Show `title`, a title stored beside the transcript, on `conversation`.
 /// True when the row's title changed.
 pub fn apply_external_title(conversation: &mut Conversation, title: &SessionTitle) -> bool {
+    conversation.external_title = Some(title.clone());
     let (shown, title) = match title {
         SessionTitle::Custom(title) => (&mut conversation.custom_title, title),
         SessionTitle::Generated(title) => (&mut conversation.summary, title),
@@ -2064,7 +2097,7 @@ fn parse_session(
     let parsed = storage.parse_session(permit, stub, root, debug_level, on_transcript_read, clock);
     match parsed {
         Ok(Ok(listed)) if listed.row.source != storage.source() => {
-            Ok(Err(UnlistedReason::ForeignTranscript))
+            Ok(Err(UnlistedSession::of_another_agent(listed)))
         }
         Err(error) => {
             debug::warn(
@@ -2356,9 +2389,9 @@ mod tests {
     fn listed_row(outcome: SessionOutcome) -> Option<Conversation> {
         match outcome.into_parts().0 {
             SessionRead::Listed(conversation) => Some(*conversation),
-            SessionRead::Empty
+            SessionRead::Empty(_)
             | SessionRead::Missing
-            | SessionRead::Failed(_)
+            | SessionRead::Failed(..)
             | SessionRead::NotCached => None,
         }
     }
@@ -2412,8 +2445,8 @@ mod tests {
                 stamps,
                 &raw,
                 transcripts,
+                &|error| panic!("the record of {:?}'s session builds: {error}", row.source),
             )
-            .unwrap()
             .into_record()
             .unwrap_or_else(|| panic!("{:?}'s session has a record", row.source));
             let mut database = SqliteCache::open_for_refresh(ownership.token()).unwrap();
@@ -3739,8 +3772,9 @@ mod tests {
         );
     }
 
-    /// Without a replacement, a read whose writes fail waits for this
-    /// rearview's own refresh, never another rearview's.
+    /// When the writes fail and no other rearview took over refresh
+    /// ownership, the read waits for this rearview's own refresh, not
+    /// another's.
     #[test]
     fn read_revoked_without_replacement_waits_for_this_rearviews_refresh() {
         let base = tempfile::tempdir().unwrap();
@@ -3769,8 +3803,8 @@ mod tests {
         );
     }
 
-    /// A read whose write of a session the cache never held fails keeps the
-    /// entries it parsed on its outcome; a read whose write lands does not.
+    /// A read of an uncached session whose write fails keeps the entries it
+    /// parsed on its outcome; a read whose write lands does not.
     #[test]
     fn read_whose_write_fails_keeps_the_entries_it_parsed() {
         let base = tempfile::tempdir().unwrap();
@@ -3789,21 +3823,26 @@ mod tests {
         let written = home.write("written", 1, &["a written question"]);
         let unwritten = home.write("unwritten", 2, &["an unwritten question"]);
 
-        let (_, entries_of_written) = loader
+        let (_, unwritten_of_written) = loader
             .cache_one(&home.root(), discovered_stub(&home, &written))
-            .into_read_and_unwritten_entries();
+            .into_read_and_unwritten();
         let _failing =
             sqlite_cache::connection::test_hooks::fail_the_first_data_commit(base.path(), || {});
-        let (read, entries_of_unwritten) = loader
+        let (read, unwritten_of_unwritten) = loader
             .cache_one(&home.root(), discovered_stub(&home, &unwritten))
-            .into_read_and_unwritten_entries();
+            .into_read_and_unwritten();
 
-        assert!(entries_of_written.is_none(), "the copy holds the entries");
+        assert!(
+            matches!(unwritten_of_written, UnwrittenParse::Nothing),
+            "the copy holds the entries"
+        );
         assert!(
             matches!(read, SessionRead::Listed(_)),
             "the parse lists the session"
         );
-        let entries = entries_of_unwritten.expect("the outcome keeps the parsed entries");
+        let UnwrittenParse::Entries(entries) = unwritten_of_unwritten else {
+            panic!("the outcome keeps the parsed entries")
+        };
         assert!(
             format!("{:?}", entries.entries).contains("an unwritten question"),
             "{:?}",
@@ -5069,7 +5108,7 @@ mod tests {
                 .map(|outcome| outcome.into_parts().0)
                 .collect::<Vec<_>>()
                 .as_slice(),
-            [SessionRead::Empty]
+            [SessionRead::Empty(_)]
         ));
         assert_eq!(home.watch().parses_after_mark(), 0);
     }
@@ -5212,7 +5251,7 @@ mod tests {
             |home: &ClaudeHome| make_unreadable(&home.write("unreadable", 0, &["a question"]));
         assert!(matches!(
             rediscovered_read(unreadable),
-            SessionRead::Failed(ReadError::Permanent)
+            SessionRead::Failed(ReadError::Permanent, _)
         ));
     }
 
@@ -5222,7 +5261,7 @@ mod tests {
         let locked = |home: &ClaudeHome| lock(&home.write("locked", 0, &["a question"]));
         assert!(matches!(
             rediscovered_read(locked),
-            SessionRead::Failed(ReadError::Transient)
+            SessionRead::Failed(ReadError::Transient, _)
         ));
     }
 

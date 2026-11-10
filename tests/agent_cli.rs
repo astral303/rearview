@@ -2011,6 +2011,11 @@ fn assert_perf_records_in_order(
         .iter()
         .map(|stage| format!("stage={stage}"))
         .collect::<Vec<_>>();
+    let refresh_rounds = stages.iter().filter(|stage| **stage == "refresh").count();
+    expected.extend(std::iter::repeat_n(
+        "refresh-round".to_owned(),
+        refresh_rounds,
+    ));
     for _ in 0..agents {
         expected.extend(["discovery", "cache", "refresh"].map(str::to_owned));
     }
@@ -2088,15 +2093,15 @@ fn every_agent_command_prints_its_perf_records_in_order() {
     for (args, stages) in [
         (
             vec!["agent", "within", reference, "needle", "--lexical"],
-            &["keys", "transcript", "search", "render"][..],
+            &["keys", "refresh", "transcript", "search", "render"][..],
         ),
         (
             vec!["agent", "read", reference],
-            &["keys", "transcript", "render"][..],
+            &["keys", "refresh", "transcript", "render"][..],
         ),
         (
             vec!["agent", "outline", reference],
-            &["keys", "transcript", "render"][..],
+            &["keys", "refresh", "transcript", "render"][..],
         ),
     ] {
         let records = perf_records_of(&run(

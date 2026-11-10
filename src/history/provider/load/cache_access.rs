@@ -232,4 +232,4 @@ impl SessionLoader<'_> {
 }
 
 /// The most sessions a writer-locked batch parses.
-pub(super) const READ_BATCH_LENGTH: usize = 4;
+pub(crate) const READ_BATCH_LENGTH: usize = 4;

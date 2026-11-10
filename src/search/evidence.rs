@@ -465,6 +465,7 @@ mod tests {
             parse_errors: Vec::new(),
             summary: None,
             custom_title: None,
+            external_title: None,
             model: None,
             total_tokens: 0,
             duration_minutes: None,

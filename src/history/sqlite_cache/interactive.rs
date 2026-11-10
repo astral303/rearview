@@ -51,26 +51,24 @@ pub enum CachedRead<T> {
 }
 
 /// A copy the drawing thread read as current for the session's row: the
-/// row's own copy, or a [`NewerCopy`]. Only [`InteractiveCache::read`] makes
-/// one.
-pub struct CurrentCopy<T>(T, Option<NewerCopy>);
+/// row's own copy, or an [`AdoptedCopy`]. Only [`InteractiveCache::read`]
+/// makes one.
+pub struct CurrentCopy<T>(T, Option<AdoptedCopy>);
 
-/// The publication and catalogue row of a copy the reader shows in place of
-/// the session's row: one written after a published row, or one holding
-/// every transcript discovery found for an unpublished row.
+/// The publication of a copy the reader adopts in place of the session's
+/// row: one written after a published row, or one holding every transcript
+/// discovery found for an unpublished row.
 #[derive(Clone)]
-pub struct NewerCopy {
+pub struct AdoptedCopy {
     pub publication: super::Publication,
-    /// The copy's catalogue row; `None` when the cache no longer lists it.
-    pub row: Option<Box<crate::history::Conversation>>,
 }
 
 impl<T> InteractiveRead<T> {
     /// This read with its copy converted by `convert`.
     pub fn map<U>(self, convert: impl FnOnce(T) -> U) -> InteractiveRead<U> {
         let read = match self.read {
-            CachedRead::Current(CurrentCopy(copy, newer)) => {
-                CachedRead::Current(CurrentCopy(convert(copy), newer))
+            CachedRead::Current(CurrentCopy(copy, adopted)) => {
+                CachedRead::Current(CurrentCopy(convert(copy), adopted))
             }
             CachedRead::Older { copy, next } => CachedRead::Older {
                 copy: convert(copy),
@@ -91,8 +89,8 @@ impl<T> CurrentCopy<T> {
         self.0
     }
 
-    /// The copy, and its [`NewerCopy`] when it is not the row's own.
-    pub fn into_parts(self) -> (T, Option<NewerCopy>) {
+    /// The copy, and its [`AdoptedCopy`] when it is not the row's own.
+    pub fn into_parts(self) -> (T, Option<AdoptedCopy>) {
         (self.0, self.1)
     }
 }
@@ -101,9 +99,6 @@ impl<T> CurrentCopy<T> {
 pub(crate) struct CachedCopy<T> {
     pub(crate) value: T,
     pub(crate) currency: super::Currency,
-    /// The catalogue row of a newer copy; `None` for any other copy, and
-    /// when the cache no longer lists the newer copy at its generation.
-    pub(crate) newer_row: Option<Box<crate::history::Conversation>>,
 }
 
 impl InteractiveCache {
@@ -119,7 +114,7 @@ impl InteractiveCache {
         ReaderWait::Interactive.open(&self.base)
     }
 
-    /// `from_cache`'s copy of a session: current or newer, or out of date
+    /// `from_cache`'s copy of a session: current or adopted, or out of date
     /// with its [`NextStep::after_read_without_writing`], as is a session
     /// missing from the cache or a cache that could not be read.
     pub(crate) fn read<T>(
@@ -132,11 +127,10 @@ impl InteractiveCache {
         let read = match copy {
             Ok(Some(copy)) => match copy.currency {
                 super::Currency::Current => CachedRead::Current(CurrentCopy(copy.value, None)),
-                super::Currency::Newer { generation, .. } => CachedRead::Current(CurrentCopy(
+                super::Currency::Adopt { generation, .. } => CachedRead::Current(CurrentCopy(
                     copy.value,
-                    Some(NewerCopy {
+                    Some(AdoptedCopy {
                         publication: super::Publication::Published { generation },
-                        row: copy.newer_row,
                     }),
                 )),
                 super::Currency::Older => CachedRead::Older {

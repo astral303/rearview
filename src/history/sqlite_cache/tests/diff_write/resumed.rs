@@ -21,8 +21,8 @@ const OWN_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
 const SCOUT_THREAD: &str = "019f0000-0000-7000-8000-00000000000c";
 const SCOUT: &str = "rollout-2026-08-01T10-05-03-019f0000-0000-7000-8000-00000000000c.jsonl";
 
-/// A Codex session's files under a sessions tree and the archived tree
-/// beside it, and the cache holding the last write of the session.
+/// A Codex session's files under a sessions tree, and the cache holding the
+/// last write of the session.
 struct CodexSession {
     home: tempfile::TempDir,
     base: tempfile::TempDir,
@@ -34,9 +34,6 @@ struct CodexSession {
     /// Another spelling of `home`, which later reads name the session's
     /// files through; `None` for `home` as it is.
     home_spelling: Option<PathBuf>,
-    /// The directory `home`'s trees link into, for a session stored through
-    /// links; `None` for trees inside `home`.
-    store: Option<tempfile::TempDir>,
 }
 
 /// One update's read.
@@ -53,66 +50,15 @@ impl CodexSession {
     /// transcripts are `subagents`, each a file name and its lines, stored
     /// as a load stores its parse.
     fn stored(own: &[String], subagents: &[(&str, Vec<String>)]) -> Self {
-        Self::stored_with_archived(own, subagents, &[])
-    }
-
-    /// [`Self::stored`], with the sub-agent transcripts `archived` in the
-    /// archived tree, after the others.
-    fn stored_with_archived(
-        own: &[String],
-        subagents: &[(&str, Vec<String>)],
-        archived: &[(&str, Vec<String>)],
-    ) -> Self {
-        Self::stored_in(tempfile::tempdir().unwrap(), None, own, subagents, archived)
-    }
-
-    /// [`Self::stored_with_archived`], with `home`'s sessions tree and
-    /// archived tree links into a store: the sessions tree to `sessions`,
-    /// the archived tree to `archived`, each a directory below the store.
-    fn stored_through_links(
-        sessions: &str,
-        archived_target: &str,
-        own: &[String],
-        subagents: &[(&str, Vec<String>)],
-        archived: &[(&str, Vec<String>)],
-    ) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let store = tempfile::tempdir().unwrap();
-        for (target, link) in [
-            (sessions, "sessions"),
-            (archived_target, "archived_sessions"),
-        ] {
-            let target = store.path().join(PathBuf::from_iter(target.split('/')));
-            std::fs::create_dir_all(&target).unwrap();
-            link_directory(&target, &home.path().join(link));
-        }
-        Self::stored_in(home, Some(store), own, subagents, archived)
-    }
-
-    fn stored_in(
-        home: tempfile::TempDir,
-        store: Option<tempfile::TempDir>,
-        own: &[String],
-        subagents: &[(&str, Vec<String>)],
-        archived: &[(&str, Vec<String>)],
-    ) -> Self {
         let day = home.path().join("sessions/2026/08/01");
         std::fs::create_dir_all(&day).unwrap();
         let own_path = day.join(format!("rollout-2026-08-01T10-00-00-{OWN_THREAD}.jsonl"));
         write_lines(&own_path, own);
-        let archived_tree = home.path().join("archived_sessions");
-        if !archived.is_empty() {
-            std::fs::create_dir_all(&archived_tree).unwrap();
-        }
         let subagents = subagents
             .iter()
-            .map(|(name, lines)| (day.join(name), lines))
-            .chain(
-                archived
-                    .iter()
-                    .map(|(name, lines)| (archived_tree.join(name), lines)),
-            )
-            .map(|(path, lines)| {
+            .map(|(name, lines)| {
+                let path = day.join(name);
                 write_lines(&path, lines);
                 path
             })
@@ -128,7 +74,6 @@ impl CodexSession {
             subagents,
             updates: 1,
             home_spelling: None,
-            store,
         };
         let fixture = session.fixture();
         let record = parsed_record(Source::Codex, &fixture.root, &fixture.stub);
@@ -179,20 +124,6 @@ impl CodexSession {
 
     fn subagent(&self, name: &str) -> PathBuf {
         self.own.with_file_name(name)
-    }
-
-    /// Links the archived tree to a copy of what it holds at `target`, a
-    /// directory below the store: the tree's canonical path changes.
-    fn retarget_archived_tree(&self, target: &str) {
-        let link = self.home.path().join("archived_sessions");
-        let target = self.store.as_ref().unwrap().path().join(target);
-        std::fs::create_dir_all(&target).unwrap();
-        for entry in std::fs::read_dir(&link).unwrap() {
-            let entry = entry.unwrap();
-            std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
-        }
-        std::fs::remove_dir(&link).unwrap();
-        link_directory(&target, &link);
     }
 
     /// Writes the title `name` for the session to the session index.
@@ -254,7 +185,7 @@ fn update_stored(cache: &mut OwnedCache, base: &Path, fixture: &Fixture) -> Upda
                 "the resumed read lists the row a parse lists"
             );
             bytes_read = resumed.bytes_read;
-            if let Some(Ok(tail)) = &resumed.record.entries {
+            if let Some(RecordEntries::Written(tail)) = &resumed.record.entries {
                 tail_entries = tail.entries.len();
             }
             cache.write(&resumed.record).unwrap();
@@ -646,114 +577,92 @@ fn append_after_root_spelling_changes_resumes_as_fresh_parse() {
     );
 }
 
-/// The sessions tree links to a store and the archived tree to a directory
-/// below it: the checkpoint's name of an archived sub-agent reads back as
-/// the archived transcript, not as a path below the sessions tree.
+/// A Codex thread edited once, its rollouts before the edit archived, with
+/// the archived tree linked into a store and cached by a load. The link
+/// moves to a copy of its files before the next load. That load reads the
+/// session whole, each rollout once, and its copy holds the archived turns.
 #[test]
-fn archived_subagent_below_sessions_trees_canonical_path_resumes_as_fresh_parse() {
-    // The scout's first turn stands before the checkpoint, so the stored
-    // checkpoint numbers its thread.
-    let first = reply("10:05:04.000", "msg_s1", "Reading the notes.");
-    let mut own = scout_spawn();
-    own.push(user("10:05:20.000", "msg_u_wait", "Any news?"));
-    own.push(reply("10:05:21.000", "msg_a_wait", "Still waiting."));
-    let mut session = CodexSession::stored_through_links(
-        "store",
-        "store/archive",
-        &own_lines(&own),
-        &fixture_subagents(),
-        &[(SCOUT, scout_lines(std::slice::from_ref(&first)))],
+fn load_after_archived_tree_is_retargeted_reads_the_session_whole_once() {
+    use crate::history::sqlite_cache::admitted_reads;
+    let home = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let archive = |name: &str| store.path().join(name);
+    std::fs::create_dir_all(archive("archive-one")).unwrap();
+    let link = home.path().join("archived_sessions");
+    link_directory(&archive("archive-one"), &link);
+    let bases = crate::history::format::codex::test_support::write_session_with_archived_bases(
+        home.path(),
+        OWN_THREAD,
+        SCOUT_THREAD,
     );
-    let archived = session.subagents.last().unwrap().clone();
-    write_lines(
-        &archived,
-        &scout_lines(&[
-            first,
-            reply("10:05:40.000", "msg_s2", "The notes list the steps."),
-        ]),
-    );
-    own.push(scout_report("10:05:50.000", "The notes list the steps."));
-    own.push(reply("10:05:51.000", "msg_a_scout", "The scout is done."));
-    write_lines(&session.own, &own_lines(&own));
-
-    let update = session.update();
-
-    assert_eq!(update.outcome, Ok(()), "the session resumes");
-    assert_eq!(
-        update.transcripts_read, 2,
-        "the read opens the session's transcript and the changed archived sub-agent's"
-    );
-}
-
-/// The archived tree's link moves to a copy of its files between two runs.
-/// The stored copy names the archived root by a `roots` row the tree no
-/// longer canonicalises to, and it does not list. Once the session's parse
-/// is written in its place, as a whole read writes it, the next read
-/// resumes.
-#[test]
-fn copy_naming_retargeted_archived_tree_does_not_list_and_its_rewrite_resumes() {
-    let first = reply("10:05:04.000", "msg_s1", "Reading the notes.");
-    let mut session = CodexSession::stored_through_links(
-        "sessions",
-        "archive-one",
-        &own_lines(&scout_spawn()),
-        &fixture_subagents(),
-        &[(SCOUT, scout_lines(std::slice::from_ref(&first)))],
-    );
-    let archived = session.subagents.last().unwrap().clone();
-    session.retarget_archived_tree("archive-two");
-    let mut scout = vec![first, reply("10:05:06.000", "msg_s2", "Still reading.")];
-    write_lines(&archived, &scout_lines(&scout));
-    session.updates += 1;
-    let fixture = session.fixture();
-
-    let stored = session
-        .cache
-        .catalogue_session(
-            fixture.storage(),
-            fixture.source(),
-            &fixture.root,
-            &fixture.stub.cache_key,
-            false,
-        )
+    let codex = crate::history::provider::contract_tests::registered_fixtures()
+        .into_iter()
+        .find(|fixture| fixture.provider().source() == Source::Codex)
         .unwrap();
+    let storage = crate::history::provider::contract_tests::kept_storage_under(codex, home.path());
+    let base = crate::tui::claude_home::admitted_cache();
+    let environment = crate::history::environment::test_support::test_environment(
+        vec![storage],
+        Some(base.path()),
+    );
+    let load = || {
+        let operation = crate::history::environment::test_support::waiting_operation(&environment);
+        let rows = crate::history::provider::load_sessions(
+            &environment,
+            storage,
+            crate::history::provider::LoadOptions::default(),
+            &operation,
+            &mut |_, _| {},
+        )
+        .unwrap()
+        .conversations;
+        operation.finish().unwrap();
+        rows
+    };
+    load();
+
+    std::fs::create_dir_all(archive("archive-two")).unwrap();
+    for entry in std::fs::read_dir(&link).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), archive("archive-two").join(entry.file_name())).unwrap();
+    }
+    std::fs::remove_dir(&link).unwrap();
+    link_directory(&archive("archive-two"), &link);
+    let rollouts = [
+        &bases.session,
+        &bases.session_base,
+        &bases.subagent,
+        &bases.subagent_base,
+    ];
+    let before = rollouts.map(|rollout| admitted_reads::count(rollout));
+
+    let rows = load();
+
+    let reads: Vec<usize> = rollouts
+        .iter()
+        .zip(before)
+        .map(|(rollout, before)| admitted_reads::count(rollout) - before)
+        .collect();
+    assert_eq!(
+        reads,
+        [1, 1, 1, 1],
+        "the second load's reads of each rollout"
+    );
+    let row = rows
+        .iter()
+        .find(|row| row.path == bases.session)
+        .expect("the load lists the session");
+    let entries = crate::history::sqlite_cache::find_cached_session_waiting(
+        environment.cache_base(),
+        row.cache_address.as_ref().unwrap(),
+    )
+    .unwrap()
+    .expect("the load wrote the session's copy")
+    .entries()
+    .unwrap()
+    .expect("the copy holds the session's entries");
     assert!(
-        stored.is_none(),
-        "the copy naming the archived tree's earlier root does not list"
-    );
-    session.cache.write(&fixture.record()).unwrap();
-
-    scout.push(reply("10:05:08.000", "msg_s3", "Done reading."));
-    write_lines(&archived, &scout_lines(&scout));
-    assert_eq!(
-        session.update().outcome,
-        Ok(()),
-        "the read after the whole read resumes"
-    );
-}
-
-/// A session whose sub-agent transcript Codex archived, read on after that
-/// sub-agent grew: the read resumes and writes what a fresh parse holds.
-#[test]
-fn turn_appended_to_archived_subagent_resumes_as_fresh_parse() {
-    let first = reply("10:05:04.000", "msg_s1", "Reading the notes.");
-    let mut session = CodexSession::stored_with_archived(
-        &own_lines(&scout_spawn()),
-        &fixture_subagents(),
-        &[(SCOUT, scout_lines(std::slice::from_ref(&first)))],
-    );
-    let archived = session.subagents.last().unwrap().clone();
-    assert!(archived.starts_with(session.home.path().join("archived_sessions")));
-    write_lines(
-        &archived,
-        &scout_lines(&[first, reply("10:05:06.000", "msg_s2", "Still reading.")]),
-    );
-
-    let update = session.update();
-
-    assert_eq!(update.outcome, Ok(()), "the session resumes");
-    assert_eq!(
-        update.transcripts_read, 1,
-        "the read opens the changed archived transcript alone"
+        format!("{:?}", entries.entries).contains("alpha"),
+        "the copy holds the archived rollout's turn"
     );
 }

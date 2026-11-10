@@ -4,6 +4,7 @@
 
 use super::load::ReadError;
 use super::storage::SessionStub;
+use crate::agent::diagnostic::AgentWarning;
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::sqlite_cache::NextStep;
 use crate::history::{Conversation, TranscriptEntries};
@@ -13,12 +14,17 @@ use std::path::{Path, PathBuf};
 pub enum SessionRead {
     /// The row the list shows for the session.
     Listed(Box<Conversation>),
-    /// Read cleanly, and holds no conversation the provider lists.
-    Empty,
+    /// Read cleanly, though the file doesn't hold any conversation the
+    /// provider lists. Carries the warning agent commands print for it,
+    /// built from the parse or as the cache recorded it (`None` for a row
+    /// recorded without one).
+    Empty(Option<AgentWarning>),
     /// Neither discovery nor a lookup of the file finds a session there.
     Missing,
-    /// Could not be read.
-    Failed(ReadError),
+    /// Could not be read, with the warning agent commands print for it, as
+    /// for an empty session; `None` too when a failed discovery or lookup
+    /// kept the session from being read.
+    Failed(ReadError, Option<AgentWarning>),
     /// Missing from the session cache, and nothing parsed the transcript: a
     /// read of the cache alone, as the TUI's drawing thread reads it.
     NotCached,
@@ -35,11 +41,23 @@ pub struct SessionOutcome {
     revision: Option<CachedFingerprint>,
     read: SessionRead,
     next: NextStep,
-    /// The entries of the session's parse that its copy in the cache does
-    /// not hold: the write did not land, no record could be built, or a
-    /// file changed after its stamp. `None` when the copy holds them or the
-    /// read parsed nothing.
-    unwritten_entries: Option<TranscriptEntries>,
+    unwritten: UnwrittenParse,
+}
+
+/// The findings of a session's whole parse missing from its copy in the
+/// cache.
+pub enum UnwrittenParse {
+    /// The copy holds what the read found, the read parsed nothing, or the
+    /// read resumed from the stored copy: a resumed read whose write fails
+    /// reads as that copy, older than the transcript.
+    Nothing,
+    /// The parse's entries: the write did not land, no record could be
+    /// built, a file changed after its stamp, or the session doesn't hold
+    /// any conversation the provider lists.
+    Entries(TranscriptEntries),
+    /// The parse found the file is not a transcript in the agent's format.
+    /// The read's warning reports it.
+    Rejected,
 }
 
 impl SessionOutcome {
@@ -50,20 +68,19 @@ impl SessionOutcome {
             revision: stub.fingerprint.stamp(),
             read,
             next: NextStep::Settled,
-            unwritten_entries: None,
+            unwritten: UnwrittenParse::Nothing,
         }
     }
 
-    /// `read`, the read of the session at `stub` whose parse read
-    /// `unwritten_entries`, which the session's copy in the cache does not
-    /// hold, settled.
-    pub(super) fn settled_with_unwritten_entries(
+    /// `read`, the read of the session at `stub`, settled. The copy in the
+    /// cache lacks `unwritten`, what the parse found.
+    pub(super) fn settled_with_unwritten(
         stub: &SessionStub,
         read: SessionRead,
-        unwritten_entries: Option<TranscriptEntries>,
+        unwritten: UnwrittenParse,
     ) -> Self {
         Self {
-            unwritten_entries,
+            unwritten,
             ..Self::settled(stub, read)
         }
     }
@@ -76,7 +93,7 @@ impl SessionOutcome {
     /// The session at `locator`, which a failed discovery or lookup kept from
     /// being read: it may still be there, unchanged.
     pub(super) fn failed_transiently(locator: &Path) -> Self {
-        Self::unread(locator, SessionRead::Failed(ReadError::Transient))
+        Self::unread(locator, SessionRead::Failed(ReadError::Transient, None))
     }
 
     /// The session at `stub`, missing from the session cache.
@@ -93,7 +110,7 @@ impl SessionOutcome {
             revision: None,
             read,
             next: NextStep::Settled,
-            unwritten_entries: None,
+            unwritten: UnwrittenParse::Nothing,
         }
     }
 
@@ -129,6 +146,15 @@ impl SessionOutcome {
         matches!(self.read, SessionRead::Listed(_))
     }
 
+    /// The row the list shows for the session; `None` when the read found
+    /// none.
+    pub fn listed_row(&self) -> Option<&Conversation> {
+        match &self.read {
+            SessionRead::Listed(row) => Some(row),
+            _ => None,
+        }
+    }
+
     /// True when no session is at the file the read was asked for.
     pub fn is_missing(&self) -> bool {
         matches!(self.read, SessionRead::Missing)
@@ -150,10 +176,10 @@ impl SessionOutcome {
         (self.read, self.next)
     }
 
-    /// The read, and the entries of its parse that the session's copy in
-    /// the cache does not hold, for a caller that reads the session's
-    /// content once and refreshes it no further.
-    pub fn into_read_and_unwritten_entries(self) -> (SessionRead, Option<TranscriptEntries>) {
-        (self.read, self.unwritten_entries)
+    /// The read, and what its parse found that the session's copy in the
+    /// cache does not hold, for a caller that reads the session's content
+    /// once and refreshes it no further.
+    pub fn into_read_and_unwritten(self) -> (SessionRead, UnwrittenParse) {
+        (self.read, self.unwritten)
     }
 }

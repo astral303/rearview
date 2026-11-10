@@ -152,7 +152,7 @@ pub trait SessionFormat: Sync {
         permit: ParsePermit<'_>,
         path: &Path,
     ) -> Result<Option<SessionProjection>> {
-        self.read_transcript(permit.admit(), path, DroppedRecords::default())
+        self.read_transcript(permit.admit(path), path, DroppedRecords::default())
     }
 
     /// [`Self::parse_transcript`], counting into `dropped` the records the
@@ -163,7 +163,7 @@ pub trait SessionFormat: Sync {
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
-        self.read_transcript(permit.admit(), path, dropped)
+        self.read_transcript(permit.admit(path), path, dropped)
     }
 
     /// The format's own reading of the transcript at `path` behind

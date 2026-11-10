@@ -1139,7 +1139,9 @@ pub(super) mod tests {
         let read = |path: &Path| canonicalised_by_opening(storage, &agent_read_of(path));
         let printout =
             |path: &Path| canonicalised_by_opening(storage, &printout_of(Source::Kimi, path));
-        let direct_open = |path: &Path| canonicalised_by_opening(storage, &direct_open_of(path));
+        let direct_open = |path: &Path| {
+            canonicalised_by_opening(storage, &direct_open_of(path, "active kimi question"))
+        };
         let expected = OpeningCanonicalisations {
             key_discovery: vec![
                 (first_root, "key discovery: the first root"),
@@ -1170,11 +1172,20 @@ pub(super) mod tests {
 
         assert_canonicalised(&read(&wire), &expected.agent_read());
         assert_canonicalised(&printout(&wire), &expected.printout());
-        let opened_directly = [
-            (first_root, "the TUI's open: the first root"),
-            (second_root, "the TUI's open: the second root"),
-        ];
-        assert_canonicalised(&direct_open(&wire), &opened_directly);
+        fn opened_directly<'a>(
+            typed: &'a Path,
+            roots: [&'a Path; 2],
+        ) -> [(&'a Path, &'static str); 3] {
+            [
+                (typed, "the TUI's open: the typed path"),
+                (roots[0], "the TUI's open: the first root"),
+                (roots[1], "the TUI's open: the second root"),
+            ]
+        }
+        assert_canonicalised(
+            &direct_open(&wire),
+            &opened_directly(&wire, [first_root, second_root]),
+        );
         assert_canonicalised(
             &read(&canonical_wire),
             &expected.agent_read_by_canonical_path(),
@@ -1185,7 +1196,10 @@ pub(super) mod tests {
             search_for_the_files_root.to_vec()
         };
         assert_canonicalised(&printout(&canonical_wire), &by_canonical_path);
-        assert_canonicalised(&direct_open(&canonical_wire), &opened_directly);
+        assert_canonicalised(
+            &direct_open(&canonical_wire),
+            &opened_directly(&canonical_wire, [first_root, second_root]),
+        );
     }
 
     #[test]

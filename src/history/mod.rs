@@ -42,7 +42,7 @@ use std::path::PathBuf;
 // Re-export public API
 pub use display_entries::{
     DisplayEntries, EntryOrigin, display_log_entries_interactively, printed_log_entries,
-    sniffed_display_log_entries,
+    sniffed_display_log_entries, viewed_copy_interactively,
 };
 pub use environment::Environment;
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
@@ -120,7 +120,7 @@ pub(crate) fn normalized_session(
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
-/// A bare file's normalized entries (`--render`, a direct path), read by the
+/// A bare file's normalised entries (`--render`, a direct path), read by the
 /// format of the agent its projection names.
 pub(crate) fn sniffed_session(
     permit: ParsePermit<'_>,
@@ -242,6 +242,10 @@ pub struct Conversation {
     pub summary: Option<String>,
     /// Custom session title set by user via /rename (from type=custom-title JSONL entry)
     pub custom_title: Option<String>,
+    /// The title stored beside the transcript that the row shows in place
+    /// of its parsed `custom_title` or `summary`; `None` when it shows the
+    /// parsed ones.
+    pub external_title: Option<provider::SessionTitle>,
     /// Model name from assistant messages (e.g., "claude-opus-4-5-20251101")
     pub model: Option<String>,
     /// Total tokens used in the conversation (input + output + cache)

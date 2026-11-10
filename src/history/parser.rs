@@ -35,7 +35,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// The reason a session's parse yields no row for the list. The session
+/// The reason a session's parse does not produce a row for the list. The session
 /// cache records it, so agent commands can warn about the session without
 /// parsing it again.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,8 +50,61 @@ pub enum UnlistedReason {
 }
 
 /// A session's parse: the row the list shows with the transcripts the parse
-/// read, or the reason it shows none.
-pub type ParsedSession = std::result::Result<ListedSession, UnlistedReason>;
+/// read, or the session without a row.
+pub type ParsedSession = std::result::Result<ListedSession, UnlistedSession>;
+
+/// A session's parse that does not produce a row for the list.
+pub struct UnlistedSession {
+    pub reason: UnlistedReason,
+    /// The session's entries, with its sub-agents' turns spliced in, as an
+    /// agent command reads them; `None` for a file that is not a transcript
+    /// in the agent's format.
+    pub(crate) entries: Option<TranscriptEntries>,
+}
+
+impl UnlistedSession {
+    /// A file that is not a transcript in the agent's format.
+    pub(crate) fn foreign() -> Self {
+        Self {
+            reason: UnlistedReason::ForeignTranscript,
+            entries: None,
+        }
+    }
+
+    /// `listed`, a session the agent's format reads but another agent
+    /// recorded and lists, keeping the entries its parse read.
+    pub(crate) fn of_another_agent(listed: ListedSession) -> Self {
+        Self {
+            reason: UnlistedReason::ForeignTranscript,
+            entries: Some(listed.transcripts.into_entries_and_search_parts().0),
+        }
+    }
+
+    /// The session whose own entries are `own` and whose sub-agents read as
+    /// `subagents`, unlisted for `reason`.
+    fn with_subagent_turns(
+        reason: UnlistedReason,
+        own: TranscriptEntries,
+        subagents: SubagentReads,
+    ) -> Self {
+        Self {
+            reason,
+            entries: Some(TranscriptEntries {
+                entries: splice_turns(own.entries, subagents.transcripts.turns),
+                malformed_lines: own.malformed_lines,
+            }),
+        }
+    }
+}
+
+impl std::fmt::Debug for UnlistedSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnlistedSession")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
 
 /// A row builder's result: the row the list shows, or the reason it shows
 /// none.
@@ -350,7 +403,7 @@ pub fn process_projected_session(
 ) -> Result<ParsedSession> {
     on_transcript_read();
     let Some(session) = session else {
-        return Ok(Err(UnlistedReason::ForeignTranscript));
+        return Ok(Err(UnlistedSession::foreign()));
     };
     let subagents =
         SubagentReads::of_projections(permit, stub, subagent_format, on_transcript_read);
@@ -382,7 +435,7 @@ pub fn process_linked_session(
 ) -> Result<ParsedSession> {
     on_transcript_read();
     let Some(session) = session else {
-        return Ok(Err(UnlistedReason::ForeignTranscript));
+        return Ok(Err(UnlistedSession::foreign()));
     };
     let (subagents, ledger) = SubagentReads::of_linked_projections(
         permit,
@@ -418,14 +471,24 @@ fn row_with_subagents(
     });
     let place = checkpoint_place(&steps, session.transcript_read.stable_line);
     drop(steps);
-    let (mut row, fold) = spliced_conversation_with_checkpoint(
+    let spliced = spliced_conversation_with_checkpoint(
         stub.locator.clone(),
         &session,
         &subagents.marks,
         place.as_ref().map(|(sequence, _)| *sequence),
         RowDating::new(stub.fingerprint.modified, clock),
         debug_level,
-    )?;
+    );
+    let (mut row, fold) = match spliced {
+        Ok(spliced) => spliced,
+        Err(reason) => {
+            return Err(UnlistedSession::with_subagent_turns(
+                reason,
+                TranscriptEntries::of_projection(session),
+                subagents,
+            ));
+        }
+    };
     let checkpoint = place
         .zip(fold)
         .map(|((sequence, splice), fold)| SessionCheckpoint {
@@ -506,7 +569,10 @@ pub(crate) fn headerless_session(session: HeaderlessSession<'_>) -> ParsedSessio
         .last_activity()
         .map(|last| last.with_timezone(&Local))
         .unwrap_or_else(|| dating.fallback_time());
-    let mut row = builder.finish(source, stub.locator.clone(), timestamp, debug_level)?;
+    let mut row = match builder.finish(source, stub.locator.clone(), timestamp, debug_level) {
+        Ok(row) => row,
+        Err(reason) => return Err(UnlistedSession::with_subagent_turns(reason, own, subagents)),
+    };
     row.session_id = session_id;
     let checkpoint = place
         .zip(fold)
@@ -1573,6 +1639,7 @@ impl ConversationBuilder {
             parse_errors: self.parse_errors,
             summary,
             custom_title,
+            external_title: None,
             model: folded.model,
             total_tokens: folded.total_tokens,
             duration_minutes: folded.duration_minutes,

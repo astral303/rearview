@@ -65,15 +65,31 @@ pub enum Publication {
     Unpublished { discovered: Vec<PathBuf> },
 }
 
+impl Publication {
+    /// The generation the command that built the row wrote, when its write
+    /// landed. That command reads a copy at or after it as current without
+    /// checking the copy's transcripts, and a copy before it as older (see
+    /// [`CachedSession::currency_for_publisher`]): its refresh read the
+    /// transcripts, and an agent's write after that parse would otherwise
+    /// make the command's own copy older.
+    pub(crate) fn trusted_generation(&self) -> Option<i64> {
+        match self {
+            Self::Published { generation } => Some(*generation),
+            Self::Unpublished { .. } => None,
+        }
+    }
+}
+
 /// A copy's currency for a row, as [`CachedSession::currency`] finds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Currency {
     /// The row's own copy.
     Current,
     /// A copy written after a published row, or holding every transcript
-    /// discovery found for an unpublished row: its reader shows it as
-    /// current, with its own generation, sub-agents and catalogue row.
-    Newer {
+    /// discovery found for an unpublished row. The reader adopts it in
+    /// place of the row, as current, with its own generation, sub-agents
+    /// and catalogue row.
+    Adopt {
         generation: i64,
         subagents: Vec<PathBuf>,
     },
@@ -164,6 +180,22 @@ impl CachedSession {
         }
     }
 
+    /// This copy's currency for a row built by the reading command, whose
+    /// publication is `publication`: a copy at or after the generation the
+    /// command published is current without a check of its transcripts (see
+    /// [`Publication::trusted_generation`]). `None` when the cache no longer
+    /// holds the copy of an unpublished row.
+    pub(crate) fn currency_for_publisher(
+        &self,
+        publication: &Publication,
+    ) -> Result<Option<Currency>> {
+        match publication.trusted_generation() {
+            Some(generation) if self.generation >= generation => Ok(Some(Currency::Current)),
+            Some(_) => Ok(Some(Currency::Older)),
+            None => self.currency(publication),
+        }
+    }
+
     /// This copy's currency for a row whose publication is `publication`;
     /// `None` when the cache no longer holds the copy. The copy's
     /// transcripts are checked whether or not this session reads its copy
@@ -177,17 +209,27 @@ impl CachedSession {
             Publication::Unpublished { discovered } => discovered,
             Publication::Published { .. } => &[],
         };
+        let may_adopt = match publication {
+            Publication::Published { generation } => self.generation > *generation,
+            Publication::Unpublished { .. } => true,
+        };
         let stored = checking.read(|connection, session, places| {
-            let stored = stored_subagents(connection, session)?;
-            let stored_keys: HashSet<(i64, FileKey)> = stored
-                .iter()
-                .map(|subagent| (subagent.root, subagent.key()))
-                .collect();
-            let holds_discovered = discovered.iter().all(|path| {
-                places
-                    .place(path)
-                    .is_some_and(|place| stored_keys.contains(&(place.root, place.key())))
-            });
+            let stored = if may_adopt {
+                stored_subagents(connection, session)?
+            } else {
+                Vec::new()
+            };
+            let holds_discovered = discovered.is_empty() || {
+                let stored_keys: HashSet<(i64, FileKey)> = stored
+                    .iter()
+                    .map(|subagent| (subagent.root, subagent.key()))
+                    .collect();
+                discovered.iter().all(|path| {
+                    places
+                        .place(path)
+                        .is_some_and(|place| stored_keys.contains(&(place.root, place.key())))
+                })
+            };
             let paths = stored
                 .into_iter()
                 .map(|subagent| places.path(subagent))
@@ -200,7 +242,7 @@ impl CachedSession {
             Err(error) if error.is_changed_source() => return Ok(Some(Currency::Older)),
             Err(error) => return Err(error),
         };
-        let newer = || Currency::Newer {
+        let adopted = || Currency::Adopt {
             generation: self.generation,
             subagents: stored,
         };
@@ -208,11 +250,11 @@ impl CachedSession {
             Publication::Published { generation } if self.generation == *generation => {
                 Currency::Current
             }
-            Publication::Published { generation } if self.generation > *generation => newer(),
+            Publication::Published { generation } if self.generation > *generation => adopted(),
             // A copy before the row's own: the cache was rebuilt since.
             Publication::Published { .. } => Currency::Older,
             Publication::Unpublished { .. } if !holds_discovered => Currency::Older,
-            Publication::Unpublished { .. } => newer(),
+            Publication::Unpublished { .. } => adopted(),
         }))
     }
 

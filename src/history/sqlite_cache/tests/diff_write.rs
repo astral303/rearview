@@ -158,7 +158,10 @@ impl Fixture {
 }
 
 fn entries_of(record: &mut SessionRecord) -> &mut TranscriptEntries {
-    record.entries.as_mut().unwrap().as_mut().unwrap()
+    let Some(RecordEntries::Written(entries)) = &mut record.entries else {
+        panic!("the record writes its entries")
+    };
+    entries
 }
 
 /// Each stored row of `session` in `table` from `query`, whose `?1` is the

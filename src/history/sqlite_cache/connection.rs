@@ -147,9 +147,36 @@ pub(crate) mod test_hooks {
         base: &Path,
         on_failure: impl Fn() + Send + Sync + 'static,
     ) -> Installed {
+        at_the_first_data_commit(base, FirstDataCommit::Fails, on_failure)
+    }
+
+    /// Call `action` as the first commit to the session cache database in
+    /// `base` that changes session data lands, until the result drops.
+    pub(crate) fn run_at_the_first_data_commit(
+        base: &Path,
+        action: impl Fn() + Send + Sync + 'static,
+    ) -> Installed {
+        at_the_first_data_commit(base, FirstDataCommit::Lands, action)
+    }
+
+    /// The outcome of the first commit that changes session data.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FirstDataCommit {
+        Fails,
+        Lands,
+    }
+
+    /// Call `action` at the first commit to the session cache database in
+    /// `base` that changes session data, until the result drops. That commit
+    /// fails or lands as `commit` specifies.
+    fn at_the_first_data_commit(
+        base: &Path,
+        commit: FirstDataCommit,
+        action: impl Fn() + Send + Sync + 'static,
+    ) -> Installed {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let has_failed = Arc::new(AtomicBool::new(false));
-        let on_failure: Arc<dyn Fn() + Send + Sync> = Arc::new(on_failure);
+        let has_seen_first_data_commit = Arc::new(AtomicBool::new(false));
+        let action: Arc<dyn Fn() + Send + Sync> = Arc::new(action);
         on_every_connection(base, move |connection| {
             if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
                 return;
@@ -169,15 +196,15 @@ pub(crate) mod test_hooks {
             connection
                 .rollback_hook(Some(move || rolled_back.store(false, Ordering::SeqCst)))
                 .unwrap();
-            let (has_failed, on_failure) = (Arc::clone(&has_failed), Arc::clone(&on_failure));
+            let (has_seen, action) = (Arc::clone(&has_seen_first_data_commit), Arc::clone(&action));
             connection
                 .commit_hook(Some(move || {
-                    let fails = changes_data.swap(false, Ordering::SeqCst)
-                        && !has_failed.swap(true, Ordering::SeqCst);
-                    if fails {
-                        on_failure();
+                    let is_first = changes_data.swap(false, Ordering::SeqCst)
+                        && !has_seen.swap(true, Ordering::SeqCst);
+                    if is_first {
+                        action();
                     }
-                    fails
+                    is_first && commit == FirstDataCommit::Fails
                 }))
                 .unwrap();
         })

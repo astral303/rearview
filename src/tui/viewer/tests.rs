@@ -24,6 +24,7 @@ fn read_as_viewer(
             .expect("the load lists the row at its address"),
         &row.publication,
     ))
+    .conversation
 }
 
 /// The transcript at `file_path`, outside every agent's session roots, as

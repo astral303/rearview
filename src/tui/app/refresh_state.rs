@@ -83,10 +83,10 @@ impl ListEdit {
             SessionRead::Listed(row) => {
                 self.replaced.insert(index, *row);
             }
-            SessionRead::Missing | SessionRead::Empty => {
+            SessionRead::Missing | SessionRead::Empty(_) => {
                 self.removed.insert(index);
             }
-            SessionRead::Failed(_) | SessionRead::NotCached => {}
+            SessionRead::Failed(..) | SessionRead::NotCached => {}
         }
     }
 }
@@ -418,13 +418,12 @@ impl App {
                 entries,
             }) => {
                 state.conversation_source = Some(source);
-                let session_id = row.as_ref().map(|row| row.session_id.clone());
-                self.show_opened_file_row(row.map(|row| *row), is_first_read);
-                self.opened_file_entries = Some(entries.clone());
                 self.pending_view_reload = Some(ReloadedSession::parsed(
-                    crate::tui::viewer::parsed_conversation(entries),
-                    session_id,
+                    crate::tui::viewer::parsed_conversation(entries.clone()),
+                    row.as_deref(),
                 ));
+                self.show_opened_file_row(row.map(|row| *row), is_first_read);
+                self.opened_file_entries = Some(entries);
             }
             Err(error) if is_first_read => return Err(error),
             Err(_) if !path.exists() => self.set_status("Session not found".to_owned()),

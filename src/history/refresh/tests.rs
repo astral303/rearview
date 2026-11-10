@@ -91,9 +91,9 @@ impl Disk {
                     row.has_transient_read_error = true;
                     SessionRead::Listed(Box::new(row))
                 }
-                Content::Empty => SessionRead::Empty,
-                Content::TransientError => SessionRead::Failed(ReadError::Transient),
-                Content::PermanentError => SessionRead::Failed(ReadError::Permanent),
+                Content::Empty => SessionRead::Empty(None),
+                Content::TransientError => SessionRead::Failed(ReadError::Transient, None),
+                Content::PermanentError => SessionRead::Failed(ReadError::Permanent, None),
             };
             rediscovered
                 .outcomes

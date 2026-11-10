@@ -50,8 +50,13 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
     let mut record = parsed_record(session.row.source, &root, &stub_of(&session, 1));
-    let entries = record.entries.take().unwrap();
-    record.entries = Some(Err("temporary entry read failure".to_owned()));
+    let Some(RecordEntries::Written(entries)) = record.entries.take() else {
+        panic!("a parsed record writes its entries");
+    };
+    record.entries = Some(RecordEntries::Unwritten {
+        reason: "temporary entry read failure".to_owned(),
+        entries,
+    });
     cache.write(&record).unwrap();
 
     assert_eq!(
@@ -73,7 +78,10 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
         Err(AppError::SessionCacheNotReady { .. })
     ));
 
-    record.entries = Some(entries);
+    let Some(RecordEntries::Unwritten { entries, .. }) = record.entries.take() else {
+        unreachable!("the record was given unwritten entries above");
+    };
+    record.entries = Some(RecordEntries::Written(entries));
     cache.write(&record).unwrap();
     assert!(
         cache
@@ -102,7 +110,7 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     let root = root_of(&session);
     let old = parsed_record(session.row.source, &root, &stub_of(&session, 1));
     let mut new = parsed_record(session.row.source, &root, &stub_of(&session, 2));
-    new.entries = Some(Ok(message_schema::transcript(vec![
+    new.entries = Some(RecordEntries::Written(message_schema::transcript(vec![
         serde_json::json!({"type":"user","message":{"role":"user","content":"winning generation"}}),
     ])));
     let (previous, keys) = older.write_catalogue(&old, None).unwrap();
@@ -118,7 +126,7 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     assert_ne!(previous, replacement.id);
 
     let old_rows = entries::SessionRows::of(
-        old.entries.as_ref().unwrap().as_ref().unwrap(),
+        old.entries.as_ref().unwrap().written().unwrap(),
         &std::collections::HashSet::new(),
     );
     assert!(
@@ -141,7 +149,7 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
         new.entries
             .as_ref()
             .unwrap()
-            .as_ref()
+            .written()
             .unwrap()
             .entries
             .len()

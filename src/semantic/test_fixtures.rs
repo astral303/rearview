@@ -124,6 +124,7 @@ impl SemanticConversationFixture {
             parse_errors: Vec::new(),
             summary: self.summary,
             custom_title: self.custom_title,
+            external_title: None,
             model: None,
             total_tokens: 0,
             duration_minutes: None,

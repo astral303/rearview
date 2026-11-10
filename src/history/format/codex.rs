@@ -76,7 +76,7 @@ impl SessionFormat for CodexRolloutFormat {
         subagents: &[PathBuf],
     ) -> Result<Option<TranscriptEntries>> {
         let (thread, mut threads) = rayon::join(
-            || read_thread(permit.admit(), path, DroppedRecords::default()),
+            || read_thread(permit.admit(path), path, DroppedRecords::default()),
             || super::subagent_threads(self, permit, subagents),
         );
         let Some(thread) = thread? else {
@@ -111,7 +111,7 @@ impl TranscriptReader for CodexRolloutFormat {
         source: &Path,
         read: &TranscriptRead,
     ) -> Result<Resumption> {
-        permit.admit();
+        permit.admit(source);
         let (Some(stable_cursor), Ok(state)) = (
             LineCursor::decode(&read.stable_cursor),
             serde_json::from_slice::<RecordState>(&read.parser_state),
@@ -157,7 +157,7 @@ impl TranscriptReader for CodexRolloutFormat {
         source: &Path,
     ) -> Result<Option<SessionProjection>> {
         Ok(
-            read_thread(permit.admit(), source, DroppedRecords::default())?
+            read_thread(permit.admit(source), source, DroppedRecords::default())?
                 .map(|thread| thread.projection),
         )
     }
@@ -668,14 +668,15 @@ fn fold_delivered_final_answers(
 const FINAL_ANSWER_CALL: &str = "final_answer";
 
 /// The thread ending in the rollout at `path`, titled from the session index.
-/// `None` when the file is not a rollout. `_admitted` is the parse a permit
-/// admitted.
+/// `None` when the file is not a rollout. `admitted` is the read of `path` a
+/// permit admitted; each earlier rollout read takes its own admission.
 pub(crate) fn read_thread(
-    _admitted: Admitted,
+    admitted: Admitted,
     path: &Path,
     dropped: DroppedRecords,
 ) -> Result<Option<ThreadRead>> {
-    let Some(mut thread) = parse_thread(path, ParallelThreshold::DEFAULT, dropped)? else {
+    let Some(mut thread) = parse_thread(&admitted, path, ParallelThreshold::DEFAULT, dropped)?
+    else {
         return Ok(None);
     };
     let projection = &mut thread.projection;
@@ -917,8 +918,9 @@ fn read_opening(reader: &mut impl BufRead) -> Result<Option<RolloutOpening>> {
 
 /// The thread ending in the rollout at `path`: its earlier rollouts, oldest
 /// first, each up to where the next continues it, then `path`. `None` when the
-/// file is not a rollout.
+/// file is not a rollout. `admitted` is the read of `path`.
 fn parse_thread(
+    admitted: &Admitted,
     path: &Path,
     parallel: ParallelThreshold,
     dropped: DroppedRecords,
@@ -928,7 +930,7 @@ fn parse_thread(
         return Ok(None);
     };
     let mut thread = ThreadProjection::new(&opening.header, dropped);
-    thread.read_earlier_rollouts(earlier_rollouts(path, &opening.header), parallel);
+    thread.read_earlier_rollouts(admitted, earlier_rollouts(path, &opening.header), parallel);
     let newest = thread.read_newest(&opening, &mut reader, opening.records_start, parallel)?;
     let transcript_read = if opening.can_resume() {
         newest.transcript_read(&opening, reader.get_mut())?
@@ -1037,11 +1039,18 @@ impl ThreadProjection {
     }
 
     /// A rollout that fails to read ends the chain, as a missing one does:
-    /// drop the turns read so far, and read the newer rollouts.
-    fn read_earlier_rollouts(&mut self, earlier: EarlierRollouts, parallel: ParallelThreshold) {
+    /// drop the turns read so far, and read the newer rollouts. Each rollout
+    /// read is admitted as a file the read `admitted` names reads.
+    fn read_earlier_rollouts(
+        &mut self,
+        admitted: &Admitted,
+        earlier: EarlierRollouts,
+        parallel: ParallelThreshold,
+    ) {
         self.earlier_turns = earlier.earlier_turns;
         for rollout in earlier.rollouts {
-            if let Err(unread) = self.read_earlier(&rollout, parallel) {
+            let read = self.read_earlier(admitted.admit_linked(&rollout.path), &rollout, parallel);
+            if let Err(unread) = read {
                 self.entries.clear();
                 self.state.last_shown = LastShown::default();
                 self.started = None;
@@ -1053,6 +1062,7 @@ impl ThreadProjection {
         let discarded = &mut self.discarded_turn_subagents;
         discarded.has_transient_error |= earlier.has_transient_error;
         for rollout in earlier.outside_chain {
+            let _rollout_read = admitted.admit_linked(&rollout.path);
             match File::open(&rollout.path) {
                 Ok(file) => discarded.record_spawns_in(BufReader::new(file), rollout.replaced_at),
                 Err(error) => discarded.record_read_error(error),
@@ -1065,9 +1075,10 @@ impl ThreadProjection {
     /// prompt discarded those turns. Fails with
     /// [`EarlierTurns::TransientError`] after a transient error, and
     /// [`EarlierTurns::Missing`] after a permanent one or when the offset cuts
-    /// the header.
+    /// the header. `_admitted` is the rollout's admitted read.
     fn read_earlier(
         &mut self,
+        _admitted: Admitted,
         rollout: &EarlierRollout,
         parallel: ParallelThreshold,
     ) -> std::result::Result<(), EarlierTurns> {
@@ -4195,6 +4206,24 @@ mod tests {
     }
 
     #[test]
+    fn whole_read_of_thread_edited_twice_admits_each_rollout_once() {
+        use crate::history::sqlite_cache::admitted_reads;
+        let home = tempfile::tempdir().unwrap();
+        let thread = edited_thread(home.path());
+        let rollouts = [&thread.root, &thread.first_edit, &thread.second_edit];
+        let before = rollouts.map(|rollout| admitted_reads::count(rollout));
+
+        parsed(&thread.second_edit);
+
+        let reads: Vec<usize> = rollouts
+            .iter()
+            .zip(before)
+            .map(|(rollout, before)| admitted_reads::count(rollout) - before)
+            .collect();
+        assert_eq!(reads, [1, 1, 1], "the admitted reads of each rollout");
+    }
+
+    #[test]
     fn rollout_not_found_after_transient_listing_error_is_transient() {
         let index = RolloutIndex {
             has_transient_error: true,
@@ -4253,7 +4282,11 @@ mod tests {
         let mut thread_projection =
             ThreadProjection::new(&header(&thread.second_edit), DroppedRecords::default());
 
-        thread_projection.read_earlier_rollouts(earlier, ParallelThreshold::DEFAULT);
+        thread_projection.read_earlier_rollouts(
+            &crate::history::FOR_FIXTURES.admit(&thread.second_edit),
+            earlier,
+            ParallelThreshold::DEFAULT,
+        );
         let projection = thread_projection
             .finish(header(&thread.second_edit), TranscriptRead::full_read())
             .projection;
@@ -4669,7 +4702,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let thread = test_support::write_edited_thread_with_subagents(home.path(), PARENT_THREAD);
         let read = read_thread(
-            crate::history::FOR_FIXTURES.admit(),
+            crate::history::FOR_FIXTURES.admit(&thread.newest),
             &thread.newest,
             DroppedRecords::default(),
         )
@@ -5000,10 +5033,15 @@ mod tests {
 
         /// The thread ending in the rollout at `path`, read whole.
         fn read_whole(path: &Path) -> SessionProjection {
-            parse_thread(path, ParallelThreshold::DEFAULT, DroppedRecords::default())
-                .unwrap()
-                .expect("a rollout")
-                .projection
+            parse_thread(
+                &crate::history::FOR_FIXTURES.admit(path),
+                path,
+                ParallelThreshold::DEFAULT,
+                DroppedRecords::default(),
+            )
+            .unwrap()
+            .expect("a rollout")
+            .projection
         }
 
         /// The rollout at `path`, changed since `stored`, read on from it.
@@ -5098,10 +5136,13 @@ mod tests {
                 for split in record_splits(&bytes) {
                     let name = format!("{} at {split}", fixture.display());
                     std::fs::write(&path, &bytes[..split]).unwrap();
-                    let Some(prefix) =
-                        parse_thread(&path, ParallelThreshold::DEFAULT, DroppedRecords::default())
-                            .unwrap()
-                    else {
+                    let Some(prefix) = parse_thread(
+                        &crate::history::FOR_FIXTURES.admit(&path),
+                        &path,
+                        ParallelThreshold::DEFAULT,
+                        DroppedRecords::default(),
+                    )
+                    .unwrap() else {
                         continue;
                     };
                     let prefix = prefix.projection;

@@ -526,7 +526,11 @@ impl SessionStorage for CodexStorage {
         if let Some(database) = state_database_beside_sessions_tree(&root.path) {
             SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
         }
-        let thread = codex::read_thread(permit.admit(), &stub.locator, DroppedRecords::default())?;
+        let thread = codex::read_thread(
+            permit.admit(&stub.locator),
+            &stub.locator,
+            DroppedRecords::default(),
+        )?;
         let discarded = thread
             .as_ref()
             .map(|thread| {
@@ -2112,31 +2116,72 @@ pub(super) mod tests {
             &canonicalised_by_opening(storage, &printout_of(Source::Codex, &canonical_session)),
             &expected.printout(),
         );
-        let direct_open = [
-            (sessions.as_path(), "the TUI's open: the sessions root"),
-            (
-                archived.as_path(),
-                "the TUI's open: the archived tree beside it",
-            ),
-        ];
-        assert_canonicalised(
-            &canonicalised_by_opening(storage, &direct_open_of(&written.session)),
-            &direct_open,
+        let direct_open = |typed: &Path| {
+            assert_canonicalised(
+                &canonicalised_by_opening(storage, &direct_open_of(typed, "alpha")),
+                &[
+                    (typed, "the TUI's open: the typed path"),
+                    (sessions.as_path(), "the TUI's open: the sessions root"),
+                    (
+                        archived.as_path(),
+                        "the TUI's open: the archived tree beside it",
+                    ),
+                ],
+            )
+        };
+        direct_open(&written.session);
+        direct_open(&canonical_session);
+    }
+
+    /// The same session read by `agent read` on an empty cache:
+    /// key discovery caches the session to key it, below the roots it
+    /// canonicalised, and the command reads that parse, so each root is
+    /// canonicalised once.
+    #[test]
+    fn session_with_archived_rollouts_read_on_empty_cache_canonicalises_each_root_once() {
+        use crate::history::environment::test_support::{
+            agent_read_of, canonicalised_by_opening_on_empty_cache,
+        };
+        use crate::history::provider::walk::test_support::assert_canonicalised;
+        let home = tempfile::tempdir().unwrap();
+        let written = codex::test_support::write_session_with_archived_bases(
+            home.path(),
+            THREAD,
+            SUBAGENT_THREAD,
         );
+        let sessions = home.path().join("sessions");
+        let archived = home.path().join("archived_sessions");
+
         assert_canonicalised(
-            &canonicalised_by_opening(storage, &direct_open_of(&canonical_session)),
-            &direct_open,
+            &canonicalised_by_opening_on_empty_cache(
+                storage_under(home.path()),
+                &agent_read_of(&written.session),
+            ),
+            &[
+                (sessions.as_path(), "key discovery: the sessions root"),
+                (
+                    archived.as_path(),
+                    "key discovery: the archived tree beside it",
+                ),
+                (
+                    Path::new("/tmp/project"),
+                    "key discovery: the session's recorded project directory",
+                ),
+            ],
         );
     }
 
     /// A row a load listed before Codex created its archived tree, read
     /// after another rearview cached a copy whose earlier rollouts Codex
     /// archived since: the viewer finds that copy missing at the row's
-    /// address and asks for a refresh, and the refreshed row's viewer,
-    /// agent `read` and printout read the archived turns.
+    /// address and asks for a refresh, which the session-refresh worker runs,
+    /// and the viewer, agent `read` and printout then read the archived turns.
     #[test]
     fn live_row_reads_copy_naming_archived_tree_created_after_its_load_once_refreshed() {
         use crate::history::environment::test_support::{load_rows_in, test_environment};
+        use crate::tui::claude_home::{
+            recover_viewer, viewer_lacks_copy, viewer_over, viewer_text,
+        };
         let home = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
         let written = codex::test_support::write_session_with_archived_bases(
@@ -2167,21 +2212,18 @@ pub(super) mod tests {
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
             .unwrap();
         load_rows_in(&test_environment(vec![storage], Some(base.path())), storage);
-        let address = row.cache_address.as_ref().unwrap();
 
-        let viewed = crate::history::display_log_entries_interactively(
-            &crate::history::InteractiveCache::at(environment.cache_base().clone()),
-            address,
-            &row.publication,
+        let mut viewer = viewer_over(row, environment.clone());
+        assert!(
+            viewer_lacks_copy(&viewer),
+            "the copy naming a root the row's address lacks reads as missing"
         );
-        let next = match viewed.into_read() {
-            crate::history::CachedRead::Missing { next } => next,
-            _ => panic!("the copy naming a root the row's address lacks reads as missing"),
-        };
-        assert_eq!(
-            next,
-            crate::history::sqlite_cache::NextStep::CacheInBackground,
-            "the viewer asks for a refresh of the session"
+        recover_viewer(&mut viewer);
+        let viewed = viewer_text(&viewer);
+        drop(viewer);
+        assert!(
+            viewed.contains("alpha"),
+            "the viewer shows the archived rollouts' turns once its refresh ran: {viewed}"
         );
         let refreshed = load_rows_in(&environment, storage)
             .into_iter()

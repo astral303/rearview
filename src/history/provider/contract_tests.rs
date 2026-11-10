@@ -1146,7 +1146,7 @@ fn subagent_lists(fixture: &dyn ProviderFixture, resolved: &ResolvedSession) -> 
 fn reads_as_parsed(read: &SessionRead, lists: bool) -> bool {
     matches!(
         (lists, read),
-        (true, SessionRead::Listed(_)) | (false, SessionRead::Empty)
+        (true, SessionRead::Listed(_)) | (false, SessionRead::Empty(_))
     )
 }
 
@@ -1691,12 +1691,14 @@ fn reads_of_listed_row_dont_canonicalise_a_path() {
 }
 
 /// `agent read` and the printout of a session by its path, from a cache its
-/// own load filled, canonicalise each root once: `agent read`'s refresh
-/// reads below the roots its key discovery canonicalised. Each agent's
-/// fixture has one root. Kimi's legacy second root and Codex's archived
-/// rollouts have tests of their own in those agents' modules.
+/// own load filled, canonicalise the paths `OpeningCanonicalisations` lists
+/// for each route. `agent read`'s refresh reads below the roots its key
+/// discovery canonicalised, and canonicalises again a directory beside the
+/// root that key discovery could not canonicalise. Each agent's fixture has
+/// one root. Kimi's legacy second root and Codex's archived rollouts have
+/// tests of their own in those agents' modules.
 #[test]
-fn reads_of_session_by_path_canonicalise_each_root_once_per_route() {
+fn reads_of_session_by_path_canonicalise_roots_and_recorded_and_transcript_directories() {
     use crate::history::environment::test_support::{
         agent_read_of, canonicalised_by_opening, printout_of,
     };

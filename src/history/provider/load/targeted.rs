@@ -632,8 +632,9 @@ impl SessionLoader<'_> {
     /// database when it holds the session as it is now, the others parsed
     /// from their transcripts, in writer-locked groups while the refresh
     /// owner is live, and written to the database. A whole parse whose copy
-    /// does not hold its entries keeps them on its outcome; a resumed read
-    /// whose write fails reads as the stored copy. A read of the cache as it
+    /// does not hold its entries keeps them on its outcome, as does the
+    /// parse of a session without a row; a resumed read whose write fails
+    /// reads as the stored copy. A read of the cache as it
     /// is, and every session left once the owner is no longer live, parses
     /// nothing: see [`Self::cached_copy`].
     fn read_stubs_attempt(
@@ -716,10 +717,11 @@ impl SessionLoader<'_> {
                 let stamps = writes_database.then(|| StubStamps::current(stub));
                 let (raw, transcripts) = self.parse(permit, root, stub, &|| {});
                 let record = match stamps {
-                    Some(stamps) => self.reported_record(
-                        stub,
-                        cache_record(&place, stub, stamps, &raw, transcripts),
-                    ),
+                    Some(stamps) => {
+                        cache_record(&place, stub, stamps, &raw, transcripts, &|error| {
+                            self.report_unbuilt_record(stub, error)
+                        })
+                    }
                     None => ParseRecord::without_database(&raw, transcripts),
                 };
                 SessionParse::Whole(Box::new(raw), record)
@@ -748,7 +750,7 @@ impl SessionLoader<'_> {
                     reads.push(match parsed {
                         SessionParse::Whole(raw, record) => {
                             let (generation, unwritten_entries) = match record {
-                                ParseRecord::Record(Some(record)) => {
+                                ParseRecord::Record(record) => {
                                     let generation = write(&mut database, &record);
                                     let is_written =
                                         generation.is_some() && record.writes_its_entries();
@@ -756,20 +758,24 @@ impl SessionLoader<'_> {
                                         (!is_written).then(|| record.into_parsed_entries());
                                     (generation, unwritten.flatten())
                                 }
-                                ParseRecord::Record(None) => (None, None),
-                                ParseRecord::Unbuilt(unbuilt) => (None, Some(unbuilt.entries)),
+                                ParseRecord::NotRecorded => (None, None),
+                                ParseRecord::Unbuilt(entries) => (None, Some(entries)),
                             };
-                            let raw = match (*raw, generation) {
+                            let mut raw = match (*raw, generation) {
                                 (RawRead::Parsed(row), Some(generation)) => {
                                     RawRead::Parsed(published_at(row, generation))
                                 }
                                 (raw, _) => raw,
                             };
+                            let unwritten = match unwritten_entries {
+                                Some(entries) => UnwrittenParse::Entries(entries),
+                                None => raw.take_unlisted_parse(),
+                            };
                             AttemptRead {
-                                outcome: SessionOutcome::settled_with_unwritten_entries(
+                                outcome: SessionOutcome::settled_with_unwritten(
                                     stub,
                                     self.session_read(&place, stub, raw),
-                                    unwritten_entries,
+                                    unwritten,
                                 ),
                                 is_current: generation.is_some(),
                             }

@@ -888,9 +888,9 @@ impl App {
                 Some(SessionLookup::Loading(path))
             }
             SessionRead::Listed(_)
-            | SessionRead::Empty
+            | SessionRead::Empty(_)
             | SessionRead::Missing
-            | SessionRead::Failed(_) => None,
+            | SessionRead::Failed(..) => None,
         }
     }
 

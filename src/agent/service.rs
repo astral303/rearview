@@ -445,9 +445,6 @@ pub struct AgentService {
     /// The stale sessions the command has met so far; the command prints
     /// them in one record when it renders.
     stale_coverage: RefCell<Option<StaleCoverage>>,
-    /// Each agent's roots as the command's key discovery canonicalised them;
-    /// empty until it runs. The command's refresh reads below them.
-    key_roots: RefCell<HashMap<history::Source, Vec<history::provider::SessionRoot>>>,
     perf: CommandPerf,
     environment: history::Environment,
 }
@@ -534,6 +531,10 @@ impl HeldTargets {
         self.0.into_values()
     }
 
+    fn holds(&self, target: &agent::refs::AgentConversationKey) -> bool {
+        self.0.contains_key(&target.path)
+    }
+
     /// The held key of `target`, a session the cache was held for.
     fn of_target(
         &self,
@@ -557,7 +558,6 @@ struct CheckedTargets {
 }
 
 impl CheckedTargets {
-    /// Adds `checked`, one target's check.
     fn add(&mut self, checked: TargetCopy) {
         match checked {
             TargetCopy::Current(key) => self.held.keep(key),
@@ -578,8 +578,7 @@ impl CheckedTargets {
         self.stale_copies.contains_key(path) || self.missing_copies.contains(path)
     }
 
-    /// These targets, with `retried`, a later check of some of them, in
-    /// place of this check of those.
+    /// These targets, with `retried` in place of their earlier check.
     fn with_retried(mut self, retried: Self) -> Self {
         for key in retried.held.into_keys() {
             self.stale_copies.remove(&key.path);
@@ -595,7 +594,7 @@ impl CheckedTargets {
 /// A target's key, as [`AgentService::check_target_copy`] checks it against
 /// its copy.
 enum TargetCopy {
-    /// The copy is current for the key, the key adopted a newer copy, or
+    /// The copy is current for the key, the key adopted another copy, or
     /// the command holds the target's transcript.
     Current(agent::refs::AgentConversationKey),
     /// The copy is older than the key.
@@ -607,6 +606,46 @@ enum TargetCopy {
     Missing(agent::refs::AgentConversationKey),
 }
 
+/// The rule a copy's currency for a key is decided by.
+type CopyCurrency = fn(
+    &history::sqlite_cache::CachedSession,
+    &history::sqlite_cache::Publication,
+) -> Result<Option<history::sqlite_cache::Currency>>;
+
+/// A targeted read of one session as a command keeps it for its key and
+/// its reads: without the listed row's texts.
+enum TargetRead {
+    /// The read listed the session: the row's address, sub-agents and
+    /// publication of its copy.
+    Listed {
+        address: history::sqlite_cache::SessionAddress,
+        subagents: Vec<PathBuf>,
+        publication: history::sqlite_cache::Publication,
+        unwritten: history::provider::UnwrittenParse,
+    },
+    /// The read did not list the session.
+    Unlisted {
+        read: history::provider::SessionRead,
+        unwritten: history::provider::UnwrittenParse,
+    },
+}
+
+impl TargetRead {
+    fn of(outcome: history::provider::SessionOutcome) -> Self {
+        match outcome.into_read_and_unwritten() {
+            (history::provider::SessionRead::Listed(row), unwritten) => Self::Listed {
+                address: row
+                    .cache_address
+                    .expect("a row a targeted read lists has its cache address"),
+                subagents: row.subagents,
+                publication: row.publication,
+                unwritten,
+            },
+            (read, unwritten) => Self::Unlisted { read, unwritten },
+        }
+    }
+}
+
 impl AgentService {
     pub fn new(environment: history::Environment) -> Self {
         let environment = environment.for_one_command();
@@ -614,7 +653,6 @@ impl AgentService {
             transcripts: RefCell::default(),
             bounded_transcripts: RefCell::default(),
             stale_coverage: RefCell::default(),
-            key_roots: RefCell::default(),
             perf: CommandPerf::new(Arc::clone(environment.clock())),
             environment,
         }
@@ -622,13 +660,11 @@ impl AgentService {
 
     /// Every agent's keys, discovered under `operation` as
     /// [`discover_agent_keys`] discovers them, and timed as the command's
-    /// key stage. Keeps the agents' roots for the command's refresh.
+    /// key stage.
     fn discover_keys(&self, operation: &history::OperationScope) -> Result<DiscoveredKeys> {
-        let discovered = self.perf.time(Stage::Keys, || {
+        self.perf.time(Stage::Keys, || {
             discover_agent_keys(&self.environment, self.perf.load_meter(), operation)
-        })?;
-        self.key_roots.replace(discovered.roots.clone());
-        Ok(discovered)
+        })
     }
 
     /// Adds `coverage`'s sessions to the command's stale sessions.
@@ -659,15 +695,18 @@ impl AgentService {
     /// it, the command waits for ownership and refreshes again each target
     /// it neither published nor parsed: only the owner parses transcripts.
     /// Once the command's own writes stop, it does not refresh again, and a
-    /// missing target reads as missing from the cache.
+    /// missing target is reported as not in the session cache. The refresh
+    /// reads below `reads`' roots and does not read again a target in
+    /// `reads`.
     fn hold_cache_for_reading(
         &self,
         operation: history::OperationScope,
         targets: &[&agent::refs::AgentConversationKey],
         keys: &[agent::refs::AgentConversationKey],
         window: &TimeFilter,
+        mut reads: KeyedReads,
     ) -> Result<(history::OperationScope, HeldTargets)> {
-        let checked = self.refresh_and_check_targets(&operation, targets)?;
+        let checked = self.refresh_and_check_targets(&operation, targets, &mut reads)?;
         let waits_for_another_rearview = !checked.missing_copies.is_empty()
             && operation.stale_cause() == history::StaleCause::AnotherRearview;
         let (operation, checked) = if waits_for_another_rearview {
@@ -685,7 +724,7 @@ impl AgentService {
             for target in &retried {
                 self.transcripts.borrow_mut().remove(&target.path);
             }
-            let rechecked = self.refresh_and_check_targets(&waiting, &retried)?;
+            let rechecked = self.refresh_and_check_targets(&waiting, &retried, &mut reads)?;
             (waiting, checked.with_retried(rechecked))
         } else {
             (operation, checked)
@@ -702,50 +741,75 @@ impl AgentService {
     }
 
     /// The keys of `targets`, each checked against its copy as
-    /// [`Self::check_target_copy`] checks it. As `operation`'s refresh owner,
-    /// the command brings each target's copy up to date first; a target
-    /// whose copy the refresh published is not checked.
+    /// [`Self::check_target_copy`] checks it. A target key discovery read
+    /// keeps that read, from `keyed`, whatever the command's access now. As
+    /// `operation`'s refresh owner, the command brings each other target's
+    /// copy up to date first, reading each distinct session once whatever
+    /// the number of targets naming it. A target this command read is
+    /// checked as [`history::sqlite_cache::CachedSession::currency_for_publisher`]
+    /// checks it, as the printout checks its copy; one it reads as the
+    /// cache holds it, against its transcripts.
     fn refresh_and_check_targets(
         &self,
         operation: &history::OperationScope,
         targets: &[&agent::refs::AgentConversationKey],
+        keyed: &mut KeyedReads,
     ) -> Result<CheckedTargets> {
-        let mut checked = CheckedTargets::default();
-        let unchecked: Vec<agent::refs::AgentConversationKey> = match operation.acquire_access()? {
-            history::sqlite_cache::OperationAccess::Owner(_) => {
-                let (published, unpublished) = self
-                    .refresh_targets(targets, operation)?
-                    .into_keys()
-                    .partition(|key| {
-                        matches!(
-                            key.publication,
-                            history::sqlite_cache::Publication::Published { .. }
-                        )
-                    });
-                for key in published {
-                    checked.held.keep(key);
-                }
-                unpublished
+        let mut held = HeldTargets::default();
+        let mut unread: Vec<&agent::refs::AgentConversationKey> = Vec::new();
+        for &target in targets {
+            if held.holds(target) || unread.iter().any(|kept| kept.path == target.path) {
+                continue;
             }
+            match keyed.sessions.remove(&target.path) {
+                Some(read) => held.keep(self.hold_read(operation, target, read)?),
+                None => unread.push(target),
+            }
+        }
+        let unchecked: Vec<agent::refs::AgentConversationKey> = match operation.acquire_access()? {
+            history::sqlite_cache::OperationAccess::Owner(_) if !unread.is_empty() => {
+                self.perf.record_refresh_round(unread.len());
+                let refreshed = self.perf.time(Stage::Refresh, || {
+                    self.refresh_targets(&unread, operation, keyed)
+                })?;
+                for key in refreshed {
+                    held.keep(key);
+                }
+                Vec::new()
+            }
+            history::sqlite_cache::OperationAccess::Owner(_) => Vec::new(),
             history::sqlite_cache::OperationAccess::AsIs => {
-                targets.iter().map(|target| (*target).clone()).collect()
+                unread.iter().map(|target| (*target).clone()).collect()
             }
         };
+        let mut checked = CheckedTargets::default();
+        for key in held.into_keys() {
+            checked.add(self.check_target_copy(
+                operation,
+                key,
+                history::sqlite_cache::CachedSession::currency_for_publisher,
+            )?);
+        }
         for target in unchecked {
-            checked.add(self.check_target_copy(operation, target)?);
+            checked.add(self.check_target_copy(
+                operation,
+                target,
+                history::sqlite_cache::CachedSession::currency,
+            )?);
         }
         Ok(checked)
     }
 
-    /// `target` checked against its copy for its key, without parsing. A
-    /// newer copy is read as current: the key adopts its generation and
-    /// sub-agents. An older copy is read as it is, once, and kept for the
-    /// command's reads. A target whose transcript the command holds is not
-    /// checked.
+    /// `target` checked against its copy for its key by `currency`, without
+    /// parsing. A copy to adopt is read as current: the key uses its
+    /// generation and sub-agents. An older copy is read as it is, once, and
+    /// kept for the command's reads. A target whose transcript the command
+    /// holds is not checked.
     fn check_target_copy(
         &self,
         operation: &history::OperationScope,
         mut target: agent::refs::AgentConversationKey,
+        currency: CopyCurrency,
     ) -> Result<TargetCopy> {
         if self.transcripts.borrow().contains_key(&target.path) {
             return Ok(TargetCopy::Current(target));
@@ -753,11 +817,11 @@ impl AgentService {
         let base = self.environment.cache_base();
         let currency = operation.read_when_unlocked(|| {
             history::sqlite_cache::find_cached_copy_without_waiting(base, &target.address)?
-                .map_or(Ok(None), |copy| copy.currency(&target.publication))
+                .map_or(Ok(None), |copy| currency(&copy, &target.publication))
         })?;
         Ok(match currency {
             Some(history::sqlite_cache::Currency::Current) => TargetCopy::Current(target),
-            Some(history::sqlite_cache::Currency::Newer {
+            Some(history::sqlite_cache::Currency::Adopt {
                 generation,
                 subagents,
             }) => {
@@ -783,103 +847,110 @@ impl AgentService {
         })
     }
 
-    /// Brings the copy of each of `targets` up to date as `operation`'s
-    /// refresh owner, one targeted read per agent, and returns the targets'
-    /// keys: a target the refresh lists is kept at its refreshed row's
-    /// address, sub-agents and publication. The entries the refresh parsed
-    /// and its copy does not hold are kept for the command's reads. A target
-    /// the refresh doesn't list, such as an empty session, doesn't have a
-    /// copy: its transcript is read now, under the ownership, and kept for
-    /// the command's reads.
+    /// The keys of `targets`, distinct sessions, each copy brought up to
+    /// date as `operation`'s refresh owner, one targeted read per agent
+    /// below `keyed`'s roots, and held as [`Self::hold_read`] holds its read.
     fn refresh_targets(
         &self,
         targets: &[&agent::refs::AgentConversationKey],
         operation: &history::OperationScope,
-    ) -> Result<HeldTargets> {
-        let mut held = HeldTargets::default();
+        keyed: &KeyedReads,
+    ) -> Result<Vec<agent::refs::AgentConversationKey>> {
         let mut sources: Vec<history::Source> = Vec::new();
         for target in targets {
             if !sources.contains(&target.source) {
                 sources.push(target.source);
             }
         }
+        let mut held = Vec::with_capacity(targets.len());
         for source in sources {
-            let mut of_source: Vec<&agent::refs::AgentConversationKey> = Vec::new();
-            for target in targets.iter().filter(|target| target.source == source) {
-                if !of_source.iter().any(|kept| kept.path == target.path) {
-                    of_source.push(target);
-                }
-            }
+            let of_source: Vec<&agent::refs::AgentConversationKey> = targets
+                .iter()
+                .copied()
+                .filter(|target| target.source == source)
+                .collect();
             let paths: Vec<&Path> = of_source
                 .iter()
                 .map(|target| target.path.as_path())
                 .collect();
-            let key_roots = self.key_roots.borrow().get(&source).map(|roots| {
-                roots
-                    .iter()
-                    .map(history::provider::SessionRoot::forgetting_failed_canonicalisations)
-                    .collect()
-            });
-            let meter = self.perf.load_meter().agent(source);
-            let outcomes = match key_roots {
-                Some(roots) => history::provider::cache_sessions_in_roots(
-                    &self.environment,
-                    source,
-                    roots,
-                    &paths,
-                    false,
-                    operation,
-                    meter,
-                )?,
-                None => history::provider::cache_sessions(
-                    &self.environment,
-                    source,
-                    &paths,
-                    false,
-                    operation,
-                    meter,
-                )?,
-            };
-            let mut listed: HashMap<
-                PathBuf,
-                (history::Conversation, Option<history::TranscriptEntries>),
-            > = outcomes
-                .into_iter()
-                .filter_map(|outcome| {
-                    let path = outcome.locator().to_path_buf();
-                    match outcome.into_read_and_unwritten_entries() {
-                        (history::provider::SessionRead::Listed(row), unwritten) => {
-                            Some((path, (*row, unwritten)))
-                        }
-                        _ => None,
-                    }
-                })
-                .collect();
-            for target in of_source {
-                let Some((row, unwritten_entries)) = listed.remove(&target.path) else {
-                    if let Some(permit) = operation.acquire_ownership_and_parse_permit()? {
-                        self.keep_uncached_transcript(permit, target);
-                    }
-                    held.keep((*target).clone());
-                    continue;
-                };
-                let Some(address) = row.cache_address else {
-                    held.keep((*target).clone());
-                    continue;
-                };
-                let key = agent::refs::AgentConversationKey {
-                    address,
-                    subagents: row.subagents,
-                    publication: row.publication,
-                    ..(*target).clone()
-                };
-                if let Some(entries) = unwritten_entries {
-                    self.keep_parsed_transcript(&key, entries);
-                }
-                held.keep(key);
+            let outcomes = self.read_targets_of(source, &paths, operation, keyed)?;
+            for (target, outcome) in of_source.into_iter().zip(outcomes) {
+                held.push(self.hold_read(operation, target, TargetRead::of(outcome))?);
             }
         }
         Ok(held)
+    }
+
+    /// `target`'s key as `read`, this command's read of its session, left
+    /// it. A target the read lists is kept at its row's address, sub-agents
+    /// and publication, and the entries the read parsed and its copy does
+    /// not hold are kept for the command's reads. A target the read doesn't
+    /// list, such as an empty session, doesn't have a copy:
+    /// [`Self::keep_unlisted_read`] keeps what the read found of it.
+    fn hold_read(
+        &self,
+        operation: &history::OperationScope,
+        target: &agent::refs::AgentConversationKey,
+        read: TargetRead,
+    ) -> Result<agent::refs::AgentConversationKey> {
+        match read {
+            TargetRead::Listed {
+                address,
+                subagents,
+                publication,
+                unwritten,
+            } => {
+                let key = agent::refs::AgentConversationKey {
+                    address,
+                    subagents,
+                    publication,
+                    ..target.clone()
+                };
+                if let history::provider::UnwrittenParse::Entries(entries) = unwritten {
+                    self.keep_parsed_transcript(&key, entries);
+                }
+                Ok(key)
+            }
+            TargetRead::Unlisted { read, unwritten } => {
+                self.keep_unlisted_read(operation, target, read, unwritten)?;
+                Ok(target.clone())
+            }
+        }
+    }
+
+    /// The targeted read of `source`'s sessions at `paths`, one outcome
+    /// each, below the roots key discovery canonicalised, as `keyed` holds
+    /// them, or below the storage's roots without them.
+    fn read_targets_of(
+        &self,
+        source: history::Source,
+        paths: &[&Path],
+        operation: &history::OperationScope,
+        keyed: &KeyedReads,
+    ) -> Result<Vec<history::provider::SessionOutcome>> {
+        let meter = self.perf.load_meter().agent(source);
+        match keyed.roots.get(&source) {
+            Some(roots) => history::provider::cache_sessions_in_roots(
+                &self.environment,
+                source,
+                roots
+                    .iter()
+                    .map(history::provider::SessionRoot::forgetting_failed_canonicalisations)
+                    .collect(),
+                paths,
+                false,
+                operation,
+                meter,
+            ),
+            None => history::provider::cache_sessions(
+                &self.environment,
+                source,
+                paths,
+                false,
+                operation,
+                meter,
+            ),
+        }
     }
 
     /// Keeps `entries`, the entries a refresh parsed of `key`'s session and
@@ -899,24 +970,66 @@ impl AgentService {
             .insert(key.path.clone(), transcript);
     }
 
-    /// Reads `key`'s transcript with the refresh owner's `permit`, for a
-    /// target the refresh read without listing it: an empty session, a
-    /// failed read, or a file discovery doesn't find. Keeps it for the
-    /// command's reads.
-    fn keep_uncached_transcript(
+    /// Keeps the transcript of `key`'s session, which the refresh read as
+    /// `read` without listing it, for the command's reads: the entries its
+    /// parse read, or the failure its warning reports for a file the parse
+    /// rejected or could not read. The refresh owner parses the transcript,
+    /// under `operation`, of an empty session restored from the cache, which
+    /// does not store its entries, and of a file discovery doesn't find.
+    /// Without ownership, such a session fails as its warning reports, or
+    /// is reported as not in the session cache. A session missing from the
+    /// cache, or one a failed discovery kept from being read, does not keep
+    /// a transcript and is reported as not in the session cache.
+    fn keep_unlisted_read(
         &self,
-        permit: history::ParsePermit<'_>,
+        operation: &history::OperationScope,
         key: &agent::refs::AgentConversationKey,
-    ) {
+        read: history::provider::SessionRead,
+        parsed: history::provider::UnwrittenParse,
+    ) -> Result<()> {
+        use history::provider::{SessionRead, UnwrittenParse};
+        let reference = key.path.to_string_lossy();
+        let keep_failure = |warning: &AgentWarning| {
+            if let Some(failure) = AgentError::of_read_warning(warning, &reference) {
+                self.transcripts
+                    .borrow_mut()
+                    .insert(key.path.clone(), Err(failure));
+            }
+        };
+        let warning = match (&read, parsed) {
+            (_, UnwrittenParse::Entries(entries)) => {
+                self.keep_parsed_transcript(key, entries);
+                return Ok(());
+            }
+            (SessionRead::Failed(_, Some(warning)), _)
+            | (SessionRead::Empty(Some(warning)), UnwrittenParse::Rejected) => {
+                keep_failure(warning);
+                return Ok(());
+            }
+            (SessionRead::Empty(warning), _) => warning.as_ref(),
+            (SessionRead::Missing, _) => None,
+            (SessionRead::Listed(_) | SessionRead::Failed(_, None) | SessionRead::NotCached, _) => {
+                return Ok(());
+            }
+        };
         if self.transcripts.borrow().contains_key(&key.path) {
-            return;
+            return Ok(());
         }
-        let parsed = self
-            .perf
-            .time_transcript_parse(key, || parse_uncached_transcript(permit, key));
+        let parsed = match operation.acquire_ownership_and_parse_permit()? {
+            Some(permit) => self
+                .perf
+                .time_transcript_parse(key, || parse_uncached_transcript(permit, key)),
+            None => {
+                if let Some(warning) = warning {
+                    keep_failure(warning);
+                }
+                return Ok(());
+            }
+        };
         self.transcripts
             .borrow_mut()
             .insert(key.path.clone(), parsed);
+        Ok(())
     }
 
     /// `key`'s transcript as the session cache holds it.
@@ -1278,16 +1391,17 @@ impl AgentService {
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let DiscoveredKeys {
             keys,
-            directory_warnings: mut warnings,
-            ..
+            mut warnings,
+            reads,
         } = self.discover_keys(&operation)?;
         let resolved = resolve_agent_conversation_arg(
             &args.conversation,
             &keys,
             self.environment.shared_canonicaliser(),
-        )?;
+        )
+        .map_err(|error| failure_after_warnings(error, &warnings))?;
         let (operation, targets) =
-            self.hold_cache_for_reading(operation, &[&resolved.key], &keys, &window)?;
+            self.hold_cache_for_reading(operation, &[&resolved.key], &keys, &window, reads)?;
         let transcript = perf
             .time(Stage::Transcript, || {
                 self.load_transcript(targets.of_target(&resolved.key))
@@ -1389,10 +1503,11 @@ impl AgentService {
 /// stub, its content is reachable through that session, and a key of its own
 /// would resolve to a row that does not exist.
 ///
-/// A provider whose sessions cannot be listed does not contribute any keys
-/// or roots: the other providers' sessions stay readable. Each directory
-/// discovery could not list gets a warning, and the cached sessions under it
-/// keep their keys.
+/// A provider whose sessions cannot be listed, or whose keys the session
+/// cache fails to give, does not contribute any keys or roots, and gets a
+/// warning naming that step: the other providers' sessions stay readable.
+/// Each directory discovery could not list gets a warning, and the cached
+/// sessions under it keep their keys.
 ///
 /// `meter` records what each provider's discovery and cache read. The cache
 /// is read, and a root it holds no session of is cached, under `operation`.
@@ -1402,28 +1517,33 @@ fn discover_agent_keys(
     operation: &history::OperationScope,
 ) -> Result<DiscoveredKeys> {
     let mut keys = Vec::new();
-    let mut directory_warnings = Vec::new();
-    let mut roots = HashMap::new();
+    let mut warnings = Vec::new();
+    let mut reads = KeyedReads::default();
     let project_directories = environment.canonical_directories();
     for &storage in environment.storages() {
         let provider = storage.source().provider();
-        let Ok(found) = provider_keys(
+        let found = match provider_keys(
             environment,
             storage,
             meter.agent(storage.source()),
             operation,
             &project_directories,
-        ) else {
-            continue;
+        ) {
+            Ok(found) => found,
+            Err(failure) => {
+                warnings.push(failure.warning(provider));
+                continue;
+            }
         };
         keys.extend(found.keys);
-        directory_warnings.extend(
+        warnings.extend(
             found
                 .unreadable_directories
                 .iter()
                 .map(|directory| unreadable_directory_warning(provider, directory)),
         );
-        roots.insert(storage.source(), found.roots);
+        reads.roots.insert(storage.source(), found.roots);
+        reads.sessions.extend(found.sessions);
     }
     if keys.is_empty() && !any_history_root_exists(environment) {
         return Err(AgentError::io(
@@ -1438,18 +1558,56 @@ fn discover_agent_keys(
     keys.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(DiscoveredKeys {
         keys,
-        directory_warnings,
-        roots,
+        warnings,
+        reads,
     })
 }
 
-/// Every agent's keys, as [`discover_agent_keys`] found them.
 struct DiscoveredKeys {
     keys: Vec<agent::refs::AgentConversationKey>,
-    directory_warnings: Vec<AgentWarning>,
+    /// A warning for each agent whose keys could not be discovered and for
+    /// each directory discovery could not list, in agent order.
+    warnings: Vec<AgentWarning>,
+    reads: KeyedReads,
+}
+
+/// The step of an agent's key discovery that failed.
+#[derive(Debug)]
+enum KeyDiscoveryFailure {
+    /// Listing the agent's sessions.
+    Listing(AppError),
+    /// Reading or writing the session cache for the records the keys need.
+    SessionCache(AppError),
+}
+
+impl KeyDiscoveryFailure {
+    /// The warning an agent command prints for `provider`'s failure.
+    fn warning(&self, provider: &dyn history::provider::SessionProvider) -> AgentWarning {
+        match self {
+            Self::Listing(error) => listing_failure_warning(provider, error),
+            Self::SessionCache(error) => AgentWarning {
+                kind: AgentWarningKind::Io,
+                reference: None,
+                detail: format!(
+                    "failed to read or write the session cache for {} sessions: {error}",
+                    provider.labels().display
+                ),
+            },
+        }
+    }
+}
+
+/// The roots key discovery canonicalised and the sessions it read. The
+/// command's refresh reads below these roots, and holds a session read here
+/// without reading it again.
+#[derive(Default)]
+struct KeyedReads {
     /// Each listed agent's roots, canonicalised as the keys canonicalised
     /// them.
     roots: HashMap<history::Source, Vec<history::provider::SessionRoot>>,
+    /// The reads of the sessions key discovery cached to key them, on a
+    /// cache that held no session of their root, by path: written or not.
+    sessions: HashMap<PathBuf, TargetRead>,
 }
 
 /// [`discover_agent_keys`] from the sessions a load discovered and the
@@ -1543,12 +1701,13 @@ fn unreadable_directory_warning(
     }
 }
 
-/// One agent's keys, as [`provider_keys`] found them.
 struct ProviderKeys {
     keys: Vec<agent::refs::AgentConversationKey>,
     unreadable_directories: Vec<history::provider::UnreadableDirectory>,
     /// The agent's roots, canonicalised as the keys canonicalised them.
     roots: Vec<history::provider::SessionRoot>,
+    /// The reads of the sessions cached to key them, by path.
+    sessions: Vec<(PathBuf, TargetRead)>,
 }
 
 /// Every key under every root `storage` stores sessions in, the cache read
@@ -1559,12 +1718,21 @@ fn provider_keys(
     meter: AgentMeter,
     operation: &history::OperationScope,
     project_directories: &CanonicalDirectories,
-) -> Result<ProviderKeys> {
-    let mut keys = Vec::new();
-    let mut unreadable_directories = Vec::new();
-    let roots = storage.roots_in(&environment.root_environment())?;
-    for root in &roots {
-        let (root_keys, root_directories) = root_keys(&KeyedRoot {
+) -> std::result::Result<ProviderKeys, KeyDiscoveryFailure> {
+    let mut found = ProviderKeys {
+        keys: Vec::new(),
+        unreadable_directories: Vec::new(),
+        roots: storage
+            .roots_in(&environment.root_environment())
+            .map_err(KeyDiscoveryFailure::Listing)?,
+        sessions: Vec::new(),
+    };
+    for root in &found.roots {
+        let RootKeys {
+            keys,
+            unreadable_directories,
+            sessions,
+        } = root_keys(&KeyedRoot {
             environment,
             storage,
             root,
@@ -1572,14 +1740,18 @@ fn provider_keys(
             operation,
             project_directories,
         })?;
-        keys.extend(root_keys);
-        unreadable_directories.extend(root_directories);
+        found.keys.extend(keys);
+        found.unreadable_directories.extend(unreadable_directories);
+        found.sessions.extend(sessions);
     }
-    Ok(ProviderKeys {
-        keys,
-        unreadable_directories,
-        roots,
-    })
+    Ok(found)
+}
+
+struct RootKeys {
+    keys: Vec<agent::refs::AgentConversationKey>,
+    unreadable_directories: Vec<history::provider::UnreadableDirectory>,
+    /// The reads of the sessions cached to key them, by path.
+    sessions: Vec<(PathBuf, TargetRead)>,
 }
 
 /// One root whose sessions a command keys: the storage that lists them, the
@@ -1605,19 +1777,14 @@ struct KeyedRoot<'a> {
 /// cache, read under `operation`, so a corpus that can run to gigabytes is
 /// not parsed again. The cache is read only for such a session, or for a
 /// directory discovery could not list.
-fn root_keys(
-    keyed: &KeyedRoot<'_>,
-) -> Result<(
-    Vec<agent::refs::AgentConversationKey>,
-    Vec<history::provider::UnreadableDirectory>,
-)> {
+fn root_keys(keyed: &KeyedRoot<'_>) -> std::result::Result<RootKeys, KeyDiscoveryFailure> {
     let KeyedRoot {
         environment,
         storage,
         root,
         meter,
-        operation,
         project_directories,
+        ..
     } = *keyed;
     let provider = storage.source().provider();
     let clock = environment.clock().as_ref();
@@ -1627,19 +1794,20 @@ fn root_keys(
         stubs,
         unreadable_directories,
         ..
-    } = storage.discover(root, environment.lister())?;
+    } = storage
+        .discover(root, environment.lister())
+        .map_err(KeyDiscoveryFailure::Listing)?;
     meter.discovered(1, stubs.len(), clock.elapsed_since(discovering));
-    let unkeyed: Vec<&Path> = stubs
+    let roots = history::sqlite_cache::SessionRoots::of(root, environment.canonicaliser());
+    let unkeyed: Vec<&history::provider::SessionStub> = stubs
         .iter()
         .filter(|stub| !agent::refs::is_keyed_by_path(provider, &stub.locator))
-        .map(|stub| stub.locator.as_path())
         .collect();
-    let recorded = if unkeyed.is_empty() {
-        HashMap::new()
+    let RecordedSessions { recorded, sessions } = if unkeyed.is_empty() {
+        RecordedSessions::default()
     } else {
-        recorded_sessions(environment, storage, root, &unkeyed, meter, operation)?
+        recorded_sessions(keyed, &unkeyed).map_err(KeyDiscoveryFailure::SessionCache)?
     };
-    let roots = history::sqlite_cache::SessionRoots::of(root, environment.canonicaliser());
     let mut keys: Vec<agent::refs::AgentConversationKey> = stubs
         .iter()
         .filter_map(|stub| {
@@ -1658,14 +1826,16 @@ fn root_keys(
         })
         .collect();
     if !unreadable_directories.is_empty() {
-        keys.extend(cached_keys_under(
-            keyed,
-            &roots,
-            &stubs,
-            &unreadable_directories,
-        )?);
+        keys.extend(
+            cached_keys_under(keyed, &roots, &stubs, &unreadable_directories)
+                .map_err(KeyDiscoveryFailure::SessionCache)?,
+        );
     }
-    Ok((keys, unreadable_directories))
+    Ok(RootKeys {
+        keys,
+        unreadable_directories,
+        sessions,
+    })
 }
 
 /// Keys for the listed sessions the session cache holds under `directories`,
@@ -1739,39 +1909,65 @@ fn address_in(
     )
 }
 
-/// The directory and id each session `storage` keeps under `root` recorded,
-/// by cache key, from the session cache. When the cache doesn't hold a
-/// session of the root, `operation`'s refresh owner first caches the
-/// sessions at `unkeyed`; while another rearview keeps the cache, those
-/// sessions stay without a record. A session the cache records as empty or
-/// as unreadable stays without one too.
+#[derive(Default)]
+struct RecordedSessions {
+    /// The directory and id each session recorded, by cache key; `None`
+    /// for a session the cache records as empty or as unreadable.
+    recorded: HashMap<String, Option<history::provider::RecordedSession>>,
+    /// The reads of the sessions cached to find their records, by path.
+    sessions: Vec<(PathBuf, TargetRead)>,
+}
+
+/// The directory and id each session `keyed`'s storage keeps under its root
+/// recorded, from the session cache. When the cache doesn't hold a session
+/// of the root, `keyed`'s refresh owner first caches the sessions `unkeyed`
+/// names under that root, and their reads give the records, whether or not
+/// their writes landed. While another rearview keeps the cache, those
+/// sessions stay without a record.
 fn recorded_sessions(
-    environment: &history::Environment,
-    storage: &dyn history::provider::SessionStorage,
-    root: &history::provider::SessionRoot,
-    unkeyed: &[&Path],
-    meter: AgentMeter,
-    operation: &history::OperationScope,
-) -> Result<HashMap<String, Option<history::provider::RecordedSession>>> {
-    let cached = cached_recorded_sessions(environment, storage, root, meter, operation)?;
-    if !cached.is_empty() {
-        return Ok(cached);
+    keyed: &KeyedRoot<'_>,
+    unkeyed: &[&history::provider::SessionStub],
+) -> Result<RecordedSessions> {
+    let KeyedRoot {
+        environment,
+        storage,
+        root,
+        meter,
+        operation,
+        ..
+    } = *keyed;
+    let recorded = cached_recorded_sessions(environment, storage, root, meter, operation)?;
+    if !recorded.is_empty()
+        || matches!(
+            operation.acquire_access()?,
+            history::sqlite_cache::OperationAccess::AsIs
+        )
+    {
+        return Ok(RecordedSessions {
+            recorded,
+            sessions: Vec::new(),
+        });
     }
-    if matches!(
-        operation.acquire_access()?,
-        history::sqlite_cache::OperationAccess::AsIs
-    ) {
-        return Ok(cached);
-    }
-    history::provider::cache_sessions(
+    let paths: Vec<&Path> = unkeyed.iter().map(|stub| stub.locator.as_path()).collect();
+    let read = history::provider::cache_sessions_in_roots(
         environment,
         storage.source(),
-        unkeyed,
+        vec![root.forgetting_failed_canonicalisations()],
+        &paths,
         false,
         operation,
         meter,
     )?;
-    cached_recorded_sessions(environment, storage, root, meter, operation)
+    let mut recorded = HashMap::new();
+    let mut sessions = Vec::with_capacity(read.len());
+    for (stub, outcome) in unkeyed.iter().zip(read) {
+        let record = outcome
+            .listed_row()
+            .map(history::provider::RecordedSession::of);
+        recorded.insert(stub.cache_key.clone(), record);
+        sessions.push((stub.locator.clone(), TargetRead::of(outcome)));
+    }
+    Ok(RecordedSessions { recorded, sessions })
 }
 
 /// The session cache database's record of each session `storage` keeps
@@ -1807,7 +2003,7 @@ fn cached_recorded_sessions(
 struct StaleCoverage {
     cause: history::StaleCause,
     /// Each session's reference, and its copy's last message time: `None`
-    /// when the cache never held the session or its messages are undated.
+    /// when the session is uncached or its messages are undated.
     sessions: Vec<(String, Option<chrono::DateTime<chrono::Local>>)>,
 }
 
@@ -2016,6 +2212,7 @@ fn conversation_from_agent_transcript(
         parse_errors: Vec::new(),
         summary: transcript.summary.clone(),
         custom_title: transcript.custom_title.clone(),
+        external_title: None,
         model: None,
         total_tokens: 0,
         duration_minutes: None,
@@ -2085,9 +2282,28 @@ pub fn protocol_error(error: AppError) -> AppError {
     }
 }
 
+/// `error` printed after `warnings`, the warnings the command met before it
+/// failed, such as the listing failure that explains a reference not found.
+fn failure_after_warnings(error: AppError, warnings: &[AgentWarning]) -> AppError {
+    if warnings.is_empty() {
+        return error;
+    }
+    match structured_agent_error(error) {
+        AppError::Agent(error) => {
+            let mut output: String = warnings
+                .iter()
+                .map(agent::diagnostic::format_warning)
+                .collect();
+            output.push_str(&agent::diagnostic::format_error(&error));
+            AppError::AgentProtocol(output)
+        }
+        error => error,
+    }
+}
+
 fn structured_agent_error(error: AppError) -> AppError {
     match error {
-        AppError::Agent(_) => error,
+        AppError::Agent(_) | AppError::AgentProtocol(_) => error,
         AppError::SessionNotFound(reference) => AgentError::new(
             AgentErrorKind::NotFound,
             Some(&reference),
@@ -2282,6 +2498,7 @@ fn stripped_semantic_conversation(
         parse_errors: Vec::new(),
         summary: None,
         custom_title: None,
+        external_title: None,
         model: None,
         total_tokens: 0,
         duration_minutes: None,
@@ -2751,26 +2968,28 @@ impl AgentService {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
-        let (keys, directory_warnings) = match keys {
-            Some(keys) => (keys, Vec::new()),
+        let (keys, discovery_warnings, reads) = match keys {
+            Some(keys) => (keys, Vec::new(), KeyedReads::default()),
             None => {
                 discovered = self.discover_keys(&operation)?;
                 (
                     discovered.keys.as_slice(),
-                    discovered.directory_warnings.clone(),
+                    discovered.warnings.clone(),
+                    discovered.reads,
                 )
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
         let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
         let (mut resolved_refs, focus) =
-            resolve_agent_read_args(args, keys, self.environment.shared_canonicaliser())?;
+            resolve_agent_read_args(args, keys, self.environment.shared_canonicaliser())
+                .map_err(|error| failure_after_warnings(error, &discovery_warnings))?;
         let targets: Vec<&agent::refs::AgentConversationKey> = resolved_refs
             .iter()
             .map(|(_, resolved)| &resolved.key)
             .collect();
         let (operation, refreshed_targets) =
-            self.hold_cache_for_reading(operation, &targets, keys, &options.window)?;
+            self.hold_cache_for_reading(operation, &targets, keys, &options.window, reads)?;
         let transcripts = perf.time(Stage::Transcript, || {
             resolved_refs
                 .iter()
@@ -2825,7 +3044,7 @@ impl AgentService {
                     context: args.context,
                 })
         };
-        let mut warnings = directory_warnings;
+        let mut warnings = discovery_warnings;
         warnings.extend(resolved_refs.iter().zip(transcripts.iter()).filter_map(
             |((_, resolved), transcript)| {
                 transcript_warning(transcript, &resolved.reference.canonical())
@@ -2859,23 +3078,25 @@ impl AgentService {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
-        let (keys, directory_warnings) = match keys {
-            Some(keys) => (keys, Vec::new()),
+        let (keys, discovery_warnings, reads) = match keys {
+            Some(keys) => (keys, Vec::new(), KeyedReads::default()),
             None => {
                 discovered = self.discover_keys(&operation)?;
                 (
                     discovered.keys.as_slice(),
-                    discovered.directory_warnings.clone(),
+                    discovered.warnings.clone(),
+                    discovered.reads,
                 )
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
         let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
         let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
-        let resolved =
-            outline_ref.resolve_conversation(keys, self.environment.shared_canonicaliser())?;
+        let resolved = outline_ref
+            .resolve_conversation(keys, self.environment.shared_canonicaliser())
+            .map_err(|error| failure_after_warnings(error, &discovery_warnings))?;
         let (operation, targets) =
-            self.hold_cache_for_reading(operation, &[&resolved.key], keys, &options.window)?;
+            self.hold_cache_for_reading(operation, &[&resolved.key], keys, &options.window, reads)?;
         let transcript = perf
             .time(Stage::Transcript, || {
                 self.load_transcript_for_range(
@@ -2884,7 +3105,7 @@ impl AgentService {
                 )
             })
             .map_err(|error| target_error(error, &resolved))?;
-        let mut warnings = directory_warnings;
+        let mut warnings = discovery_warnings;
         warnings.extend(transcript_warning(
             &transcript,
             &resolved.reference.canonical(),
@@ -3195,12 +3416,12 @@ mod tests {
         let operation = waiting_operation(environment);
         let DiscoveredKeys {
             keys,
-            directory_warnings,
-            roots,
+            warnings: directory_warnings,
+            reads,
         } = discover_agent_keys(environment, meter, &operation).unwrap();
         operation.finish().unwrap();
         assert_eq!(
-            roots.len(),
+            reads.roots.len(),
             environment.storages().len(),
             "every agent lists its sessions"
         );
@@ -3283,7 +3504,7 @@ mod tests {
             project_directories: &crate::history::path::CanonicalDirectories::of_system(),
         })
         .unwrap()
-        .0;
+        .keys;
         discovery_keys.sort_by(|left, right| left.path.cmp(&right.path));
 
         for workspace in [None, Some(&workspace)] {
@@ -3771,8 +3992,8 @@ mod tests {
         );
     }
 
-    /// A session the cache has never held counts as changed, and its record
-    /// leaves out `cached-until`.
+    /// An uncached session counts as changed, and its record leaves out
+    /// `cached-until`.
     #[test]
     fn selection_beside_another_refresh_names_session_cache_lacks_without_cached_until() {
         let sessions = CachedClaudeSessions::new();
@@ -4521,6 +4742,109 @@ mod tests {
         })
     }
 
+    /// `agent read` of a Codex session on an empty cache whose write fails:
+    /// the session's key needs the directory it recorded, and its key
+    /// discovery's parse gives both the key and the transcript the command
+    /// reads, so the transcript is read once.
+    #[test]
+    fn read_of_codex_session_on_empty_cache_whose_write_fails_reads_key_discoverys_parse() {
+        use history::sqlite_cache::admitted_reads;
+        let fixture = history::provider::contract_tests::registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == history::Source::Codex)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let locator = fixture.write_session(home.path(), fixture.ids().session);
+        assert!(
+            !agent::refs::is_keyed_by_path(fixture.provider(), &locator),
+            "the key needs the session's record"
+        );
+        let storage = history::provider::contract_tests::kept_storage_under(fixture, home.path());
+        let cache = crate::tui::claude_home::admitted_cache();
+        let reference = locator.to_string_lossy().into_owned();
+        let failing = fail_the_first_data_commit(cache.path(), || {});
+        let before = admitted_reads::count(&locator);
+
+        let output = AgentService::new(test_environment(vec![storage], Some(cache.path())))
+            .execute(agent_command(&["read", &reference]))
+            .unwrap_or_else(crate::error_report);
+
+        drop(failing);
+        assert!(
+            !output.contains("agent-error") && output.contains("\nm1 "),
+            "the parse is read:\n{output}"
+        );
+        assert_eq!(admitted_reads::count(&locator) - before, 1);
+    }
+
+    /// `agent read` of each provider's session without a row reads the
+    /// transcript once on an empty cache, and prints what it printed then
+    /// when read again from the cache.
+    ///
+    /// A session whose path keys it prints the entries the refresh parsed,
+    /// or fails with the warning the refresh built, a file the agent's
+    /// format rejects included. Read again, a session the cache records as
+    /// empty is read once more because the cache does not store its entries;
+    /// an unreadable transcript is not read again.
+    ///
+    /// A session keyed by the id and directory it recorded is read by key
+    /// discovery, which finds no record and no key: the read reports it not
+    /// found, and does not read it again from the cache.
+    #[test]
+    fn read_of_session_without_row_parses_it_once_then_again_only_from_an_empty_copy() {
+        use history::sqlite_cache::admitted_reads;
+        let mut wrong = Vec::new();
+        let mut path_keyed_cases = 0;
+        for case in every_providers_unlisted_cases() {
+            let fixture = history::provider::contract_tests::registered_fixtures()
+                .into_iter()
+                .find(|fixture| fixture.provider().source() == case.source)
+                .unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let locator = fixture.write_session(home.path(), fixture.ids().session);
+            case.transcript.write_over(&locator);
+            let is_keyed_by_path = agent::refs::is_keyed_by_path(fixture.provider(), &locator);
+            path_keyed_cases += usize::from(is_keyed_by_path);
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            let reference = locator.to_string_lossy().into_owned();
+            let read = || {
+                let before = admitted_reads::count(&locator);
+                let output = AgentService::new(test_environment(vec![storage], Some(cache.path())))
+                    .execute(agent_command(&["read", &reference]))
+                    .unwrap_or_else(crate::error_report);
+                (admitted_reads::count(&locator) - before, output)
+            };
+
+            let (cold_reads, cold) = read();
+            let (warm_reads, warm) = read();
+
+            let is_skipped = case.reason.starts_with("skipped ");
+            let is_empty = case.status == "empty";
+            let label = format!("{:?}, {:?}", case.source, case.transcript);
+            let warm_parses = usize::from(is_keyed_by_path && is_empty);
+            if (cold_reads, warm_reads) != (1, warm_parses) {
+                wrong.push(format!(
+                    "{label}: read {cold_reads} times, then {warm_reads} times"
+                ));
+            }
+            if cold != warm {
+                wrong.push(format!("{label}: prints\n{cold}\nthen\n{warm}"));
+            }
+            let prints_its_outcome = if is_keyed_by_path {
+                cold.contains("agent-error") != is_skipped
+            } else {
+                cold.contains("agent-error kind=not-found")
+            };
+            if !prints_its_outcome {
+                wrong.push(format!("{label}: prints\n{cold}"));
+            }
+        }
+        assert!(path_keyed_cases > 0, "a provider keys its sessions by path");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
     /// A transcript another program holds open without sharing fails the
     /// owner's read with an error the next read can clear: the load records
     /// no row, and the load after the lock is released records the session.
@@ -4559,10 +4883,10 @@ mod tests {
         );
     }
 
-    /// A session the cache has never held is named without `cached-until`
-    /// when its path keys it, and left out without an error otherwise.
+    /// An uncached session is named without `cached-until` when its path
+    /// keys it, and left out without an error otherwise.
     #[test]
-    fn sessions_names_every_providers_never_cached_session_its_path_keys() {
+    fn sessions_names_every_providers_uncached_session_its_path_keys() {
         let mut wrong = Vec::new();
         for fixture in history::provider::contract_tests::registered_fixtures() {
             let home = tempfile::tempdir().unwrap();
@@ -4618,10 +4942,10 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// Decision 4: the cache never held this Pi session, and its path names
-    /// no session ID, so no key names it.
+    /// Decision 4: this Pi session is uncached and its path doesn't contain
+    /// a session ID, so no key names it.
     #[test]
-    fn never_cached_pi_session_without_id_in_path_is_left_out_without_error() {
+    fn uncached_pi_session_without_id_in_path_is_left_out_without_error() {
         let fixture = history::provider::contract_tests::registered_fixtures()
             .into_iter()
             .find(|fixture| fixture.provider().source() == history::Source::Pi)
@@ -4678,12 +5002,11 @@ mod tests {
 
     /// Beside another rearview's refresh, a session the cache recorded as
     /// empty or unreadable gets the warning the refresh owner printed for
-    /// it, and a session the cache never held is named in the `stale-cache`
-    /// record. Neither is parsed. The owner's warning is the one its load
-    /// recorded.
+    /// it, and an uncached session is named in the `stale-cache` record.
+    /// Neither is parsed. The owner's warning is the one its load recorded.
     #[test]
-    fn sessions_and_search_beside_another_refresh_print_owners_warnings_and_name_never_cached_session()
-     {
+    fn sessions_and_search_beside_another_refresh_print_owners_warnings_and_name_uncached_session()
+    {
         let user_line = |content: serde_json::Value| {
             format!(
                 "{}\n",
@@ -4768,7 +5091,7 @@ mod tests {
                 ));
                 continue;
             }
-            let never_cached = claude_session_in(
+            let uncached = claude_session_in(
                 &claude,
                 directory.path(),
                 "0f000000-0000-4000-8000-000000000005",
@@ -4778,7 +5101,7 @@ mod tests {
                 beside_another_refresh_warnings_differ(
                     storage,
                     cache_base.path(),
-                    &never_cached,
+                    &uncached,
                     &owners_warnings,
                     warnings_of,
                 )
@@ -4792,12 +5115,12 @@ mod tests {
     /// The differences of `sessions` and `search` over `storage` and the
     /// cache under `cache_base`, beside another rearview's refresh, from the
     /// expected output: `owners_warnings` as `warnings_of` finds them, the
-    /// session at `never_cached` named in the `stale-cache` record without
+    /// session at `uncached` named in the `stale-cache` record without
     /// `cached-until`, and no transcript parsed.
     fn beside_another_refresh_warnings_differ(
         storage: &'static dyn history::provider::SessionStorage,
         cache_base: &Path,
-        never_cached: &Path,
+        uncached: &Path,
         owners_warnings: &[String],
         warnings_of: impl Fn(&str) -> Vec<String>,
     ) -> Vec<String> {
@@ -4827,12 +5150,12 @@ mod tests {
                     owners_warnings.concat()
                 ));
             }
-            let never_cached_record = format!(
+            let uncached_record = format!(
                 "protocol agent-warning stale-cache refs={} : {STALE_CACHE_SENTENCE}\n",
                 agent::refs::session_key(
                     history::Source::Claude.provider(),
                     &history::provider::SessionStub {
-                        locator: never_cached.to_path_buf(),
+                        locator: uncached.to_path_buf(),
                         subagents: Vec::new(),
                         cache_key: String::new(),
                         fingerprint: history::provider::Fingerprint {
@@ -4844,7 +5167,7 @@ mod tests {
                     &crate::history::path::CanonicalDirectories::of_system(),
                     agent::refs::AgentConversationKey::address_for_test(
                         history::Source::Claude,
-                        never_cached,
+                        uncached,
                     ),
                 )
                 .map(|key| {
@@ -4854,9 +5177,9 @@ mod tests {
                 })
                 .unwrap()
             );
-            if !output.contains(&never_cached_record) {
+            if !output.contains(&uncached_record) {
                 wrong.push(format!(
-                    "{command}: the record names the never-cached session without cached-until:\n{output}"
+                    "{command}: the record names the uncached session without cached-until:\n{output}"
                 ));
             }
             let parsed: usize = service
@@ -5152,11 +5475,11 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
     }
 
-    /// `read` and `outline` of a session the cache never held, whose refresh
-    /// fails at its first write, read the session the refresh parsed: it is
-    /// parsed once, and a cached session read beside it is not parsed.
+    /// `read` and `outline` of an uncached session, whose refresh fails at
+    /// its first write, read the session the refresh parsed: it is parsed
+    /// once, and a cached session read beside it is not parsed.
     #[test]
-    fn targeted_commands_of_session_cache_never_held_whose_write_fails_read_its_one_parse() {
+    fn targeted_commands_of_uncached_session_whose_write_fails_read_its_one_parse() {
         let home = crate::tui::claude_home::ClaudeHome::new();
         let cache = crate::tui::claude_home::admitted_cache();
         let environment = || {
@@ -5168,33 +5491,28 @@ mod tests {
         };
         let cached = home.write("cached", 5, &["a cached question"]);
         home.rows(&environment());
-        let never_cached = home.write("never", 6, &["an unseen question"]);
-        let (cached, never_cached) = (
+        let uncached = home.write("never", 6, &["an unseen question"]);
+        let (cached, uncached) = (
             cached.to_string_lossy().into_owned(),
-            never_cached.to_string_lossy().into_owned(),
+            uncached.to_string_lossy().into_owned(),
         );
-        let commands: [&[&str]; 2] = [
-            &["read", &cached, &never_cached],
-            &["outline", &never_cached],
-        ];
+        let commands: [&[&str]; 2] = [&["read", &cached, &uncached], &["outline", &uncached]];
 
+        let reads_of = |path: &str| history::sqlite_cache::admitted_reads::count(Path::new(path));
         let mut wrong = Vec::new();
         for args in commands {
             let failing = fail_the_first_data_commit(cache.path(), || {});
-            let parsed_before = home.watch().parsed_sessions().len();
+            let before = (reads_of(&uncached), reads_of(&cached));
             let output = AgentService::new(environment())
                 .execute(agent_command(args))
                 .unwrap_or_else(crate::error_report);
             drop(failing);
-            let parsed = home.watch().parsed_sessions()[parsed_before..].to_vec();
-            let parses_of = |path: &str| {
-                parsed
-                    .iter()
-                    .filter(|parsed| **parsed == Path::new(path))
-                    .count()
-            };
-            if parses_of(&never_cached) != 1 || parses_of(&cached) != 0 {
-                wrong.push(format!("{}: parses {parsed:?}", args[0]));
+            let reads = (reads_of(&uncached) - before.0, reads_of(&cached) - before.1);
+            if reads != (1, 0) {
+                wrong.push(format!(
+                    "{}: reads the uncached and the cached session {reads:?} times",
+                    args[0]
+                ));
             }
             if !output.contains("an unseen question")
                 || output.contains("agent-error")
@@ -5204,6 +5522,366 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// Beside another rearview's refresh, `read` of a cached and an uncached
+    /// session waits for refresh ownership, then refreshes the uncached
+    /// session alone, reading its transcript once, and reads the cached
+    /// session from its copy.
+    #[test]
+    fn read_beside_another_refresh_waits_then_parses_only_target_without_copy() {
+        use history::sqlite_cache::admitted_reads;
+        let sessions = SessionsBesideAnotherRefresh::new();
+        let cached = sessions.home.write("cached", 5, &["a cached question"]);
+        sessions.home.rows(&sessions.environment);
+        let uncached = sessions.home.write("never", 6, &["an unseen question"]);
+        let before = (
+            admitted_reads::count(&cached),
+            admitted_reads::count(&uncached),
+        );
+
+        let (output, refresh_rounds) = sessions.read_past_the_wait(&[&cached, &uncached]);
+
+        assert!(
+            output.contains("a cached question")
+                && output.contains("an unseen question")
+                && !output.contains("agent-error"),
+            "{output}"
+        );
+        assert_eq!(
+            (
+                admitted_reads::count(&cached) - before.0,
+                admitted_reads::count(&uncached) - before.1
+            ),
+            (0, 1),
+            "the reads of the cached and the uncached transcript"
+        );
+        assert_eq!(
+            refresh_rounds,
+            ["perf refresh-round sessions=1"],
+            "the refresh rounds"
+        );
+    }
+
+    /// Beside another rearview's refresh, `read` of a session whose copy is
+    /// older than its transcript and of an uncached session waits for
+    /// refresh ownership, then refreshes both: the older copy's newest
+    /// message prints, and no `stale-cache` record names it.
+    #[test]
+    fn read_beside_another_refresh_refreshes_target_with_older_copy_after_the_wait() {
+        let sessions = SessionsBesideAnotherRefresh::new();
+        let changed = sessions.home.write("changed", 5, &["a cached question"]);
+        sessions.home.rows(&sessions.environment);
+        sessions.home.append(&changed, 7, "a newer question");
+        let uncached = sessions.home.write("never", 6, &["an unseen question"]);
+
+        let (output, refresh_rounds) = sessions.read_past_the_wait(&[&changed, &uncached]);
+
+        assert!(
+            output.contains("a newer question")
+                && output.contains("an unseen question")
+                && !output.contains("stale-cache")
+                && !output.contains("agent-error"),
+            "{output}"
+        );
+        assert_eq!(
+            refresh_rounds,
+            ["perf refresh-round sessions=2"],
+            "the refresh rounds"
+        );
+    }
+
+    /// Claude Code sessions whose session cache another rearview's refresh
+    /// owns until a command reading them waits past its patience.
+    struct SessionsBesideAnotherRefresh {
+        home: crate::tui::claude_home::ClaudeHome,
+        cache: tempfile::TempDir,
+        clock: Arc<TestClock>,
+        environment: history::Environment,
+    }
+
+    impl SessionsBesideAnotherRefresh {
+        fn new() -> Self {
+            let home = crate::tui::claude_home::ClaudeHome::new();
+            let cache = crate::tui::claude_home::admitted_cache();
+            let clock = Arc::new(TestClock::default());
+            let environment = home.environment_with_cache(
+                cache.path(),
+                history::ProcessIdentity::default(),
+                clock.clone(),
+            );
+            Self {
+                home,
+                cache,
+                clock,
+                environment,
+            }
+        }
+
+        /// The output and `refresh-round` records of `read` of `sessions`
+        /// while another rearview's refresh owns the cache, released once
+        /// the command waits past its patience.
+        fn read_past_the_wait(&self, sessions: &[&Path]) -> (String, Vec<String>) {
+            let references: Vec<String> = sessions
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            let mut args = vec!["read"];
+            args.extend(references.iter().map(String::as_str));
+            let other_refresh = history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
+                &crate::tui::claude_home::another_rearview(
+                    self.cache.path(),
+                    Arc::new(TestClock::default()),
+                ),
+            )
+            .unwrap();
+            let started = self.clock.now();
+            std::thread::scope(|scope| {
+                let command = scope.spawn(|| {
+                    let service = AgentService::new(self.environment.clone());
+                    let output = service
+                        .execute(agent_command(&args))
+                        .unwrap_or_else(crate::error_report);
+                    (output, refresh_rounds(&service))
+                });
+                // Only the command's waits move test time. Its first wait for
+                // ownership gives up at its patience, so time past twice that
+                // is its wait after reading the cache as it is.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while self.clock.elapsed_since(started) < REFRESH_OWNERSHIP_PATIENCE * 2 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the command waits past its patience"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                drop(other_refresh);
+                command.join().unwrap()
+            })
+        }
+    }
+
+    /// `read` of an empty session the cache holds and of an uncached
+    /// session, whose write fails: the empty session, whose entries the
+    /// cache does not store, is not parsed once the command's writes stop,
+    /// and is reported as not in the session cache.
+    #[test]
+    fn read_of_empty_copy_after_the_commands_writes_stop_reports_it_unparsed() {
+        use history::sqlite_cache::admitted_reads;
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let cache = crate::tui::claude_home::admitted_cache();
+        let environment = home.environment_with_cache(
+            cache.path(),
+            history::ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+        );
+        let empty = home.write("empty", 5, &[""]);
+        home.rows(&environment);
+        let uncached = home.write("never", 6, &["an unseen question"]);
+        let references = [&uncached, &empty].map(|path| path.to_string_lossy().into_owned());
+        let before = admitted_reads::count(&empty);
+        let failing = fail_the_first_data_commit(cache.path(), || {});
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&["read", &references[0], &references[1]]))
+            .unwrap_or_else(crate::error_report);
+
+        drop(failing);
+        assert_eq!(
+            admitted_reads::count(&empty) - before,
+            0,
+            "the empty session's reads"
+        );
+        assert!(
+            output.contains("the%20session%20is%20not%20in%20the%20session%20cache"),
+            "{output}"
+        );
+    }
+
+    /// The `refresh-round` records of `service`'s command.
+    fn refresh_rounds(service: &AgentService) -> Vec<String> {
+        service
+            .perf
+            .records(None)
+            .lines()
+            .filter(|line| line.starts_with("perf refresh-round "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `read` of two ranges of one session refreshes the session once, in
+    /// one round of one session: on an empty cache the transcript is parsed
+    /// once, and from the cache it is not parsed.
+    #[test]
+    fn read_of_two_ranges_of_one_session_refreshes_it_once() {
+        use history::sqlite_cache::admitted_reads;
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let cache = crate::tui::claude_home::admitted_cache();
+        let environment = home.environment_with_cache(
+            cache.path(),
+            history::ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+        );
+        let transcript = home.write("ranges", 5, &["first", "second", "third"]);
+        let reference = transcript.to_string_lossy().into_owned();
+        let (first, rest) = (format!("{reference}:m1"), format!("{reference}:m2..m3"));
+        let read = || {
+            let before = admitted_reads::count(&transcript);
+            let service = AgentService::new(environment.clone());
+            let output = service
+                .execute(agent_command(&["read", &first, &rest]))
+                .unwrap_or_else(crate::error_report);
+            assert!(
+                output.contains("first") && output.contains("third"),
+                "{output}"
+            );
+            (
+                admitted_reads::count(&transcript) - before,
+                refresh_rounds(&service),
+            )
+        };
+
+        let cold = read();
+        let warm = read();
+
+        assert_eq!(
+            cold,
+            (1, vec!["perf refresh-round sessions=1".to_owned()]),
+            "the parses and refresh rounds on an empty cache"
+        );
+        assert_eq!(
+            warm,
+            (0, vec!["perf refresh-round sessions=1".to_owned()]),
+            "the parses and refresh rounds from the cache"
+        );
+    }
+
+    /// A target this command published a copy of reads the copy at its
+    /// generation as current, and a copy before it, as a cache rebuilt since
+    /// holds, as older, as the printout reads it.
+    #[test]
+    fn target_whose_copy_is_before_its_published_generation_reads_as_older() {
+        use history::sqlite_cache::Publication;
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let cache = crate::tui::claude_home::admitted_cache();
+        let environment = home.environment_with_cache(
+            cache.path(),
+            history::ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+        );
+        let transcript = home.write("published", 5, &["a question"]);
+        let row = home
+            .rows(&environment)
+            .into_iter()
+            .find(|row| row.path == transcript)
+            .unwrap();
+        let generation = history::sqlite_cache::find_cached_session_waiting(
+            environment.cache_base(),
+            row.cache_address.as_ref().unwrap(),
+        )
+        .unwrap()
+        .expect("the load cached the session")
+        .generation();
+        let key = agent::refs::AgentConversationKey::from_conversation(
+            &row,
+            &crate::history::path::CanonicalDirectories::of_system(),
+        )
+        .unwrap();
+        let is_older = |published: i64| {
+            let service = AgentService::new(environment.clone());
+            let operation =
+                command_operation(service.environment.cache_base(), service.perf.load_meter());
+            let mut keyed = KeyedReads::default();
+            keyed.sessions.insert(
+                key.path.clone(),
+                TargetRead::Listed {
+                    address: key.address.clone(),
+                    subagents: key.subagents.clone(),
+                    publication: Publication::Published {
+                        generation: published,
+                    },
+                    unwritten: history::provider::UnwrittenParse::Nothing,
+                },
+            );
+            let checked = service
+                .refresh_and_check_targets(&operation, &[&key], &mut keyed)
+                .unwrap();
+            checked.stale_copies.contains_key(&key.path)
+        };
+
+        assert!(!is_older(generation), "the copy at its generation");
+        assert!(is_older(generation + 1), "a copy before its generation");
+    }
+
+    /// `read` of a Codex session on an empty cache reads the session its
+    /// key discovery cached, without a refresh round.
+    #[test]
+    fn read_of_session_key_discovery_cached_skips_the_refresh_round() {
+        let fixture = history::provider::contract_tests::registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == history::Source::Codex)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let locator = fixture.write_session(home.path(), fixture.ids().session);
+        let storage = history::provider::contract_tests::kept_storage_under(fixture, home.path());
+        let cache = crate::tui::claude_home::admitted_cache();
+        let service = AgentService::new(test_environment(vec![storage], Some(cache.path())));
+
+        let output = service
+            .execute(agent_command(&["read", &locator.to_string_lossy()]))
+            .unwrap_or_else(crate::error_report);
+
+        assert!(!output.contains("agent-error"), "{output}");
+        assert_eq!(refresh_rounds(&service), Vec::<String>::new());
+    }
+
+    /// `read` of one uncached session more than a write group holds,
+    /// whose first group's commit fails: the session left for the next
+    /// group is reported as not in the session cache, without a parse,
+    /// while each session of the first group is parsed once.
+    #[test]
+    fn read_whose_first_write_group_fails_reports_target_of_later_group_unparsed() {
+        use history::sqlite_cache::admitted_reads;
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let cache = crate::tui::claude_home::admitted_cache();
+        let sessions: Vec<PathBuf> = (0..=history::provider::READ_BATCH_LENGTH)
+            .map(|index| {
+                home.write(
+                    &format!("never-{index}"),
+                    5 + index as u32,
+                    &["an unseen question"],
+                )
+            })
+            .collect();
+        let references: Vec<String> = sessions
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let mut args = vec!["read"];
+        args.extend(references.iter().map(String::as_str));
+        let failing = fail_the_first_data_commit(cache.path(), || {});
+
+        let output = AgentService::new(home.environment_with_cache(
+            cache.path(),
+            history::ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+        ))
+        .execute(agent_command(&args))
+        .unwrap_or_else(crate::error_report);
+
+        drop(failing);
+        let mut reads: Vec<usize> = sessions
+            .iter()
+            .map(|path| admitted_reads::count(path))
+            .collect();
+        reads.sort();
+        let mut expected = vec![1; history::provider::READ_BATCH_LENGTH];
+        expected.insert(0, 0);
+        assert_eq!(reads, expected, "each session's reads");
+        assert!(
+            output.contains("the%20session%20is%20not%20in%20the%20session%20cache"),
+            "{output}"
+        );
     }
 
     /// Beside another rearview's refresh, `read`, `outline` and `within` of a
@@ -5447,6 +6125,175 @@ mod tests {
             "{}",
             warnings[0].detail
         );
+    }
+
+    /// `read`, `outline` and `within` beside an agent whose sessions cannot
+    /// be listed read the other agent's session and print one warning
+    /// naming the agent that failed.
+    #[test]
+    fn targeted_commands_warn_of_agent_whose_sessions_cannot_be_listed() {
+        let home = HomeWithUnlistableCodex::new();
+
+        let mut wrong = Vec::new();
+        for args in [
+            vec!["read", &home.claude_reference],
+            vec!["outline", &home.claude_reference],
+            vec!["within", &home.claude_reference, "question"],
+        ] {
+            let output = home.run(&args);
+            if home.listing_warnings(&output) != 1 || output.contains("agent-error") {
+                wrong.push(format!("{}:\n{output}", args[0]));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `read`, `outline` and `within` of a session of the agent whose
+    /// sessions cannot be listed print the listing failure with the error.
+    #[test]
+    fn targeted_commands_print_listing_failure_with_error_for_reference_it_explains() {
+        let home = HomeWithUnlistableCodex::new();
+
+        let mut wrong = Vec::new();
+        for args in [
+            vec!["read", &home.codex_reference],
+            vec!["outline", &home.codex_reference],
+            vec!["within", &home.codex_reference, "question"],
+        ] {
+            let output = home.run(&args);
+            if home.listing_warnings(&output) != 1 || !output.contains("agent-error") {
+                wrong.push(format!("{}:\n{output}", args[0]));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `read` of a Codex session whose key needs its record, when the
+    /// session cache fails to give the records, names the cache in the
+    /// warning it prints with the error, not the listing.
+    #[test]
+    fn read_whose_key_records_the_cache_fails_to_give_warns_of_the_cache() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let fixture = history::provider::contract_tests::registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == history::Source::Codex)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let locator = fixture.write_session(home.path(), fixture.ids().session);
+        let storage = history::provider::contract_tests::kept_storage_under(fixture, home.path());
+        let cache = crate::tui::claude_home::admitted_cache();
+        load_as_owner(storage, cache.path());
+        let _refused = history::sqlite_cache::connection::test_hooks::on_every_connection(
+            cache.path(),
+            |connection| {
+                connection
+                    .authorizer(Some(|context: AuthContext<'_>| match context.action {
+                        AuthAction::Read {
+                            table_name: "sessions",
+                            column_name: "cwd",
+                        } => Authorization::Deny,
+                        _ => Authorization::Allow,
+                    }))
+                    .unwrap();
+            },
+        );
+
+        let output = AgentService::new(test_environment(vec![storage], Some(cache.path())))
+            .execute(agent_command(&["read", &locator.to_string_lossy()]))
+            .unwrap_or_else(crate::error_report);
+
+        assert!(
+            output.contains(
+                "failed%20to%20read%20or%20write%20the%20session%20cache%20for%20Codex%20sessions"
+            ) && !output.contains("failed%20to%20list")
+                && output.contains("agent-error"),
+            "{output}"
+        );
+    }
+
+    /// A Claude and a Codex session under one home, with an environment
+    /// whose directory listing refuses Codex's sessions root, so listing
+    /// Codex's sessions fails.
+    struct HomeWithUnlistableCodex {
+        _home: tempfile::TempDir,
+        cache: tempfile::TempDir,
+        storages: Vec<&'static dyn history::provider::SessionStorage>,
+        lister: Arc<history::provider::walk::test_support::ScriptedLister>,
+        claude_reference: String,
+        codex_reference: String,
+    }
+
+    impl HomeWithUnlistableCodex {
+        fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let mut storages = Vec::new();
+            let mut references = Vec::new();
+            for source in [history::Source::Claude, history::Source::Codex] {
+                let fixture = history::provider::contract_tests::registered_fixtures()
+                    .into_iter()
+                    .find(|fixture| fixture.provider().source() == source)
+                    .unwrap();
+                let locator = fixture.write_session(home.path(), fixture.ids().session);
+                references.push(locator.to_string_lossy().into_owned());
+                storages.push(history::provider::contract_tests::kept_storage_under(
+                    fixture,
+                    home.path(),
+                ));
+            }
+            let lister = Arc::new(history::provider::walk::test_support::ScriptedLister::default());
+            let cache = crate::tui::claude_home::admitted_cache();
+            let environment = Self::environment_of(&storages, &cache, &lister);
+            for root in storages[1]
+                .roots_in(&environment.root_environment())
+                .unwrap()
+            {
+                lister.refuse(&root.path);
+            }
+            let codex_reference = references.pop().unwrap();
+            let claude_reference = references.pop().unwrap();
+            Self {
+                _home: home,
+                cache,
+                storages,
+                lister,
+                claude_reference,
+                codex_reference,
+            }
+        }
+
+        fn environment_of(
+            storages: &[&'static dyn history::provider::SessionStorage],
+            cache: &tempfile::TempDir,
+            lister: &Arc<history::provider::walk::test_support::ScriptedLister>,
+        ) -> history::Environment {
+            history::Environment::new(
+                storages.to_vec(),
+                cache.path().to_path_buf(),
+                history::ProcessIdentity::default(),
+                Arc::new(TestClock::default()),
+                lister.clone(),
+            )
+        }
+
+        /// The output of the agent command `args`, or its error report.
+        fn run(&self, args: &[&str]) -> String {
+            AgentService::new(Self::environment_of(
+                &self.storages,
+                &self.cache,
+                &self.lister,
+            ))
+            .execute(agent_command(args))
+            .unwrap_or_else(crate::error_report)
+        }
+
+        /// The number of `output`'s warnings that Codex's sessions could not
+        /// be listed.
+        fn listing_warnings(&self, output: &str) -> usize {
+            output
+                .lines()
+                .filter(|line| line.contains("failed%20to%20list%20Codex%20sessions"))
+                .count()
+        }
     }
 
     /// Key discovery over a root the cache lacks loads the root as the

@@ -267,6 +267,7 @@ mod tests {
             parse_errors: Vec::new(),
             summary: Some("summary sentinel".to_string()),
             custom_title: Some("title sentinel".to_string()),
+            external_title: None,
             model: Some("claude-sonnet-4-6".to_string()),
             total_tokens: 0,
             duration_minutes: None,
@@ -275,7 +276,9 @@ mod tests {
             is_missing_earlier_turns: false,
             cached_session: None,
             cache_address: None,
-            publication: crate::history::sqlite_cache::Publication::Unpublished { discovered: Vec::new() },
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
         }
     }
 

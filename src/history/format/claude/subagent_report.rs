@@ -455,7 +455,7 @@ mod tests {
         let path = dir.path().join("agent-a4444444444444444.jsonl");
         std::fs::write(&path, records.join("\n")).unwrap();
         let entries = fold_delivered_handbacks(
-            transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+            transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
                 .unwrap()
                 .entries,
         );

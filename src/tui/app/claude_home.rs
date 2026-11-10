@@ -370,6 +370,63 @@ pub(crate) fn app_reading(rows: Vec<Conversation>, environment: Environment) -> 
     )
 }
 
+const VIEWPORT: usize = 20;
+
+/// The text the viewer shows for the file at `typed`, opened in
+/// `environment` as `rearview <file>` opens it: canonicalised, read by the
+/// background worker and rendered.
+pub(crate) fn text_of_file_opened_directly(typed: &Path, environment: &Environment) -> String {
+    let file =
+        super::DirectFile::canonicalise(typed.to_path_buf(), environment.canonicaliser()).unwrap();
+    let mut app = App::new_single_file(
+        file,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        environment.clone(),
+    );
+    app.check_view_resize(80, VIEWPORT);
+    app.serve_direct_file_read();
+    app.complete_pending_view_refresh(VIEWPORT);
+    viewer_text(&app)
+}
+
+/// The text the open viewer shows.
+pub(crate) fn viewer_text(app: &App) -> String {
+    let super::AppMode::View(state) = app.app_mode() else {
+        unreachable!("the viewer is open")
+    };
+    state
+        .rendered_lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|(text, _)| text.as_str()))
+        .collect()
+}
+
+/// The viewer over `row`, opened as the list opens it, in an app reading
+/// `environment`.
+pub(crate) fn viewer_over(row: Conversation, environment: Environment) -> App {
+    let mut app = app_reading(vec![row], environment);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    app
+}
+
+/// True when the open viewer didn't find a copy of its session.
+pub(crate) fn viewer_lacks_copy(app: &App) -> bool {
+    let super::AppMode::View(state) = app.app_mode() else {
+        unreachable!("the viewer is open")
+    };
+    state.is_copy_missing
+}
+
+/// The session refresh the open viewer asked for, run as the background
+/// worker runs it, then the viewer's read of what the refresh listed.
+pub(crate) fn recover_viewer(app: &mut App) {
+    super::refresh_tests::serve_session_refresh(app);
+    assert!(app.complete_pending_view_refresh(VIEWPORT));
+}
+
 /// A list `Ctrl+R` of `app` under `window`, run as the background worker
 /// runs it.
 pub(crate) fn serve_list_refresh(app: &mut App, window: crate::time_filter::TimeFilter) {

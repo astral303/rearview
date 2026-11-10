@@ -21,8 +21,8 @@ impl RecordContent {
             .entries
             .as_ref()
             .expect("a listed record holds entries")
-            .as_ref()
-            .unwrap_or_else(|error| panic!("the record's entries read: {error}"));
+            .written()
+            .expect("the record writes its entries");
         assert!(
             record
                 .catalogue
@@ -179,7 +179,7 @@ fn codex_record_changed_after_parse(
         .unwrap()
         .expect("the session is listed");
     after_parse();
-    let record = SessionRecord::listed(
+    let ListedRecord::Built(record) = SessionRecord::listed(
         &crate::history::sqlite_cache::RecordPlace {
             storage: storage_of(Source::Codex),
             source: Source::Codex,
@@ -191,10 +191,10 @@ fn codex_record_changed_after_parse(
         stamps,
         &listed.row,
         listed.transcripts,
-    )
-    .ok()
-    .expect("the session has a record");
-    (record, reads.into_inner())
+    ) else {
+        panic!("the session has a record");
+    };
+    (*record, reads.into_inner())
 }
 
 /// The record of the Codex session at `locator`, its sub-agent transcripts
@@ -300,10 +300,9 @@ fn record_holds_its_parses_text_and_parse_reads_each_transcript_once() {
         .iter()
         .filter(|file| file.kind == "locator" || file.kind == "subagent")
         .count();
-    let entries = record
-        .entries
-        .expect("a listed record holds entries")
-        .expect("the record's entries are read");
+    let Some(RecordEntries::Written(entries)) = record.entries else {
+        panic!("the listed record writes its entries");
+    };
     let entries = format!("{:?}", entries.entries);
     for original in originals {
         assert!(
@@ -348,8 +347,10 @@ fn transcript_changed_after_parse_fails_record_and_keeps_the_parsed_entries() {
         });
 
         let error = match &record.entries {
-            Some(Err(error)) => error,
-            Some(Ok(_)) => panic!("{name} changed after the parse fails the record"),
+            Some(RecordEntries::Unwritten { reason, .. }) => reason,
+            Some(RecordEntries::Written(_)) => {
+                panic!("{name} changed after the parse fails the record")
+            }
             None => panic!("a listed record holds entries"),
         };
         // The record spells the path as the parse found it, which can differ

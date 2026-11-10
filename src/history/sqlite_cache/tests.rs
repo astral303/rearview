@@ -54,7 +54,7 @@ pub(crate) fn parsed_record_and_row(
         )
         .unwrap()
         .expect("the session is listed");
-    let record = SessionRecord::listed(
+    let ListedRecord::Built(record) = SessionRecord::listed(
         &crate::history::sqlite_cache::RecordPlace {
             storage: storage_of(source),
             source,
@@ -66,10 +66,10 @@ pub(crate) fn parsed_record_and_row(
         stamps,
         &listed.row,
         listed.transcripts,
-    )
-    .ok()
-    .expect("the session has a record");
-    (record, listed.row)
+    ) else {
+        panic!("the session has a record");
+    };
+    (*record, listed.row)
 }
 
 /// The record a load writes for `stub`'s session under `root`, from the
@@ -319,7 +319,7 @@ pub(super) fn write_test_entries(
     for transcript in transcripts {
         record.catalogue.add_test_file("subagent", transcript, None);
     }
-    record.entries = Some(Ok(entries));
+    record.entries = Some(RecordEntries::Written(entries));
     cache.mark_admitted().unwrap();
     cache.write(&record).unwrap();
     (storage, root)
@@ -394,7 +394,7 @@ fn every_tool_result_is_stored_and_other_opaque_payloads_keep_only_their_positio
         .join("\n");
     std::fs::write(&source, lines).unwrap();
     let (mut record, root) = source_record(Source::Claude, &source);
-    record.entries = Some(Ok(TranscriptEntries {
+    record.entries = Some(RecordEntries::Written(TranscriptEntries {
         entries: expected_entries.clone(),
         malformed_lines: Vec::new(),
     }));
@@ -671,13 +671,9 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
             metadata.modified().unwrap(),
         )),
     );
-    record.entries = Some(Ok(normalized_session(
-        crate::history::FOR_FIXTURES,
-        Source::Claude,
-        &source,
-        &[],
-    )
-    .unwrap()));
+    record.entries = Some(RecordEntries::Written(
+        normalized_session(crate::history::FOR_FIXTURES, Source::Claude, &source, &[]).unwrap(),
+    ));
     let mut cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
     let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();

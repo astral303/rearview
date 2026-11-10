@@ -327,14 +327,39 @@ pub(crate) mod test_support {
         storage: &'static dyn SessionStorage,
         open: &dyn Fn(&Environment),
     ) -> Vec<PathBuf> {
+        canonicalised_by(storage, open, |environment| {
+            load_rows_in(environment, storage);
+        })
+    }
+
+    /// The paths `open` canonicalises, in order and with repeats, on a
+    /// command that starts from an admitted, empty cache.
+    pub(crate) fn canonicalised_by_opening_on_empty_cache(
+        storage: &'static dyn SessionStorage,
+        open: &dyn Fn(&Environment),
+    ) -> Vec<PathBuf> {
+        canonicalised_by(storage, open, |environment| {
+            crate::history::sqlite_cache::SqliteCache::open(environment.cache_base())
+                .unwrap()
+                .mark_admitted()
+                .unwrap();
+        })
+    }
+
+    /// The paths `open` canonicalises after `prepare` on a cache of its own.
+    fn canonicalised_by(
+        storage: &'static dyn SessionStorage,
+        open: &dyn Fn(&Environment),
+        prepare: impl FnOnce(&Environment),
+    ) -> Vec<PathBuf> {
         let base = tempfile::tempdir().unwrap();
         let canonicaliser = Arc::new(CountingCanonicaliser::default());
         let environment = test_environment(vec![storage], Some(base.path()))
             .with_canonicaliser(canonicaliser.clone());
-        load_rows_in(&environment, storage);
-        let after_load = canonicaliser.canonicalised().len();
+        prepare(&environment);
+        let after_preparing = canonicaliser.canonicalised().len();
         open(&environment);
-        canonicaliser.canonicalised()[after_load..].to_vec()
+        canonicaliser.canonicalised()[after_preparing..].to_vec()
     }
 
     /// `agent read` of the session at `path`.
@@ -351,20 +376,16 @@ pub(crate) mod test_support {
     }
 
     /// The TUI's open of the session at `path`, a file named on the command
-    /// line.
-    pub(crate) fn direct_open_of(path: &Path) -> impl Fn(&Environment) {
+    /// line: canonicalised, read by the background worker and shown. Fails
+    /// unless the viewer's text contains `shown`.
+    pub(crate) fn direct_open_of(path: &Path, shown: &str) -> impl Fn(&Environment) {
         let path = path.to_path_buf();
+        let shown = shown.to_owned();
         move |environment| {
-            let operation = waiting_operation(environment);
-            let read =
-                crate::history::provider::open_direct_file(environment, &path, false, &operation);
-            operation.finish().unwrap();
+            let text = crate::tui::claude_home::text_of_file_opened_directly(&path, environment);
             assert!(
-                matches!(
-                    read,
-                    Ok(crate::history::provider::DirectFileRead::Session { .. })
-                ),
-                "the file opens as a session"
+                text.contains(&shown),
+                "the viewer shows the opened session: {text}"
             );
         }
     }

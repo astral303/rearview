@@ -49,12 +49,8 @@ pub(super) const ENTRIES_NOT_FAILED: &str = "(status != 'listed' OR entries_erro
 /// row and, for a listed session, its entries.
 pub(crate) struct SessionRecord {
     pub(super) catalogue: CatalogueRow,
-    /// `None` for a session that is not listed; the reason `session_entries`
-    /// failed for a listed one.
-    pub(super) entries: Option<Result<TranscriptEntries, String>>,
-    /// The parse's entries when a file changed after its stamp: `entries`
-    /// then holds the reason they are not written.
-    unwritten_entries: Option<TranscriptEntries>,
+    /// `None` for a session that is not listed.
+    pub(super) entries: Option<RecordEntries>,
     /// The warning an agent command prints for a session that is not
     /// listed, as [`crate::agent::diagnostic::AgentWarning::to_recorded`]
     /// writes it; `None` for a listed one.
@@ -66,6 +62,34 @@ pub(crate) struct SessionRecord {
     /// For a record of a resumed read: what changed, written over the
     /// stored session in place of its whole entries.
     pub(super) update: Option<Box<super::window::WindowUpdate>>,
+}
+
+/// A listed session's entries, as its record carries them to the writer.
+pub(crate) enum RecordEntries {
+    /// Written into the copy with the record.
+    Written(TranscriptEntries),
+    /// Kept out of the copy, which stores `reason` as its entries error:
+    /// a file changed after its stamp. `entries` are the parse's.
+    Unwritten {
+        reason: String,
+        entries: TranscriptEntries,
+    },
+}
+
+impl RecordEntries {
+    /// The entries the copy is written with; `None` when they are kept out.
+    pub(super) fn written(&self) -> Option<&TranscriptEntries> {
+        match self {
+            Self::Written(entries) => Some(entries),
+            Self::Unwritten { .. } => None,
+        }
+    }
+
+    fn into_entries(self) -> TranscriptEntries {
+        match self {
+            Self::Written(entries) | Self::Unwritten { entries, .. } => entries,
+        }
+    }
 }
 
 /// The checkpoint a resumed read of a session starts from and the agent's
@@ -93,12 +117,18 @@ impl CheckpointRecord {
     }
 }
 
-/// A listed session's parse that no record could be built for.
-pub(crate) struct UnbuiltRecord {
-    pub(crate) entries: TranscriptEntries,
-    /// The failure to build the record; `None` when nothing failed, as for
-    /// a stub without a fingerprint to validate a record against.
-    pub(crate) error: Option<crate::error::AppError>,
+/// A listed session's parse, as [`SessionRecord::listed`] records it.
+pub(crate) enum ListedRecord {
+    Built(Box<SessionRecord>),
+    /// The stub does not have a fingerprint to validate a record against;
+    /// the parse's entries stay with the read.
+    WithoutFingerprint(TranscriptEntries),
+    /// Building the record failed with `error`, as for a file outside every
+    /// root; the parse's entries stay with the read.
+    Failed {
+        error: crate::error::AppError,
+        entries: TranscriptEntries,
+    },
 }
 
 /// A session's transcript files as its stub names them, the locator first,
@@ -118,7 +148,7 @@ impl StubStamps {
         )
     }
 
-    /// The stamp of the stub's file at `path`.
+    /// The stamp of `path`.
     pub(crate) fn fingerprint_of(&self, path: &Path) -> Option<CachedFingerprint> {
         self.0
             .iter()
@@ -157,17 +187,14 @@ impl RecordPlace<'_> {
 impl SessionRecord {
     /// The record of `conversation`, the session at `stub` under `place`'s
     /// root, with the entries of `transcripts`, the parse that built it.
-    /// `stamps` are the stub's files stamped before that parse. Without a
-    /// record, the parse's entries: when the stub does not have a fingerprint
-    /// to validate a record against, or a file of the session is outside
-    /// every root of `place`.
+    /// `stamps` are the stub's files stamped before that parse.
     pub(crate) fn listed(
         place: &RecordPlace<'_>,
         stub: &SessionStub,
         stamps: StubStamps,
         conversation: &Conversation,
         mut transcripts: SessionTranscripts,
-    ) -> std::result::Result<Self, Box<UnbuiltRecord>> {
+    ) -> ListedRecord {
         let described = (|| {
             let Some(mut catalogue) =
                 CatalogueRow::of_stub(place, stub, stamps, SessionStatus::Listed)?
@@ -180,11 +207,16 @@ impl SessionRecord {
         })();
         let mut catalogue = match described {
             Ok(Some(catalogue)) => catalogue,
-            unbuilt => {
-                return Err(Box::new(UnbuiltRecord {
+            Ok(None) => {
+                return ListedRecord::WithoutFingerprint(
+                    transcripts.into_entries_and_search_parts().0,
+                );
+            }
+            Err(error) => {
+                return ListedRecord::Failed {
+                    error,
                     entries: transcripts.into_entries_and_search_parts().0,
-                    error: unbuilt.err(),
-                }));
+                };
             }
         };
         let added = catalogue.check_stamps();
@@ -198,24 +230,29 @@ impl SessionRecord {
                 linker: place.linker,
             });
         let (entries, search_parts) = transcripts.into_entries_and_search_parts();
-        let (entries, unwritten_entries, search_parts) = match added {
-            Ok(()) => (Ok(entries), None, search_parts),
-            Err(error) => (Err(error.to_string()), Some(entries), Vec::new()),
+        let (entries, search_parts) = match added {
+            Ok(()) => (RecordEntries::Written(entries), search_parts),
+            Err(error) => (
+                RecordEntries::Unwritten {
+                    reason: error.to_string(),
+                    entries,
+                },
+                Vec::new(),
+            ),
         };
-        Ok(Self {
+        ListedRecord::Built(Box::new(Self {
             catalogue,
             entries: Some(entries),
-            unwritten_entries,
             unlisted_reason: None,
             search_parts,
             checkpoint,
             update: None,
-        })
+        }))
     }
 
     /// True when a copy written from this record holds its entries.
     pub(crate) fn writes_its_entries(&self) -> bool {
-        matches!(self.entries, Some(Ok(_)))
+        matches!(self.entries, Some(RecordEntries::Written(_)))
     }
 
     /// The entries of this record's whole parse, written or not; `None` for
@@ -225,10 +262,7 @@ impl SessionRecord {
         if self.update.is_some() {
             return None;
         }
-        match self.entries {
-            Some(Ok(entries)) => Some(entries),
-            _ => self.unwritten_entries,
-        }
+        self.entries.map(RecordEntries::into_entries)
     }
 
     /// The record of `conversation`, a resumed read of the session at `stub`
@@ -272,8 +306,7 @@ impl SessionRecord {
         });
         Ok(Some(Self {
             catalogue,
-            entries: Some(Ok(entries)),
-            unwritten_entries: None,
+            entries: Some(RecordEntries::Written(entries)),
             unlisted_reason: None,
             search_parts,
             checkpoint,
@@ -299,7 +332,6 @@ impl SessionRecord {
         Ok(Some(Self {
             catalogue,
             entries: None,
-            unwritten_entries: None,
             unlisted_reason: Some(reason),
             search_parts: Vec::new(),
             checkpoint: None,

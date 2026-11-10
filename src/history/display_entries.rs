@@ -160,13 +160,13 @@ fn printed_session(
     )?;
     // The printout is rearview's last output: no later refresh follows the
     // read's next step.
-    let Some((super::provider::SessionRead::Listed(row), unwritten_entries)) = outcomes
+    let Some((super::provider::SessionRead::Listed(row), unwritten)) = outcomes
         .pop()
-        .map(|outcome| outcome.into_read_and_unwritten_entries())
+        .map(|outcome| outcome.into_read_and_unwritten())
     else {
         return Err(not_in_the_cache(path));
     };
-    if let Some(entries) = unwritten_entries {
+    if let super::provider::UnwrittenParse::Entries(entries) = unwritten {
         return Ok(PrintedSession {
             entries: entries.into(),
             older_copy_reason: None,
@@ -179,11 +179,11 @@ fn printed_session(
         None => None,
     };
     let currency = match &copy {
-        Some(copy) => currency_for_its_publisher(copy, &row.publication)?,
+        Some(copy) => copy.currency_for_publisher(&row.publication)?,
         None => None,
     };
     let older_copy = match (copy, currency) {
-        (Some(copy), Some(Currency::Current | Currency::Newer { .. })) => {
+        (Some(copy), Some(Currency::Current | Currency::Adopt { .. })) => {
             return Ok(PrintedSession {
                 entries: copy_entries(copy, path)?,
                 older_copy_reason: None,
@@ -201,25 +201,6 @@ fn printed_session(
             super::StaleCause::WritesStopped => "rearview could not update it in the session cache",
         }),
     })
-}
-
-/// `copy`'s currency for the row whose publication is `publication`, read by
-/// the command whose refresh built the row. A copy at or after the
-/// generation the refresh published is current without checking its
-/// transcripts: the refresh read them, and an agent's write after its parse
-/// would otherwise make its own copy older. `None` when the cache no longer
-/// holds the copy of an unpublished row.
-fn currency_for_its_publisher(
-    copy: &CachedSession,
-    publication: &Publication,
-) -> Result<Option<Currency>> {
-    match publication {
-        Publication::Published { generation } if copy.generation() >= *generation => {
-            Ok(Some(Currency::Current))
-        }
-        Publication::Published { .. } => Ok(Some(Currency::Older)),
-        Publication::Unpublished { .. } => copy.currency(publication),
-    }
 }
 
 /// The entries of `copy`, the copy of the session at `path`, as the cache
@@ -241,44 +222,76 @@ fn not_in_the_cache(path: &Path) -> crate::error::AppError {
     }
 }
 
-/// The entries of the session at `address` as the viewer, exports and the
-/// clipboard copy read them, through `cache`'s interactive read: the newest
-/// copy the cache holds, current or not, for a row whose publication is
-/// `publication`. A copy written after the row comes with its own
-/// publication and catalogue row.
+/// The entries of the session at `address` as exports and the clipboard copy
+/// read them, through `cache`'s interactive read: the newest copy the cache
+/// holds, current or not, for a row whose publication is `publication`. A
+/// copy the read adopts in the row's place comes with its own publication.
 pub fn display_log_entries_interactively(
     cache: &InteractiveCache,
     address: &SessionAddress,
     publication: &Publication,
 ) -> InteractiveRead<DisplayEntries> {
     cache.read(|reader| {
-        let Some(session) = reader.copy_at(address)? else {
+        let Some((session, currency)) = newest_copy(reader, address, publication)? else {
             return Ok(None);
         };
-        let Some(currency) = session.currency(publication)? else {
-            return Ok(None);
-        };
-        let newer_row = match &currency {
-            Currency::Newer { generation, .. } => reader
-                .catalogue_row_at(address)?
-                .filter(|row| {
-                    row.publication
-                        == Publication::Published {
-                            generation: *generation,
-                        }
-                })
-                .map(Box::new),
-            Currency::Current | Currency::Older => None,
-        };
-        Ok(session
-            .ignoring_source_changes()
-            .entries()?
-            .map(|entries| CachedCopy {
-                value: DisplayEntries::from(entries),
-                currency,
-                newer_row,
-            }))
+        Ok(session.entries()?.map(|entries| CachedCopy {
+            value: DisplayEntries::from(entries),
+            currency,
+        }))
     })
+}
+
+/// A copy of a session as the viewer shows it.
+pub struct ViewedCopy {
+    pub entries: DisplayEntries,
+    /// The copy's catalogue row, the header's source; `None` when the cache
+    /// no longer lists the copy.
+    pub row: Option<Box<super::Conversation>>,
+}
+
+/// [`display_log_entries_interactively`] with the copy's catalogue row, as
+/// the viewer reads the session at `address`.
+pub fn viewed_copy_interactively(
+    cache: &InteractiveCache,
+    address: &SessionAddress,
+    publication: &Publication,
+) -> InteractiveRead<ViewedCopy> {
+    cache.read(|reader| {
+        let Some((session, currency)) = newest_copy(reader, address, publication)? else {
+            return Ok(None);
+        };
+        let generation = Publication::Published {
+            generation: session.generation(),
+        };
+        let row = reader
+            .catalogue_row_at(address)?
+            .filter(|row| row.publication == generation)
+            .map(Box::new);
+        Ok(session.entries()?.map(|entries| CachedCopy {
+            value: ViewedCopy {
+                entries: DisplayEntries::from(entries),
+                row,
+            },
+            currency,
+        }))
+    })
+}
+
+/// The newest copy `reader` holds of the session at `address`, read as it
+/// is, with its currency for a row whose publication is `publication`;
+/// `None` when the cache does not hold it.
+fn newest_copy(
+    reader: &super::sqlite_cache::SqliteCache,
+    address: &SessionAddress,
+    publication: &Publication,
+) -> Result<Option<(CachedSession, Currency)>> {
+    let Some(session) = reader.copy_at(address)? else {
+        return Ok(None);
+    };
+    Ok(session
+        .currency(publication)?
+        .map(|currency| (session.ignoring_source_changes(), currency)))
 }
 
 /// A bare file's [`sniffed_session`] as the viewer and the terminal printout

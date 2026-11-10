@@ -42,19 +42,21 @@ pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session
 pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
 pub use cached_session::{CachedSession, Publication, SessionAddress};
-pub(crate) use catalogue::{RecordPlace, SessionRecord, SessionStatus, StubStamps, UnbuiltRecord};
+#[cfg(test)]
+pub(crate) use catalogue::RecordEntries;
+pub(crate) use catalogue::{ListedRecord, RecordPlace, SessionRecord, SessionStatus, StubStamps};
 pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
 pub(crate) use entries::StoredEntries;
-pub(crate) use interactive::{CachedCopy, refuse_the_drawing_thread};
 pub use interactive::{
-    CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead, NewerCopy,
+    AdoptedCopy, CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead,
 };
+pub(crate) use interactive::{CachedCopy, refuse_the_drawing_thread};
 pub use next_step::NextStep;
 pub use observer::{AwaitedRefresh, Observation, OtherRearview};
-#[cfg(test)]
-pub(crate) use permit::FOR_FIXTURES;
 pub use permit::{Admitted, ParsePermit};
+#[cfg(test)]
+pub(crate) use permit::{FOR_FIXTURES, admitted_reads};
 pub(crate) use read_catalogue::CatalogueSession;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
@@ -673,16 +675,17 @@ impl CacheWriter {
             .filter(|file| file.kind == "subagent")
             .map(|file| file.path.as_path())
             .collect();
-        if let (Some(update), Some(Ok(entries))) = (&record.update, &record.entries) {
+        let written = record
+            .entries
+            .as_ref()
+            .and_then(catalogue::RecordEntries::written);
+        if let (Some(update), Some(entries)) = (&record.update, written) {
             return self.update_window(record, update, entries, &subagents);
         }
-        let rows = match &record.entries {
-            Some(Ok(entries)) => Some(entries::SessionRows::of(entries, &subagents)),
-            _ => None,
-        };
+        let rows = written.map(|entries| entries::SessionRows::of(entries, &subagents));
         // The free space is checked above, outside the transaction: the check
         // takes the owner's turn, which the transaction holds.
-        if let (Some(rows), Some(Ok(entries))) = (&rows, &record.entries)
+        if let (Some(rows), Some(entries)) = (&rows, written)
             && let Some(generation) = self.update_stored(record, rows, entries)?
         {
             return Ok(generation);
@@ -831,7 +834,7 @@ impl CacheWriter {
         )?;
         let owner = &self.owner;
         let entries_error = match &record.entries {
-            Some(Ok(entries)) => {
+            Some(catalogue::RecordEntries::Written(entries)) => {
                 let rows = rows.expect("listed entries have rows");
                 entries::insert(
                     &mut self.cache.connection,
@@ -848,7 +851,7 @@ impl CacheWriter {
                 refresh::commit(batch, owner)?;
                 None
             }
-            Some(Err(error)) => Some(error.as_str()),
+            Some(catalogue::RecordEntries::Unwritten { reason, .. }) => Some(reason.as_str()),
             None => record.unlisted_reason.as_deref(),
         };
         check_space()?;

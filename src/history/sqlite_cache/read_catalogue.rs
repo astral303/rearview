@@ -341,6 +341,7 @@ fn conversation(
         parse_errors,
         summary: row.get(13)?,
         custom_title: row.get(14)?,
+        external_title: None,
         model: row.get(15)?,
         total_tokens: row.get::<_, i64>(16)? as u64,
         duration_minutes: row.get::<_, Option<i64>>(17)?.map(|minutes| minutes as u64),

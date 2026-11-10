@@ -64,6 +64,18 @@ impl AgentError {
     pub fn semantic_unavailable(detail: impl Into<String>) -> Self {
         Self::new(AgentErrorKind::SemanticUnavailable, None, detail)
     }
+
+    /// Converts `warning`, a session read's warning, into the error for
+    /// `reference` when it reports a failed read; `None` for a skipped
+    /// session's warning.
+    pub(crate) fn of_read_warning(warning: &AgentWarning, reference: &str) -> Option<Self> {
+        let kind = match warning.kind {
+            AgentWarningKind::MalformedTranscript => AgentErrorKind::MalformedTranscript,
+            AgentWarningKind::Io => AgentErrorKind::Io,
+            _ => return None,
+        };
+        Some(Self::new(kind, Some(reference), warning.detail.clone()))
+    }
 }
 
 impl fmt::Display for AgentError {

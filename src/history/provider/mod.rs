@@ -42,6 +42,8 @@ pub(crate) use direct_file::OutsideEveryRoot;
 pub use direct_file::{DirectFileRead, open_direct_file};
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
 pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
+#[cfg(test)]
+pub(crate) use load::READ_BATCH_LENGTH;
 pub use load::{
     DiscoveredSession, FoundSession, LeftOutRows, LoadOptions, ReadError, RecordedSession,
     RediscoveredSessions, SkippedSessions, StaleCopy, apply_external_title, cache_sessions,
@@ -49,7 +51,7 @@ pub use load::{
 };
 #[cfg(test)]
 pub use load::{LoadedSessions, read_resolved_session, reread_sessions};
-pub use outcome::{SessionOutcome, SessionRead};
+pub use outcome::{SessionOutcome, SessionRead, UnwrittenParse};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 pub use storage::{
     DiscoveredSessions, Fingerprint, IgnoredSessions, ResolvedSession, SessionCache,

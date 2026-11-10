@@ -199,6 +199,7 @@ pub fn one_message_conversation(
         parse_errors: vec![],
         summary: summary.map(str::to_string),
         custom_title: title.map(str::to_string),
+        external_title: None,
         model: None,
         total_tokens: 0,
         duration_minutes: None,

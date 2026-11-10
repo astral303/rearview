@@ -141,7 +141,7 @@ impl TranscriptReader for KimiWireFormat {
         source: &Path,
         read: &TranscriptRead,
     ) -> Result<Resumption> {
-        permit.admit();
+        permit.admit(source);
         let (Some(stable_cursor), Ok(state)) = (
             LineCursor::decode(&read.stable_cursor),
             serde_json::from_slice::<WireState>(&read.parser_state),

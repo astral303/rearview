@@ -11,7 +11,7 @@ use crate::search::preview::{
 };
 use crate::tui::actions_menu::{self, ActionAvailability, SessionAction};
 use crate::tui::app::{
-    App, AppMode, DialogMode, ListSearchMode, LoadingState, OpenSessionStatus,
+    App, AppMode, DialogMode, HeaderRow, ListSearchMode, LoadingState, OpenSessionStatus,
     SemanticResultMetadata, ViewSearchMode, ViewState, list_lines_per_item,
 };
 use crate::tui::theme::{self, Theme};
@@ -515,7 +515,7 @@ fn render_semantic_debug_popup(frame: &mut Frame, app: &App) {
 /// the last message's day and time within one day, each with the year when
 /// it differs from `today`'s. Taken from the open view's messages once
 /// parsed, otherwise from the row's last timestamp and duration.
-fn header_dates(conv: &Conversation, state: &ViewState, today: NaiveDate, zone: Zone) -> String {
+fn header_dates(conv: &HeaderRow, state: &ViewState, today: NaiveDate, zone: Zone) -> String {
     let span = state
         .parsed_conversation
         .as_deref()
@@ -533,11 +533,7 @@ fn header_dates(conv: &Conversation, state: &ViewState, today: NaiveDate, zone: 
 }
 
 /// Check if the header (with summary) fits on a single line given terminal width
-fn header_fits_single_line(
-    conv: &crate::history::Conversation,
-    dates: &str,
-    terminal_width: u16,
-) -> bool {
+fn header_fits_single_line(conv: &HeaderRow, dates: &str, terminal_width: u16) -> bool {
     let summary = match &conv.summary {
         Some(s) => s,
         None => return true, // No summary means it's already single line
@@ -609,14 +605,11 @@ pub fn view_layout_rects(area: Rect, app: &App, state: &ViewState) -> ViewLayout
     } else {
         1
     };
-    let conv = app
-        .conversations()
-        .iter()
-        .find(|c| c.path == state.conversation_path);
-    let has_summary = conv.is_some_and(|c| c.summary.is_some());
-    let fits_single_line = conv.is_some_and(|c| {
-        let dates = header_dates(c, state, app.today(), app.clock().zone());
-        header_fits_single_line(c, &dates, area.width)
+    let header = state.header.as_ref();
+    let has_summary = header.is_some_and(|header| header.summary.is_some());
+    let fits_single_line = header.is_some_and(|header| {
+        let dates = header_dates(header, state, app.today(), app.clock().zone());
+        header_fits_single_line(header, &dates, area.width)
     });
     let header_height = if has_summary && !fits_single_line {
         3
@@ -677,11 +670,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
 }
 
 fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
-    let conv = state.copy_row.as_ref().map(|row| &*row.0).or_else(|| {
-        app.conversations()
-            .iter()
-            .find(|c| c.path == state.conversation_path)
-    });
+    let conv = state.header.as_ref();
 
     let (
         project,
@@ -2634,7 +2623,12 @@ mod tests {
         );
         let conversation = &app.conversations()[0];
         assert_eq!(
-            header_dates(conversation, view_state(&app), today, Zone::System),
+            header_dates(
+                &HeaderRow::of(conversation),
+                view_state(&app),
+                today,
+                Zone::System
+            ),
             expected
         );
     }
@@ -2655,7 +2649,12 @@ mod tests {
         );
         let conversation = &app.conversations()[0];
         assert_eq!(
-            header_dates(conversation, view_state(&app), app.today(), Zone::System),
+            header_dates(
+                &HeaderRow::of(conversation),
+                view_state(&app),
+                app.today(),
+                Zone::System
+            ),
             expected
         );
     }
@@ -2799,6 +2798,7 @@ mod tests {
             parse_errors: Vec::new(),
             summary: Some("summary sentinel".to_string()),
             custom_title: Some("title sentinel".to_string()),
+            external_title: None,
             model: None,
             total_tokens: 0,
             duration_minutes: None,

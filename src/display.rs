@@ -338,9 +338,49 @@ mod tests {
         assert!(
             matches!(
                 currency,
-                Some(crate::history::sqlite_cache::Currency::Newer { .. })
+                Some(crate::history::sqlite_cache::Currency::Adopt { .. })
             ),
             "the printout refreshes the session's cached copy: {currency:?}"
+        );
+    }
+
+    /// A copy at the generation the command published is current though its
+    /// transcript changed after the write. A copy below that generation is
+    /// older.
+    #[test]
+    fn copy_at_the_published_generation_is_current_though_its_transcript_changed() {
+        use crate::history::sqlite_cache::{Currency, Publication};
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let a = home.write("a", 5, &["first question"]);
+        let environment = home.environment();
+        let rows = home.rows(&environment);
+        let row = rows.iter().find(|row| row.path == a).unwrap();
+        let copy = crate::history::sqlite_cache::find_cached_session_waiting(
+            environment.cache_base(),
+            row.cache_address.as_ref().unwrap(),
+        )
+        .unwrap()
+        .expect("the cache holds the session");
+        home.append(&a, 6, "written after the copy");
+        let published = Publication::Published {
+            generation: copy.generation(),
+        };
+        let published_later = Publication::Published {
+            generation: copy.generation() + 1,
+        };
+
+        assert_eq!(
+            copy.currency_for_publisher(&published).unwrap(),
+            Some(Currency::Current)
+        );
+        assert_eq!(
+            copy.currency_for_publisher(&published_later).unwrap(),
+            Some(Currency::Older)
+        );
+        assert_eq!(
+            copy.currency(&published).unwrap(),
+            Some(Currency::Older),
+            "a check of the transcripts finds the copy out of date"
         );
     }
 
@@ -350,21 +390,27 @@ mod tests {
         home: crate::tui::claude_home::ClaudeHome,
         cache: tempfile::TempDir,
         transcript: std::path::PathBuf,
+        /// The sub-agent transcript started after the session was cached.
+        subagent: std::path::PathBuf,
     }
 
     impl SessionWithNewSubAgent {
         fn new() -> Self {
             let home = crate::tui::claude_home::ClaudeHome::new();
             let transcript = home.write("a", 5, &["first question"]);
-            let session = Self {
+            let mut session = Self {
                 home,
                 cache: crate::tui::claude_home::admitted_cache(),
                 transcript,
+                subagent: std::path::PathBuf::new(),
             };
             session.home.rows(&session.environment());
-            session
-                .home
-                .write_subagent(&session.transcript, "explore", 6, &["sub-agent question"]);
+            session.subagent = session.home.write_subagent(
+                &session.transcript,
+                "explore",
+                6,
+                &["sub-agent question"],
+            );
             session
         }
 
@@ -452,72 +498,57 @@ mod tests {
     }
 
     /// The printout of a session whose transcript changes once its refresh
-    /// has written the copy prints that copy, without a notice: the refresh
-    /// published it.
+    /// has written the copy prints that copy, without a notice and without
+    /// reading the transcript again: the refresh published it.
     #[test]
     fn printout_prints_copy_its_refresh_published_when_transcript_changes_after_the_write() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::history::sqlite_cache::admitted_reads;
         let session = SessionWithNewSubAgent::new();
         let transcript = session.transcript.clone();
-        let has_appended = Arc::new(AtomicBool::new(false));
-        let _appending = crate::history::sqlite_cache::connection::test_hooks::on_every_connection(
-            session.cache.path(),
-            move |connection| {
-                if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
-                    return;
-                }
-                let changes_data = Arc::new(AtomicBool::new(false));
-                let changed = Arc::clone(&changes_data);
-                connection
-                    .update_hook(Some(
-                        move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
-                            if table != "refresh_state" {
-                                changed.store(true, Ordering::SeqCst);
-                            }
-                        },
-                    ))
-                    .unwrap();
-                let (transcript, has_appended) = (transcript.clone(), Arc::clone(&has_appended));
-                connection
-                    .commit_hook(Some(move || {
-                        if changes_data.swap(false, Ordering::SeqCst)
-                            && !has_appended.swap(true, Ordering::SeqCst)
-                        {
-                            let mut file = std::fs::OpenOptions::new()
-                                .append(true)
-                                .open(&transcript)
-                                .unwrap();
-                            std::io::Write::write_all(&mut file, b"{}\n").unwrap();
-                        }
-                        false
-                    }))
-                    .unwrap();
-            },
-        );
+        let _appending =
+            crate::history::sqlite_cache::connection::test_hooks::run_at_the_first_data_commit(
+                session.cache.path(),
+                move || {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&transcript)
+                        .unwrap();
+                    std::io::Write::write_all(&mut file, b"{}\n").unwrap();
+                },
+            );
+        let reads_of = |transcript: &std::path::Path| admitted_reads::count(transcript);
+        let before = (reads_of(&session.transcript), reads_of(&session.subagent));
 
         let (entries, notices) = session.printed().unwrap();
 
         assert!(entries.contains("sub-agent question"), "{entries}");
         assert_eq!(notices, "");
+        assert_eq!(
+            (
+                reads_of(&session.transcript) - before.0,
+                reads_of(&session.subagent) - before.1
+            ),
+            (0, 1),
+            "the refresh reads on from the copy, reading the new sub-agent once"
+        );
     }
 
-    /// The printout of a session the cache never held, whose refresh fails
-    /// to write, prints the session the refresh parsed, without a notice.
+    /// The printout of an uncached session, whose refresh fails to write,
+    /// prints the session the refresh parsed, without a notice.
     #[test]
-    fn printout_of_session_cache_never_held_whose_write_fails_prints_its_parse() {
+    fn printout_of_uncached_session_whose_write_fails_prints_its_parse() {
         let session = SessionWithNewSubAgent::new();
-        let never_cached = SessionWithNewSubAgent {
+        let uncached = SessionWithNewSubAgent {
             transcript: session.home.write("b", 7, &["unseen question"]),
             ..session
         };
         let _failing =
             crate::history::sqlite_cache::connection::test_hooks::fail_the_first_data_commit(
-                never_cached.cache.path(),
+                uncached.cache.path(),
                 || {},
             );
 
-        let (entries, notices) = never_cached.printed().unwrap();
+        let (entries, notices) = uncached.printed().unwrap();
 
         assert!(entries.contains("unseen question"), "{entries}");
         assert_eq!(notices, "");
@@ -556,18 +587,18 @@ mod tests {
         assert_eq!(notices, "");
     }
 
-    /// Beside another rearview's refresh, the printout of a session the
-    /// cache never held fails: the cache doesn't hold a copy, and the
-    /// printout may not parse the session.
+    /// Beside another rearview's refresh, the printout of an uncached
+    /// session fails: the cache doesn't hold a copy, and the printout may
+    /// not parse the session.
     #[test]
-    fn printout_beside_another_refresh_fails_for_session_cache_never_held() {
+    fn printout_beside_another_refresh_fails_for_uncached_session() {
         let session = SessionWithNewSubAgent::new();
-        let never_cached = SessionWithNewSubAgent {
+        let uncached = SessionWithNewSubAgent {
             transcript: session.home.write("b", 7, &["unseen question"]),
             ..session
         };
 
-        let printed = never_cached.beside_another_refresh(|| never_cached.printed());
+        let printed = uncached.beside_another_refresh(|| uncached.printed());
 
         assert!(printed.is_err(), "{printed:?}");
     }

@@ -298,6 +298,14 @@ pub fn day_at_line(
     })
 }
 
+/// A copy of a session as the viewer shows it: its conversation, and the
+/// copy's catalogue row the header shows.
+pub struct ViewedConversation {
+    pub conversation: ParsedConversation,
+    /// `None` when the cache no longer lists the copy.
+    pub row: Option<Box<crate::history::Conversation>>,
+}
+
 /// The conversation the cache keeps at `address`, its newest copy read
 /// through `cache`'s interactive read, as the TUI's drawing thread reads it,
 /// for a row whose publication is `publication`.
@@ -305,9 +313,13 @@ pub fn parse_conversation_file_interactively(
     cache: &crate::history::InteractiveCache,
     address: &crate::history::sqlite_cache::SessionAddress,
     publication: &crate::history::sqlite_cache::Publication,
-) -> crate::history::InteractiveRead<ParsedConversation> {
-    crate::history::display_log_entries_interactively(cache, address, publication)
-        .map(parsed_conversation)
+) -> crate::history::InteractiveRead<ViewedConversation> {
+    crate::history::viewed_copy_interactively(cache, address, publication).map(|viewed| {
+        ViewedConversation {
+            conversation: parsed_conversation(viewed.entries),
+            row: viewed.row,
+        }
+    })
 }
 
 /// A bare file the user names (`--render`, a direct path argument), read by

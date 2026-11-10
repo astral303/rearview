@@ -52,7 +52,8 @@ fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
         &InteractiveCache::at(test_cache_base()),
         address_of(row),
         &row.publication,
-    ));
+    ))
+    .conversation;
     let options = RenderOptions {
         tool_display,
         show_thinking: true,

@@ -267,7 +267,7 @@ impl TranscriptReader for OpenCodeDbFormat {
         source: &Path,
         read: &TranscriptRead,
     ) -> Result<Resumption> {
-        permit.admit();
+        permit.admit(source);
         let (Some(reference), Ok(cursor), Ok(state)) = (
             decode_ref(source),
             serde_json::from_slice::<RowsCursor>(&read.stable_cursor),

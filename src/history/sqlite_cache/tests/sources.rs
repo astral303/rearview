@@ -229,7 +229,7 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     assert_eq!(
         format!(
             "{:?}",
-            missing.entries.as_ref().unwrap().as_ref().unwrap().entries
+            missing.entries.as_ref().unwrap().written().unwrap().entries
         ),
         format!("{:?}", fresh.entries)
     );
@@ -273,20 +273,14 @@ fn bounded_read_doesnt_restore_unrelated_result() {
     .join("\n");
     std::fs::write(&source, lines).unwrap();
     let (mut record, root) = source_record(Source::Claude, &source);
-    record
-        .entries
-        .as_mut()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .malformed_lines
-        .push(crate::history::MalformedLine {
-            line_number: 3,
-            detail: None,
-        });
-    let (_, crate::log_entry::LogEntry::User { message, .. }) =
-        &mut record.entries.as_mut().unwrap().as_mut().unwrap().entries[1]
-    else {
+    let Some(RecordEntries::Written(written)) = &mut record.entries else {
+        panic!("the record writes its entries")
+    };
+    written.malformed_lines.push(crate::history::MalformedLine {
+        line_number: 3,
+        detail: None,
+    });
+    let (_, crate::log_entry::LogEntry::User { message, .. }) = &mut written.entries[1] else {
         panic!("user result")
     };
     let crate::log_entry::UserContent::Blocks(blocks) = &mut message.content else {
@@ -349,7 +343,7 @@ fn text_only_result_arrays_reconstruct_without_fetching_source() {
     let (mut record, root) = source_record(Source::Claude, &source);
     record.catalogue.files.clear();
     let expected =
-        serde_json::to_value(&record.entries.as_ref().unwrap().as_ref().unwrap().entries[0].1)
+        serde_json::to_value(&record.entries.as_ref().unwrap().written().unwrap().entries[0].1)
             .unwrap();
     let mut cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
@@ -377,7 +371,7 @@ fn object_result_reads_from_cache_without_its_source() {
     let (mut record, root) = source_record(Source::Claude, &source);
     record.catalogue.files.clear();
     let expected =
-        serde_json::to_value(&record.entries.as_ref().unwrap().as_ref().unwrap().entries[0].1)
+        serde_json::to_value(&record.entries.as_ref().unwrap().written().unwrap().entries[0].1)
             .unwrap();
     let mut cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();

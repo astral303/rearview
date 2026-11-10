@@ -42,7 +42,7 @@ use search_state::{
 };
 #[allow(unused_imports)]
 pub use types::{
-    Action, AppMode, CopyRow, CountHighlight, DialogMode, DirectFile, Focus, LIST_LINES_PER_ITEM,
+    Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow, LIST_LINES_PER_ITEM,
     ListScope, ListSearchMode, LoadingState, OpenSessionStatus, SemanticProgress,
     SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewState, list_lines_per_item,
 };

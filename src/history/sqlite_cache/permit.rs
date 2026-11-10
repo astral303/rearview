@@ -13,12 +13,29 @@ pub struct ParsePermit<'a> {
     _grant: PhantomData<&'a ()>,
 }
 
-/// One parse a [`ParsePermit`] admitted. Only [`ParsePermit::admit`] makes
-/// one, so a format's own reading of a transcript cannot run without a
-/// permit.
-#[derive(Clone, Copy)]
+/// One transcript file's read a [`ParsePermit`] admitted. Only
+/// [`ParsePermit::admit`] and [`Admitted::admit_linked`] make one, so a
+/// format's own reading of a transcript cannot run without a permit, and
+/// each file read takes its own admission.
 pub struct Admitted {
     _proof: (),
+}
+
+impl Admitted {
+    /// Admit the read of `transcript`, another file the admitted
+    /// transcript's read reads, such as an earlier rollout it continues.
+    pub(crate) fn admit_linked(&self, transcript: &std::path::Path) -> Admitted {
+        record_admission(transcript)
+    }
+}
+
+/// Test builds count the admission of `transcript` in [`admitted_reads`].
+fn record_admission(transcript: &std::path::Path) -> Admitted {
+    #[cfg(test)]
+    admitted_reads::record(transcript);
+    #[cfg(not(test))]
+    let _ = transcript;
+    Admitted { _proof: () }
 }
 
 impl<'a> ParsePermit<'a> {
@@ -46,10 +63,12 @@ impl<'a> ParsePermit<'a> {
         }
     }
 
-    /// Admit one parse. Panics in debug builds on the TUI's drawing thread.
-    pub(crate) fn admit(self) -> Admitted {
+    /// Admit one parse of the transcript at `transcript`. Panics in debug
+    /// builds on the TUI's drawing thread. Test builds count the admission
+    /// in [`admitted_reads`].
+    pub(crate) fn admit(self, transcript: &std::path::Path) -> Admitted {
         super::refuse_the_drawing_thread("parse a transcript");
-        Admitted { _proof: () }
+        record_admission(transcript)
     }
 }
 
@@ -59,3 +78,35 @@ impl<'a> ParsePermit<'a> {
 pub(crate) const FOR_FIXTURES: ParsePermit<'static> = ParsePermit {
     _grant: PhantomData,
 };
+
+/// Every transcript file read a [`ParsePermit`] admitted in this test
+/// process, by path: the file a parse names, each sub-agent transcript it
+/// reads and each earlier rollout a Codex thread continues. A test counts
+/// the parses of its own files here, whichever route reads them. Reads of
+/// a file's opening lines only, as discovery and Codex's search for the
+/// rollouts a thread continues make them, are not counted. Temporary
+/// directories keep parallel tests' paths apart.
+#[cfg(test)]
+pub(crate) mod admitted_reads {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, PoisonError};
+
+    static READS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(transcript: &Path) {
+        READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(transcript.to_path_buf());
+    }
+
+    /// The reads of the transcript at `transcript` admitted so far.
+    pub(crate) fn count(transcript: &Path) -> usize {
+        READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|read| *read == transcript)
+            .count()
+    }
+}

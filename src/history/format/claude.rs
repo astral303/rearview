@@ -24,7 +24,7 @@ use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::parser::{
     HeaderlessSession, ParsedSession, RowDating, SubagentReads, SubagentRecordParts,
-    SubagentTranscripts, UnlistedReason,
+    SubagentTranscripts, UnlistedSession,
 };
 #[cfg(test)]
 use crate::history::parser::{ParsedRow, SubagentMark};
@@ -127,13 +127,12 @@ impl SessionFormat for ClaudeTranscript {
         path: &Path,
         subagents: &[PathBuf],
     ) -> Result<Option<TranscriptEntries>> {
-        let admitted = permit.admit();
         let (session, mut threads) = if subagents.is_empty() {
-            (transcript_entries(admitted, path), Vec::new())
+            (transcript_entries(permit.admit(path), path), Vec::new())
         } else {
             rayon::join(
-                || transcript_entries(admitted, path),
-                || subagent_threads(admitted, subagents),
+                || transcript_entries(permit.admit(path), path),
+                || subagent_threads(permit, subagents),
             )
         };
         let session = session?;
@@ -176,7 +175,7 @@ impl TranscriptReader for ClaudeTranscript {
         source: &Path,
         read: &TranscriptRead,
     ) -> Result<Resumption> {
-        permit.admit();
+        permit.admit(source);
         let (Some(stable_cursor), Ok(state)) = (
             LineCursor::decode(&read.stable_cursor),
             serde_json::from_slice::<ReadState>(&read.parser_state),
@@ -224,7 +223,7 @@ impl TranscriptReader for ClaudeTranscript {
         permit: ParsePermit<'_>,
         source: &Path,
     ) -> Result<Option<SessionProjection>> {
-        Ok(read_subagent(permit.admit(), source)?.map(|read| read.projection))
+        Ok(read_subagent(permit.admit(source), source)?.map(|read| read.projection))
     }
 
     /// Claude keeps a session's titles in its transcript.
@@ -276,11 +275,11 @@ impl ThreadLinker for ClaudeTranscript {
 /// holds a Claude record, in order, parsed on the rayon pool. The view has no
 /// debug channel for the others: the load reports them when the row is
 /// built.
-fn subagent_threads(admitted: Admitted, subagents: &[PathBuf]) -> Vec<SubagentThread> {
+fn subagent_threads(permit: ParsePermit<'_>, subagents: &[PathBuf]) -> Vec<SubagentThread> {
     subagents
         .par_iter()
         .filter_map(|subagent| {
-            let read = read_subagent(admitted, subagent).ok()??;
+            let read = read_subagent(permit.admit(subagent), subagent).ok()??;
             Some(SubagentThread::of_projection(subagent, read.projection))
         })
         .collect()
@@ -394,15 +393,14 @@ pub(crate) fn session_row(
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
 ) -> Result<ParsedSession> {
-    let admitted = permit.admit();
-    let session = read_transcript(admitted, &stub.locator);
+    let session = read_transcript(permit.admit(&stub.locator), &stub.locator);
     on_transcript_read();
     let (own, own_read) = session?;
     if !holds_a_claude_record(&own.entries) {
-        return Ok(Err(UnlistedReason::ForeignTranscript));
+        return Ok(Err(UnlistedSession::foreign()));
     }
     let (subagents, ledger) = subagent_reads(
-        admitted,
+        permit,
         &own.entries,
         &stub.subagents,
         debug_level,
@@ -435,7 +433,7 @@ pub(crate) fn session_row(
 /// the threads. An unreadable transcript is left out of the threads to
 /// splice, as the view leaves it out.
 fn subagent_reads(
-    admitted: Admitted,
+    permit: ParsePermit<'_>,
     session: &[(RecordLine, LogEntry)],
     subagents: &[PathBuf],
     debug_level: Option<DebugLevel>,
@@ -444,7 +442,7 @@ fn subagent_reads(
     let reads: Vec<_> = subagents
         .par_iter()
         .map(|subagent| {
-            let read = read_subagent(admitted, subagent);
+            let read = read_subagent(permit.admit(subagent), subagent);
             on_transcript_read();
             read
         })
@@ -1586,6 +1584,61 @@ mod tests {
     use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
 
+    /// A load's whole read of a session with two sub-agents, and the
+    /// entries an agent command parses of it, each admit every transcript
+    /// once.
+    #[test]
+    fn whole_read_of_session_with_sub_agents_admits_each_transcript_once() {
+        use crate::history::sqlite_cache::admitted_reads;
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let transcript = home.write("parent", 5, &["a question"]);
+        let subagents = ["explore", "plan"]
+            .map(|agent| home.write_subagent(&transcript, agent, 6, &["a sub-agent question"]));
+        let files: Vec<&Path> = std::iter::once(transcript.as_path())
+            .chain(subagents.iter().map(PathBuf::as_path))
+            .collect();
+        let reads_since = |before: &[usize]| -> Vec<usize> {
+            files
+                .iter()
+                .zip(before)
+                .map(|(file, before)| admitted_reads::count(file) - before)
+                .collect()
+        };
+        let cache = crate::tui::claude_home::admitted_cache();
+        let environment = home.environment_with_cache(
+            cache.path(),
+            crate::history::ProcessIdentity::default(),
+            std::sync::Arc::new(TestClock::default()),
+        );
+
+        let before: Vec<usize> = files
+            .iter()
+            .map(|file| admitted_reads::count(file))
+            .collect();
+        home.rows(&environment);
+        let load_reads = reads_since(&before);
+        let before: Vec<usize> = files
+            .iter()
+            .map(|file| admitted_reads::count(file))
+            .collect();
+        CLAUDE_TRANSCRIPT
+            .session_entries(crate::history::FOR_FIXTURES, &transcript, &subagents)
+            .unwrap()
+            .unwrap();
+        let entry_reads = reads_since(&before);
+
+        assert_eq!(
+            load_reads,
+            [1, 1, 1],
+            "the load's admitted reads of each file"
+        );
+        assert_eq!(
+            entry_reads,
+            [1, 1, 1],
+            "the entries' admitted reads of each file"
+        );
+    }
+
     /// A session resumed under a newer Claude Code mixes versions; each
     /// record counts under its own.
     #[test]
@@ -1819,7 +1872,7 @@ mod tests {
             ],
         );
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
         let summaries = user_texts(&entries)
@@ -1943,7 +1996,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -1985,7 +2038,7 @@ mod tests {
         let partial = r#"{"type":"attachment","uuid":"p1","attachment":{"type":"file","filename":"/repo/src/main.rs","content":{"type":"text","file":{"filePath":"/repo/src/main.rs","content":"line ten","numLines":5,"startLine":10,"totalLines":40}},"displayPath":"src/main.rs"}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[partial]);
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2007,7 +2060,7 @@ mod tests {
             &ATTACHED_AGAIN_AFTER_COMPACTION,
         );
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2032,7 +2085,7 @@ mod tests {
         let image = r#"{"type":"attachment","uuid":"m1","attachment":{"type":"file","filename":"/repo/shot.png","content":{"type":"image","file":{"base64":"iVBORw0KGgo=","type":"image/png","originalSize":8}},"displayPath":"shot.png"}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[image]);
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2103,7 +2156,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS);
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2132,7 +2185,7 @@ mod tests {
             &[&HOOKED_SHELL_CALLS[..5], &[post_tool_use]].concat(),
         );
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2152,7 +2205,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS[..4]);
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2171,7 +2224,7 @@ mod tests {
             &HOOK_MESSAGE_WITHOUT_A_CALL,
         );
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2201,7 +2254,7 @@ mod tests {
             &[STOP_HOOK_ERROR, STOP_HOOK_SUMMARY],
         );
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2251,7 +2304,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &[IDE_DIAGNOSTICS]);
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
@@ -2285,7 +2338,7 @@ mod tests {
         let diagnostics = r#"{"type":"attachment","uuid":"d2","attachment":{"type":"diagnostics","files":[{"uri":"file:///repo/a.rs","diagnostics":[{"message":"no position"}]},{"uri":"file:///repo/b.rs","diagnostics":[]}]}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[diagnostics]);
 
-        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
             .unwrap()
             .entries;
 
