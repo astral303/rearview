@@ -2754,8 +2754,10 @@ pub(super) mod tests {
         let second = load_rows(&storage, cache_base.path());
         assert!(
             second[0]
-                .load_content()
+                .load_held_content()
                 .unwrap()
+                .unwrap()
+                .row
                 .agent_search_text
                 .contains("later sub-agent answer"),
             "the fingerprint spans the sub-agent, so its growth reads the session again"

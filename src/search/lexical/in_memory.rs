@@ -6,8 +6,8 @@ use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
-    CachedSession, CopyKey, ReadOrder, ScannedRow, SearchedFields, SessionKey, TextVisitor,
-    scan_search_texts,
+    CachedSession, CopyKey, ReadOrder, ScanScope, ScannedRow, SearchedFields, SessionKey,
+    TextVisitor, scan_search_texts,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -36,10 +36,12 @@ impl SessionSearchTexts {
     pub(crate) fn read(cached: &CachedSession) -> Result<Option<Self>> {
         let copy = cached.clone().ignoring_source_changes().waiting();
         let mut read = TextsInReadOrder::default();
-        let found = copy.read_search_texts_of_held_copy(SearchedFields::List, |text| {
-            let placement = Placement::of(text.ordinal);
-            read.push((placement, text.order), text.text);
-            ControlFlow::Continue(())
+        let found = copy.read_held_copy(|held| {
+            held.visit_search_texts(SearchedFields::List, &TimeFilter::default(), |text| {
+                let placement = Placement::of(text.ordinal);
+                read.push((placement, text.order), text.text);
+                ControlFlow::Continue(())
+            })
         })?;
         Ok(found.map(|()| laid_out(vec![read])))
     }
@@ -207,6 +209,7 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
         &references,
         SearchedFields::List,
         &TimeFilter::default(),
+        ScanScope::AllWorkspaces,
         TextCollector::default,
     );
     let Ok(scanned) = scanned else {
@@ -221,11 +224,7 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
             pieces[copy].push(texts);
         }
     }
-    let missing = scanned
-        .missing
-        .into_iter()
-        .map(|(copy, _)| copy)
-        .collect::<HashSet<_>>();
+    let missing = scanned.missing.into_iter().collect::<HashSet<_>>();
     let replaced = scanned
         .replaced
         .into_iter()

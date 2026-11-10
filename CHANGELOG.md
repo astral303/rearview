@@ -46,8 +46,12 @@
 - Fix the list's search matching a Codex, Grok Build or Kimi Code
   session's old name after a rename, and missing the new one, until its
   transcript changed. A Grok Build or Kimi Code session renamed from its
-  generated title no longer shows that title beside its new name, and
-  `agent within` now shows the new name too.
+  generated title no longer shows that title beside its new name.
+
+#### `rearview agent` commands
+
+- Fix `agent within` showing a Codex, Grok Build or Kimi Code session's
+  old name after a rename until its transcript changed.
 
 ### Changes
 

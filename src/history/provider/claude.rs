@@ -1378,8 +1378,10 @@ pub(crate) mod tests {
         // A resumed row's texts load lazily, as an unchanged row's do.
         assert!(
             after
-                .load_content()
+                .load_held_content()
                 .unwrap()
+                .unwrap()
+                .row
                 .agent_search_text
                 .contains("LATE_SUBAGENT_SENTINEL")
         );

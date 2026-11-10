@@ -113,21 +113,121 @@ pub struct CachedSession {
 }
 
 /// A read of one copy of a session.
-pub(crate) enum CopyRead<T> {
+enum CopyRead<T> {
     Read(T),
-    /// Another write replaced the copy: the cache holds the copy of
-    /// `generation` at its address.
-    Replaced {
-        generation: i64,
-    },
+    /// Another write replaced the copy: the cache holds another copy at its
+    /// address.
+    Replaced,
 }
 
-/// Some messages of a session, read whole.
-pub(crate) struct MessagesRead {
-    /// The transcript holding the messages read alone.
-    pub(crate) transcript: crate::agent::transcript::AgentTranscript,
-    /// The number of the session's last message.
-    pub(crate) message_count: usize,
+/// The copy the cache holds at a session's address, read inside one read
+/// snapshot: [`CachedSession::read_held_copy`].
+pub(crate) struct HeldCopy<'c> {
+    connection: &'c Connection,
+    session: i64,
+    places: &'c Places,
+    generation: i64,
+}
+
+impl HeldCopy<'_> {
+    pub(crate) fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    /// Calls `visit` with each search text in `fields` within `window`, as
+    /// [`super::search_texts::visit_texts_within`] does.
+    pub(crate) fn visit_search_texts(
+        &self,
+        fields: super::SearchedFields,
+        window: &crate::time_filter::TimeFilter,
+        visit: impl FnMut(super::search_texts::SearchText<'_>) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
+        super::search_texts::visit_texts_within(
+            self.connection,
+            self.session,
+            fields,
+            window,
+            visit,
+        )
+    }
+
+    /// Calls `visit` with each search text and semantic text the copy
+    /// stores, as [`super::search_parts::visit_search_parts`] lays them out.
+    pub(crate) fn stored_search_parts(&self, visit: impl FnMut(super::SearchPart)) -> Result<()> {
+        super::search_parts::visit_search_parts(self.connection, self.session, visit)
+    }
+
+    /// [`Self::stored_search_parts`]'s search texts alone.
+    pub(crate) fn stored_agent_search_texts(
+        &self,
+        mut visit: impl FnMut(super::SearchPart),
+    ) -> Result<()> {
+        super::search_parts::visit_agent_search_texts(self.connection, self.session, &mut visit)
+    }
+
+    /// [`Self::stored_search_parts`]'s semantic texts alone.
+    pub(crate) fn stored_semantic_turns(
+        &self,
+        mut visit: impl FnMut(super::SearchPart),
+    ) -> Result<()> {
+        super::search_parts::visit_semantic_turns(self.connection, self.session, &mut visit)
+    }
+
+    /// The agent's semantic route text stored for this copy with
+    /// `custom_title` and `summary`; `None` when none is.
+    pub(crate) fn stored_semantic_route(
+        &self,
+        custom_title: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<Option<String>> {
+        super::semantic_routes::stored_route(
+            self.connection,
+            self.session,
+            self.generation,
+            custom_title,
+            summary,
+        )
+    }
+
+    /// The key a route text computed from this copy's texts is stored under.
+    pub(crate) fn semantic_route_key(&self) -> super::RouteKey {
+        super::RouteKey::new(self.session, self.generation)
+    }
+
+    fn message_count(&self) -> Result<usize> {
+        let message_count: i64 = self
+            .connection
+            .prepare_cached("SELECT message_count FROM sessions WHERE id = ?1")?
+            .query_row([self.session], |row| row.get(0))?;
+        Ok(message_count as usize)
+    }
+
+    /// The copy's message count and the times of each message.
+    pub(crate) fn message_times(&self) -> Result<(usize, crate::history::MessageTimes)> {
+        let message_count = self.message_count()?;
+        let times = super::read_catalogue::stored_message_times(
+            self.connection,
+            self.session,
+            message_count,
+        )?;
+        Ok((message_count, times))
+    }
+
+    /// The messages numbered `ordinals`, each whole, as the viewer shows
+    /// them, read through the index on the message numbers. `path` is the
+    /// session's transcript.
+    pub(crate) fn agent_messages(
+        &self,
+        path: &Path,
+        ordinals: &[usize],
+    ) -> Result<crate::agent::search::SearchedTranscript> {
+        let stored = entries::read_messages(self.connection, self.session, self.places, ordinals)?;
+        Ok(crate::agent::search::SearchedTranscript {
+            transcript: crate::agent::transcript::AgentTranscript::from_stored(path, stored)?,
+            message_count: self.message_count()?,
+            copy_generation: Some(self.generation),
+        })
+    }
 }
 
 /// One copy of a session in the cache. Every write of the session gives its
@@ -360,7 +460,7 @@ impl CachedSession {
     fn read_result<T>(&self, read: Option<CopyRead<T>>) -> Result<Option<T>> {
         match read {
             Some(CopyRead::Read(result)) => Ok(Some(result)),
-            Some(CopyRead::Replaced { .. }) => Err(AppError::SessionCacheNotReady {
+            Some(CopyRead::Replaced) => Err(AppError::SessionCacheNotReady {
                 session: self.address.cache_key.clone(),
                 reason: "catalogue generation changed".to_owned(),
             }),
@@ -368,29 +468,34 @@ impl CachedSession {
         }
     }
 
-    /// The messages numbered `ordinals` of the copy, each whole, as the
-    /// viewer shows them, and the session's message count, read through the
-    /// index on the message numbers. `None` as for [`Self::read`].
-    pub(crate) fn agent_messages(
+    /// `read`'s result over the copy the cache holds at this copy's address,
+    /// whichever generation it is, in one read snapshot: another write cannot
+    /// replace the copy during the read. `None` as for [`Self::read`].
+    pub(crate) fn read_held_copy<T>(
         &self,
-        path: &Path,
-        ordinals: &[usize],
-    ) -> Result<Option<CopyRead<MessagesRead>>> {
-        self.read_copy(|connection, session, places| {
-            let stored = entries::read_messages(connection, session, places, ordinals)?;
-            let message_count: Option<i64> = connection
-                .prepare_cached("SELECT MAX(ordinal) FROM messages WHERE session = ?1")?
-                .query_row([session], |row| row.get(0))?;
-            Ok(MessagesRead {
-                transcript: crate::agent::transcript::AgentTranscript::from_stored(path, stored)?,
-                message_count: message_count.map_or(0, |count| count as usize),
+        read: impl FnOnce(&HeldCopy<'_>) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Some(cache) = self.wait.open(&self.base)? else {
+            return Ok(None);
+        };
+        cache.with_read_snapshot(|connection| {
+            let Some(stored) = self.listed_in(connection)? else {
+                return Ok(None);
+            };
+            self.read_listed(connection, stored.id, |connection, session, places| {
+                read(&HeldCopy {
+                    connection,
+                    session,
+                    places,
+                    generation: stored.generation,
+                })
             })
         })
     }
 
     /// [`Self::read`], reporting a copy another write replaced at the
     /// address.
-    pub(super) fn read_copy<T>(
+    fn read_copy<T>(
         &self,
         read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
     ) -> Result<Option<CopyRead<T>>> {
@@ -406,26 +511,45 @@ impl CachedSession {
         connection: &Connection,
         read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
     ) -> Result<Option<CopyRead<T>>> {
+        let Some(stored) = self.listed_in(connection)? else {
+            return Ok(None);
+        };
+        if stored.generation != self.generation {
+            return Ok(Some(CopyRead::Replaced));
+        }
+        Ok(self
+            .read_listed(connection, stored.id, read)?
+            .map(CopyRead::Read))
+    }
+
+    /// The listed session row at this copy's address, whichever copy it
+    /// holds; `None` when the cache holds none there.
+    pub(super) fn listed_in(
+        &self,
+        connection: &Connection,
+    ) -> Result<Option<entries::StoredSession>> {
         let address = &self.address;
         if !is_storage_current(connection, address.storage)? {
             return Ok(None);
         }
-        let Some(stored) = entries::listed_session_of(
+        entries::listed_session_of(
             connection,
             address.storage.directory,
             address.roots.key(),
             &address.cache_key,
-        )?
-        else {
-            return Ok(None);
-        };
-        let session = stored.id;
-        if stored.generation != self.generation {
-            return Ok(Some(CopyRead::Replaced {
-                generation: stored.generation,
-            }));
-        }
-        let places = Places::stored(connection, &address.roots)?;
+        )
+    }
+
+    /// `read`'s result over the session row `session` and the places of its
+    /// roots; `None` when the row stores a file below a root this address
+    /// lacks.
+    fn read_listed<T>(
+        &self,
+        connection: &Connection,
+        session: i64,
+        read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let places = Places::stored(connection, &self.address.roots)?;
         let result = (|| {
             if self.checks_source {
                 self.validate_source(connection, &places, session)?;
@@ -437,7 +561,7 @@ impl CachedSession {
             Ok(result)
         })();
         match result {
-            Ok(result) => Ok(Some(CopyRead::Read(result))),
+            Ok(result) => Ok(Some(result)),
             Err(AppError::StoredRootUnknown { .. }) => Ok(None),
             Err(error) => Err(error),
         }

@@ -37,7 +37,7 @@ fn cached_and_searched_text(
 ) -> (String, Vec<String>) {
     let cached = cached_text(&list_row(source, path, subagents));
     let transcript = AgentTranscript::load_cached_for_test(source, path, subagents).unwrap();
-    (cached, segment_texts(&transcript))
+    (cached, segment_texts(&transcript, TimeFilter::default()))
 }
 
 fn cached_text(row: &Conversation) -> String {

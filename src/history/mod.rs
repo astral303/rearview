@@ -41,6 +41,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 // Re-export public API
+pub(crate) use content::SemanticContent;
 pub use display_entries::{
     DisplayEntries, EntryOrigin, display_log_entries_interactively, printed_log_entries,
     sniffed_display_log_entries, viewed_copy_interactively,
@@ -69,6 +70,7 @@ pub use sqlite_cache::{
     InteractiveCache, InteractiveRead, NextStep, OperationScope, OtherRearview, ParsePermit,
     Patience, StaleCause, WaitStatus,
 };
+pub(crate) use sqlite_cache::{RoutesStored, SemanticRoute, store_semantic_routes};
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
 };
@@ -282,14 +284,15 @@ impl Conversation {
             .filter_map(|text| text.as_deref())
     }
 
-    /// [`Self::title_and_summary_texts`], then `full_text`, each after a separator.
+    /// [`Self::title_and_summary_texts`], then `full_text`, each after a
+    /// separator.
     pub(crate) fn full_text_after_title_and_summary(&self) -> Cow<'_, str> {
-        let mut leading = self.title_and_summary_texts().peekable();
-        if leading.peek().is_none() {
+        let mut title_and_summary = self.title_and_summary_texts().peekable();
+        if title_and_summary.peek().is_none() {
             return Cow::Borrowed(&self.full_text);
         }
         let mut text = String::new();
-        for piece in leading.chain([self.full_text.as_str()]) {
+        for piece in title_and_summary.chain([self.full_text.as_str()]) {
             message_texts::push_separated(&mut text, piece);
         }
         Cow::Owned(text)

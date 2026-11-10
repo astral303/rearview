@@ -724,8 +724,8 @@ pub(crate) struct SubagentTranscripts {
     subagent_metadata: Vec<SubagentMetadataPart>,
     sources: BTreeSet<PathBuf>,
     earlier_transcripts: Vec<FileStamp>,
-    /// What the read of each sub-agent transcript leaves for the next, by
-    /// its path.
+    /// The state each sub-agent transcript's read leaves for the next read,
+    /// by its path.
     reads: HashMap<PathBuf, TranscriptRead>,
     /// Each sub-agent transcript's encoded [`ThreadFold`], by its path.
     folds: HashMap<PathBuf, Vec<u8>>,
@@ -973,7 +973,9 @@ pub(crate) struct SubagentContribution {
 
 impl SubagentContribution {
     /// Raw text pieces omitted by the dialogue splice: titles, searchable
-    /// metadata and nested progress. Keep boundaries and normalise on read.
+    /// metadata and nested progress, each a separate piece, as the session
+    /// cache stores them. Lexical search matches them as stored; the content
+    /// read normalises their whitespace.
     pub(crate) fn metadata_texts<'a>(
         entries: impl IntoIterator<Item = &'a LogEntry>,
     ) -> Vec<String> {
@@ -1247,7 +1249,8 @@ struct UserTurnText {
     preview: String,
     /// The search text of each part, one entry per part.
     search_parts: Vec<String>,
-    semantic: String,
+    /// The turn's own text, which [`semantic_turn`] embeds.
+    text: String,
     /// A slash command as `agent read` shows it, `/name args`.
     skill_preview: Option<String>,
 }
@@ -1300,18 +1303,28 @@ pub(crate) fn search_parts_of_entry(entry: &LogEntry, spliced: bool) -> [Vec<Str
     [full, agent, thinking]
 }
 
-pub(crate) fn semantic_text_of_entry(entry: &LogEntry) -> Option<String> {
-    match entry {
-        LogEntry::User { message, .. } => filter_turn(
-            SemanticTurnRole::User,
-            &user_turn_text(&message.content).semantic,
-        ),
-        LogEntry::Assistant { message, .. } => filter_turn(
-            SemanticTurnRole::Assistant,
-            &extract_text_from_assistant(message),
-        ),
-        LogEntry::PiMetadata { text, .. } => filter_turn(SemanticTurnRole::User, text),
-        _ => None,
+/// The kind of entry a semantic turn's text comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnSource {
+    User,
+    Assistant,
+    /// A metadata row, embedded as the user's.
+    Metadata,
+}
+
+/// The semantic turn of an entry whose text is `text`: a user message's
+/// string or its text blocks joined as [`extract_text_from_blocks`] joins
+/// them, an assistant reply's text blocks joined, or a metadata row's text,
+/// each with its terminal codes. A user's task report embeds as its summary
+/// and body. `None` when the filter keeps nothing.
+pub(crate) fn semantic_turn(source: TurnSource, text: &str) -> Option<String> {
+    match source {
+        TurnSource::User => match parse_task_report(text) {
+            Some(report) => filter_turn(SemanticTurnRole::User, &report.search_text()),
+            None => filter_turn(SemanticTurnRole::User, text),
+        },
+        TurnSource::Assistant => filter_turn(SemanticTurnRole::Assistant, text),
+        TurnSource::Metadata => filter_turn(SemanticTurnRole::User, text),
     }
 }
 
@@ -1336,12 +1349,12 @@ fn user_blocks_text(blocks: &[ContentBlock]) -> UserTurnText {
 /// [`user_turn_text`] for a turn whose text is `text`; `search_texts` gives
 /// the search text of each of its parts.
 fn user_turn_text_of(text: String, search_texts: impl FnOnce() -> Vec<String>) -> UserTurnText {
-    let (preview, search_parts, semantic) = match parse_task_report(&text) {
+    let (preview, search_parts) = match parse_task_report(&text) {
         Some(report) => {
             let search = report.search_text();
-            (report.summary, vec![search.clone()], search)
+            (report.summary, vec![search])
         }
-        None => (text.clone(), search_texts(), text),
+        None => (text.clone(), search_texts()),
     };
     let skill_preview = extract_skill_preview(&preview);
     UserTurnText {
@@ -1349,7 +1362,7 @@ fn user_turn_text_of(text: String, search_texts: impl FnOnce() -> Vec<String>) -
             .clone()
             .map_or(search_parts, |skill_preview| vec![skill_preview]),
         preview,
-        semantic,
+        text,
         skill_preview,
     }
 }
@@ -1452,7 +1465,7 @@ impl ConversationBuilder {
                 let UserTurnText {
                     preview: preview_text,
                     search_parts,
-                    semantic: semantic_input,
+                    text,
                     skill_preview,
                 } = user_turn_text(&message.content);
 
@@ -1479,7 +1492,7 @@ impl ConversationBuilder {
                 if effective_preview.is_empty() {
                     return;
                 }
-                if let Some(turn) = filter_turn(SemanticTurnRole::User, &semantic_input) {
+                if let Some(turn) = semantic_turn(TurnSource::User, &text) {
                     self.semantic_turns.push(turn);
                     self.semantic_turn_ranges
                         .push(MessageRange::single(numbered.ordinal));
@@ -1522,8 +1535,7 @@ impl ConversationBuilder {
                             .add_reply_preview(numbered.ordinal, preview_text, true);
                     }
                     None => {
-                        if let Some(turn) = filter_turn(SemanticTurnRole::Assistant, &preview_text)
-                        {
+                        if let Some(turn) = semantic_turn(TurnSource::Assistant, &preview_text) {
                             self.semantic_turns.push(turn);
                             self.semantic_turn_ranges.push(message_range);
                         }
@@ -1554,7 +1566,7 @@ impl ConversationBuilder {
                     self.full_text.push(ordinal, text);
                 }
                 if let Some(numbered) = numbered
-                    && let Some(turn) = filter_turn(SemanticTurnRole::User, text)
+                    && let Some(turn) = semantic_turn(TurnSource::Metadata, text)
                 {
                     self.semantic_turns.push(turn);
                     self.semantic_turn_ranges
@@ -1612,7 +1624,7 @@ impl ConversationBuilder {
     /// Append one record's filtered `text` to the semantic turn of the reply
     /// at `ordinal`.
     fn append_reply_semantic_turn(&mut self, ordinal: usize, text: &str, range: MessageRange) {
-        let Some(turn) = filter_turn(SemanticTurnRole::Assistant, text) else {
+        let Some(turn) = semantic_turn(TurnSource::Assistant, text) else {
             return;
         };
         match self.assistant_id_semantic_indices.get(&ordinal).copied() {

@@ -50,14 +50,18 @@ impl<'q> RawQuery<'q> {
     }
 
     /// The terms a message must hold to be a hit message under `terms`.
-    pub(super) fn required_terms(&self, terms: RetrievalTerms) -> MessageTerms {
-        let literals = MessageTerms::first(self.literals.len());
+    pub(super) fn required_terms(&self, terms: &RetrievalTerms) -> MessageTerms {
         match terms {
             RetrievalTerms::WordsAndLiterals => MessageTerms {
                 words: MessageTerms::first(self.words.len()),
-                literals,
+                literals: MessageTerms::first(self.literals.len()),
             },
-            RetrievalTerms::Literals => MessageTerms { words: 0, literals },
+            RetrievalTerms::Phrase(phrase) => MessageTerms {
+                words: 0,
+                literals: MessageTerms::bits(
+                    self.literals.iter().map(|literal| phrase.contains(literal)),
+                ),
+            },
         }
     }
 
@@ -90,19 +94,29 @@ impl RawMatcher<'_> {
         }
     }
 
-    /// The terms `counts`, the counts of one text, hold as `agent search`'s
+    /// The terms `text`, whose counts are `counts`, holds as `agent search`'s
     /// retrieval matches a message: a word starting a word of the text, or a
-    /// word holding CJK anywhere in it, and a literal inside it.
-    pub(super) fn message_terms(&self, counts: &Counts) -> MessageTerms {
+    /// word holding CJK anywhere in it, and a literal inside it. Unlike
+    /// `counts`, a literal starting or ending with whitespace also matches
+    /// the whitespace at the text's edges, as it matches a message's part.
+    pub(super) fn message_terms(&self, text: &str, counts: &Counts) -> MessageTerms {
         let words = self
             .query
             .words
             .iter()
             .zip(counts.prefixes.iter().zip(&counts.contains))
             .map(|(word, (&prefixes, &contains))| prefixes > 0 || (word.holds_cjk && contains));
+        let literals =
+            self.query
+                .literals
+                .iter()
+                .zip(&counts.literals)
+                .map(|(literal, &in_trimmed_text)| {
+                    in_trimmed_text || (has_edge_whitespace(literal) && literal.matches(text))
+                });
         MessageTerms {
             words: MessageTerms::bits(words),
-            literals: MessageTerms::bits(counts.literals.iter().copied()),
+            literals: MessageTerms::bits(literals),
         }
     }
 
@@ -346,6 +360,12 @@ impl PatternState {
         self.matched = 0;
         Some(self.word_starts[self.next_slot])
     }
+}
+
+/// True when `literal` starts or ends with whitespace: only then can it
+/// match a text and not the text without the whitespace at its edges.
+fn has_edge_whitespace(literal: &Literal) -> bool {
+    literal.text().starts_with(' ') || literal.text().ends_with(' ')
 }
 
 /// True when `text` holds a character outside ASCII that lowercases to

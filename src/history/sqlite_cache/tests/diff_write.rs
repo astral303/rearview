@@ -318,21 +318,23 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
     let listed = fixture.listed(cache);
     let copy = listed.cached_session.clone().unwrap();
     let mut texts = Vec::new();
-    copy.read_search_texts(
-        SearchedFields::Agent,
-        &crate::time_filter::TimeFilter::default(),
-        |text| {
-            let placed = format!("{:?} {:?} {}", text.order, text.ordinal, text.text);
-            texts.push((text.order, placed));
-            ControlFlow::Continue(())
-        },
-    )
+    copy.read_held_copy(|held| {
+        held.visit_search_texts(
+            SearchedFields::Agent,
+            &crate::time_filter::TimeFilter::default(),
+            |text| {
+                let placed = format!("{:?} {:?} {}", text.order, text.ordinal, text.text);
+                texts.push((text.order, placed));
+                ControlFlow::Continue(())
+            },
+        )
+    })
     .unwrap()
     .unwrap();
     texts.sort();
     let texts = texts.into_iter().map(|(_, text)| text).collect::<Vec<_>>();
     rows.push(format!("search texts {texts:?}"));
-    let content = listed.load_content().unwrap();
+    let content = listed.load_held_content().unwrap().unwrap().row;
     rows.push(format!(
         "content {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
         content.full_text,

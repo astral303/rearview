@@ -3,10 +3,10 @@
 //! session, borrowed from SQLite. Each statement reads through an index on
 //! the session, without joins.
 
+use super::SearchField;
 use super::text_scan::{
     LayoutGroup, MessagesInWindow, ReadOrder, StoredPlace, StoredWindow, text_at,
 };
-use super::{CachedSession, CopyRead, SearchField};
 use crate::error::Result;
 use crate::time_filter::TimeFilter;
 use rusqlite::Connection;
@@ -79,57 +79,21 @@ pub(crate) struct SearchText<'a> {
 }
 
 /// Calls `visit` with each search text in `fields` of the session row
-/// `session`, as [`CachedSession::read_search_texts`] does without a window.
-pub(super) fn visit_session_texts(
+/// `session`, each placed in the session by its `order`, until `visit`
+/// breaks. With `window` active, reads only the texts of messages inside it,
+/// without text outside every message. Leaves out the session's title and
+/// summary: search reads them from the listed row, to match a name changed
+/// outside the transcript.
+pub(super) fn visit_texts_within(
     connection: &Connection,
     session: i64,
     fields: SearchedFields,
-    visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    window: &TimeFilter,
+    mut visit: impl FnMut(SearchText<'_>) -> ControlFlow<()>,
 ) -> Result<()> {
-    let _ = SessionRead::new(connection, session, fields, None)?.visit_texts(visit)?;
+    let read = SessionRead::new(connection, session, fields, StoredWindow::of(window))?;
+    let _ = read.visit_texts(&mut visit)?;
     Ok(())
-}
-
-impl CachedSession {
-    /// Calls `visit` with each search text in `fields`, each placed in the
-    /// session by its `order`, until `visit` breaks. With `window` active,
-    /// reads only the texts of messages inside it, without text outside every
-    /// message. Leaves out the session's title and summary: search reads them
-    /// from the listed row, to match a name changed outside the transcript.
-    pub(crate) fn read_search_texts(
-        &self,
-        fields: SearchedFields,
-        window: &TimeFilter,
-        mut visit: impl FnMut(SearchText<'_>) -> ControlFlow<()>,
-    ) -> Result<Option<()>> {
-        self.read(|connection, session, _| {
-            let read = SessionRead::new(connection, session, fields, StoredWindow::of(window))?;
-            let _ = read.visit_texts(&mut visit)?;
-            Ok(())
-        })
-    }
-
-    /// [`Self::read_search_texts`] without a window, of the copy the cache
-    /// holds at this copy's address: when another write replaced this copy,
-    /// the texts of the copy that replaced it. A second replacement during
-    /// the read fails it.
-    pub(crate) fn read_search_texts_of_held_copy(
-        &self,
-        fields: SearchedFields,
-        mut visit: impl FnMut(SearchText<'_>) -> ControlFlow<()>,
-    ) -> Result<Option<()>> {
-        let read = self.read_copy(|connection, session, _| {
-            visit_session_texts(connection, session, fields, &mut visit)
-        })?;
-        match read {
-            Some(CopyRead::Read(())) => Ok(Some(())),
-            Some(CopyRead::Replaced { generation }) => self
-                .clone()
-                .of_generation(generation)
-                .read_search_texts(fields, &TimeFilter::default(), visit),
-            None => Ok(None),
-        }
-    }
 }
 
 /// The session `?1`'s sub-agent metadata parts, outside every entry.
@@ -139,11 +103,24 @@ impl CachedSession {
 const SUBAGENT_METADATA_READ: &str =
     "SELECT part, text FROM parts WHERE session = ?1 AND entry IS NULL ORDER BY part";
 
+/// The columns a session's read takes of each part holding search text.
+const READ_PART_COLUMNS: &str =
+    "entry_sequence, message_ordinal, search_position, search_field, text";
+
 /// The session `?1`'s parts holding search text in `fields`.
 fn parts_query(fields: SearchedFields) -> String {
     format!(
-        "SELECT entry_sequence, message_ordinal, search_position, search_field, text FROM parts \
-         WHERE session = ?1 AND search_field IN ({})",
+        "SELECT {READ_PART_COLUMNS} FROM parts WHERE session = ?1 AND search_field IN ({})",
+        fields.part_field_codes()
+    )
+}
+
+/// The session `?1`'s parts holding search text in `fields` of its messages
+/// numbered from `?2` to `?3`.
+fn parts_of_messages_query(fields: SearchedFields) -> String {
+    format!(
+        "SELECT {READ_PART_COLUMNS} FROM parts WHERE session = ?1 \
+         AND message_ordinal BETWEEN ?2 AND ?3 AND search_field IN ({})",
         fields.part_field_codes()
     )
 }
@@ -191,20 +168,35 @@ impl<'c> SessionRead<'c> {
         }
     }
 
-    /// Visits the parts holding search text, of every kind.
+    /// Visits the parts holding search text, of every kind: with a window,
+    /// those of each run of messages inside it.
     fn visit_parts(
         &self,
         visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
     ) -> Result<ControlFlow<()>> {
-        let mut statement = self.connection.prepare_cached(&parts_query(self.fields))?;
-        let mut rows = statement.query([self.session])?;
+        let Some(window) = &self.window else {
+            let mut statement = self.connection.prepare_cached(&parts_query(self.fields))?;
+            return Self::visit_rows(statement.query([self.session])?, visit);
+        };
+        let mut statement = self
+            .connection
+            .prepare_cached(&parts_of_messages_query(self.fields))?;
+        for run in window.runs_of(self.session) {
+            let rows = statement.query([self.session, *run.start(), *run.end()])?;
+            if Self::visit_rows(rows, visit)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Visits the texts of `rows`, each a row of [`READ_PART_COLUMNS`].
+    fn visit_rows(
+        mut rows: rusqlite::Rows<'_>,
+        visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
         while let Some(row) = rows.next()? {
             let place = StoredPlace::at(row, (0, 1, 2))?;
-            if let Some(window) = &self.window
-                && !window.holds(self.session, place.ordinal)
-            {
-                continue;
-            }
             let text = SearchText {
                 ordinal: place.message(),
                 order: place.order(),
@@ -251,8 +243,8 @@ mod tests {
     /// One session's read, and a write moving its search places, cost what
     /// the session holds, not what the cache holds, only while each statement
     /// reads through an index, without sorting. The sub-agent metadata read
-    /// uses the index of those parts alone; a windowed scan reads one
-    /// message's parts through `parts_by_message`.
+    /// uses the index of those parts alone; a windowed read or scan reads a
+    /// run of messages' parts through `parts_by_message`.
     #[test]
     fn each_statement_on_one_sessions_parts_reads_through_an_index_without_sorting() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
@@ -262,6 +254,7 @@ mod tests {
         for fields in [SearchedFields::List, SearchedFields::Agent] {
             for (query, index) in [
                 (parts_query(fields), "parts_by_message"),
+                (parts_of_messages_query(fields), "parts_by_message"),
                 (SUBAGENT_METADATA_READ.to_owned(), "parts_outside_entries"),
                 (parts_of_messages(fields), "parts_by_message"),
                 (

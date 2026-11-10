@@ -302,9 +302,9 @@ fn bytes_read(
         + window_bytes
 }
 
-/// How the changed `window` of the sub-agent transcript at `path`, whose
-/// share at its stable cursor is `fold`, is taken in: a window, unless its
-/// title changed or its entries add metadata parts, which read it whole.
+/// The change of the sub-agent transcript at `path`, whose share at its
+/// stable cursor is `fold`: the whole transcript when its title changed or
+/// its new entries add metadata parts, else the changed `window`.
 fn resumed_change(
     reader: &dyn crate::history::provider::TranscriptReader,
     permit: ParsePermit<'_>,

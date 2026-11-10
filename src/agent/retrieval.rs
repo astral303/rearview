@@ -84,8 +84,7 @@ pub struct AgentTranscriptSearchTarget<'a> {
     /// The session's messages: every one, or at least every message holding
     /// the query's terms.
     pub transcript: &'a AgentTranscript,
-    /// The number of the session's last message, the end of every hit's
-    /// read range.
+    /// The session's message count, the end of every hit's read range.
     pub message_count: usize,
     pub conversation_ref: Option<&'a str>,
     pub timestamp: Option<DateTime<Local>>,
@@ -93,7 +92,6 @@ pub struct AgentTranscriptSearchTarget<'a> {
 
 impl<'a> AgentTranscriptSearchTarget<'a> {
     /// A target holding every message of `transcript`.
-    #[cfg(test)]
     pub fn whole(
         transcript: &'a AgentTranscript,
         conversation_ref: Option<&'a str>,
@@ -405,17 +403,14 @@ fn build_segments(
     }
 }
 
-/// The text of every segment retrieval searches in `transcript`.
+/// The text of every segment retrieval searches in `transcript` within
+/// `window`.
 #[cfg(test)]
-pub(crate) fn segment_texts(transcript: &AgentTranscript) -> Vec<String> {
-    build_segments(
-        transcript,
-        ParallelThreshold::DEFAULT,
-        TimeFilter::default(),
-    )
-    .into_iter()
-    .map(|segment| segment.text)
-    .collect()
+pub(crate) fn segment_texts(transcript: &AgentTranscript, window: TimeFilter) -> Vec<String> {
+    build_segments(transcript, ParallelThreshold::DEFAULT, window)
+        .into_iter()
+        .map(|segment| segment.text)
+        .collect()
 }
 
 fn message_segments(message: &AgentMessage, window: TimeFilter) -> Vec<Segment> {

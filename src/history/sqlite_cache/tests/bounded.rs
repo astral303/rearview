@@ -163,9 +163,11 @@ fn sql_windows_keep_full_message_spans_and_final_millisecond() {
         .cached_session
         .as_ref()
         .unwrap()
-        .read_search_texts(SearchedFields::List, &window, |text| {
-            selected.push((text.order, text.ordinal, text.text.to_owned()));
-            std::ops::ControlFlow::Continue(())
+        .read_held_copy(|held| {
+            held.visit_search_texts(SearchedFields::List, &window, |text| {
+                selected.push((text.order, text.ordinal, text.text.to_owned()));
+                std::ops::ControlFlow::Continue(())
+            })
         })
         .unwrap()
         .unwrap();

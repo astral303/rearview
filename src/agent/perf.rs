@@ -130,6 +130,35 @@ pub struct CommandPerf {
     refresh_rounds: Mutex<Vec<usize>>,
     /// `None` until a global search starts.
     search: OnceLock<SearchReads>,
+    /// The semantic route texts a semantic search computed; `None` when it
+    /// computed none.
+    semantic_routes: Mutex<Option<ComputedRoutes>>,
+}
+
+/// The semantic route texts a semantic search computed from the copies'
+/// texts.
+#[derive(Clone, Copy, Debug)]
+struct ComputedRoutes {
+    count: usize,
+    /// Why they were not stored; `None` once stored.
+    skipped: Option<RoutesSkipped>,
+}
+
+/// Why computed semantic route texts were not stored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutesSkipped {
+    /// Another rearview owns the refresh.
+    AnotherRearview,
+    WriteFailed,
+}
+
+impl RoutesSkipped {
+    fn name(self) -> &'static str {
+        match self {
+            Self::AnotherRearview => "another-rearview",
+            Self::WriteFailed => "write-failed",
+        }
+    }
 }
 
 /// One transcript parsed.
@@ -151,7 +180,17 @@ impl CommandPerf {
             transcripts: Mutex::default(),
             refresh_rounds: Mutex::default(),
             search: OnceLock::new(),
+            semantic_routes: Mutex::default(),
         }
+    }
+
+    /// Records the `count` semantic route texts a semantic search computed,
+    /// and why they were not stored; `skipped` is `None` once stored.
+    pub fn record_semantic_routes(&self, count: usize, skipped: Option<RoutesSkipped>) {
+        *self
+            .semantic_routes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(ComputedRoutes { count, skipped });
     }
 
     /// Records one round of the targeted refresh, reading `sessions`
@@ -172,11 +211,17 @@ impl CommandPerf {
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(stage);
         let started = self.clock.now();
         let result = run();
+        self.record(stage, self.clock.elapsed_since(started));
+        result
+    }
+
+    /// Records `time` as one run of `stage`, for a stage whose work is
+    /// spread over several calls.
+    pub fn record(&self, stage: Stage, time: Duration) {
         self.stages
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push((stage, self.clock.elapsed_since(started)));
-        result
+            .push((stage, time));
     }
 
     /// The meter the command's load records what it read in.
@@ -246,7 +291,8 @@ impl CommandPerf {
     }
 
     /// One `perf` record per stage in the order they ran; one per round of
-    /// the targeted refresh, in order; each agent's discovery, cache and
+    /// the targeted refresh, in order; the semantic route texts computed;
+    /// each agent's discovery, cache and
     /// refresh, agents in the order they loaded; each
     /// transcript parsed; a global search's reads and retrieval; the
     /// `peak_memory` in bytes when the platform reports it; then the total.
@@ -272,6 +318,25 @@ impl CommandPerf {
             .iter()
         {
             let _ = writeln!(records, "perf refresh-round sessions={sessions}");
+        }
+        if let Some(routes) = *self
+            .semantic_routes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            let _ = match routes.skipped {
+                None => writeln!(
+                    records,
+                    "perf semantic-routes computed={0} stored={0}",
+                    routes.count
+                ),
+                Some(skipped) => writeln!(
+                    records,
+                    "perf semantic-routes computed={} stored=0 skipped={}",
+                    routes.count,
+                    skipped.name()
+                ),
+            };
         }
         for agent in self.load.agents() {
             write_agent_load(&mut records, &agent);
@@ -360,15 +425,15 @@ impl SearchReads {
     pub fn time_read<E>(
         &self,
         key: &AgentConversationKey,
-        read: impl FnOnce() -> Result<SearchedTranscript, E>,
-    ) -> Result<SearchedTranscript, E> {
+        read: impl FnOnce() -> Result<Option<SearchedTranscript>, E>,
+    ) -> Result<Option<SearchedTranscript>, E> {
         let started = self.clock.now();
         let result = read();
         let elapsed = self.clock.elapsed_since(started);
         self.sessions_opened.fetch_add(1, Ordering::Relaxed);
         self.transcript_bytes
             .fetch_add(key.transcript_bytes.unwrap_or(0), Ordering::Relaxed);
-        if let Ok(searched) = &result {
+        if let Ok(Some(searched)) = &result {
             self.messages_read
                 .fetch_add(searched.transcript.messages.len(), Ordering::Relaxed);
         }
@@ -545,10 +610,10 @@ mod tests {
         perf.time(Stage::TranscriptSearch, || {
             let _ = perf
                 .search_reads()
-                .time_read(&key_of(5), || Ok::<_, ()>(transcript_of(2).into()));
+                .time_read(&key_of(5), || Ok::<_, ()>(Some(transcript_of(2).into())));
             let _ = perf
                 .search_reads()
-                .time_read(&key_of(3), || Ok::<_, ()>(transcript_of(1).into()));
+                .time_read(&key_of(3), || Ok::<_, ()>(Some(transcript_of(1).into())));
         });
 
         let records = perf.records(None);
@@ -583,7 +648,7 @@ mod tests {
         perf.search_reads()
             .time_read(&key_of(1), || {
                 clock.sleep(Duration::from_millis(25));
-                Ok::<_, ()>(transcript_of(1).into())
+                Ok::<_, ()>(Some(transcript_of(1).into()))
             })
             .unwrap();
         clock.advance(Duration::from_millis(5));

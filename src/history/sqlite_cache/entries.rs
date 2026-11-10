@@ -17,12 +17,14 @@ use super::roots::{Places, WrittenPlaces};
 use crate::agent::sanitize::join_terminal_codes;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
+use crate::history::parser::{TurnSource, semantic_turn};
 use crate::history::{MalformedLine, MalformedLineDetail, TranscriptEntries};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
@@ -338,12 +340,21 @@ pub(crate) struct StoredEntries {
 /// The stored text in column `text` of `row`, with the terminal codes in
 /// column `codes` back in place.
 fn text_with_codes(row: &Row, text: usize, codes: usize) -> rusqlite::Result<Option<String>> {
-    let Some(stored) = row.get::<_, Option<String>>(text)? else {
+    Ok(text_ref_with_codes(row, text, codes)?.map(Cow::into_owned))
+}
+
+/// [`text_with_codes`], borrowed from `row` when the text has no codes.
+fn text_ref_with_codes<'r>(
+    row: &'r Row<'_>,
+    text: usize,
+    codes: usize,
+) -> rusqlite::Result<Option<Cow<'r, str>>> {
+    let Some(stored) = row.get_ref(text)?.as_str_or_null()? else {
         return Ok(None);
     };
     match row.get_ref(codes)?.as_blob_or_null()? {
-        Some(stored_codes) => join_terminal_codes(&stored, stored_codes)
-            .map(Some)
+        Some(stored_codes) => join_terminal_codes(stored, stored_codes)
+            .map(|joined| Some(Cow::Owned(joined)))
             .map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     codes,
@@ -351,7 +362,7 @@ fn text_with_codes(row: &Row, text: usize, codes: usize) -> rusqlite::Result<Opt
                     Box::new(error),
                 )
             }),
-        None => Ok(Some(stored)),
+        None => Ok(Some(Cow::Borrowed(stored))),
     }
 }
 
@@ -393,20 +404,20 @@ pub(super) fn read_messages(
     read_selected(connection, session, places, &selected)
 }
 
-/// Each contributing user, assistant and metadata entry of `session` that
-/// takes a message number, in order, with its text parts, without terminal
-/// codes: everything [`crate::history::parser::semantic_text_of_entry`]
-/// reads of an entry.
-const SEMANTIC_ENTRIES: &str = "SELECT e.sequence, m.ordinal, e.kind, e.content, e.text, e.label, \
-     p.text FROM entries e JOIN messages m ON m.id = e.message \
+/// Each contributing user and assistant entry of `session` that takes a
+/// message number, with each of its text parts, and each such metadata
+/// entry, in order: everything [`semantic_turn`] reads of an entry. A
+/// message entry without a text part has no semantic turn.
+const SEMANTIC_ENTRIES: &str = "SELECT e.sequence, m.ordinal, e.kind, e.content, e.text, \
+     e.text_codes, p.text, p.text_codes FROM entries e JOIN messages m ON m.id = e.message \
      LEFT JOIN parts p ON p.entry = e.id AND p.kind = 'text' \
      WHERE e.session = ?1 AND e.contributes AND m.ordinal IS NOT NULL \
-     AND e.kind IN ('user', 'assistant', 'pi-metadata') ORDER BY e.sequence, p.part";
+     AND e.kind IN ('user', 'assistant', 'pi-metadata') \
+     AND (p.id IS NOT NULL OR e.kind = 'pi-metadata') ORDER BY e.sequence, p.part";
 
 /// Calls `visit` with the message number and the semantic text of each
-/// entry of `session` holding one, in the session's order, from the entry's
-/// text blocks alone: [`crate::history::parser::semantic_text_of_entry`]
-/// reads nothing else.
+/// entry of `session` holding one, in the session's order, as the parse
+/// computes it.
 pub(super) fn read_semantic_texts(
     connection: &Connection,
     session: i64,
@@ -414,98 +425,78 @@ pub(super) fn read_semantic_texts(
 ) -> Result<()> {
     let mut statement = connection.prepare_cached(SEMANTIC_ENTRIES)?;
     let mut rows = statement.query([session])?;
-    let mut entry: Option<(i64, usize, SemanticEntry)> = None;
-    let mut finish = |entry: Option<(i64, usize, SemanticEntry)>| {
-        if let Some((_, ordinal, semantic)) = entry
-            && let Some(text) =
-                crate::history::parser::semantic_text_of_entry(&semantic.into_entry())
+    let mut entry: Option<(i64, SemanticEntry)> = None;
+    let mut finish = |entry: Option<(i64, SemanticEntry)>| {
+        if let Some((_, entry)) = entry
+            && let Some(turn) = semantic_turn(entry.source, &entry.text)
         {
-            visit(ordinal, text);
+            visit(entry.ordinal, turn);
         }
     };
     while let Some(row) = rows.next()? {
         let sequence: i64 = row.get(0)?;
-        let block = row.get::<_, Option<String>>(6)?;
-        if let Some((current, _, semantic)) = &mut entry
+        let block = text_ref_with_codes(row, 6, 7)?;
+        if let Some((current, entry)) = &mut entry
             && *current == sequence
         {
-            semantic.blocks.extend(block);
+            entry.push_block(block.as_deref());
             continue;
         }
         finish(entry.take());
-        entry = Some((
-            sequence,
-            row.get::<_, i64>(1)? as usize,
-            SemanticEntry {
-                kind: row.get(2)?,
-                string_content: row.get::<_, Option<String>>(3)?.as_deref() == Some(CONTENT_STRING),
-                text: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                label: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                blocks: block.into_iter().collect(),
-            },
-        ));
+        let (source, text) = match row.get_ref(2)?.as_str().map_err(rusqlite::Error::from)? {
+            "user" => (TurnSource::User, None),
+            "assistant" => (TurnSource::Assistant, None),
+            _ => (TurnSource::Metadata, text_with_codes(row, 4, 5)?),
+        };
+        let content = row
+            .get_ref(3)?
+            .as_str_or_null()
+            .map_err(rusqlite::Error::from)?;
+        let mut read = SemanticEntry {
+            ordinal: row.get::<_, i64>(1)? as usize,
+            source,
+            string_content: content == Some(CONTENT_STRING),
+            text: text.unwrap_or_default(),
+            blocks: 0,
+        };
+        read.push_block(block.as_deref());
+        entry = Some((sequence, read));
     }
     finish(entry);
     Ok(())
 }
 
-/// What a semantic text reads of one entry: its kind, its own text and
-/// label, and its text blocks.
+/// The text [`semantic_turn`] reads of one entry, as the parse builds it.
 struct SemanticEntry {
-    kind: String,
+    ordinal: usize,
+    source: TurnSource,
+    /// True for a user message recorded as one string, held in its first
+    /// text part.
     string_content: bool,
+    /// A metadata row's own text; a message's text blocks, joined.
     text: String,
-    label: String,
-    blocks: Vec<String>,
+    /// The text blocks read.
+    blocks: usize,
 }
 
 impl SemanticEntry {
-    /// The entry, holding its text blocks alone.
-    fn into_entry(self) -> LogEntry {
-        let blocks = || {
-            self.blocks
-                .iter()
-                .map(|text| ContentBlock::Text { text: text.clone() })
-                .collect::<Vec<_>>()
+    /// Adds the entry's next text block, `None` for an entry without one.
+    fn push_block(&mut self, block: Option<&str>) {
+        let Some(block) = block else {
+            return;
         };
-        match self.kind.as_str() {
-            "user" => LogEntry::User {
-                message: UserMessage {
-                    role: String::new(),
-                    content: if self.string_content {
-                        UserContent::String(self.blocks.first().cloned().unwrap_or_default())
-                    } else {
-                        UserContent::Blocks(blocks())
-                    },
-                },
-                timestamp: None,
-                uuid: None,
-                cwd: None,
-                parent_tool_use_id: None,
-                source_tool_use_id: None,
-                usage: None,
-            },
-            "assistant" => LogEntry::Assistant {
-                message: AssistantMessage {
-                    role: String::new(),
-                    content: blocks(),
-                    model: None,
-                    usage: None,
-                    id: None,
-                },
-                agent: None,
-                timestamp: None,
-                uuid: None,
-                parent_tool_use_id: None,
-            },
-            _ => LogEntry::PiMetadata {
-                label: self.label,
-                text: self.text,
-                timestamp: None,
-                searchable: true,
-                usage: None,
-            },
+        let joins = match self.source {
+            TurnSource::Metadata => false,
+            TurnSource::User if self.string_content => self.blocks == 0,
+            TurnSource::User | TurnSource::Assistant => true,
+        };
+        if joins {
+            if self.blocks > 0 {
+                self.text.push(' ');
+            }
+            self.text.push_str(block);
         }
+        self.blocks += 1;
     }
 }
 
@@ -589,7 +580,7 @@ pub(super) fn read_selected(
         .optional()?
         .ok_or_else(|| AppError::SessionCacheNotReady {
             session: format!("session row {session}"),
-            reason: "the cache does not hold that row".to_owned(),
+            reason: "the session is not in the session cache".to_owned(),
         })?;
     Ok(StoredEntries {
         transcript: TranscriptEntries {

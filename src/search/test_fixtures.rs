@@ -10,8 +10,9 @@ use std::path::PathBuf;
 /// Claude Code sessions in a temporary directory, each cached in a session
 /// cache of its own directory, with their rows as the cache lists them.
 pub struct CachedClaudeSessions {
-    _home: tempfile::TempDir,
-    _cache: tempfile::TempDir,
+    home: tempfile::TempDir,
+    cache: tempfile::TempDir,
+    names: Vec<String>,
     pub rows: Vec<Conversation>,
 }
 
@@ -21,8 +22,7 @@ pub fn cached_claude_sessions(
     transcripts: &[(&str, Vec<serde_json::Value>)],
 ) -> CachedClaudeSessions {
     use crate::history::Source;
-    use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
-    use crate::history::sqlite_cache::tests::{parsed_record_and_row, rearview_at};
+    use crate::history::sqlite_cache::tests::rearview_at;
     use crate::history::sqlite_cache::{CatalogueSession, SqliteCache};
 
     let home = tempfile::tempdir().unwrap();
@@ -31,40 +31,116 @@ pub fn cached_claude_sessions(
     cache.mark_admitted().unwrap();
     let storage = Source::Claude.provider().storage().cache();
     cache.admit_storage(storage).unwrap();
-    let root = SessionRoot::new(home.path());
-    let mut rows = Vec::new();
+    let mut sessions = CachedClaudeSessions {
+        home,
+        cache: cache_directory,
+        names: Vec::new(),
+        rows: Vec::new(),
+    };
     for (name, records) in transcripts {
-        let path = home.path().join(format!("{name}.jsonl"));
-        let lines = records
-            .iter()
-            .map(serde_json::Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, lines).unwrap();
-        let stub = SessionStub {
-            locator: path,
-            subagents: Vec::new(),
-            cache_key: (*name).to_owned(),
-            fingerprint: Fingerprint {
-                size: 1000,
-                modified: Some(std::time::UNIX_EPOCH),
-            },
-        };
-        let (record, _) = parsed_record_and_row(Source::Claude, &root, &stub);
-        cache.write(&record).unwrap();
+        sessions.names.push((*name).to_owned());
+        let writer = sessions.writer(sessions.names.len() - 1);
+        writer.write_to(&mut cache, records);
         let CatalogueSession::Listed(cached) = cache
-            .catalogue_session(storage, Source::Claude, &root, &stub.cache_key, false)
+            .catalogue_session(storage, Source::Claude, &writer.root(), name, false)
             .unwrap()
             .unwrap()
         else {
             panic!("the session {name} is listed")
         };
-        rows.push(*cached);
+        sessions.rows.push(*cached);
     }
-    CachedClaudeSessions {
-        _home: home,
-        _cache: cache_directory,
-        rows,
+    sessions
+}
+
+impl CachedClaudeSessions {
+    /// The session cache's directory.
+    pub fn cache_path(&self) -> &std::path::Path {
+        self.cache.path()
+    }
+
+    /// The writer of the session of row `index`, as another rearview writes
+    /// it. The row keeps naming the copy it read.
+    pub fn writer(&self, index: usize) -> CachedClaudeSessionWriter {
+        CachedClaudeSessionWriter {
+            home: self.home.path().to_path_buf(),
+            cache: self.cache.path().to_path_buf(),
+            name: self.names[index].clone(),
+        }
+    }
+
+    /// [`CachedClaudeSessionWriter::rewrite`] of row `index`.
+    pub fn rewrite(&self, index: usize, records: &[serde_json::Value]) {
+        self.writer(index).rewrite(records);
+    }
+
+    /// [`CachedClaudeSessionWriter::remove`] of row `index`.
+    pub fn remove(&self, index: usize) {
+        self.writer(index).remove();
+    }
+}
+
+/// One session of [`CachedClaudeSessions`], written by another rearview.
+pub struct CachedClaudeSessionWriter {
+    home: PathBuf,
+    cache: PathBuf,
+    name: String,
+}
+
+impl CachedClaudeSessionWriter {
+    /// Writes the session again from `records`, as a load writes a changed
+    /// transcript: the cache then holds another copy of it.
+    pub fn rewrite(&self, records: &[serde_json::Value]) {
+        let mut cache = crate::history::sqlite_cache::SqliteCache::open(
+            &crate::history::sqlite_cache::tests::rearview_at(&self.cache),
+        )
+        .unwrap();
+        self.write_to(&mut cache, records);
+    }
+
+    /// Removes the session from the cache.
+    pub fn remove(&self) {
+        crate::history::sqlite_cache::tests::remove_sessions_where(
+            &self.cache,
+            "cache_key",
+            &self.name,
+        );
+    }
+
+    fn root(&self) -> crate::history::provider::SessionRoot {
+        crate::history::provider::SessionRoot::new(&self.home)
+    }
+
+    /// Writes the transcript from `records`, and its record to `cache`.
+    fn write_to(
+        &self,
+        cache: &mut crate::history::sqlite_cache::OwnedCache,
+        records: &[serde_json::Value],
+    ) {
+        use crate::history::Source;
+        use crate::history::provider::{Fingerprint, SessionStub};
+        let path = self.home.join(format!("{}.jsonl", self.name));
+        let lines = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &lines).unwrap();
+        let stub = SessionStub {
+            locator: path,
+            subagents: Vec::new(),
+            cache_key: self.name.clone(),
+            fingerprint: Fingerprint {
+                size: lines.len() as u64,
+                modified: Some(std::time::UNIX_EPOCH),
+            },
+        };
+        let (record, _) = crate::history::sqlite_cache::tests::parsed_record_and_row(
+            Source::Claude,
+            &self.root(),
+            &stub,
+        );
+        cache.write(&record).unwrap();
     }
 }
 

@@ -168,13 +168,75 @@ fn content_read_from_copy_lays_out_texts_in_block_order_as_parse_does() {
         panic!("the session is listed")
     };
 
-    let content = listed.load_content().unwrap();
+    let content = listed.load_held_content().unwrap().unwrap().row;
 
     assert_eq!(
         (&content.full_text, &content.agent_search_text),
         (&parsed.full_text, &parsed.agent_search_text),
         "the copy's content lays out the texts as the parse does"
     );
+}
+
+/// Semantic turns read from a copy equal the parse's, terminal codes
+/// included, so both give a turn the same embedding key.
+#[test]
+fn semantic_turns_read_from_copy_keep_terminal_codes_as_parse_does() {
+    let red = "\u{1b}[31mred\u{1b}[0m";
+    let lines = [
+        serde_json::json!({"type": "user", "message": {"role": "user",
+            "content": format!("the {red} question")}}),
+        serde_json::json!({"type": "assistant", "message": {"id": "reply", "role": "assistant",
+            "content": [{"type": "text", "text": format!("the {red} answer")}]}}),
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "text", "text": format!("a {red} block")},
+            {"type": "text", "text": "and another"},
+        ]}}),
+    ]
+    .map(|line| line.to_string());
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("codes.jsonl");
+    std::fs::write(&path, lines.join("\n")).unwrap();
+    let session = AgentSession::new(Source::Claude, path, Vec::new(), Vec::new());
+    let root = root_of(&session);
+    let (record, parsed) = parsed_record_and_row(Source::Claude, &root, &stub_of(&session, 1));
+    assert_eq!(
+        parsed
+            .semantic_turns
+            .iter()
+            .filter(|turn| turn.contains(red))
+            .count(),
+        3,
+        "each of the parse's turns keeps its terminal codes: {:?}",
+        parsed.semantic_turns
+    );
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = admitted_cache(base.path());
+    cache.admit_storage(storage_of(Source::Claude)).unwrap();
+    cache.write(&record).unwrap();
+    let CatalogueSession::Listed(listed) = cache
+        .catalogue_session(
+            storage_of(Source::Claude),
+            Source::Claude,
+            &root,
+            CACHE_KEY,
+            false,
+        )
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("the session is listed")
+    };
+
+    for (read, content) in [
+        ("semantic turns", listed.load_semantic_turns().unwrap()),
+        ("content", listed.load_held_content().unwrap().unwrap().row),
+    ] {
+        assert_eq!(
+            (&content.semantic_turns, &content.semantic_turn_ranges),
+            (&parsed.semantic_turns, &parsed.semantic_turn_ranges),
+            "the copy's {read} read gives the parse's semantic turns"
+        );
+    }
 }
 
 #[test]

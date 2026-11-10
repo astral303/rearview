@@ -33,8 +33,10 @@ fn database_backed_sessions_validate_current_logical_fingerprint() {
     ));
     assert!(
         !cached
-            .load_content()
+            .load_held_content()
             .unwrap()
+            .unwrap()
+            .row
             .full_text
             .contains("fresh database text"),
         "a changed session database's copy is read without parsing the database"

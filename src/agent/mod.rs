@@ -22,6 +22,8 @@ mod read_coverage;
 pub mod record_writer;
 pub mod refs;
 pub mod retrieval;
+#[cfg(test)]
+mod rewritten_sessions;
 pub mod sanitize;
 pub mod search;
 #[cfg(test)]

@@ -30,14 +30,15 @@ mod schema;
 mod scope;
 mod search_parts;
 mod search_texts;
+mod semantic_routes;
 mod text_scan;
 mod window;
 
 pub use base::{CacheBase, ProcessIdentity};
 #[cfg(test)]
 pub(crate) use base::{DiskSpace, DriveRunningOut};
-pub(crate) use cached_session::CopyRead;
 pub(crate) use cached_session::Currency;
+pub(crate) use cached_session::HeldCopy;
 pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
 pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
@@ -63,7 +64,10 @@ pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart};
 pub(crate) use search_texts::SearchedFields;
-pub(crate) use text_scan::{ReadOrder, ScannedRow, TextVisitor, scan_search_texts};
+pub(crate) use semantic_routes::{
+    RouteKey, RoutesStored, SemanticRoute, store_routes as store_semantic_routes,
+};
+pub(crate) use text_scan::{ReadOrder, ScanScope, ScannedRow, TextVisitor, scan_search_texts};
 pub(crate) use window::{InPlaceRow, StoredFile, StoredResume, StoredTurn, WindowUpdate};
 
 use crate::cli::DebugLevel;
@@ -1067,8 +1071,8 @@ fn write_transcript_reads(
 
 /// Updates the stored session row `session` to `record`'s, with
 /// `message_count`, and writes its files, their reads, its checkpoint, its
-/// parse errors and its sub-agent metadata parts. Returns the generation it gave the
-/// row.
+/// parse errors and its sub-agent metadata parts. Returns the generation it
+/// gave the row.
 fn write_catalogue_rows(
     connection: &Connection,
     session: i64,
@@ -1172,8 +1176,8 @@ fn write_malformed_lines(
     )
 }
 
-/// Writes the sub-agent metadata parts of `record`, whose files `keys` places, and
-/// whose session's stored files were `stored_files` before this write.
+/// Writes the sub-agent metadata parts of `record`. `keys` places its files;
+/// `stored_files` are its session's stored files before this write.
 fn write_subagent_metadata(
     connection: &Connection,
     session: i64,

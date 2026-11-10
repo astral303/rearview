@@ -159,6 +159,72 @@ pub(crate) mod test_hooks {
         at_the_first_data_commit(base, FirstDataCommit::Lands, action)
     }
 
+    /// Call `action` once, as a reader opens a connection to the session
+    /// cache database in `base` and `opens` names that reader, before the
+    /// reader runs a statement, until the result drops. A reader is a
+    /// read-only connection.
+    pub(crate) fn run_as_a_reader_opens(
+        base: &Path,
+        opens: ReaderOpening,
+        action: impl FnOnce() + Send + 'static,
+    ) -> ReaderAction {
+        let arming_thread = std::thread::current().id();
+        let readers_on_arming_thread = std::sync::atomic::AtomicUsize::new(0);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let has_run = Arc::clone(&ran);
+        let action = Mutex::new(Some(Box::new(action) as Box<dyn FnOnce() + Send>));
+        let installed = on_every_connection(base, move |connection| {
+            if !connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+                return;
+            }
+            let on_arming_thread = std::thread::current().id() == arming_thread;
+            let named = match opens {
+                ReaderOpening::FirstOnAnotherThread => !on_arming_thread,
+                ReaderOpening::OnThisThread(nth) => {
+                    on_arming_thread
+                        && readers_on_arming_thread
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1
+                            == nth
+                }
+            };
+            if !named {
+                return;
+            }
+            let action = action.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(action) = action {
+                action();
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        ReaderAction {
+            _installed: installed,
+            has_run,
+        }
+    }
+
+    /// An action [`run_as_a_reader_opens`] installed.
+    pub(crate) struct ReaderAction {
+        _installed: Installed,
+        has_run: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ReaderAction {
+        pub(crate) fn has_run(&self) -> bool {
+            self.has_run.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The reader [`run_as_a_reader_opens`] runs its action at.
+    #[derive(Clone, Copy)]
+    pub(crate) enum ReaderOpening {
+        /// The first reader opened on a thread other than the one that armed
+        /// it: in a scan of the cache, the reader of its first task.
+        FirstOnAnotherThread,
+        /// The reader the arming thread opens `n`-th, counting from 1.
+        OnThisThread(usize),
+    }
+
     /// The outcome of the first commit that changes session data.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum FirstDataCommit {

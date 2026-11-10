@@ -18,7 +18,7 @@ pub struct LexicalEvidence {
     /// The session's other texts, shared with the texts held in memory;
     /// `None` for the conversation's `full_text`.
     body: Option<Arc<str>>,
-    /// Ranges in `leading`, then `body`, each after a separator.
+    /// Ranges in `title_and_summary`, then `body`, each after a separator.
     pub context_ranges: Vec<(usize, usize)>,
 }
 

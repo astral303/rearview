@@ -42,6 +42,32 @@ pub(crate) fn replace_copy(copy: &super::CachedSession) -> i64 {
         .unwrap()
 }
 
+/// Removes every session whose `column` of `sessions` holds `value` from the
+/// session cache in `base`, as another rearview's write removing it does.
+/// The write takes no refresh ownership: a test holding another rearview's
+/// ownership keeps it.
+pub(crate) fn remove_sessions_where(base: &Path, column: &str, value: &str) {
+    let connection = connection::open(
+        &database_path(base),
+        connection::Access::ReadWrite,
+        WAITING_BUSY_TIMEOUT,
+    )
+    .unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    let removed = connection
+        .execute(
+            &format!("DELETE FROM sessions WHERE {column} = ?1"),
+            [value],
+        )
+        .unwrap();
+    assert!(
+        removed > 0,
+        "the cache holds a session whose {column} is {value}"
+    );
+}
+
 pub(super) fn admitted_cache(base: &Path) -> super::OwnedCache {
     let cache = SqliteCache::open(&rearview_at(base)).unwrap();
     cache.mark_admitted().unwrap();

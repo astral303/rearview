@@ -281,24 +281,7 @@ fn conversation(
     let preview_first: String = row.get(11)?;
     let preview_last: String = row.get(12)?;
     let message_count = row.get::<_, i64>(18)? as usize;
-    let mut spans = vec![None; message_count];
-    let mut statement = connection.prepare_cached(
-        "SELECT ordinal, first_ms, last_ms FROM messages WHERE session = ?1 AND ordinal IS NOT NULL ORDER BY ordinal",
-    )?;
-    let mut times = statement.query([session])?;
-    while let Some(time) = times.next()? {
-        let ordinal = time.get::<_, i64>(0)? as usize;
-        let first: Option<i64> = time.get(1)?;
-        let last: Option<i64> = time.get(2)?;
-        if let Some(slot) = ordinal
-            .checked_sub(1)
-            .and_then(|index| spans.get_mut(index))
-        {
-            *slot = first.zip(last).map(|(first, last)| {
-                TimeSpan::from_seconds(first.div_euclid(1000), last.div_euclid(1000))
-            });
-        }
-    }
+    let message_times = stored_message_times(connection, session, message_count)?;
     let parse_errors = connection.prepare_cached(
         "SELECT line_number, line_content, error_message, context_before, context_after FROM parse_errors WHERE session = ?1 ORDER BY position",
     )?.query_map([session], |row| Ok(ParseError {
@@ -335,7 +318,7 @@ fn conversation(
         project_name: row.get(8)?,
         cwd: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
         message_count,
-        message_times: MessageTimes::new(&spans),
+        message_times,
         message_text_starts: Default::default(),
         assistant_messages: row.get::<_, i64>(19)? as usize,
         parse_errors,
@@ -353,6 +336,34 @@ fn conversation(
         has_transient_read_error: false,
         is_missing_earlier_turns: row.get(20)?,
     })
+}
+
+/// The times of each of the first `message_count` messages of the session
+/// row `session`.
+pub(super) fn stored_message_times(
+    connection: &Connection,
+    session: i64,
+    message_count: usize,
+) -> Result<MessageTimes> {
+    let mut spans = vec![None; message_count];
+    let mut statement = connection.prepare_cached(
+        "SELECT ordinal, first_ms, last_ms FROM messages WHERE session = ?1 AND ordinal IS NOT NULL ORDER BY ordinal",
+    )?;
+    let mut times = statement.query([session])?;
+    while let Some(time) = times.next()? {
+        let ordinal = time.get::<_, i64>(0)? as usize;
+        let first: Option<i64> = time.get(1)?;
+        let last: Option<i64> = time.get(2)?;
+        if let Some(slot) = ordinal
+            .checked_sub(1)
+            .and_then(|index| spans.get_mut(index))
+        {
+            *slot = first.zip(last).map(|(first, last)| {
+                TimeSpan::from_seconds(first.div_euclid(1000), last.div_euclid(1000))
+            });
+        }
+    }
+    Ok(MessageTimes::new(&spans))
 }
 
 /// A listed row's own transcript and its sub-agent transcripts, in order.
@@ -448,9 +459,11 @@ mod tests {
                 .is_err(),
             "replaced generations are not silently reused"
         );
+        let held = cached.load_held_content().unwrap().unwrap();
         assert!(
-            cached.load_content().is_err(),
-            "the content of a replaced copy isn't read from its transcript"
+            held.generation > Some(cached.cached_session.as_ref().unwrap().generation())
+                && held.row.full_text.contains("original text"),
+            "the content of a replaced copy is read from the copy the cache holds"
         );
         let CatalogueSession::Listed(current) = cache
             .catalogue_session(storage, source, &root, &stub.cache_key, false)
@@ -460,7 +473,7 @@ mod tests {
             panic!("listed fixture")
         };
         std::fs::write(&path, record("fresh replacement text")).unwrap();
-        let content = current.load_content().unwrap();
+        let content = current.load_held_content().unwrap().unwrap().row;
         assert!(
             content.full_text.contains("original text")
                 && !content.full_text.contains("fresh replacement text"),
@@ -509,7 +522,7 @@ mod tests {
             assert_eq!(cached.subagents.len(), original.subagents.len());
             assert!(cached.full_text.is_empty());
             assert!(cached.semantic_turns.is_empty());
-            let content = cached.load_content().unwrap();
+            let content = cached.load_held_content().unwrap().unwrap().row;
             for (actual, expected) in [
                 (&content.full_text, &original.full_text),
                 (&content.agent_search_text, &original.agent_search_text),
@@ -521,7 +534,7 @@ mod tests {
                 assert_eq!(actual, expected, "{} content", original.source.label());
             }
             let agent_route = |row: &Conversation| {
-                crate::agent::service::agent_route_semantic_conversation(row)
+                crate::agent::service::agent_route_of(row, row.semantic_route_text())
                     .map(|route| route.semantic_turns)
             };
             assert_eq!(
@@ -533,6 +546,34 @@ mod tests {
             assert_eq!(content.semantic_turns, original.semantic_turns);
             assert_eq!(content.semantic_turn_ranges, original.semantic_turn_ranges);
             assert_eq!(content.message_text_starts, original.message_text_starts);
+
+            let parsed_route =
+                (!original.semantic_turns.is_empty()).then(|| original.semantic_route_text());
+            let computed = cached.load_semantic_content().unwrap().unwrap();
+            assert_eq!(
+                (
+                    &computed.route_text,
+                    &computed.held.row.semantic_turns,
+                    computed.computed_route.is_some()
+                ),
+                (
+                    &parsed_route,
+                    &original.semantic_turns,
+                    parsed_route.is_some()
+                ),
+                "the {} copy's route text, computed without one stored, is its parse's",
+                original.source.label()
+            );
+            cache
+                .store_semantic_routes(&Vec::from_iter(computed.computed_route))
+                .unwrap();
+            let stored = cached.load_semantic_content().unwrap().unwrap();
+            assert_eq!(
+                (&stored.route_text, stored.computed_route.is_none()),
+                (&parsed_route, true),
+                "the {} copy's stored route text is its parse's",
+                original.source.label()
+            );
         }
     }
 }

@@ -508,6 +508,7 @@ fn run_with(
         return semantic_cli::generate_cache(
             &conversations,
             local_workspace(&environment)?.as_ref(),
+            environment.cache_base(),
             clock,
         );
     }

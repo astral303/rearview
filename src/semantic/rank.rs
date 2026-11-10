@@ -43,6 +43,23 @@ pub struct RankedHits {
     pub chunks: Vec<SemanticHit>,
 }
 
+impl RankedHits {
+    pub fn holds_conversation(&self, index: usize) -> bool {
+        self.conversations
+            .iter()
+            .chain(&self.chunks)
+            .any(|hit| hit.conversation_index == index)
+    }
+
+    /// Removes the hits of the conversations at `dropped`, keeping the order
+    /// of the rest.
+    pub fn drop_conversations(&mut self, dropped: &HashSet<usize>) {
+        for hits in [&mut self.conversations, &mut self.chunks] {
+            hits.retain(|hit| !dropped.contains(&hit.conversation_index));
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ScoredChunk<'a> {
     chunk: &'a EmbeddedChunk,

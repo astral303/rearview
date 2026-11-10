@@ -1323,6 +1323,7 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
             RetrievalTerms::WordsAndLiterals,
             chrono::Local::now(),
             |_| true,
+            crate::search::ScanScope::AllWorkspaces,
         )
         .unwrap()
         .ranked
@@ -1333,25 +1334,27 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
             ));
         }
     }
-    for (phrase, expected) in [("yakety \"yakety release\"", 1), ("\"zebrafish\"", 0)] {
-        let found = try_agent_search(
+    let every_row = (0..conversations.len()).collect::<Vec<_>>();
+    for (phrase, expected) in [("yakety release", 1), ("zebrafish", 0)] {
+        let found = crate::agent::service::lexically_rank_scoped(
             conversations,
-            &agent_texts,
             phrase,
-            RetrievalTerms::Literals,
-            chrono::Local::now(),
-            |_| true,
+            &every_row,
+            crate::agent::search::AgentSearchScope::Global,
+            crate::search::mode::SearchMode::Exact,
+            &unwindowed,
+            &crate::clock::TestClock::default(),
         )
         .unwrap()
         .ranked
         .len();
         if found != expected {
             wrong.push(format!(
-                "agent search's exact filter {phrase:?} finds {expected} session(s), not {found}"
+                "exact agent search {phrase:?} finds {expected} session(s), not {found}"
             ));
         }
     }
-    let content = conversations[0].load_content().unwrap();
+    let content = conversations[0].load_held_content().unwrap().unwrap().row;
     let route = content.semantic_route_text().to_lowercase();
     if !route.contains("yakety") || route.contains("zebrafish") {
         wrong.push(format!(

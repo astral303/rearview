@@ -203,7 +203,7 @@ impl TitleAndSummary {
     }
 }
 
-/// How a provider finds and parses the sessions under its roots.
+/// A provider's discovery and parse of the sessions under its roots.
 pub trait SessionStorage: Sync {
     /// Whose sessions these are. A redirected root can hold a sibling agent's
     /// transcripts, so the load loop keeps only what this source claims — and

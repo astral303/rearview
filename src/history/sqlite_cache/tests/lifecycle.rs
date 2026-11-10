@@ -193,7 +193,7 @@ fn read_snapshot_survives_replacement_between_identity_and_reconstruction() {
 }
 
 #[test]
-fn read_of_session_row_cache_doesnt_hold_fails_naming_row() {
+fn read_of_session_not_in_cache_fails_naming_its_row() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let (storage, root) = write_test_entries(&mut cache, message_schema::transcript(Vec::new()));
@@ -210,8 +210,8 @@ fn read_of_session_row_cache_doesnt_hold_fails_naming_row() {
         .unwrap_err()
         .to_string();
     assert!(
-        failure.contains("session row") && failure.contains("does not hold"),
-        "the failure names the session row: {failure}"
+        failure.contains("session row") && failure.contains("not in the session cache"),
+        "the failure names the session row as not in the session cache: {failure}"
     );
 }
 

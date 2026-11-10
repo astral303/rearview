@@ -2,16 +2,17 @@
 //! its retrieval requires of a hit, from the ranking scan's counts of each
 //! kept text: its transcript stage then reads those messages alone.
 
+use crate::search::literal::Literal;
 use std::collections::HashMap;
 
 /// The terms `agent search`'s retrieval requires a message to hold.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetrievalTerms {
     /// Each query word and each literal: lexical mode.
     WordsAndLiterals,
-    /// Each literal: exact mode, which ranks with the query's words and
-    /// retrieves with its phrase alone.
-    Literals,
+    /// The literals of exact mode's phrase. The ranking counts the query's
+    /// own words and literals and also requires every session to hold these.
+    Phrase(Vec<Literal>),
 }
 
 /// The query terms a message's texts hold, one bit per term: word `i` in
@@ -81,14 +82,36 @@ impl SessionHitMessages {
 }
 
 /// The hit messages of each session the ranking scan counted, by the
-/// session's index among the ranked conversations. A session the scan did
-/// not count, one the cache does not hold, has none.
+/// session's index among the ranked conversations. Missing for a session
+/// the scan did not count or the cache does not hold: search then reads its
+/// transcript whole.
 #[derive(Clone, Debug, Default)]
 pub struct HitMessages(pub(super) HashMap<usize, SessionHitMessages>);
 
 impl HitMessages {
     pub fn of(&self, index: usize) -> Option<&SessionHitMessages> {
         self.0.get(&index)
+    }
+
+    /// No hit message for each of `rows` the cache holds, by index: a query
+    /// without terms.
+    pub(super) fn none_of<'r>(
+        rows: impl IntoIterator<Item = (usize, &'r crate::history::Conversation)>,
+    ) -> Self {
+        Self(
+            rows.into_iter()
+                .filter_map(|(index, row)| {
+                    let copy = row.cached_session.as_ref()?;
+                    Some((
+                        index,
+                        SessionHitMessages {
+                            generation: copy.generation(),
+                            ordinals: Vec::new(),
+                        },
+                    ))
+                })
+                .collect(),
+        )
     }
 }
 

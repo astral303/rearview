@@ -2,6 +2,7 @@ use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::{PADDED_MESSAGE_SEPARATOR, push_separated};
 use crate::history::parser::normalize_whitespace;
+pub(crate) use crate::history::sqlite_cache::ScanScope;
 use crate::history::sqlite_cache::SearchedFields;
 use crate::search::literal::{
     Literal, LiteralCorpusEntry, build_agent_literal_corpus, build_literal_corpus,
@@ -191,7 +192,7 @@ fn searchable_conversation_with(
     // The title and the summary are read with whitespace collapsed, as a
     // search of the session cache's texts reads them. A cached row leaves
     // them out: `streamed::collect_all` counts them with the cache's texts.
-    let leading_lower = if conv.cached_session.is_some() {
+    let title_and_summary_lower = if conv.cached_session.is_some() {
         Vec::new()
     } else {
         conv.title_and_summary_texts()
@@ -201,7 +202,7 @@ fn searchable_conversation_with(
     // Stage 1 reads the body and the project name as one text; the body field
     // scores the part before the project name.
     let mut text_lower = String::with_capacity(
-        leading_lower
+        title_and_summary_lower
             .iter()
             .chain(&agent_texts)
             .map(|text| text.len() + PADDED_MESSAGE_SEPARATOR.len())
@@ -210,7 +211,7 @@ fn searchable_conversation_with(
             + project_lower.len()
             + 1,
     );
-    for text in leading_lower
+    for text in title_and_summary_lower
         .iter()
         .map(String::as_str)
         .chain([conv.search_text_lower.as_str()])
@@ -287,6 +288,7 @@ pub fn agent_search(
         RetrievalTerms::WordsAndLiterals,
         now,
         |_| true,
+        ScanScope::AllWorkspaces,
     )
     .expect("in-memory search")
     .ranked
@@ -299,33 +301,63 @@ pub struct AgentRanking {
     /// The messages of each conversation the session cache holds that hold
     /// every term `retrieval` requires.
     pub hit_messages: HitMessages,
-    query: String,
+    /// The conversations in scope whose session left the cache during the
+    /// ranking: neither ranked nor holding hit messages.
+    pub left_cache: Vec<usize>,
+    terms: CountedTerms,
     window: TimeFilter,
     retrieval: RetrievalTerms,
 }
 
 impl AgentRanking {
-    /// The hit messages of `copy`, its texts read alone: a copy another write
-    /// gave a ranked session after the ranking scan. `None` when the cache no
-    /// longer holds the copy.
-    pub fn hit_messages_alone(
+    /// True when the query holds no word and no literal, such as a query of
+    /// separators: no message holds a hit.
+    pub(crate) fn counts_no_terms(&self) -> bool {
+        self.terms.words.trim().is_empty() && self.terms.literals.is_empty()
+    }
+
+    /// The hit messages of `held`, its texts read alone: the copy another
+    /// write gave a ranked session after the ranking scan.
+    pub(crate) fn hit_messages_in(
         &self,
-        copy: crate::history::sqlite_cache::CachedSession,
-    ) -> Result<Option<SessionHitMessages>> {
-        let (words, literals) = counted_terms(&ParsedQuery::parse(&self.query));
-        let words = words.split_whitespace().collect::<Vec<_>>();
-        streamed::hit_messages_alone(
-            copy,
+        held: &crate::history::sqlite_cache::HeldCopy<'_>,
+    ) -> Result<SessionHitMessages> {
+        let words = self.terms.words();
+        streamed::hit_messages_in(
+            held,
             &self.window,
-            &RawQuery::new(&words, &[], &literals),
-            self.retrieval,
+            &self.retrieval,
+            &RawQuery::new(&words, &[], &self.terms.literals),
         )
     }
 }
 
+/// The hit messages `agent search`'s ranking scan finds for `query` under
+/// `retrieval` among one session's `texts`, each with its message number.
+#[cfg(test)]
+pub(crate) fn hit_messages_of_texts<'t>(
+    query: &str,
+    retrieval: &RetrievalTerms,
+    texts: impl IntoIterator<Item = (Option<usize>, &'t str)>,
+) -> Vec<usize> {
+    let window = TimeFilter::default();
+    let surface = SearchSurface::Agent {
+        window: &window,
+        retrieval,
+        scope: ScanScope::AllWorkspaces,
+    };
+    let terms = CountedTerms::of(&ParsedQuery::parse(query), surface);
+    let words = terms.words();
+    streamed::hit_messages_of_texts(
+        &RawQuery::new(&words, &[], &terms.literals),
+        retrieval,
+        texts,
+    )
+}
+
 /// The conversations `scope` keeps that match `query`, best first, and
 /// their hit messages under `retrieval`. Only those conversations' texts are
-/// read.
+/// read; `scan_scope` is the selection `scope` makes.
 pub fn try_agent_search(
     conversations: &[Conversation],
     texts: &AgentSearchTexts,
@@ -333,21 +365,33 @@ pub fn try_agent_search(
     retrieval: RetrievalTerms,
     now: DateTime<Local>,
     scope: impl Fn(usize) -> bool + Sync,
+    scan_scope: ScanScope,
 ) -> Result<AgentRanking> {
-    let parsed = ParsedQuery::parse(query);
-    let (results, hit_messages) = search_debug_with_query(
+    let surface = SearchSurface::Agent {
+        window: &texts.window,
+        retrieval: &retrieval,
+        scope: scan_scope,
+    };
+    let terms = CountedTerms::of(&ParsedQuery::parse(query), surface);
+    let searched = search_debug_with_query(
         conversations,
         &texts.searchable,
-        &parsed,
+        &terms,
         now,
-        SearchSurface::Agent(&texts.window),
-        Some(retrieval),
+        surface,
         scope,
     )?;
+    let mut left_cache = searched.left_cache.into_iter().collect::<Vec<_>>();
+    left_cache.sort_unstable();
     Ok(AgentRanking {
-        ranked: results.into_iter().map(|(index, _)| index).collect(),
-        hit_messages,
-        query: query.to_owned(),
+        ranked: searched
+            .results
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect(),
+        hit_messages: searched.hit_messages,
+        left_cache,
+        terms,
         window: texts.window,
         retrieval,
     })
@@ -360,18 +404,32 @@ enum SearchSurface<'w> {
     /// read from memory for each session whose texts are held there.
     List(&'w SearchTextsInMemory),
     /// `agent search`'s: also sub-agents' text, thinking and tool calls; with
-    /// the window active, only the text of the messages inside it.
-    Agent(&'w TimeFilter),
+    /// the window active, only the text of the messages inside it. The scan
+    /// also finds the messages holding every term `retrieval` requires.
+    /// `scope` is the selection the searched sessions came from.
+    Agent {
+        window: &'w TimeFilter,
+        retrieval: &'w RetrievalTerms,
+        scope: ScanScope,
+    },
 }
 
 impl<'w> SearchSurface<'w> {
+    /// The selection a scan of the cache for this surface reads.
+    fn scan_scope(self) -> ScanScope {
+        match self {
+            Self::List(_) => ScanScope::AllWorkspaces,
+            Self::Agent { scope, .. } => scope,
+        }
+    }
+
     fn literal_corpus<C: Borrow<Conversation> + Sync>(
         self,
         conversations: &[C],
     ) -> Vec<LiteralCorpusEntry> {
         match self {
             Self::List(_) => build_literal_corpus(conversations),
-            Self::Agent(window) => build_agent_literal_corpus(conversations, window),
+            Self::Agent { window, .. } => build_agent_literal_corpus(conversations, window),
         }
     }
 
@@ -379,7 +437,7 @@ impl<'w> SearchSurface<'w> {
     fn stored_fields(self) -> (SearchedFields, TimeFilter) {
         match self {
             Self::List(_) => (SearchedFields::List, TimeFilter::default()),
-            Self::Agent(window) => (SearchedFields::Agent, *window),
+            Self::Agent { window, .. } => (SearchedFields::Agent, *window),
         }
     }
 
@@ -387,7 +445,7 @@ impl<'w> SearchSurface<'w> {
     fn texts_in_memory(self, conversation: &Conversation) -> Option<&'w SessionSearchTexts> {
         match self {
             Self::List(texts) => texts.get(conversation),
-            Self::Agent(_) => None,
+            Self::Agent { .. } => None,
         }
     }
 
@@ -396,7 +454,7 @@ impl<'w> SearchSurface<'w> {
     /// does not raise its rank.
     fn ranked_time(self, conversation: &Conversation) -> DateTime<Local> {
         match self {
-            Self::Agent(window) if window.is_active() => conversation
+            Self::Agent { window, .. } if window.is_active() => conversation
                 .message_times
                 .last_second_within(window)
                 .and_then(|second| Local.timestamp_opt(second, 0).single())
@@ -473,43 +531,46 @@ fn debug_search_with_surface<C: Borrow<Conversation> + Sync>(
     scope: impl Fn(usize) -> bool + Sync,
 ) -> Result<LexicalDebugSearch> {
     let parsed = ParsedQuery::parse(query);
-    let (results, _) = search_debug_with_query(
-        conversations,
-        searchable,
-        &parsed,
-        now,
-        surface,
-        None,
-        scope,
-    )?;
+    let terms = CountedTerms::of(&parsed, surface);
+    let results =
+        search_debug_with_query(conversations, searchable, &terms, now, surface, scope)?.results;
     Ok(LexicalDebugSearch { parsed, results })
 }
 
-/// Results matching every literal, and with `retrieval`, the hit messages.
+/// A search's results, best first, with what its count of stored texts
+/// found.
+struct Searched {
+    results: Vec<(usize, ScoreDebug)>,
+    hit_messages: HitMessages,
+    /// As [`streamed::StoredCounts::left_cache`].
+    left_cache: std::collections::HashSet<usize>,
+}
+
+/// Results matching every literal, and on `agent search`'s surface, the hit
+/// messages.
 fn exact_debug_results<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     literals: &[Literal],
     now: DateTime<Local>,
     surface: SearchSurface<'_>,
-    retrieval: Option<RetrievalTerms>,
     scope: impl Fn(usize) -> bool + Sync,
-) -> Result<(Vec<(usize, ScoreDebug)>, HitMessages)> {
+) -> Result<Searched> {
     let corpus = surface.literal_corpus(conversations);
     let ranked_time = |index: usize| surface.ranked_time(conversations[index].borrow());
     let query = RawQuery::new(&[], &[], literals);
     let in_scope = (0..conversations.len())
         .filter(|index| scope(*index))
         .collect::<Vec<_>>();
-    let (bodies, hit_messages) = streamed::collect_all(
+    let stored = streamed::collect_all(
         conversations,
         &cached_among(conversations, &in_scope),
         surface,
         &query,
-        retrieval,
     )?;
     let mut matching = in_scope
         .into_par_iter()
-        .filter(|index| match bodies.get(index) {
+        .filter(|index| !stored.left_cache.contains(index))
+        .filter(|index| match stored.counts.get(index) {
             Some(body) => body.matches_literals(),
             None => matches_all_literals(&corpus[*index].text, literals),
         })
@@ -519,7 +580,11 @@ fn exact_debug_results<C: Borrow<Conversation> + Sync>(
         .into_iter()
         .map(|index| (index, freshness_only(ranked_time(index), now)))
         .collect();
-    Ok((results, hit_messages))
+    Ok(Searched {
+        results,
+        hit_messages: stored.hit_messages,
+        left_cache: stored.left_cache,
+    })
 }
 
 /// Those of `indices` whose conversation the session cache holds.
@@ -575,57 +640,86 @@ fn normalized_query_words(query: &str) -> String {
     )
 }
 
-/// The normalised words and the literals lexical search counts for
-/// `parsed`: a quoted-only query's literals alone; otherwise its words, its
-/// literals and each word holding `_` as a literal.
-fn counted_terms(parsed: &ParsedQuery) -> (String, Vec<Literal>) {
-    if parsed.is_quoted_only() {
-        return (String::new(), parsed.literals().to_vec());
-    }
-    let intent = parsed.lexical_text().trim();
-    let literals = parsed
-        .literals()
-        .iter()
-        .cloned()
-        .chain(identifier_literals(intent))
-        .collect();
-    (normalized_query_words(intent), literals)
+/// The normalised words and the literals lexical search counts for a query.
+struct CountedTerms {
+    words: String,
+    literals: Vec<Literal>,
 }
 
-/// The results for `parsed`, and with `retrieval`, the hit messages of the
-/// conversations read from the session cache.
+impl CountedTerms {
+    /// The terms of `parsed`: a quoted-only query's literals alone;
+    /// otherwise its words, its literals and each word holding `_` as a
+    /// literal. In exact mode also each literal of the phrase not already
+    /// among them.
+    fn of(parsed: &ParsedQuery, surface: SearchSurface<'_>) -> Self {
+        let mut terms = if parsed.is_quoted_only() {
+            Self {
+                words: String::new(),
+                literals: parsed.literals().to_vec(),
+            }
+        } else {
+            let intent = parsed.lexical_text().trim();
+            Self {
+                words: normalized_query_words(intent),
+                literals: parsed
+                    .literals()
+                    .iter()
+                    .cloned()
+                    .chain(identifier_literals(intent))
+                    .collect(),
+            }
+        };
+        if let SearchSurface::Agent {
+            retrieval: RetrievalTerms::Phrase(phrase),
+            ..
+        } = surface
+        {
+            for literal in phrase {
+                if !terms.literals.contains(literal) {
+                    terms.literals.push(literal.clone());
+                }
+            }
+        }
+        terms
+    }
+
+    fn words(&self) -> Vec<&str> {
+        self.words.split_whitespace().collect()
+    }
+}
+
+/// The results for `terms`, and on `agent search`'s surface, the hit
+/// messages of the conversations read from the session cache. A
+/// conversation whose session left the cache during the search is not a
+/// result.
 fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     searchable: &[SearchableConversation],
-    parsed: &ParsedQuery,
+    terms: &CountedTerms,
     now: DateTime<Local>,
     surface: SearchSurface<'_>,
-    retrieval: Option<RetrievalTerms>,
     scope: impl Fn(usize) -> bool + Sync,
-) -> Result<(Vec<(usize, ScoreDebug)>, HitMessages)> {
-    let browse = || {
-        Ok((
-            browse_debug_results(conversations, now, surface, &scope),
-            HitMessages::default(),
-        ))
-    };
-    if parsed.is_effectively_empty() {
-        return browse();
-    }
-    let (query_lower, literal_filters) = counted_terms(parsed);
-    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+) -> Result<Searched> {
+    let literal_filters = &terms.literals;
+    let query_words = terms.words();
     if query_words.is_empty() {
         if literal_filters.is_empty() {
-            return browse();
+            let results = browse_debug_results(conversations, now, surface, &scope);
+            let hit_messages = match surface {
+                SearchSurface::Agent { .. } => HitMessages::none_of(
+                    results
+                        .iter()
+                        .map(|&(index, _)| (index, conversations[index].borrow())),
+                ),
+                SearchSurface::List(_) => HitMessages::default(),
+            };
+            return Ok(Searched {
+                results,
+                hit_messages,
+                left_cache: std::collections::HashSet::new(),
+            });
         }
-        return exact_debug_results(
-            conversations,
-            &literal_filters,
-            now,
-            surface,
-            retrieval,
-            scope,
-        );
+        return exact_debug_results(conversations, literal_filters, now, surface, scope);
     }
 
     let corpus = (!literal_filters.is_empty()).then(|| surface.literal_corpus(conversations));
@@ -638,31 +732,30 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
     } else {
         vec![]
     };
-    let raw_query = RawQuery::new(&query_words, &adjacent_pairs, &literal_filters);
+    let raw_query = RawQuery::new(&query_words, &adjacent_pairs, literal_filters);
     let in_scope = searchable
         .iter()
         .map(|s| s.index)
         .filter(|index| scope(*index))
         .collect::<Vec<_>>();
-    let (bodies, hit_messages) = streamed::collect_all(
+    let stored = streamed::collect_all(
         conversations,
         &cached_among(conversations, &in_scope),
         surface,
         &raw_query,
-        retrieval,
     )?;
 
     let mut scored: Vec<(usize, ScoreDebug, DateTime<Local>)> = searchable
         .par_iter()
         .map(|s| -> Result<_> {
-            if !scope(s.index) {
+            if !scope(s.index) || stored.left_cache.contains(&s.index) {
                 return Ok(None);
             }
             let row = conversations[s.index].borrow();
             let time = surface.ranked_time(row);
-            if let Some(body) = bodies.get(&s.index) {
+            if let Some(body) = stored.counts.get(&s.index) {
                 let include_project =
-                    !matches!(surface, SearchSurface::Agent(window) if window.is_active());
+                    !matches!(surface, SearchSurface::Agent { window, .. } if window.is_active());
                 return Ok(streamed::score(
                     s,
                     body,
@@ -674,9 +767,10 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
                 )
                 .map(|debug| (s.index, debug, time)));
             }
-            if corpus.as_ref().is_some_and(|corpus| {
-                !matches_all_literals(&corpus[s.index].text, &literal_filters)
-            }) {
+            if corpus
+                .as_ref()
+                .is_some_and(|corpus| !matches_all_literals(&corpus[s.index].text, literal_filters))
+            {
                 return Ok(None);
             }
             let time = surface.ranked_time(conversations[s.index].borrow());
@@ -701,7 +795,11 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
         .into_iter()
         .map(|(idx, debug, _)| (idx, debug))
         .collect();
-    Ok((results, hit_messages))
+    Ok(Searched {
+        results,
+        hit_messages: stored.hit_messages,
+        left_cache: stored.left_cache,
+    })
 }
 
 /// Field weights for scoring

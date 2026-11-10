@@ -573,8 +573,7 @@ impl RowFold {
     }
 }
 
-/// `title` trimmed; `None` for a blank one. A blank custom title clears the
-/// title; a blank AI title leaves the summary as it is.
+/// `title` trimmed; `None` for a blank one.
 fn shown_title(title: &str) -> Option<String> {
     let trimmed = title.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())

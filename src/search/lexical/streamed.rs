@@ -4,9 +4,11 @@
 use super::hit_messages::MessageTerms;
 use super::raw::{ADJACENCY_CAP, Counts, PREFIX_CAP, RawMatcher, RawQuery};
 use super::*;
-use crate::error::{AppError, Result};
-use crate::history::sqlite_cache::{CachedSession, ScannedRow, TextVisitor, scan_search_texts};
-use std::collections::HashMap;
+use crate::error::Result;
+use crate::history::sqlite_cache::{
+    CachedSession, HeldCopy, ScannedRow, TextVisitor, scan_search_texts,
+};
+use std::collections::{HashMap, HashSet};
 
 impl Counts {
     pub(super) fn matches_literals(&self) -> bool {
@@ -28,15 +30,14 @@ impl Counts {
 /// from the texts held in memory, and none for a session without texts
 /// held; for `agent search`, from the cache. Without a time window, the
 /// counts also hold the row's title and summary, and a literal in a
-/// conversation's project name counts as found. With `retrieval`, also the
-/// hit messages of each conversation read from the cache.
+/// conversation's project name counts as found. For `agent search`, also
+/// the hit messages of each conversation read from the cache.
 pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     indices: &[usize],
     surface: SearchSurface<'_>,
     query: &RawQuery<'_>,
-    retrieval: Option<RetrievalTerms>,
-) -> Result<(HashMap<usize, Counts>, HitMessages)> {
+) -> Result<StoredCounts> {
     let (held, stored): (Vec<_>, Vec<_>) = indices
         .iter()
         .map(|&index| {
@@ -53,23 +54,26 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
         .into_iter()
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let hit_messages = match surface {
+    let mut stored = match surface {
         SearchSurface::List(_) => {
             let matcher = query.matcher();
             counts.extend(stored.iter().map(|&index| (index, matcher.counts())));
-            HitMessages::default()
+            StoredCounts {
+                counts,
+                hit_messages: HitMessages::default(),
+                left_cache: HashSet::new(),
+            }
         }
-        SearchSurface::Agent(_) => {
-            let (stored_counts, hit_messages) =
-                count_stored(conversations, &stored, surface, query, retrieval)?;
-            counts.extend(stored_counts);
-            hit_messages
+        SearchSurface::Agent { retrieval, .. } => {
+            let mut found = count_stored(conversations, &stored, surface, query, retrieval)?;
+            found.counts.extend(counts);
+            found
         }
     };
     let (_, window) = surface.stored_fields();
     if !window.is_active() {
         let mut matcher = query.matcher();
-        for (index, counts) in &mut counts {
+        for (index, counts) in &mut stored.counts {
             let conversation = conversations[*index].borrow();
             for text in conversation.title_and_summary_texts() {
                 matcher.count(text, counts);
@@ -80,39 +84,59 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
             }
         }
     }
-    Ok((counts, hit_messages))
+    Ok(stored)
+}
+
+/// What a count of sessions' stored search texts found, by the index of
+/// each conversation counted.
+pub(super) struct StoredCounts {
+    pub(super) counts: HashMap<usize, Counts>,
+    pub(super) hit_messages: HitMessages,
+    /// The conversations whose session left the cache while it was counted:
+    /// another rearview removed it, or was writing it again. Nothing of them
+    /// is counted.
+    pub(super) left_cache: HashSet<usize>,
 }
 
 /// `query`'s counts over the search texts of each conversation at `indices`,
 /// read from the session cache in one scan, by index. A conversation's
 /// counts hold the texts holding some of the query, and `has_text` is true
-/// when any text it holds has more than whitespace.
+/// when any text it holds has more than whitespace. Also each conversation's
+/// messages holding every term `retrieval` requires. A session another write
+/// replaced during the scan is counted again alone, from the copy the cache
+/// then holds.
 fn count_stored<C: Borrow<Conversation>>(
     conversations: &[C],
     indices: &[usize],
     surface: SearchSurface<'_>,
     query: &RawQuery<'_>,
-    retrieval: Option<RetrievalTerms>,
-) -> Result<(HashMap<usize, Counts>, HitMessages)> {
+    retrieval: &RetrievalTerms,
+) -> Result<StoredCounts> {
     let matcher = query.matcher();
-    let mut counts: HashMap<usize, Counts> = indices
-        .iter()
-        .map(|&index| (index, matcher.counts()))
-        .collect();
-    let mut hit_messages = HitMessages::default();
+    let mut stored = StoredCounts {
+        counts: indices
+            .iter()
+            .map(|&index| (index, matcher.counts()))
+            .collect(),
+        hit_messages: HitMessages::default(),
+        left_cache: HashSet::new(),
+    };
     if indices.is_empty() {
-        return Ok((counts, hit_messages));
+        return Ok(stored);
     }
     let copies = indices
         .iter()
         .map(|&index| cached_copy(conversations[index].borrow()))
         .collect::<Vec<_>>();
     let (fields, window) = surface.stored_fields();
-    let scanned = scan_search_texts(&copies, fields, &window, || {
-        BodyCounter::new(query, retrieval.is_some())
+    let scanned = scan_search_texts(&copies, fields, &window, surface.scan_scope(), || {
+        BodyCounter::new(query)
     })?;
-    if let Some((_, error)) = scanned.missing.into_iter().next() {
-        return Err(error);
+    let counts = &mut stored.counts;
+    let hit_messages = &mut stored.hit_messages;
+    for copy in scanned.missing {
+        counts.remove(&indices[copy]);
+        stored.left_cache.insert(indices[copy]);
     }
     let replaced = scanned.replaced.into_iter().collect::<HashMap<_, _>>();
     let mut message_terms: HashMap<usize, HashMap<usize, MessageTerms>> = HashMap::new();
@@ -124,7 +148,7 @@ fn count_stored<C: Borrow<Conversation>>(
                 session.add(&found);
             }
         }
-        for ((copy, ordinal), terms) in counter.messages.into_iter().flatten() {
+        for ((copy, ordinal), terms) in counter.messages {
             if !replaced.contains_key(&copy) {
                 message_terms
                     .entry(copy)
@@ -135,90 +159,94 @@ fn count_stored<C: Borrow<Conversation>>(
             }
         }
     }
-    if let Some(retrieval) = retrieval {
-        let required = query.required_terms(retrieval);
-        for (copy, &copy_read) in copies.iter().enumerate() {
-            if !replaced.contains_key(&copy) {
-                let terms = message_terms.remove(&copy).unwrap_or_default();
-                hit_messages.0.insert(
-                    indices[copy],
-                    SessionHitMessages::holding(copy_read.generation(), &terms, required),
-                );
-            }
-        }
-    }
-    for (copy, generation) in replaced {
-        let conversation = conversations[indices[copy]].borrow();
-        let (counts_alone, messages) = count_alone(
-            cached_copy(conversation).clone().of_generation(generation),
-            surface,
-            query,
-        )?
-        .ok_or_else(|| not_in_cache(conversation))?;
-        counts.insert(indices[copy], counts_alone);
-        if let Some(retrieval) = retrieval {
+    let required = query.required_terms(retrieval);
+    for (copy, &copy_read) in copies.iter().enumerate() {
+        if counts.contains_key(&indices[copy]) && !replaced.contains_key(&copy) {
+            let terms = message_terms.remove(&copy).unwrap_or_default();
             hit_messages.0.insert(
                 indices[copy],
-                SessionHitMessages::holding(generation, &messages, query.required_terms(retrieval)),
+                SessionHitMessages::holding(copy_read.generation(), &terms, required),
             );
         }
     }
-    Ok((counts, hit_messages))
-}
-
-fn not_in_cache(conversation: &Conversation) -> AppError {
-    AppError::SessionCacheNotReady {
-        session: conversation.session_id.clone(),
-        reason: "the session is not in the session cache".to_owned(),
-    }
-}
-
-/// `query`'s counts over `copy`'s search texts, read alone, and the terms
-/// each message's texts hold: a copy another write gave the session after a
-/// scan started. `None` when the cache no longer holds the copy.
-fn count_alone(
-    copy: CachedSession,
-    surface: SearchSurface<'_>,
-    query: &RawQuery<'_>,
-) -> Result<Option<(Counts, HashMap<usize, MessageTerms>)>> {
-    let (fields, window) = surface.stored_fields();
-    let mut matcher = query.matcher();
-    let mut counts = matcher.counts();
-    let mut text_counts = matcher.counts();
-    let mut messages: HashMap<usize, MessageTerms> = HashMap::new();
-    let read =
-        copy.ignoring_source_changes()
+    for copy in replaced.into_keys() {
+        let index = indices[copy];
+        let held = cached_copy(conversations[index].borrow())
+            .clone()
+            .ignoring_source_changes()
             .waiting()
-            .read_search_texts(fields, &window, |text| {
-                text_counts.clear();
-                matcher.count(text.text, &mut text_counts);
-                counts.add(&text_counts);
-                if let Some(ordinal) = text.ordinal {
-                    messages
-                        .entry(ordinal)
-                        .or_default()
-                        .add(matcher.message_terms(&text_counts));
-                }
-                std::ops::ControlFlow::Continue(())
+            .read_held_copy(|held| {
+                Ok((
+                    held.generation(),
+                    count_alone(held, (fields, &window), query)?,
+                ))
             })?;
-    Ok(read.map(|()| (counts, messages)))
+        match held {
+            Some((generation, (counts_alone, messages))) => {
+                counts.insert(index, counts_alone);
+                hit_messages.0.insert(
+                    index,
+                    SessionHitMessages::holding(generation, &messages, required),
+                );
+            }
+            None => {
+                counts.remove(&index);
+                stored.left_cache.insert(index);
+            }
+        }
+    }
+    Ok(stored)
 }
 
-/// The hit messages of `copy` for `query` under `retrieval`, its texts read
-/// alone: a copy another write gave a ranked session after the ranking scan.
-/// `None` when the cache no longer holds the copy.
-pub(super) fn hit_messages_alone(
-    copy: CachedSession,
-    window: &TimeFilter,
+/// `query`'s counts over the search texts of `held`, read alone, and the
+/// terms each message's texts hold.
+fn count_alone(
+    held: &HeldCopy<'_>,
+    (fields, window): (SearchedFields, &TimeFilter),
     query: &RawQuery<'_>,
-    retrieval: RetrievalTerms,
-) -> Result<Option<SessionHitMessages>> {
-    let generation = copy.generation();
-    Ok(
-        count_alone(copy, SearchSurface::Agent(window), query)?.map(|(_, messages)| {
-            SessionHitMessages::holding(generation, &messages, query.required_terms(retrieval))
-        }),
-    )
+) -> Result<(Counts, HashMap<usize, MessageTerms>)> {
+    let mut counter = BodyCounter::new(query);
+    held.visit_search_texts(fields, window, |text| {
+        counter.count(ALONE, text.ordinal, text.text);
+        std::ops::ControlFlow::Continue(())
+    })?;
+    Ok(counter.into_session(ALONE))
+}
+
+/// The position of a session read alone, as [`BodyCounter`] counts it.
+const ALONE: usize = 0;
+
+/// The messages of the texts `texts`, each with its message number, that
+/// hold every term `retrieval` requires of `query`, counted as the scan
+/// counts each text it reads.
+#[cfg(test)]
+pub(super) fn hit_messages_of_texts<'t>(
+    query: &RawQuery<'_>,
+    retrieval: &RetrievalTerms,
+    texts: impl IntoIterator<Item = (Option<usize>, &'t str)>,
+) -> Vec<usize> {
+    let mut counter = BodyCounter::new(query);
+    for (ordinal, text) in texts {
+        counter.count(ALONE, ordinal, text);
+    }
+    let (_, messages) = counter.into_session(ALONE);
+    SessionHitMessages::holding(0, &messages, query.required_terms(retrieval)).ordinals
+}
+
+/// The hit messages of `held` for `query` under `retrieval` within
+/// `window`, its texts read alone.
+pub(super) fn hit_messages_in(
+    held: &HeldCopy<'_>,
+    window: &TimeFilter,
+    retrieval: &RetrievalTerms,
+    query: &RawQuery<'_>,
+) -> Result<SessionHitMessages> {
+    let (_, messages) = count_alone(held, (SearchedFields::Agent, window), query)?;
+    Ok(SessionHitMessages::holding(
+        held.generation(),
+        &messages,
+        query.required_terms(retrieval),
+    ))
 }
 
 fn cached_copy(conversation: &Conversation) -> &CachedSession {
@@ -231,22 +259,64 @@ struct BodyCounter<'q> {
     matcher: RawMatcher<'q>,
     /// The counts of the text examined last.
     text: Counts,
+    /// The terms the text examined last holds as a message's part.
+    text_terms: MessageTerms,
     bodies: HashMap<usize, Counts>,
-    /// When hit messages are wanted, the terms each message's kept texts
-    /// hold, by the position of its session and its number.
-    messages: Option<HashMap<(usize, usize), MessageTerms>>,
+    /// The terms each message's kept texts hold, by the position of its
+    /// session and its number.
+    messages: HashMap<(usize, usize), MessageTerms>,
 }
 
 impl<'q> BodyCounter<'q> {
-    fn new(query: &'q RawQuery<'q>, counts_messages: bool) -> Self {
+    fn new(query: &'q RawQuery<'q>) -> Self {
         let matcher = query.matcher();
         let text = matcher.counts();
         Self {
             matcher,
             text,
+            text_terms: MessageTerms::default(),
             bodies: HashMap::new(),
-            messages: counts_messages.then(HashMap::new),
+            messages: HashMap::new(),
         }
+    }
+
+    /// Counts `text` of the session at `copy`, in the message `ordinal`, as
+    /// a scan counts each text it reads.
+    fn count(&mut self, copy: usize, ordinal: Option<usize>, text: &str) {
+        if !text.trim().is_empty() {
+            self.holds_text(copy);
+        }
+        if self.examine(text) {
+            self.keep_examined(copy, ordinal);
+        }
+    }
+
+    /// Adds the text examined last to the session at `copy`, in the message
+    /// `ordinal`.
+    fn keep_examined(&mut self, copy: usize, ordinal: Option<usize>) {
+        body_of(&mut self.bodies, &self.matcher, copy).add(&self.text);
+        if let Some(ordinal) = ordinal {
+            self.messages
+                .entry((copy, ordinal))
+                .or_default()
+                .add(self.text_terms);
+        }
+    }
+
+    /// The counts of the session at `copy`, and the terms each of its
+    /// messages holds.
+    fn into_session(mut self, copy: usize) -> (Counts, HashMap<usize, MessageTerms>) {
+        let counts = self
+            .bodies
+            .remove(&copy)
+            .unwrap_or_else(|| self.matcher.counts());
+        let messages = self
+            .messages
+            .into_iter()
+            .filter(|((of_copy, _), _)| *of_copy == copy)
+            .map(|((_, ordinal), terms)| (ordinal, terms))
+            .collect();
+        (counts, messages)
     }
 }
 
@@ -254,21 +324,18 @@ impl TextVisitor for BodyCounter<'_> {
     fn examine(&mut self, text: &str) -> bool {
         self.text.clear();
         self.matcher.count(text, &mut self.text);
-        self.text
-            .contains
-            .iter()
-            .chain(&self.text.literals)
-            .any(|found| *found)
+        self.text_terms = self.matcher.message_terms(text, &self.text);
+        self.text_terms.literals != 0
+            || self
+                .text
+                .contains
+                .iter()
+                .chain(&self.text.literals)
+                .any(|found| *found)
     }
 
     fn keep(&mut self, row: &ScannedRow, _text: &str) {
-        body_of(&mut self.bodies, &self.matcher, row.copy).add(&self.text);
-        if let (Some(messages), Some(ordinal)) = (&mut self.messages, row.ordinal) {
-            messages
-                .entry((row.copy, ordinal))
-                .or_default()
-                .add(self.matcher.message_terms(&self.text));
-        }
+        self.keep_examined(row.copy, row.ordinal);
     }
 
     fn holds_text(&mut self, copy: usize) {
@@ -492,17 +559,26 @@ mod tests {
             for window in &windows {
                 for surface in [
                     SearchSurface::List(&in_memory),
-                    SearchSurface::Agent(window),
+                    SearchSurface::Agent {
+                        window,
+                        retrieval: &RetrievalTerms::WordsAndLiterals,
+                        scope: ScanScope::AllWorkspaces,
+                    },
+                    SearchSurface::Agent {
+                        window,
+                        retrieval: &RetrievalTerms::WordsAndLiterals,
+                        scope: ScanScope::Project,
+                    },
                 ] {
                     let original_texts = match surface {
                         SearchSurface::List(_) => precompute_search_text(&original),
-                        SearchSurface::Agent(_) => {
+                        SearchSurface::Agent { .. } => {
                             precompute_agent_search_text(&original, window).searchable
                         }
                     };
                     let cached_texts = match surface {
                         SearchSurface::List(_) => precompute_search_text(&cached),
-                        SearchSurface::Agent(_) => {
+                        SearchSurface::Agent { .. } => {
                             precompute_agent_search_text(&cached, window).searchable
                         }
                     };

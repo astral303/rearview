@@ -154,18 +154,45 @@ pub struct AgentSearchOutput {
     pub coverage: Option<SessionCoverage>,
 }
 
+impl AgentSearchOutput {
+    /// Every hit, the flat list's and each group's.
+    pub fn every_hit(&self) -> impl Iterator<Item = &AgentOutputHit> {
+        self.hits
+            .iter()
+            .chain(self.groups.iter().flat_map(|group| group.hits.iter()))
+    }
+
+    fn every_hit_mut(&mut self) -> impl Iterator<Item = &mut AgentOutputHit> {
+        self.hits.iter_mut().chain(
+            self.groups
+                .iter_mut()
+                .flat_map(|group| group.hits.iter_mut()),
+        )
+    }
+}
+
 pub struct LexicalSearchRun {
     pub output: AgentSearchOutput,
     /// The sessions whose transcript failed to load, in rank order.
     pub failed_reads: Vec<(AgentConversationKey, AppError)>,
+    /// The sessions that left the session cache before their transcript was
+    /// read, in rank order. They count as failed.
+    pub left_cache: Vec<AgentConversationKey>,
+    /// The generation of the cached copy each searched session's hit
+    /// messages were read from, by conversation reference: its hits number
+    /// that copy's messages. A transcript read whole is missing.
+    pub copies_read: HashMap<String, i64>,
 }
 
 /// A ranked session's transcript as a lexical search reads it.
 pub struct SearchedTranscript {
     /// Every message, or the messages holding the query's terms alone.
     pub transcript: AgentTranscript,
-    /// The number of the session's last message.
+    /// The session's message count.
     pub message_count: usize,
+    /// The generation of the cached copy the messages were read from;
+    /// `None` for a transcript read whole.
+    pub copy_generation: Option<i64>,
 }
 
 impl From<AgentTranscript> for SearchedTranscript {
@@ -174,32 +201,20 @@ impl From<AgentTranscript> for SearchedTranscript {
         Self {
             message_count: transcript.messages.len(),
             transcript,
+            copy_generation: None,
         }
     }
 }
 
 impl SearchedTranscript {
-    fn messages(&self) -> SessionMessages<'_> {
-        SessionMessages {
+    /// The messages as retrieval's target, without the session's reference
+    /// or time: [`retrieval_hits`] adds them.
+    fn target(&self) -> AgentTranscriptSearchTarget<'_> {
+        AgentTranscriptSearchTarget {
             transcript: &self.transcript,
             message_count: self.message_count,
-        }
-    }
-}
-
-/// The messages of a session retrieval searches, as [`SearchedTranscript`]
-/// holds them.
-#[derive(Clone, Copy)]
-struct SessionMessages<'t> {
-    transcript: &'t AgentTranscript,
-    message_count: usize,
-}
-
-impl<'t> SessionMessages<'t> {
-    fn whole(transcript: &'t AgentTranscript) -> Self {
-        Self {
-            transcript,
-            message_count: transcript.messages.len(),
+            conversation_ref: None,
+            timestamp: None,
         }
     }
 }
@@ -281,23 +296,13 @@ pub fn attach_transcript_metadata(
         });
     }
     for hit in output
-        .hits
-        .iter_mut()
-        .chain(
-            output
-                .groups
-                .iter_mut()
-                .flat_map(|group| group.hits.iter_mut()),
-        )
+        .every_hit_mut()
         .filter(|hit| hit.conversation_ref == reference)
     {
         hit.project_id = resolved.key.project_id();
         hit.conversation_uuid = resolved.reference.uuid();
         hit.session = resolved.key.session_filename.clone();
-        let focus = FocusMetadata::of(transcript, resolved, hit.focus_range);
-        hit.anchors = focus.anchors;
-        hit.times = focus.times;
-        hit.render_options.merge(focus.flags);
+        attach_focus_metadata(hit, transcript, resolved);
     }
     for group in output
         .groups
@@ -308,6 +313,34 @@ pub fn attach_transcript_metadata(
         group.conversation_uuid = resolved.reference.uuid();
         group.session = resolved.key.session_filename.clone();
     }
+}
+
+/// Gives each semantic-only hit of `resolved`'s session in `output` the
+/// anchors and times of its focus messages in `transcript`. Every other hit
+/// keeps those its lexical retrieval found.
+pub fn attach_semantic_hit_metadata(
+    output: &mut AgentSearchOutput,
+    resolved: &ResolvedConversation,
+    transcript: &AgentTranscript,
+) {
+    let reference = resolved.reference.canonical();
+    for hit in output
+        .every_hit_mut()
+        .filter(|hit| hit.conversation_ref == reference && hit.source == AgentHitKind::Semantic)
+    {
+        attach_focus_metadata(hit, transcript, resolved);
+    }
+}
+
+fn attach_focus_metadata(
+    hit: &mut AgentOutputHit,
+    transcript: &AgentTranscript,
+    resolved: &ResolvedConversation,
+) {
+    let focus = FocusMetadata::of(transcript, resolved, hit.focus_range);
+    hit.anchors = focus.anchors;
+    hit.times = focus.times;
+    hit.render_options.merge(focus.flags);
 }
 
 pub fn effective_agent_mode(
@@ -590,7 +623,7 @@ pub fn run_within_search(
             request.top,
             conversation,
             resolved,
-            SessionMessages::whole(transcript),
+            AgentTranscriptSearchTarget::whole(transcript, None, None),
             mode,
             request.window,
         ),
@@ -605,7 +638,7 @@ pub fn run_within_search(
                     candidate_depth,
                     conversation,
                     resolved,
-                    SessionMessages::whole(transcript),
+                    AgentTranscriptSearchTarget::whole(transcript, None, None),
                     SearchMode::Lexical,
                     request.window,
                 ),
@@ -643,7 +676,8 @@ pub fn run_global_lexical_search(
         conversations,
         keys,
         ranked_indices,
-        |_, key| load_transcript(key).map(SearchedTranscript::from),
+        |_, key| load_transcript(key).map(|transcript| Some(transcript.into())),
+        |_, key| key.transcript_bytes,
         None,
     )
     .map(|run| run.output)
@@ -654,8 +688,10 @@ pub fn run_global_lexical_search(
 /// With a window, a session without hits inside it does not take a place on
 /// the page: the next-ranked session is searched in its place. `reads`, when
 /// collecting, records the time spent matching the searched transcripts.
-/// `load_transcript` reads the transcript of the conversation at an index of
-/// `conversations`.
+/// `read_session` reads the conversation at an index of `conversations`: its
+/// hit messages, or its whole transcript; `None` when its session left the
+/// session cache. `read_bytes` is about how many bytes that read reads, for
+/// the read-ahead bound; `None` when unknown.
 ///
 /// Transcripts are read and searched on several threads, each as soon as it
 /// is read, but their hits are taken in rank order, so the stop rule and the
@@ -665,7 +701,8 @@ pub fn run_global_lexical_search_reporting(
     conversations: &[Conversation],
     keys: &[AgentConversationKey],
     ranked_indices: &[usize],
-    load_transcript: impl Fn(usize, &AgentConversationKey) -> Result<SearchedTranscript> + Sync,
+    read_session: impl Fn(usize, &AgentConversationKey) -> Result<Option<SearchedTranscript>> + Sync,
+    read_bytes: impl Fn(usize, &AgentConversationKey) -> Option<u64> + Sync,
     reads: Option<&SearchReads>,
 ) -> Result<LexicalSearchRun> {
     let mode = request.mode();
@@ -703,20 +740,27 @@ pub fn run_global_lexical_search_reporting(
     let mut hits = Vec::new();
     let mut conversations_with_hits = std::collections::HashSet::new();
     let mut failed_reads = Vec::new();
+    let mut left_cache = Vec::new();
+    let mut copies_read = HashMap::new();
     let mut retrieval_time = std::time::Duration::ZERO;
     let mut failed = 0;
     let mut places_taken = 0;
     let searched = scan_in_order(
         &page,
         sessions_still_wanted(request, 0, 0),
-        |session| session.map_or(Some(0), |(_, _, resolved)| resolved.key.transcript_bytes),
-        |session| session.map(|(index, _, resolved)| load_transcript(index, &resolved.key)),
+        |session| {
+            session.map_or(Some(0), |(index, _, resolved)| {
+                read_bytes(index, &resolved.key)
+            })
+        },
+        |session| session.map(|(index, _, resolved)| read_session(index, &resolved.key)),
         |session, read| {
             let (Some((_, conversation, resolved)), Some(read)) = (*session, read) else {
                 return SessionSearch::Unsearchable;
             };
             let searched = match read {
-                Ok(searched) => searched,
+                Ok(Some(searched)) => searched,
+                Ok(None) => return SessionSearch::LeftCache { resolved },
                 Err(error) => return SessionSearch::Failed { resolved, error },
             };
             let (hits, retrieval_time) = time_retrieval(reads, || {
@@ -725,7 +769,7 @@ pub fn run_global_lexical_search_reporting(
                     hits_per_session,
                     conversation,
                     resolved,
-                    searched.messages(),
+                    searched.target(),
                     retrieval_mode,
                     request.window,
                 )
@@ -734,6 +778,7 @@ pub fn run_global_lexical_search_reporting(
                 resolved,
                 hits,
                 retrieval_time,
+                copy_generation: searched.copy_generation,
             }
         },
         |session| {
@@ -746,12 +791,20 @@ pub fn run_global_lexical_search_reporting(
                     failed += 1;
                     failed_reads.push((resolved.key.clone(), error));
                 }
+                SessionSearch::LeftCache { resolved } => {
+                    failed += 1;
+                    left_cache.push(resolved.key.clone());
+                }
                 SessionSearch::Searched {
                     resolved,
                     hits: session_hits,
                     retrieval_time: session_retrieval_time,
+                    copy_generation,
                 } => {
                     retrieval_time += session_retrieval_time;
+                    if let Some(generation) = copy_generation {
+                        copies_read.insert(resolved.reference.canonical(), generation);
+                    }
                     if !session_hits.is_empty() {
                         conversations_with_hits.insert(resolved.reference.canonical());
                     }
@@ -792,6 +845,8 @@ pub fn run_global_lexical_search_reporting(
             }),
         },
         failed_reads,
+        left_cache,
+        copies_read,
     })
 }
 
@@ -828,10 +883,15 @@ enum SessionSearch<'a> {
         resolved: &'a ResolvedConversation,
         error: AppError,
     },
+    /// The session left the session cache before its transcript was read.
+    /// Counted as failed.
+    LeftCache { resolved: &'a ResolvedConversation },
     Searched {
         resolved: &'a ResolvedConversation,
         hits: Vec<AgentOutputHit>,
         retrieval_time: std::time::Duration,
+        /// As [`SearchedTranscript::copy_generation`].
+        copy_generation: Option<i64>,
     },
 }
 
@@ -841,7 +901,7 @@ impl SessionSearch<'_> {
     fn takes_a_place(&self, window: TimeFilter) -> bool {
         match self {
             Self::Searched { hits, .. } => !window.is_active() || !hits.is_empty(),
-            Self::Unsearchable | Self::Failed { .. } => true,
+            Self::Unsearchable | Self::Failed { .. } | Self::LeftCache { .. } => true,
         }
     }
 }
@@ -982,7 +1042,7 @@ fn retrieval_hits(
     limit: usize,
     conversation: &Conversation,
     resolved: &ResolvedConversation,
-    messages: SessionMessages<'_>,
+    messages: AgentTranscriptSearchTarget<'_>,
     mode: SearchMode,
     window: TimeFilter,
 ) -> Vec<AgentOutputHit> {
@@ -994,10 +1054,9 @@ fn retrieval_hits(
     let transcript = messages.transcript;
     retrieve_agent_hits_for_target(
         AgentTranscriptSearchTarget {
-            transcript,
-            message_count: messages.message_count,
             conversation_ref: Some(&resolved.reference.canonical()),
             timestamp: Some(conversation.timestamp),
+            ..messages
         },
         &search_query,
         AgentRetrievalOptions {
@@ -1839,6 +1898,59 @@ mod tests {
             times: None,
             read_range,
         }
+    }
+
+    /// A hybrid search reads its semantic hits' focus messages alone: a
+    /// lexical or fused hit keeps the anchors its retrieval found.
+    #[test]
+    fn semantic_hit_metadata_leaves_lexical_and_fused_hits_anchors() {
+        let resolved = resolved("a.jsonl");
+        let reference = resolved.reference.canonical();
+        let retrieval_anchors = vec!["ma_0000000000000001".to_owned()];
+        let hit = |source, focus| AgentOutputHit {
+            source,
+            anchors: retrieval_anchors.clone(),
+            ..lexical_dialogue_hit(&reference, "a", 1.0, "text", focus, focus)
+        };
+        let mut output = AgentSearchOutput {
+            protocol: AgentProtocolKind::Search,
+            target: None,
+            query: "cache".to_owned(),
+            mode: SearchMode::Hybrid,
+            hits: vec![
+                hit(AgentHitKind::Lexical, MessageRange::single(1)),
+                hit(AgentHitKind::Hybrid, MessageRange::single(2)),
+                hit(AgentHitKind::Semantic, MessageRange::single(3)),
+            ],
+            groups: Vec::new(),
+            flat: true,
+            budget: None,
+            coverage: None,
+        };
+        let semantic_focus = transcript(vec![message(3, AgentMessageRole::User, "cache")]);
+
+        attach_semantic_hit_metadata(&mut output, &resolved, &semantic_focus);
+
+        let anchors = output
+            .hits
+            .iter()
+            .map(|hit| (hit.source, hit.anchors.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            anchors[..2],
+            [
+                (AgentHitKind::Lexical, retrieval_anchors.clone()),
+                (AgentHitKind::Hybrid, retrieval_anchors.clone()),
+            ]
+        );
+        assert_eq!(
+            anchors[2],
+            (
+                AgentHitKind::Semantic,
+                FocusMetadata::of(&semantic_focus, &resolved, MessageRange::single(3)).anchors
+            )
+        );
+        assert_ne!(anchors[2].1, retrieval_anchors);
     }
 
     #[test]
@@ -3446,11 +3558,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_read_is_reported_and_counts_as_failed_and_searched() {
+    fn failed_read_and_session_left_cache_are_reported_apart_and_count_as_failed() {
         let (conversations, keys) = numbered_sessions(60);
         let ranked = (0..60).collect::<Vec<_>>();
         let request = global_request("needle", SearchMode::Lexical, 3, false);
         let unreadable = conversations[1].path.clone();
+        let left_cache = conversations[2].path.clone();
 
         let run = run_global_lexical_search_reporting(
             &request,
@@ -3460,10 +3573,13 @@ mod tests {
             |_, key| {
                 if key.path == unreadable {
                     Err(AppError::Io(std::io::Error::other("unreadable")))
+                } else if key.path == left_cache {
+                    Ok(None)
                 } else {
-                    Ok(needle_transcript().into())
+                    Ok(Some(needle_transcript().into()))
                 }
             },
+            |_, key| key.transcript_bytes,
             None,
         )
         .unwrap();
@@ -3477,17 +3593,24 @@ mod tests {
             [&unreadable]
         );
         assert_eq!(
+            run.left_cache
+                .iter()
+                .map(|key| &key.path)
+                .collect::<Vec<_>>(),
+            [&left_cache]
+        );
+        assert_eq!(
             output.coverage,
             Some(SessionCoverage {
                 matched: 60,
                 offset: 0,
-                searched: 4,
-                failed: 1,
+                searched: 5,
+                failed: 2,
             })
         );
         assert!(
             format_agent_output(&output)
-                .contains("continue search offset=4 mode=lexical action=rerun-with-offset\n")
+                .contains("continue search offset=5 mode=lexical action=rerun-with-offset\n")
         );
     }
 
