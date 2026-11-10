@@ -24,7 +24,6 @@ use ratatui::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -34,14 +33,17 @@ mod exact_literal;
 mod input_controller;
 mod list_state;
 mod refresh_state;
+mod search_generation;
 mod search_state;
+mod search_worker;
 mod session_store;
 mod types;
 mod view_state;
 #[allow(unused_imports)]
-use search_state::{
-    SearchCommand, SearchResponse, SearchWorker, SemanticSearchState, SessionIdQuery, TextsHeld,
-    spawn_search_worker,
+use search_state::{SemanticSearchState, SessionIdQuery};
+#[allow(unused_imports)]
+use search_worker::{
+    SearchCommand, SearchCommands, SearchResponse, SearchWorker, TextsHeld, spawn_search_worker,
 };
 #[allow(unused_imports)]
 pub use types::{
@@ -111,7 +113,7 @@ pub struct App {
     /// Projects hidden from the list and its search results
     excluded_projects: ExcludedProjects,
     /// Channel to send commands to the background search worker
-    search_tx: mpsc::Sender<SearchCommand>,
+    search_tx: SearchCommands,
     /// Channel to receive results from the background search worker
     search_rx: mpsc::Receiver<SearchResponse>,
     /// The search worker's count of sessions without texts held, whenever it
@@ -122,11 +124,7 @@ pub struct App {
     texts_held: TextsHeld,
     /// The `UpdateData` commands sent to the search worker
     search_data_sent: u64,
-    /// Monotonic generation counter for search requests
-    search_generation: u64,
-    /// `search_generation`, shared with the search worker, which runs a
-    /// search again over texts read only while the app awaits its generation
-    awaited_search: Arc<AtomicU64>,
+    search_generation: search_generation::SearchGeneration,
     /// When the search in flight on the worker thread was dispatched; `None`
     /// once its results are on screen
     search_started_at: Option<Moment>,
@@ -303,8 +301,7 @@ impl App {
                 sessions_without_texts: SessionsWithoutTexts::default(),
             },
             search_data_sent: 0,
-            search_generation: 0,
-            awaited_search: parts.search_worker.awaited_search,
+            search_generation: parts.search_worker.generation,
             search_started_at: None,
             dispatched_query: None,
             shown_results_query: None,
@@ -947,7 +944,8 @@ impl App {
 
     /// Show the open session again once its refresh finished: once the read
     /// of its copy lands within `wait`, or the file opened directly as
-    /// parsed. True when it showed, so the caller draws the result next.
+    /// parsed. A newer refresh's row queued behind the read starts its own
+    /// read then. True when it showed, so the caller draws the result next.
     pub fn complete_pending_view_refresh(
         &mut self,
         viewport_height: usize,
@@ -957,7 +955,10 @@ impl App {
             return false;
         };
         match reload.finish(wait) {
-            Ok((reloaded, read)) => {
+            Ok(((reloaded, read), queued)) => {
+                self.pending_view_reload = queued.map(|queued| {
+                    view_state::PendingReload::start(queued, self.interactive_cache())
+                });
                 self.reload_open_session(viewport_height, reloaded, read);
                 true
             }

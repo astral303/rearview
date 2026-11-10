@@ -1,14 +1,16 @@
 //! A session's entry rows as a write stores them, built in memory before
 //! any is written: its transcripts, threads, messages and entries, each
-//! entry with its search texts and digest. A first write inserts them all;
+//! entry with its search texts and the digest of its columns; a write
+//! builds an entry's parts as it writes the entry. A first write inserts them all;
 //! a later write compares them with the stored rows and writes the
 //! differences.
 
+use super::EntryColumns;
 use super::digest::Digest;
 use super::messages::{MessageRow, Messages};
+use super::parts::EntryParts;
 use super::search::{self, EntrySearch};
 use super::threads::{Numbering, ThreadRow};
-use super::{EntryColumns, parts};
 use crate::agent::message_numbering::NumberingCheckpoint;
 use crate::history::TranscriptEntries;
 use crate::history::format::RecordLine;
@@ -43,7 +45,8 @@ pub(super) struct EntryRow<'a> {
     /// The index in [`SessionRows::transcripts`] of the sub-agent
     /// transcript a spliced turn came from.
     pub(super) child: Option<usize>,
-    pub(super) digest: i64,
+    /// The hash of the columns the row stores besides its place and parts.
+    pub(super) columns_digest: i64,
 }
 
 impl EntryRow<'_> {
@@ -56,9 +59,18 @@ impl EntryRow<'_> {
             .flatten()
     }
 
-    /// A hash of the columns the row stores besides its place, with its
-    /// parts, result items and search texts.
-    fn digest(&self) -> i64 {
+    /// The row's part rows and its digest, built once for each write of the
+    /// row: a write keeps them only while it writes the entry.
+    pub(super) fn parts(&self) -> EntryParts<'_> {
+        EntryParts::of(
+            self.columns.parts.blocks(),
+            &self.search,
+            self.columns_digest,
+        )
+    }
+
+    /// A hash of the columns the row stores besides its place and parts.
+    fn columns_digest(&self) -> i64 {
         let columns = &self.columns;
         let mut digest = Digest::default();
         digest.number(Some(self.record.line as i64));
@@ -78,13 +90,6 @@ impl EntryRow<'_> {
         digest.number(columns.duration_ms.map(|duration| duration as i64));
         digest.flag(columns.flag);
         digest.usage(self.metadata_usage());
-        parts::digest(&mut digest, columns.parts.blocks(), &self.search.blocks);
-        digest.number(Some(self.search.derived.len() as i64));
-        for derived in &self.search.derived {
-            digest.number(Some(derived.place.field.code()));
-            digest.number(Some(derived.place.position));
-            digest.text(Some(&derived.text));
-        }
         digest.finish()
     }
 }
@@ -144,9 +149,9 @@ impl<'a> SessionRows<'a> {
                 transcript: placement.transcript,
                 splice_key,
                 child,
-                digest: 0,
+                columns_digest: 0,
             };
-            row.digest = row.digest();
+            row.columns_digest = row.columns_digest();
             rows.push(row);
         }
         Self {

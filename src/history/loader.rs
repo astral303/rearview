@@ -637,10 +637,11 @@ pub fn delete_empty_sessions(
     );
     let candidates = find_empty_sessions(environment, scope, &operation)?;
     let summary = if delete {
-        let permit = operation.wait_for_ownership_and_parse_permit()?;
-        delete_each(candidates, |session| {
-            super::provider::delete_session(permit, session.source, &session.path)
-        })?
+        operation.wait_to_parse_as_owner(|permit| {
+            delete_each(candidates, |session| {
+                super::provider::delete_session(permit, session.source, &session.path)
+            })
+        })??
     } else {
         DeleteEmptySummary {
             candidates,
@@ -851,13 +852,10 @@ mod tests {
             crate::error_report(error),
             "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
         );
-        for file in [
-            "history.sqlite3",
-            "history.sqlite3-wal",
-            "history.sqlite3-shm",
-        ] {
-            assert!(!cache.path().join(file).exists(), "{file} is deleted");
-        }
+        assert!(
+            super::super::sqlite_cache::is_emptied(cache.path()),
+            "the cache database's contents are deleted"
+        );
     }
 
     /// The TUI's launch over `environment`: its last message.

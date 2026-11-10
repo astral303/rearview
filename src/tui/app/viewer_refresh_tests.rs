@@ -202,6 +202,51 @@ fn reload_keeps_old_copy_under_updating_until_its_read_lands() {
 }
 
 #[test]
+fn refresh_finishing_during_gated_read_queues_one_read_after_it() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..30));
+    let mut app = viewer_on(&home);
+    let gate = ConnectionGate::closed(app.environment.cache_base().path(), |thread| {
+        thread.name() == Some("viewer-read")
+    });
+
+    write_messages(&path, &numbered(0..31));
+    request_refresh(&mut app);
+    write_messages(&path, &numbered(0..32));
+    request_refresh(&mut app);
+    let waits_for_the_first_read = !app.complete_pending_view_refresh(VIEWPORT, Duration::ZERO);
+    gate.open();
+    let first_landed = app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+    let reads_again = app.is_reading_open_session();
+    let status_between = app.open_session_status();
+    let second_landed = app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+
+    assert!(
+        waits_for_the_first_read,
+        "the second refresh doesn't replace the read running"
+    );
+    assert!(first_landed, "the first read lands and shows");
+    assert!(
+        reads_again,
+        "the newer refresh's read starts once the first lands"
+    );
+    assert_eq!(
+        status_between,
+        Some(OpenSessionStatus::Updating),
+        "the viewer shows the session as updating until the newer read lands"
+    );
+    assert!(
+        second_landed && view_text(&app).contains("message 31"),
+        "the newer refresh's read shows the newest messages"
+    );
+    assert!(
+        !app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS),
+        "no further read follows"
+    );
+}
+
+#[test]
 fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
     let home = ClaudeHome::new();
     let first = home.transcript("first");

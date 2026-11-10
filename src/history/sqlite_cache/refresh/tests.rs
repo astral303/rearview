@@ -565,6 +565,82 @@ fn committed_batch_restarts_takeover_window() {
     assert!(finds_a_recent_owner(&base, &mut None));
 }
 
+/// An operation's parse runs as one write batch of its ownership: another
+/// rearview finds the writer lock held and takes nothing over, though the
+/// last commit stands past the takeover window, until the parse ends.
+#[test]
+fn owners_parse_blocks_takeover_until_it_ends() {
+    use crate::history::sqlite_cache::{OperationScope, Patience};
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let operation = OperationScope::new(&base, Patience::UntilAcquired, Arc::default());
+    operation.wait_to_parse_as_owner(|_| ()).unwrap();
+    let connection = connect(base.path(), POLL_EVERY).unwrap();
+    let stale = || {
+        connection
+            .execute("UPDATE refresh_state SET last_commit_ms = 0", [])
+            .unwrap()
+    };
+    stale();
+    let another_rearview = rearview(directory.path());
+
+    let during_parse = operation
+        .wait_to_parse_as_owner(|_| RefreshOwnership::try_acquire_now(&another_rearview).unwrap())
+        .unwrap();
+
+    assert!(
+        matches!(
+            during_parse,
+            Acquisition::HeldBy(RefreshOwner::AnotherProcess)
+        ),
+        "another rearview doesn't take over during the parse"
+    );
+    stale();
+    assert!(
+        matches!(
+            RefreshOwnership::try_acquire_now(&another_rearview).unwrap(),
+            Acquisition::Acquired(_)
+        ),
+        "once the parse ends, another rearview takes the stale ownership over"
+    );
+}
+
+/// A parse batch that can't start fails with its own cause, not as lost
+/// ownership.
+#[test]
+fn owners_parse_whose_batch_cant_start_fails_with_its_cause() {
+    use crate::history::sqlite_cache::{OperationScope, Patience};
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let operation = OperationScope::new(&base, Patience::UntilAcquired, Arc::default());
+    operation.wait_to_parse_as_owner(|_| ()).unwrap();
+    connect(base.path(), POLL_EVERY)
+        .unwrap()
+        .execute_batch("ALTER TABLE refresh_state RENAME TO moved_refresh_state")
+        .unwrap();
+
+    let parsed = operation.wait_to_parse_as_owner(|_| ());
+
+    let error = parsed.expect_err("the parse fails").to_string();
+    assert!(
+        error.contains("refresh_state"),
+        "the failure names its cause: {error}"
+    );
+}
+
+/// A parse that takes its owner's turn again would wait forever behind its
+/// own batch; debug builds panic.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "took the owner's turn")]
+fn owners_parse_taking_its_owners_turn_panics() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+
+    let _ = owner.token.parse_batch(|_| owner.token.check_space());
+}
+
 #[test]
 fn long_batch_blocks_takeover_and_timestamps_its_end() {
     let directory = tempfile::tempdir().unwrap();
@@ -863,6 +939,182 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
             .write_batch(|| panic!("the revoked owner doesn't publish"))
             .is_err()
     );
+}
+
+/// The files a deletion removes beside the database.
+fn side_files(base: &Path) -> Vec<PathBuf> {
+    super::super::DATABASE_SIDE_FILE_SUFFIXES
+        .iter()
+        .map(|suffix| base.join(format!("{}{suffix}", super::super::DATABASE_FILE_NAME)))
+        .collect()
+}
+
+/// The names of the tables the database in `base` holds.
+fn table_names(base: &Path) -> Vec<String> {
+    connect(base, POLL_EVERY)
+        .unwrap()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The commit time the database in `base` stores for its owner.
+fn last_commit_ms(base: &Path) -> i64 {
+    connect(base, POLL_EVERY)
+        .unwrap()
+        .query_row(
+            "SELECT last_commit_ms FROM refresh_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Polls until `base`'s stored commit time is `expected`, failing after ten
+/// seconds.
+fn wait_for_commit_at(base: &Path, expected: i64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while last_commit_ms(base) != expected {
+        assert!(
+            Instant::now() < deadline,
+            "the owner commits at {expected} while the deletion waits"
+        );
+        thread::sleep(POLL_EVERY);
+    }
+}
+
+/// Ownership of a cache in `base` holding this release's tables.
+fn owner_of_written_cache(base: &CacheBase) -> RefreshOwnership {
+    let owner = RefreshOwnership::acquire_for_test(base).unwrap();
+    SqliteCache::open_for_refresh(owner.token()).unwrap();
+    owner
+}
+
+#[test]
+fn low_space_deletion_keeps_database_another_reader_holds_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let mut owner = owner_of_written_cache(&base);
+    let reader = connect(base.path(), POLL_EVERY).unwrap();
+    let read = |reader: &Connection| {
+        reader.query_row("SELECT COUNT(*) FROM meta", [], |row| row.get::<_, i64>(0))
+    };
+    read(&reader).unwrap();
+
+    let deletion = owner.delete_database(ExclusiveWait::of(POLL_EVERY));
+
+    assert_eq!(
+        deletion,
+        CacheDeletion::Deferred,
+        "the deletion waits out its wait for the reader, then defers"
+    );
+    assert!(read(&reader).is_ok(), "the reader still reads the database");
+    drop(owner);
+    assert_eq!(
+        observe(&base).unwrap(),
+        Observation::Idle,
+        "the ownership of the kept database is released"
+    );
+}
+
+#[test]
+fn low_space_deletion_keeps_ownership_past_takeover_window_and_empties_database_once_reader_closes()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let base = rearview_on(directory.path(), Arc::clone(&clock));
+    let mut owner = owner_of_written_cache(&base);
+    let identity = owner.token().identity.clone();
+    let reader = connect(base.path(), POLL_EVERY).unwrap();
+    reader
+        .query_row("SELECT COUNT(*) FROM meta", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    let competing = rearview_on(directory.path(), Arc::clone(&clock));
+    let mut observed = None;
+
+    thread::scope(|scope| {
+        let deletion = scope.spawn(move || {
+            let deletion = owner.delete_database(ExclusiveWait {
+                total: Duration::from_secs(30),
+                attempt: POLL_EVERY,
+            });
+            drop(owner);
+            deletion
+        });
+        assert!(
+            !matches!(
+                try_acquire(&competing, STALE_AFTER, &mut observed).unwrap(),
+                Attempt::Acquired(_)
+            ),
+            "a competing owner doesn't acquire the fresh ownership"
+        );
+        clock.advance(STALE_AFTER);
+        wait_for_commit_at(base.path(), now_ms(clock.as_ref()));
+        assert!(
+            !matches!(
+                try_acquire(&competing, STALE_AFTER, &mut observed).unwrap(),
+                Attempt::Acquired(_)
+            ),
+            "the deletion's commits keep a competing owner out past the takeover window"
+        );
+        drop(reader);
+        assert_eq!(
+            deletion.join().unwrap(),
+            CacheDeletion::Deleted,
+            "the deletion completes once the reader closes"
+        );
+    });
+
+    assert_eq!(
+        table_names(base.path()),
+        ["refresh_state"],
+        "the database keeps the refresh's state alone"
+    );
+    for file in side_files(base.path()) {
+        assert!(!file.exists(), "{} is removed", file.display());
+    }
+    assert!(
+        !base.process().holds(&identity),
+        "the ownership ends with its database"
+    );
+    assert!(
+        matches!(
+            RefreshOwnership::try_acquire_now(&competing).unwrap(),
+            Acquisition::Acquired(_)
+        ),
+        "the competing owner acquires the emptied cache at once"
+    );
+}
+
+#[test]
+fn low_space_deletion_that_fails_reports_the_database_as_spelled_and_the_cause() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let mut owner = owner_of_written_cache(&base);
+    // A directory where the emptying writes its rollback journal: on every
+    // platform, SQLite can't create the journal file there.
+    std::fs::create_dir(&side_files(base.path())[2]).unwrap();
+
+    let deletion = owner.delete_database(ExclusiveWait::of(POLL_EVERY));
+
+    let CacheDeletion::Failed { file, error } = &deletion else {
+        panic!("the deletion fails: {deletion:?}");
+    };
+    assert_eq!(
+        Path::new(file),
+        without_verbatim_prefix(&super::super::database_path(
+            &base.canonical_path().unwrap()
+        )),
+        "the failure names the database"
+    );
+    assert!(
+        !file.starts_with(r"\\?\"),
+        "the database is spelled without the verbatim prefix: {file}"
+    );
+    assert!(!error.is_empty(), "the failure carries its cause");
 }
 
 #[test]

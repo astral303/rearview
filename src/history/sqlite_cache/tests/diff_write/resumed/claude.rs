@@ -650,6 +650,101 @@ fn subagent_reply_spanning_session_reply_stays_whole_after_checkpoint() {
     );
 }
 
+/// `count` prompts, each answered by its own reply, from 10:00 on.
+fn answered_prompts(count: usize) -> Vec<String> {
+    (0..count)
+        .flat_map(|index| {
+            let (minute, second) = (index / 30, (index % 30) * 2);
+            [
+                prompt(&format!("10:{minute:02}:{second:02}"), "Next step?"),
+                reply(
+                    &format!("10:{minute:02}:{:02}", second + 1),
+                    &format!("msg_h{index}"),
+                    "Done.",
+                ),
+            ]
+        })
+        .collect()
+}
+
+/// The bytes of the session checkpoint stored after `history` answered
+/// prompts and one more appended.
+fn checkpoint_bytes_after_append(history: usize) -> usize {
+    let mut session = ClaudeSession::stored(&answered_prompts(history), &[]);
+    write_lines(&session.own.clone(), &answered_prompts(history + 1));
+    assert_eq!(session.update().outcome, Ok(()), "the session resumes");
+    session
+        .cache
+        .connection
+        .query_row(
+            "SELECT length(checkpoint) FROM session_checkpoints",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+}
+
+#[test]
+fn session_checkpoint_size_stays_flat_as_replies_grow() {
+    let short = checkpoint_bytes_after_append(10);
+    let long = checkpoint_bytes_after_append(400);
+
+    assert!(
+        long < short + 32,
+        "the checkpoint holds no state per earlier reply: {short} bytes after 10 replies, \
+         {long} after 400"
+    );
+}
+
+/// Claude Code continues a reply after a `Read` of an image: the call, its
+/// result, a user record describing the image, then the reply's next call
+/// under the same message id. 97 of the 929 Claude transcripts of one real
+/// corpus hold such a reply. A sub-agent reply whose next call is appended
+/// after that record was stored reads the sub-agent whole: the sub-agent's
+/// stored share holds one token total for the replies before its stable
+/// cursor, and the reply's last usage counts once.
+#[test]
+fn subagent_reply_continued_after_an_image_record_reads_subagent_whole() {
+    let checked = [
+        prompt("10:03:00", "Check the screenshot too"),
+        call(
+            "10:03:01",
+            "msg_s3",
+            "toolu_read",
+            "Read",
+            json!({"file_path": "/tmp/project/screen.png"}),
+        ),
+        result("10:03:02", "toolu_read", "Read the image"),
+        prompt(
+            "10:03:02",
+            "[Image: original 3200x1008, displayed at 2000x630. Multiply coordinates by 1.60 to map to original image.]",
+        ),
+    ];
+    let mut session = ClaudeSession::stored(&opening_past_subagent(), &[(SCOUT, scout(&checked))]);
+    write_lines(
+        &session.subagent(SCOUT),
+        &scout(&with(
+            &checked,
+            &[call(
+                "10:03:03",
+                "msg_s3",
+                "toolu_tests",
+                "Bash",
+                json!({"command": "cargo test"}),
+            )],
+        )),
+    );
+
+    let update = session.update();
+
+    assert_eq!(update.outcome, Ok(()), "the session resumes");
+    assert_eq!(
+        update.bytes_read,
+        std::fs::metadata(session.subagent(SCOUT)).unwrap().len(),
+        "the sub-agent transcript is read whole"
+    );
+}
+
 #[test]
 fn subagent_continued_after_checkpoint_resumes_its_turns_before_it_in_place() {
     let mut session = ClaudeSession::stored(&opening_past_subagent(), &[(SCOUT, scout(&[]))]);

@@ -34,6 +34,19 @@ pub(crate) fn with_platform_separators(path: impl Into<OsString>) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// A Windows path without the `\\?\` prefix `canonicalize` adds, as the
+/// user and OMP spell it.
+pub(crate) fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{share}"))
+    } else if let Some(local) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(local)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Windows and macOS file systems ignore case by default; Linux's do not.
 const FILE_NAMES_IGNORE_CASE: bool = cfg!(any(windows, target_os = "macos"));
 

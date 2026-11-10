@@ -5,7 +5,7 @@ use super::base::CacheBase;
 use super::coordinator::{Coordinator, WaitStatus};
 use super::observer::OtherRearview;
 use super::refresh::{RefreshOwnership, RefreshToken};
-use crate::error::{AppError, Result};
+use crate::error::{AppError, CacheDeletion, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -72,10 +72,18 @@ impl<'s> LiveOwner<'s> {
         self.scope.is_live(&self.token)
     }
 
-    /// The permit for the transcripts one writer-locked batch parses;
-    /// `None` once the ownership is no longer live.
-    pub(crate) fn parse_permit(&self) -> Option<super::ParsePermit<'s>> {
-        self.is_live().then(super::permit::ParsePermit::owner)
+    /// `parse`'s result, run with the permit to parse as one write batch
+    /// (see [`RefreshToken::parse_batch`]), with the batch's result: `None`
+    /// when the batch could not start, so `parse` never ran. `None` alone
+    /// once the ownership is no longer live.
+    pub(crate) fn parse_batch<T>(
+        &self,
+        parse: impl for<'p> FnOnce(super::ParsePermit<'p>) -> T,
+    ) -> Option<(Option<T>, Result<()>)> {
+        if !self.is_live() {
+            return None;
+        }
+        Some(self.token.parse_batch(parse))
     }
 }
 
@@ -96,32 +104,75 @@ enum Held {
     Nothing,
     Ownership(RefreshOwnership),
     AsIs,
-    /// A write found this many bytes free on the cache's drive, below the
-    /// floor, and the cache database was deleted.
-    OutOfSpace(u64),
+    /// A write found `free_bytes` free on the cache's drive, below the
+    /// floor. The operation keeps `ownership` until it ends, then deletes
+    /// the cache database as `deletion` reports.
+    OutOfSpace {
+        free_bytes: u64,
+        ownership: Option<RefreshOwnership>,
+        deletion: CacheDeletion,
+    },
 }
 
 impl Held {
     /// When a write of the held ownership found the drive short of space:
-    /// release the ownership and delete the cache database under `base`.
-    fn abort_when_out_of_space(&mut self, base: &CacheBase) {
+    /// keep the ownership for the deletion at the operation's end.
+    fn stop_when_out_of_space(&mut self) {
         let Self::Ownership(ownership) = self else {
             return;
         };
         let Some(free_bytes) = ownership.token().out_of_space() else {
             return;
         };
-        *self = Self::OutOfSpace(free_bytes);
-        super::delete_database(base.path());
+        let Self::Ownership(ownership) = std::mem::replace(self, Self::Nothing) else {
+            unreachable!("the held ownership was just matched");
+        };
+        *self = Self::OutOfSpace {
+            free_bytes,
+            ownership: Some(ownership),
+            deletion: CacheDeletion::Pending,
+        };
+    }
+
+    /// Delete the cache database once a write found its drive short of
+    /// space, while the ownership keeps every other rearview out, waiting
+    /// at most `wait` for other connections to close; then end the
+    /// ownership.
+    fn delete_when_out_of_space(&mut self, wait: super::refresh::ExclusiveWait) {
+        self.stop_when_out_of_space();
+        if let Self::OutOfSpace {
+            ownership,
+            deletion,
+            ..
+        } = self
+            && let Some(mut ownership) = ownership.take()
+        {
+            *deletion = ownership.delete_database(wait);
+        }
+    }
+
+    /// The out-of-space error once a write found the drive short of space.
+    fn out_of_space(&self) -> Option<AppError> {
+        let Self::OutOfSpace {
+            free_bytes,
+            deletion,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(AppError::SessionCacheOutOfSpace {
+            free_bytes: *free_bytes,
+            floor_bytes: super::refresh::FREE_SPACE_FLOOR,
+            deletion: deletion.clone(),
+        })
     }
 }
 
-fn out_of_space(free_bytes: u64) -> AppError {
-    AppError::SessionCacheOutOfSpace {
-        free_bytes,
-        floor_bytes: super::refresh::FREE_SPACE_FLOOR,
-    }
-}
+/// The longest a low-space deletion waits for other connections to the
+/// cache database to close.
+const DELETION_WAIT: super::refresh::ExclusiveWait =
+    super::refresh::ExclusiveWait::of(super::WAITING_BUSY_TIMEOUT);
 
 impl OperationScope {
     /// The operation on the cache under `base`, waiting as `patience` allows
@@ -139,19 +190,19 @@ impl OperationScope {
     /// An operation that reads the cache under `base` as it is and never
     /// acquires ownership.
     pub fn as_is(base: &CacheBase, status: Arc<WaitStatus>) -> Self {
-        Self {
-            held: Mutex::new(Held::AsIs),
-            ..Self::new(base, Patience::UntilAcquired, status)
-        }
+        let mut operation = Self::new(base, Patience::UntilAcquired, status);
+        *operation
+            .held
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = Held::AsIs;
+        operation
     }
 
     /// This operation, stopped by `cancellation`: once it is set, a wait for
     /// ownership fails, and the operation reads the cache as it is.
-    pub fn cancelled_by(self, cancellation: &Cancellation) -> Self {
-        Self {
-            cancellation: cancellation.clone(),
-            ..self
-        }
+    pub fn cancelled_by(mut self, cancellation: &Cancellation) -> Self {
+        self.cancellation = cancellation.clone();
+        self
     }
 
     /// Acquire this operation's access to the cache now. The first call that
@@ -165,12 +216,14 @@ impl OperationScope {
     pub(crate) fn acquire_access(&self) -> Result<OperationAccess<'_>> {
         let coordinator = &self.coordinator;
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        held.abort_when_out_of_space(coordinator.base());
+        held.stop_when_out_of_space();
+        if let Some(error) = held.out_of_space() {
+            return Err(error);
+        }
         match &*held {
             Held::Ownership(ownership) => return Ok(self.access_of(ownership.token())),
             Held::AsIs => return Ok(OperationAccess::AsIs),
-            Held::OutOfSpace(free_bytes) => return Err(out_of_space(*free_bytes)),
-            Held::Nothing => {}
+            Held::Nothing | Held::OutOfSpace { .. } => {}
         }
         let ownership = match self.patience {
             Patience::UntilAcquired => Some(coordinator.acquire(&self.status, &self.cancellation)?),
@@ -222,38 +275,50 @@ impl OperationScope {
     pub(crate) fn stale_cause(&self) -> StaleCause {
         match &*self.held.lock().unwrap_or_else(PoisonError::into_inner) {
             Held::Ownership(ownership) => Self::stale_cause_of(ownership.token()),
-            Held::OutOfSpace(_) => StaleCause::WritesStopped,
+            Held::OutOfSpace { .. } => StaleCause::WritesStopped,
             Held::Nothing | Held::AsIs => StaleCause::AnotherRearview,
         }
     }
 
     /// Acquire refresh ownership as [`Self::acquire_access`] does: the first
-    /// call waits as long as the operation's [`Patience`] allows. Returns the
-    /// permit to parse transcripts with while this operation is the live
-    /// owner, and `None` while it reads the cache as it is. Fails as
-    /// `acquire_access` fails.
-    pub(crate) fn acquire_ownership_and_parse_permit(
+    /// call waits as long as the operation's [`Patience`] allows. While this
+    /// operation is the live owner, returns `parse`'s result, run with the
+    /// permit to parse transcripts as one write batch, so no other rearview
+    /// takes the ownership over while it runs. `None` while the operation
+    /// reads the cache as it is. Fails as `acquire_access` fails, and with
+    /// the batch's own error when it could not start or commit.
+    pub(crate) fn parse_as_owner<T>(
         &self,
-    ) -> Result<Option<super::ParsePermit<'_>>> {
+        parse: impl for<'p> FnOnce(super::ParsePermit<'p>) -> T,
+    ) -> Result<Option<T>> {
         Ok(match self.acquire_access()? {
-            OperationAccess::Owner(_) => Some(super::permit::ParsePermit::owner()),
+            OperationAccess::Owner(owner) => match owner.parse_batch(parse) {
+                Some((parsed, batch)) => {
+                    batch?;
+                    parsed
+                }
+                None => None,
+            },
             OperationAccess::AsIs => None,
         })
     }
 
-    /// Wait until this operation acquires refresh ownership, for as long as
-    /// another rearview keeps the cache, and return the permit to parse
-    /// transcripts with. Panics unless the operation's patience is
-    /// [`Patience::UntilAcquired`]. Fails as [`Self::acquire_access`] fails,
-    /// and with [`AppError::SessionCacheRefreshLost`] once the ownership is no
-    /// longer live.
-    pub(crate) fn wait_for_ownership_and_parse_permit(&self) -> Result<super::ParsePermit<'_>> {
+    /// [`Self::parse_as_owner`], waiting until this operation acquires
+    /// refresh ownership for as long as another rearview keeps the cache.
+    /// Panics unless the operation's patience is [`Patience::UntilAcquired`].
+    /// Fails as [`Self::acquire_access`] fails, and with
+    /// [`AppError::SessionCacheRefreshLost`] once the ownership is no longer
+    /// live or its batch could not start.
+    pub(crate) fn wait_to_parse_as_owner<T>(
+        &self,
+        parse: impl for<'p> FnOnce(super::ParsePermit<'p>) -> T,
+    ) -> Result<T> {
         assert_eq!(
             self.patience,
             Patience::UntilAcquired,
             "only an operation that waits until it acquires ownership is sure to own the cache"
         );
-        self.acquire_ownership_and_parse_permit()?
+        self.parse_as_owner(parse)?
             .ok_or(AppError::SessionCacheRefreshLost)
     }
 
@@ -312,15 +377,27 @@ impl OperationScope {
     /// End the operation, releasing its refresh ownership. Fails when one of
     /// its writes found the cache's drive with less than the floor free: the
     /// cache database is then deleted, and the operation's command reports
-    /// the free space.
+    /// the free space and a deletion that was deferred or failed.
     pub fn finish(self) -> Result<()> {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        held.abort_when_out_of_space(self.coordinator.base());
-        if let Held::OutOfSpace(free_bytes) = *held {
-            return Err(out_of_space(free_bytes));
+        held.delete_when_out_of_space(DELETION_WAIT);
+        if let Some(error) = held.out_of_space() {
+            return Err(error);
         }
         *held = Held::Nothing;
         Ok(())
+    }
+}
+
+impl Drop for OperationScope {
+    /// An operation ended by an error, without [`Self::finish`], deletes
+    /// the cache database too once one of its writes found the drive short
+    /// of space. The error it ended with reports the deletion as pending.
+    fn drop(&mut self) {
+        self.held
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .delete_when_out_of_space(DELETION_WAIT);
     }
 }
 

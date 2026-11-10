@@ -27,8 +27,12 @@ pub(crate) struct RowFold {
     /// the reply appends to it. Holds only replies numbered since the fold
     /// started.
     reply_previews: HashMap<usize, usize>,
-    /// Each reply's last token usage, by its thread and reply id.
+    /// Each reply's last token usage, by its thread and reply id. Holds only
+    /// replies numbered since the fold started.
     keyed_tokens: HashMap<(i64, String), u64>,
+    /// The token total of the replies before the checkpoint the fold
+    /// started from.
+    closed_reply_tokens: u64,
 }
 
 /// The fold's facts a checkpoint stores as they are.
@@ -159,13 +163,16 @@ pub(crate) fn is_clear_only(user_messages: &[String]) -> bool {
 
 /// A fold as a checkpoint stores it: everything but the reply ids it
 /// numbered, so a fold resumed from it continues no reply started before
-/// the checkpoint.
+/// the checkpoint. A resumed read whose new records continue such a reply
+/// reads the transcript whole instead.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct FoldCheckpoint {
     facts: RowFacts,
     numbering: NumberingCheckpoint,
     positions: Vec<(i64, i64)>,
-    keyed_tokens: Vec<(i64, String, u64)>,
+    /// The token total of every reply before the checkpoint, each reply's
+    /// last usage counted once.
+    closed_reply_tokens: u64,
 }
 
 impl FoldCheckpoint {
@@ -252,11 +259,8 @@ impl RowFold {
             positions: checkpoint.positions.iter().copied().collect(),
             message_times: MessageTimesBuilder::default(),
             reply_previews: HashMap::new(),
-            keyed_tokens: checkpoint
-                .keyed_tokens
-                .iter()
-                .map(|(thread, id, tokens)| ((*thread, id.clone()), *tokens))
-                .collect(),
+            keyed_tokens: HashMap::new(),
+            closed_reply_tokens: checkpoint.closed_reply_tokens,
         }
     }
 
@@ -264,18 +268,17 @@ impl RowFold {
     pub(crate) fn checkpoint(&self) -> FoldCheckpoint {
         let mut positions: Vec<(i64, i64)> = self.positions.iter().map(|(&t, &p)| (t, p)).collect();
         positions.sort_unstable();
-        let mut keyed_tokens: Vec<(i64, String, u64)> = self
-            .keyed_tokens
-            .iter()
-            .map(|((thread, id), tokens)| (*thread, id.clone(), *tokens))
-            .collect();
-        keyed_tokens.sort_unstable();
         FoldCheckpoint {
             facts: self.facts.clone(),
             numbering: self.numbering.checkpoint(),
             positions,
-            keyed_tokens,
+            closed_reply_tokens: self.reply_tokens(),
         }
+    }
+
+    /// The token total of the replies folded so far.
+    fn reply_tokens(&self) -> u64 {
+        self.closed_reply_tokens + self.keyed_tokens.values().sum::<u64>()
     }
 
     /// Place a parent entry in `identity`'s thread and number it.
@@ -495,7 +498,7 @@ impl RowFold {
 
     /// The token total so far.
     pub(crate) fn total_tokens(&self) -> u64 {
-        self.keyed_tokens.values().sum::<u64>() + self.facts.anonymous_tokens
+        self.reply_tokens() + self.facts.anonymous_tokens
     }
 
     /// The row's facts, or the reason the session lists no row.

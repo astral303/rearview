@@ -1188,10 +1188,12 @@ impl AgentService {
         if self.transcripts.borrow().contains_key(&key.path) {
             return Ok(());
         }
-        let parsed = match operation.acquire_ownership_and_parse_permit()? {
-            Some(permit) => self
-                .perf
-                .time_transcript_parse(key, || parse_uncached_transcript(permit, key)),
+        let parsed = operation.parse_as_owner(|permit| {
+            self.perf
+                .time_transcript_parse(key, || parse_uncached_transcript(permit, key))
+        })?;
+        let parsed = match parsed {
+            Some(parsed) => parsed,
             None => {
                 if let Some(warning) = warning {
                     keep_failure(warning);
@@ -3871,6 +3873,7 @@ mod tests {
                 Err(AppError::SessionCacheOutOfSpace {
                     free_bytes: 0,
                     floor_bytes: 1,
+                    deletion: crate::error::CacheDeletion::Deleted,
                 })
             },
             |pass| {
@@ -6000,8 +6003,8 @@ mod tests {
             "the write fails with the free space: {stored:?}"
         );
         assert!(
-            !sessions.cache_path().join("history.sqlite3").exists(),
-            "the cache database is deleted"
+            history::sqlite_cache::is_emptied(sessions.cache_path()),
+            "the cache database's contents are deleted"
         );
     }
 
@@ -6028,9 +6031,10 @@ mod tests {
         assert!(
             records.contains(
                 "perf semantic-routes computed=1 stored=0 skipped=write-failed \
-                 cause=Session cache database error: CHECK constraint failed: text = 'refused'"
+                 cause=Session%20cache%20database%20error:%20CHECK%20constraint%20failed:\
+                 %20text%20%3D%20%27refused%27\n"
             ),
-            "the record names the write's cause: {records}"
+            "the record names the write's cause, encoded as one field: {records}"
         );
     }
 
@@ -6669,11 +6673,8 @@ mod tests {
             "protocol agent-error kind=io detail=rearview:%20not%20enough%20disk%20space%20for%20the%20session%20cache%20%280.9%20GB%20free%2C%20needs%20at%20least%201%20GB%29.%20Free%20some%20space%20and%20run%20rearview%20again.\n"
         );
         assert!(
-            !sessions
-                .cache_base
-                .path()
-                .join(history::sqlite_cache::DATABASE_FILE_NAME)
-                .exists()
+            history::sqlite_cache::is_emptied(sessions.cache_base.path()),
+            "the cache database's contents are deleted"
         );
     }
 

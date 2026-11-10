@@ -158,7 +158,10 @@ impl RoutesSkipped {
     fn record(&self) -> String {
         match self {
             Self::AnotherRearview => "skipped=another-rearview".to_owned(),
-            Self::WriteFailed(cause) => format!("skipped=write-failed cause={cause}"),
+            Self::WriteFailed(cause) => format!(
+                "skipped=write-failed cause={}",
+                super::diagnostic::encode_detail(cause)
+            ),
         }
     }
 }

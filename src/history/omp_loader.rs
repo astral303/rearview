@@ -1,4 +1,4 @@
-use super::path::CanonicalDirectories;
+use super::path::{CanonicalDirectories, without_verbatim_prefix};
 use super::pi_loader::{
     AGENT_DIR_VARIABLE, SESSION_DIR_VARIABLE, is_session_directory_override, unset_if_empty,
     whole_path_dir_name, with_separators_as_dashes,
@@ -216,19 +216,6 @@ impl UserDirectories {
             .canonical(path)
             .map(|canonical| without_verbatim_prefix(&canonical))
             .unwrap_or_else(|| path.to_path_buf())
-    }
-}
-
-/// A Windows path without the `\\?\` prefix `canonicalize` adds, as OMP
-/// spells it.
-fn without_verbatim_prefix(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{share}"))
-    } else if let Some(local) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(local)
-    } else {
-        path.to_path_buf()
     }
 }
 

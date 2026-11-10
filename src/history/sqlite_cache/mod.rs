@@ -136,17 +136,37 @@ fn database_path(base: &Path) -> PathBuf {
     base.join(DATABASE_FILE_NAME)
 }
 
-/// Delete the database under `base`, with its write-ahead log and
-/// shared-memory file. A file another program holds open stays: on Windows,
-/// another rearview's connection keeps it, and the next write there finds
-/// the drive short of space in turn.
-fn delete_database(base: &Path) {
+/// The files SQLite keeps beside the database: its write-ahead log,
+/// shared-memory file and rollback journal, named by these suffixes.
+const DATABASE_SIDE_FILE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// True when the database under `base` holds no session table and no
+/// file beside it, as a low-space deletion leaves it.
+#[cfg(test)]
+pub(crate) fn is_emptied(base: &Path) -> bool {
     let database = database_path(base);
-    for suffix in ["", "-wal", "-shm"] {
+    let side_file = DATABASE_SIDE_FILE_SUFFIXES.iter().any(|suffix| {
         let mut path = database.clone().into_os_string();
         path.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(path));
+        PathBuf::from(path).exists()
+    });
+    let sessions_table: bool = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'sessions')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    !side_file && !sessions_table
+}
+
+/// Drop every table this release or an earlier one created.
+fn drop_every_table(connection: &Connection) -> rusqlite::Result<()> {
+    for table in schema::RETIRED_TABLES.iter().chain(schema::TABLES) {
+        connection.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
     }
+    Ok(())
 }
 
 /// True for SQLite's refusal while another connection holds a lock the
@@ -520,29 +540,13 @@ impl CacheWriter {
     /// Take SQLite's exclusive lock for the rebuild, inside `turn`, and
     /// leave WAL mode.
     fn begin_rebuild(&self, turn: &refresh::Turn<'_>) -> Result<()> {
-        // With exclusive locking in WAL mode, BEGIN EXCLUSIVE waits up to the
-        // busy timeout for every other connection to close, and keeps the
-        // lock across commits and VACUUM until this connection closes.
-        self.connection
-            .pragma_update(None, "locking_mode", "EXCLUSIVE")?;
-        let batch = refresh::exclusive_transaction(&self.connection, turn)?;
-        refresh::commit(batch, &self.owner)?;
-        // Delete the write-ahead log on leaving WAL mode: SQLite opens a
-        // `-wal` file beside a database out of WAL mode as its log again.
-        connection::set_persistent_wal(&self.connection, false)?;
-        let mode: String =
-            self.connection
-                .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
-        if !mode.eq_ignore_ascii_case("delete") {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                Some(format!(
-                    "The session cache rebuild could not leave WAL mode: {mode}"
-                )),
-            )
-            .into());
-        }
-        Ok(())
+        refresh::take_exclusive_lock(
+            &self.connection,
+            &self.owner,
+            turn,
+            refresh::ExclusiveWait::of(WAITING_BUSY_TIMEOUT),
+            |batch| refresh::commit(batch, &self.owner),
+        )
     }
 
     /// Empty the database into this release's layout, holding the owner's
@@ -554,9 +558,7 @@ impl CacheWriter {
         // Do not discard the existing cache until exclusion and the journal
         // transition have succeeded. Interrupted rebuilds remain retryable.
         let batch = refresh::transaction_in_turn(&self.connection, &self.owner, &turn)?;
-        for table in schema::RETIRED_TABLES.iter().chain(schema::TABLES) {
-            batch.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
-        }
+        drop_every_table(&batch)?;
         refresh::commit(batch, &self.owner)?;
         self.connection
             .pragma_update(None, "page_size", PAGE_SIZE)?;

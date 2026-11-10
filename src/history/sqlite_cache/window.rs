@@ -63,6 +63,14 @@ pub(crate) struct StoredTurn {
     pub(crate) message: Option<i64>,
 }
 
+/// The stored turns of session `?1`'s sub-agent transcript at root `?2` and
+/// path `?3`, from line `?4` on, through `entries_by_child`.
+pub(super) const STORED_TURNS_FROM_LINE: &str = "SELECT e.record_line, e.sequence, e.splice_key, \
+     m.ordinal IS NOT NULL AND e.contributes, m.reply_id, e.digest, e.id, e.message \
+     FROM entries e LEFT JOIN messages m ON m.id = e.message \
+     WHERE e.child = (SELECT id FROM transcripts WHERE session = ?1 AND root = ?2 AND path = ?3) \
+     AND e.record_line >= ?4 ORDER BY e.sequence";
+
 /// A session's id and generation, with its checkpoint's sequence, encoded
 /// checkpoint and ledger.
 type StoredCheckpointRow = (i64, i64, i64, Vec<u8>, Vec<u8>);
@@ -183,40 +191,77 @@ impl SqliteCache {
     }
 
     /// The stored turns of the sub-agent transcript at `path` in `resume`'s
-    /// session, in sequence order.
-    pub(crate) fn stored_turns(
+    /// session read from `from_line` of it on, in sequence order. The read
+    /// starts at the line, so an append costs the same however long the
+    /// sub-agent's history grew.
+    pub(crate) fn stored_turns_from(
         &self,
         resume: &StoredResume,
         path: &Path,
+        from_line: usize,
     ) -> Result<Vec<StoredTurn>> {
         self.with_read_snapshot(|connection| {
             check_generation(connection, resume)?;
-            let mut statement = connection.prepare_cached(
-                "SELECT e.record_line, e.sequence, e.splice_key, \
-                 m.ordinal IS NOT NULL AND e.contributes, m.reply_id, e.digest, e.id, e.message \
-                 FROM entries e JOIN transcripts t ON t.id = e.child \
-                 LEFT JOIN messages m ON m.id = e.message \
-                 WHERE e.session = ?1 AND t.session = ?1 AND t.root = ?2 AND t.path = ?3 \
-                 ORDER BY e.sequence",
-            )?;
+            let mut statement = connection.prepare_cached(STORED_TURNS_FROM_LINE)?;
             // A transcript outside the session's roots holds no stored turn.
             let Some(place) = resume.places.place(path) else {
                 return Ok(Vec::new());
             };
             Ok(statement
-                .query_map(params![resume.session, place.root, place.path], |row| {
-                    Ok(StoredTurn {
-                        line: row.get::<_, i64>(0)? as usize,
-                        sequence: row.get(1)?,
-                        splice_key: row.get(2)?,
-                        is_message: row.get::<_, Option<bool>>(3)?.unwrap_or(false),
-                        reply_id: row.get(4)?,
-                        digest: row.get(5)?,
-                        id: row.get(6)?,
-                        message: row.get(7)?,
-                    })
-                })?
+                .query_map(
+                    params![resume.session, place.root, place.path, from_line as i64],
+                    |row| {
+                        Ok(StoredTurn {
+                            line: row.get::<_, i64>(0)? as usize,
+                            sequence: row.get(1)?,
+                            splice_key: row.get(2)?,
+                            is_message: row.get::<_, Option<bool>>(3)?.unwrap_or(false),
+                            reply_id: row.get(4)?,
+                            digest: row.get(5)?,
+                            id: row.get(6)?,
+                            message: row.get(7)?,
+                        })
+                    },
+                )?
                 .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// True when a stored turn of the sub-agent transcript at `path` in
+    /// `resume`'s session, read from before `line` of it, belongs to a
+    /// message carrying one of `reply_ids`.
+    pub(crate) fn continues_subagent_reply(
+        &self,
+        resume: &StoredResume,
+        path: &Path,
+        reply_ids: &[&str],
+        line: usize,
+    ) -> Result<bool> {
+        let Some(place) = resume.places.place(path) else {
+            return Ok(false);
+        };
+        self.with_read_snapshot(|connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM messages m JOIN entries e ON e.message = m.id \
+                 WHERE m.session = ?1 AND m.reply_id = ?2 AND e.record_line < ?5 AND e.child = \
+                 (SELECT id FROM transcripts WHERE session = ?1 AND root = ?3 AND path = ?4))",
+            )?;
+            for reply_id in reply_ids {
+                let exists: bool = statement.query_row(
+                    params![
+                        resume.session,
+                        reply_id,
+                        place.root,
+                        place.path,
+                        line as i64
+                    ],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         })
     }
 

@@ -445,6 +445,81 @@ fn turn_appended_to_subagent_is_read_as_its_window() {
     );
 }
 
+/// The stored turns of `/root/scout`, after `history` replies, read from
+/// its last line, and the SQLite program steps the read took.
+fn last_stored_turn_and_steps(history: usize) -> (usize, u64) {
+    let replies = (0..history)
+        .map(|index| {
+            reply(
+                &format!("10:{:02}:{:02}.000", 6 + index / 60, index % 60),
+                &format!("msg_s{index}"),
+                "Reading the notes.",
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut subagents = fixture_subagents();
+    subagents.push((SCOUT, scout_lines(&replies)));
+    let mut session = CodexSession::stored(&own_lines(&scout_spawn()), &subagents);
+    let fixture = session.fixture();
+    let generation = fixture
+        .listed(&session.cache)
+        .cached_session
+        .expect("the listed row holds its copy")
+        .generation();
+    let resume = session
+        .cache
+        .stored_resume(
+            Source::Codex.provider().storage(),
+            &fixture.root,
+            &fixture.stub.cache_key,
+            generation,
+        )
+        .unwrap()
+        .unwrap();
+    let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = std::sync::Arc::clone(&steps);
+    session
+        .cache
+        .connection
+        .progress_handler(
+            1,
+            Some(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+
+    let turns = session
+        .cache
+        .stored_turns_from(&resume, &session.subagent(SCOUT), history + 1)
+        .unwrap();
+
+    session
+        .cache
+        .connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .unwrap();
+    (turns.len(), steps.load(Ordering::Relaxed))
+}
+
+#[test]
+fn subagents_stored_turns_read_from_line_cost_same_however_long_its_history() {
+    let (short_turns, short_steps) = last_stored_turn_and_steps(10);
+    let (long_turns, long_steps) = last_stored_turn_and_steps(400);
+
+    assert_eq!(
+        (short_turns, long_turns),
+        (1, 1),
+        "the read returns the turn at the line alone"
+    );
+    assert!(
+        long_steps < short_steps * 2,
+        "the read's steps stay flat as the history grows: {short_steps} after 10 replies, \
+         {long_steps} after 400"
+    );
+}
+
 #[test]
 fn subagent_spawned_and_reporting_over_later_updates_resumes_each_time() {
     let mut session = CodexSession::stored(&own_lines(&scout_spawn()), &fixture_subagents());
@@ -523,6 +598,88 @@ fn rewritten_or_shrunk_own_transcript_is_read_whole() {
         session.update().outcome,
         Err(WholeRead::OwnRewritten),
         "a shrunk transcript is read whole"
+    );
+}
+
+/// Forty questions and answers, each about `topic`, from 10:03 on: enough
+/// to put the first more than the rewrite check's 4 KiB before the end.
+fn exchanges_about(topic: &str) -> Vec<String> {
+    (0..40)
+        .flat_map(|index| {
+            [
+                user(
+                    &format!("10:03:{index:02}.000"),
+                    &format!("msg_u_{topic}_{index}"),
+                    &format!("Question {index} about the {topic}"),
+                ),
+                reply(
+                    &format!("10:03:{index:02}.500"),
+                    &format!("msg_a_{topic}_{index}"),
+                    &format!("Answer {index} about the {topic}"),
+                ),
+            ]
+        })
+        .collect()
+}
+
+/// Rewrites the first `from` in the file at `path` as `to`, of the same
+/// length, more than 4 KiB before the file's end, and moves the file's
+/// modification time on by a second.
+fn edit_early_in_place(path: &Path, from: &str, to: &str) {
+    assert_eq!(from.len(), to.len(), "the edit keeps the file's size");
+    let text = std::fs::read_to_string(path).unwrap();
+    let at = text.find(from).unwrap();
+    assert!(
+        at + 4096 < text.len(),
+        "the edit stands more than 4 KiB before the end: {at} of {}",
+        text.len()
+    );
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::write(path, text.replacen(from, to, 1)).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified + Duration::from_secs(1))
+        .unwrap();
+}
+
+#[test]
+fn own_transcript_edited_in_place_before_checked_tail_is_read_whole() {
+    let mut session =
+        CodexSession::stored(&own_lines(&exchanges_about("notes")), &fixture_subagents());
+
+    edit_early_in_place(
+        &session.own,
+        "Question 0 about the notes",
+        "Question 0 about the NOTES",
+    );
+
+    assert_eq!(
+        session.update().outcome,
+        Err(WholeRead::OwnRewritten),
+        "a transcript changed without growing is read whole"
+    );
+}
+
+#[test]
+fn subagent_transcript_edited_in_place_before_checked_tail_is_read_whole() {
+    let mut subagents = fixture_subagents();
+    subagents.push((SCOUT, scout_lines(&exchanges_about("steps"))));
+    let mut session = CodexSession::stored(&own_lines(&scout_spawn()), &subagents);
+
+    edit_early_in_place(
+        &session.subagent(SCOUT),
+        "Answer 0 about the steps",
+        "Answer 0 about the STEPS",
+    );
+    let update = session.update();
+
+    assert_eq!(update.outcome, Ok(()), "the session resumes");
+    assert_eq!(
+        update.bytes_read,
+        std::fs::metadata(session.subagent(SCOUT)).unwrap().len(),
+        "the sub-agent transcript changed without growing is read whole"
     );
 }
 

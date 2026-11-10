@@ -28,6 +28,8 @@ use std::borrow::Cow;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
+#[cfg(test)]
+pub(super) use context::CALLS_AND_RESULTS;
 pub(super) use diff::{replace_leading, rewrite_in_place, update, update_tail};
 pub(super) use parts::SearchOnlyKind;
 pub(super) use rows::{RowsStart, SessionRows};

@@ -213,17 +213,19 @@ impl SessionLoader<'_> {
         }
         let mut rest = items;
         while !rest.is_empty() {
-            let Some(permit) = owner.parse_permit() else {
-                return rest;
-            };
             let (group, remaining) = rest.split_at(READ_BATCH_LENGTH.min(rest.len()));
-            let Some((parsed, coordinated)) = owner
-                .token()
-                .batch_returning(|| group.par_iter().map(|item| parse(permit, item)).collect())
-            else {
+            let Some((parsed, coordinated)) = owner.parse_batch(|permit| {
+                group
+                    .par_iter()
+                    .map(|item| parse(permit, item))
+                    .collect::<Vec<_>>()
+            }) else {
                 return rest;
             };
             self.report_read_coordination(coordinated);
+            let Some(parsed) = parsed else {
+                return rest;
+            };
             after_group(group, parsed);
             rest = remaining;
         }

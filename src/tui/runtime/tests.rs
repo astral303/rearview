@@ -243,7 +243,10 @@ fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space(
         error.to_string(),
         "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again."
     );
-    assert!(!cache.path().join(DATABASE_FILE_NAME).exists());
+    assert!(
+        crate::history::sqlite_cache::is_emptied(cache.path()),
+        "the cache database's contents are deleted"
+    );
 }
 
 /// Behind another rearview's rebuild, the launch shows the rebuilding label

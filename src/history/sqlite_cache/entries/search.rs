@@ -25,8 +25,21 @@ pub(super) struct EntrySearch {
 #[derive(Clone, Copy)]
 pub(super) struct TextPlace {
     pub(super) field: SearchField,
+    /// The field's rank in [`ENTRY_SEARCH_FIELDS`] in the high bits, the
+    /// text's index among the field's texts in the low
+    /// [`FIELD_POSITION_BITS`]: a text appended to one field moves no text
+    /// of a later field.
     pub(super) position: i64,
 }
+
+/// The fields of an entry's search texts, in the order the parse lays them
+/// out.
+pub(super) const ENTRY_SEARCH_FIELDS: [SearchField; 3] =
+    [SearchField::Full, SearchField::Agent, SearchField::Thinking];
+
+/// The bits of a [`TextPlace::position`] holding the text's index in its
+/// field.
+const FIELD_POSITION_BITS: u32 = 32;
 
 pub(super) struct DerivedText {
     pub(super) place: TextPlace,
@@ -50,12 +63,15 @@ pub(super) fn entry_search(
         return search;
     }
     let block_texts: Vec<Option<BlockText>> = blocks.iter().map(BlockText::of).collect();
-    let fields = [SearchField::Full, SearchField::Agent, SearchField::Thinking];
-    let texts = fields
-        .into_iter()
+    let texts = (0_i64..)
+        .zip(ENTRY_SEARCH_FIELDS)
         .zip(parts)
-        .flat_map(|(field, texts)| texts.into_iter().map(move |text| (field, text)));
-    for (position, (field, text)) in (0..).zip(texts) {
+        .flat_map(|((rank, field), texts)| {
+            (0_i64..)
+                .zip(texts)
+                .map(move |(index, text)| (field, (rank << FIELD_POSITION_BITS) | index, text))
+        });
+    for (field, position, text) in texts {
         let searched = searched_text(&text, &block_texts);
         if searched.is_empty() {
             continue;

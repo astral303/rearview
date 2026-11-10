@@ -1064,8 +1064,8 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
             fixture.label()
         );
         assert!(
-            writes_of(&writes, "parts", "INSERT") > 0,
-            "{}: the write replaces the changed entry's parts: {writes:?}",
+            writes_of(&writes, "parts", "UPDATE") > 0,
+            "{}: the write updates the changed entry's changed parts: {writes:?}",
             fixture.label()
         );
         assert_eq!(
@@ -1084,6 +1084,235 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
             source.label()
         );
     }
+}
+
+/// Replaces the first text block of the last entry of `record` holding a
+/// text block and another block with a stand-in; returns the entry's index.
+fn with_one_text_stand_in(record: &mut SessionRecord) -> Option<usize> {
+    let entries = &mut entries_of(record).entries;
+    let index = entries.iter_mut().rposition(|(_, entry)| {
+        blocks_of(entry).is_some_and(|blocks| {
+            blocks.len() > 1
+                && blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { .. }))
+        })
+    })?;
+    let blocks = blocks_of(&mut entries[index].1)?;
+    let Some(ContentBlock::Text { text }) = blocks
+        .iter_mut()
+        .find(|block| matches!(block, ContentBlock::Text { .. }))
+    else {
+        unreachable!("the entry holds a text block")
+    };
+    *text = "STAND_IN text".to_owned();
+    Some(index)
+}
+
+/// The id and digest of each part of the entry at `sequence`.
+fn parts_of_entry_at(cache: &CacheWriter, sequence: usize) -> Vec<(i64, i64)> {
+    cache
+        .connection
+        .prepare(
+            "SELECT p.id, p.digest FROM parts p JOIN entries e ON e.id = p.entry \
+             WHERE e.sequence = ?1 ORDER BY p.part",
+        )
+        .unwrap()
+        .query_map([sequence as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn entry_with_one_changed_part_updates_that_part_alone_for_every_agent() {
+    let mut tested = Vec::new();
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let mut before = fixture.record();
+        let Some(changed) = with_one_text_stand_in(&mut before) else {
+            continue;
+        };
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let parts_before = parts_of_entry_at(&cache, changed);
+
+        let record = fixture.record();
+        cache.write(&record).unwrap();
+
+        let writes = take_row_writes(&cache.connection);
+        let parts_after = parts_of_entry_at(&cache, changed);
+        let kept = parts_before
+            .iter()
+            .zip(&parts_after)
+            .filter(|(before, after)| before == after)
+            .count();
+        assert_eq!(
+            (
+                writes_of(&writes, "entries", "UPDATE"),
+                writes_of(&writes, "parts", "UPDATE"),
+                writes_of(&writes, "parts", "INSERT") + writes_of(&writes, "parts", "DELETE"),
+                writes_of(&writes, "result_items", "INSERT")
+                    + writes_of(&writes, "result_items", "DELETE"),
+            ),
+            (1, 1, 0, 0),
+            "{}: the write updates the entry's digest and its changed part alone: {writes:?}",
+            fixture.label()
+        );
+        assert_eq!(
+            (
+                parts_after.len(),
+                kept,
+                parts_before.iter().map(|(id, _)| id).collect::<Vec<_>>()
+            ),
+            (
+                parts_before.len(),
+                parts_before.len() - 1,
+                parts_after.iter().map(|(id, _)| id).collect::<Vec<_>>()
+            ),
+            "{}: every part keeps its id, and every unchanged part its row",
+            fixture.label()
+        );
+        assert_matches_fresh_write(&cache, &fixture, &record);
+        tested.push(fixture.source());
+    }
+    assert!(
+        tested.contains(&Source::OpenCode),
+        "OpenCode has an entry with a text and another block: {tested:?}"
+    );
+}
+
+/// Removes the last block of the last entry of `record` holding a call and
+/// another block; returns the entry's index.
+fn without_last_block_of_entry_with_call(record: &mut SessionRecord) -> Option<usize> {
+    let entries = &mut entries_of(record).entries;
+    let is_call = |block: &ContentBlock| matches!(block, ContentBlock::ToolUse { .. });
+    let index = entries.iter_mut().rposition(|(_, entry)| {
+        blocks_of(entry).is_some_and(|blocks| blocks.len() > 1 && blocks.iter().any(is_call))
+    })?;
+    blocks_of(&mut entries[index].1)?.pop();
+    Some(index)
+}
+
+#[test]
+fn block_appended_to_entry_with_call_inserts_its_parts_alone_for_every_agent() {
+    let mut tested = Vec::new();
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let mut before = fixture.record();
+        let Some(changed) = without_last_block_of_entry_with_call(&mut before) else {
+            continue;
+        };
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let parts_before = parts_of_entry_at(&cache, changed);
+
+        let record = fixture.record();
+        cache.write(&record).unwrap();
+
+        let writes = take_row_writes(&cache.connection);
+        let parts_after = parts_of_entry_at(&cache, changed);
+        let added = parts_after.len() - parts_before.len();
+        assert_eq!(
+            (
+                writes_of(&writes, "entries", "UPDATE"),
+                writes_of(&writes, "parts", "INSERT"),
+                writes_of(&writes, "parts", "UPDATE") + writes_of(&writes, "parts", "DELETE"),
+                writes_of(&writes, "result_items", "DELETE"),
+            ),
+            (1, added as i64, 0, 0),
+            "{}: the write updates the entry's digest and inserts the new block's parts \
+             alone: {writes:?}",
+            fixture.label()
+        );
+        let kept: BTreeSet<_> = parts_after.iter().collect();
+        assert!(
+            added > 0 && parts_before.iter().all(|part| kept.contains(part)),
+            "{}: every earlier part keeps its id and its row: {parts_before:?} then \
+             {parts_after:?}",
+            fixture.label()
+        );
+        assert_matches_fresh_write(&cache, &fixture, &record);
+        tested.push(fixture.source());
+    }
+    for source in [
+        Source::Claude,
+        Source::Codex,
+        Source::Kimi,
+        Source::Pi,
+        Source::Omp,
+    ] {
+        assert!(
+            tested.contains(&source),
+            "{} has an entry holding a call and another block: {tested:?}",
+            source.label()
+        );
+    }
+}
+
+/// Empties the first text block of the last entry of `record` holding two
+/// texts that aren't empty, so search reads one text fewer before the
+/// second; returns the entry's index.
+fn with_first_of_two_texts_emptied(record: &mut SessionRecord) -> Option<usize> {
+    let entries = &mut entries_of(record).entries;
+    let is_text = |block: &ContentBlock| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty());
+    let index = entries.iter_mut().rposition(|(_, entry)| {
+        blocks_of(entry)
+            .is_some_and(|blocks| blocks.iter().filter(|block| is_text(block)).count() > 1)
+    })?;
+    let first = blocks_of(&mut entries[index].1)?
+        .iter_mut()
+        .find(|block| is_text(block))?;
+    *first = ContentBlock::Text {
+        text: String::new(),
+    };
+    Some(index)
+}
+
+#[test]
+fn text_filled_in_before_another_moves_the_later_texts_search_position_alone_for_every_agent() {
+    let mut tested = Vec::new();
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let mut before = fixture.record();
+        let Some(changed) = with_first_of_two_texts_emptied(&mut before) else {
+            continue;
+        };
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let parts_before = parts_of_entry_at(&cache, changed);
+
+        let record = fixture.record();
+        cache.write(&record).unwrap();
+
+        let writes = take_row_writes(&cache.connection);
+        let parts_after = parts_of_entry_at(&cache, changed);
+        let kept = parts_before
+            .iter()
+            .filter(|part| parts_after.contains(part))
+            .count();
+        assert_eq!(
+            (
+                writes_of(&writes, "parts", "INSERT") + writes_of(&writes, "parts", "DELETE"),
+                parts_after.len(),
+                kept,
+            ),
+            (0, parts_before.len(), parts_before.len() - 1),
+            "{}: the filled-in text's part alone changes its row: {writes:?}",
+            fixture.label()
+        );
+        assert!(
+            writes_of(&writes, "parts", "UPDATE") > 1,
+            "{}: the write moves the later text's search position: {writes:?}",
+            fixture.label()
+        );
+        assert_matches_fresh_write(&cache, &fixture, &record);
+        tested.push(fixture.source());
+    }
+    assert!(
+        tested.contains(&Source::OpenCode),
+        "OpenCode has an entry holding two texts: {tested:?}"
+    );
 }
 
 /// Removes the text blocks of the first entry of `record` holding one;

@@ -228,7 +228,7 @@ fn session_rewritten_faster_than_its_reads_holds_newest_texts_read_until_its_own
 
 #[test]
 fn rows_whose_text_reader_is_gone_count_as_unreadable_not_loading() {
-    use super::search_state::{PendingWork, SearchCommand, SearchWorkerState};
+    use super::search_worker::{PendingWork, SearchCommand, SearchWorkerState};
     let home = ClaudeHome::new();
     home.write("a", 5, &["needle"]);
     home.write("b", 10, &["other"]);
@@ -236,15 +236,16 @@ fn rows_whose_text_reader_is_gone_count_as_unreadable_not_loading() {
     let rows = cached_rows(&home, &environment);
     let (copies_to_read, reader) = std::sync::mpsc::channel();
     drop(reader);
-    let mut worker = SearchWorkerState::new(copies_to_read, Arc::default());
+    let (_generation, awaited) = super::search_generation::SearchGeneration::start();
     let (texts_reply, _) = std::sync::mpsc::channel();
+    let mut worker = SearchWorkerState::new(copies_to_read, texts_reply, awaited);
 
     worker.apply(
         SearchCommand::UpdateData {
             searchable: Arc::new(crate::search::precompute_search_text(&rows)),
             conversations: Arc::new(rows.into_iter().map(Arc::new).collect()),
-            texts_reply,
-        },
+        }
+        .into(),
         &mut PendingWork::default(),
     );
 
@@ -256,6 +257,71 @@ fn rows_whose_text_reader_is_gone_count_as_unreadable_not_loading() {
         },
         "the rows the reader can no longer read count as unreadable"
     );
+}
+
+#[test]
+fn search_worker_stops_once_app_drops_its_commands_while_a_read_runs() {
+    use super::search_worker::{SearchCommand, spawn_search_worker};
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["needle"]);
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    let test_thread = std::thread::current().id();
+    let gate =
+        super::test_waits::ConnectionGate::closed(environment.cache_base().path(), move |thread| {
+            thread.id() != test_thread
+        });
+    let worker = spawn_search_worker(Arc::new(TestClock::default()));
+    assert!(worker.commands.send(SearchCommand::UpdateData {
+        searchable: Arc::new(crate::search::precompute_search_text(&rows)),
+        conversations: Arc::new(rows.into_iter().map(Arc::new).collect()),
+    }));
+    let reading = worker.texts_held.recv_timeout(TEXTS_READ_LAND).unwrap();
+
+    drop(worker.commands);
+    let after_drop = worker.results.recv_timeout(TEXTS_READ_LAND);
+    gate.open();
+
+    assert_eq!(
+        reading.sessions_without_texts.loading, 1,
+        "the session's read is held at the gate"
+    );
+    assert_eq!(
+        after_drop.err(),
+        Some(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "the worker stops while the read runs"
+    );
+}
+
+#[test]
+fn panicking_read_replies_with_every_copy_of_its_batch_failed() {
+    use super::search_worker::{TextsToRead, spawn_text_reader};
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["needle"]);
+    home.write("b", 10, &["other"]);
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    let copies = SearchTextsInMemory::default().keep_copies_of(&rows);
+    let reader = spawn_text_reader(|_| panic!("the read broke"));
+    let (reply, replies) = std::sync::mpsc::channel();
+
+    reader.send(TextsToRead::new(copies, reply)).unwrap();
+    let reads = replies
+        .recv_timeout(TEXTS_READ_LAND)
+        .expect("the reader replies")
+        .into_texts_read()
+        .expect("the reply holds the batch's reads");
+
+    assert_eq!(reads.len(), 2, "the reply holds every copy of the batch");
+    for (_, read) in reads {
+        let failure = read.err().map(|failure| failure.to_string());
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("panicked: the read broke")),
+            "each copy failed with the panic: {failure:?}"
+        );
+    }
 }
 
 /// The search bar as the TUI draws it.
@@ -332,39 +398,102 @@ fn search_bar_shows_sessions_loading_until_their_reads_land_then_sessions_unread
 #[test]
 fn texts_read_run_last_search_again_only_while_the_app_awaits_it() {
     use super::ListSearchMode;
-    use super::search_state::{PendingWork, SearchCommand, SearchWorkerState};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use super::search_worker::{PendingWork, SearchCommand, SearchWorkerState, WorkerInput};
     let (copies_to_read, _reader) = std::sync::mpsc::channel();
-    let awaited = Arc::new(AtomicU64::new(1));
-    let mut worker = SearchWorkerState::new(copies_to_read, Arc::clone(&awaited));
+    let (mut generation, awaited) = super::search_generation::SearchGeneration::start();
+    let (texts_reply, _) = std::sync::mpsc::channel();
+    let mut worker = SearchWorkerState::new(copies_to_read, texts_reply, awaited);
     let mut searched = PendingWork::default();
+    let searched_generation = generation.advance();
     worker.apply(
         SearchCommand::Search {
             query: "needle".to_owned(),
-            generation: 1,
+            generation: searched_generation,
             mode: ListSearchMode::Lexical,
-        },
+        }
+        .into(),
         &mut searched,
     );
     worker.search(searched.search.unwrap(), Local::now());
     let mut rerun_generation = || {
         let mut applied = PendingWork::default();
-        worker.apply(SearchCommand::TextsRead(Vec::new()), &mut applied);
+        worker.apply(WorkerInput::texts_read(Vec::new()), &mut applied);
         applied.search.map(|search| search.generation)
     };
 
     let while_awaited = rerun_generation();
-    awaited.store(2, Ordering::Release);
+    generation.advance();
     let once_cleared = rerun_generation();
 
     assert_eq!(
         while_awaited,
-        Some(1),
+        Some(searched_generation),
         "texts read run the awaited search again"
     );
     assert_eq!(
         once_cleared, None,
         "texts read don't run a search the app no longer awaits"
+    );
+}
+
+#[test]
+fn texts_read_after_semantic_results_show_dont_rerun_their_lexical_fallback() {
+    use super::ListSearchMode;
+    use super::semantic_test_helpers::{
+        connect_semantic_search_channels, send_semantic_complete_response,
+    };
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["needle"]);
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    let test_thread = std::thread::current().id();
+    let gate =
+        super::test_waits::ConnectionGate::closed(environment.cache_base().path(), move |thread| {
+            thread.id() != test_thread
+        });
+    let mut app = super::claude_home::app_reading(rows, environment);
+    app.list_search_mode = ListSearchMode::Semantic;
+    let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    app.query = "needle".to_owned();
+    app.dispatch_search();
+    let generation = app.search_generation();
+    let fallback = app
+        .search_rx
+        .recv_timeout(TEXTS_READ_LAND)
+        .expect("the search worker answers the lexical fallback over the texts held");
+    send_semantic_complete_response(
+        &response_tx,
+        generation,
+        vec![0],
+        std::collections::HashMap::new(),
+        super::SemanticProgress::Complete,
+    );
+    app.receive_search_results();
+
+    gate.open();
+    let mut reruns = Vec::new();
+    let deadline = std::time::Instant::now() + TEXTS_READ_LAND;
+    while app.texts_held.sessions_without_texts.loading > 0 || app.texts_held.updates_applied == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session's texts are read"
+        );
+        while let Ok(held) = app.texts_held_rx.try_recv() {
+            app.texts_held = held;
+        }
+        reruns.extend(app.search_rx.try_iter().map(|response| response.generation));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    reruns.extend(app.search_rx.try_iter().map(|response| response.generation));
+
+    assert_eq!(fallback.generation, generation);
+    assert!(
+        app.semantic_search.unreadable.is_some(),
+        "the semantic results are on screen"
+    );
+    assert!(
+        !reruns.contains(&generation),
+        "texts read after the semantic results show don't rerun the fallback: {reruns:?}"
     );
 }
 

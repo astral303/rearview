@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 30;
+pub(super) const SCHEMA_VERSION: u32 = 34;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Tables an earlier version held, dropped before [`TABLES`] when the schema
@@ -309,10 +309,13 @@ CREATE TABLE IF NOT EXISTS entries (
     -- The sub-agent transcript a spliced turn came from; null for the
     -- session's own entries.
     child INTEGER REFERENCES transcripts (id),
-    -- A hash of what the row stores besides its place in the session and
-    -- its message (`message`, `contributes`, `position`, `sequence`,
-    -- `record_transcript`), with its parts and result items. A write keeps
-    -- the row and its children when the new entry hashes the same.
+    -- A hash of the columns the row stores besides its place in the session
+    -- and its message (`message`, `contributes`, `position`, `sequence`,
+    -- `record_transcript`, `child`). A changed entry keeps its columns when
+    -- the new entry hashes the same.
+    columns_digest INTEGER NOT NULL,
+    -- A hash of `columns_digest` and each of its parts' `digest`. A write
+    -- keeps the row and its children when the new entry hashes the same.
     digest INTEGER NOT NULL,
     UNIQUE (session, sequence)
 );
@@ -325,7 +328,7 @@ CREATE INDEX IF NOT EXISTS entries_by_time ON entries (timestamp_ms)
     WHERE timestamp_ms IS NOT NULL;
 
 -- Each content part retains its original position, including reference-only
--- images and unknown blocks. After an entry's blocks come the parts search
+-- images and unknown blocks. Numbered below zero come the parts search
 -- alone reads, each with only its search field, its search place and its
 -- text, without terminal codes: a part of kind `result-text` for each
 -- searched result with items in `result_items`, the text items joined by
@@ -345,8 +348,7 @@ CREATE TABLE IF NOT EXISTS parts (
     part INTEGER NOT NULL,
     kind TEXT NOT NULL,
     -- The search field lexical search reads `text` in; null when search
-    -- does not read the part. Before `text`, so reading it does not read a
-    -- long text's overflow pages.
+    -- does not read the part.
     search_field INTEGER,
     -- Set with `search_field` on an entry's part: the entry's `sequence`,
     -- and the `ordinal` of the entry's message when the entry contributes
@@ -356,26 +358,39 @@ CREATE TABLE IF NOT EXISTS parts (
     -- Set with `search_field` on an entry's part: the text's position among
     -- the entry's search texts as the parse lays them out, so a read of the
     -- session's search texts in `(entry_sequence, search_position)` order
-    -- lays them out as the parse does.
+    -- lays them out as the parse does. Its field's rank fills the high
+    -- bits, the text's index in its field the low 32.
     search_position INTEGER,
     -- A `subagent-metadata` part's `session_files` position of the
     -- sub-agent transcript holding the text.
     file_position INTEGER,
-    -- Text, thinking, or a result's content recorded as one string.
-    text TEXT,
-    text_codes BLOB,
     -- A call's id, or the call a result answers.
     call_id TEXT,
     -- A call's tool name, or a standalone result's.
     name TEXT,
     -- A call's tool kind.
     tool TEXT,
-    -- A call's input, or a result's content as recorded when it is neither
-    -- text nor an array of text items. Image payloads stay in the source.
-    json TEXT,
     -- `array` for a result whose items `result_items` holds, `json` for one
     -- `json` holds, null otherwise.
     result_shape TEXT,
+    -- A hash of what an entry's part and its result items store besides
+    -- its search place: a changed entry keeps each part that hashes the
+    -- same. Null for a part outside every entry.
+    digest INTEGER,
+    -- The fields of an `Agent` or `AgentMessage` call's input that link
+    -- sub-agents to the calls launching and addressing them, as a JSON
+    -- object of the fields the input holds; null for any other call and
+    -- for one holding none. A bounded read reads them for every call of the
+    -- session without its input.
+    call_context TEXT,
+    -- The long columns last: a read of the columns above does not read
+    -- their overflow pages.
+    -- Text, thinking, or a result's content recorded as one string.
+    text TEXT,
+    text_codes BLOB,
+    -- A call's input, or a result's content as recorded when it is neither
+    -- text nor an array of text items. Image payloads stay in the source.
+    json TEXT,
     UNIQUE (entry, part)
 );
 -- A windowed read or scan reads the parts of a run of messages through this

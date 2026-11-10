@@ -39,7 +39,9 @@ fn record_admission(transcript: &std::path::Path) -> Admitted {
 }
 
 impl<'a> ParsePermit<'a> {
-    /// The permit of the refresh owner whose token lives for `'a`.
+    /// The permit of a refresh owner's write batch: only
+    /// [`RefreshToken::parse_batch`](super::refresh::RefreshToken::parse_batch)
+    /// makes one, for the batch's work alone.
     pub(super) fn owner() -> Self {
         Self {
             _grant: PhantomData,

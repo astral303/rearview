@@ -425,7 +425,7 @@ fn semantic_ranked_selection_opens_selected_conversation_and_returns() {
     );
     let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.semantic_search.pending_generation = Some(7);
 
     send_semantic_complete_response(
@@ -481,7 +481,7 @@ fn semantic_list_click_uses_three_line_rows() {
     app.list_search_mode = ListSearchMode::Semantic;
     app.query = "needle".to_string();
     app.cursor_pos = app.query.chars().count();
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.semantic_search.pending_generation = Some(7);
     drop(request_rx);
     send_semantic_complete_response(
@@ -730,7 +730,7 @@ fn pending_open_opens_requested_session_after_list_reorders() {
 
     tx.send(SearchResponse {
         filtered: vec![0, 1],
-        generation: app.search_generation,
+        generation: app.search_generation(),
         mode: ListSearchMode::Lexical,
         evidence: std::collections::HashMap::new(),
         is_exact_literal: false,

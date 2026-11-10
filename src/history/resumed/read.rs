@@ -60,7 +60,8 @@ pub(crate) enum WholeRead {
     /// The session's own transcript continues an earlier one, or its read
     /// does not resume.
     OwnDoesNotResume,
-    /// The session's own transcript was rewritten or its identity changed.
+    /// The session's own transcript was rewritten, changed without growing,
+    /// or its identity changed.
     OwnRewritten,
     /// A record of the session's own transcript after its stable cursor
     /// changes an entry before it.
@@ -110,6 +111,16 @@ impl WholeRead {
             Self::CwdChanged => "the session's working directory changed",
         }
     }
+}
+
+/// A stored transcript file's change since the stored copy, by its stamp.
+enum FileChange {
+    Unchanged,
+    /// Grown, or changed in a way only its reader can judge: the read
+    /// resumes from the stored cursor when its reader's checks pass.
+    Grown,
+    /// Changed without growing: read whole.
+    Rewritten,
 }
 
 /// What a resumed read of one session reads with.
@@ -179,14 +190,22 @@ pub(crate) fn read_resumed(
     };
     let stamps = StubStamps::current(stub);
     let reader = storage.transcript_reader();
-    // A source without a stamp either time, such as a database's session,
-    // is unchanged only when its reader says so.
-    let is_changed = |file: &StoredFile| -> Result<bool> {
+    let change_of = |file: &StoredFile| -> Result<FileChange> {
         let stamp = stamps.fingerprint_of(&file.path);
-        if stamp.is_none() && file.fingerprint.is_none() {
-            return Ok(!reader.is_unchanged_since(&file.path, &file.read)?);
-        }
-        Ok(stamp != file.fingerprint)
+        Ok(match (stamp, file.fingerprint) {
+            // A source without a stamp either time, such as a database's
+            // session, is unchanged only when its reader says so.
+            (None, None) if reader.is_unchanged_since(&file.path, &file.read)? => {
+                FileChange::Unchanged
+            }
+            (None, None) => FileChange::Grown,
+            (stamp, stored) if stamp == stored => FileChange::Unchanged,
+            // The rewrite check sees only the bytes just before the cursor.
+            (Some(stamp), Some(stored)) if stamp.file_size <= stored.file_size => {
+                FileChange::Rewritten
+            }
+            _ => FileChange::Grown,
+        })
     };
     let Some(own) = resume
         .files
@@ -209,15 +228,19 @@ pub(crate) fn read_resumed(
     if stored_subagents.keys().any(|path| !current.contains(path)) {
         return Ok(Err(WholeRead::SubagentRemoved));
     }
-    let own_window = if is_changed(own)? {
-        on_transcript_read();
-        match resume_read(reader, permit, &own.path, &own.read)? {
-            Resumption::Window(window) => Some(window),
-            Resumption::FullRead => return Ok(Err(WholeRead::OwnRewritten)),
-            Resumption::ChangesEarlierEntry => return Ok(Err(WholeRead::OwnChangesEarlierEntry)),
+    let own_window = match change_of(own)? {
+        FileChange::Unchanged => None,
+        FileChange::Rewritten => return Ok(Err(WholeRead::OwnRewritten)),
+        FileChange::Grown => {
+            on_transcript_read();
+            match resume_read(reader, permit, &own.path, &own.read)? {
+                Resumption::Window(window) => Some(window),
+                Resumption::FullRead => return Ok(Err(WholeRead::OwnRewritten)),
+                Resumption::ChangesEarlierEntry => {
+                    return Ok(Err(WholeRead::OwnChangesEarlierEntry));
+                }
+            }
         }
-    } else {
-        None
     };
     let mut threads = Vec::with_capacity(stub.subagents.len());
     for path in &stub.subagents {
@@ -240,11 +263,16 @@ pub(crate) fn read_resumed(
                 let Some(fold) = stored_share(file) else {
                     return Ok(Err(WholeRead::SubagentShareUnreadable));
                 };
-                let change = if is_changed(file)? {
-                    on_transcript_read();
-                    resumed_change(reader, permit, path, &file.read, &fold)?
-                } else {
-                    Change::Unchanged
+                let change = match change_of(file)? {
+                    FileChange::Unchanged => Change::Unchanged,
+                    FileChange::Rewritten => {
+                        on_transcript_read();
+                        whole_change(reader, permit, path)?
+                    }
+                    FileChange::Grown => {
+                        on_transcript_read();
+                        resumed_change(reader, permit, path, &file.read, &fold, (cache, &resume))?
+                    }
                 };
                 Thread {
                     path,
@@ -303,20 +331,32 @@ fn bytes_read(
 }
 
 /// The change of the sub-agent transcript at `path`, whose share at its
-/// stable cursor is `fold`: the whole transcript when its title changed or
-/// its new entries add metadata parts, else the changed `window`.
+/// stable cursor is `fold`: the whole transcript when its title changed,
+/// its new entries add metadata parts, or the window continues a reply
+/// stored before it; else the changed `window`.
 fn resumed_change(
     reader: &dyn crate::history::provider::TranscriptReader,
     permit: ParsePermit<'_>,
     path: &Path,
     stored: &TranscriptRead,
     fold: &ThreadFold,
+    (cache, resume): (&SqliteCache, &StoredResume),
 ) -> Result<Change> {
     if let Resumption::Window(window) = resume_read(reader, permit, path, stored)? {
         let title = leading_title(&reader.leading_entries(path, &window.read)?);
+        // Read whole a window that continues a stored reply: the share's
+        // fold holds one token total for the replies before the window.
+        let mut reply_ids: Vec<&str> = window
+            .entries
+            .iter()
+            .filter_map(|(_, entry)| reply_id(entry))
+            .collect();
+        reply_ids.sort_unstable();
+        reply_ids.dedup();
         if title == fold.title
             && !fold.has_parts_after_stable
             && !adds_subagent_metadata(&window.entries)
+            && !cache.continues_subagent_reply(resume, path, &reply_ids, window.start_line)?
         {
             return Ok(Change::Window(window));
         }
@@ -480,9 +520,8 @@ fn place(
         };
         let mut stored_turns = match replaced_from {
             Some(from_line) => cache
-                .stored_turns(resume, thread.path)?
+                .stored_turns_from(resume, thread.path, from_line)?
                 .into_iter()
-                .filter(|turn| turn.line >= from_line)
                 .map(|turn| ((turn.line, 0), turn))
                 .collect::<Vec<_>>(),
             None => Vec::new(),

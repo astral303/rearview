@@ -27,6 +27,8 @@ pub mod provider;
 mod refresh;
 pub(crate) mod resumed;
 pub(crate) mod row_fold;
+#[cfg(test)]
+mod semantic_route_tests;
 mod shard_files;
 pub(crate) mod skill_text;
 pub(crate) mod sqlite_cache;

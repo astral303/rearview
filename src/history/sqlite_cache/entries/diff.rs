@@ -95,10 +95,15 @@ pub(in super::super) fn replace_leading(
     for index in 0..rows.entries.len() {
         let row = &rows.entries[index];
         match stored.get(index) {
-            Some(&(_, digest)) if digest == row.digest => {}
-            Some(&(id, _)) => {
+            Some(&(id, digest)) => {
+                let parts = row.parts();
+                if digest == parts.digest() {
+                    continue;
+                }
                 let place = EntryPlace::of(row, rows.sequence_of(index), &ids);
-                writer.update_entry(row, &place, SearchPlace::of(rows, index), id)?;
+                let search = SearchPlace::of(rows, index);
+                writer.update_content(row, &parts, id, search)?;
+                writer.place_entry(row, &place, search, id)?;
             }
             None => {
                 writer.insert_entry(rows, &mut ids, index)?;
@@ -121,10 +126,11 @@ pub(in super::super) fn rewrite_in_place(
 ) -> Result<()> {
     let mut writer = RowWriter::new(connection, session, places)?;
     for (index, (row, &(id, message, digest))) in rows.entries.iter().zip(stored).enumerate() {
-        if row.digest == digest {
+        let parts = row.parts();
+        if parts.digest() == digest {
             continue;
         }
-        writer.rewrite_content(row, id)?;
+        writer.rewrite_content(row, &parts, id)?;
         if let (Some(new), Some(message)) = (row.message, message)
             && rows.messages[new].first_entry == index
         {
@@ -595,9 +601,11 @@ fn update_entries(
         let row = &rows.entries[index];
         let place = EntryPlace::of(row, rows.sequence_of(index), ids);
         let search = SearchPlace::of(rows, index);
-        if entry.digest != row.digest {
-            writer.update_entry(row, &place, search, entry.id)?;
-        } else if entry.sequence != place.sequence
+        let parts = row.parts();
+        if entry.digest != parts.digest() {
+            writer.update_content(row, &parts, entry.id, search)?;
+        }
+        if entry.sequence != place.sequence
             || entry.message != place.message
             || entry.record_transcript != place.transcript
             || entry.child != place.child

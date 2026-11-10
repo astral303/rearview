@@ -212,14 +212,18 @@ fn delete_session_by_id(environment: &history::Environment, session_id: &str) ->
         history::Patience::UntilAcquired,
         Arc::default(),
     );
-    let permit = operation.wait_for_ownership_and_parse_permit()?;
-    let found = history::provider::find_sessions_by_id(environment, session_id);
-    let (source, path) = match found.as_slice() {
-        [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
-        [only] => only.clone(),
-        several => return Err(ambiguous_session_id(session_id, several)),
-    };
-    let deleted = history::provider::delete_session(permit, source, &path)?;
+    let (source, deleted) = operation.wait_to_parse_as_owner(|permit| {
+        let found = history::provider::find_sessions_by_id(environment, session_id);
+        let (source, path) = match found.as_slice() {
+            [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
+            [only] => only.clone(),
+            several => return Err(ambiguous_session_id(session_id, several)),
+        };
+        Ok((
+            source,
+            history::provider::delete_session(permit, source, &path)?,
+        ))
+    })??;
     operation.finish()?;
     eprintln!("{}", deletion_report(source, session_id, deleted));
     Ok(())
@@ -541,10 +545,9 @@ fn run_with(
         )?
         .conversations;
         history::listing::retain_listed(&mut conversations, &time_filter);
-        dropped_records_cli::print_report(
-            operation.wait_for_ownership_and_parse_permit()?,
-            &conversations,
-        );
+        operation.wait_to_parse_as_owner(|permit| {
+            dropped_records_cli::print_report(permit, &conversations)
+        })?;
         operation.finish()?;
         return Ok(());
     }

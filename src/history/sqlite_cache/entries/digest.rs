@@ -9,11 +9,15 @@ pub(super) struct Digest(blake3::Hasher);
 
 impl Digest {
     pub(super) fn text(&mut self, text: Option<&str>) {
-        match text {
-            Some(text) => {
+        self.bytes(text.map(str::as_bytes));
+    }
+
+    pub(super) fn bytes(&mut self, bytes: Option<&[u8]>) {
+        match bytes {
+            Some(bytes) => {
                 self.0.update(&[1]);
-                self.0.update(&(text.len() as u64).to_le_bytes());
-                self.0.update(text.as_bytes());
+                self.0.update(&(bytes.len() as u64).to_le_bytes());
+                self.0.update(bytes);
             }
             None => {
                 self.0.update(&[0]);

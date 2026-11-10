@@ -198,8 +198,16 @@ pub(super) enum PendingReload {
     /// A file opened directly, already parsed, or a row without an address in
     /// the cache.
     Ready(Box<ReloadedSession>),
-    Reading(ViewerRead<ReloadRead>),
+    /// At most one read runs: a newer refresh finishing meanwhile is
+    /// `queued`, and its read starts once this one lands.
+    Reading {
+        read: ViewerRead<ReloadRead>,
+        queued: Option<Box<ReloadedSession>>,
+    },
 }
+
+/// A landed reload, and the newer refresh's row to read next.
+pub(super) type LandedReload = (ReloadRead, Option<Box<ReloadedSession>>);
 
 impl PendingReload {
     /// `reloaded`, reading its copy in `cache` when it has one.
@@ -210,24 +218,42 @@ impl PendingReload {
         let Some(address) = reloaded.address.clone() else {
             return Self::Ready(reloaded);
         };
-        Self::Reading(ViewerRead::start(move || {
-            let read =
-                parse_conversation_file_interactively(&cache, &address, &reloaded.publication);
-            (*reloaded, Some(read))
-        }))
+        Self::Reading {
+            read: ViewerRead::start(move || {
+                let read =
+                    parse_conversation_file_interactively(&cache, &address, &reloaded.publication);
+                (*reloaded, Some(read))
+            }),
+            queued: None,
+        }
     }
 
-    /// The reload, once its read lands within `wait`; `Err(self)` while it
-    /// runs.
-    pub(super) fn finish(self, wait: Duration) -> Result<ReloadRead, Self> {
+    /// This reload followed by `newer`, a later refresh's: a read running
+    /// keeps running with `newer` queued; otherwise `newer` replaces it.
+    fn followed_by(self, newer: Box<ReloadedSession>, cache: InteractiveCache) -> Self {
         match self {
-            Self::Ready(reloaded) => Ok((*reloaded, None)),
-            Self::Reading(read) => read.finish(wait).map_err(Self::Reading),
+            Self::Ready(_) => Self::start(newer, cache),
+            Self::Reading { read, .. } => Self::Reading {
+                read,
+                queued: Some(newer),
+            },
+        }
+    }
+
+    /// The reload and the row queued behind it, once its read lands within
+    /// `wait`; `Err(self)` while it runs.
+    pub(super) fn finish(self, wait: Duration) -> Result<LandedReload, Self> {
+        match self {
+            Self::Ready(reloaded) => Ok(((*reloaded, None), None)),
+            Self::Reading { read, queued } => match read.finish(wait) {
+                Ok(read) => Ok((read, queued)),
+                Err(read) => Err(Self::Reading { read, queued }),
+            },
         }
     }
 
     pub(super) fn is_reading(&self) -> bool {
-        matches!(self, Self::Reading(_))
+        matches!(self, Self::Reading { .. })
     }
 }
 
@@ -458,8 +484,9 @@ impl App {
     }
 
     /// When the newest finished refresh read the open session: start reading
-    /// it again from the cache in place of a read still running, leave the
-    /// viewer for a session that is gone or empty, or report the failed read.
+    /// it again from the cache, or queue that read behind one still running;
+    /// leave the viewer for a session that is gone or empty, or report the
+    /// failed read.
     /// The list applies the refresh itself once the viewer closes. A file
     /// opened directly keeps the viewer when it is gone or empty.
     pub(super) fn follow_open_session(&mut self) {
@@ -472,7 +499,11 @@ impl App {
             .and_then(|finished| OpenSessionRead::in_finished(finished, &state.conversation_path));
         match read {
             Some(OpenSessionRead::Listed(reloaded)) => {
-                let reload = PendingReload::start(reloaded, self.interactive_cache());
+                let cache = self.interactive_cache();
+                let reload = match self.pending_view_reload.take() {
+                    Some(pending) => pending.followed_by(reloaded, cache),
+                    None => PendingReload::start(reloaded, cache),
+                };
                 self.pending_view_reload = Some(reload);
             }
             Some(OpenSessionRead::Gone(status)) => {
@@ -549,7 +580,7 @@ impl App {
                 state.is_copy_missing = false;
             }
         }
-        if !self.store.is_refresh_pending(&path) {
+        if !self.store.is_refresh_pending(&path) && self.pending_view_reload.is_none() {
             self.run_deferred_copy();
         }
     }

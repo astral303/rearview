@@ -39,7 +39,6 @@ impl ListChange {
     /// Make the change as `operation`'s refresh owner. Fails as acquiring
     /// the ownership fails.
     pub(crate) fn make(self, operation: &OperationScope) -> ListChangeOutcome {
-        let permit = operation.wait_for_ownership_and_parse_permit();
         match self {
             Self::Rename {
                 source,
@@ -48,12 +47,14 @@ impl ListChange {
                 renamed_at,
             } => {
                 let provider = source.provider();
-                let result = permit.and_then(|permit| {
-                    provider
-                        .rename()
-                        .or_refuse(provider.labels().display, Operation::Rename)?
-                        .rename_session(permit, &path, &title, renamed_at)
-                });
+                let result = operation
+                    .wait_to_parse_as_owner(|permit| {
+                        provider
+                            .rename()
+                            .or_refuse(provider.labels().display, Operation::Rename)?
+                            .rename_session(permit, &path, &title, renamed_at)
+                    })
+                    .and_then(|renamed| renamed);
                 ListChangeOutcome::Renamed {
                     path,
                     title,
@@ -61,9 +62,11 @@ impl ListChange {
                 }
             }
             Self::Delete { source, path } => {
-                let result = permit.and_then(|permit| {
-                    crate::history::provider::delete_session(permit, source, &path)
-                });
+                let result = operation
+                    .wait_to_parse_as_owner(|permit| {
+                        crate::history::provider::delete_session(permit, source, &path)
+                    })
+                    .and_then(|deleted| deleted);
                 ListChangeOutcome::Deleted { path, result }
             }
         }

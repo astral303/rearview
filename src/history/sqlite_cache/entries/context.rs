@@ -7,8 +7,18 @@ use crate::agent::transcript::{
 use crate::error::Result;
 use crate::history::sqlite_cache::roots::Places;
 use crate::history::task_notification::ReportSender;
+use crate::log_entry::Tool;
 use rusqlite::{Connection, params};
+use serde_json::{Value, json};
 use std::path::Path;
+
+/// Each call and result of the session `?1`'s numbered messages, without
+/// its input or content: those columns come after the ones read, so the
+/// read reaches none of their overflow pages.
+pub(in crate::history::sqlite_cache) const CALLS_AND_RESULTS: &str = "SELECT m.ordinal, p.kind, p.call_id, p.name, p.tool, p.call_context \
+     FROM messages m JOIN entries e ON e.message = m.id JOIN parts p ON p.entry = e.id \
+     WHERE m.session = ?1 AND m.ordinal IS NOT NULL AND e.contributes \
+     AND p.kind IN ('call', 'result') ORDER BY m.ordinal, e.sequence, p.part";
 
 pub(super) fn read(
     connection: &Connection,
@@ -61,21 +71,7 @@ pub(super) fn read(
         }
         messages.push(message);
     }
-    let mut statement = connection.prepare(
-        "SELECT m.ordinal, p.kind, p.call_id, p.name, p.tool, \
-         CASE WHEN p.kind = 'call' THEN json_object( \
-             'agent_type', json(p.json -> '$.agent_type'), \
-             'subagent_type', json(p.json -> '$.subagent_type'), \
-             'description', json(p.json -> '$.description'), \
-             'recipient', json(p.json -> '$.recipient'), \
-             'run_in_background', json(p.json -> '$.run_in_background'), \
-             'launch', json_object('agent_type', json(p.json -> '$.launch.agent_type'))) END, \
-         json_type(p.json, '$.subagent_type') IS NOT NULL, \
-             json_type(p.json, '$.agent_type') IS NOT NULL \
-         FROM messages m JOIN entries e ON e.message = m.id JOIN parts p ON p.entry = e.id \
-         WHERE m.session = ?1 AND m.ordinal IS NOT NULL AND e.contributes \
-         AND p.kind IN ('call', 'result') ORDER BY m.ordinal, e.sequence, p.part",
-    )?;
+    let mut statement = connection.prepare(CALLS_AND_RESULTS)?;
     let mut rows = statement.query([session])?;
     while let Some(row) = rows.next()? {
         let ordinal = row.get::<_, i64>(0)? as usize;
@@ -83,15 +79,10 @@ pub(super) fn read(
         let kind: String = row.get(1)?;
         match kind.as_str() {
             "call" => {
-                let mut input: serde_json::Value = serde_json::from_str(&row.get::<_, String>(5)?)?;
-                let object = input
-                    .as_object_mut()
-                    .expect("projected call context is an object");
-                for (key, column) in [("subagent_type", 6), ("agent_type", 7)] {
-                    if !row.get::<_, bool>(column)? {
-                        object.remove(key);
-                    }
-                }
+                let input = match row.get::<_, Option<String>>(5)? {
+                    Some(stored) => serde_json::from_str(&stored)?,
+                    None => json!({}),
+                };
                 message.parts.push(AgentMessagePart::ToolUse {
                     id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     name: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
@@ -131,6 +122,33 @@ pub(super) fn read(
         summary,
         custom_title,
     })
+}
+
+/// The `call_context` a write stores for a call of `tool` with `input`: the
+/// fields of the input the sub-agent links read, which read them from
+/// `Agent` and `AgentMessage` calls alone. `None` for any other call, and
+/// for an input holding none of the fields; a bounded read gives such a
+/// call an empty context.
+pub(super) fn stored_call_context(tool: Tool, input: &Value) -> Option<String> {
+    if !matches!(tool, Tool::Agent | Tool::AgentMessage) {
+        return None;
+    }
+    let mut context = serde_json::Map::new();
+    for key in [
+        "description",
+        "recipient",
+        "run_in_background",
+        "agent_type",
+        "subagent_type",
+    ] {
+        if let Some(value) = input.get(key) {
+            context.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(agent_type) = input.pointer("/launch/agent_type") {
+        context.insert("launch".to_owned(), json!({ "agent_type": agent_type }));
+    }
+    (!context.is_empty()).then(|| Value::Object(context).to_string())
 }
 
 fn source(message: &AgentMessage, timestamp: Option<String>) -> AgentPartSource {

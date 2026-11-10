@@ -328,10 +328,15 @@ fn format_record(protocol: &str, kind: &str, reference: Option<&str>, detail: &s
     }
     if !detail.is_empty() {
         output.push_str(" detail=");
-        output.push_str(&escape_atom(&sanitize_agent_text(detail)));
+        output.push_str(&encode_detail(detail));
     }
     output.push('\n');
     output
+}
+
+/// `detail`, free text, as one field's value of a protocol or `perf` record.
+pub(crate) fn encode_detail(detail: &str) -> String {
+    escape_atom(&sanitize_agent_text(detail))
 }
 
 #[cfg(test)]
