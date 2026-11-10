@@ -335,6 +335,26 @@ pub(crate) struct SessionKey {
     cache_key: String,
 }
 
+/// The cache base and wait of one reader, which every copy it hands out
+/// reads with.
+#[derive(Clone)]
+pub(crate) struct CopyHandles {
+    pub(super) base: CacheBase,
+    pub(super) wait: ReaderWait,
+}
+
+impl CopyHandles {
+    /// The copy of `generation` at `address`.
+    pub(crate) fn at(&self, address: SessionAddress, generation: i64) -> CachedSession {
+        CachedSession {
+            base: self.base.clone(),
+            address,
+            generation,
+            wait: self.wait,
+        }
+    }
+}
+
 impl CachedSession {
     /// The generation of the copy this session reads.
     pub(crate) fn generation(&self) -> i64 {

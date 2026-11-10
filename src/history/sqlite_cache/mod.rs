@@ -41,9 +41,9 @@ mod window;
 pub use base::{CacheBase, ProcessIdentity};
 #[cfg(test)]
 pub(crate) use base::{DiskSpace, DriveRunningOut};
-pub(crate) use cached_session::Currency;
 pub(crate) use cached_session::HeldCopy;
 pub use cached_session::{CachedSession, Publication, SessionAddress};
+pub(crate) use cached_session::{CopyHandles, Currency};
 pub(crate) use cached_session::{CopyKey, SessionKey};
 pub(crate) use cached_session::{read_copy_waiting, read_copy_without_waiting};
 #[cfg(test)]
@@ -299,6 +299,14 @@ impl SqliteCache {
     /// The cache base this connection's database lives in.
     fn base(&self) -> &CacheBase {
         self.connection.base()
+    }
+
+    /// The handles of copies this cache reads, reading as it reads.
+    pub(crate) fn copy_handles(&self) -> CopyHandles {
+        CopyHandles {
+            base: self.base().clone(),
+            wait: self.wait,
+        }
     }
 
     /// `root` and the directories beside it, with the keys this database

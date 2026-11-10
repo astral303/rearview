@@ -227,6 +227,7 @@ impl SqliteCache {
         let mut statement = connection.prepare(&sql)?;
         let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         let mut sessions = HashMap::new();
+        let copies = self.copy_handles();
         while let Some(row) = rows.next()? {
             let status: String = row.get(2)?;
             let session = match status.as_str() {
@@ -234,12 +235,10 @@ impl SqliteCache {
                     let Some(files) = transcripts_of(connection, &places, row.get(0)?)? else {
                         continue;
                     };
-                    let cached_session = CachedSession {
-                        base: self.base().clone(),
-                        address: SessionAddress::new(storage, source, roots.clone(), row.get(1)?),
-                        generation: row.get(22)?,
-                        wait: self.wait,
-                    };
+                    let cached_session = copies.at(
+                        SessionAddress::new(storage, source, roots.clone(), row.get(1)?),
+                        row.get(22)?,
+                    );
                     CatalogueSession::Listed(Box::new(conversation(
                         connection,
                         row,
