@@ -29,13 +29,6 @@ pub(crate) trait Clock: Send + Sync {
     fn now(&self) -> Moment;
 
     /// Wait `duration` of this clock's time.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only tests sleep; a production wait sleeps here, not in std::thread"
-        )
-    )]
     fn sleep(&self, duration: Duration);
 
     /// The time since `start`; zero when `start` is later.

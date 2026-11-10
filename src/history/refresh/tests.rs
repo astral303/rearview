@@ -303,7 +303,9 @@ fn listed_session_gone_from_disk_is_removed() {
 
 #[test]
 fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() {
+    use crate::history::environment::test_support::real_time_environment;
     use crate::history::provider::DiscoveredSessions;
+    use crate::history::provider::walk::DirectoryLister;
     use crate::history::provider::{
         RootEnvironment, RootedStorage, SessionCache, SessionRoot, SessionStorage,
     };
@@ -326,8 +328,12 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
         fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
             self.inner.roots_in(environment)
         }
-        fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-            let found = self.inner.discover(root)?;
+        fn discover(
+            &self,
+            root: &SessionRoot,
+            lister: &dyn DirectoryLister,
+        ) -> Result<DiscoveredSessions> {
+            let found = self.inner.discover(root, lister)?;
             if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
                 self.discovered.send(()).unwrap();
             }
@@ -337,8 +343,10 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
             &self,
             root: &SessionRoot,
             locator: &std::path::Path,
+            lister: &dyn DirectoryLister,
         ) -> Result<Option<SessionStub>> {
-            self.inner.rediscover_unlisted_session(root, locator)
+            self.inner
+                .rediscover_unlisted_session(root, locator, lister)
         }
         fn parse_session(
             &self,
@@ -369,7 +377,7 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
         discovered: send,
         calls: AtomicUsize::new(0),
     };
-    let cache = crate::history::cache::SessionCacheStore::under(base.path(), storage.cache());
+    let environment = real_time_environment(Vec::new(), Some(base.path()));
     let owner = OtherProcessOwner::hold(base.path());
     let known = KnownSessions {
         listed: HashMap::from([(
@@ -389,10 +397,11 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
                 &[Source::Pi],
                 RefreshOptions::default(),
                 &|_, needs_reading| {
-                    crate::history::provider::rediscover_sessions_with_cache(
+                    crate::history::provider::rediscover_sessions(
+                        &environment,
                         &storage,
-                        &cache,
                         false,
+                        None,
                         needs_reading,
                     )
                 },

@@ -14,7 +14,7 @@ fn header_gaps(session: &AgentSession) -> Vec<String> {
     let row = &session.row;
     let agent = row.source;
     let resolved = resolved_conversation(row);
-    let transcript = AgentTranscript::load_owned(agent, &row.path, &row.subagents).unwrap();
+    let transcript = AgentTranscript::load_owned(None, agent, &row.path, &row.subagents).unwrap();
     let outline = format_outline(&resolved, &transcript, EVERY_PART);
     let read = format_read(
         &[ReadRequest {

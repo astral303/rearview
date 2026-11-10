@@ -1,7 +1,8 @@
 //! A catalogue row's content location; connections stay local to each read.
 
 use super::{
-    ReaderWait, SqliteCache, StoredEntries, entries, files, is_storage_current, path_text,
+    CacheBase, ReaderWait, SqliteCache, StoredEntries, entries, files, is_storage_current,
+    path_text,
 };
 use crate::error::Result;
 use crate::history::TranscriptEntries;
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct CachedSession {
-    pub(super) base: PathBuf,
+    pub(super) base: CacheBase,
     pub(super) storage: SessionCache,
     pub(super) root: PathBuf,
     pub(super) cache_key: String,
@@ -23,6 +24,11 @@ pub struct CachedSession {
 }
 
 impl CachedSession {
+    /// The clock of the rearview that found this session.
+    pub(crate) fn clock(&self) -> &dyn crate::clock::Clock {
+        self.base.clock().as_ref()
+    }
+
     /// Other message bodies contain only the context needed to render this
     /// range's links, handles and header. Do not render outside `range`.
     pub(crate) fn agent_range(
@@ -106,17 +112,18 @@ impl CachedSession {
     }
 }
 
-/// The listed session at `path` with `subagents` in the user's cache,
-/// through [`SqliteCache::open_waiting`].
+/// The listed session at `path` with `subagents` in the cache under `base`,
+/// through [`SqliteCache::open_waiting`]; `None` without a base.
 pub(crate) fn find_waiting(
+    base: Option<&CacheBase>,
     source: crate::history::Source,
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<Option<CachedSession>> {
-    let Some(base) = crate::cache_file::session_cache_base() else {
+    let Some(base) = base else {
         return Ok(None);
     };
-    let Some(cache) = SqliteCache::open_waiting(&base)? else {
+    let Some(cache) = SqliteCache::open_waiting(base)? else {
         return Ok(None);
     };
     cache.find_session(source, path, subagents)
@@ -141,7 +148,7 @@ impl SqliteCache {
             let stored = connection.prepare("SELECT path FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position")?
                 .query_map([generation], |row| row.get::<_, String>(0).map(PathBuf::from))?.collect::<rusqlite::Result<Vec<_>>>()?;
             if stored != subagents.iter().map(|path| files::key(path)).collect::<Vec<_>>() { return Ok(None); }
-            Ok(Some(CachedSession { base: self.base(), storage: source.provider().storage().cache(), root: root.into(), cache_key, generation, source, wait: self.wait }))
+            Ok(Some(CachedSession { base: self.base().clone(), storage: source.provider().storage().cache(), root: root.into(), cache_key, generation, source, wait: self.wait }))
         })
     }
 }

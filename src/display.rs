@@ -4,7 +4,7 @@ use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
 use crate::history::{
-    Conversation, DisplayEntries, MalformedLine, display_log_entries_waiting,
+    CacheBase, Conversation, DisplayEntries, MalformedLine, display_log_entries_waiting,
     sniffed_display_log_entries,
 };
 use crate::pager;
@@ -50,14 +50,16 @@ pub(crate) enum DisplayFormat {
 }
 
 /// The session the terminal printout shows for `selected_path`, read through
-/// its row's agent with the row's sub-agent transcripts. A path no row holds
-/// is read by whichever agent's format recognizes it.
+/// its row's agent with the row's sub-agent transcripts, from the cache under
+/// `base` when it holds the session. A path no row holds is read by
+/// whichever agent's format recognizes it.
 pub fn read_session_to_print(
+    base: Option<&CacheBase>,
     conversations: &[Conversation],
     selected_path: &Path,
 ) -> Result<DisplayEntries> {
     match conversations.iter().find(|row| row.path == selected_path) {
-        Some(row) => display_log_entries_waiting(row.source, &row.path, &row.subagents),
+        Some(row) => display_log_entries_waiting(base, row.source, &row.path, &row.subagents),
         None => sniffed_display_log_entries(selected_path),
     }
 }
@@ -373,7 +375,7 @@ mod tests {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
 
-        let session = read_session_to_print(&[], &path).unwrap();
+        let session = read_session_to_print(None, &[], &path).unwrap();
         let printed = printout(session, &DisplayOptions::default(), DisplayFormat::Plain);
 
         assert!(printed.contains("active root question"), "{printed}");
@@ -415,9 +417,13 @@ mod tests {
         };
         let project = tempfile::tempdir().unwrap();
         let (transcript, subagents) = write_handback_session(project.path(), true);
-        let session =
-            display_log_entries_waiting(crate::history::Source::Claude, &transcript, &subagents)
-                .unwrap();
+        let session = display_log_entries_waiting(
+            None,
+            crate::history::Source::Claude,
+            &transcript,
+            &subagents,
+        )
+        .unwrap();
         let with_thinking = DisplayOptions {
             show_thinking: true,
             ..DisplayOptions::default()

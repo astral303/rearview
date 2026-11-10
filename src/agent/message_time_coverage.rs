@@ -15,7 +15,7 @@ fn each_messages_cached_span_matches_times_agent_read_shows() {
         .filter_map(|session| {
             let row = &session.row;
             let transcript =
-                AgentTranscript::load_owned(row.source, &row.path, &row.subagents).unwrap();
+                AgentTranscript::load_owned(None, row.source, &row.path, &row.subagents).unwrap();
             let shown = MessageTimes::of_messages(&transcript.messages);
             (row.message_times != shown).then(|| {
                 format!(
@@ -36,7 +36,7 @@ fn every_agents_message_parts_carry_time_they_were_written() {
         .flat_map(|session| {
             let row = &session.row;
             let transcript =
-                AgentTranscript::load_owned(row.source, &row.path, &row.subagents).unwrap();
+                AgentTranscript::load_owned(None, row.source, &row.path, &row.subagents).unwrap();
             transcript
                 .messages
                 .into_iter()

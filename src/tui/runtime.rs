@@ -7,7 +7,7 @@ use crate::debug_log;
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
 use crate::history::{
-    Conversation, InteractiveCache, LoaderMessage, RefreshOptions, RefreshOutcome,
+    Conversation, Environment, LoaderMessage, RefreshOptions, RefreshOutcome,
     refresh_in_background, refresh_sessions,
 };
 use crate::tui::viewer::ToolDisplayMode;
@@ -110,7 +110,7 @@ fn drain_events(wait: Duration) -> Result<Vec<Event>> {
     Ok(events)
 }
 
-fn prepare_frame(app: &mut App, terminal: &mut Terminal<TerminalBackend>) -> FrameState {
+fn prepare_frame<B: Backend>(app: &mut App, terminal: &mut Terminal<B>) -> FrameState {
     let frame_area = terminal.get_frame().area();
     let viewport_height = frame_area.height.saturating_sub(3) as usize;
 
@@ -128,22 +128,23 @@ fn prepare_frame(app: &mut App, terminal: &mut Terminal<TerminalBackend>) -> Fra
     }
 }
 
-fn draw_frame(app: &App, terminal: &mut Terminal<TerminalBackend>) -> Result<()> {
-    terminal.draw(|frame| ui::render(frame, app))?;
+fn draw_frame<B: Backend>(app: &App, terminal: &mut Terminal<B>) -> Result<()> {
+    terminal
+        .draw(|frame| ui::render(frame, app))
+        .map_err(|error| AppError::Io(io::Error::other(error.to_string())))?;
     Ok(())
 }
 
 fn handle_events<F>(
     app: &mut App,
     frame_state: &FrameState,
-    poll_timeout: Duration,
+    events: Vec<Event>,
     allow_list_click_enter: bool,
     mut on_action: F,
-) -> Result<EventLoopResult<Option<Action>>>
+) -> EventLoopResult<Option<Action>>
 where
     F: FnMut(&mut App, Action) -> EventLoopResult<Option<Action>>,
 {
-    let events = drain_events(poll_timeout)?;
     for ev in events {
         let key = match ev {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
@@ -161,9 +162,9 @@ where
                         {
                             match on_action(app, action) {
                                 EventLoopResult::Continue => {}
-                                EventLoopResult::Break => return Ok(EventLoopResult::Break),
+                                EventLoopResult::Break => return EventLoopResult::Break,
                                 EventLoopResult::Return(action) => {
-                                    return Ok(EventLoopResult::Return(action));
+                                    return EventLoopResult::Return(action);
                                 }
                             }
                         }
@@ -174,13 +175,13 @@ where
                             frame_state.frame_area,
                             frame_state.viewport_height,
                         ) {
-                            return Ok(EventLoopResult::Break);
+                            return EventLoopResult::Break;
                         }
                         if allow_list_click_enter
                             && app.handle_list_click(m.row, frame_state.frame_area)
                             && app.request_open()
                         {
-                            return Ok(EventLoopResult::Break);
+                            return EventLoopResult::Break;
                         }
                     }
                     MouseEventKind::Moved => {
@@ -196,37 +197,266 @@ where
         if let Some(action) = app.handle_key(key.code, key.modifiers, frame_state.viewport_height) {
             match on_action(app, action) {
                 EventLoopResult::Continue => {}
-                EventLoopResult::Break => return Ok(EventLoopResult::Break),
-                EventLoopResult::Return(action) => return Ok(EventLoopResult::Return(action)),
+                EventLoopResult::Break => return EventLoopResult::Break,
+                EventLoopResult::Return(action) => return EventLoopResult::Return(action),
             }
         }
         // The frame drawn next shows the list as opening; the load runs after it.
         if app.is_opening() {
-            return Ok(EventLoopResult::Break);
+            return EventLoopResult::Break;
         }
     }
-    Ok(EventLoopResult::Continue)
+    EventLoopResult::Continue
 }
 
-/// Hand a finished refresh to `app`. A refresh thread that stopped without
-/// an outcome reports as a failed refresh.
-fn receive_refresh(app: &mut App, refresh: &mut Option<Receiver<Result<RefreshOutcome>>>) {
-    let Some(outcome) = refresh.as_ref() else {
+/// The end of one pass of the event loop.
+pub(crate) enum Tick {
+    Continue,
+    /// Leave the TUI with this action.
+    Exit(Action),
+}
+
+/// The TUI's event loop body: the load's and the refresh's messages, the
+/// timed checks, one frame, the pending open or viewer refresh, then the
+/// terminal events of one poll. [`run_with_loader`] and [`run_single_file`]
+/// run it against the terminal; a test runs it against a test backend with
+/// events of its own.
+pub(crate) struct Runtime {
+    app: App,
+    environment: Environment,
+    /// The streaming load's messages; `None` for a file opened directly.
+    loader: Option<Receiver<LoaderMessage>>,
+    load_meter: Arc<LoadMeter>,
+    refresh_options: RefreshOptions,
+    /// The background refresh thread's outcome, while one runs.
+    refresh: Option<Receiver<Result<RefreshOutcome>>>,
+}
+
+impl Runtime {
+    /// The list, filled from `loader`, the streaming load whose reads
+    /// `load_meter` records, in `environment`. `Ctrl+R` refreshes it with
+    /// `refresh_options`.
+    pub(crate) fn listing(
+        app: App,
+        environment: Environment,
+        loader: Receiver<LoaderMessage>,
+        load_meter: Arc<LoadMeter>,
+        refresh_options: RefreshOptions,
+    ) -> Self {
+        Self {
+            app,
+            environment,
+            loader: Some(loader),
+            load_meter,
+            refresh_options,
+            refresh: None,
+        }
+    }
+
+    /// A file opened directly, in `environment`.
+    pub(crate) fn single_file(app: App, environment: Environment) -> Self {
+        Self {
+            app,
+            environment,
+            loader: None,
+            load_meter: Arc::default(),
+            refresh_options: RefreshOptions::default(),
+            refresh: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> &App {
+        &self.app
+    }
+
+    /// One pass of the event loop, drawing on `terminal`. `poll` returns the
+    /// terminal events that arrive within the time it is given.
+    pub(crate) fn tick<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        poll: &mut dyn FnMut(Duration) -> Result<Vec<Event>>,
+    ) -> Result<Tick> {
+        self.receive_load()?;
+        self.receive_refresh();
+        self.app.apply_finished_refresh();
+        self.app.set_load_waiting_for_another_rearview(
+            self.app.is_loading() && self.load_meter.is_waiting_for_refresh(),
+        );
+        self.app.check_awaited_refresh();
+        if self.refresh.is_none()
+            && let Some(rows) = self.app.begin_caching_refresh()
+        {
+            self.refresh = Some(refresh_in_background(move || Ok(rows.cache())));
+        }
+
+        let frame_state = prepare_frame(&mut self.app, terminal);
+        self.app.receive_search_results();
+        self.app.receive_fork_read();
+        draw_frame(&self.app, terminal)?;
+        if self.app.complete_pending_open(frame_state.frame_width())
+            || self
+                .app
+                .complete_pending_view_refresh(frame_state.viewport_height)
+        {
+            return Ok(Tick::Continue);
+        }
+
+        let events = poll(self.poll_timeout())?;
+        Ok(match self.handle_events(&frame_state, events) {
+            EventLoopResult::Return(Some(action)) => Tick::Exit(action),
+            EventLoopResult::Continue | EventLoopResult::Break | EventLoopResult::Return(None) => {
+                Tick::Continue
+            }
+        })
+    }
+
+    /// The rows the list holds, for the action the TUI exits with.
+    pub(crate) fn into_conversations(self) -> Vec<Conversation> {
+        self.app.into_conversations()
+    }
+
+    /// Apply every message the load has sent. Fails with the load's fatal
+    /// error, or when the finished load found no session.
+    fn receive_load(&mut self) -> Result<()> {
+        let Some(loader) = &self.loader else {
+            return Ok(());
+        };
+        loop {
+            match loader.try_recv() {
+                Ok(LoaderMessage::Fatal(error)) => return Err(error),
+                Ok(LoaderMessage::ProviderError) => {}
+                Ok(LoaderMessage::Batch(conversations)) => {
+                    self.app.append_conversations(conversations);
+                }
+                Ok(LoaderMessage::Progress(progress)) => self.app.report_load_progress(progress),
+                Ok(LoaderMessage::Ignored(term)) => self.app.add_active_filter(term),
+                Ok(LoaderMessage::SkippedSessions(sessions)) => {
+                    self.app.add_skipped_sessions(sessions);
+                }
+                Ok(LoaderMessage::Done) => finish_loading(&mut self.app)?,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if self.app.is_loading() {
+                        finish_loading(&mut self.app)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Hand a finished refresh to the app. A refresh thread that stopped
+    /// without an outcome reports as a failed refresh.
+    fn receive_refresh(&mut self) {
+        let Some(outcome) = self.refresh.as_ref() else {
+            return;
+        };
+        let outcome = match outcome.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(AppError::RefreshStopped),
+        };
+        self.refresh = None;
+        self.app.finish_refresh(outcome);
+    }
+
+    /// The longest the next poll waits for input: briefly while work runs in
+    /// the background, until the next timed redraw otherwise.
+    fn poll_timeout(&self) -> Duration {
+        if self.app.is_loading() || self.refresh.is_some() || self.app.is_reading_fork() {
+            Duration::from_millis(50)
+        } else if self.app.has_search_work_in_flight() {
+            Duration::from_millis(8)
+        } else {
+            self.app.idle_wait()
+        }
+    }
+
+    fn handle_events(
+        &mut self,
+        frame_state: &FrameState,
+        events: Vec<Event>,
+    ) -> EventLoopResult<Option<Action>> {
+        if self.app.is_single_file_mode() {
+            return handle_events(
+                &mut self.app,
+                frame_state,
+                events,
+                false,
+                |_, action| match action {
+                    Action::Quit => EventLoopResult::Return(Some(Action::Quit)),
+                    _ => EventLoopResult::Continue,
+                },
+            );
+        }
+        let environment = &self.environment;
+        let refresh_options = self.refresh_options;
+        let refresh = &mut self.refresh;
+        handle_events(
+            &mut self.app,
+            frame_state,
+            events,
+            true,
+            |app, action| match action {
+                Action::Refresh => {
+                    if let Some(known) = app.begin_refresh() {
+                        let environment = environment.clone();
+                        *refresh = Some(refresh_in_background(move || {
+                            refresh_sessions(&environment, &known, refresh_options)
+                                .map(RefreshOutcome::Changes)
+                        }));
+                    }
+                    EventLoopResult::Continue
+                }
+                Action::Delete(ref path) => {
+                    delete_selected_session(app, path, environment.clock().as_ref());
+                    EventLoopResult::Continue
+                }
+                _ => EventLoopResult::Return(Some(action)),
+            },
+        )
+    }
+}
+
+/// Show `app`'s loaded list; fails when it holds no session.
+fn finish_loading(app: &mut App) -> Result<()> {
+    app.finish_loading();
+    if app.conversations().is_empty() {
+        return Err(AppError::NoHistoryFound("selected scope".to_string()));
+    }
+    Ok(())
+}
+
+/// Delete the listed session at `path` and leave the viewer, or report why
+/// it could not be deleted; log under `clock`'s time.
+fn delete_selected_session(app: &mut App, path: &std::path::Path, clock: &dyn Clock) {
+    let Some(source) = app.get_selected_source() else {
+        let _ = debug_log::log_debug(
+            &format!("No listed session to delete at {}", path.display()),
+            clock,
+        );
         return;
     };
-    let outcome = match outcome.try_recv() {
-        Ok(outcome) => outcome,
-        Err(std::sync::mpsc::TryRecvError::Empty) => return,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(AppError::RefreshStopped),
-    };
-    *refresh = None;
-    app.finish_refresh(outcome);
+    match crate::history::provider::delete_session(source, path) {
+        Ok(_) => {
+            app.remove_selected_from_list();
+            app.exit_view_mode();
+        }
+        Err(error) => {
+            let _ = debug_log::log_debug(
+                &format!("Failed to delete session {}: {}", path.display(), error),
+                clock,
+            );
+            app.report_delete_failure(&error);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_loader(
     rx: Receiver<LoaderMessage>,
-    load_meter: &LoadMeter,
+    load_meter: Arc<LoadMeter>,
     refresh_options: RefreshOptions,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
@@ -234,7 +464,7 @@ pub fn run_with_loader(
     scope: ListScope,
     search_options: TuiSearchOptions,
     active_filters: Vec<crate::history::FilterTerm>,
-    clock: Arc<dyn Clock>,
+    environment: Environment,
 ) -> Result<(Action, Vec<Conversation>)> {
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new_loading_with_options(
@@ -243,132 +473,20 @@ pub fn run_with_loader(
         keys,
         scope,
         search_options,
-        InteractiveCache::in_user_cache(),
-        clock.clone(),
+        environment.clone(),
     );
     app.set_active_filters(active_filters);
     app.set_show_last(refresh_options.show_last);
-    let mut refresh = None;
-
+    let mut runtime = Runtime::listing(app, environment, rx, load_meter, refresh_options);
     loop {
-        loop {
-            match rx.try_recv() {
-                Ok(LoaderMessage::Fatal(err)) => {
-                    drop(guard);
-                    return Err(err);
-                }
-                Ok(LoaderMessage::ProviderError) => {}
-                Ok(LoaderMessage::Batch(convs)) => {
-                    app.append_conversations(convs);
-                }
-                Ok(LoaderMessage::Progress(progress)) => app.report_load_progress(progress),
-                Ok(LoaderMessage::Ignored(term)) => app.add_active_filter(term),
-                Ok(LoaderMessage::SkippedSessions(sessions)) => {
-                    app.add_skipped_sessions(sessions);
-                }
-                Ok(LoaderMessage::Done) => {
-                    app.finish_loading();
-                    if app.conversations().is_empty() {
-                        drop(guard);
-                        return Err(AppError::NoHistoryFound("selected scope".to_string()));
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if app.is_loading() {
-                        app.finish_loading();
-                        if app.conversations().is_empty() {
-                            drop(guard);
-                            return Err(AppError::NoHistoryFound("selected scope".to_string()));
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        receive_refresh(&mut app, &mut refresh);
-        app.apply_finished_refresh();
-        app.set_load_waiting_for_another_rearview(
-            app.is_loading() && load_meter.is_waiting_for_refresh(),
-        );
-        app.check_awaited_refresh();
-        if refresh.is_none()
-            && let Some(rows) = app.begin_caching_refresh()
-        {
-            refresh = Some(refresh_in_background(move || Ok(rows.cache())));
-        }
-
-        let frame_state = prepare_frame(&mut app, &mut guard.terminal);
-        app.receive_search_results();
-        app.receive_fork_read();
-        draw_frame(&app, &mut guard.terminal)?;
-        if app.complete_pending_open(frame_state.frame_width())
-            || app.complete_pending_view_refresh(frame_state.viewport_height)
-        {
-            continue;
-        }
-
-        let poll_timeout = if app.is_loading() || refresh.is_some() || app.is_reading_fork() {
-            Duration::from_millis(50)
-        } else if app.has_search_work_in_flight() {
-            Duration::from_millis(8)
-        } else {
-            app.idle_wait()
-        };
-
-        let event_result = handle_events(
-            &mut app,
-            &frame_state,
-            poll_timeout,
-            true,
-            |app, action| match action {
-                Action::Refresh => {
-                    if let Some(known) = app.begin_refresh() {
-                        let clock = clock.clone();
-                        refresh = Some(refresh_in_background(move || {
-                            refresh_sessions(&known, refresh_options, clock.as_ref())
-                                .map(RefreshOutcome::Changes)
-                        }));
-                    }
-                    EventLoopResult::Continue
-                }
-                Action::Delete(ref path) => {
-                    let Some(source) = app.get_selected_source() else {
-                        let _ = debug_log::log_debug(
-                            &format!("No listed session to delete at {}", path.display()),
-                            clock.as_ref(),
-                        );
-                        return EventLoopResult::Continue;
-                    };
-                    match crate::history::provider::delete_session(source, path) {
-                        Ok(_) => {
-                            app.remove_selected_from_list();
-                            app.exit_view_mode();
-                            EventLoopResult::Continue
-                        }
-                        Err(e) => {
-                            let _ = debug_log::log_debug(
-                                &format!("Failed to delete session {}: {}", path.display(), e),
-                                clock.as_ref(),
-                            );
-                            app.report_delete_failure(&e);
-                            EventLoopResult::Continue
-                        }
-                    }
-                }
-                _ => EventLoopResult::Return(Some(action)),
-            },
-        )?;
-
-        match event_result {
-            EventLoopResult::Continue => {}
-            EventLoopResult::Break => continue,
-            EventLoopResult::Return(Some(action)) => return Ok((action, app.into_conversations())),
-            EventLoopResult::Return(None) => {}
+        if let Tick::Exit(action) = runtime.tick(&mut guard.terminal, &mut drain_events)? {
+            return Ok((action, runtime.into_conversations()));
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 pub fn run_single_file(
     path: PathBuf,
@@ -376,47 +494,21 @@ pub fn run_single_file(
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
-    clock: Arc<dyn Clock>,
+    environment: Environment,
 ) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
-    let mut app = App::new_single_file(
+    let app = App::new_single_file(
         path,
         source,
         tool_display,
         show_thinking,
         keys,
-        InteractiveCache::in_user_cache(),
-        clock,
+        environment.clone(),
     );
-
+    let mut runtime = Runtime::single_file(app, environment);
     loop {
-        app.check_awaited_refresh();
-        let frame_state = prepare_frame(&mut app, &mut guard.terminal);
-        draw_frame(&app, &mut guard.terminal)?;
-        if app.complete_pending_open(frame_state.frame_width())
-            || app.complete_pending_view_refresh(frame_state.viewport_height)
-        {
-            continue;
-        }
-
-        let poll_timeout = app.idle_wait();
-        let event_result = handle_events(
-            &mut app,
-            &frame_state,
-            poll_timeout,
-            false,
-            |_, action| match action {
-                Action::Quit => EventLoopResult::Return(Some(Action::Quit)),
-                _ => EventLoopResult::Continue,
-            },
-        )?;
-
-        match event_result {
-            EventLoopResult::Continue => {}
-            EventLoopResult::Break => continue,
-            EventLoopResult::Return(Some(Action::Quit)) => return Ok(()),
-            EventLoopResult::Return(None) => {}
-            EventLoopResult::Return(Some(_)) => {}
+        if let Tick::Exit(_) = runtime.tick(&mut guard.terminal, &mut drain_events)? {
+            return Ok(());
         }
     }
 }

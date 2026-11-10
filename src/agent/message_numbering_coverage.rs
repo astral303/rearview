@@ -24,7 +24,7 @@ fn numbering_gaps(session: &AgentSession) -> Vec<String> {
             "{agent:?}: the fixture names no reply after records without text"
         )];
     };
-    let transcript = AgentTranscript::load_owned(agent, &row.path, &row.subagents).unwrap();
+    let transcript = AgentTranscript::load_owned(None, agent, &row.path, &row.subagents).unwrap();
     let mut gaps = Vec::new();
     if row.message_count != transcript.messages.len() {
         gaps.push(format!(

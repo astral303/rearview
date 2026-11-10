@@ -3,7 +3,7 @@
 //! `agent_progress` shape unconverted, since they index and print it.
 
 use super::format::RecordLine;
-use super::sqlite_cache::{InteractiveCache, InteractiveRead};
+use super::sqlite_cache::{CacheBase, InteractiveCache, InteractiveRead};
 use super::{MalformedLine, Source, TranscriptEntries, normalized_session, sniffed_session};
 use crate::error::Result;
 use crate::log_entry::{
@@ -90,15 +90,16 @@ impl From<TranscriptEntries> for DisplayEntries {
 }
 
 /// The session's [`normalized_session`] as the terminal printout reads it,
-/// through the user's cache's waiting reader. The TUI reads through
-/// [`display_log_entries_interactively`].
+/// through the waiting reader of the cache under `base`. The TUI reads
+/// through [`display_log_entries_interactively`].
 pub fn display_log_entries_waiting(
+    base: Option<&CacheBase>,
     source: Source,
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<DisplayEntries> {
     if let Ok(Some(cached)) =
-        super::sqlite_cache::find_cached_session_waiting(source, path, subagents)
+        super::sqlite_cache::find_cached_session_waiting(base, source, path, subagents)
         && let Ok(Some(entries)) = cached.entries()
     {
         return Ok(entries.into());
@@ -175,14 +176,22 @@ mod tests {
         std::fs::write(&session, user_line("parent", 0) + "\n").unwrap();
         let first = explore_subagent(dir.path(), "agent-a");
         let second = explore_subagent(dir.path(), "agent-b");
-        let before =
-            display_log_entries_waiting(Source::Claude, &session, &[first.clone(), second.clone()])
-                .unwrap();
+        let before = display_log_entries_waiting(
+            None,
+            Source::Claude,
+            &session,
+            &[first.clone(), second.clone()],
+        )
+        .unwrap();
 
         let started_since = explore_subagent(dir.path(), "agent-c");
-        let after =
-            display_log_entries_waiting(Source::Claude, &session, &[first, started_since, second])
-                .unwrap();
+        let after = display_log_entries_waiting(
+            None,
+            Source::Claude,
+            &session,
+            &[first, started_since, second],
+        )
+        .unwrap();
 
         assert_eq!(origin_of(&after, "agent-b"), origin_of(&before, "agent-b"));
         let distinct: HashSet<&EntryOrigin> = after.origins.iter().collect();

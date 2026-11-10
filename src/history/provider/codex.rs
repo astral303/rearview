@@ -3,7 +3,7 @@
 
 use super::sqlite::{self, SchemaPin};
 use super::subagents::SubagentForest;
-use super::walk::{SessionFiles, Transcripts};
+use super::walk::{DirectoryLister, SessionFiles, SystemLister, Transcripts};
 use super::{
     Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
     ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
@@ -142,13 +142,15 @@ impl SessionDeleter for CodexProvider {
             std::fs::remove_file(path)?;
             return Ok(Deleted::just_the_session());
         };
-        let transcripts = walk::transcripts_at_depth(sessions_root, codex::SESSIONS_TREE_DEPTH)?;
+        let transcripts =
+            walk::transcripts_at_depth(&SystemLister, sessions_root, codex::SESSIONS_TREE_DEPTH)?;
         let archived =
             codex::archived_rollouts_beside(sessions_root).map_err(refusal_if_transient)?;
         let subagents = CodexThreadIndex::under_tree(
             sessions_root,
             Some(&transcripts),
             sqlite::DEFAULT_BUSY_TIMEOUT,
+            &SystemLister,
         )?
         .threads_beneath(&thread_id);
         let mut doomed = subagents
@@ -186,10 +188,13 @@ impl SubagentFinder for CodexProvider {
         ) else {
             return Ok(Vec::new());
         };
-        Ok(
-            CodexThreadIndex::under_tree(sessions_tree, None, sqlite::DEFAULT_BUSY_TIMEOUT)?
-                .subagent_rollouts(name.thread_id),
-        )
+        Ok(CodexThreadIndex::under_tree(
+            sessions_tree,
+            None,
+            sqlite::DEFAULT_BUSY_TIMEOUT,
+            &SystemLister,
+        )?
+        .subagent_rollouts(name.thread_id))
     }
 }
 
@@ -206,7 +211,7 @@ impl SessionIdResolver for CodexProvider {
             return Ok(None);
         }
         for root in CodexStorage.roots()? {
-            let index = CodexThreadIndex::under(&root)?;
+            let index = CodexThreadIndex::under(&root, &SystemLister)?;
             if let Some(stub) = index.stub_of(&root, session_id) {
                 return Ok(Some(ResolvedSession { root, stub }));
             }
@@ -246,9 +251,10 @@ struct IndexedThread {
 impl CodexThreadIndex {
     /// Reads the database when its file exists and fails when it cannot be
     /// used; reads the rollout headers only when the file is absent, so the
-    /// list cannot differ between launches.
-    pub(crate) fn under(root: &SessionRoot) -> Result<Self> {
-        Self::under_tree(&root.path, None, sqlite::DEFAULT_BUSY_TIMEOUT)
+    /// list cannot differ between launches. The tree is listed through
+    /// `lister`.
+    pub(crate) fn under(root: &SessionRoot, lister: &dyn DirectoryLister) -> Result<Self> {
+        Self::under_tree(&root.path, None, sqlite::DEFAULT_BUSY_TIMEOUT, lister)
     }
 
     /// [`Self::under`] for the tree at `sessions_tree`, waiting
@@ -259,6 +265,7 @@ impl CodexThreadIndex {
         sessions_tree: &Path,
         walked: Option<&Transcripts>,
         busy_timeout: Duration,
+        lister: &dyn DirectoryLister,
     ) -> Result<Self> {
         let database =
             state_database_beside_sessions_tree(sessions_tree).filter(|database| database.exists());
@@ -268,6 +275,7 @@ impl CodexThreadIndex {
         Ok(match walked {
             Some(transcripts) => Self::from_rollout_headers(transcripts),
             None => Self::from_rollout_headers(&walk::transcripts_at_depth(
+                lister,
                 sessions_tree,
                 codex::SESSIONS_TREE_DEPTH,
             )?),
@@ -469,19 +477,24 @@ impl SessionStorage for CodexStorage {
     /// counted, not listed: nothing here decodes them, and with compression
     /// on every rollout older than a week is one, so a history that stops a
     /// week back would otherwise look complete.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        Ok(CodexThreadIndex::under(root)?.discovered(root))
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        Ok(CodexThreadIndex::under(root, lister)?.discovered(root))
     }
 
     fn rediscover_unlisted_session(
         &self,
         root: &SessionRoot,
         locator: &Path,
+        lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
         let Some(name) = RolloutFileName::parse_path(locator) else {
             return Ok(None);
         };
-        Ok(CodexThreadIndex::under(root)?.stub_of(root, name.thread_id))
+        Ok(CodexThreadIndex::under(root, lister)?.stub_of(root, name.thread_id))
     }
 
     /// Leaves out of the row each discarded turn's sub-agents and the threads
@@ -886,7 +899,7 @@ pub(super) mod tests {
     fn discovered_names(home: &Path) -> Vec<String> {
         let root = SessionRoot::new(home.join("sessions"));
         CodexStorage
-            .discover(&root)
+            .discover(&root, &SystemLister)
             .unwrap()
             .stubs
             .into_iter()
@@ -1115,7 +1128,7 @@ pub(super) mod tests {
 
         fn resolve_under(&self, home: &Path, id: &str) -> Result<Option<ResolvedSession>> {
             let root = sessions_root(home);
-            Ok(CodexThreadIndex::under(&root)?
+            Ok(CodexThreadIndex::under(&root, &SystemLister)?
                 .stub_of(&root, id)
                 .map(|stub| ResolvedSession { root, stub }))
         }
@@ -1192,7 +1205,7 @@ pub(super) mod tests {
         std::fs::write(&unsent, format!("{header}\n")).unwrap();
         let root = sessions_root(home.path());
 
-        let discovered = CodexStorage.discover(&root).unwrap();
+        let discovered = CodexStorage.discover(&root, &SystemLister).unwrap();
         let [stub] = discovered.stubs.as_slice() else {
             panic!("one thread: {:?}", discovered.stubs);
         };
@@ -1236,10 +1249,13 @@ pub(super) mod tests {
             }]
         };
         write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
-        assert_eq!(CodexStorage.discover(&root).unwrap().ignored, ignored(0));
+        assert_eq!(
+            CodexStorage.discover(&root, &SystemLister).unwrap().ignored,
+            ignored(0)
+        );
 
         write_compressed_rollout(home.path(), "2026-08-01T10-00-00", OTHER_THREAD);
-        let discovered = CodexStorage.discover(&root).unwrap();
+        let discovered = CodexStorage.discover(&root, &SystemLister).unwrap();
         assert_eq!(discovered.ignored, ignored(1));
         assert_eq!(
             discovered.stubs.len(),
@@ -1248,7 +1264,10 @@ pub(super) mod tests {
         );
 
         write_compressed_rollout(home.path(), "2026-08-02T10-00-00", NESTED_SUBAGENT_THREAD);
-        assert_eq!(CodexStorage.discover(&root).unwrap().ignored, ignored(2));
+        assert_eq!(
+            CodexStorage.discover(&root, &SystemLister).unwrap().ignored,
+            ignored(2)
+        );
     }
 
     #[test]
@@ -1755,7 +1774,7 @@ pub(super) mod tests {
 
     fn resolved_stub(home: &Path, thread_id: &str) -> Option<SessionStub> {
         let root = sessions_root(home);
-        CodexThreadIndex::under(&root)
+        CodexThreadIndex::under(&root, &SystemLister)
             .unwrap()
             .stub_of(&root, thread_id)
     }
@@ -1800,7 +1819,9 @@ pub(super) mod tests {
             THREAD,
         );
 
-        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+        let discovered = CodexStorage
+            .discover(&sessions_root(home.path()), &SystemLister)
+            .unwrap();
 
         assert_eq!(discovered.stubs.len(), 1);
         assert_eq!(discovered.stubs[0].subagents, vec![subagent_newest]);
@@ -1811,8 +1832,7 @@ pub(super) mod tests {
     /// reading it into its parent would count that conversation twice.
     #[test]
     fn guardian_review_is_neither_listed_nor_read_into_its_parent() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
+        use crate::history::environment::test_support::load_rows;
 
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1821,7 +1841,7 @@ pub(super) mod tests {
         std::fs::copy(fixture("guardian.jsonl"), &review).unwrap();
         let root = sessions_root(home.path());
 
-        let discovered = CodexStorage.discover(&root).unwrap();
+        let discovered = CodexStorage.discover(&root, &SystemLister).unwrap();
         assert_eq!(
             discovered
                 .stubs
@@ -1845,8 +1865,7 @@ pub(super) mod tests {
             inner: CodexStorage,
             root,
         };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let listed = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let listed = load_rows(&storage, cache_base.path());
         assert_eq!(listed.len(), 1);
         let mut parent_alone = discovered.stubs[0].clone();
         parent_alone.subagents.clear();
@@ -1883,7 +1902,9 @@ pub(super) mod tests {
             NESTED_SUBAGENT_THREAD,
             SUBAGENT_THREAD,
         );
-        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+        let discovered = CodexStorage
+            .discover(&sessions_root(home.path()), &SystemLister)
+            .unwrap();
         let announced = std::sync::atomic::AtomicUsize::new(0);
 
         parser::process_session_file(
@@ -1903,8 +1924,7 @@ pub(super) mod tests {
 
     #[test]
     fn row_leaves_out_discarded_turns_sub_agents_and_threads_beneath_them() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
+        use crate::history::environment::test_support::load_rows;
 
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1913,8 +1933,11 @@ pub(super) mod tests {
             inner: CodexStorage,
             root: sessions_root(home.path()),
         };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let mut kept_only = CodexStorage.discover(&storage.root).unwrap().stubs[0].clone();
+        let mut kept_only = CodexStorage
+            .discover(&storage.root, &SystemLister)
+            .unwrap()
+            .stubs[0]
+            .clone();
         kept_only.subagents = vec![thread.kept.clone()];
         let kept_only = parser::process_session_file(
             &kept_only,
@@ -1927,7 +1950,7 @@ pub(super) mod tests {
         .unwrap();
 
         for load in ["parsed", "restored from the cache"] {
-            let rows = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+            let rows = load_rows(&storage, cache_base.path());
             let [row] = rows.as_slice() else {
                 panic!("{} sessions when {load}", rows.len());
             };
@@ -1965,7 +1988,7 @@ pub(super) mod tests {
         let home = tempfile::tempdir().unwrap();
         let thread = codex::test_support::write_edited_thread_with_subagents(home.path(), THREAD);
         let root = sessions_root(home.path());
-        let stub = CodexStorage.discover(&root).unwrap().stubs[0].clone();
+        let stub = CodexStorage.discover(&root, &SystemLister).unwrap().stubs[0].clone();
         let _lock = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -2003,7 +2026,9 @@ pub(super) mod tests {
             SUBAGENT_THREAD,
         );
 
-        let discovered = CodexStorage.discover(&sessions_root(home.path())).unwrap();
+        let discovered = CodexStorage
+            .discover(&sessions_root(home.path()), &SystemLister)
+            .unwrap();
 
         assert_eq!(discovered.stubs.len(), 1);
         assert_eq!(discovered.stubs[0].locator, orphan);
@@ -2014,8 +2039,7 @@ pub(super) mod tests {
     /// row must pick that up without the parent's file changing.
     #[test]
     fn sub_agent_thread_that_grows_after_its_parent_invalidates_row() {
-        use crate::history::cache::SessionCacheStore;
-        use crate::history::provider::load_sessions_with_cache;
+        use crate::history::environment::test_support::load_rows;
 
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -2026,8 +2050,7 @@ pub(super) mod tests {
             inner: CodexStorage,
             root: sessions_root(home.path()),
         };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let first = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let first = load_rows(&storage, cache_base.path());
         assert_eq!(first.len(), 1);
         assert!(
             first[0]
@@ -2056,7 +2079,7 @@ pub(super) mod tests {
         .unwrap();
         drop(grown);
 
-        let second = load_sessions_with_cache(&storage, &cache, false, None).unwrap();
+        let second = load_rows(&storage, cache_base.path());
         assert!(
             second[0]
                 .agent_search_text
@@ -2222,7 +2245,9 @@ pub(super) mod tests {
     }
 
     fn discover(home: &Path) -> DiscoveredSessions {
-        CodexStorage.discover(&sessions_root(home)).unwrap()
+        CodexStorage
+            .discover(&sessions_root(home), &SystemLister)
+            .unwrap()
     }
 
     /// A session, its sub-agent thread, a nested sub-agent and a Guardian
@@ -2389,7 +2414,7 @@ pub(super) mod tests {
 
     /// The reason and detail of the failure to list `home`.
     fn discover_failure(home: &Path) -> (SessionDatabaseFailure, String) {
-        match CodexStorage.discover(&sessions_root(home)) {
+        match CodexStorage.discover(&sessions_root(home), &SystemLister) {
             Err(AppError::SessionListUnreadable { reason, detail }) => (reason, detail),
             other => panic!("expected an unusable database, got {other:?}"),
         }
@@ -2472,6 +2497,7 @@ pub(super) mod tests {
             &home.path().join("sessions"),
             None,
             Duration::from_millis(50),
+            &SystemLister,
         );
 
         match failure {
@@ -2578,11 +2604,15 @@ pub(super) mod tests {
 
     /// Every rollout left under `home`, relative to it.
     fn surviving_rollouts(home: &Path) -> Vec<PathBuf> {
-        walk::jsonl_files_at_depth(&home.join("sessions"), codex::SESSIONS_TREE_DEPTH)
-            .unwrap()
-            .into_iter()
-            .map(|rollout| rollout.strip_prefix(home).unwrap().to_path_buf())
-            .collect()
+        walk::jsonl_files_at_depth(
+            &SystemLister,
+            &home.join("sessions"),
+            codex::SESSIONS_TREE_DEPTH,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|rollout| rollout.strip_prefix(home).unwrap().to_path_buf())
+        .collect()
     }
 
     /// Delete reads the threads beneath the target from the same index the

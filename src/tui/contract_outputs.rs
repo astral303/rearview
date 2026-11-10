@@ -35,17 +35,18 @@ pub(crate) struct TuiOutputs {
     pub(crate) viewer: String,
 }
 
-/// The TUI's outputs over the sessions the providers' roots hold, with the
-/// options the binary starts with when no configuration is set, on `clock`.
-pub(crate) fn tui_outputs(queries: &[&str], clock: Arc<dyn Clock>) -> TuiOutputs {
+/// The TUI's outputs over the sessions `environment`'s storages hold, loaded
+/// through its session cache, with the options the binary starts with when
+/// no configuration is set. The views read no session cache.
+pub(crate) fn tui_outputs(queries: &[&str], environment: history::Environment) -> TuiOutputs {
+    let clock: Arc<dyn Clock> = Arc::clone(environment.clock());
     let mut app = App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
-        crate::history::InteractiveCache::default(),
-        Arc::clone(&clock),
+        history::Environment::without_session_cache(Arc::clone(&clock)),
     );
     let time = TimeFilter::default();
     app.set_active_filters(history::active_load_filters(&[&time]));
@@ -53,11 +54,11 @@ pub(crate) fn tui_outputs(queries: &[&str], clock: Arc<dyn Clock>) -> TuiOutputs
     load(
         &mut app,
         history::load_all_conversations_streaming(
+            environment,
             true,
             None,
             time,
             Default::default(),
-            Arc::clone(&clock),
         ),
     );
 

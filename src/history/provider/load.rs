@@ -14,16 +14,16 @@ use crate::history::format::same_file;
 use crate::history::load_meter::AgentMeter;
 use crate::history::sqlite_cache::refresh::{LockWait, RefreshOwnership, RefreshToken};
 use crate::history::sqlite_cache::{
-    self, CacheFollowUp, CacheWrite, CacheWriter, CatalogueSession, Fallback, InteractiveCache,
-    InteractiveRead, SessionRecord, SessionStatus, SqliteCache,
+    self, CacheBase, CacheFollowUp, CacheWrite, CacheWriter, CatalogueSession, Fallback,
+    InteractiveCache, InteractiveRead, SessionRecord, SessionStatus, SqliteCache,
 };
-use crate::history::{Conversation, FilterTerm, Source, format_short_name_from_path};
+use crate::history::{Conversation, Environment, FilterTerm, Source, format_short_name_from_path};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod cache_access;
 mod targeted;
@@ -261,46 +261,37 @@ impl SkippedSessions {
 /// completes without reading it. Discovery repeated after waiting for refresh
 /// ownership can replace the total before reading continues. `meter` records
 /// what each step read. A changed session whose cached row `left_out` holds
-/// keeps that row unread. A row without any time is dated `clock`'s current
-/// time.
+/// keeps that row unread. A row without any time is dated `environment`'s
+/// current time.
 pub fn load_sessions(
+    environment: &Environment,
     storage: &dyn SessionStorage,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     meter: AgentMeter,
     left_out: LeftOutRows,
     progress: &mut dyn FnMut(usize, usize),
-    clock: &dyn Clock,
 ) -> Result<LoadedSessions> {
-    SessionLoader {
-        storage,
-        cache: &SessionCacheStore::in_user_cache(storage.cache()),
-        show_last,
-        debug_level,
-        meter,
-        clock,
-    }
-    .load(left_out, progress)
+    SessionLoader::new(environment, storage, show_last, debug_level, meter).load(left_out, progress)
 }
 
 /// `storage`'s sessions as discovery finds them now, reading only those
 /// `needs_reading` picks: through the cache, as a load reads them, rewriting
 /// only the shards whose sessions missed it.
 pub fn rediscover_sessions(
+    environment: &Environment,
     storage: &dyn SessionStorage,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     needs_reading: &dyn Fn(&SessionStub) -> bool,
-    clock: &dyn Clock,
 ) -> Result<RediscoveredSessions> {
-    SessionLoader {
+    SessionLoader::new(
+        environment,
         storage,
-        cache: &SessionCacheStore::in_user_cache(storage.cache()),
         show_last,
         debug_level,
-        meter: AgentMeter::UNMETERED,
-        clock,
-    }
+        AgentMeter::UNMETERED,
+    )
     .rediscover(needs_reading)
 }
 
@@ -311,33 +302,44 @@ pub fn rediscover_sessions(
 /// ownership or writing any cache. A session read outside the database
 /// carries its follow-up.
 ///
-/// `None` when no provider stores the session, or it holds no conversation,
-/// or cannot be read.
+/// `None` when no provider stores the session, `environment` does not read
+/// its provider's storage, or the session holds no conversation, or cannot
+/// be read.
 pub fn load_session_by_id(
-    cache: &InteractiveCache,
+    environment: &Environment,
     session_id: &str,
     show_last: bool,
-    clock: &dyn Clock,
 ) -> InteractiveRead<Option<(Source, Conversation)>> {
-    let Some((source, ResolvedSession { root, stub })) = super::resolve_session_id(session_id)
-    else {
+    let Some((source, resolved)) = super::resolve_session_id(session_id) else {
         return InteractiveRead::settled(None);
     };
-    let storage = source.provider().storage();
-    let read = SessionLoader {
-        storage,
-        cache: &SessionCacheStore::in_base(cache.base(), storage.cache()),
-        show_last,
-        debug_level: None,
-        meter: AgentMeter::UNMETERED,
-        clock,
-    }
-    .read_one(&root, stub);
+    let read = read_resolved_session(environment, source, resolved, show_last);
     InteractiveRead {
         value: match read.value {
-            SessionRead::Listed(conversation) => Some((source, *conversation)),
-            SessionRead::Empty | SessionRead::Failed(_) => None,
+            Some(SessionRead::Listed(conversation)) => Some((source, *conversation)),
+            Some(SessionRead::Empty | SessionRead::Failed(_)) | None => None,
         },
+        follow_up: read.follow_up,
+    }
+}
+
+/// `source`'s session `resolved` names, read as [`load_session_by_id`]
+/// reads the session an ID resolves to: as the TUI's drawing thread reads,
+/// with the preview `show_last` selects. `None` when `environment` does not
+/// read `source`'s storage.
+pub fn read_resolved_session(
+    environment: &Environment,
+    source: Source,
+    resolved: ResolvedSession,
+    show_last: bool,
+) -> InteractiveRead<Option<SessionRead>> {
+    let Some(storage) = environment.storage_of(source) else {
+        return InteractiveRead::settled(None);
+    };
+    let read = SessionLoader::new(environment, storage, show_last, None, AgentMeter::UNMETERED)
+        .read_one(&resolved.root, resolved.stub);
+    InteractiveRead {
+        value: Some(read.value),
         follow_up: read.follow_up,
     }
 }
@@ -357,19 +359,17 @@ pub fn load_session_by_id(
 /// list the file's directory, reads as a [`ReadError::Transient`] failure:
 /// the session may still be there, unchanged.
 pub fn reread_sessions(
-    cache: &InteractiveCache,
+    environment: &Environment,
     source: Source,
     locators: &[&Path],
     show_last: bool,
-    clock: &dyn Clock,
 ) -> Vec<InteractiveRead<Option<SessionRead>>> {
     reread_in(
-        cache,
+        environment,
         source,
         locators,
         show_last,
         TargetedRead::Interactive,
-        clock,
     )
 }
 
@@ -379,196 +379,38 @@ pub fn reread_sessions(
 /// hold. A session read outside the database after the read lost write
 /// permission waits for the refresh running then, if any.
 pub fn cache_sessions(
-    cache: &InteractiveCache,
+    environment: &Environment,
     source: Source,
     locators: &[&Path],
     show_last: bool,
-    clock: &dyn Clock,
 ) -> Vec<InteractiveRead<Option<SessionRead>>> {
     reread_in(
-        cache,
+        environment,
         source,
         locators,
         show_last,
         TargetedRead::Caching,
-        clock,
     )
 }
 
-/// The sessions at `locators` read again through `cache` with `source`'s
-/// storage, as `targeted_read` selects.
+/// The sessions at `locators` read again through `environment`'s cache with
+/// `source`'s storage, as `targeted_read` selects. Every read is `None` when
+/// `environment` does not read `source`'s storage.
 fn reread_in(
-    cache: &InteractiveCache,
+    environment: &Environment,
     source: Source,
     locators: &[&Path],
     show_last: bool,
     targeted_read: TargetedRead,
-    clock: &dyn Clock,
 ) -> Vec<InteractiveRead<Option<SessionRead>>> {
-    let storage = source.provider().storage();
-    SessionLoader {
-        storage,
-        cache: &SessionCacheStore::in_base(cache.base(), storage.cache()),
-        show_last,
-        debug_level: None,
-        meter: AgentMeter::UNMETERED,
-        clock,
-    }
-    .reread(locators, targeted_read)
-}
-
-/// [`reread_sessions`] for one session, against a caller-chosen storage and
-/// cache, on test time.
-#[cfg(test)]
-pub(crate) fn reread_session_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    locator: &Path,
-    show_last: bool,
-) -> InteractiveRead<Option<SessionRead>> {
-    read_session_with_cache(
-        storage,
-        cache,
-        locator,
-        show_last,
-        TargetedRead::Interactive,
-    )
-}
-
-/// [`cache_sessions`] for one session, against a caller-chosen storage and
-/// cache.
-#[cfg(test)]
-pub(crate) fn cache_session_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    locator: &Path,
-    show_last: bool,
-) -> InteractiveRead<Option<SessionRead>> {
-    read_session_with_cache(storage, cache, locator, show_last, TargetedRead::Caching)
-}
-
-#[cfg(test)]
-fn read_session_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    locator: &Path,
-    show_last: bool,
-    targeted_read: TargetedRead,
-) -> InteractiveRead<Option<SessionRead>> {
-    SessionLoader {
-        storage,
-        cache,
-        show_last,
-        debug_level: None,
-        meter: AgentMeter::UNMETERED,
-        clock: &crate::clock::TestClock::default(),
-    }
-    .reread(&[locator], targeted_read)
-    .pop()
-    .expect("one result per locator")
-}
-
-/// The session `stub` names under `root`, read as [`load_session_by_id`]
-/// reads a resolved session, against a caller-chosen storage and cache.
-#[cfg(test)]
-pub(crate) fn read_resolved_session_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    root: &SessionRoot,
-    stub: SessionStub,
-) -> InteractiveRead<SessionRead> {
-    SessionLoader {
-        storage,
-        cache,
-        show_last: false,
-        debug_level: None,
-        meter: AgentMeter::UNMETERED,
-        clock: &crate::clock::TestClock::default(),
-    }
-    .read_one(root, stub)
-}
-
-/// [`load_sessions`] against a caller-chosen cache, on test time, reporting
-/// nothing.
-#[cfg(test)]
-pub(crate) fn load_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-) -> Result<LoadedSessions> {
-    load_leaving_out_with_cache(storage, cache, show_last, debug_level, LeftOutRows::NONE)
-}
-
-/// [`load_with_cache`], leaving the changed sessions whose cached row
-/// `left_out` holds unread.
-#[cfg(test)]
-pub(crate) fn load_leaving_out_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-    left_out: LeftOutRows,
-) -> Result<LoadedSessions> {
-    SessionLoader {
-        storage,
-        cache,
-        show_last,
-        debug_level,
-        meter: AgentMeter::UNMETERED,
-        clock: &crate::clock::TestClock::default(),
-    }
-    .load(left_out, &mut |_, _| {})
-}
-
-/// [`load_with_cache`], recording what it read in `meter` and leaving the
-/// changed sessions whose cached row `left_out` holds unread.
-#[cfg(test)]
-fn load_metered_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    meter: AgentMeter,
-    left_out: LeftOutRows,
-) -> Result<LoadedSessions> {
-    SessionLoader {
-        storage,
-        cache,
-        show_last: false,
-        debug_level: None,
-        meter,
-        clock: &crate::clock::TestClock::default(),
-    }
-    .load(left_out, &mut |_, _| {})
-}
-
-/// [`load_with_cache`], keeping only the conversations.
-#[cfg(test)]
-pub(crate) fn load_sessions_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    show_last: bool,
-    debug_level: Option<DebugLevel>,
-) -> Result<Vec<Conversation>> {
-    load_with_cache(storage, cache, show_last, debug_level).map(|loaded| loaded.conversations)
-}
-
-/// [`rediscover_sessions`] against a caller-chosen cache, on test time.
-#[cfg(test)]
-pub(crate) fn rediscover_sessions_with_cache(
-    storage: &dyn SessionStorage,
-    cache: &SessionCacheStore,
-    show_last: bool,
-    needs_reading: &dyn Fn(&SessionStub) -> bool,
-) -> Result<RediscoveredSessions> {
-    SessionLoader {
-        storage,
-        cache,
-        show_last,
-        debug_level: None,
-        meter: AgentMeter::UNMETERED,
-        clock: &crate::clock::TestClock::default(),
-    }
-    .rediscover(needs_reading)
+    let Some(storage) = environment.storage_of(source) else {
+        return locators
+            .iter()
+            .map(|_| InteractiveRead::settled(None))
+            .collect();
+    };
+    SessionLoader::new(environment, storage, show_last, None, AgentMeter::UNMETERED)
+        .reread(locators, targeted_read)
 }
 
 /// One root's share of [`LoadedSessions`].
@@ -627,14 +469,47 @@ impl RootCaches<'_> {
     };
 }
 
-/// One provider's sessions, loaded against one cache with one set of options.
+/// One provider's sessions, loaded in one environment with one set of
+/// options.
 struct SessionLoader<'a> {
+    environment: &'a Environment,
     storage: &'a dyn SessionStorage,
-    cache: &'a SessionCacheStore,
+    /// `storage`'s shards under the environment's cache base.
+    cache: SessionCacheStore,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     meter: AgentMeter<'a>,
-    clock: &'a dyn Clock,
+}
+
+impl<'a> SessionLoader<'a> {
+    fn new(
+        environment: &'a Environment,
+        storage: &'a dyn SessionStorage,
+        show_last: bool,
+        debug_level: Option<DebugLevel>,
+        meter: AgentMeter<'a>,
+    ) -> Self {
+        Self {
+            environment,
+            storage,
+            cache: SessionCacheStore::in_base(
+                environment.cache_base().map(CacheBase::path),
+                storage.cache(),
+            ),
+            show_last,
+            debug_level,
+            meter,
+        }
+    }
+
+    fn clock(&self) -> &'a dyn Clock {
+        self.environment.clock().as_ref()
+    }
+
+    /// The session cache base this load reads and writes; `None` without one.
+    fn cache_base(&self) -> Option<&'a CacheBase> {
+        self.environment.cache_base()
+    }
 }
 
 impl SessionLoader<'_> {
@@ -788,16 +663,16 @@ impl SessionLoader<'_> {
     /// spans the provider instead of restarting at each root.
     fn discover_every_root(&self) -> Result<Vec<(SessionRoot, DiscoveredSessions)>> {
         self.meter.discovering();
-        let discovering = Instant::now();
+        let discovering = self.clock().now();
         let mut discovered = Vec::new();
         for root in self.storage.roots()? {
-            let found = self.storage.discover(&root)?;
+            let found = self.storage.discover(&root, self.environment.lister())?;
             discovered.push((root, found));
         }
         self.meter.discovered(
             discovered.len(),
             discovered.iter().map(|(_, found)| found.stubs.len()).sum(),
-            discovering.elapsed(),
+            self.clock().elapsed_since(discovering),
         );
         Ok(discovered)
     }
@@ -824,7 +699,9 @@ impl SessionLoader<'_> {
         left_out: LeftOutRows,
         read: &mpsc::Sender<TranscriptProgress>,
     ) -> LoadedRoot {
-        self.load_root_waiting(root, found, left_out, read, &LockWait::starting_now)
+        self.load_root_waiting(root, found, left_out, read, &|| {
+            LockWait::starting_now(self.clock())
+        })
     }
 
     /// [`Self::load_root`], each wait for SQLite's writer lock starting as
@@ -864,16 +741,15 @@ impl SessionLoader<'_> {
         if stubs.is_empty()
             && !self.cache.has_root_files(&root.path)
             && self
-                .cache
-                .base()
-                .is_none_or(|base| !base.join(sqlite_cache::DATABASE_FILE_NAME).exists())
+                .cache_base()
+                .is_none_or(|base| !base.path().join(sqlite_cache::DATABASE_FILE_NAME).exists())
         {
             // Nothing to read, and no cache to remove sessions from.
             return self.load_root_writing(root, stubs, left_out, read, RootCaches::SHARDS_ONLY);
         }
         let deletions = Deletions::of(found);
         let probe_wait = new_lock_wait();
-        let probed = self.open_database(root, &stubs, probe_wait.remaining());
+        let probed = self.open_database(root, &stubs, probe_wait.remaining(self.clock()));
         let is_database_busy = probed.as_ref().is_err_and(sqlite_cache::is_busy_error);
         match self.report_open_failure(probed) {
             Some(snapshot) if !self.needs_refresh(root, &stubs, left_out, &snapshot, deletions) => {
@@ -905,7 +781,7 @@ impl SessionLoader<'_> {
         let stubs = adopt_rediscovery(stubs, found, rediscovered, read);
         let owner = ownership.token();
         self.report_cache_update(
-            owner.write_batch(|| self.cache.migrate_legacy(&root.path, self.clock)),
+            owner.write_batch(|| self.cache.migrate_legacy(&root.path, self.clock())),
         );
         let snapshot = self.open_database_for_refresh(root, &stubs, owner);
         if !owner.can_publish() {
@@ -1115,9 +991,10 @@ impl SessionLoader<'_> {
     /// False when the database cannot hold the root: a refused base, or no
     /// database file and no stubs to write.
     fn may_hold_root(&self, stubs: &[SessionStub]) -> bool {
-        self.cache.base().is_some_and(|base| {
-            !sqlite_cache::is_refused(base)
-                && (!stubs.is_empty() || base.join(sqlite_cache::DATABASE_FILE_NAME).exists())
+        self.cache_base().is_some_and(|base| {
+            !base.is_refused()
+                && (!stubs.is_empty()
+                    || base.path().join(sqlite_cache::DATABASE_FILE_NAME).exists())
         })
     }
 
@@ -1200,7 +1077,8 @@ impl SessionLoader<'_> {
                     .flat_map(|index| self.cache.read_existing_shard(&root.path, index))
                     .collect()
             } else {
-                self.cache.read_existing_metered(&root.path, self.meter)
+                self.cache
+                    .read_existing_metered(&root.path, self.meter, self.clock())
             };
             (external_titles, cached)
         });
@@ -1374,13 +1252,13 @@ impl SessionLoader<'_> {
                 let written = owner.write_batch(|| match caches.deletions {
                     Deletions::Reconcile => {
                         self.cache
-                            .write_shard(&root.path, index, &entries.current, self.clock)
+                            .write_shard(&root.path, index, &entries.current, self.clock())
                     }
                     Deletions::Keep => self.cache.merge_into_shard(
                         &root.path,
                         index,
                         entries.current_in_shard(index),
-                        self.clock,
+                        self.clock(),
                     ),
                 });
                 let failed = written.is_err();
@@ -1431,7 +1309,7 @@ impl SessionLoader<'_> {
                     stub.locator.clone(),
                     self.show_last,
                     external_titles,
-                    self.clock,
+                    self.clock(),
                 );
                 leaves_out(&row).then_some(row)
             })
@@ -1511,19 +1389,19 @@ impl SessionLoader<'_> {
                 self.restore(entry.clone(), stub, external_titles)
             }
             None => {
-                let parsing = self.clock.now();
+                let parsing = self.clock().now();
                 let outcome = parse_session(
                     self.storage,
                     stub,
                     root,
                     self.debug_level,
                     on_transcript_read,
-                    self.clock,
+                    self.clock(),
                 );
                 self.meter.session_parsed(
                     transcript_count(stub),
                     stub.fingerprint.size,
-                    self.clock.elapsed_since(parsing),
+                    self.clock().elapsed_since(parsing),
                 );
                 outcome
             }
@@ -1544,7 +1422,7 @@ impl SessionLoader<'_> {
             stub.locator.clone(),
             self.show_last,
             external_titles,
-            self.clock,
+            self.clock(),
         ))
     }
 }
@@ -1684,9 +1562,11 @@ fn cache_record(
 }
 
 /// `storage`'s session at `stub` under `root`, read from its transcripts as
-/// a load reads a changed session, written to the shard cache for the load
-/// that follows. `meter` records the parse.
+/// a load in `environment` reads a changed session, written to the shard
+/// cache for the load that follows. `meter` records the parse.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sample_record(
+    environment: &Environment,
     storage: &dyn SessionStorage,
     root: &SessionRoot,
     stub: &SessionStub,
@@ -1695,7 +1575,7 @@ pub(crate) fn sample_record(
     meter: AgentMeter,
     check_space: &dyn Fn() -> Result<()>,
 ) -> Result<Option<SessionRecord>> {
-    let clock = crate::clock::SystemClock::new();
+    let clock = environment.clock().as_ref();
     let (parsed, coordinated) = owner.read(|| {
         check_space()?;
         let parsing = clock.now();
@@ -1705,7 +1585,7 @@ pub(crate) fn sample_record(
             root,
             debug_level,
             &|| meter.transcript_read(),
-            &clock,
+            clock,
         );
         meter.session_parsed(
             transcript_count(stub),
@@ -1713,15 +1593,7 @@ pub(crate) fn sample_record(
             clock.elapsed_since(parsing),
         );
         let record = cache_record(storage, root, stub, &outcome);
-        let cache = SessionCacheStore::under(owner.base(), storage.cache());
-        let loader = SessionLoader {
-            storage,
-            cache: &cache,
-            show_last: false,
-            debug_level,
-            meter,
-            clock: &clock,
-        };
+        let loader = SessionLoader::new(environment, storage, false, debug_level, meter);
         let mut entries = CacheEntries::read_from(HashMap::new());
         loader.record(stub, outcome, &mut entries);
         check_space()?;
@@ -1733,7 +1605,7 @@ pub(crate) fn sample_record(
         check_space()?;
         let cache = SessionCacheStore::under(owner.base(), storage.cache());
         owner.write_batch(|| {
-            cache.merge_into_shard(&root.path, shard_index(&stub.cache_key), entries, &clock);
+            cache.merge_into_shard(&root.path, shard_index(&stub.cache_key), entries, clock);
         })?;
     }
     check_space()?;
@@ -2039,15 +1911,124 @@ fn is_locked_by_another_program(_: &std::io::Error) -> bool {
 mod tests {
     use super::cache_access::READ_BATCH_LENGTH;
     use super::*;
-    use crate::history::RefreshOwner;
+    use crate::clock::SystemClock;
     use crate::history::cache::{self, keys_in_distinct_shards};
     use crate::history::load_meter::{ItemCount, LoadMeter, LoadStep, StepProgress};
     use crate::history::parser::{SubagentContribution, SubagentReads};
+    use crate::history::provider::walk::{DirectoryLister, SystemLister};
     use crate::history::provider::{Fingerprint, IgnoredSessions};
     use crate::history::sqlite_cache::refresh::Acquisition;
+    use crate::history::{ProcessIdentity, RefreshOwner};
     use std::collections::{BTreeMap, HashSet};
-    use std::sync::Mutex;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    /// The environment of a load through the session cache under `cache`'s
+    /// base, on the system clock: these tests interleave loads with real
+    /// threads and processes. A load reads only the storage it is given.
+    fn environment_of(cache: &SessionCacheStore) -> Environment {
+        Environment::new(
+            Vec::new(),
+            cache.base().map(Path::to_path_buf),
+            ProcessIdentity::default(),
+            Arc::new(SystemClock::new()),
+            Arc::new(SystemLister),
+        )
+    }
+
+    /// The cache in `directory` as a rearview of its own reaches it.
+    fn rearview(directory: &Path) -> CacheBase {
+        crate::history::sqlite_cache::refresh::tests::rearview(directory)
+    }
+
+    fn load_with_cache(
+        storage: &dyn SessionStorage,
+        cache: &SessionCacheStore,
+        show_last: bool,
+        debug_level: Option<DebugLevel>,
+    ) -> Result<LoadedSessions> {
+        load_leaving_out_with_cache(storage, cache, show_last, debug_level, LeftOutRows::NONE)
+    }
+
+    fn load_leaving_out_with_cache(
+        storage: &dyn SessionStorage,
+        cache: &SessionCacheStore,
+        show_last: bool,
+        debug_level: Option<DebugLevel>,
+        left_out: LeftOutRows,
+    ) -> Result<LoadedSessions> {
+        load_sessions(
+            &environment_of(cache),
+            storage,
+            show_last,
+            debug_level,
+            AgentMeter::UNMETERED,
+            left_out,
+            &mut |_, _| {},
+        )
+    }
+
+    fn load_metered_with_cache(
+        storage: &dyn SessionStorage,
+        cache: &SessionCacheStore,
+        meter: AgentMeter,
+        left_out: LeftOutRows,
+    ) -> Result<LoadedSessions> {
+        load_sessions(
+            &environment_of(cache),
+            storage,
+            false,
+            None,
+            meter,
+            left_out,
+            &mut |_, _| {},
+        )
+    }
+
+    fn load_sessions_with_cache(
+        storage: &dyn SessionStorage,
+        cache: &SessionCacheStore,
+        show_last: bool,
+        debug_level: Option<DebugLevel>,
+    ) -> Result<Vec<Conversation>> {
+        load_with_cache(storage, cache, show_last, debug_level).map(|loaded| loaded.conversations)
+    }
+
+    fn rediscover_sessions_with_cache(
+        storage: &dyn SessionStorage,
+        cache: &SessionCacheStore,
+        show_last: bool,
+        needs_reading: &dyn Fn(&SessionStub) -> bool,
+    ) -> Result<RediscoveredSessions> {
+        rediscover_sessions(
+            &environment_of(cache),
+            storage,
+            show_last,
+            None,
+            needs_reading,
+        )
+    }
+
+    /// [`cache_sessions`] for one session in `cache`'s environment, through
+    /// `storage` whatever its source.
+    fn cache_session_with_cache(
+        storage: &dyn SessionStorage,
+        cache: &SessionCacheStore,
+        locator: &Path,
+        show_last: bool,
+    ) -> InteractiveRead<Option<SessionRead>> {
+        let environment = environment_of(cache);
+        SessionLoader::new(
+            &environment,
+            storage,
+            show_last,
+            None,
+            AgentMeter::UNMETERED,
+        )
+        .reread(&[locator], TargetedRead::Caching)
+        .pop()
+        .expect("one result per locator")
+    }
 
     /// Virtual locators verify that the shared load loop leaves a provider's
     /// storage interpretation to the provider.
@@ -2221,7 +2202,11 @@ mod tests {
             Ok(self.roots.clone())
         }
 
-        fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+        fn discover(
+            &self,
+            root: &SessionRoot,
+            _lister: &dyn DirectoryLister,
+        ) -> Result<DiscoveredSessions> {
             *self.discoveries.lock().unwrap() += 1;
             if let Some(found) = self.discovery_results.lock().unwrap().pop_front() {
                 return found;
@@ -2244,6 +2229,7 @@ mod tests {
             &self,
             _root: &SessionRoot,
             _locator: &Path,
+            _lister: &dyn DirectoryLister,
         ) -> Result<Option<SessionStub>> {
             Ok(None)
         }
@@ -2377,8 +2363,12 @@ mod tests {
             let base = tempfile::tempdir().unwrap();
             let meter = LoadMeter::default();
             let agent_meter = meter.agent(row.source);
-            let ownership = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+            let cache = SessionCacheStore::under(base.path(), storage.cache());
+            let environment = environment_of(&cache);
+            let ownership =
+                RefreshOwnership::acquire(environment.cache_base().unwrap(), || ()).unwrap();
             let record = sample_record(
+                &environment,
                 storage,
                 &root,
                 &stub,
@@ -2394,17 +2384,9 @@ mod tests {
             database.admit_storage(storage.cache()).unwrap();
             database.write(&record).unwrap();
             drop(record);
-            let cache = SessionCacheStore::under(base.path(), storage.cache());
             let shard = shard_file_of_session(base.path(), &stub.cache_key);
             std::fs::write(&shard, b"unreadable legacy shard").unwrap();
-            let loader = SessionLoader {
-                storage,
-                cache: &cache,
-                show_last: false,
-                debug_level: None,
-                meter: agent_meter,
-                clock: &crate::clock::TestClock::default(),
-            };
+            let loader = SessionLoader::new(&environment, storage, false, None, agent_meter);
             let (read, _) = mpsc::channel();
 
             let loaded = loader.load_root(
@@ -2454,22 +2436,16 @@ mod tests {
         let storage = VirtualStorage::new(vec![old.clone(), added.clone()]);
         let cache = SessionCacheStore::under(base.path(), storage.cache());
         let root = SessionRoot::new("container.db");
-        let database = SqliteCache::open(base.path()).unwrap();
+        let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         drop(database);
         let owner = OtherProcessOwner::hold(base.path());
         let meter = LoadMeter::default();
-        let clock = crate::clock::TestClock::default();
+        let environment = environment_of(&cache);
         std::thread::scope(|scope| {
-            let loader = SessionLoader {
-                storage: &storage,
-                cache: &cache,
-                show_last: false,
-                debug_level: None,
-                meter: meter.agent(Source::Pi),
-                clock: &clock,
-            };
+            let loader =
+                SessionLoader::new(&environment, &storage, false, None, meter.agent(Source::Pi));
             let captured = DiscoveredSessions::complete(vec![old.clone()]);
             let root_ref = &root;
             let (read, updates) = mpsc::channel();
@@ -2509,7 +2485,9 @@ mod tests {
                 "the waiter's cache snapshot includes the owner's writes"
             );
         });
-        let database = SqliteCache::open_waiting(base.path()).unwrap().unwrap();
+        let database = SqliteCache::open_waiting(&rearview(base.path()))
+            .unwrap()
+            .unwrap();
         let keys: HashSet<_> = database
             .stored_keys(storage.cache(), &root.path)
             .unwrap()
@@ -2526,7 +2504,7 @@ mod tests {
         let storage = VirtualStorage::new(vec![stub.clone()]);
         let cache = SessionCacheStore::under(base.path(), storage.cache());
         let root = SessionRoot::new("container.db");
-        let mut database = SqliteCache::open(base.path()).unwrap();
+        let mut database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         database
@@ -2631,20 +2609,14 @@ mod tests {
             VirtualStorage::new(vec![target.clone(), virtual_stub("ses_other", 300, 3_000)]);
         let cache = SessionCacheStore::under(base.path(), storage.cache());
         let root = SessionRoot::new("container.db");
-        let database = SqliteCache::open(base.path()).unwrap();
+        let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         drop(database);
         let shards_before = shard_files_under(base.path());
         let owner = OtherProcessOwner::hold(base.path());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let started = Instant::now();
         let read = loader.read_one(&root, target);
@@ -2660,7 +2632,9 @@ mod tests {
         assert!(matches!(read.value, SessionRead::Listed(_)));
         assert_eq!(storage.parsed_ids(), ["ses_target"]);
         owner.release();
-        let database = SqliteCache::open_waiting(base.path()).unwrap().unwrap();
+        let database = SqliteCache::open_waiting(&rearview(base.path()))
+            .unwrap()
+            .unwrap();
         assert!(
             database
                 .stored_keys(storage.cache(), &root.path)
@@ -2681,14 +2655,8 @@ mod tests {
         let root = SessionRoot::new("container.db");
         admit_database(base.path());
         let rebuild = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let started = Instant::now();
         let read = loader.read_one(&root, target);
@@ -2722,14 +2690,8 @@ mod tests {
         let cache = SessionCacheStore::under(base.path(), storage.cache());
         let root = SessionRoot::new("container.db");
         admit_database(base.path());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let read = loader.cache_one(&root, stub);
 
@@ -2744,7 +2706,7 @@ mod tests {
         assert!(shard_files_under(base.path()).is_empty());
         assert!(
             matches!(
-                RefreshOwnership::try_acquire_now(base.path()).unwrap(),
+                RefreshOwnership::try_acquire_now(&rearview(base.path())).unwrap(),
                 Acquisition::Acquired(_)
             ),
             "the read releases refresh ownership"
@@ -2857,14 +2819,8 @@ mod tests {
             virtual_stub("ses_by_id", 200, 2_000),
         ]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         let root = SessionRoot::new("container.db");
         loader
             .cache_row(&root, &virtual_stub("ses_listed", 100, 1_000))
@@ -2877,7 +2833,7 @@ mod tests {
         assert!(by_id.path.ends_with("ses_by_id.jsonl"));
         assert_eq!(storage.parsed_ids(), vec!["ses_by_id", "ses_listed"]);
         let mut keys = cache
-            .read(&root.path, loader.clock)
+            .read(&root.path, loader.clock())
             .into_keys()
             .collect::<Vec<_>>();
         keys.sort();
@@ -2906,17 +2862,15 @@ mod tests {
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
         let mut reports = Vec::new();
 
-        SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        }
-        .load(LeftOutRows::NONE, &mut |done, total| {
-            reports.push((done, total))
-        })
+        load_sessions(
+            &environment_of(&cache),
+            &storage,
+            false,
+            None,
+            AgentMeter::UNMETERED,
+            LeftOutRows::NONE,
+            &mut |done, total| reports.push((done, total)),
+        )
         .unwrap();
 
         assert_eq!(reports, vec![(0, 3), (1, 3), (2, 3), (3, 3)]);
@@ -2934,16 +2888,7 @@ mod tests {
             .with_ignored(0, "sessions archived");
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
 
-        let loaded = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        }
-        .load(LeftOutRows::NONE, &mut |_, _| {})
-        .unwrap();
+        let loaded = load_with_cache(&storage, &cache, false, None).unwrap();
 
         assert_eq!(loaded.conversations.len(), 1);
         assert_eq!(
@@ -2959,14 +2904,8 @@ mod tests {
         let cache_base = tempfile::tempdir().unwrap();
         let storage = VirtualStorage::new(vec![virtual_stub("ses_first", 100, 1_000)]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         loader.load(LeftOutRows::NONE, &mut |_, _| {}).unwrap();
 
@@ -3022,7 +2961,7 @@ mod tests {
                 .push(is_writer_locked(&observed_base));
         }));
         let cache = SessionCacheStore::under(base.path(), storage.cache());
-        let database = SqliteCache::open(base.path()).unwrap();
+        let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         drop(database);
@@ -3030,7 +2969,9 @@ mod tests {
         assert_eq!(loaded.len(), 13);
         assert_eq!(storage.parse_count(), 13);
         let root = SessionRoot::new("container.db");
-        let database = SqliteCache::open_waiting(base.path()).unwrap().unwrap();
+        let database = SqliteCache::open_waiting(&rearview(base.path()))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             database
                 .stored_keys(storage.cache(), &root.path)
@@ -3042,14 +2983,8 @@ mod tests {
         // writer lock.
         let extra = virtual_stub("ses_extra", 100, 1_000);
         storage.stubs.push(extra.clone());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         assert!(loader.cache_row(&root, &extra).is_some());
         let locked_during_parse = locked_during_parse.lock().unwrap();
         assert_eq!(locked_during_parse.len(), 14);
@@ -3086,14 +3021,8 @@ mod tests {
             .unwrap()
             .extend([Ok(before), Ok(after)]);
         let cache = SessionCacheStore::under(base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         let loaded = loader.load(LeftOutRows::NONE, &mut |_, _| {}).unwrap();
         assert_eq!(
             loaded.ignored,
@@ -3119,14 +3048,8 @@ mod tests {
             Ok(DiscoveredSessions::complete(Vec::new())),
         ]);
         let cache = SessionCacheStore::under(base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         assert!(
             loader.reread(&[&stub.locator], TargetedRead::Caching)[0]
                 .value
@@ -3141,16 +3064,10 @@ mod tests {
         let stub = virtual_stub("ses_readable", 100, 1_000);
         let storage = VirtualStorage::new(vec![stub.clone()]);
         let cache = SessionCacheStore::under(base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
-        let ownership = RefreshOwnership::acquire(base.path(), || ()).unwrap();
-        let replacement = replace_owner(base.path());
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
+        let ownership = RefreshOwnership::acquire(&rearview(base.path()), || ()).unwrap();
+        let replacement = replace_owner(&rearview(base.path()));
         let Err(read_only) = loader.rediscover_owned(&SessionRoot::new("container.db"), ownership)
         else {
             panic!("the lost ownership was kept");
@@ -3174,7 +3091,7 @@ mod tests {
             }),
         ]);
         let cache = SessionCacheStore::under(base.path(), storage.cache());
-        let database = SqliteCache::open(base.path()).unwrap();
+        let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         drop(database);
@@ -3184,7 +3101,9 @@ mod tests {
         assert_eq!(loaded.conversations.len(), 1);
         assert_eq!(*storage.discoveries.lock().unwrap(), 2);
         assert_eq!(storage.parsed_ids(), ["ses_readable"]);
-        let database = SqliteCache::open_waiting(base.path()).unwrap().unwrap();
+        let database = SqliteCache::open_waiting(&rearview(base.path()))
+            .unwrap()
+            .unwrap();
         assert!(
             database
                 .stored_keys(storage.cache(), &SessionRoot::new("container.db").path)
@@ -3195,7 +3114,7 @@ mod tests {
         assert!(shard_files_under(base.path()).is_empty());
         assert!(
             matches!(
-                RefreshOwnership::try_acquire_now(base.path()).unwrap(),
+                RefreshOwnership::try_acquire_now(&rearview(base.path())).unwrap(),
                 Acquisition::Acquired(_)
             ),
             "the load releases refresh ownership"
@@ -3214,14 +3133,9 @@ mod tests {
             fail_every_commit_after_acquisition(base.path());
             let fresh = virtual_stub("ses_readable", 200, 2_000);
             let storage = VirtualStorage::new(vec![fresh.clone()]);
-            let loader = SessionLoader {
-                storage: &storage,
-                cache: &cache,
-                show_last: false,
-                debug_level: None,
-                meter: AgentMeter::UNMETERED,
-                clock: &crate::clock::TestClock::default(),
-            };
+            let environment = environment_of(&cache);
+            let loader =
+                SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
             let row = if targeted {
                 loader
                     .cache_row(&SessionRoot::new("container.db"), &old)
@@ -3274,14 +3188,8 @@ mod tests {
         storage.before_parse = Some(Box::new(move |_| {
             *started.lock().unwrap() = Some(OtherProcessOwner::hold(&replacement_base));
         }));
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let read = loader.cache_one(&SessionRoot::new("container.db"), changed);
 
@@ -3305,14 +3213,8 @@ mod tests {
         let cache = SessionCacheStore::under(base.path(), storage.cache());
         admit_database(base.path());
         let rebuild = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         let limit = Duration::from_secs(3);
         let (read, _) = mpsc::channel();
 
@@ -3322,7 +3224,7 @@ mod tests {
             DiscoveredSessions::complete(storage.stubs.clone()),
             LeftOutRows::NONE,
             &read,
-            &|| LockWait::starting_now_for(limit),
+            &|| LockWait::starting_now_for(environment.clock().as_ref(), limit),
         );
 
         let elapsed = started.elapsed();
@@ -3371,7 +3273,7 @@ mod tests {
             .collect();
         let seeded = VirtualStorage::new(old.clone());
         let cache = SessionCacheStore::under(base.path(), seeded.cache());
-        let database = SqliteCache::open(base.path()).unwrap();
+        let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(seeded.cache()).unwrap();
         drop(database);
@@ -3413,14 +3315,8 @@ mod tests {
                     Some(connection.execute_batch("DROP TRIGGER fail_commit").is_ok());
             }
         }));
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         let mut rows = if targeted {
             loader
                 .read_stubs(
@@ -3508,17 +3404,19 @@ mod tests {
         let stub = virtual_stub("ses_sample", 100, 1_000);
         let root = SessionRoot::new("container.db");
         let storage = VirtualStorage::new(vec![stub.clone()]);
-        let ownership = RefreshOwnership::acquire(base.path(), || ()).unwrap();
+        let ownership = RefreshOwnership::acquire(&rearview(base.path()), || ()).unwrap();
         ownership
             .token()
-            .write_batch(|| storage.discover(&root))
+            .write_batch(|| storage.discover(&root, &SystemLister))
             .unwrap()
             .unwrap();
         let connection =
             rusqlite::Connection::open(base.path().join(sqlite_cache::DATABASE_FILE_NAME)).unwrap();
         connection.execute_batch("CREATE TRIGGER fail_commit BEFORE UPDATE OF last_commit_ms ON refresh_state WHEN NEW.owner = OLD.owner BEGIN SELECT RAISE(ABORT, 'injected timestamp failure'); END;").unwrap();
+        let cache = SessionCacheStore::under(base.path(), storage.cache());
         assert!(
             sample_record(
+                &environment_of(&cache),
                 &storage,
                 &root,
                 &stub,
@@ -3732,12 +3630,12 @@ mod tests {
             fixture.write_session(home.path(), fixture.ids().session);
             let root = fixture.root_under(home.path());
             let storage = fixture.storage().cache();
-            SqliteCache::open(base.path())
+            SqliteCache::open(&rearview(base.path()))
                 .unwrap()
                 .mark_admitted()
                 .unwrap();
             super::super::contract_tests::load_under(fixture, home.path(), base.path());
-            let mut database = SqliteCache::open(base.path()).unwrap();
+            let mut database = SqliteCache::open(&rearview(base.path())).unwrap();
             let keys = database.stored_keys(storage, &root.path).unwrap();
             assert_eq!(keys.len(), 1);
             database.remove(storage, &root.path, &keys).unwrap();
@@ -3745,7 +3643,9 @@ mod tests {
 
             super::super::contract_tests::load_under(fixture, home.path(), base.path());
 
-            let database = SqliteCache::open_waiting(base.path()).unwrap().unwrap();
+            let database = SqliteCache::open_waiting(&rearview(base.path()))
+                .unwrap()
+                .unwrap();
             assert!(
                 !database
                     .entries(storage, &root.path, &keys[0])
@@ -3765,12 +3665,14 @@ mod tests {
             fixture.write_session(home.path(), fixture.ids().session);
             let root = fixture.root_under(home.path());
             let storage = fixture.storage().cache();
-            SqliteCache::open(base.path())
+            SqliteCache::open(&rearview(base.path()))
                 .unwrap()
                 .mark_admitted()
                 .unwrap();
             super::super::contract_tests::load_under(fixture, home.path(), base.path());
-            let database = SqliteCache::open_waiting(base.path()).unwrap().unwrap();
+            let database = SqliteCache::open_waiting(&rearview(base.path()))
+                .unwrap()
+                .unwrap();
             let fingerprint = database.current_fingerprints(storage, &root.path).unwrap();
             assert_eq!(fingerprint.len(), 1);
             let connection =
@@ -3906,7 +3808,9 @@ mod tests {
 
         load_sessions_with_cache(&partial, &cache, false, None).unwrap();
 
-        let database = SqliteCache::open_waiting(base.path()).unwrap().unwrap();
+        let database = SqliteCache::open_waiting(&rearview(base.path()))
+            .unwrap()
+            .unwrap();
         let current = database
             .current_fingerprints(partial.cache(), Path::new("container.db"))
             .unwrap();
@@ -3936,14 +3840,8 @@ mod tests {
         ));
         let cache = SessionCacheStore::under(base.path(), storage.cache());
         admit_database(base.path());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let read = loader.cache_one(&SessionRoot::new("container.db"), added);
 
@@ -3954,12 +3852,15 @@ mod tests {
 
     /// Complete disk admission of `base`'s database, as a first build does.
     fn admit_database(base: &Path) {
-        SqliteCache::open(base).unwrap().mark_admitted().unwrap();
+        SqliteCache::open(&rearview(base))
+            .unwrap()
+            .mark_admitted()
+            .unwrap();
     }
 
     /// The cache keys `base`'s database stores for `storage`'s root.
     fn stored_keys_under(base: &Path, storage: &VirtualStorage) -> Vec<String> {
-        SqliteCache::open_waiting(base)
+        SqliteCache::open_waiting(&rearview(base))
             .unwrap()
             .unwrap()
             .stored_keys(storage.cache(), Path::new("container.db"))
@@ -4011,14 +3912,8 @@ mod tests {
                 path: PathBuf::from("container.db"),
                 error: "temporarily unavailable".to_owned(),
             });
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         loader.load_discovered(
             vec![(SessionRoot::new("container.db"), partial)],
@@ -4038,7 +3933,7 @@ mod tests {
         let locator = fixture.write_session(home.path(), fixture.ids().session);
         let root = fixture.root_under(home.path());
         let storage = fixture.storage();
-        SqliteCache::open(cache_base.path())
+        SqliteCache::open(&rearview(cache_base.path()))
             .unwrap()
             .mark_admitted()
             .unwrap();
@@ -4057,7 +3952,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let written = SqliteCache::open(cache_base.path())
+        let written = SqliteCache::open(&rearview(cache_base.path()))
             .unwrap()
             .entries(storage.cache(), &root.path, &cache_key)
             .unwrap()
@@ -4502,14 +4397,8 @@ mod tests {
         let (listed, by_id) = (&stubs[0], &stubs[1]);
         let storage = VirtualStorage::new(stubs.clone());
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         let root = SessionRoot::new("container.db");
         loader.cache_row(&root, listed).unwrap();
         let written = shard_files_under(cache_base.path());
@@ -4532,14 +4421,8 @@ mod tests {
         let by_id = &stubs[1];
         let storage = VirtualStorage::new(stubs.clone());
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         let root = SessionRoot::new("container.db");
         loader.load_root(
             &root,
@@ -4549,7 +4432,7 @@ mod tests {
         );
         let parsed_by_the_load = storage.parsed_ids().len();
 
-        let shard = cache.read_shard(&root.path, shard_index(&by_id.cache_key), loader.clock);
+        let shard = cache.read_shard(&root.path, shard_index(&by_id.cache_key), loader.clock());
         loader.load_one(&root, by_id).unwrap();
 
         assert_eq!(shard.keys().collect::<Vec<_>>(), [&by_id.cache_key]);
@@ -4573,14 +4456,8 @@ mod tests {
         .unreadable(["ses_unreadable"])
         .failing_transiently(["ses_busy"]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let loaded = loader.load(LeftOutRows::NONE, &mut |_, _| {}).unwrap();
 
@@ -4686,15 +4563,9 @@ mod tests {
         let storage = VirtualStorage::new(vec![first.clone(), second.clone()]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
 
-        let reads = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        }
-        .reread(&[&second.locator, &first.locator], TargetedRead::Caching);
+        let environment = environment_of(&cache);
+        let reads = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED)
+            .reread(&[&second.locator, &first.locator], TargetedRead::Caching);
 
         assert_eq!(
             *storage.discoveries.lock().unwrap(),
@@ -4830,14 +4701,8 @@ mod tests {
         .failing_transiently(["ses_busy"])
         .unreadable(["ses_unreadable"]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let rediscovered = loader.rediscover(&|_| true).unwrap();
 
@@ -5002,14 +4867,8 @@ mod tests {
             virtual_stub("ses_other", 50, 500),
         ]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
 
         let reports = progress_of_load(&loader);
 
@@ -5028,14 +4887,8 @@ mod tests {
         ])
         .holding_nothing(["ses_empty"]);
         let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
-        let loader = SessionLoader {
-            storage: &storage,
-            cache: &cache,
-            show_last: false,
-            debug_level: None,
-            meter: AgentMeter::UNMETERED,
-            clock: &crate::clock::TestClock::default(),
-        };
+        let environment = environment_of(&cache);
+        let loader = SessionLoader::new(&environment, &storage, false, None, AgentMeter::UNMETERED);
         progress_of_load(&loader);
 
         let reports = progress_of_load(&loader);

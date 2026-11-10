@@ -35,13 +35,7 @@ impl Conversation {
             .source
             .provider()
             .storage()
-            .parse_session(
-                &stub,
-                &root,
-                None,
-                &|| {},
-                &crate::clock::SystemClock::new(),
-            )?
+            .parse_session(&stub, &root, None, &|| {}, cached.clock())?
             .ok_or_else(|| AppError::UnrecognizedTranscript(self.path.display().to_string()))?;
         Ok(Cow::Owned(content))
     }

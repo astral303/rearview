@@ -53,7 +53,7 @@ fn listed_sessions(
     for root in storage.roots_in(environment)? {
         locators.extend(
             storage
-                .discover(&root)?
+                .discover(&root, &super::walk::SystemLister)?
                 .stubs
                 .into_iter()
                 .map(|stub| stub.locator),

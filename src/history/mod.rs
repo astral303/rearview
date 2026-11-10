@@ -13,6 +13,7 @@
 pub mod cache;
 mod content;
 mod display_entries;
+pub(crate) mod environment;
 mod filter;
 pub mod format;
 pub mod load_meter;
@@ -41,6 +42,7 @@ pub use display_entries::{
     DisplayEntries, EntryOrigin, display_log_entries_interactively, display_log_entries_waiting,
     sniffed_display_log_entries,
 };
+pub use environment::Environment;
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub(crate) use loader::SeenPaths;
 pub use loader::{
@@ -56,8 +58,12 @@ pub use refresh::{
     KnownSessions, RefreshOptions, RefreshOutcome, SessionChanges, UpdatedSession,
     refresh_in_background, refresh_sessions,
 };
+#[cfg(test)]
+pub use sqlite_cache::ProcessIdentity;
 pub use sqlite_cache::refresh::RefreshOwner;
-pub use sqlite_cache::{CacheFollowUp, DrawingThread, InteractiveCache, InteractiveRead};
+pub use sqlite_cache::{
+    CacheBase, CacheFollowUp, DrawingThread, InteractiveCache, InteractiveRead,
+};
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
 };

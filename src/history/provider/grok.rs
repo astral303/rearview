@@ -6,7 +6,7 @@
 //! reads the parent's `subagents/<id>/meta.json` to attach each sub-agent to
 //! its parent.
 
-use super::walk::{self, SessionFiles};
+use super::walk::{self, DirectoryLister, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
@@ -146,8 +146,8 @@ impl SessionDeleter for GrokProvider {
         let sessions_root = sessions_root_of(&session_dir);
         let subagent_dirs = match sessions_root {
             Some(root) => {
-                let index = SessionDirectories::probing(root);
-                subagent_session_dirs(&session_dir, &|id| index.locate(id))
+                let index = SessionDirectories::probing(&SystemLister, root);
+                subagent_session_dirs(&SystemLister, &session_dir, &|id| index.locate(id))
             }
             None => Vec::new(),
         };
@@ -179,9 +179,13 @@ impl SubagentFinder for GrokProvider {
         let Some(sessions_root) = sessions_root_of(&session_dir) else {
             return Ok(Vec::new());
         };
-        let index = SessionDirectories::probing(sessions_root);
+        let index = SessionDirectories::probing(&SystemLister, sessions_root);
         let locate = |id: &str| index.locate(id);
-        Ok(subagent_transcripts_of(&session_dir, &locate))
+        Ok(subagent_transcripts_of(
+            &SystemLister,
+            &session_dir,
+            &locate,
+        ))
     }
 }
 
@@ -198,7 +202,7 @@ impl SessionIdResolver for GrokProvider {
             return Ok(None);
         }
         for root in GrokStorage.roots()? {
-            if let Some(stub) = session_stub_of(&root, session_id) {
+            if let Some(stub) = session_stub_of(&SystemLister, &root, session_id) {
                 return Ok(Some(ResolvedSession { root, stub }));
             }
         }
@@ -207,11 +211,15 @@ impl SessionIdResolver for GrokProvider {
 }
 
 /// The stub of `session_id` under `root`, probing the cwd directories for it
-/// and for each sub-agent it names.
-fn session_stub_of(root: &SessionRoot, session_id: &str) -> Option<SessionStub> {
-    let index = SessionDirectories::probing(&root.path);
+/// and for each sub-agent it names, listed through `lister`.
+fn session_stub_of(
+    lister: &dyn DirectoryLister,
+    root: &SessionRoot,
+    session_id: &str,
+) -> Option<SessionStub> {
+    let index = SessionDirectories::probing(lister, &root.path);
     let directory = index.locate(&crate::search::session_id_for_lookup(session_id))?;
-    session_stub(root, &directory, &|id| index.locate(id))
+    session_stub(lister, root, &directory, &|id| index.locate(id))
 }
 
 /// The session directory a locator sits in, when it is a Grok session
@@ -303,7 +311,9 @@ fn evict_from_search_index(index: &Path, session_ids: &[String]) {
 
 /// The session directories under a sessions root, by session id: the
 /// directories two levels down that hold a `summary.json`.
-struct SessionDirectories {
+struct SessionDirectories<'a> {
+    /// Lists every directory a walk or a probe reads.
+    lister: &'a dyn DirectoryLister,
     sessions_root: PathBuf,
     /// Every session directory, sorted, when the whole tree was walked;
     /// `None` for a lookup that probes the cwd directories instead.
@@ -312,15 +322,15 @@ struct SessionDirectories {
     by_id: HashMap<String, PathBuf>,
 }
 
-impl SessionDirectories {
+impl<'a> SessionDirectories<'a> {
     /// Every session directory under `sessions_root`. A missing root returns
     /// none rather than an error: the user has not installed Grok.
-    fn walk(sessions_root: &Path) -> Result<Self> {
+    fn walk(lister: &'a dyn DirectoryLister, sessions_root: &Path) -> Result<Self> {
         let mut directories = Vec::new();
         if sessions_root.exists() {
-            for cwd_dir in walk::subdirectories(sessions_root)? {
+            for cwd_dir in walk::subdirectories(lister, sessions_root)? {
                 directories.extend(
-                    walk::subdirectories(&cwd_dir)?
+                    walk::subdirectories(lister, &cwd_dir)?
                         .into_iter()
                         .filter(|directory| directory.join(SUMMARY_FILE).is_file()),
                 );
@@ -334,6 +344,7 @@ impl SessionDirectories {
             }
         }
         Ok(Self {
+            lister,
             sessions_root: sessions_root.to_path_buf(),
             walked: Some(directories),
             by_id,
@@ -341,8 +352,9 @@ impl SessionDirectories {
     }
 
     /// A lookup that probes `<sessions_root>/*/<id>/` for each id asked.
-    fn probing(sessions_root: &Path) -> Self {
+    fn probing(lister: &'a dyn DirectoryLister, sessions_root: &Path) -> Self {
         Self {
+            lister,
             sessions_root: sessions_root.to_path_buf(),
             walked: None,
             by_id: HashMap::new(),
@@ -356,7 +368,7 @@ impl SessionDirectories {
         if self.walked.is_some() {
             return self.by_id.get(id).cloned();
         }
-        let mut cwd_dirs = walk::subdirectories(&self.sessions_root).ok()?;
+        let mut cwd_dirs = walk::subdirectories(self.lister, &self.sessions_root).ok()?;
         cwd_dirs.sort();
         cwd_dirs
             .into_iter()
@@ -366,9 +378,10 @@ impl SessionDirectories {
 }
 
 /// The `child_session_id` of each `subagents/*/meta.json` in `session_dir`,
-/// in directory order. A `meta.json` that cannot be read is skipped.
-fn child_session_ids(session_dir: &Path) -> Vec<String> {
-    let Ok(mut entries) = walk::subdirectories(&session_dir.join("subagents")) else {
+/// listed through `lister`, in directory order. A `meta.json` that cannot be
+/// read is skipped.
+fn child_session_ids(lister: &dyn DirectoryLister, session_dir: &Path) -> Vec<String> {
+    let Ok(mut entries) = walk::subdirectories(lister, &session_dir.join("subagents")) else {
         return Vec::new();
     };
     entries.sort();
@@ -389,16 +402,18 @@ fn child_session_ids(session_dir: &Path) -> Vec<String> {
 /// flattened after their parent, each once. A missing sub-agent directory is
 /// skipped.
 fn subagent_session_dirs(
+    lister: &dyn DirectoryLister,
     session_dir: &Path,
     locate: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Vec<PathBuf> {
     fn collect(
+        lister: &dyn DirectoryLister,
         session_dir: &Path,
         locate: &dyn Fn(&str) -> Option<PathBuf>,
         seen: &mut HashSet<String>,
         found: &mut Vec<PathBuf>,
     ) {
-        for child in child_session_ids(session_dir) {
+        for child in child_session_ids(lister, session_dir) {
             if !seen.insert(child.clone()) {
                 continue;
             }
@@ -406,22 +421,23 @@ fn subagent_session_dirs(
                 continue;
             };
             found.push(child_dir.clone());
-            collect(&child_dir, locate, seen, found);
+            collect(lister, &child_dir, locate, seen, found);
         }
     }
     let mut seen = directory_name(session_dir).into_iter().collect();
     let mut found = Vec::new();
-    collect(session_dir, locate, &mut seen, &mut found);
+    collect(lister, session_dir, locate, &mut seen, &mut found);
     found
 }
 
 /// The transcript of every sub-agent session `session_dir` names, nested ones
 /// flattened after their parent.
 fn subagent_transcripts_of(
+    lister: &dyn DirectoryLister,
     session_dir: &Path,
     locate: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Vec<PathBuf> {
-    subagent_session_dirs(session_dir, locate)
+    subagent_session_dirs(lister, session_dir, locate)
         .into_iter()
         .map(|directory| directory.join(UPDATES_FILE))
         .collect()
@@ -432,12 +448,13 @@ fn subagent_transcripts_of(
 /// has no transcript; its summary supplies the fingerprint, and the session
 /// reads as empty.
 fn session_stub(
+    lister: &dyn DirectoryLister,
     root: &SessionRoot,
     session_dir: &Path,
     locate: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<SessionStub> {
     let transcript = session_dir.join(UPDATES_FILE);
-    let subagents = subagent_transcripts_of(session_dir, locate);
+    let subagents = subagent_transcripts_of(lister, session_dir, locate);
     if let Some(stub) = walk::session_stubs(
         root,
         vec![SessionFiles {
@@ -487,19 +504,25 @@ impl SessionStorage for GrokStorage {
     /// Every session directory is a session, unless some session's
     /// `subagents/` names it: then its transcript is that session's
     /// sub-agent transcript.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        let directories = SessionDirectories::walk(&root.path)?;
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        let directories = SessionDirectories::walk(lister, &root.path)?;
         let walked = directories.walked.as_deref().unwrap_or_default();
         let children: HashSet<String> = walked
             .iter()
-            .flat_map(|directory| child_session_ids(directory))
+            .flat_map(|directory| child_session_ids(lister, directory))
             .collect();
         let stubs = walked
             .iter()
             .filter(|directory| {
                 directory_name(directory).is_none_or(|name| !children.contains(&name))
             })
-            .filter_map(|directory| session_stub(root, directory, &|id| directories.locate(id)))
+            .filter_map(|directory| {
+                session_stub(lister, root, directory, &|id| directories.locate(id))
+            })
             .collect();
         Ok(DiscoveredSessions::complete(stubs))
     }
@@ -510,9 +533,11 @@ impl SessionStorage for GrokStorage {
         &self,
         root: &SessionRoot,
         locator: &Path,
+        lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
         let session_dir = session_dir_of(locator)?;
-        Ok(directory_name(&session_dir).and_then(|session_id| session_stub_of(root, &session_id)))
+        Ok(directory_name(&session_dir)
+            .and_then(|session_id| session_stub_of(lister, root, &session_id)))
     }
 
     fn parse_session(
@@ -536,7 +561,7 @@ impl SessionStorage for GrokStorage {
     /// in rearview changes that file, not the transcript the cache validates
     /// against.
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
-        let Ok(directories) = SessionDirectories::walk(&root.path) else {
+        let Ok(directories) = SessionDirectories::walk(&SystemLister, &root.path) else {
             return HashMap::new();
         };
         directories
@@ -743,7 +768,7 @@ pub(super) mod tests {
 
     impl GrokFixtureIndex {
         fn locate(home: &Path, id: &str) -> PathBuf {
-            SessionDirectories::probing(&sessions_under(home))
+            SessionDirectories::probing(&SystemLister, &sessions_under(home))
                 .locate(id)
                 .unwrap()
         }
@@ -914,7 +939,10 @@ pub(super) mod tests {
                 return Ok(None);
             }
             let root = self.root_under(home);
-            Ok(session_stub_of(&root, id).map(|stub| ResolvedSession { root, stub }))
+            Ok(
+                session_stub_of(&SystemLister, &root, id)
+                    .map(|stub| ResolvedSession { root, stub }),
+            )
         }
 
         fn expected_fork(&self, _locator: &Path) -> ExpectedCommand {
@@ -945,7 +973,7 @@ pub(super) mod tests {
 
     fn discovered(home: &Path) -> Vec<SessionStub> {
         GrokStorage
-            .discover(&SessionRoot::new(sessions_under(home)))
+            .discover(&SessionRoot::new(sessions_under(home)), &SystemLister)
             .unwrap()
             .stubs
     }

@@ -1,9 +1,10 @@
 //! `Ctrl+R` in the viewer: the open session read again from its file.
 
+use super::claude_home::{ClaudeHome, app_reading};
 use super::refresh_tests::refresh_found;
 use super::*;
 use crate::clock::TestClock;
-use crate::history::provider::{ReadError, SessionRead};
+use crate::history::environment::test_support::test_environment;
 use crate::history::{SessionChanges, Source, UpdatedSession};
 
 const VIEWPORT: usize = 10;
@@ -26,15 +27,21 @@ fn numbered(range: std::ops::Range<usize>) -> Vec<String> {
 }
 
 fn write_messages(path: &Path, texts: &[String]) {
-    let lines: Vec<String> = texts.iter().map(|text| user_line(text)).collect();
-    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    write_lines(path, texts.iter().map(|text| user_line(text)).collect());
 }
 
 /// `count` messages, message N sent at second N.
 fn write_timed_messages(path: &Path, count: usize) {
-    let lines: Vec<String> = (0..count)
-        .map(|index| user_line_at(&format!("message {index}"), index))
-        .collect();
+    write_lines(
+        path,
+        (0..count)
+            .map(|index| user_line_at(&format!("message {index}"), index))
+            .collect(),
+    );
+}
+
+fn write_lines(path: &Path, lines: Vec<String>) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
@@ -60,58 +67,21 @@ fn tool_run_lines() -> Vec<String> {
     .to_vec()
 }
 
-/// The session's row as the list reads it from its file alone, with the
-/// sub-agent transcripts the row already lists: these files live in temporary
-/// directories that no agent's discovery lists.
-fn read_from_its_file(row: &Conversation, _show_last: bool) -> Option<SessionRead> {
-    let mut read = crate::history::parser::process_conversation_file(row.path.clone(), None, None)
-        .ok()
-        .flatten()?;
-    read.index = row.index;
-    read.subagents = row.subagents.clone();
-    Some(SessionRead::Listed(Box::new(read)))
-}
-
 fn row_from_file(path: &Path) -> Conversation {
     crate::history::parser::process_conversation_file(path.to_path_buf(), None, None)
         .unwrap()
         .unwrap()
 }
 
-/// The list holding the session at `path`, open in the viewer.
-fn viewer_on(path: &Path) -> App {
-    viewer_on_with_subagents(path, Vec::new())
+/// The list holding `home`'s sessions, the first open in the viewer.
+fn viewer_on(home: &ClaudeHome) -> App {
+    viewer_on_clock(home, Arc::new(TestClock::default()))
 }
 
 /// [`viewer_on`], on a `clock` the test moves.
-fn viewer_on_clock(path: &Path, clock: Arc<TestClock>) -> App {
-    viewer_on_clock_with_subagents(path, Vec::new(), clock)
-}
-
-/// The list holding the session at `path`, whose row lists the sub-agent
-/// transcripts `subagents`, open in the viewer.
-fn viewer_on_with_subagents(path: &Path, subagents: Vec<PathBuf>) -> App {
-    viewer_on_clock_with_subagents(path, subagents, Arc::new(TestClock::default()))
-}
-
-fn viewer_on_clock_with_subagents(
-    path: &Path,
-    subagents: Vec<PathBuf>,
-    clock: Arc<TestClock>,
-) -> App {
-    let row = Conversation {
-        subagents,
-        ..row_from_file(path)
-    };
-    let mut app = App::new(
-        vec![row],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-        clock,
-    );
-    app.set_session_reader_for_test(read_from_its_file);
+fn viewer_on_clock(home: &ClaudeHome, clock: Arc<TestClock>) -> App {
+    let environment = home.environment_on(clock);
+    let mut app = app_reading(home.rows(&environment), environment);
     app.selected = Some(0);
     app.enter_view_mode(80);
     app
@@ -153,10 +123,10 @@ fn status_text(app: &App) -> Option<&str> {
 
 #[test]
 fn refresh_reads_on_next_frame_and_second_press_adds_no_read() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
     write_messages(&path, &numbered(0..5));
 
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
@@ -171,10 +141,10 @@ fn refresh_reads_on_next_frame_and_second_press_adds_no_read() {
 
 #[test]
 fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
 
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.handle_key(KeyCode::Esc, KeyModifiers::empty(), VIEWPORT);
@@ -188,10 +158,10 @@ fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
 
 #[test]
 fn leaving_viewer_with_q_drops_pending_refresh() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
 
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.handle_key(KeyCode::Char('q'), KeyModifiers::empty(), VIEWPORT);
@@ -212,10 +182,10 @@ fn arrived_below(app: &App) -> Option<usize> {
 
 #[test]
 fn at_bottom_refresh_shows_new_messages_and_counts_them_for_badge() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..30));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
     app.handle_key(KeyCode::End, KeyModifiers::empty(), VIEWPORT);
 
     write_messages(&path, &numbered(0..32));
@@ -230,10 +200,10 @@ fn at_bottom_refresh_shows_new_messages_and_counts_them_for_badge() {
 
 #[test]
 fn at_bottom_refresh_that_finds_nothing_new_reports_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..30));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
     app.handle_key(KeyCode::End, KeyModifiers::empty(), VIEWPORT);
 
     press_refresh(&mut app);
@@ -244,10 +214,10 @@ fn at_bottom_refresh_that_finds_nothing_new_reports_nothing() {
 
 #[test]
 fn scrolled_up_refresh_with_new_messages_highlights_only_count() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..30));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
     scroll_to_message(&mut app, "message 10");
 
     write_messages(&path, &numbered(0..32));
@@ -290,12 +260,12 @@ fn record_copy(text: &str) -> Result<ClipboardDestination, String> {
 
 #[test]
 fn message_copy_copies_message_on_screen_after_file_grew() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
-    let subagent = dir.path().join("session/subagents/agent-x.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    let subagent = home.project().join("session/subagents/agent-x.jsonl");
     write_timed_messages(&path, 30);
     write_subagent_turns(&subagent, 1, 5);
-    let mut app = viewer_on_with_subagents(&path, vec![subagent.clone()]);
+    let mut app = viewer_on(&home);
     app.set_clipboard_writer_for_test(record_copy);
     let message_index = scroll_to_message(&mut app, "message 10");
     if let AppMode::View(state) = &mut app.app_mode {
@@ -318,12 +288,12 @@ fn message_copy_copies_message_on_screen_after_file_grew() {
 
 #[test]
 fn scrolled_up_refresh_keeps_same_message_at_top() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
-    let subagent = dir.path().join("session/subagents/agent-x.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    let subagent = home.project().join("session/subagents/agent-x.jsonl");
     write_timed_messages(&path, 30);
     write_subagent_turns(&subagent, 1, 5);
-    let mut app = viewer_on_with_subagents(&path, vec![subagent.clone()]);
+    let mut app = viewer_on(&home);
     scroll_to_message(&mut app, "message 10");
     assert!(top_row_text(&app).contains("message 10"));
 
@@ -336,15 +306,15 @@ fn scrolled_up_refresh_keeps_same_message_at_top() {
 
 #[test]
 fn expanded_run_stays_expanded_when_sub_agent_turns_splice_in_above_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
-    let subagent = dir.path().join("session/subagents/agent-x.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    let subagent = home.project().join("session/subagents/agent-x.jsonl");
     let mut lines = vec![user_line("intro")];
     lines.extend(tool_run_lines());
     lines.push(user_line("outro"));
-    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    write_lines(&path, lines);
     write_subagent_turns(&subagent, 1, 0);
-    let mut app = viewer_on_with_subagents(&path, vec![subagent.clone()]);
+    let mut app = viewer_on(&home);
     app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), VIEWPORT);
     app.handle_key(KeyCode::Enter, KeyModifiers::empty(), VIEWPORT);
     let expanded = view(&app).expanded_tool_outputs.clone();
@@ -361,10 +331,10 @@ fn expanded_run_stays_expanded_when_sub_agent_turns_splice_in_above_it() {
 
 #[test]
 fn refresh_updates_sessions_row_in_list() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
     let before = app.conversations()[0].message_count;
 
     write_messages(&path, &numbered(0..5));
@@ -375,10 +345,10 @@ fn refresh_updates_sessions_row_in_list() {
 
 #[test]
 fn deleted_session_returns_to_list() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
 
     std::fs::remove_file(&path).unwrap();
     press_refresh(&mut app);
@@ -390,11 +360,11 @@ fn deleted_session_returns_to_list() {
 
 #[test]
 fn failed_read_keeps_view() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = viewer_on(&path);
-    app.set_session_reader_for_test(|_, _| Some(SessionRead::Failed(ReadError::Permanent)));
+    let mut app = viewer_on(&home);
+    home.refuse_project();
 
     press_refresh(&mut app);
 
@@ -407,11 +377,11 @@ fn failed_read_keeps_view() {
 
 #[test]
 fn refresh_that_adds_messages_highlights_count_for_three_seconds() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..30));
     let clock = Arc::new(TestClock::default());
-    let mut app = viewer_on_clock(&path, clock.clone());
+    let mut app = viewer_on_clock(&home, clock.clone());
     scroll_to_message(&mut app, "message 10");
 
     write_messages(&path, &numbered(0..32));
@@ -427,10 +397,10 @@ fn refresh_that_adds_messages_highlights_count_for_three_seconds() {
 
 #[test]
 fn refresh_that_adds_nothing_doesnt_highlight_count() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..30));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
 
     press_refresh(&mut app);
 
@@ -448,11 +418,11 @@ fn two_seconds_pass(clock: &TestClock, app: &App) {
 
 #[test]
 fn second_count_change_restarts_highlight_from_that_refresh() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..30));
     let clock = Arc::new(TestClock::default());
-    let mut app = viewer_on_clock(&path, clock.clone());
+    let mut app = viewer_on_clock(&home, clock.clone());
     scroll_to_message(&mut app, "message 10");
     write_messages(&path, &numbered(0..31));
     press_refresh(&mut app);
@@ -470,11 +440,11 @@ fn second_count_change_restarts_highlight_from_that_refresh() {
 
 #[test]
 fn second_refresh_at_bottom_shows_its_own_count_of_new_messages() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..30));
     let clock = Arc::new(TestClock::default());
-    let mut app = viewer_on_clock(&path, clock.clone());
+    let mut app = viewer_on_clock(&home, clock.clone());
     app.handle_key(KeyCode::End, KeyModifiers::empty(), VIEWPORT);
     write_messages(&path, &numbered(0..32));
     press_refresh(&mut app);
@@ -492,37 +462,11 @@ fn second_refresh_at_bottom_shows_its_own_count_of_new_messages() {
 }
 
 #[test]
-fn failed_display_read_leaves_row_as_it_was() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
-    write_messages(&path, &numbered(0..3));
-    let mut app = viewer_on(&path);
-    let before = app.conversations()[0].message_count;
-    app.set_session_reader_for_test(|row, _| {
-        Some(SessionRead::Listed(Box::new(Conversation {
-            message_count: row.message_count + 2,
-            ..row.clone()
-        })))
-    });
-
-    // The row's read succeeds; the viewer's own read of the file fails.
-    std::fs::remove_file(&path).unwrap();
-    press_refresh(&mut app);
-
-    assert_eq!(app.conversations()[0].message_count, before);
-    assert!(
-        status_text(&app).is_some_and(|text| text.starts_with("Refresh failed: ")),
-        "{:?}",
-        status_text(&app)
-    );
-}
-
-#[test]
 fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = viewer_on(&path);
+    let mut app = viewer_on(&home);
     let read_by_the_list_refresh = app.conversations()[0].clone();
     app.begin_refresh().unwrap();
 
@@ -545,8 +489,8 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
 
 #[test]
 fn refresh_reads_directly_opened_file_again() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
     let mut app = App::new_single_file(
         path.clone(),
@@ -554,8 +498,7 @@ fn refresh_reads_directly_opened_file_again() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.check_view_resize(80, VIEWPORT);
 
@@ -573,10 +516,10 @@ fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refre
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
     let session = std::fs::read_to_string(fixtures.join("v3.jsonl")).unwrap();
     let title_slot_and_header: Vec<&str> = session.lines().take(2).collect();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
     std::fs::write(&path, title_slot_and_header.join("\n") + "\n").unwrap();
-    let subagent = dir.path().join("session").join("worker.jsonl");
+    let subagent = directory.path().join("session").join("worker.jsonl");
     std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
     std::fs::copy(fixtures.join("subagent.jsonl"), &subagent).unwrap();
     let mut app = App::new_single_file_with_stored_check(
@@ -586,8 +529,7 @@ fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refre
         false,
         KeyBindings::default(),
         |source, session_id, _| source == Source::Omp && session_id == "omp_session_custom_id",
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.check_view_resize(80, VIEWPORT);
 
@@ -601,8 +543,8 @@ fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refre
 /// as the list's loop.
 #[test]
 fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
     let mut app = App::new_single_file(
         path.clone(),
@@ -610,8 +552,7 @@ fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.check_view_resize(80, VIEWPORT);
     assert_eq!(app.idle_wait(), Duration::from_secs(3600));

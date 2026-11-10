@@ -83,7 +83,7 @@ impl SqliteCache {
                         source,
                         show_last,
                         CachedSession {
-                            base: self.base(),
+                            base: self.base().clone(),
                             storage,
                             root: root.to_path_buf(),
                             cache_key: row.get(1)?,

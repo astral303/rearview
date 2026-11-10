@@ -303,8 +303,8 @@ mod tests {
         .unwrap();
         std::fs::write(project.join("not-pi.jsonl"), "{\"type\":\"user\"}\n").unwrap();
 
-        let nested_files =
-            crate::history::provider::walk::jsonl_files_at_depth(&nested, 1).unwrap();
+        use crate::history::provider::walk::{SystemLister, jsonl_files_at_depth};
+        let nested_files = jsonl_files_at_depth(&SystemLister, &nested, 1).unwrap();
         assert_eq!(nested_files.len(), 2);
         assert!(
             nested_files.iter().any(|path| {
@@ -323,7 +323,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            crate::history::provider::walk::jsonl_files_at_depth(&session_directory, 0)
+            jsonl_files_at_depth(&SystemLister, &session_directory, 0)
                 .unwrap()
                 .len(),
             1

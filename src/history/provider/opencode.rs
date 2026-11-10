@@ -456,7 +456,12 @@ impl SessionStorage for OpenCodeStorage {
     /// stale until the session's next activity. Archived rows are collected
     /// with the rest. A missing database is an agent the user has not
     /// installed: an absence, not a failure.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+    /// The sessions live in OpenCode's database: no directory is listed.
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        _lister: &dyn super::walk::DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
         discover_in(&root.path, sqlite::DEFAULT_BUSY_TIMEOUT)
     }
 
@@ -475,6 +480,7 @@ impl SessionStorage for OpenCodeStorage {
         &self,
         root: &SessionRoot,
         locator: &Path,
+        _lister: &dyn super::walk::DirectoryLister,
     ) -> Result<Option<SessionStub>> {
         stored_session_in(&root.path, &owned_ref(locator)?.session_id)
     }
@@ -673,6 +679,7 @@ pub(super) mod tests {
     use crate::history::provider::contract_tests::{
         AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
     };
+    use crate::history::provider::walk::SystemLister;
     use serde_json::json;
     use std::ffi::{OsStr as StdOsStr, OsString};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -946,7 +953,7 @@ pub(super) mod tests {
 
     fn discovered(database: &Path) -> Vec<SessionStub> {
         OpenCodeStorage
-            .discover(&SessionRoot::new(database))
+            .discover(&SessionRoot::new(database), &SystemLister)
             .unwrap()
             .stubs
     }
@@ -988,7 +995,7 @@ pub(super) mod tests {
         drop(connection);
 
         let discovered = OpenCodeStorage
-            .discover(&SessionRoot::new(&database))
+            .discover(&SessionRoot::new(&database), &SystemLister)
             .unwrap();
 
         assert_eq!(cache_keys(&discovered.stubs), ["ses_first", "ses_second"]);
@@ -1596,7 +1603,7 @@ pub(super) mod tests {
 
     /// The reason of the failure to list `database`.
     fn discover_failure(database: &Path) -> SessionDatabaseFailure {
-        match OpenCodeStorage.discover(&SessionRoot::new(database)) {
+        match OpenCodeStorage.discover(&SessionRoot::new(database), &SystemLister) {
             Err(AppError::SessionListUnreadable { reason, .. }) => reason,
             other => panic!("expected an unusable database, got {other:?}"),
         }

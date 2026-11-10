@@ -1,33 +1,42 @@
 //! The drawing thread's session cache reads while another rearview refreshes
 //! or rebuilds the cache.
 
+use super::claude_home::{ClaudeHome, another_rearview, app_reading};
 use super::refresh_tests::refresh_found;
 use super::*;
 use crate::clock::TestClock;
-use crate::history::provider::SessionRead;
-use crate::history::provider::contract_tests::{load_under, registered_fixtures};
+use crate::history::ProcessIdentity;
+use crate::history::environment::test_support::real_time_environment;
+use crate::history::provider::contract_tests::{
+    kept_storage_under, load_under, registered_fixtures,
+};
+use crate::history::provider::walk::SystemLister;
 use crate::history::sqlite_cache::SqliteCache;
+use crate::history::sqlite_cache::connection::test_hooks;
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
 use crate::history::sqlite_cache::refresh::tests::{
-    OtherProcessOwner, OwnerActivity, expire_last_commit,
+    OtherProcessOwner, OwnerActivity, exclusive_lock, expire_last_commit, rearview,
+    writer_lock_held,
 };
 use crate::history::workspace::tests::workspace_at_home;
-use crate::history::{CacheFollowUp, SessionChanges};
-use crate::history::{RefreshOwner, Source};
+use crate::history::{Environment, RefreshOwner, SessionChanges};
 use crate::tui::export::ClipboardDestination;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Longer than the drawing thread's busy timeout, far shorter than the 30
 /// seconds the waiting reader spends behind a rebuild.
 const WITHOUT_WAITING: Duration = Duration::from_secs(5);
 
-/// A Claude session written under `home` and cached in `base`, as a warm
-/// load lists it: its row reads its text from the database.
+/// A session written under `home` and cached in `base`, as a warm load
+/// lists it: its row reads its text from the database.
 fn cached_session(home: &Path, base: &Path) -> Conversation {
     let fixture = registered_fixtures()[0];
     fixture.write_session(home, fixture.ids().session);
-    SqliteCache::open(base).unwrap().mark_admitted().unwrap();
+    SqliteCache::open(&rearview(base))
+        .unwrap()
+        .mark_admitted()
+        .unwrap();
     load_under(fixture, home, base);
     let mut rows = load_under(fixture, home, base);
     assert_eq!(rows.len(), 1);
@@ -48,30 +57,24 @@ fn mark_every_session_writing(base: &Path) {
         .unwrap();
 }
 
-/// An app listing `rows`, reading the session cache under `base`.
-fn app_reading(rows: Vec<Conversation>, base: &Path) -> App {
-    let mut app = App::new(
-        rows,
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-        Arc::new(TestClock::default()),
-    );
-    app.set_cache_base_for_test(base);
-    app.list_search_mode = ListSearchMode::Lexical;
-    app
-}
-
-fn listed_unchanged(row: &Conversation, _: bool) -> Option<SessionRead> {
-    Some(SessionRead::Listed(Box::new(row.clone())))
+/// The first registered agent's storage pinned to `home`, with the session
+/// cache under `base`, on the system clock: these tests run beside another
+/// process that commits in real time.
+fn reading_home(home: &Path, base: &Path) -> Environment {
+    real_time_environment(
+        vec![kept_storage_under(registered_fixtures()[0], home, None)],
+        Some(base),
+    )
 }
 
 #[test]
 fn a_conversation_copy_doesnt_wait_for_another_processs_rebuild() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
-    let mut app = app_reading(vec![cached_session(home.path(), base.path())], base.path());
+    let mut app = app_reading(
+        vec![cached_session(home.path(), base.path())],
+        reading_home(home.path(), base.path()),
+    );
     app.set_clipboard_writer_for_test(|_| Ok(ClipboardDestination::System));
     app.enter_view_mode(80);
     let rebuild = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
@@ -94,8 +97,10 @@ fn a_conversation_copy_doesnt_wait_for_another_processs_rebuild() {
 fn a_rename_with_an_active_query_doesnt_wait_for_another_processs_rebuild() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
-    let mut app = app_reading(vec![cached_session(home.path(), base.path())], base.path());
-    app.set_session_reader_for_test(listed_unchanged);
+    let mut app = app_reading(
+        vec![cached_session(home.path(), base.path())],
+        reading_home(home.path(), base.path()),
+    );
     app.set_query_for_test("hello");
     let rebuild = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
 
@@ -113,7 +118,10 @@ fn a_rename_with_an_active_query_doesnt_wait_for_another_processs_rebuild() {
 fn a_workspace_toggle_with_an_active_query_doesnt_wait_for_another_processs_rebuild() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
-    let mut app = app_reading(vec![cached_session(home.path(), base.path())], base.path());
+    let mut app = app_reading(
+        vec![cached_session(home.path(), base.path())],
+        reading_home(home.path(), base.path()),
+    );
     app.workspace = Some(workspace_at_home(home.path()));
     app.set_query_for_test("hello");
     let rebuild = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
@@ -135,7 +143,7 @@ fn opening_a_session_another_process_is_writing_waits_for_that_refresh() {
     let row = cached_session(home.path(), base.path());
     mark_every_session_writing(base.path());
     let other = OtherProcessOwner::hold(base.path());
-    let mut app = app_reading(vec![row], base.path());
+    let mut app = app_reading(vec![row], reading_home(home.path(), base.path()));
 
     let started = Instant::now();
     app.enter_view_mode(80);
@@ -162,10 +170,8 @@ fn a_file_opened_directly_while_another_process_writes_it_waits_for_that_refresh
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        reading_home(home.path(), base.path()),
     );
-    app.set_cache_base_for_test(base.path());
 
     let started = Instant::now();
     app.re_render_view(20);
@@ -180,24 +186,27 @@ fn a_file_opened_directly_while_another_process_writes_it_waits_for_that_refresh
 
 #[test]
 fn a_file_opened_directly_rereads_its_row_once_the_awaited_refresh_completes() {
-    static IS_REFRESH_RUNNING: AtomicBool = AtomicBool::new(true);
     let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
     let fixture = registered_fixtures()[0];
     let path = fixture.write_session(home.path(), fixture.ids().session);
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
+    let other_refresh =
+        RefreshOwnership::acquire(&another_rearview(base.path(), clock.clone()), || ()).unwrap();
     let mut app = App::new_single_file(
         path.clone(),
-        Source::Claude,
+        fixture.provider().source(),
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        Environment::new(
+            Vec::new(),
+            Some(base.path().to_path_buf()),
+            ProcessIdentity::default(),
+            clock,
+            Arc::new(SystemLister),
+        ),
     );
-    app.set_running_refresh_check_for_test(|| {
-        IS_REFRESH_RUNNING
-            .load(Ordering::Relaxed)
-            .then_some(RefreshOwner::AnotherProcess)
-    });
     app.await_refresh([path], RefreshOwner::AnotherProcess);
     app.expire_awaited_refresh_check_for_test();
 
@@ -211,7 +220,7 @@ fn a_file_opened_directly_rereads_its_row_once_the_awaited_refresh_completes() {
         "the row waits while the other refresh runs"
     );
 
-    IS_REFRESH_RUNNING.store(false, Ordering::Relaxed);
+    drop(other_refresh);
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
 
@@ -228,30 +237,20 @@ fn rows_awaiting_this_processs_refresh_wait_for_the_process_that_took_it_over() 
     let base = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let fixture = registered_fixtures()[0];
-    fixture.write_session(home.path(), fixture.ids().session);
+    let path = fixture.write_session(home.path(), fixture.ids().session);
     let mut rows = load_under(fixture, home.path(), base.path());
-    let held = RefreshOwnership::acquire(base.path(), || ()).unwrap();
-    let mut app = app_reading(vec![rows.remove(0)], base.path());
-    let reads = std::rc::Rc::new(std::cell::Cell::new(0));
-    let counted = reads.clone();
-    app.set_sessions_reader_for_test(Box::new(move |rows, _| {
-        counted.set(counted.get() + 1);
-        let follow_up =
-            (counted.get() == 1).then_some(CacheFollowUp::AwaitRefresh(RefreshOwner::ThisProcess));
-        rows.iter()
-            .map(|row| crate::history::provider::InteractiveRead {
-                value: Some(SessionRead::Listed(Box::new((*row).clone()))),
-                follow_up,
-            })
-            .collect()
-    }));
-    let path = app.conversations()[0].path.clone();
+    let environment = reading_home(home.path(), base.path());
+    let held = RefreshOwnership::acquire(environment.cache_base().unwrap(), || ()).unwrap();
+    let mut app = app_reading(vec![rows.remove(0)], environment);
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(&path);
     app.finish_refresh(refresh_found(SessionChanges::default()));
     assert!(app.is_awaiting_refresh());
+    assert!(!app.is_waiting_for_another_rearview());
     expire_last_commit(base.path());
     let other = OtherProcessOwner::hold(base.path());
+    let size_before_the_takeover = listed_size(&app);
+    let size_now = grow(&path);
 
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
@@ -259,18 +258,25 @@ fn rows_awaiting_this_processs_refresh_wait_for_the_process_that_took_it_over() 
         app.is_waiting_for_another_rearview(),
         "the check sees the process that took the refresh over"
     );
-    assert_eq!(reads.get(), 1);
+    assert_eq!(listed_size(&app), size_before_the_takeover);
 
     other.release();
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
     assert_eq!(
-        reads.get(),
-        2,
+        listed_size(&app),
+        Some(size_now),
         "the row was not read again once the other refresh completed"
     );
     assert!(!app.is_awaiting_refresh());
     drop(held);
+}
+
+/// The transcript size the first listed row was read at.
+fn listed_size(app: &App) -> Option<u64> {
+    app.conversations()[0]
+        .fingerprint
+        .map(|fingerprint| fingerprint.file_size)
 }
 
 /// The transcript sizes `base`'s database records, current or not.
@@ -292,7 +298,7 @@ fn current_sizes(
     home: &Path,
     base: &Path,
 ) -> Vec<u64> {
-    SqliteCache::open_waiting(base)
+    SqliteCache::open_waiting(&rearview(base))
         .unwrap()
         .unwrap()
         .current_fingerprints(fixture.storage().cache(), &fixture.root_under(home).path)
@@ -310,30 +316,10 @@ fn grow(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
-/// An app viewing `row`, a session `fixture` wrote under `home` and cached
-/// in `base`, that reads listed sessions through `fixture`'s storage under
-/// `home`: on the drawing thread as the TUI rereads a row, and on the
-/// background refresh thread as it caches one.
-fn app_viewing_written_session(
-    row: Conversation,
-    fixture: &'static dyn crate::history::provider::contract_tests::ProviderFixture,
-    home: &Path,
-    base: &Path,
-) -> App {
-    use crate::history::provider::contract_tests::{cache_under, reread_under};
-    let mut app = app_reading(vec![row], base);
-    let (home_path, base_path) = (home.to_path_buf(), base.to_path_buf());
-    app.set_sessions_reader_for_test(Box::new(move |rows, _| {
-        rows.iter()
-            .map(|row| reread_under(fixture, &home_path, &base_path, &row.path))
-            .collect()
-    }));
-    let (home_path, base_path) = (home.to_path_buf(), base.to_path_buf());
-    app.set_session_cacher_for_test(std::sync::Arc::new(move |_, rows, _, _| {
-        rows.iter()
-            .map(|row| cache_under(fixture, &home_path, &base_path, &row.path))
-            .collect()
-    }));
+/// An app viewing `row`, a session written under `home` and cached in
+/// `base`.
+fn app_viewing_written_session(row: Conversation, home: &Path, base: &Path) -> App {
+    let mut app = app_reading(vec![row], reading_home(home, base));
     app.enter_view_mode(80);
     app
 }
@@ -342,11 +328,10 @@ fn app_viewing_written_session(
 fn ctrl_r_on_a_changed_session_reads_its_transcript_without_writing_the_cache() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
-    let fixture = registered_fixtures()[0];
     let row = cached_session(home.path(), base.path());
     let cached_sizes = recorded_sizes(base.path());
     grow(&row.path);
-    let mut app = app_viewing_written_session(row, fixture, home.path(), base.path());
+    let mut app = app_viewing_written_session(row, home.path(), base.path());
 
     let started = Instant::now();
     app.refresh_open_session(20);
@@ -378,7 +363,7 @@ fn the_background_refresh_thread_caches_a_session_ctrl_r_read_and_updates_its_ro
     let row = cached_session(home.path(), base.path());
     let path = row.path.clone();
     grow(&path);
-    let mut app = app_viewing_written_session(row, fixture, home.path(), base.path());
+    let mut app = app_viewing_written_session(row, home.path(), base.path());
     app.refresh_open_session(20);
     app.exit_view_mode();
     let size_now = grow(&path);
@@ -405,6 +390,100 @@ fn the_background_refresh_thread_caches_a_session_ctrl_r_read_and_updates_its_ro
     );
 }
 
+/// An app listing `home`'s sessions, read without a session cache, that
+/// reads the session cache under `base` as this process reaches it, on
+/// `clock`.
+fn app_listing_home_over_cache(home: &ClaudeHome, base: &Path, clock: Arc<dyn Clock>) -> App {
+    app_reading(
+        home.rows(&home.environment()),
+        home.environment_with_cache(base, ProcessIdentity::default(), clock),
+    )
+}
+
+/// Eighth-pass findings (Claude F7, Codex F1): the drawing thread's check
+/// for a refresh's completion opened a writable connection and took
+/// SQLite's writer lock.
+#[test]
+#[ignore = "fixed in step 4"]
+fn a_completion_check_opens_no_writable_connection() {
+    let home = ClaudeHome::new();
+    let base = tempfile::tempdir().unwrap();
+    let a = home.write("a", 5, &["a"]);
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
+    let other_refresh =
+        RefreshOwnership::acquire(&another_rearview(base.path(), clock.clone()), || ()).unwrap();
+    let mut app = app_listing_home_over_cache(&home, base.path(), clock);
+    app.await_refresh([a], RefreshOwner::AnotherProcess);
+    let drawing_thread = std::thread::current().id();
+    let writable_connections = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&writable_connections);
+    let _hooks = test_hooks::on_every_connection(base.path(), move |connection| {
+        if std::thread::current().id() == drawing_thread
+            && !connection.is_readonly(rusqlite::MAIN_DB).unwrap()
+        {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert!(app.is_waiting_for_another_rearview());
+    assert_eq!(writable_connections.load(Ordering::SeqCst), 0);
+    drop(other_refresh);
+}
+
+/// Eighth-pass finding (Claude F7): a completion check beside another
+/// connection's write transaction, while no refresh owned the cache,
+/// reported another rearview's refresh.
+#[test]
+#[ignore = "fixed in step 4"]
+fn a_completion_check_beside_a_write_without_an_owner_doesnt_report_another_rearview() {
+    let home = ClaudeHome::new();
+    let base = tempfile::tempdir().unwrap();
+    let a = home.write("a", 5, &["a"]);
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
+    drop(RefreshOwnership::acquire(&another_rearview(base.path(), clock.clone()), || ()).unwrap());
+    let write_without_an_owner = writer_lock_held(base.path());
+    let mut app = app_listing_home_over_cache(&home, base.path(), clock);
+    app.await_refresh([a], RefreshOwner::AnotherProcess);
+
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert!(!app.is_waiting_for_another_rearview());
+    drop(write_without_an_owner);
+}
+
+/// Eighth-pass finding (Codex F3): after another rearview took over this
+/// process's expired refresh and began a rebuild, its unreadable owner read
+/// as this process's refresh, hiding the waiting label.
+#[test]
+#[ignore = "fixed in step 4"]
+fn another_rearviews_rebuild_after_a_takeover_doesnt_read_as_this_processs_refresh() {
+    let home = ClaudeHome::new();
+    let base = tempfile::tempdir().unwrap();
+    let a = home.write("a", 5, &["a"]);
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::default());
+    let environment =
+        home.environment_with_cache(base.path(), ProcessIdentity::default(), clock.clone());
+    let paused_refresh =
+        RefreshOwnership::acquire(environment.cache_base().unwrap(), || ()).unwrap();
+    expire_last_commit(base.path());
+    let takeover = RefreshOwnership::acquire(&another_rearview(base.path(), clock), || ()).unwrap();
+    let rebuild = exclusive_lock(base.path());
+    let mut app = app_reading(home.rows(&home.environment()), environment);
+    app.await_refresh([a], RefreshOwner::ThisProcess);
+
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert!(app.is_waiting_for_another_rearview());
+    drop(rebuild);
+    drop(takeover);
+    drop(paused_refresh);
+}
+
 #[test]
 fn a_test_app_reads_no_session_cache() {
     let app = App::new(
@@ -416,24 +495,29 @@ fn a_test_app_reads_no_session_cache() {
         Arc::new(TestClock::default()),
     );
 
-    assert_eq!(app.cache.base(), None);
+    assert!(app.environment.cache_base().is_none());
+}
+
+/// An app listing nothing, reading the session cache under `base`.
+fn app_reading_cache(base: &Path) -> App {
+    app_reading(Vec::new(), real_time_environment(Vec::new(), Some(base)))
 }
 
 #[test]
 #[should_panic(expected = "drawing thread")]
 fn refresh_ownership_refuses_the_drawing_thread() {
     let base = tempfile::tempdir().unwrap();
-    let _app = app_reading(Vec::new(), base.path());
+    let _app = app_reading_cache(base.path());
 
-    let _ = RefreshOwnership::acquire(base.path(), || ());
+    let _ = RefreshOwnership::acquire(&rearview(base.path()), || ());
 }
 
 #[test]
 #[should_panic(expected = "drawing thread")]
 fn a_cache_writer_refuses_the_drawing_thread() {
     let base = tempfile::tempdir().unwrap();
-    let ownership = RefreshOwnership::acquire(base.path(), || ()).unwrap();
-    let _app = app_reading(Vec::new(), base.path());
+    let ownership = RefreshOwnership::acquire(&rearview(base.path()), || ()).unwrap();
+    let _app = app_reading_cache(base.path());
 
     let _ = SqliteCache::open_for_refresh(ownership.token());
 }
@@ -442,11 +526,11 @@ fn a_cache_writer_refuses_the_drawing_thread() {
 #[should_panic(expected = "drawing thread")]
 fn the_waiting_cache_reader_refuses_the_drawing_thread() {
     let base = tempfile::tempdir().unwrap();
-    SqliteCache::open(base.path())
+    SqliteCache::open(&rearview(base.path()))
         .unwrap()
         .mark_admitted()
         .unwrap();
-    let _app = app_reading(Vec::new(), base.path());
+    let _app = app_reading_cache(base.path());
 
-    let _ = SqliteCache::open_waiting(base.path());
+    let _ = SqliteCache::open_waiting(&rearview(base.path()));
 }

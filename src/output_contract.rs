@@ -362,7 +362,10 @@ fn child_process_writes_the_outputs() {
     };
     let output = PathBuf::from(output);
     let agent = AgentOutputs::run();
-    let tui = crate::tui::contract_outputs::tui_outputs(TUI_QUERIES, fixed_clock());
+    let tui = crate::tui::contract_outputs::tui_outputs(
+        TUI_QUERIES,
+        crate::history::Environment::of_user(fixed_clock()),
+    );
     for (surface, text) in [
         (Surface::AgentSessions, agent.sessions),
         (Surface::AgentSearch, agent.search),
@@ -763,7 +766,10 @@ fn agent_command(args: &[&str]) -> AgentCommandRun {
             let Some(crate::cli::Commands::Agent { command }) = parsed.command else {
                 panic!("{args:?} is an agent command");
             };
-            match crate::agent::service::execute(*command, fixed_clock()) {
+            match crate::agent::service::execute(
+                *command,
+                crate::history::Environment::of_user(fixed_clock()),
+            ) {
                 Ok(output) => {
                     record.push_str("--- stdout\n");
                     record.push_str(&output);

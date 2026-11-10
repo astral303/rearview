@@ -1,7 +1,9 @@
+use super::claude_home::{ClaudeHome, app_reading};
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::clock::TestClock;
 use crate::config::KeyBinding;
+use crate::history::environment::test_support::test_environment;
 use crate::tui::actions_menu::{ActionAvailability, SessionAction};
 use chrono::TimeZone;
 use std::cell::RefCell;
@@ -55,32 +57,13 @@ fn test_conversation(path: PathBuf, custom_title: Option<String>) -> Conversatio
     }
 }
 
-fn app_with_conversation(path: PathBuf, custom_title: Option<String>) -> App {
-    let mut app = App::new(
+/// An app listing the session at `path`, one of `home`'s, and reading
+/// sessions again through `home`.
+fn app_with_conversation(home: &ClaudeHome, path: PathBuf, custom_title: Option<String>) -> App {
+    app_reading(
         vec![test_conversation(path, custom_title)],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-        Arc::new(TestClock::default()),
-    );
-    app.set_session_reader_for_test(parsed_from_its_file);
-    app
-}
-
-/// A test row read again from its file alone: the rows here live in
-/// temporary directories that no agent's discovery lists.
-fn parsed_from_its_file(
-    row: &Conversation,
-    _show_last: bool,
-) -> Option<crate::history::provider::SessionRead> {
-    let mut read = crate::history::parser::process_conversation_file(row.path.clone(), None, None)
-        .ok()
-        .flatten()?;
-    read.index = row.index;
-    Some(crate::history::provider::SessionRead::Listed(Box::new(
-        read,
-    )))
+        home.environment(),
+    )
 }
 
 fn write_conversation(path: &std::path::Path, title: Option<&str>) {
@@ -91,6 +74,7 @@ fn write_conversation(path: &std::path::Path, title: Option<&str>) {
             title
         ));
     }
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
@@ -101,6 +85,7 @@ fn write_named_conversation(path: &std::path::Path, text: &str) {
         "message": {"role": "user", "content": text}
     })
     .to_string();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
@@ -405,7 +390,7 @@ fn semantic_ranked_selection_opens_selected_conversation_and_returns() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
     app.list_search_mode = ListSearchMode::Semantic;
@@ -456,7 +441,7 @@ fn semantic_list_click_uses_three_line_rows() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     let (_request_tx, request_rx) = mpsc::channel();
     let (response_tx, response_rx) = mpsc::channel();
@@ -513,10 +498,10 @@ fn row_count(app: &App) -> usize {
 #[test]
 fn i_rewraps_rows_beside_timestamp_column_and_back() {
     const FRAME_WIDTH: usize = 60;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("long.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("long");
     write_named_conversation(&path, &"word ".repeat(60));
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
     app.enter_view_mode(FRAME_WIDTH);
     let rows_without_timing = row_count(&app);
@@ -572,8 +557,7 @@ fn single_file_view_click_uses_cached_entries_after_file_removed() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.check_view_resize(80, 17);
     std::fs::remove_file(&path).unwrap();
@@ -642,10 +626,10 @@ fn enter_without_message_navigation_does_nothing() {
 
 #[test]
 fn enter_on_message_without_tool_run_does_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
     app.enter_view_mode(80);
     press(&mut app, KeyCode::Char('J'));
@@ -657,10 +641,10 @@ fn enter_on_message_without_tool_run_does_nothing() {
 
 #[test]
 fn enter_on_row_leaves_open_pending_for_next_frame() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
 
     press(&mut app, KeyCode::Enter);
@@ -671,10 +655,10 @@ fn enter_on_row_leaves_open_pending_for_next_frame() {
 
 #[test]
 fn completing_pending_open_enters_viewer() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
     press(&mut app, KeyCode::Enter);
 
@@ -728,10 +712,10 @@ fn pending_open_opens_requested_session_after_list_reorders() {
 
 #[test]
 fn row_click_requests_open_as_enter_does() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     let frame_area = Rect::new(0, 0, 80, 17);
 
     assert!(app.handle_list_click(3, frame_area));
@@ -751,8 +735,7 @@ fn enter_while_corpus_loads_doesnt_request_open() {
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.append_conversations(vec![test_conversation(path, None)]);
     assert!(app.is_loading());
@@ -765,10 +748,10 @@ fn enter_while_corpus_loads_doesnt_request_open() {
 
 #[test]
 fn enter_with_dialog_open_doesnt_request_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("plain");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
     app.selected = Some(0);
     app.set_dialog_mode_for_test(DialogMode::Help { scroll: 0 });
 
@@ -1461,10 +1444,10 @@ fn scrolling_over_collapsed_run_never_focuses_call() {
 
 #[test]
 fn cancel_rename_keeps_existing_title() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("abc123.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("abc123");
     write_conversation(&path, Some("old"));
-    let mut app = app_with_conversation(path, Some("old".to_string()));
+    let mut app = app_with_conversation(&home, path, Some("old".to_string()));
 
     app.start_rename();
     assert!(matches!(app.dialog_mode, DialogMode::Rename { .. }));
@@ -1501,10 +1484,10 @@ fn configured_rename_key_starts_rename() {
 
 #[test]
 fn bare_r_remains_search_input() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("abc123.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("abc123");
     write_conversation(&path, None);
-    let mut app = app_with_conversation(path, None);
+    let mut app = app_with_conversation(&home, path, None);
 
     app.handle_key(KeyCode::Char('r'), KeyModifiers::empty(), 10);
 
@@ -1514,10 +1497,10 @@ fn bare_r_remains_search_input() {
 
 #[test]
 fn submit_rename_reparses_and_updates_search_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("abc123.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("abc123");
     write_conversation(&path, Some("old"));
-    let mut app = app_with_conversation(path.clone(), Some("old".to_string()));
+    let mut app = app_with_conversation(&home, path, Some("old".to_string()));
 
     app.start_rename();
     app.handle_rename_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
@@ -1533,23 +1516,18 @@ fn submit_rename_reparses_and_updates_search_index() {
 
 #[test]
 fn submit_rename_preserves_selected_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let first = dir.path().join("first.jsonl");
-    let second = dir.path().join("second.jsonl");
+    let home = ClaudeHome::new();
+    let first = home.transcript("first");
+    let second = home.transcript("second");
     write_conversation(&first, None);
     write_conversation(&second, None);
-    let mut app = App::new(
+    let mut app = app_reading(
         vec![
             test_conversation(first, None),
             test_conversation(second.clone(), None),
         ],
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        vec![],
-        Arc::new(TestClock::default()),
+        home.environment(),
     );
-    app.set_session_reader_for_test(parsed_from_its_file);
     app.selected = Some(1);
 
     app.start_rename();
@@ -1561,10 +1539,10 @@ fn submit_rename_preserves_selected_path() {
 
 #[test]
 fn submit_empty_rename_clears_searchable_title() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("abc123.jsonl");
+    let home = ClaudeHome::new();
+    let path = home.transcript("abc123");
     write_conversation(&path, Some("old"));
-    let mut app = app_with_conversation(path.clone(), Some("old".to_string()));
+    let mut app = app_with_conversation(&home, path, Some("old".to_string()));
 
     app.start_rename();
     app.handle_rename_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
@@ -1804,8 +1782,7 @@ fn copying_session_id_of_directly_opened_file_reads_its_header() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1827,8 +1804,7 @@ fn file_that_holds_no_conversation_copies_no_session_id() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1851,8 +1827,7 @@ fn copying_path_yields_path_not_session_id() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -1873,8 +1848,7 @@ fn exporting_to_clipboard_copies_generated_content() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.set_clipboard_writer_for_test(record_copied_text);
 
@@ -2239,8 +2213,7 @@ fn directly_opened_session_its_agent_stores_offers_only_rename() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
     app.is_opened_file_stored = true;
 
@@ -2275,8 +2248,7 @@ fn directly_opened_copy_offers_no_action_and_f2_doesnt_rename_it() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        InteractiveCache::default(),
-        Arc::new(TestClock::default()),
+        test_environment(Vec::new(), None),
     );
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);

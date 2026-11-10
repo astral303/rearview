@@ -169,9 +169,11 @@ impl AgentTranscript {
     }
 
     /// Load a transcript already attributed to `source`, with the sub-agent
-    /// transcripts its row names spliced in: only that provider's format
-    /// reads them, so a locator never meets a foreign format.
+    /// transcripts its row names spliced in, from the cache under `base`
+    /// when it holds the session: only that provider's format reads them, so
+    /// a locator never meets a foreign format.
     pub fn load_owned(
+        base: Option<&crate::history::CacheBase>,
         source: crate::history::Source,
         path: impl AsRef<Path>,
         subagents: &[PathBuf],
@@ -179,7 +181,7 @@ impl AgentTranscript {
         let path = path.as_ref();
         let provider = source.provider();
         if let Ok(Some(cached)) =
-            crate::history::sqlite_cache::find_cached_session_waiting(source, path, subagents)
+            crate::history::sqlite_cache::find_cached_session_waiting(base, source, path, subagents)
             && let Ok(Some(stored)) = cached.numbered_entries(None)
         {
             return Self::from_stored(path, stored);
@@ -1450,8 +1452,8 @@ mod tests {
         let path = directory.path().join("test.jsonl");
         std::fs::write(&path, "{malformed\nnot json").unwrap();
 
-        let error =
-            AgentTranscript::load_owned(crate::history::Source::Claude, &path, &[]).unwrap_err();
+        let error = AgentTranscript::load_owned(None, crate::history::Source::Claude, &path, &[])
+            .unwrap_err();
 
         let crate::error::AppError::Agent(AgentError { kind, detail, .. }) = error else {
             panic!("an agent error: {error:?}");
@@ -1506,9 +1508,13 @@ mod tests {
         )
         .unwrap();
 
-        let transcript =
-            AgentTranscript::load_owned(crate::history::Source::Claude, &session, &[subagent])
-                .unwrap();
+        let transcript = AgentTranscript::load_owned(
+            None,
+            crate::history::Source::Claude,
+            &session,
+            &[subagent],
+        )
+        .unwrap();
 
         let texts = transcript
             .messages

@@ -32,7 +32,12 @@ impl App {
         let session_id = Some(self.conversations[conv_idx].session_id.clone());
         let subagents = self.conversations[conv_idx].subagents.clone();
 
-        match parse_conversation_file_interactively(&self.cache, source, &path, &subagents) {
+        match parse_conversation_file_interactively(
+            &self.interactive_cache(),
+            source,
+            &path,
+            &subagents,
+        ) {
             Ok(read) => {
                 self.follow_up_read(&path, read.follow_up);
                 let conversation = Arc::new(read.value);
@@ -78,7 +83,7 @@ impl App {
                 });
             }
             Err(e) => {
-                self.status_message = Some((format!("Failed to open: {}", e), self.clock.now()));
+                self.status_message = Some((format!("Failed to open: {}", e), self.clock().now()));
             }
         }
     }
@@ -260,8 +265,12 @@ impl App {
         match self.read_open_session(&path, source, row_index) {
             Some(SessionRead::Listed(row)) => {
                 let subagents = row.subagents.clone();
-                match parse_conversation_file_interactively(&self.cache, source, &path, &subagents)
-                {
+                match parse_conversation_file_interactively(
+                    &self.interactive_cache(),
+                    source,
+                    &path,
+                    &subagents,
+                ) {
                     Ok(read) => {
                         self.follow_up_read(&path, read.follow_up);
                         let session_id = Some(row.session_id.clone());
@@ -318,7 +327,7 @@ impl App {
                     path,
                     source,
                     self.is_opened_file_stored,
-                    self.clock.as_ref(),
+                    self.clock(),
                 ) {
                     Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
                     Ok(None) => SessionRead::Empty,
@@ -378,13 +387,14 @@ impl App {
         state.session_id = session_id;
         state.parsed_conversation = Some(conversation);
         self.render_view(viewport_height, relocation.as_ref(), is_at_bottom);
+        let now = self.clock().now();
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
         let messages_after = state.message_ranges.len();
         if messages_after != messages_before {
             state.count_highlight = Some(CountHighlight {
-                until: self.clock.now() + COUNT_HIGHLIGHT,
+                until: now + COUNT_HIGHLIGHT,
                 arrived_below: (is_at_bottom && messages_after > messages_before)
                     .then(|| messages_after - messages_before),
             });
@@ -406,9 +416,9 @@ impl App {
             parse_conversation_file_interactively, render_parsed_conversation,
         };
 
-        let clock = &self.clock;
+        let clock = Arc::clone(self.environment.clock());
         let mut followed_up = None;
-        let cache = &self.cache;
+        let cache = &self.interactive_cache();
 
         if let AppMode::View(ref mut state) = self.app_mode {
             let anchor = capture_anchor(
@@ -1084,7 +1094,7 @@ impl App {
         match self.focused_call_text() {
             Ok(text) => self.copy_to_clipboard("Call", &text),
             Err(e) => {
-                self.status_message = Some((e, self.clock.now()));
+                self.status_message = Some((e, self.clock().now()));
             }
         }
     }

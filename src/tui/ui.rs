@@ -2360,7 +2360,8 @@ fn highlight_ranges(
 mod tests {
     use super::*;
     use crate::clock::{Clock, TestClock};
-    use crate::history::{Conversation, InteractiveCache, Source};
+    use crate::history::environment::test_support::{environment_on, test_environment};
+    use crate::history::{Conversation, Source};
     use crate::search::query::ParsedQuery;
     use crate::semantic::types::{
         SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
@@ -2468,8 +2469,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
-            InteractiveCache::default(),
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
         app.check_view_resize(80, 17);
         app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), 17);
@@ -2551,8 +2551,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
-            InteractiveCache::default(),
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
         app.check_view_resize(80, 6);
         app
@@ -2646,8 +2645,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
-            InteractiveCache::default(),
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
         app.check_view_resize(80, 17);
         for key in "/cache rebuild"
@@ -2828,7 +2826,7 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
-            clock,
+            environment_on(clock),
         )
     }
 
@@ -3061,8 +3059,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
-            InteractiveCache::default(),
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
 
@@ -3554,7 +3551,7 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
         app.set_query_for_test("sentinel");
         let (response_tx, response_rx) = mpsc::channel();
@@ -3614,8 +3611,7 @@ mod tests {
             KeyBindings::default(),
             ListScope::default(),
             TuiSearchOptions::default(),
-            InteractiveCache::default(),
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
 
         assert_eq!(refresh_key_fg(&app), rgb(th().dim_key));
@@ -3665,8 +3661,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
-            InteractiveCache::default(),
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
         app.check_view_resize(160, 10);
         app
@@ -4332,7 +4327,7 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
         app.set_query_for_test("semantic \"audio_generation\"");
         let (response_tx, response_rx) = mpsc::channel();
@@ -4410,7 +4405,7 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
-            Arc::new(TestClock::default()),
+            test_environment(Vec::new(), None),
         );
         app.set_query_for_test("semantic \"alpha_exact\" \"beta_exact\"");
         complete_semantic_search(

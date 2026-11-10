@@ -19,6 +19,7 @@
 //! each provider's [`ProviderFixture::every_record_session`] through
 //! [`every_record_sessions`]. It fails for a provider without a fixture.
 
+use super::walk::{DirectoryLister, SystemLister};
 use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
     RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionProvider, SessionRead,
@@ -27,7 +28,8 @@ use super::{
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
-use crate::history::cache::SessionCacheStore;
+use crate::history::environment::test_support::test_environment;
+use crate::history::load_meter::AgentMeter;
 use crate::history::{CacheFollowUp, Conversation, Source};
 use runner::run_contract;
 pub(crate) use runner::{every_record_sessions, registered_fixtures};
@@ -383,7 +385,10 @@ pub(crate) trait ProviderFixture: Sync {
     /// Discovery under `home`, through the provider's storage.
     fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
         let storage = self.storage();
-        storage.discover(&self.root_under(home)).unwrap().stubs
+        storage
+            .discover(&self.root_under(home), &SystemLister)
+            .unwrap()
+            .stubs
     }
 
     /// The session `id` names under `home`, as the provider's
@@ -543,7 +548,7 @@ mod runner {
 
     /// Runs `contract` over every registered provider whose declarations turn
     /// it on, naming the provider when the contract fails for it.
-    pub(super) fn run_contract(contract: Contract, body: impl Fn(&dyn ProviderFixture)) {
+    pub(super) fn run_contract(contract: Contract, body: impl Fn(&'static dyn ProviderFixture)) {
         let mut ran = false;
         for provider in providers() {
             if !contract.runs_for(*provider) {
@@ -606,40 +611,36 @@ mod runner {
 /// Every conversation under `home`, through the shared load loop with its
 /// session cache under `cache_base`.
 pub(crate) fn load_under(
-    fixture: &dyn ProviderFixture,
+    fixture: &'static dyn ProviderFixture,
     home: &Path,
     cache_base: &Path,
 ) -> Vec<Conversation> {
-    let storage = FixtureStorage { fixture, home };
-    let cache = SessionCacheStore::under(cache_base, storage.cache());
-    super::load_sessions_with_cache(&storage, &cache, false, None).unwrap()
+    let environment = fixture_environment(fixture, home, cache_base);
+    let storage = environment.storages()[0];
+    super::load_sessions(
+        &environment,
+        storage,
+        false,
+        None,
+        AgentMeter::UNMETERED,
+        super::LeftOutRows::NONE,
+        &mut |_, _| {},
+    )
+    .unwrap()
+    .conversations
 }
 
-/// The session at `locator` under `home` read again as the TUI's drawing
-/// thread reads a listed row, with its session cache under `cache_base`.
-pub(crate) fn reread_under(
-    fixture: &dyn ProviderFixture,
+/// `fixture`'s storage pinned to `home`, alone, with its session cache under
+/// `cache_base`, on test time.
+pub(crate) fn fixture_environment(
+    fixture: &'static dyn ProviderFixture,
     home: &Path,
     cache_base: &Path,
-    locator: &Path,
-) -> super::InteractiveRead<Option<super::SessionRead>> {
-    let storage = FixtureStorage { fixture, home };
-    let cache = SessionCacheStore::under(cache_base, storage.cache());
-    super::reread_session_with_cache(&storage, &cache, locator, false)
-}
-
-/// The session at `locator` under `home` read again as the TUI's background
-/// refresh thread reads a listed row to cache it, with its session cache
-/// under `cache_base`.
-pub(crate) fn cache_under(
-    fixture: &dyn ProviderFixture,
-    home: &Path,
-    cache_base: &Path,
-    locator: &Path,
-) -> super::InteractiveRead<Option<super::SessionRead>> {
-    let storage = FixtureStorage { fixture, home };
-    let cache = SessionCacheStore::under(cache_base, storage.cache());
-    super::cache_session_with_cache(&storage, &cache, locator, false)
+) -> crate::history::Environment {
+    test_environment(
+        vec![kept_storage_under(fixture, home, None)],
+        Some(cache_base),
+    )
 }
 
 /// The provider's storage pinned to `home`, with discovery answered by the
@@ -663,7 +664,11 @@ impl SessionStorage for FixtureStorage<'_> {
         Ok(vec![self.fixture.root_under(self.home)])
     }
 
-    fn discover(&self, _root: &SessionRoot) -> Result<DiscoveredSessions> {
+    fn discover(
+        &self,
+        _root: &SessionRoot,
+        _lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
         Ok(DiscoveredSessions::complete(
             self.fixture.discover_under(self.home),
         ))
@@ -673,10 +678,11 @@ impl SessionStorage for FixtureStorage<'_> {
         &self,
         root: &SessionRoot,
         locator: &Path,
+        lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
         self.fixture
             .storage()
-            .rediscover_unlisted_session(root, locator)
+            .rediscover_unlisted_session(root, locator, lister)
     }
 
     fn parse_session(
@@ -732,8 +738,12 @@ impl SessionStorage for StorageMissingADirectory {
         self.storage.roots_in(environment)
     }
 
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        let mut found = self.storage.discover(root)?;
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        let mut found = self.storage.discover(root, lister)?;
         found
             .unreadable_directories
             .extend(self.unreadable_directory.iter().map(|path| {
@@ -749,8 +759,10 @@ impl SessionStorage for StorageMissingADirectory {
         &self,
         root: &SessionRoot,
         locator: &Path,
+        lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
-        self.storage.rediscover_unlisted_session(root, locator)
+        self.storage
+            .rediscover_unlisted_session(root, locator, lister)
     }
 
     fn parse_session(
@@ -1095,8 +1107,8 @@ fn a_sub_agent_id_reads_through_an_empty_cache() {
             .resolve_under(home.path(), &fixture.subagent_id(ids.session))
             .unwrap()
             .unwrap();
-        let storage = fixture.storage();
-        let parsed = storage
+        let parsed = fixture
+            .storage()
             .parse_session(
                 &resolved.stub,
                 &resolved.root,
@@ -1105,18 +1117,19 @@ fn a_sub_agent_id_reads_through_an_empty_cache() {
                 &crate::clock::TestClock::default(),
             )
             .unwrap();
+        let environment = fixture_environment(fixture, home.path(), cache_base.path());
 
-        let read = super::read_resolved_session_with_cache(
-            storage,
-            &SessionCacheStore::under(cache_base.path(), storage.cache()),
-            &resolved.root,
-            resolved.stub,
+        let read = super::read_resolved_session(
+            &environment,
+            fixture.provider().source(),
+            resolved,
+            false,
         );
 
         assert!(
             matches!(
                 (parsed, read.value),
-                (Some(_), SessionRead::Listed(_)) | (None, SessionRead::Empty)
+                (Some(_), Some(SessionRead::Listed(_))) | (None, Some(SessionRead::Empty))
             ),
             "the sub-agent reads as its parsed session"
         );
@@ -1138,39 +1151,34 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
             .resolve_under(home.path(), &fixture.subagent_id(ids.session))
             .unwrap()
             .unwrap();
-        let storage = FixtureStorage {
-            fixture,
-            home: home.path(),
-        };
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let environment = fixture_environment(fixture, home.path(), cache_base.path());
+        let source = fixture.provider().source();
         let refresh = crate::history::sqlite_cache::refresh::RefreshOwnership::acquire(
-            cache_base.path(),
+            environment.cache_base().unwrap(),
             || (),
         )
         .unwrap();
 
-        let opened = super::read_resolved_session_with_cache(
-            &storage,
-            &cache,
-            &resolved.root,
-            resolved.stub.clone(),
-        );
+        let opened = super::read_resolved_session(&environment, source, resolved.clone(), false);
         assert!(
             matches!(opened.follow_up, Some(CacheFollowUp::AwaitRefresh(_))),
             "the sub-agent's read did not wait for the running refresh"
         );
         drop(refresh);
-        let reread =
-            super::reread_session_with_cache(&storage, &cache, &resolved.stub.locator, false);
-        let cached =
-            super::cache_session_with_cache(&storage, &cache, &resolved.stub.locator, false);
+        let locator = resolved.stub.locator.as_path();
+        let reread = super::reread_sessions(&environment, source, &[locator], false)
+            .pop()
+            .unwrap();
+        let cached = super::cache_sessions(&environment, source, &[locator], false)
+            .pop()
+            .unwrap();
 
         for read_again in [&reread.value, &cached.value] {
             assert!(
                 matches!(
                     (&opened.value, read_again),
-                    (SessionRead::Listed(_), Some(SessionRead::Listed(_)))
-                        | (SessionRead::Empty, Some(SessionRead::Empty))
+                    (Some(SessionRead::Listed(_)), Some(SessionRead::Listed(_)))
+                        | (Some(SessionRead::Empty), Some(SessionRead::Empty))
                 ),
                 "the sub-agent is read again after the refresh"
             );

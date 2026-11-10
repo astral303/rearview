@@ -1,14 +1,16 @@
 //! Refresh batches hold SQLite's writer lock through their work and timestamp
 //! their commits. A recent unfinished refresh keeps ownership between batches.
 
+use super::base::{CacheBase, ProcessIdentity};
+use super::connection::{self, Access};
 use super::is_busy;
+use crate::clock::{Clock, Moment};
 use crate::error::{AppError, Result};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const STALE_AFTER: Duration = Duration::from_secs(15);
 const POLL_EVERY: Duration = Duration::from_millis(200);
@@ -22,18 +24,6 @@ const POLL_EVERY: Duration = Duration::from_millis(200);
 /// load's database probe that finds the database busy spends the waiter's
 /// [`LockWait`] too.
 const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(30);
-
-/// The owner identities this process holds, by canonical cache base: added
-/// on acquisition, removed on revocation or release. SQLite's
-/// `refresh_state.owner` decides which refresh owns a cache; this names the
-/// stored owners that are this process's.
-static HELD_IN_THIS_PROCESS: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
-
-fn held_in_this_process() -> MutexGuard<'static, Vec<(PathBuf, String)>> {
-    HELD_IN_THIS_PROCESS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
 
 /// The process whose refresh owns a session cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,20 +46,15 @@ enum ActiveOwner {
 
 impl ActiveOwner {
     /// Every classification of a refresh's process goes through here. A
-    /// stored identity this process holds is this process's refresh; any
+    /// stored identity this rearview holds is this process's refresh; any
     /// other is another process's. An unreadable owner counts as this
-    /// process's while this process holds ownership of `base`: the registry
+    /// process's while this rearview holds ownership of `base`: the identity
     /// is the only evidence left, so this case is not identity-verified.
-    fn owning_process(&self, base: &Path) -> RefreshOwner {
+    fn owning_process(&self, base: &CacheBase) -> RefreshOwner {
         let is_this_process = match self {
-            Self::Stored(identity) => held_in_this_process()
-                .iter()
-                .any(|(_, held)| held == identity),
-            Self::Unreadable => std::fs::canonicalize(base).is_ok_and(|base| {
-                held_in_this_process()
-                    .iter()
-                    .any(|(held_base, _)| *held_base == base)
-            }),
+            Self::Stored(identity) => base.process().holds(identity),
+            Self::Unreadable => std::fs::canonicalize(base.path())
+                .is_ok_and(|canonical| base.process().holds_any_owner_of(&canonical)),
         };
         if is_this_process {
             RefreshOwner::ThisProcess
@@ -87,43 +72,45 @@ pub(crate) enum Acquisition {
     HeldBy(RefreshOwner),
 }
 
-/// One wait for SQLite's writer lock. It runs out [`LOCK_WAIT_LIMIT`] after
-/// it starts, or after the waiter last saw a refresh commit.
+/// One wait for SQLite's writer lock, on one clock. It runs out
+/// [`LOCK_WAIT_LIMIT`] after it starts, or after the waiter last saw a
+/// refresh commit.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LockWait {
-    since: Instant,
+    since: Moment,
     limit: Duration,
 }
 
 impl LockWait {
-    pub(crate) fn starting_now() -> Self {
+    pub(crate) fn starting_now(clock: &dyn Clock) -> Self {
         Self {
-            since: Instant::now(),
+            since: clock.now(),
             limit: LOCK_WAIT_LIMIT,
         }
     }
 
     /// A wait starting now that runs out after `limit`.
     #[cfg(test)]
-    pub(crate) fn starting_now_for(limit: Duration) -> Self {
+    pub(crate) fn starting_now_for(clock: &dyn Clock, limit: Duration) -> Self {
         Self {
-            since: Instant::now(),
+            since: clock.now(),
             limit,
         }
     }
 
-    /// The time left before the wait runs out; zero once it has.
-    pub(crate) fn remaining(&self) -> Duration {
-        self.limit.saturating_sub(self.since.elapsed())
+    /// The time left on `clock`, the wait's own, before the wait runs out;
+    /// zero once it has.
+    pub(crate) fn remaining(&self, clock: &dyn Clock) -> Duration {
+        self.limit.saturating_sub(clock.elapsed_since(self.since))
     }
 
-    fn has_run_out(&self) -> bool {
-        self.remaining().is_zero()
+    fn has_run_out(&self, clock: &dyn Clock) -> bool {
+        self.remaining(clock).is_zero()
     }
 
     /// Start the wait again: the waiter saw a refresh commit.
-    fn renew(&mut self) {
-        self.since = Instant::now();
+    fn renew(&mut self, clock: &dyn Clock) {
+        self.since = clock.now();
     }
 }
 
@@ -147,30 +134,35 @@ impl RefreshOwnership {
     /// [`LOCK_WAIT_LIMIT`]. `start_wait` runs when an attempt finds another
     /// process's refresh and no wait is counted; its result drops when an
     /// attempt finds this process's own refresh, or when this returns.
-    pub(crate) fn acquire<W>(base: &Path, start_wait: impl FnMut() -> W) -> Result<Self> {
-        Self::acquire_within(base, LockWait::starting_now(), start_wait)
+    pub(crate) fn acquire<W>(base: &CacheBase, start_wait: impl FnMut() -> W) -> Result<Self> {
+        Self::acquire_within(
+            base,
+            LockWait::starting_now(base.clock().as_ref()),
+            start_wait,
+        )
     }
 
     /// [`Self::acquire`], continuing `lock_wait`: a wait that ran out fails
     /// after one attempt that finds the writer lock busy. Never on the TUI's
     /// drawing thread.
     pub(crate) fn acquire_within<W>(
-        base: &Path,
+        base: &CacheBase,
         mut lock_wait: LockWait,
         mut start_wait: impl FnMut() -> W,
     ) -> Result<Self> {
         super::interactive::refuse_the_drawing_thread("acquire session cache refresh ownership");
-        let base = canonical_base(base)?;
+        let base = base.canonical()?;
+        let clock = base.clock().as_ref();
         let mut waiting = None;
         let mut observed = None;
         loop {
             let owner = match try_acquire(&base, STALE_AFTER, &mut observed)? {
                 Attempt::Acquired(token) => return Ok(Self::register(token)),
                 Attempt::Owned(identity) => {
-                    lock_wait.renew();
+                    lock_wait.renew(clock);
                     ActiveOwner::Stored(identity)
                 }
-                Attempt::WriterBusy(_) if lock_wait.has_run_out() => {
+                Attempt::WriterBusy(_) if lock_wait.has_run_out(clock) => {
                     return Err(writer_lock_busy());
                 }
                 Attempt::WriterBusy(owner) => owner,
@@ -179,15 +171,15 @@ impl RefreshOwnership {
                 RefreshOwner::AnotherProcess => waiting.or_else(|| Some(start_wait())),
                 RefreshOwner::ThisProcess => None,
             };
-            thread::sleep(POLL_EVERY);
+            clock.sleep(POLL_EVERY);
         }
     }
 
     /// Refresh ownership of `base` when no refresh owns it now; otherwise the
     /// process whose refresh does. Never waits.
     #[cfg(test)]
-    pub(crate) fn try_acquire_now(base: &Path) -> Result<Acquisition> {
-        let base = canonical_base(base)?;
+    pub(crate) fn try_acquire_now(base: &CacheBase) -> Result<Acquisition> {
+        let base = base.canonical()?;
         Ok(match try_acquire(&base, STALE_AFTER, &mut None)? {
             Attempt::Acquired(token) => Acquisition::Acquired(Self::register(token)),
             Attempt::Owned(identity) => {
@@ -197,10 +189,10 @@ impl RefreshOwnership {
         })
     }
 
-    /// `token`'s ownership, added to the identities this process holds until
+    /// `token`'s ownership, added to the identities its rearview holds until
     /// dropped.
     fn register(token: RefreshToken) -> Self {
-        held_in_this_process().push((token.base.clone(), token.identity.clone()));
+        token.process.hold(&token.base, &token.identity);
         Self { token }
     }
 
@@ -217,7 +209,7 @@ impl Drop for RefreshOwnership {
             let _ = connection.execute(
                 "UPDATE refresh_state SET owner = NULL, last_commit_ms = ?1
                  WHERE singleton = 1 AND owner = ?2",
-                params![now_ms(), self.token.identity],
+                params![now_ms(self.token.clock.as_ref()), self.token.identity],
             );
         }
         self.token.forget();
@@ -227,16 +219,19 @@ impl Drop for RefreshOwnership {
 /// The process whose refresh owns `base`'s cache now: its batch holds the
 /// writer lock, or its last commit is recent. `None` while no refresh owns
 /// it. Never waits, never acquires ownership and never writes.
-pub(crate) fn running_refresh(base: &Path) -> Result<Option<RefreshOwner>> {
-    if !super::database_path(base).is_file() {
+pub(crate) fn running_refresh(base: &CacheBase) -> Result<Option<RefreshOwner>> {
+    if !super::database_path(base.path()).is_file() {
         return Ok(None);
     }
     let owner = (|| {
-        let connection = connect_waiter(base)?;
+        let connection = connect_waiter(base.path())?;
         let Some(transaction) = begin_without_waiting(&connection)? else {
             return Ok(Some(owner_behind_writer_lock(&connection)));
         };
-        Ok(recent_owner(&transaction, STALE_AFTER, &mut None)?.map(ActiveOwner::Stored))
+        Ok(
+            recent_owner(&transaction, STALE_AFTER, &mut None, base.clock().as_ref())?
+                .map(ActiveOwner::Stored),
+        )
     })();
     let owner = match owner {
         Err(AppError::SessionCache(error)) if is_busy(&error) => Some(ActiveOwner::Unreadable),
@@ -247,8 +242,8 @@ pub(crate) fn running_refresh(base: &Path) -> Result<Option<RefreshOwner>> {
 
 /// The process whose refresh holds `base`'s database when a read finds it
 /// busy, as the stored owner names it.
-pub(crate) fn owner_of_busy_database(base: &Path) -> RefreshOwner {
-    connect_waiter(base)
+pub(crate) fn owner_of_busy_database(base: &CacheBase) -> RefreshOwner {
+    connect_waiter(base.path())
         .map_or(ActiveOwner::Unreadable, |connection| {
             owner_behind_writer_lock(&connection)
         })
@@ -259,6 +254,10 @@ pub(crate) fn owner_of_busy_database(base: &Path) -> RefreshOwner {
 pub(crate) struct RefreshToken {
     base: PathBuf,
     identity: String,
+    /// The rearview this owner belongs to.
+    process: ProcessIdentity,
+    /// The clock this owner's commit times are read on.
+    clock: Arc<dyn Clock>,
     writable: Arc<AtomicBool>,
     /// Taken before SQLite's writer lock by each write batch for this owner,
     /// and released after its commit or rollback, so this owner's threads
@@ -267,10 +266,13 @@ pub(crate) struct RefreshToken {
 }
 
 impl RefreshToken {
-    fn new(base: PathBuf, identity: String) -> Self {
+    /// `identity`'s ownership of `base`, a canonical cache base.
+    fn new(base: &CacheBase, identity: String) -> Self {
         Self {
-            base,
+            base: base.path().to_path_buf(),
             identity,
+            process: base.process().clone(),
+            clock: Arc::clone(base.clock()),
             writable: Arc::new(AtomicBool::new(true)),
             turn: Arc::new(Mutex::new(())),
         }
@@ -287,6 +289,15 @@ impl RefreshToken {
         &self.base
     }
 
+    /// This owner's cache base as its rearview reaches it.
+    pub(crate) fn cache_base(&self) -> CacheBase {
+        CacheBase::new(
+            self.base.clone(),
+            self.process.clone(),
+            Arc::clone(&self.clock),
+        )
+    }
+
     pub(crate) fn can_publish(&self) -> bool {
         self.writable.load(Ordering::Acquire)
     }
@@ -299,9 +310,9 @@ impl RefreshToken {
         self.forget();
     }
 
-    /// Remove this identity from the ones this process holds.
+    /// Remove this identity from the ones its rearview holds.
     fn forget(&self) {
-        held_in_this_process().retain(|(_, identity)| *identity != self.identity);
+        self.process.forget(&self.identity);
     }
 
     /// Call inside the batch's immediate transaction, after taking its lock.
@@ -359,13 +370,9 @@ impl RefreshToken {
     }
 }
 
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
-
-fn canonical_base(base: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(base)?;
-    Ok(std::fs::canonicalize(base)?)
+/// `clock`'s wall time in epoch milliseconds, as `last_commit_ms` stores it.
+fn now_ms(clock: &dyn Clock) -> i64 {
+    clock.wall().timestamp_millis()
 }
 
 /// The outcome of one attempt to acquire refresh ownership.
@@ -379,40 +386,39 @@ enum Attempt {
 }
 
 /// An owner's identity and last commit as one waiter saw them, and when it
-/// first saw that pair.
+/// first saw that pair on the waiter's clock.
 struct ObservedRefresh {
     owner: String,
     last_commit_ms: i64,
-    since: Instant,
+    since: Moment,
 }
 
+/// One attempt at refresh ownership of `base`, a canonical cache base.
 fn try_acquire(
-    base: &Path,
+    base: &CacheBase,
     stale_after: Duration,
     observed: &mut Option<ObservedRefresh>,
 ) -> Result<Attempt> {
+    let clock = base.clock().as_ref();
     let attempt = (|| {
-        let connection = connect_waiter(base)?;
+        let connection = connect_waiter(base.path())?;
         let Some(transaction) = begin_without_waiting(&connection)? else {
             return Ok(Attempt::WriterBusy(owner_behind_writer_lock(&connection)));
         };
         if !has_refresh_state(&transaction)? {
             transaction.execute_batch(CREATE)?;
         }
-        if let Some(identity) = recent_owner(&transaction, stale_after, observed)? {
+        if let Some(identity) = recent_owner(&transaction, stale_after, observed, clock)? {
             return Ok(Attempt::Owned(identity));
         }
         let identity: String =
             transaction.query_row("SELECT hex(randomblob(16))", [], |row| row.get(0))?;
         transaction.execute(
             "UPDATE refresh_state SET owner = ?1, last_commit_ms = ?2 WHERE singleton = 1",
-            params![identity, now_ms()],
+            params![identity, now_ms(clock)],
         )?;
         transaction.commit()?;
-        Ok(Attempt::Acquired(RefreshToken::new(
-            base.to_path_buf(),
-            identity,
-        )))
+        Ok(Attempt::Acquired(RefreshToken::new(base, identity)))
     })();
     match attempt {
         Err(AppError::SessionCache(error)) if is_busy(&error) => {
@@ -426,7 +432,7 @@ fn try_acquire(
 /// again: an open WAL connection keeps an owner's exclusive rebuild waiting at
 /// `BEGIN EXCLUSIVE`.
 fn connect_waiter(base: &Path) -> Result<Connection> {
-    let connection = Connection::open(super::database_path(base))?;
+    let connection = connection::open(&super::database_path(base), Access::Create)?;
     connection.busy_timeout(Duration::ZERO)?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(connection)
@@ -443,13 +449,14 @@ fn begin_without_waiting(connection: &Connection) -> Result<Option<Transaction<'
 /// The identity of the refresh that owns the cache and is not stale; `None`
 /// while no refresh does. Call holding the writer lock, so an owner inside a
 /// long batch is never judged stale. Ownership goes stale 15 seconds after
-/// its last commit by the wall clock, or after this waiter has seen the same
-/// owner and commit for 15 seconds by its monotonic clock, so a clock
-/// rollback cannot extend it.
+/// its last commit by `clock`'s wall time, or after this waiter has seen the
+/// same owner and commit for 15 seconds by `clock`'s monotonic time, so a
+/// clock rollback cannot extend it.
 fn recent_owner(
     transaction: &Transaction<'_>,
     stale_after: Duration,
     observed: &mut Option<ObservedRefresh>,
+    clock: &dyn Clock,
 ) -> Result<Option<String>> {
     if !has_refresh_state(transaction)? {
         return Ok(None);
@@ -469,13 +476,13 @@ fn recent_owner(
         *observed = Some(ObservedRefresh {
             owner: owner.clone(),
             last_commit_ms,
-            since: Instant::now(),
+            since: clock.now(),
         });
     }
-    let unchanged_for = observed
-        .as_ref()
-        .map_or(Duration::ZERO, |observed| observed.since.elapsed());
-    let is_recent = now_ms().saturating_sub(last_commit_ms) < stale_after.as_millis() as i64
+    let unchanged_for = observed.as_ref().map_or(Duration::ZERO, |observed| {
+        clock.elapsed_since(observed.since)
+    });
+    let is_recent = now_ms(clock).saturating_sub(last_commit_ms) < stale_after.as_millis() as i64
         && unchanged_for < stale_after;
     Ok(is_recent.then_some(owner))
 }
@@ -514,13 +521,18 @@ fn writer_lock_busy() -> AppError {
     .into()
 }
 
-/// Retry `operation` while the database is busy, for up to `limit`.
-fn retry_busy<T>(limit: Duration, mut operation: impl FnMut() -> rusqlite::Result<T>) -> Result<T> {
-    let started = Instant::now();
+/// Retry `operation` while the database is busy, for up to `limit` of
+/// `clock`'s time.
+fn retry_busy<T>(
+    limit: Duration,
+    clock: &dyn Clock,
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+) -> Result<T> {
+    let started = clock.now();
     loop {
         match operation() {
-            Err(error) if is_busy(&error) && started.elapsed() < limit => {
-                thread::sleep(POLL_EVERY);
+            Err(error) if is_busy(&error) && clock.elapsed_since(started) < limit => {
+                clock.sleep(POLL_EVERY);
             }
             result => return Ok(result?),
         }
@@ -528,10 +540,7 @@ fn retry_busy<T>(limit: Duration, mut operation: impl FnMut() -> rusqlite::Resul
 }
 
 fn connect(base: &Path, timeout: Duration) -> Result<Connection> {
-    let connection = Connection::open_with_flags(
-        super::database_path(base),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )?;
+    let connection = connection::open(&super::database_path(base), Access::ReadWrite)?;
     connection.busy_timeout(timeout)?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(connection)
@@ -599,7 +608,7 @@ fn transaction_during<'a>(
     _turn: &Turn<'_>,
     lock_wait_limit: Duration,
 ) -> Result<WriteBatch<'a>> {
-    let transaction = retry_busy(lock_wait_limit, || {
+    let transaction = retry_busy(lock_wait_limit, owner.clock.as_ref(), || {
         Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
     })
     .inspect_err(|_| owner.revoke())?;
@@ -630,7 +639,7 @@ pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> 
     let changed = batch
         .execute(
             "UPDATE refresh_state SET last_commit_ms = ?1 WHERE singleton = 1 AND owner = ?2",
-            params![now_ms(), owner.identity],
+            params![now_ms(owner.clock.as_ref()), owner.identity],
         )
         .inspect_err(|_| owner.revoke())?;
     if changed != 1 {

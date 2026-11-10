@@ -21,7 +21,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 type ResolvedReadRefs = Vec<(agent::refs::ReadRef, agent::refs::ResolvedConversation)>;
 
@@ -217,7 +216,11 @@ struct LoadedSessions {
 impl LoadedSessions {
     /// Loads the history without rereading a changed session whose cached
     /// row `rules` leave out.
-    fn load(rules: &SelectionRules, perf: &CommandPerf, clock: &dyn Clock) -> Result<Self> {
+    fn load(
+        rules: &SelectionRules,
+        perf: &CommandPerf,
+        environment: &history::Environment,
+    ) -> Result<Self> {
         // Leave out the session this command runs in: the caller already
         // holds its text, and listing it or a hit in it would spend the
         // output budget on that text.
@@ -234,11 +237,11 @@ impl LoadedSessions {
         };
         let history = perf.time(Stage::Load, || {
             history::load_history(
+                environment,
                 false,
                 None,
                 Some(perf.load_meter()),
                 history::provider::LeftOutRows::of(&leaves_out),
-                clock,
             )
         })?;
         Ok(Self {
@@ -365,20 +368,21 @@ pub struct AgentService {
     perf: CommandPerf,
     #[cfg(test)]
     transcript_parse_count: std::cell::Cell<usize>,
-    clock: Arc<dyn Clock>,
+    environment: history::Environment,
 }
 
-pub fn execute(command: AgentCommand, clock: Arc<dyn Clock>) -> Result<String> {
-    AgentService::new(clock).execute(command)
+pub fn execute(command: AgentCommand, environment: history::Environment) -> Result<String> {
+    AgentService::new(environment).execute(command)
 }
 
-/// `key`'s transcript read from disk, its failure worded for the agent
-/// protocol.
+/// `key`'s transcript read through the cache under `base` or from disk, its
+/// failure worded for the agent protocol.
 fn read_agent_transcript(
+    base: Option<&history::CacheBase>,
     key: &agent::refs::AgentConversationKey,
 ) -> std::result::Result<agent::transcript::AgentTranscript, AgentError> {
     let path: &Path = &key.path;
-    agent::transcript::AgentTranscript::load_owned(key.source, path, &key.subagents).map_err(
+    agent::transcript::AgentTranscript::load_owned(base, key.source, path, &key.subagents).map_err(
         |error| match error {
             AppError::Agent(error) => error,
             AppError::Io(error) => AgentError::io(
@@ -398,21 +402,26 @@ fn read_agent_transcript(
 
 /// [`read_agent_transcript`] as a search's transcript loader.
 fn load_agent_transcript(
+    base: Option<&history::CacheBase>,
     key: &agent::refs::AgentConversationKey,
 ) -> Result<agent::transcript::AgentTranscript> {
-    read_agent_transcript(key).map_err(AppError::from)
+    read_agent_transcript(base, key).map_err(AppError::from)
 }
 
 impl AgentService {
-    pub fn new(clock: Arc<dyn Clock>) -> Self {
+    pub fn new(environment: history::Environment) -> Self {
         Self {
             transcripts: RefCell::default(),
             bounded_transcripts: RefCell::default(),
-            perf: CommandPerf::new(Arc::clone(&clock)),
+            perf: CommandPerf::new(Arc::clone(environment.clock())),
             #[cfg(test)]
             transcript_parse_count: std::cell::Cell::default(),
-            clock,
+            environment,
         }
+    }
+
+    fn clock(&self) -> &Arc<dyn Clock> {
+        self.environment.clock()
     }
 
     fn load_transcript_for_range(
@@ -431,6 +440,7 @@ impl AgentService {
             return Ok(transcript.clone());
         }
         if let Ok(Some(cached)) = history::sqlite_cache::find_cached_session_waiting(
+            self.environment.cache_base(),
             key.source,
             &key.path,
             &key.subagents,
@@ -497,9 +507,9 @@ impl AgentService {
         #[cfg(test)]
         self.transcript_parse_count
             .set(self.transcript_parse_count.get() + 1);
-        let loaded = self
-            .perf
-            .time_transcript_parse(key, || read_agent_transcript(key));
+        let loaded = self.perf.time_transcript_parse(key, || {
+            read_agent_transcript(self.environment.cache_base(), key)
+        });
         self.transcripts
             .borrow_mut()
             .insert(path.to_path_buf(), loaded.clone());
@@ -524,8 +534,9 @@ impl AgentService {
     fn search(&self, args: &cli::AgentSearchArgs) -> Result<String> {
         let perf = &self.perf;
         let reads = perf.search_reads();
+        let cache_base = self.environment.cache_base();
         let load_transcript = |key: &agent::refs::AgentConversationKey| {
-            reads.time_read(key, || load_agent_transcript(key))
+            reads.time_read(key, || load_agent_transcript(cache_base, key))
         };
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
@@ -533,7 +544,7 @@ impl AgentService {
         let embedding_budget = configured_embedding_budget(&config.semantic.unwrap_or_default());
         // Resolved before loading so an inverted range fails without paying for
         // a full corpus parse.
-        let time = args.time.resolve(self.clock.as_ref())?;
+        let time = args.time.resolve(self.clock().as_ref())?;
         let SessionSelection {
             conversations,
             scoped,
@@ -559,7 +570,7 @@ impl AgentService {
             window: time,
         };
         let mode = request.mode();
-        let clock = self.clock.as_ref();
+        let clock = self.clock().as_ref();
         let rank = || {
             perf.time(Stage::Ranking, || {
                 lexically_rank_scoped(&conversations, &args.query, &scoped, mode, &time, clock)
@@ -642,7 +653,7 @@ impl AgentService {
                                 embedding_budget,
                                 request.semantic_chunk_hits(),
                                 request.window,
-                                self.clock.clone(),
+                                self.clock().clone(),
                             )
                         })
                     },
@@ -696,7 +707,7 @@ impl AgentService {
     /// warnings for the selection's skipped and malformed transcripts.
     fn select_sessions(&self, rules: &SelectionRules) -> Result<SessionSelection> {
         let perf = &self.perf;
-        let loaded = LoadedSessions::load(rules, perf, self.clock.as_ref())?;
+        let loaded = LoadedSessions::load(rules, perf, &self.environment)?;
         let mut selection = SessionSelection::from_loaded(loaded, rules, perf)?;
         let skipped = perf.time(Stage::SkippedTranscripts, || {
             warnings_for_skipped_transcripts(self, &selection.conversations, &selection.keys)
@@ -708,7 +719,7 @@ impl AgentService {
     fn run_sessions(&self, args: &cli::AgentSessionsArgs) -> Result<String> {
         let agent_config = config::load_config()?.agent.unwrap_or_default();
         let rules = SelectionRules::new(
-            args.time.resolve(self.clock.as_ref())?,
+            args.time.resolve(self.clock().as_ref())?,
             &args.scope,
             &agent_config,
         );
@@ -723,7 +734,7 @@ impl AgentService {
                 &listing,
                 configured_budget(args.no_budget, args.budget, agent_config.output_chars),
                 &selection.warnings,
-                self.clock.wall(),
+                self.clock().wall(),
             ))
         })
     }
@@ -732,10 +743,10 @@ impl AgentService {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
-        let window = args.time.resolve(self.clock.as_ref())?;
+        let window = args.time.resolve(self.clock().as_ref())?;
         let perf = &self.perf;
         let (keys, _) = perf.time(Stage::Keys, || {
-            discover_agent_keys(perf.load_meter(), self.clock.as_ref())
+            discover_agent_keys(&self.environment, perf.load_meter())
         })?;
         let resolved = resolve_agent_conversation_arg(&args.conversation, &keys)?;
         let transcript = perf
@@ -760,8 +771,11 @@ impl AgentService {
             request.tui_semantic_search,
         );
         let mut output = perf.time(Stage::Search, || -> Result<_> {
-            let conversation =
-                conversation_from_agent_transcript(&transcript, &resolved.key, self.clock.as_ref());
+            let conversation = conversation_from_agent_transcript(
+                &transcript,
+                &resolved.key,
+                self.clock().as_ref(),
+            );
             Ok(match mode {
                 SearchMode::Lexical | SearchMode::Exact => agent::search::run_within_search(
                     &request,
@@ -777,7 +791,7 @@ impl AgentService {
                         &resolved,
                         &transcript,
                         SemanticToolContent::All,
-                        self.clock.clone(),
+                        self.clock().clone(),
                     )?;
                     warnings.extend(semantic_warnings);
                     output
@@ -788,7 +802,7 @@ impl AgentService {
                     &resolved,
                     &transcript,
                     SemanticToolContent::MatchingQuery(&request.query),
-                    self.clock.clone(),
+                    self.clock().clone(),
                 ) {
                     Ok((output, semantic_warnings)) => {
                         warnings.extend(semantic_warnings);
@@ -818,7 +832,7 @@ impl AgentService {
             Ok(agent::search::format_agent_output_with_warnings(
                 &output,
                 &warnings,
-                self.clock.wall(),
+                self.clock().wall(),
             ))
         })
     }
@@ -836,18 +850,19 @@ impl AgentService {
 ///
 /// `meter` records what each provider's discovery and cache read.
 fn discover_agent_keys(
+    environment: &history::Environment,
     meter: &LoadMeter,
-    clock: &dyn Clock,
 ) -> Result<(Vec<agent::refs::AgentConversationKey>, Vec<AgentWarning>)> {
     let mut keys = Vec::new();
     let mut warnings = Vec::new();
-    for provider in history::provider::providers() {
-        match provider_keys(*provider, meter.agent(provider.source()), clock) {
+    for &storage in environment.storages() {
+        let provider = storage.source().provider();
+        match provider_keys(environment, storage, meter.agent(storage.source())) {
             Ok(candidates) => keys.extend(candidates),
-            Err(error) => warnings.push(listing_failure_warning(*provider, &error)),
+            Err(error) => warnings.push(listing_failure_warning(provider, &error)),
         }
     }
-    if keys.is_empty() && !any_history_root_exists() {
+    if keys.is_empty() && !any_history_root_exists(environment) {
         return Err(AgentError::io(
             None,
             format!(
@@ -903,10 +918,9 @@ fn loaded_agent_keys(
     (keys, warnings)
 }
 
-fn any_history_root_exists() -> bool {
-    history::provider::providers().iter().any(|provider| {
-        provider
-            .storage()
+fn any_history_root_exists(environment: &history::Environment) -> bool {
+    environment.storages().iter().any(|storage| {
+        storage
             .roots()
             .is_ok_and(|roots| roots.iter().any(|root| root.path.exists()))
     })
@@ -926,17 +940,19 @@ fn listing_failure_warning(
     }
 }
 
-/// Every key under every root `provider` stores sessions in.
+/// Every key under every root `storage` stores sessions in.
 fn provider_keys(
-    provider: &dyn history::provider::SessionProvider,
+    environment: &history::Environment,
+    storage: &dyn history::provider::SessionStorage,
     meter: AgentMeter,
-    clock: &dyn Clock,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
-    let storage = provider.storage();
-    let cache = history::cache::SessionCacheStore::in_user_cache(storage.cache());
+    let cache = history::cache::SessionCacheStore::in_base(
+        environment.cache_base().map(history::CacheBase::path),
+        storage.cache(),
+    );
     let mut keys = Vec::new();
     for root in storage.roots()? {
-        keys.extend(root_keys(provider, &root, &cache, meter, clock)?);
+        keys.extend(root_keys(environment, storage, &root, &cache, meter)?);
     }
     Ok(keys)
 }
@@ -951,18 +967,19 @@ fn provider_keys(
 /// gigabytes is not parsed again. The cache is read only for such a
 /// session.
 fn root_keys(
-    provider: &dyn history::provider::SessionProvider,
+    environment: &history::Environment,
+    storage: &dyn history::provider::SessionStorage,
     root: &history::provider::SessionRoot,
     cache: &history::cache::SessionCacheStore,
     meter: AgentMeter,
-    clock: &dyn Clock,
 ) -> Result<Vec<agent::refs::AgentConversationKey>> {
-    let storage = provider.storage();
+    let provider = storage.source().provider();
+    let clock = environment.clock().as_ref();
     let entries = std::cell::OnceCell::new();
-    let cached = || entries.get_or_init(|| cache.read_existing_metered(&root.path, meter));
+    let cached = || entries.get_or_init(|| cache.read_existing_metered(&root.path, meter, clock));
     meter.discovering();
     let discovering = clock.now();
-    let stubs = storage.discover(root)?.stubs;
+    let stubs = storage.discover(root, environment.lister())?.stubs;
     meter.discovered(1, stubs.len(), clock.elapsed_since(discovering));
     Ok(stubs
         .iter()
@@ -970,7 +987,7 @@ fn root_keys(
             let recorded = if agent::refs::is_keyed_by_path(provider, &stub.locator) {
                 None
             } else {
-                recorded_session(storage, stub, cached(), meter)
+                recorded_session(storage, stub, cached(), meter, clock)
             };
             agent::refs::session_key(provider, stub, recorded.as_ref())
         })
@@ -982,17 +999,18 @@ fn root_keys(
 /// has no cache at all. `None` when the session holds no conversation, or
 /// has no entry in a cache that holds other sessions: a session the load
 /// could not read never gets one, and parsing it again on every call would
-/// find nothing new. `meter` records the parse.
+/// find nothing new. `meter` records the parse, timed on `clock`.
 fn recorded_session(
     storage: &dyn history::provider::SessionStorage,
     stub: &history::provider::SessionStub,
     cached: &HashMap<String, history::cache::SessionCacheEntry>,
     meter: AgentMeter,
+    clock: &dyn Clock,
 ) -> Option<history::provider::RecordedSession> {
     if cached.is_empty() {
-        let parsing = Instant::now();
+        let parsing = clock.now();
         let projection = history::format::parse_owned_transcript(storage.source(), &stub.locator);
-        meter.session_parsed(1, own_transcript_bytes(stub), parsing.elapsed());
+        meter.session_parsed(1, own_transcript_bytes(stub), clock.elapsed_since(parsing));
         return projection
             .ok()
             .flatten()
@@ -1235,7 +1253,7 @@ fn run_agent_semantic_search(
         embedding_budget,
         request.semantic_chunk_hits(),
         request.window,
-        service.clock.clone(),
+        service.clock().clone(),
     )?;
     let mut output = agent::search::run_global_semantic_search(request, &inputs, &semantic);
     attach_input_transcript_metadata(service, &mut output, &inputs);
@@ -1863,14 +1881,14 @@ impl AgentService {
             None => {
                 discovered = perf
                     .time(Stage::Keys, || {
-                        discover_agent_keys(perf.load_meter(), self.clock.as_ref())
+                        discover_agent_keys(&self.environment, perf.load_meter())
                     })?
                     .0;
                 &discovered
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let options = agent_protocol_options(&args.output, &agent_config, self.clock.as_ref())?;
+        let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
         let (mut resolved_refs, focus) = resolve_agent_read_args(args, keys)?;
         let transcripts = perf.time(Stage::Transcript, || {
             resolved_refs
@@ -1939,7 +1957,7 @@ impl AgentService {
                 slice.as_ref(),
                 options,
                 &warnings,
-                self.clock.wall(),
+                self.clock().wall(),
             )
         })
         .map_err(|error| match resolved_refs.first() {
@@ -1960,14 +1978,14 @@ impl AgentService {
             None => {
                 discovered = perf
                     .time(Stage::Keys, || {
-                        discover_agent_keys(perf.load_meter(), self.clock.as_ref())
+                        discover_agent_keys(&self.environment, perf.load_meter())
                     })?
                     .0;
                 &discovered
             }
         };
         let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let options = agent_protocol_options(&args.output, &agent_config, self.clock.as_ref())?;
+        let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
         let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
         let resolved = outline_ref.resolve_conversation(keys)?;
         let transcript = perf
@@ -1991,7 +2009,7 @@ impl AgentService {
                 &request,
                 options,
                 warning.as_slice(),
-                self.clock.wall(),
+                self.clock().wall(),
             )
         })
         .map_err(|error| target_error(error, &resolved))
@@ -2123,12 +2141,21 @@ pub(crate) fn resolve_agent_conversation_arg(
     agent::refs::resolve_conversation_ref(keys, reference)
 }
 
+/// A service reading every provider's storage and no session cache, on test
+/// time.
+#[cfg(test)]
+fn service_without_session_cache() -> AgentService {
+    AgentService::new(history::Environment::without_session_cache(Arc::new(
+        crate::clock::TestClock::default(),
+    )))
+}
+
 #[cfg(test)]
 pub(crate) fn run_agent_read(
     args: &AgentReadArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
 ) -> Result<String> {
-    AgentService::new(Arc::new(crate::clock::TestClock::default())).run_read(args, keys)
+    service_without_session_cache().run_read(args, keys)
 }
 
 #[cfg(test)]
@@ -2136,7 +2163,7 @@ pub(crate) fn run_agent_outline(
     args: &AgentOutlineArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
 ) -> Result<String> {
-    AgentService::new(Arc::new(crate::clock::TestClock::default())).run_outline(args, keys)
+    service_without_session_cache().run_outline(args, keys)
 }
 
 #[cfg(test)]
@@ -2145,9 +2172,29 @@ mod tests {
     use crate::agent::test_support::{assistant_jsonl_line, user_jsonl_line};
     use crate::cli::AgentOutputFlags;
     use crate::clock::TestClock;
+    use crate::history::environment::test_support::test_environment;
 
     fn service() -> AgentService {
-        AgentService::new(Arc::new(TestClock::default()))
+        service_without_session_cache()
+    }
+
+    /// `storage`'s sessions loaded through the session cache under
+    /// `cache_base` on test time, leaving `left_out`'s rows unread.
+    fn load_through(
+        storage: &dyn history::provider::SessionStorage,
+        cache_base: &Path,
+        left_out: history::provider::LeftOutRows,
+    ) -> history::provider::LoadedSessions {
+        history::provider::load_sessions(
+            &test_environment(Vec::new(), Some(cache_base)),
+            storage,
+            false,
+            None,
+            AgentMeter::UNMETERED,
+            left_out,
+            &mut |_, _| {},
+        )
+        .unwrap()
     }
 
     fn output_flags() -> AgentOutputFlags {
@@ -2233,6 +2280,7 @@ mod tests {
             &stub,
             &HashMap::new(),
             AgentMeter::UNMETERED,
+            &TestClock::default(),
         );
 
         let key = agent::refs::session_key(provider, &stub, recorded.as_ref()).unwrap();
@@ -2288,16 +2336,20 @@ mod tests {
         };
         let cache =
             history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
-        let loaded = history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
+        let loaded = load_through(
+            &storage,
+            cache_base.path(),
+            history::provider::LeftOutRows::NONE,
+        );
         let discovered = [(history::Source::Codex, loaded.discovered)];
         // The directory the fixture's listed thread recorded.
         let workspace = history::workspace::tests::workspace_at_home(Path::new("/tmp/project"));
         let mut discovery_keys = root_keys(
-            provider,
+            &test_environment(Vec::new(), Some(cache_base.path())),
+            &storage,
             &storage.root,
             &cache,
             AgentMeter::UNMETERED,
-            &TestClock::default(),
         )
         .unwrap();
         discovery_keys.sort_by(|left, right| left.path.cmp(&right.path));
@@ -2340,9 +2392,11 @@ mod tests {
             inner: provider.storage(),
             root: history::provider::SessionRoot::new(folder.parent().unwrap()).in_agent_tree(),
         };
-        let cache =
-            history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
-        let loaded = history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
+        let loaded = load_through(
+            &storage,
+            cache_base.path(),
+            history::provider::LeftOutRows::NONE,
+        );
         let discovered = [(history::Source::Claude, loaded.discovered)];
         let workspace = home.workspace(&repository);
 
@@ -2412,9 +2466,11 @@ mod tests {
             )
             .in_agent_tree(),
         };
-        let cache =
-            history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
-        let loaded = history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
+        let loaded = load_through(
+            &storage,
+            cache_base.path(),
+            history::provider::LeftOutRows::NONE,
+        );
         let utc = |minute| {
             chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 7, 26, 6, minute, 0)
                 .unwrap()
@@ -2486,7 +2542,11 @@ mod tests {
         };
         let cache =
             history::cache::SessionCacheStore::under(cache_base.path(), provider.storage().cache());
-        history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
+        load_through(
+            &storage,
+            cache_base.path(),
+            history::provider::LeftOutRows::NONE,
+        );
         let cached_fingerprint = || {
             cache
                 .read(&storage.root.path, &TestClock::default())
@@ -2542,18 +2602,19 @@ mod tests {
         let leaves_out =
             |row: &history::Conversation| rules.leaves_out(row, &current_session_ids, None);
 
-        let left_out = history::provider::load_leaving_out_with_cache(
+        let left_out = load_through(
             &storage,
-            &cache,
-            false,
-            None,
+            cache_base.path(),
             history::provider::LeftOutRows::of(&leaves_out),
-        )
-        .unwrap();
+        );
         let left_out_listing = listing_of(left_out.conversations, left_out.discovered);
 
         assert_eq!(cached_fingerprint(), fingerprint_before);
-        let reread = history::provider::load_with_cache(&storage, &cache, false, None).unwrap();
+        let reread = load_through(
+            &storage,
+            cache_base.path(),
+            history::provider::LeftOutRows::NONE,
+        );
         assert_ne!(cached_fingerprint(), fingerprint_before);
         assert_eq!(
             left_out_listing,
@@ -2592,6 +2653,7 @@ mod tests {
             &stub,
             &HashMap::new(),
             meter.agent(history::Source::Pi),
+            &TestClock::default(),
         );
 
         assert!(recorded.is_some());
@@ -2617,6 +2679,7 @@ mod tests {
             &stub,
             &cached,
             AgentMeter::UNMETERED,
+            &TestClock::default(),
         );
 
         assert_eq!(recorded, None);
@@ -2961,7 +3024,7 @@ mode = "hybrid"
         let rows_inside_window = [conversation_from_agent_transcript(
             &service.load_transcript(&row_inside).unwrap(),
             &row_inside,
-            service.clock.as_ref(),
+            service.clock().as_ref(),
         )];
 
         let outside = key_paths_outside_window(&keys, &rows_outside_window, &row_paths, &window);

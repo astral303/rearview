@@ -1,6 +1,6 @@
 //! Pi coding agent sessions, stored under `~/.pi/agent/sessions/`.
 
-use super::walk::FileRoot;
+use super::walk::{DirectoryLister, FileRoot};
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
@@ -158,11 +158,15 @@ impl SessionStorage for PiStorage {
 
     /// The walk depth belongs to the resolution that produced the root, so it
     /// is re-resolved here rather than guessed from the path.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
         let depth = pi_loader::session_root()?.depth;
         Ok(DiscoveredSessions::complete(walk::file_stubs(
             root,
-            walk::jsonl_files_at_depth(&root.path, depth)?,
+            walk::jsonl_files_at_depth(lister, &root.path, depth)?,
         )))
     }
 
@@ -171,6 +175,7 @@ impl SessionStorage for PiStorage {
         &self,
         _root: &SessionRoot,
         _locator: &Path,
+        _lister: &dyn DirectoryLister,
     ) -> Result<Option<SessionStub>> {
         Ok(None)
     }
@@ -320,7 +325,10 @@ pub(super) mod tests {
         /// walk depth from the environment.
         fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
             let root = self.root_under(home);
-            walk::file_stubs(&root, walk::jsonl_files_at_depth(&root.path, 1).unwrap())
+            walk::file_stubs(
+                &root,
+                walk::jsonl_files_at_depth(&walk::SystemLister, &root.path, 1).unwrap(),
+            )
         }
 
         fn find_under(&self, home: &Path, id: &str) -> Result<Vec<PathBuf>> {

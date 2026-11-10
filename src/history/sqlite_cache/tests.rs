@@ -12,8 +12,17 @@ mod sources;
 
 const CACHE_KEY: &str = "every-record";
 
+/// The cache in `directory` as one rearview reaches it, on test time.
+pub(crate) fn rearview_at(directory: &Path) -> CacheBase {
+    CacheBase::new(
+        directory,
+        ProcessIdentity::default(),
+        std::sync::Arc::new(TestClock::default()),
+    )
+}
+
 pub(super) fn admitted_cache(base: &Path) -> super::OwnedCache {
-    let cache = SqliteCache::open(base).unwrap();
+    let cache = SqliteCache::open(&rearview_at(base)).unwrap();
     cache.mark_admitted().unwrap();
     cache
 }
@@ -796,7 +805,7 @@ fn a_database_of_another_schema_version_is_emptied() {
     let previous_bytes = std::fs::metadata(database_path(base.path())).unwrap().len();
     drop(cache);
 
-    let reopened = SqliteCache::open(base.path()).unwrap();
+    let reopened = SqliteCache::open(&rearview_at(base.path())).unwrap();
 
     assert!(!reopened.is_admitted().unwrap());
     assert_eq!(
@@ -841,7 +850,7 @@ fn a_database_of_another_schema_version_is_emptied() {
 #[test]
 fn a_one_kib_cache_is_rebuilt_at_the_selected_size() {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = SqliteCache::open(base.path()).unwrap();
+    let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
     write_test_entries(
         &mut cache,
         TranscriptEntries {
@@ -859,7 +868,7 @@ fn a_one_kib_cache_is_rebuilt_at_the_selected_size() {
         .unwrap();
     cache.connection.execute_batch("VACUUM").unwrap();
     drop(cache);
-    let reopened = SqliteCache::open(base.path()).unwrap();
+    let reopened = SqliteCache::open(&rearview_at(base.path())).unwrap();
     assert!(!reopened.is_admitted().unwrap());
     assert_eq!(
         reopened

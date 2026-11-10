@@ -15,17 +15,16 @@
 //! no test drives, and a release build, are not checked.
 
 use super::refresh::{self, RefreshOwner};
-use super::{ReaderWait, SqliteCache, is_busy_error, is_refused};
+use super::{CacheBase, ReaderWait, SqliteCache, is_busy_error};
 use crate::error::Result;
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
 
 /// The session cache base the TUI reads, and its one way to read it.
 /// `Default` reads no cache.
 #[derive(Clone, Debug, Default)]
 pub struct InteractiveCache {
-    base: Option<PathBuf>,
+    base: Option<CacheBase>,
 }
 
 /// A TUI read that did not wait for the session cache.
@@ -68,22 +67,18 @@ impl<T> InteractiveRead<T> {
 }
 
 impl InteractiveCache {
-    /// The cache in the user's cache directory.
-    pub fn in_user_cache() -> Self {
-        Self {
-            base: crate::cache_file::session_cache_base(),
-        }
+    /// The cache under `base`, or no cache without one.
+    pub fn of(base: Option<CacheBase>) -> Self {
+        Self { base }
     }
 
     /// The cache under `base`.
-    pub fn at(base: &Path) -> Self {
-        Self {
-            base: Some(base.to_path_buf()),
-        }
+    pub fn at(base: CacheBase) -> Self {
+        Self { base: Some(base) }
     }
 
-    pub(crate) fn base(&self) -> Option<&Path> {
-        self.base.as_deref()
+    pub(crate) fn base(&self) -> Option<&CacheBase> {
+        self.base.as_ref()
     }
 
     /// The cache's reader, waiting at most 150 ms for another connection's
@@ -123,7 +118,7 @@ impl InteractiveCache {
     /// without a cache to write: no base, or a base whose first build this
     /// process refused.
     pub(crate) fn follow_up(&self, fallback: Fallback) -> Option<CacheFollowUp> {
-        if self.base().is_none_or(is_refused) {
+        if self.base().is_none_or(CacheBase::is_refused) {
             return None;
         }
         Some(self.refresh_to_await(fallback).map_or(
