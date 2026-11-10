@@ -290,22 +290,29 @@ fn visit_log_lines(
 /// they settle the header, then the entries after it.
 enum WholeLog {
     /// Before the header settles: the records so far, at most
-    /// [`HEAD_RECORDS`], and the lines that hold none.
+    /// [`HEAD_RECORDS`], the lines that hold none, and the count of the
+    /// records the reader drops.
     Head {
         records: Vec<LogLine>,
         malformed_lines: Vec<usize>,
+        dropped: DroppedRecords,
     },
     /// The header the reader accepts, and the entries after it.
-    Entries { header: LogHeader, raw: RawEntries },
+    Entries {
+        header: LogHeader,
+        raw: Box<RawEntries>,
+    },
     /// The first records hold no header the reader accepts.
     Rejected,
 }
 
 impl WholeLog {
-    fn new() -> Self {
+    /// A read whose drops `dropped` counts.
+    fn new(dropped: DroppedRecords) -> Self {
         Self::Head {
             records: Vec::with_capacity(HEAD_RECORDS),
             malformed_lines: Vec::new(),
+            dropped,
         }
     }
 
@@ -316,6 +323,7 @@ impl WholeLog {
             Self::Head {
                 records,
                 malformed_lines,
+                dropped,
             } => {
                 if line.record.is_none() {
                     malformed_lines.push(line.number);
@@ -326,6 +334,7 @@ impl WholeLog {
                     *self = Self::settled(
                         std::mem::take(records),
                         std::mem::take(malformed_lines),
+                        std::mem::take(dropped),
                         default_source,
                     );
                 }
@@ -338,19 +347,32 @@ impl WholeLog {
     /// The log once `records`, its first records, settle its header: the
     /// records past the header are its first entries, after
     /// `malformed_lines`, the lines among them that hold no record.
-    fn settled(records: Vec<LogLine>, malformed_lines: Vec<usize>, default_source: Source) -> Self {
+    /// `dropped` counts the drops under the header's format version.
+    fn settled(
+        records: Vec<LogLine>,
+        malformed_lines: Vec<usize>,
+        mut dropped: DroppedRecords,
+        default_source: Source,
+    ) -> Self {
         let Some(header) = records
             .first()
             .and_then(|first| LogHeader::of(first, records.get(1), default_source))
         else {
             return Self::Rejected;
         };
-        let mut raw = RawEntries::after(header.version, None);
+        let version = header.version;
+        // The header records the session file's format, not the release that
+        // wrote it.
+        dropped.record_version(|| Some(format!("session format {version}")));
+        let mut raw = RawEntries::after(version, header.source, None, dropped);
         raw.malformed_lines = malformed_lines;
         for line in records.into_iter().skip(header.record_count) {
             raw.push_line(line);
         }
-        Self::Entries { header, raw }
+        Self::Entries {
+            header,
+            raw: Box::new(raw),
+        }
     }
 
     /// The header and the entries after it; `None` for a log without a
@@ -360,11 +382,12 @@ impl WholeLog {
             Self::Head {
                 records,
                 malformed_lines,
-            } => Self::settled(records, malformed_lines, default_source),
+                dropped,
+            } => Self::settled(records, malformed_lines, dropped, default_source),
             settled => settled,
         };
         match settled {
-            Self::Entries { header, raw } => Some((header, raw)),
+            Self::Entries { header, raw } => Some((header, *raw)),
             Self::Head { .. } | Self::Rejected => None,
         }
     }
@@ -407,29 +430,49 @@ struct RawEntry {
     end: Option<LineCursor>,
     id: String,
     parent_id: Option<String>,
-    value: Value,
+    /// The record projected as the log shows it; `None` for a record the
+    /// reader drops.
+    entry: Option<LogEntry>,
+    /// The record's drops, while the dropped-records report counts and
+    /// the projection dropped something; added to the report's count when
+    /// the log shows the record.
+    dropped: Option<Box<DroppedRecords>>,
 }
 
-/// A log's entries after its header, each with its id and the id of its
-/// parent.
+/// A log's entries after its header, each with its id, the id of its
+/// parent, and its record projected as it was read. A record's parsed JSON
+/// is dropped once its line is projected, whichever branch the log shows.
 struct RawEntries {
     version: u64,
+    /// The agent the entries are projected for.
+    source: Source,
     /// The id of the entry before the next one: a format 1 entry's parent.
     previous_id: Option<String>,
     entries: Vec<RawEntry>,
     /// The lines that hold no record, or a record the format rejects.
     malformed_lines: Vec<usize>,
+    /// The drops of the records the log shows, once [`Self::take_shown`]
+    /// adds them.
+    dropped: DroppedRecords,
 }
 
 impl RawEntries {
-    /// The entries of a log in format `version` that follow the entry with
-    /// id `previous_id`.
-    fn after(version: u64, previous_id: Option<String>) -> Self {
+    /// The entries of a log in format `version`, read as `source`'s, that
+    /// follow the entry with id `previous_id`; `dropped` counts their drops
+    /// while the report counts.
+    fn after(
+        version: u64,
+        source: Source,
+        previous_id: Option<String>,
+        dropped: DroppedRecords,
+    ) -> Self {
         Self {
             version,
+            source,
             previous_id,
             entries: Vec::new(),
             malformed_lines: Vec::new(),
+            dropped,
         }
     }
 
@@ -468,32 +511,32 @@ impl RawEntries {
                 .map(str::to_owned)
         };
         self.previous_id = Some(id.clone());
+        let mut dropped = self.dropped.for_one_record();
+        let entry = normalize_entry(&record, &id, self.source, &mut dropped);
         self.entries.push(RawEntry {
             line: number,
             end,
             id,
             parent_id,
-            value: record,
+            entry,
+            dropped: (!dropped.is_empty()).then(|| Box::new(dropped)),
         });
     }
 
-    /// The entries the log shows, in file order, each normalized for
-    /// `source` at its line.
-    fn shown(
-        &self,
-        branch: &ShownBranch,
-        source: Source,
-        dropped: &mut DroppedRecords,
-    ) -> Vec<(usize, LogEntry)> {
-        branch
-            .indices
-            .iter()
-            .rev()
-            .filter_map(|&index| {
-                let raw = &self.entries[index];
-                normalize_entry(&raw.value, &raw.id, source, dropped).map(|entry| (raw.line, entry))
-            })
-            .collect()
+    /// Moves out the entries `branch` shows, in file order, each at its
+    /// line, and counts the drops of the records it shows.
+    fn take_shown(&mut self, branch: &ShownBranch) -> Vec<(usize, LogEntry)> {
+        let mut shown = Vec::with_capacity(branch.indices.len());
+        for &index in branch.indices.iter().rev() {
+            let raw = &mut self.entries[index];
+            if let Some(dropped) = raw.dropped.take() {
+                self.dropped.add_counts_of(*dropped);
+            }
+            if let Some(entry) = raw.entry.take() {
+                shown.push((raw.line, entry));
+            }
+        }
+        shown
     }
 }
 
@@ -692,23 +735,20 @@ impl SessionFormat for PiLogFormat {
 fn parse_reader(
     mut reader: impl BufRead + Seek,
     default_source: Source,
-    mut dropped: DroppedRecords,
+    dropped: DroppedRecords,
 ) -> Result<Option<SessionProjection>> {
-    let mut log = WholeLog::new();
+    let mut log = WholeLog::new(dropped);
     let cursor = visit_log_lines(&mut reader, LineCursor::START, |line| {
         log.read(line, default_source)
     })?;
-    let Some((header, raw)) = log.finish(default_source) else {
+    let Some((header, mut raw)) = log.finish(default_source) else {
         return Ok(None);
     };
     let version = header.version;
-    // The header records the session file's format, not the release that
-    // wrote it.
-    dropped.record_version(|| Some(format!("session format {version}")));
 
     let branch = ShownBranch::of(&raw.entries);
     let mut entries: Vec<(usize, LogEntry)> = header.title_entry().into_iter().collect();
-    entries.extend(raw.shown(&branch, header.source, &mut dropped));
+    entries.extend(raw.take_shown(&branch));
     let transcript_read = match &header.terminated {
         Some((identity, records_start)) => {
             let state = LogState {
@@ -739,7 +779,7 @@ fn parse_reader(
         entries: at_own_lines(entries),
         leaf_id: raw.entries.last().map(|entry| entry.id.clone()),
         malformed_lines: raw.malformed_lines,
-        dropped,
+        dropped: raw.dropped,
         earlier_turns: EarlierTurns::Read,
         earlier_transcripts: Vec::new(),
         transcript_read,
@@ -796,13 +836,18 @@ impl TranscriptReader for PiLogFormat {
         };
         let mut reader = BufReader::new(File::open(source)?);
         reader.seek(SeekFrom::Start(stable_cursor.offset))?;
-        let mut raw = RawEntries::after(state.version, state.leaf.clone());
+        let mut raw = RawEntries::after(
+            state.version,
+            state.source(),
+            state.leaf.clone(),
+            DroppedRecords::default(),
+        );
         let cursor = visit_log_lines(&mut reader, stable_cursor, |line| raw.push_line(line))?;
         let branch = ShownBranch::of(&raw.entries);
         let Some(end) = LogReadEnd::of(&raw.entries, &branch, stable_cursor, cursor, &state) else {
             return Ok(Resumption::ChangesEarlierEntry);
         };
-        let entries = raw.shown(&branch, state.source(), &mut DroppedRecords::default());
+        let entries = raw.take_shown(&branch);
         let bytes_read = reader
             .get_ref()
             .metadata()?
@@ -1676,6 +1721,60 @@ mod tests {
                     ("type=teleport", DropOutcome::Unrecognised),
                 ],
             );
+        }
+    }
+
+    /// The header settles from the first two records, past a line between
+    /// them that holds no record; that line is malformed, in file order with
+    /// a malformed entry after it.
+    #[test]
+    fn malformed_line_between_title_slot_and_header_leaves_the_header() {
+        let content = [
+            r#"{"type":"title","v":1,"title":"Named"}"#,
+            "not a record",
+            r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"message","message":{"role":"user","content":"without an id"}}"#,
+        ]
+        .join("\n");
+
+        let projection = parse_reader(
+            std::io::Cursor::new(content),
+            Source::Pi,
+            DroppedRecords::default(),
+        )
+        .unwrap()
+        .expect("a session");
+
+        assert_eq!(
+            (
+                projection.source,
+                projection.header.id.as_str(),
+                projection.title.as_deref(),
+                projection.malformed_lines.clone(),
+            ),
+            (Source::Omp, "s", Some("Named"), vec![2, 5])
+        );
+        assert_eq!(projection.entries.len(), 2, "the title, then the prompt");
+    }
+
+    /// Every record is projected as it is read, on whichever branch; the
+    /// report counts the drops of the branch the log shows.
+    #[test]
+    fn counting_leaves_out_records_on_an_abandoned_branch() {
+        let session = [
+            r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00Z","cwd":"/tmp"}"#,
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"teleport","id":"abandoned","parentId":"a"}"#,
+            r#"{"type":"label","id":"shown","parentId":"a"}"#,
+        ]
+        .join("\n");
+
+        for (content, source) in [
+            (session.clone(), Source::Pi),
+            (with_omp_title_slot(&session), Source::Omp),
+        ] {
+            assert_counted_drops(&content, source, &[("type=label", DropOutcome::Skipped)]);
         }
     }
 

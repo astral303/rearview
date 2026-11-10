@@ -52,6 +52,31 @@ impl DroppedRecords {
         self.counting
     }
 
+    /// An empty count for one record of the transcript this counts:
+    /// counting when this counts, under the version this counts later
+    /// records under. [`Self::add_counts_of`] adds it to this count once the record's
+    /// drops are known to count.
+    pub(crate) fn for_one_record(&self) -> Self {
+        Self {
+            counting: self.counting,
+            version: self.version.clone(),
+            first_version: None,
+            counts: BTreeMap::new(),
+        }
+    }
+
+    /// True when nothing is counted.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    /// Adds `other`'s counts, each under the version it was counted under.
+    pub(crate) fn add_counts_of(&mut self, other: Self) {
+        for (key, count) in other.counts {
+            *self.counts.entry(key).or_default() += count;
+        }
+    }
+
     /// Count one record of a kind the reader names and drops: `field` holding
     /// `value`, or `(missing)` when the record has no such field.
     pub(crate) fn skipped(&mut self, field: &str, value: Option<&str>) {
