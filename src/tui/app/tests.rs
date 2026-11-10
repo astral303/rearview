@@ -1026,6 +1026,7 @@ fn semantic_request_after_refresh_uses_refreshed_conversations() {
                 "needle",
             ),
             replaces_listed_row: false,
+            next: crate::history::NextStep::Settled,
         }],
         ..Default::default()
     });

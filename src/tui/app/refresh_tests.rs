@@ -8,7 +8,7 @@ use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::{SessionTitle, reread_sessions};
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
 use crate::history::{
-    FoundSession, ProcessIdentity, RefreshOutcome, RefreshOwner, SessionChanges, Source,
+    FoundSession, NextStep, ProcessIdentity, RefreshOutcome, RefreshOwner, SessionChanges, Source,
     UpdatedSession,
 };
 use crate::search::test_fixtures::one_message_conversation;
@@ -61,6 +61,7 @@ fn new_session(row: Conversation) -> UpdatedSession {
     UpdatedSession {
         row,
         replaces_listed_row: false,
+        next: NextStep::Settled,
     }
 }
 
@@ -68,6 +69,7 @@ fn changed_session(row: Conversation) -> UpdatedSession {
     UpdatedSession {
         row,
         replaces_listed_row: true,
+        next: NextStep::Settled,
     }
 }
 
@@ -532,10 +534,7 @@ fn a_row_the_background_thread_read_while_it_lost_ownership_is_read_again_after_
         .unwrap();
     let mut app = app_reading(rows, environment);
 
-    app.finish_refresh(Ok(RefreshOutcome::Cached(vec![(
-        a.clone(),
-        read_outside_the_database,
-    )])));
+    app.finish_refresh(Ok(RefreshOutcome::Cached(vec![read_outside_the_database])));
     assert_eq!(row_named(&app, "a").message_count, 2);
     assert!(app.is_waiting_for_another_rearview());
     home.append(&a, 7, "written during the new owner's refresh");

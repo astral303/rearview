@@ -477,6 +477,7 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
         updated: vec![UpdatedSession {
             row: read_by_the_list_refresh,
             replaces_listed_row: true,
+            next: crate::history::NextStep::Settled,
         }],
         ..Default::default()
     }));

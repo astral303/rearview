@@ -204,7 +204,7 @@ enum RefreshState {
     Running,
     /// Finished, its outcome waiting for the list to be on screen with
     /// nothing over it.
-    Finished(crate::error::Result<RefreshOutcome>),
+    Finished(Box<crate::error::Result<RefreshOutcome>>),
 }
 
 /// The session a pending open names, by identity: a refresh may move its row

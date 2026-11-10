@@ -7,11 +7,11 @@ use super::{App, AppMode, DialogMode, RefreshState};
 use crate::clock::{Clock, Moment};
 use crate::error::Result;
 use crate::history::provider::{
-    InteractiveRead, SessionRead, apply_external_title, cache_sessions, reread_sessions,
+    SessionOutcome, SessionRead, apply_external_title, cache_sessions, reread_sessions,
 };
 use crate::history::{
-    CacheFollowUp, Conversation, Environment, FoundSession, KnownSessions, RefreshOutcome,
-    RefreshOwner, SessionChanges, SkippedSessions, Source, UpdatedSession,
+    Conversation, Environment, FoundSession, KnownSessions, NextStep, RefreshOutcome, RefreshOwner,
+    SessionChanges, SkippedSessions, Source, UpdatedSession,
 };
 use crate::search;
 use std::collections::{HashMap, HashSet};
@@ -101,34 +101,32 @@ impl ListEdit {
     /// Record `read`, row `index` read again: a listed row replaces it, and a
     /// session that is gone or empty removes it. A failed read keeps the row,
     /// because it shows nothing about the session.
-    fn apply_reread(&mut self, index: usize, read: Option<SessionRead>) {
+    fn apply_reread(&mut self, index: usize, read: SessionRead) {
         match read {
-            Some(SessionRead::Listed(row)) => {
+            SessionRead::Listed(row) => {
                 self.replaced.insert(index, *row);
             }
-            None | Some(SessionRead::Empty) => {
+            SessionRead::Missing | SessionRead::Empty => {
                 self.removed.insert(index);
             }
-            Some(SessionRead::Failed(_)) => {}
+            SessionRead::Failed(_) => {}
         }
     }
 }
 
 /// `rows`' sessions read again from disk as the list builds their rows, one
-/// result each in order, sub-agent transcripts included: the file each row
+/// outcome each in order, sub-agent transcripts included: the file each row
 /// names, as its agent's discovery lists it or, for a session opened by its
 /// ID that discovery leaves out, as the agent finds it again; not another
 /// copy stored under the same session id. Each agent's discovery runs once
 /// for all of its rows. A row keeps its index and the project it is filed
-/// under, and previews its last messages when `show_last` is true. `None`
-/// when the agent no longer finds the file. Read as the drawing thread
-/// reads ([`reread_sessions`]) in `environment`: each result read outside
-/// the database carries its follow-up.
+/// under, and previews its last messages when `show_last` is true. Read as
+/// the drawing thread reads ([`reread_sessions`]) in `environment`.
 pub(super) fn read_listed_sessions(
     environment: &Environment,
     rows: &[&Conversation],
     show_last: bool,
-) -> Vec<InteractiveRead<Option<SessionRead>>> {
+) -> Vec<SessionOutcome> {
     read_rows_by_source(rows, |source, locators| {
         reread_sessions(environment, source, locators, show_last)
     })
@@ -140,19 +138,19 @@ pub(super) fn cache_listed_sessions(
     environment: &Environment,
     rows: &[&Conversation],
     show_last: bool,
-) -> Vec<InteractiveRead<Option<SessionRead>>> {
+) -> Vec<SessionOutcome> {
     read_rows_by_source(rows, |source, locators| {
         cache_sessions(environment, source, locators, show_last)
     })
 }
 
 /// `rows`' sessions read with `read`, called once per agent with the files
-/// of that agent's rows, one result per row in order. A listed result keeps
+/// of that agent's rows, one outcome per row in order. A listed row keeps
 /// its row's index and the project it is filed under.
 fn read_rows_by_source(
     rows: &[&Conversation],
-    read: impl Fn(Source, &[&Path]) -> Vec<InteractiveRead<Option<SessionRead>>>,
-) -> Vec<InteractiveRead<Option<SessionRead>>> {
+    read: impl Fn(Source, &[&Path]) -> Vec<SessionOutcome>,
+) -> Vec<SessionOutcome> {
     let mut by_source: Vec<(Source, Vec<usize>)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         match by_source
@@ -163,23 +161,17 @@ fn read_rows_by_source(
             None => by_source.push((row.source, vec![index])),
         }
     }
-    let mut reads: Vec<InteractiveRead<Option<SessionRead>>> = rows
-        .iter()
-        .map(|_| InteractiveRead::settled(None))
-        .collect();
+    let mut outcomes: Vec<Option<SessionOutcome>> = rows.iter().map(|_| None).collect();
     for (source, indices) in by_source {
         let locators: Vec<&Path> = indices.iter().map(|&i| rows[i].path.as_path()).collect();
-        for (&index, mut reread) in indices.iter().zip(read(source, &locators)) {
-            if let Some(SessionRead::Listed(session)) = &mut reread.value {
-                let row = rows[index];
-                session.index = row.index;
-                session.project_name.clone_from(&row.project_name);
-                session.project_path.clone_from(&row.project_path);
-            }
-            reads[index] = reread;
+        for (&index, outcome) in indices.iter().zip(read(source, &locators)) {
+            outcomes[index] = Some(outcome.in_place_of(rows[index]));
         }
     }
-    reads
+    outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("one outcome per row"))
+        .collect()
 }
 
 /// The rows the drawing thread read outside the session cache database,
@@ -191,19 +183,15 @@ pub struct UncachedRows {
 }
 
 impl UncachedRows {
-    /// Each row read again under refresh ownership, which caches it. Waits
-    /// for ownership as a load does, so it runs on the background refresh
-    /// thread.
+    /// Read each row again under refresh ownership and cache it. Run on the
+    /// background refresh thread: it waits for ownership as a load does.
     pub fn cache(self) -> RefreshOutcome {
         let rows: Vec<&Conversation> = self.rows.iter().collect();
-        let reads = cache_listed_sessions(&self.environment, &rows, self.show_last);
-        RefreshOutcome::Cached(
-            self.rows
-                .iter()
-                .map(|row| row.path.clone())
-                .zip(reads)
-                .collect(),
-        )
+        RefreshOutcome::Cached(cache_listed_sessions(
+            &self.environment,
+            &rows,
+            self.show_last,
+        ))
     }
 }
 
@@ -264,7 +252,7 @@ impl App {
     /// Take the background refresh thread's outcome, applying it at once
     /// when the list is on screen with nothing over it.
     pub fn finish_refresh(&mut self, outcome: Result<RefreshOutcome>) {
-        self.refresh = RefreshState::Finished(outcome);
+        self.refresh = RefreshState::Finished(Box::new(outcome));
         self.apply_finished_refresh();
     }
 
@@ -280,13 +268,13 @@ impl App {
         else {
             return;
         };
-        match outcome {
+        match *outcome {
             Ok(RefreshOutcome::Changes(changes)) => {
                 if let Some(summary) = self.apply_session_changes(changes).summary() {
                     self.set_status(summary);
                 }
             }
-            Ok(RefreshOutcome::Cached(reads)) => self.apply_cached_reads(reads),
+            Ok(RefreshOutcome::Cached(outcomes)) => self.apply_cached_reads(outcomes),
             Err(error) => {
                 self.changed_during_refresh.clear();
                 self.set_status(format!("Refresh failed: {error}"));
@@ -302,13 +290,12 @@ impl App {
             && self.pending_open.is_none()
     }
 
-    /// Apply `reads`, the rows the background refresh thread cached, as a
+    /// Apply `outcomes`, the rows the background refresh thread cached, as a
     /// completion check applies its rereads: replace a listed row, remove a
     /// session that is gone or empty, and keep a row whose read failed. A
     /// row the user renamed, deleted or opened meanwhile is read again
-    /// instead. A row read outside the database waits for the refresh its
-    /// follow-up names.
-    fn apply_cached_reads(&mut self, reads: Vec<(PathBuf, InteractiveRead<Option<SessionRead>>)>) {
+    /// instead. The TUI acts on each row's next step.
+    fn apply_cached_reads(&mut self, outcomes: Vec<SessionOutcome>) {
         let changed_by_user = std::mem::take(&mut self.changed_during_refresh);
         let index_of: HashMap<PathBuf, usize> = self
             .conversations
@@ -317,15 +304,14 @@ impl App {
             .map(|(index, row)| (row.path.clone(), index))
             .collect();
         let mut edit = ListEdit::default();
-        for (path, read) in reads {
-            if changed_by_user.contains(&path) {
+        for outcome in outcomes {
+            if changed_by_user.contains(outcome.locator()) {
                 continue;
             }
-            let Some(&index) = index_of.get(&path) else {
+            let Some(&index) = index_of.get(outcome.locator()) else {
                 continue;
             };
-            self.follow_up_read(&path, read.follow_up);
-            edit.apply_reread(index, read.value);
+            edit.apply_reread(index, self.act_on_outcome(outcome));
         }
         let reread: Vec<usize> = changed_by_user
             .iter()
@@ -378,6 +364,7 @@ impl App {
         for UpdatedSession {
             row,
             replaces_listed_row,
+            next,
         } in changes.updated
         {
             if changed_by_user.contains(&row.path) {
@@ -385,10 +372,19 @@ impl App {
             }
             match (index_of.get(&row.path).copied(), replaces_listed_row) {
                 (Some(index), true) if !edit.removed.contains(&index) => {
+                    self.act_on_next_step(&row.path, next);
                     edit.replaced.insert(index, row);
                 }
-                (None, false) => edit.inserted.push(row),
+                (None, false) => {
+                    self.act_on_next_step(&row.path, next);
+                    edit.inserted.push(row);
+                }
                 _ => {}
+            }
+        }
+        for kept in changes.kept {
+            if index_of.contains_key(&kept.path) && !changed_by_user.contains(&kept.path) {
+                self.act_on_next_step(&kept.path, kept.next);
             }
         }
         for (source, titles) in &changes.external_titles {
@@ -416,7 +412,7 @@ impl App {
         for ((index, listed_fingerprint), read) in
             reread.into_iter().zip(listed_fingerprints).zip(reads)
         {
-            if let Some(SessionRead::Listed(read)) = &read
+            if let SessionRead::Listed(read) = &read
                 && read.fingerprint.is_some()
                 && read.fingerprint == listed_fingerprint
             {
@@ -440,39 +436,39 @@ impl App {
     }
 
     /// The rows at `indices` read again as the list builds their rows, one
-    /// result each in order. A row read outside the session cache database
-    /// is followed up with [`Self::follow_up_read`].
-    pub(super) fn read_rows_again(&mut self, indices: &[usize]) -> Vec<Option<SessionRead>> {
+    /// read each in order, after [`Self::act_on_outcome`] for each.
+    pub(super) fn read_rows_again(&mut self, indices: &[usize]) -> Vec<SessionRead> {
         let rows: Vec<&Conversation> = indices
             .iter()
             .map(|&index| &self.conversations[index])
             .collect();
-        let reads = read_listed_sessions(&self.environment, &rows, self.show_last);
-        let follow_ups: Vec<(PathBuf, Option<CacheFollowUp>)> = rows
-            .iter()
-            .zip(&reads)
-            .map(|(row, read)| (row.path.clone(), read.follow_up))
-            .collect();
-        for (path, follow_up) in follow_ups {
-            self.follow_up_read(&path, follow_up);
-        }
-        reads.into_iter().map(|read| read.value).collect()
+        read_listed_sessions(&self.environment, &rows, self.show_last)
+            .into_iter()
+            .map(|outcome| self.act_on_outcome(outcome))
+            .collect()
     }
 
-    /// Act on `follow_up`, the follow-up of the session at `path` read
-    /// outside the database: read its row again once the refresh it names
-    /// completes, or hand the row to the background refresh thread to cache.
-    /// A file opened directly has no background refresh thread, so its row
-    /// only waits for a running refresh.
-    pub(super) fn follow_up_read(&mut self, path: &Path, follow_up: Option<CacheFollowUp>) {
-        match follow_up {
-            Some(CacheFollowUp::AwaitRefresh(owner)) => {
+    /// [`Self::act_on_next_step`] for `outcome`'s session, and return its
+    /// read.
+    pub(super) fn act_on_outcome(&mut self, outcome: SessionOutcome) -> SessionRead {
+        self.act_on_next_step(outcome.locator(), outcome.next());
+        outcome.into_read()
+    }
+
+    /// Act on `next`, the next step for the session at `path`: read its row
+    /// again once the refresh it names completes, or hand the row to the
+    /// background refresh thread to cache. A file opened directly has no
+    /// background refresh thread, so its row only waits for a running
+    /// refresh.
+    pub(super) fn act_on_next_step(&mut self, path: &Path, next: NextStep) {
+        match next {
+            NextStep::AwaitRefresh(owner) => {
                 self.await_refresh([path.to_path_buf()], owner);
             }
-            Some(CacheFollowUp::CacheInBackground) if !self.single_file_mode => {
+            NextStep::CacheInBackground if !self.single_file_mode => {
                 self.rows_to_cache.insert(path.to_path_buf());
             }
-            Some(CacheFollowUp::CacheInBackground) | None => {}
+            NextStep::CacheInBackground | NextStep::Settled => {}
         }
     }
 

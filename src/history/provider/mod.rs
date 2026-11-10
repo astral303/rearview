@@ -24,6 +24,7 @@ mod load;
 mod markdown_outline;
 mod omp;
 mod opencode;
+mod outcome;
 mod pi;
 mod sessions_dir;
 pub(crate) mod sqlite;
@@ -33,7 +34,6 @@ pub(crate) mod subagents;
 mod upstream_releases;
 pub(crate) mod walk;
 
-pub use crate::history::sqlite_cache::InteractiveRead;
 pub(crate) use capability::refusal_message;
 pub use capability::{Capability, DenialDetail, Operation};
 pub use discovery::{RootEnvironment, RootOrigin, SessionRoot};
@@ -41,11 +41,12 @@ pub use launcher::{SessionForker, SessionLaunch, SessionResumer};
 pub(crate) use load::sample_record;
 pub use load::{
     DiscoveredSession, FoundSession, LeftOutRows, ReadError, RecordedSession, RediscoveredSessions,
-    SessionRead, SkippedSessions, apply_external_title, cache_sessions, load_session_by_id,
-    load_sessions, rediscover_sessions, reread_sessions,
+    SkippedSessions, apply_external_title, cache_sessions, load_session_by_id, load_sessions,
+    rediscover_sessions, reread_sessions,
 };
 #[cfg(test)]
 pub use load::{LoadedSessions, read_resolved_session};
+pub use outcome::{SessionOutcome, SessionRead};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 #[cfg(test)]
 pub(crate) use storage::RootedStorage;

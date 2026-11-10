@@ -1430,11 +1430,11 @@ pub(crate) mod tests {
 
         for project in [&original, &fork] {
             let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
-            let Some(SessionRead::Listed(read)) =
+            let SessionRead::Listed(read) =
                 reread_sessions(&environment, Source::Claude, &[&transcript], false)
                     .pop()
                     .unwrap()
-                    .value
+                    .into_read()
             else {
                 panic!("{} was not read as a listed session", transcript.display());
             };

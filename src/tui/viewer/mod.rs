@@ -299,7 +299,7 @@ pub fn parse_conversation_file_interactively(
             .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(crate::history::InteractiveRead {
         value: parsed_conversation(displayed.value),
-        follow_up: displayed.follow_up,
+        next: displayed.next,
     })
 }
 
