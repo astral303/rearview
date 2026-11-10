@@ -187,17 +187,22 @@ fn joined_once(texts: &[&str], ranges: &[Range<usize>]) -> Arc<str> {
     unsafe { Arc::from_raw(Arc::into_raw(joined) as *const str) }
 }
 
-/// The texts of each of `copies` as the cache holds it, by its key; `None`
-/// for a copy whose read failed or the cache no longer holds. Each session
-/// is read on its own, through the cache's indexes on the session.
+/// The texts of each of `copies` as the cache holds it, by its key. Each
+/// session is read on its own, through the cache's indexes on the session.
 fn read_copies(copies: &[CachedSession]) -> Vec<TextsRead> {
     copies
         .par_iter()
-        .map(|cached| {
-            let texts = SessionSearchTexts::read(cached).ok().flatten();
-            (cached.copy_key(), texts.map(Arc::new))
-        })
+        .map(|cached| (cached.copy_key(), read_texts(cached)))
         .collect()
+}
+
+/// [`SessionSearchTexts::read`] of `cached`, or why it read none.
+fn read_texts(cached: &CachedSession) -> TextsReadResult {
+    match SessionSearchTexts::read(cached) {
+        Ok(Some(texts)) => Ok(Arc::new(texts)),
+        Ok(None) => Err(ReadFailure::NotInCache),
+        Err(error) => Err(ReadFailure::of(&error)),
+    }
 }
 
 /// [`read_copies`] for the copies of every row of the list, in one scan of
@@ -212,11 +217,15 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
         ScanScope::AllWorkspaces,
         TextCollector::default,
     );
-    let Ok(scanned) = scanned else {
-        return copies
-            .iter()
-            .map(|cached| (cached.copy_key(), None))
-            .collect();
+    let scanned = match scanned {
+        Ok(scanned) => scanned,
+        Err(error) => {
+            let failure = ReadFailure::of(&error);
+            return copies
+                .iter()
+                .map(|cached| (cached.copy_key(), Err(failure.clone())))
+                .collect();
+        }
     };
     let mut pieces = copies.iter().map(|_| Vec::new()).collect::<Vec<_>>();
     for collector in scanned.visitors {
@@ -224,7 +233,7 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
             pieces[copy].push(texts);
         }
     }
-    let missing = scanned.missing.into_iter().collect::<HashSet<_>>();
+    let left_cache = scanned.left_cache.into_iter().collect::<HashSet<_>>();
     let replaced = scanned
         .replaced
         .into_iter()
@@ -236,21 +245,44 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
         .map(|(copy, pieces)| {
             let cached = &copies[copy];
             let texts = if replaced.contains(&copy) {
-                SessionSearchTexts::read(cached)
-                    .ok()
-                    .flatten()
-                    .map(Arc::new)
+                read_texts(cached)
+            } else if left_cache.contains(&copy) {
+                Err(ReadFailure::NotInCache)
             } else {
-                (!missing.contains(&copy)).then(|| Arc::new(laid_out(pieces)))
+                Ok(Arc::new(laid_out(pieces)))
             };
             (cached.copy_key(), texts)
         })
         .collect()
 }
 
-/// A read of a copy's search texts; `None` when the read failed or the cache
-/// no longer holds the copy.
-pub(crate) type TextsRead = (CopyKey, Option<Arc<SessionSearchTexts>>);
+/// A read of a copy's search texts.
+pub(crate) type TextsRead = (CopyKey, TextsReadResult);
+
+/// The texts a read of a copy read, or why it read none.
+pub(crate) type TextsReadResult = std::result::Result<Arc<SessionSearchTexts>, ReadFailure>;
+
+/// The cause of a read of a copy's search texts that read none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadFailure {
+    NotInCache,
+    Error(Arc<str>),
+}
+
+impl ReadFailure {
+    pub(crate) fn of(error: &crate::error::AppError) -> Self {
+        Self::Error(error.to_string().into())
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotInCache => formatter.write_str("not in the session cache"),
+            Self::Error(error) => formatter.write_str(error),
+        }
+    }
+}
 
 /// The copies of the list's rows whose texts are to be read.
 pub(crate) struct CopiesToRead {
@@ -269,6 +301,14 @@ impl CopiesToRead {
         } else {
             read_copies(&self.copies)
         }
+    }
+
+    /// A read of each copy that failed with `failure`.
+    pub(crate) fn failed(&self, failure: &ReadFailure) -> Vec<TextsRead> {
+        self.copies
+            .iter()
+            .map(|cached| (cached.copy_key(), Err(failure.clone())))
+            .collect()
     }
 }
 
@@ -307,18 +347,26 @@ struct HeldSession {
     generation: i64,
     read: CopyReadState,
     /// The texts search reads: the row's copy's once read, until then those
-    /// of the copy read before it.
-    texts: Option<Arc<SessionSearchTexts>>,
+    /// of the newest earlier copy read.
+    texts: Option<HeldTexts>,
+}
+
+/// The texts read for one copy of a session.
+struct HeldTexts {
+    /// The generation of the copy the texts were read for.
+    generation: i64,
+    texts: Arc<SessionSearchTexts>,
 }
 
 /// The read of the copy a session's row reads.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum CopyReadState {
     Held,
     Reading,
-    /// The read failed, or the cache no longer held the session. The copy is
-    /// read again when the rows next change.
-    Failed,
+    /// The read failed, or the session left the cache: the search bar counts
+    /// the session as unreadable. The copy is read again when the rows next
+    /// change.
+    Unreadable(ReadFailure),
 }
 
 /// The sessions without texts in memory, by why.
@@ -339,32 +387,49 @@ impl SearchTextsInMemory {
             .iter()
             .filter_map(|conversation| conversation.borrow().cached_session.clone())
             .collect::<Vec<_>>();
-        let mut texts = Self::default();
+        let mut in_memory = Self::default();
         for (copy, read) in read_every_row_copy(&copies) {
-            texts.by_session.insert(
+            let (read, texts) = match read {
+                Ok(texts) => (
+                    CopyReadState::Held,
+                    Some(HeldTexts {
+                        generation: copy.generation,
+                        texts,
+                    }),
+                ),
+                Err(failure) => (CopyReadState::Unreadable(failure), None),
+            };
+            in_memory.by_session.insert(
                 copy.session,
                 HeldSession {
                     generation: copy.generation,
-                    read: if read.is_some() {
-                        CopyReadState::Held
-                    } else {
-                        CopyReadState::Failed
-                    },
-                    texts: read,
+                    read,
+                    texts,
                 },
             );
         }
-        texts
+        in_memory
     }
 
     /// The texts search reads for `conversation`'s session: its copy's, or
-    /// until they are read, those of the copy read before it.
+    /// until they are read, those of the newest earlier copy read.
     pub fn get(&self, conversation: &Conversation) -> Option<&SessionSearchTexts> {
+        let held = self.held_session(conversation)?;
+        held.texts.as_ref().map(|held| &*held.texts)
+    }
+
+    /// The cause of the failed read of `conversation`'s copy; `None` unless
+    /// that read failed.
+    pub fn read_failure(&self, conversation: &Conversation) -> Option<&ReadFailure> {
+        match &self.held_session(conversation)?.read {
+            CopyReadState::Unreadable(failure) => Some(failure),
+            CopyReadState::Held | CopyReadState::Reading => None,
+        }
+    }
+
+    fn held_session(&self, conversation: &Conversation) -> Option<&HeldSession> {
         let cached = conversation.cached_session.as_ref()?;
-        self.by_session
-            .get(&cached.copy_key().session)?
-            .texts
-            .as_deref()
+        self.by_session.get(&cached.copy_key().session)
     }
 
     /// The sessions without texts in memory: being read for the first time,
@@ -374,7 +439,7 @@ impl SearchTextsInMemory {
         for session in self.by_session.values().filter(|held| held.texts.is_none()) {
             match session.read {
                 CopyReadState::Reading => without.loading += 1,
-                CopyReadState::Failed => without.unreadable += 1,
+                CopyReadState::Unreadable(_) => without.unreadable += 1,
                 CopyReadState::Held => {}
             }
         }
@@ -383,8 +448,8 @@ impl SearchTextsInMemory {
 
     /// Keeps the texts of the sessions `conversations` list and drops the
     /// rest. Returns the copies whose texts are neither held nor being read,
-    /// now marked as being read: a copy new to its row, or one whose read
-    /// failed.
+    /// now marked as being read: copies new to their rows, and unreadable
+    /// copies.
     pub(crate) fn keep_copies_of<C: Borrow<Conversation>>(
         &mut self,
         conversations: &[C],
@@ -399,16 +464,22 @@ impl SearchTextsInMemory {
                 session,
                 generation,
             } = cached.copy_key();
-            let mut held = self.by_session.remove(&session).unwrap_or(HeldSession {
-                generation,
-                read: CopyReadState::Failed,
-                texts: None,
-            });
-            if held.generation != generation || held.read == CopyReadState::Failed {
-                held.generation = generation;
-                held.read = CopyReadState::Reading;
-                copies.push(cached.clone());
-            }
+            let held = match self.by_session.remove(&session) {
+                Some(held)
+                    if held.generation == generation
+                        && !matches!(held.read, CopyReadState::Unreadable(_)) =>
+                {
+                    held
+                }
+                held => {
+                    copies.push(cached.clone());
+                    HeldSession {
+                        generation,
+                        read: CopyReadState::Reading,
+                        texts: held.and_then(|held| held.texts),
+                    }
+                }
+            };
             kept.insert(session, held);
         }
         let are_every_row = copies.len() == kept.len();
@@ -419,21 +490,37 @@ impl SearchTextsInMemory {
         }
     }
 
-    /// Holds `texts`, the read of `copy`, while its session's row still reads
-    /// that copy. A failed read, `None`, keeps the texts held before it.
-    pub(crate) fn finish_read(&mut self, copy: CopyKey, texts: Option<Arc<SessionSearchTexts>>) {
+    /// Holds `texts`, the read of `copy`, when they are newer than the texts
+    /// its session holds. A read of the copy the row reads ends that read;
+    /// the session stays being read after a read of an earlier copy. A failed
+    /// read keeps the texts held before it.
+    pub(crate) fn finish_read(&mut self, copy: CopyKey, read: TextsReadResult) {
         let Some(held) = self.by_session.get_mut(&copy.session) else {
             return;
         };
-        if held.generation != copy.generation || held.read != CopyReadState::Reading {
+        let is_row_copy = copy.generation == held.generation;
+        if is_row_copy && held.read != CopyReadState::Reading {
             return;
         }
-        match texts {
-            Some(texts) => {
-                held.texts = Some(texts);
-                held.read = CopyReadState::Held;
+        match read {
+            Ok(texts) => {
+                if held
+                    .texts
+                    .as_ref()
+                    .is_some_and(|held| held.generation > copy.generation)
+                {
+                    return;
+                }
+                held.texts = Some(HeldTexts {
+                    generation: copy.generation,
+                    texts,
+                });
+                if is_row_copy {
+                    held.read = CopyReadState::Held;
+                }
             }
-            None => held.read = CopyReadState::Failed,
+            Err(failure) if is_row_copy => held.read = CopyReadState::Unreadable(failure),
+            Err(_) => {}
         }
     }
 }

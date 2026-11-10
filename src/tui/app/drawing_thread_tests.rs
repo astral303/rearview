@@ -230,7 +230,7 @@ fn press_ctrl(app: &mut App, code: KeyCode) -> Option<Action> {
 /// grown since.
 const VIEWER_ACTIONS: &[AppAction] = &[
     ("the viewer reload", |app, _| {
-        app.complete_pending_view_refresh(VIEWPORT);
+        app.complete_pending_view_refresh(VIEWPORT, super::test_waits::VIEWER_READ_LANDS);
     }),
     ("a frame", |app, _| app.re_render_view(VIEWPORT)),
     ("a viewer Ctrl+R", |app, _| {
@@ -529,7 +529,7 @@ fn no_app_action_parses_writes_or_waits_beside_another_rearviews_activity() {
 fn every_providers_session_opens_and_reloads_behind_another_rearviews_commit() {
     const READS: &[AppAction] = &[
         ("the viewer reload", |app, _| {
-            app.complete_pending_view_refresh(VIEWPORT);
+            app.complete_pending_view_refresh(VIEWPORT, super::test_waits::VIEWER_READ_LANDS);
         }),
         ("closing the viewer", |app, _| app.exit_view_mode()),
         ("opening the session", |app, _| app.enter_view_mode(80)),

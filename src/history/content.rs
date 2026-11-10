@@ -2,27 +2,19 @@
 
 use super::Conversation;
 use super::message_texts::{MessageTextBuilder, push_separated};
-use super::sqlite_cache::{CachedSession, RouteKey, SearchField, SearchPart, SemanticRoute};
+use super::sqlite_cache::{
+    CachedSession, HeldCopy, RouteKey, SearchField, SearchPart, SemanticRoute,
+};
 use crate::agent::refs::MessageRange;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 impl Conversation {
-    /// This row with the semantic turns of the copy it names, as the session
-    /// cache holds it, whether or not the transcript changed since: the
-    /// search texts stay empty. Only the refresh owner parses transcripts, so
-    /// a copy missing from the cache, or replaced since the row was read, is
-    /// a miss.
-    pub(crate) fn load_semantic_turns(&self) -> Result<Cow<'_, Self>> {
-        self.read_from_copy(|copy, parts| copy.stored_semantic_turns(|part| parts.push(part)))
-    }
-
     /// This row with the content of the copy the session cache holds at its
     /// address now, whichever generation it is, as it holds it; `None` when
     /// the cache no longer holds the session. A row without a copy is its
-    /// own content. The messages of a copy that replaced the row's are
-    /// counted and timed as that copy holds them.
+    /// own content.
     pub(crate) fn load_held_content(&self) -> Result<Option<HeldContent<'_>>> {
         let Some(cached) = &self.cached_session else {
             return Ok(Some(HeldContent {
@@ -30,29 +22,12 @@ impl Conversation {
                 generation: None,
             }));
         };
-        let copy = cached.clone().ignoring_source_changes().waiting();
-        let read = copy.read_held_copy(|held| {
-            let mut parts = ContentBuilder::default();
-            held.stored_search_parts(|part| parts.push(part))?;
-            // The row's own copy keeps the row's times, read with the row.
-            let replaced_times = if held.generation() == cached.generation() {
-                None
-            } else {
-                Some(held.message_times()?)
-            };
-            Ok((parts, replaced_times, held.generation()))
+        let read = self.read_held_parts(cached, |held, parts| {
+            held.stored_search_parts(|part| parts.push(part))
         })?;
-        Ok(read.map(|(parts, replaced_times, generation)| {
-            let mut row = self.clone();
-            if let Some((message_count, message_times)) = replaced_times {
-                row.message_count = message_count;
-                row.message_times = message_times;
-            }
-            parts.finish(&mut row);
-            HeldContent {
-                row: Cow::Owned(row),
-                generation: Some(generation),
-            }
+        Ok(read.map(|(row, generation, ())| HeldContent {
+            row: Cow::Owned(row),
+            generation: Some(generation),
         }))
     }
 
@@ -75,34 +50,20 @@ impl Conversation {
             }));
         };
         let (title, summary) = (self.custom_title.as_deref(), self.summary.as_deref());
-        let copy = cached.clone().ignoring_source_changes().waiting();
-        let read = copy.read_held_copy(|held| {
-            let mut parts = ContentBuilder::default();
+        let read = self.read_held_parts(cached, |held, parts| {
             held.stored_semantic_turns(|part| parts.push(part))?;
-            let mut route = None;
-            if !parts.semantic.is_empty() {
-                route = Some(match held.stored_semantic_route(title, summary)? {
-                    Some(text) => RouteRead::Stored(text),
-                    None => {
-                        held.stored_agent_search_texts(|part| parts.push(part))?;
-                        RouteRead::Unstored(held.semantic_route_key())
-                    }
-                });
+            if parts.semantic.is_empty() {
+                return Ok(None);
             }
-            let replaced_times = if held.generation() == cached.generation() {
-                None
-            } else {
-                Some(held.message_times()?)
-            };
-            Ok((parts, route, replaced_times, held.generation()))
+            Ok(Some(match held.stored_semantic_route(title, summary)? {
+                Some(text) => RouteRead::Stored(text),
+                None => {
+                    held.stored_agent_search_texts(|part| parts.push(part))?;
+                    RouteRead::Unstored(held.semantic_route_key())
+                }
+            }))
         })?;
-        Ok(read.map(|(parts, route, replaced_times, generation)| {
-            let mut row = self.clone();
-            if let Some((message_count, message_times)) = replaced_times {
-                row.message_count = message_count;
-                row.message_times = message_times;
-            }
-            parts.finish(&mut row);
+        Ok(read.map(|(mut row, generation, route)| {
             let (route_text, computed_route) = match route {
                 None => (None, None),
                 Some(RouteRead::Stored(text)) => (Some(text), None),
@@ -132,26 +93,56 @@ impl Conversation {
         self.message_text_starts = Default::default();
     }
 
-    fn read_from_copy(
-        &self,
-        read: impl FnOnce(&CachedSession, &mut ContentBuilder) -> Result<Option<()>>,
-    ) -> Result<Cow<'_, Self>> {
+    /// [`Self::load_semantic_content`] without the agent route: this row with
+    /// the semantic turns of the copy the cache holds now; `None` when the
+    /// cache no longer holds the session.
+    pub(crate) fn load_held_semantic_turns(&self) -> Result<Option<HeldContent<'_>>> {
         let Some(cached) = &self.cached_session else {
-            return Ok(Cow::Borrowed(self));
+            return Ok(Some(HeldContent {
+                row: Cow::Borrowed(self),
+                generation: None,
+            }));
         };
-        let mut parts = ContentBuilder::default();
+        let read = self.read_held_parts(cached, |held, parts| {
+            held.stored_semantic_turns(|part| parts.push(part))
+        })?;
+        Ok(read.map(|(row, generation, ())| HeldContent {
+            row: Cow::Owned(row),
+            generation: Some(generation),
+        }))
+    }
+
+    /// This row with the parts `read_parts` reads of `cached`'s copy the
+    /// cache holds now, the generation of that copy, and `read_parts`'
+    /// result; `None` when the cache no longer holds the session. Messages
+    /// are counted and timed as that copy holds them when it replaced the
+    /// row's.
+    fn read_held_parts<T>(
+        &self,
+        cached: &CachedSession,
+        read_parts: impl FnOnce(&HeldCopy<'_>, &mut ContentBuilder) -> Result<T>,
+    ) -> Result<Option<(Conversation, i64, T)>> {
         let copy = cached.clone().ignoring_source_changes().waiting();
-        match read(&copy, &mut parts)? {
-            Some(()) => {
-                let mut row = self.clone();
-                parts.finish(&mut row);
-                Ok(Cow::Owned(row))
+        let read = copy.read_held_copy(|held| {
+            let mut parts = ContentBuilder::default();
+            let more = read_parts(held, &mut parts)?;
+            // The row's own copy keeps the row's times, read with the row.
+            let replaced_times = if held.generation() == cached.generation() {
+                None
+            } else {
+                Some(held.message_times()?)
+            };
+            Ok((parts, more, replaced_times, held.generation()))
+        })?;
+        Ok(read.map(|(parts, more, replaced_times, generation)| {
+            let mut row = self.clone();
+            if let Some((message_count, message_times)) = replaced_times {
+                row.message_count = message_count;
+                row.message_times = message_times;
             }
-            None => Err(AppError::SessionCacheNotReady {
-                session: self.session_id.clone(),
-                reason: "the session is not in the session cache".to_owned(),
-            }),
-        }
+            parts.finish(&mut row);
+            (row, generation, more)
+        }))
     }
 }
 

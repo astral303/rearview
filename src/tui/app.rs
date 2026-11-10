@@ -24,6 +24,7 @@ use ratatui::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -123,6 +124,9 @@ pub struct App {
     search_data_sent: u64,
     /// Monotonic generation counter for search requests
     search_generation: u64,
+    /// `search_generation`, shared with the search worker, which runs a
+    /// search again over texts read only while the app awaits its generation
+    awaited_search: Arc<AtomicU64>,
     /// When the search in flight on the worker thread was dispatched; `None`
     /// once its results are on screen
     search_started_at: Option<Moment>,
@@ -148,10 +152,10 @@ pub struct App {
     /// The session open (`Enter`) or a row click named, until the load runs
     /// one frame later, so that frame can show the list as opening
     pending_open: Option<PendingOpen>,
-    /// The open session's refresh finished: the viewer reads it again from
-    /// the cache, or shows the file opened directly as parsed, on the next
-    /// frame
-    pending_view_reload: Option<view_state::ReloadedSession>,
+    /// The open session's refresh finished: the viewer shows it once the
+    /// read of its copy lands, or the file opened directly as parsed on the
+    /// next frame
+    pending_view_reload: Option<view_state::PendingReload>,
     /// A copy or export asked for while the open session's refresh was
     /// pending, run once the refresh finishes
     deferred_copy: Option<view_state::DeferredCopy>,
@@ -222,7 +226,7 @@ struct PendingOpen {
     path: PathBuf,
     source: crate::history::Source,
     /// The viewer's read of the row's copy, once started.
-    read: Option<view_state::OpeningRead>,
+    read: Option<view_state::ViewerRead<view_state::RowRead>>,
 }
 
 type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
@@ -296,10 +300,11 @@ impl App {
             texts_held_rx: parts.search_worker.texts_held,
             texts_held: TextsHeld {
                 updates_applied: 0,
-                without: SessionsWithoutTexts::default(),
+                sessions_without_texts: SessionsWithoutTexts::default(),
             },
             search_data_sent: 0,
             search_generation: 0,
+            awaited_search: parts.search_worker.awaited_search,
             search_started_at: None,
             dispatched_query: None,
             shown_results_query: None,
@@ -333,7 +338,8 @@ impl App {
         }
     }
 
-    /// The session cache as the drawing thread reads it.
+    /// The session cache as the TUI reads it while it draws: on the drawing
+    /// thread, and on the viewer's read threads.
     fn interactive_cache(&self) -> InteractiveCache {
         InteractiveCache::at(self.environment.cache_base().clone())
     }
@@ -466,7 +472,6 @@ impl App {
     ) -> Self {
         let search_worker = spawn_search_worker(environment.clock().clone());
         let mut view = ViewState::initial(file.canonical, None, None, tool_display, show_thinking);
-        view.parsed_conversation = Some(Arc::new(crate::tui::viewer::ParsedConversation::empty()));
         view.is_copy_missing = true;
         let conversations = Vec::new();
         let mut app = Self::from_parts(AppParts {
@@ -513,7 +518,7 @@ impl App {
         };
         let mut app = Self::new_single_file(file, tool_display, show_thinking, keys, environment);
         app.serve_direct_file_read();
-        app.complete_pending_view_refresh(VIEWPORT);
+        app.complete_pending_view_refresh(VIEWPORT, test_waits::VIEWER_READ_LANDS);
         app
     }
 
@@ -772,22 +777,17 @@ impl App {
     }
 
     /// The search bar's text after the result count while the list's search
-    /// reads some sessions without their texts: ` · 37 sessions loading`
-    /// while their first read runs, then ` · 1 session unreadable` while a
-    /// read has failed. Empty once every session's texts are held.
+    /// reads some sessions without their texts
+    /// ([`describe_sessions_without_texts`]). Semantic results on screen
+    /// count the sessions their search could not read.
     pub fn sessions_without_texts_text(&self) -> String {
-        let SessionsWithoutTexts {
-            loading,
-            unreadable,
-        } = self.texts_held.without;
-        [(loading, "loading"), (unreadable, "unreadable")]
-            .into_iter()
-            .filter(|&(count, _)| count > 0)
-            .map(|(count, state)| match count {
-                1 => format!(" · 1 session {state}"),
-                count => format!(" · {count} sessions {state}"),
-            })
-            .collect()
+        let mut counts = self.texts_held.sessions_without_texts;
+        if let Some(semantic) = self.semantic_search.unreadable
+            && self.list_search_mode == ListSearchMode::Semantic
+        {
+            counts.unreadable = semantic;
+        }
+        describe_sessions_without_texts(counts)
     }
 
     #[cfg(test)]
@@ -914,7 +914,7 @@ impl App {
                 Some(index) => {
                     let row = view_state::OpenedRow::of(&self.conversations[index]);
                     self.pending_open = Some(PendingOpen {
-                        read: Some(view_state::OpeningRead::start(
+                        read: Some(view_state::ViewerRead::of_row(
                             row,
                             self.interactive_cache(),
                         )),
@@ -937,23 +937,6 @@ impl App {
         true
     }
 
-    /// [`Self::complete_pending_open`] until the viewer shows the session,
-    /// or the open fails, failing after ten seconds. True when an open was
-    /// pending.
-    #[cfg(test)]
-    pub fn finish_pending_open_for_test(&mut self, frame_width: usize) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut advanced = false;
-        while self.complete_pending_open(frame_width, Duration::from_millis(10)) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the viewer's read lands"
-            );
-            advanced = true;
-        }
-        advanced
-    }
-
     /// True while the file opened directly, already shown, is read again:
     /// after `Ctrl+R`, or while its session refresh runs.
     pub fn is_refreshing_open_session(&self) -> bool {
@@ -962,17 +945,34 @@ impl App {
             && matches!(&self.app_mode, AppMode::View(state) if !state.is_copy_missing)
     }
 
-    /// Show the open session again once its refresh finished: read from the
-    /// cache, or as the file opened directly parsed. True when one ran, so
-    /// the caller draws the result next.
-    pub fn complete_pending_view_refresh(&mut self, viewport_height: usize) -> bool {
-        match self.pending_view_reload.take() {
-            Some(reloaded) => {
-                self.reload_open_session(viewport_height, reloaded);
+    /// Show the open session again once its refresh finished: once the read
+    /// of its copy lands within `wait`, or the file opened directly as
+    /// parsed. True when it showed, so the caller draws the result next.
+    pub fn complete_pending_view_refresh(
+        &mut self,
+        viewport_height: usize,
+        wait: Duration,
+    ) -> bool {
+        let Some(reload) = self.pending_view_reload.take() else {
+            return false;
+        };
+        match reload.finish(wait) {
+            Ok((reloaded, read)) => {
+                self.reload_open_session(viewport_height, reloaded, read);
                 true
             }
-            None => false,
+            Err(reload) => {
+                self.pending_view_reload = Some(reload);
+                false
+            }
         }
+    }
+
+    /// True while the read of the open session's reload runs.
+    pub fn is_reading_open_session(&self) -> bool {
+        self.pending_view_reload
+            .as_ref()
+            .is_some_and(view_state::PendingReload::is_reading)
     }
 
     /// Handle a left-click in list mode: select the conversation under the cursor.
@@ -1024,8 +1024,28 @@ impl App {
     }
 }
 
+/// ` · 37 sessions loading` while their first read runs, then
+/// ` · 1 session unreadable` while a read has failed; empty when neither
+/// count is above zero.
+fn describe_sessions_without_texts(counts: SessionsWithoutTexts) -> String {
+    [
+        (counts.loading, "loading"),
+        (counts.unreadable, "unreadable"),
+    ]
+    .into_iter()
+    .filter(|&(count, _)| count > 0)
+    .map(|(count, state)| match count {
+        1 => format!(" · 1 session {state}"),
+        count => format!(" · {count} sessions {state}"),
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod semantic_test_helpers;
+
+#[cfg(test)]
+pub(crate) mod test_waits;
 
 #[cfg(test)]
 pub(crate) mod claude_home;

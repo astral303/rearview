@@ -139,32 +139,48 @@ impl OpenedRow {
     }
 }
 
-/// The viewer's read of a row's copy, running on a thread of its own so the
-/// drawing thread keeps drawing while it runs.
-pub(super) struct OpeningRead {
-    read: mpsc::Receiver<RowRead>,
+/// A read of the session cache for the viewer, running on a thread of its
+/// own so the drawing thread keeps drawing while it runs.
+pub(super) struct ViewerRead<T> {
+    read: mpsc::Receiver<T>,
     thread: std::thread::JoinHandle<()>,
 }
 
 /// A row the viewer opens, with the viewer's read of its copy.
 pub(super) type RowRead = (OpenedRow, Option<InteractiveRead<ViewedConversation>>);
 
-impl OpeningRead {
-    pub(super) fn start(row: OpenedRow, cache: InteractiveCache) -> Self {
-        let (send, read) = mpsc::channel();
+/// The open session's row as its finished refresh read it, with the viewer's
+/// read of its copy; `None` for a row without an address in the cache.
+pub(super) type ReloadRead = (ReloadedSession, Option<InteractiveRead<ViewedConversation>>);
+
+impl ViewerRead<RowRead> {
+    /// The viewer's read of `row`'s copy in `cache`.
+    pub(super) fn of_row(row: OpenedRow, cache: InteractiveCache) -> Self {
+        Self::start(move || {
+            let read = row.read(&cache);
+            (row, read)
+        })
+    }
+}
+
+impl<T: Send + 'static> ViewerRead<T> {
+    fn start(read: impl FnOnce() -> T + Send + 'static) -> Self {
+        let (send, receive) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("viewer-read".into())
             .spawn(move || {
-                let read = row.read(&cache);
-                let _ = send.send((row, read));
+                let _ = send.send(read());
             })
             .expect("failed to spawn the viewer's read thread");
-        Self { read, thread }
+        Self {
+            read: receive,
+            thread,
+        }
     }
 
-    /// The row and its read, once the read lands within `wait`; `Err(self)`
-    /// while it runs. A panic on the read's thread resumes here.
-    pub(super) fn finish(self, wait: Duration) -> Result<RowRead, Self> {
+    /// The read, once it lands within `wait`; `Err(self)` while it runs. A
+    /// panic on the read's thread resumes here.
+    pub(super) fn finish(self, wait: Duration) -> Result<T, Self> {
         match self.read.recv_timeout(wait) {
             Ok(read) => Ok(read),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(self),
@@ -173,6 +189,45 @@ impl OpeningRead {
                 Ok(()) => panic!("the viewer's read thread ended without its read"),
             },
         }
+    }
+}
+
+/// The open session's reload, once its refresh finished: the viewer shows it
+/// on the next frame, or once the read of its copy lands.
+pub(super) enum PendingReload {
+    /// A file opened directly, already parsed, or a row without an address in
+    /// the cache.
+    Ready(Box<ReloadedSession>),
+    Reading(ViewerRead<ReloadRead>),
+}
+
+impl PendingReload {
+    /// `reloaded`, reading its copy in `cache` when it has one.
+    pub(super) fn start(reloaded: Box<ReloadedSession>, cache: InteractiveCache) -> Self {
+        if reloaded.parsed.is_some() {
+            return Self::Ready(reloaded);
+        }
+        let Some(address) = reloaded.address.clone() else {
+            return Self::Ready(reloaded);
+        };
+        Self::Reading(ViewerRead::start(move || {
+            let read =
+                parse_conversation_file_interactively(&cache, &address, &reloaded.publication);
+            (*reloaded, Some(read))
+        }))
+    }
+
+    /// The reload, once its read lands within `wait`; `Err(self)` while it
+    /// runs.
+    pub(super) fn finish(self, wait: Duration) -> Result<ReloadRead, Self> {
+        match self {
+            Self::Ready(reloaded) => Ok((*reloaded, None)),
+            Self::Reading(read) => read.finish(wait).map_err(Self::Reading),
+        }
+    }
+
+    pub(super) fn is_reading(&self) -> bool {
+        matches!(self, Self::Reading(_))
     }
 }
 
@@ -310,7 +365,7 @@ impl App {
             publication,
             header: Some(header),
             external_title,
-            parsed_conversation: Some(conversation),
+            parsed_conversation: conversation,
             scroll_offset: 0,
             rendered_lines: rendered.lines,
             total_lines,
@@ -366,12 +421,13 @@ impl App {
     }
 
     /// True while the open session's refresh waits, runs or awaits another
-    /// refresh, and while the background worker reads the file opened
-    /// directly.
+    /// refresh, until the viewer shows its reload, and while the background
+    /// worker reads the file opened directly.
     pub fn is_open_session_updating(&self) -> bool {
         match &self.app_mode {
             AppMode::View(state) => {
                 self.direct_file_read.is_some()
+                    || self.pending_view_reload.is_some()
                     || self.store.is_refresh_pending(&state.conversation_path)
             }
             AppMode::List => false,
@@ -401,11 +457,11 @@ impl App {
         })
     }
 
-    /// When the newest finished refresh read the open session: read it
-    /// again from the cache on the next frame, leave the viewer for a
-    /// session that is gone or empty, or report the failed read. The list
-    /// applies the refresh itself once the viewer closes. A file opened
-    /// directly keeps the viewer when it is gone or empty.
+    /// When the newest finished refresh read the open session: start reading
+    /// it again from the cache in place of a read still running, leave the
+    /// viewer for a session that is gone or empty, or report the failed read.
+    /// The list applies the refresh itself once the viewer closes. A file
+    /// opened directly keeps the viewer when it is gone or empty.
     pub(super) fn follow_open_session(&mut self) {
         let AppMode::View(state) = &self.app_mode else {
             return;
@@ -415,7 +471,10 @@ impl App {
             .newest_finished()
             .and_then(|finished| OpenSessionRead::in_finished(finished, &state.conversation_path));
         match read {
-            Some(OpenSessionRead::Listed(reloaded)) => self.pending_view_reload = Some(*reloaded),
+            Some(OpenSessionRead::Listed(reloaded)) => {
+                let reload = PendingReload::start(reloaded, self.interactive_cache());
+                self.pending_view_reload = Some(reload);
+            }
             Some(OpenSessionRead::Gone(status)) => {
                 self.deferred_copy = None;
                 if !self.single_file_mode {
@@ -431,31 +490,25 @@ impl App {
         }
     }
 
-    /// Read the open session again from the cache after its refresh finished,
-    /// as `reloaded` lists it, or show the file opened directly as parsed,
-    /// keeping the reader's place. The first read of a file opened directly
-    /// shows from the top, as an open does. A copy asked for meanwhile runs
-    /// once nothing more is pending.
+    /// Show the open session again after its refresh finished, as `reloaded`
+    /// lists it, from `read`, the viewer's read of its copy, or the file
+    /// opened directly as parsed, keeping the reader's place. The first read
+    /// of a file opened directly shows from the top, as an open does. A copy
+    /// asked for meanwhile runs once nothing more is pending.
     pub(super) fn reload_open_session(
         &mut self,
         viewport_height: usize,
         reloaded: ReloadedSession,
+        read: Option<InteractiveRead<ViewedConversation>>,
     ) {
-        use crate::tui::viewer::parse_conversation_file_interactively;
-
         let AppMode::View(state) = &self.app_mode else {
             return;
         };
         let path = state.conversation_path.clone();
         let is_first_read_of_opened_file = self.single_file_mode && state.is_copy_missing;
-        let (conversation, copy_row, adopted) = match (reloaded.parsed, &reloaded.address) {
+        let (conversation, copy_row, adopted) = match (reloaded.parsed, read) {
             (Some(conversation), _) => (Some(conversation), None, None),
-            (None, Some(address)) => {
-                let read = parse_conversation_file_interactively(
-                    &self.interactive_cache(),
-                    address,
-                    &reloaded.publication,
-                );
+            (None, Some(read)) => {
                 match self
                     .take_interactive(&path, read)
                     .current_or_older_with_adopted()
@@ -478,7 +531,7 @@ impl App {
             };
             if is_first_read_of_opened_file {
                 if let AppMode::View(state) = &mut self.app_mode {
-                    state.parsed_conversation = Some(conversation);
+                    state.parsed_conversation = conversation;
                     state.show_reloaded_row(header, copy_row);
                     state.session_id = reloaded.session_id;
                 }
@@ -701,22 +754,17 @@ impl App {
         };
         let is_at_bottom = state.is_at_bottom(viewport_height);
         let messages_before = state.message_ranges.len();
-        let relocation = state
-            .parsed_conversation
-            .as_ref()
-            .map(|earlier| EntryRelocation::between(earlier, &conversation));
-        if let Some(relocation) = &relocation {
-            state.expanded_tool_outputs = state
-                .expanded_tool_outputs
-                .iter()
-                .filter_map(|id| relocation.tool_output_id(id))
-                .collect();
-        }
+        let relocation = EntryRelocation::between(&state.parsed_conversation, &conversation);
+        state.expanded_tool_outputs = state
+            .expanded_tool_outputs
+            .iter()
+            .filter_map(|id| relocation.tool_output_id(id))
+            .collect();
         state.hovered_tool_output = None;
         state.show_reloaded_row(header, copy_row);
         state.session_id = session_id;
-        state.parsed_conversation = Some(conversation);
-        self.render_view(viewport_height, relocation.as_ref(), is_at_bottom);
+        state.parsed_conversation = conversation;
+        self.render_view(viewport_height, Some(&relocation), is_at_bottom);
         let now = self.clock().now();
         let AppMode::View(state) = &mut self.app_mode else {
             return;
@@ -742,12 +790,9 @@ impl App {
         relocation: Option<&EntryRelocation>,
         stick_to_bottom: bool,
     ) {
-        use crate::tui::viewer::{
-            parse_conversation_file_interactively, render_parsed_conversation,
-        };
+        use crate::tui::viewer::render_parsed_conversation;
 
         let clock = Arc::clone(self.environment.clock());
-        let cache = &self.interactive_cache();
 
         if let AppMode::View(ref mut state) = self.app_mode {
             let anchor = capture_anchor(
@@ -771,34 +816,6 @@ impl App {
                 });
             let old_scroll = state.scroll_offset;
 
-            let conversation = match (state.parsed_conversation.clone(), &state.cache_address) {
-                (Some(conversation), _) => conversation,
-                (None, Some(address)) => {
-                    let read =
-                        parse_conversation_file_interactively(cache, address, &state.publication);
-                    let (copy, adopted) = self
-                        .store
-                        .take_interactive(&state.conversation_path, read, clock.now())
-                        .current_or_older_with_adopted();
-                    state.adopt(adopted);
-                    state.is_copy_missing = copy.is_none();
-                    let conversation = match copy {
-                        Some(copy) => {
-                            state.show_copy_header(copy.row);
-                            copy.conversation
-                        }
-                        None => ParsedConversation::empty(),
-                    };
-                    let conversation = Arc::new(conversation);
-                    state.parsed_conversation = Some(conversation.clone());
-                    conversation
-                }
-                (None, None) => {
-                    let conversation = Arc::new(ParsedConversation::empty());
-                    state.parsed_conversation = Some(conversation.clone());
-                    conversation
-                }
-            };
             let options = RenderOptions {
                 tool_display: state.tool_display,
                 show_thinking: state.show_thinking,
@@ -809,7 +826,7 @@ impl App {
                 today: clock.today(),
                 zone: clock.zone(),
             };
-            let rendered = render_parsed_conversation(&conversation, &options);
+            let rendered = render_parsed_conversation(&state.parsed_conversation, &options);
             state.total_lines = rendered.lines.len();
             state.rendered_lines = rendered.lines;
             state.message_ranges = rendered.messages;
@@ -1407,8 +1424,7 @@ impl App {
         // The entry as the viewer read it: the file may have grown since.
         let text = state
             .parsed_conversation
-            .as_ref()
-            .and_then(|conversation| conversation.entry(entry_index))
+            .entry(entry_index)
             .map(|entry| crate::tui::export::format_entry_for_clipboard(entry, options));
 
         match text {
@@ -1452,10 +1468,7 @@ impl App {
             return Err("Not viewing a conversation".to_string());
         };
         let call = Self::focused_call_range(state).ok_or_else(|| "No call focused".to_string())?;
-        let conversation = state
-            .parsed_conversation
-            .as_ref()
-            .ok_or_else(|| "Call not found".to_string())?;
+        let conversation = &state.parsed_conversation;
         crate::tui::export::extract_call_text(
             |entry_index| conversation.entry(entry_index),
             call.input.location,

@@ -362,10 +362,8 @@ fn find_first_normalized_match(text: &str, term: &str) -> Option<(usize, usize)>
 /// A term of ASCII characters that normalise to themselves is found by a
 /// byte search, except in the whitespace-bounded span around each character
 /// outside ASCII that normalises to one of the term's letters: that span is
-/// read character by character. The ranges are those of reading the whole
-/// text character by character, because such a term holds no whitespace, so
-/// no match crosses a span's edge, and a span starts after whitespace, so its
-/// first character starts a word as it does in the whole text.
+/// read character by character. Valid for terms without whitespace: each
+/// span ends at whitespace.
 fn find_normalized_term_ranges(text: &str, term: &str) -> Vec<(usize, usize)> {
     let is_found_by_bytes = term.bytes().all(|byte| {
         byte.is_ascii_graphic() && normalize_evidence_char(char::from(byte)) == char::from(byte)

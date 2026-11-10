@@ -5,19 +5,19 @@ use crate::history::Conversation;
 use crate::history::listing::SessionOrigin;
 use crate::search::query::ParsedQuery;
 use crate::search::{
-    self, CopiesToRead, SearchTextsInMemory, SearchableConversation, SessionsWithoutTexts,
-    TextsRead,
+    self, CopiesToRead, ReadFailure, SearchTextsInMemory, SearchableConversation,
+    SessionsWithoutTexts, TextsRead,
 };
 use crate::semantic::types::SemanticCancellationToken;
 use crate::tui::semantic_worker::{
-    SemanticSearchMessage, SemanticWorkerCommand, spawn_semantic_worker,
+    SemanticSearchMessage, SemanticSearchResponse, SemanticWorkerCommand, spawn_semantic_worker,
 };
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
 
 #[allow(dead_code)]
 #[derive(Default)]
@@ -30,9 +30,27 @@ pub(super) struct SemanticSearchState {
     pub(super) last_status: SemanticProgress,
     pub(super) error: Option<String>,
     pub(super) results: HashMap<usize, SemanticResultMetadata>,
+    /// The sessions the semantic results on screen searched without semantic
+    /// turns; `None` while no semantic results are on screen.
+    pub(super) unreadable: Option<usize>,
     pub(super) worker_tx: Option<mpsc::Sender<SemanticWorkerCommand>>,
     pub(super) worker_rx: Option<mpsc::Receiver<SemanticSearchMessage>>,
     pub(super) cancellation: Option<SemanticCancellationToken>,
+}
+
+impl SemanticSearchState {
+    fn clear_results(&mut self) {
+        self.results.clear();
+        self.unreadable = None;
+    }
+
+    /// Shows `response`'s results.
+    fn show_results(&mut self, response: SemanticSearchResponse) {
+        self.last_status = response.progress;
+        self.error = response.error;
+        self.results = response.metadata;
+        self.unreadable = Some(response.unreadable);
+    }
 }
 
 /// What a query that could name a session turned out to be.
@@ -62,12 +80,18 @@ pub(super) enum SearchCommand {
     UpdateData {
         conversations: Arc<Vec<Arc<Conversation>>>,
         searchable: Arc<Vec<SearchableConversation>>,
+        /// A sender of this channel, which the reads of the rows' texts reply
+        /// on. The worker holds none of its own, so it stops once the app
+        /// and every read running are gone.
+        texts_reply: mpsc::Sender<SearchCommand>,
     },
     Search {
         query: String,
         generation: u64,
         mode: ListSearchMode,
     },
+    /// The reads of one batch of copies, from the text reader.
+    TextsRead(Vec<TextsRead>),
 }
 
 pub(super) struct SearchResponse {
@@ -75,35 +99,41 @@ pub(super) struct SearchResponse {
     pub(super) generation: u64,
     pub(super) mode: ListSearchMode,
     pub(super) evidence: HashMap<usize, search::LexicalEvidence>,
-    /// For a semantic query of quoted phrases alone, the semantic search's
-    /// results: `filtered`, each an exact match. `None` for a lexical search
-    /// and for the semantic search's lexical fallback.
-    pub(super) exact_literal_results: Option<HashMap<usize, SemanticResultMetadata>>,
+    /// True for a semantic query of quoted phrases alone: `filtered` are the
+    /// semantic search's results, each an exact match. False for a lexical
+    /// search and for the semantic search's lexical fallback.
+    pub(super) is_exact_literal: bool,
 }
 
 /// A search the worker runs once it has applied every command waiting.
 #[derive(Clone)]
-struct SearchRequest {
+pub(super) struct SearchRequest {
     query: String,
-    generation: u64,
+    pub(super) generation: u64,
     mode: ListSearchMode,
 }
 
 /// What the search worker searches: the rows, their search data, and the
 /// search texts read into memory so far.
-struct SearchWorkerState {
+pub(super) struct SearchWorkerState {
     conversations: Arc<Vec<Arc<Conversation>>>,
     searchable: Arc<Vec<SearchableConversation>>,
-    texts: SearchTextsInMemory,
-    copies_to_read: mpsc::Sender<CopiesToRead>,
-    texts_read: mpsc::Receiver<Vec<TextsRead>>,
-    /// The batches of copies sent to the reader whose texts have not come
-    /// back.
-    batches_reading: usize,
-    /// The search last run, run again when texts arrive.
+    pub(super) texts: SearchTextsInMemory,
+    copies_to_read: mpsc::Sender<TextsToRead>,
+    /// The search last run, run again when texts arrive while the app awaits
+    /// its generation.
     last_search: Option<SearchRequest>,
+    /// The generation of the search the app awaits.
+    awaited_search: Arc<AtomicU64>,
     /// The `UpdateData` commands applied.
     updates_applied: u64,
+}
+
+/// A batch of copies for the text reader, and the channel its reads reply
+/// on.
+pub(super) struct TextsToRead {
+    copies: CopiesToRead,
+    reply: mpsc::Sender<SearchCommand>,
 }
 
 /// The sessions without texts held, as the worker counts them once it has
@@ -111,48 +141,51 @@ struct SearchWorkerState {
 #[derive(Clone, Copy)]
 pub(super) struct TextsHeld {
     pub(super) updates_applied: u64,
-    pub(super) without: SessionsWithoutTexts,
+    pub(super) sessions_without_texts: SessionsWithoutTexts,
 }
 
-/// How often the worker looks for texts read while a batch is being read.
-const TEXTS_READ_POLL: Duration = Duration::from_millis(50);
-
-/// What applying the commands and texts waiting asks the worker to do.
+/// What applying the commands waiting asks the worker to do.
 #[derive(Default)]
-struct Applied {
-    search: Option<SearchRequest>,
+pub(super) struct PendingWork {
+    pub(super) search: Option<SearchRequest>,
     /// True when the count of sessions without texts may have changed.
     texts_changed: bool,
 }
 
 impl SearchWorkerState {
-    /// The next command, waiting for it; `None` once the app is gone. While
-    /// a batch is being read, the wait ends every [`TEXTS_READ_POLL`] with
-    /// `Some(None)`, so the texts read are held without a command.
-    fn next_command(
-        &self,
-        commands: &mpsc::Receiver<SearchCommand>,
-    ) -> Option<Option<SearchCommand>> {
-        if self.batches_reading == 0 {
-            return commands.recv().ok().map(Some);
-        }
-        match commands.recv_timeout(TEXTS_READ_POLL) {
-            Ok(command) => Some(Some(command)),
-            Err(mpsc::RecvTimeoutError::Timeout) => Some(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+    /// No rows yet; the copies whose texts are to be read go to
+    /// `copies_to_read`, and the app publishes the search it awaits in
+    /// `awaited_search`.
+    pub(super) fn new(
+        copies_to_read: mpsc::Sender<TextsToRead>,
+        awaited_search: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            conversations: Arc::new(Vec::new()),
+            searchable: Arc::new(Vec::new()),
+            texts: SearchTextsInMemory::default(),
+            copies_to_read,
+            last_search: None,
+            awaited_search,
+            updates_applied: 0,
         }
     }
 
-    /// Applies `command` to `applied`.
-    fn apply(&mut self, command: SearchCommand, applied: &mut Applied) {
+    /// Applies `command` to `applied`. Texts read run the last search again
+    /// over them unless a newer one waits, while the app awaits it.
+    pub(super) fn apply(&mut self, command: SearchCommand, applied: &mut PendingWork) {
         match command {
             SearchCommand::UpdateData {
                 conversations,
                 searchable,
+                texts_reply,
             } => {
-                let to_read = self.texts.keep_copies_of(&conversations);
-                if !to_read.copies.is_empty() && self.copies_to_read.send(to_read).is_ok() {
-                    self.batches_reading += 1;
+                let copies = self.texts.keep_copies_of(&conversations);
+                if !copies.copies.is_empty() {
+                    self.send_to_reader(TextsToRead {
+                        copies,
+                        reply: texts_reply,
+                    });
                 }
                 self.conversations = conversations;
                 self.searchable = searchable;
@@ -170,25 +203,38 @@ impl SearchWorkerState {
                     mode,
                 });
             }
-        }
-    }
-
-    /// Holds the texts read since the last call; the last search runs again
-    /// over them unless a newer one waits.
-    fn hold_texts_read(&mut self, applied: &mut Applied) {
-        while let Ok(reads) = self.texts_read.try_recv() {
-            self.batches_reading -= 1;
-            for (copy, texts) in reads {
-                self.texts.finish_read(copy, texts);
-            }
-            applied.texts_changed = true;
-            if applied.search.is_none() {
-                applied.search = self.last_search.clone();
+            SearchCommand::TextsRead(reads) => {
+                for (copy, read) in reads {
+                    self.texts.finish_read(copy, read);
+                }
+                applied.texts_changed = true;
+                if applied.search.is_none() {
+                    let awaited = self.awaited_search.load(Ordering::Acquire);
+                    applied.search = self
+                        .last_search
+                        .clone()
+                        .filter(|last| last.generation == awaited);
+                }
             }
         }
     }
 
-    fn search(&mut self, request: SearchRequest, now: DateTime<Local>) -> SearchResponse {
+    /// Sends `batch` to the text reader. A reader gone leaves the batch's
+    /// copies failed, not being read for good.
+    fn send_to_reader(&mut self, batch: TextsToRead) {
+        if let Err(mpsc::SendError(unsent)) = self.copies_to_read.send(batch) {
+            let failure = ReadFailure::Error("the search text reader stopped".into());
+            for (copy, read) in unsent.copies.failed(&failure) {
+                self.texts.finish_read(copy, read);
+            }
+        }
+    }
+
+    pub(super) fn search(
+        &mut self,
+        request: SearchRequest,
+        now: DateTime<Local>,
+    ) -> SearchResponse {
         let conversations = self.conversations.as_slice();
         let filtered = search::search_with_texts(
             conversations,
@@ -200,15 +246,12 @@ impl SearchWorkerState {
         let parsed = ParsedQuery::parse(&request.query);
         let evidence =
             search::build_session_list_evidence(conversations, &self.texts, &filtered, &parsed);
-        let exact_literal_results = (request.mode == ListSearchMode::Semantic
-            && parsed.is_quoted_only())
-        .then(|| exact_literal_results(conversations, &self.texts, &filtered, &parsed));
         let response = SearchResponse {
             filtered,
             generation: request.generation,
             mode: request.mode,
             evidence,
-            exact_literal_results,
+            is_exact_literal: request.mode == ListSearchMode::Semantic && parsed.is_quoted_only(),
         };
         self.last_search = Some(request);
         response
@@ -223,30 +266,19 @@ pub(super) fn spawn_search_worker(clock: Arc<dyn Clock>) -> SearchWorker {
     let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>();
     let (res_tx, res_rx) = mpsc::channel::<SearchResponse>();
     let (texts_held_tx, texts_held_rx) = mpsc::channel::<TextsHeld>();
+    let awaited_search = Arc::new(AtomicU64::new(0));
+    let worker_awaited_search = Arc::clone(&awaited_search);
 
     std::thread::Builder::new()
         .name("search-worker".into())
         .spawn(move || {
-            let (copies_to_read, texts_read) = spawn_text_reader();
-            let mut state = SearchWorkerState {
-                conversations: Arc::new(Vec::new()),
-                searchable: Arc::new(Vec::new()),
-                texts: SearchTextsInMemory::default(),
-                copies_to_read,
-                texts_read,
-                batches_reading: 0,
-                last_search: None,
-                updates_applied: 0,
-            };
-            while let Some(command) = state.next_command(&cmd_rx) {
-                let mut applied = Applied::default();
-                if let Some(command) = command {
-                    state.apply(command, &mut applied);
-                }
+            let mut state = SearchWorkerState::new(spawn_text_reader(), worker_awaited_search);
+            while let Ok(command) = cmd_rx.recv() {
+                let mut applied = PendingWork::default();
+                state.apply(command, &mut applied);
                 while let Ok(pending) = cmd_rx.try_recv() {
                     state.apply(pending, &mut applied);
                 }
-                state.hold_texts_read(&mut applied);
                 // The results go first: once the app counts no session
                 // loading, the results over every session's texts are on
                 // their channel.
@@ -258,7 +290,7 @@ pub(super) fn spawn_search_worker(clock: Arc<dyn Clock>) -> SearchWorker {
                 }
                 let held = TextsHeld {
                     updates_applied: state.updates_applied,
-                    without: state.texts.sessions_without_texts(),
+                    sessions_without_texts: state.texts.sessions_without_texts(),
                 };
                 if applied.texts_changed && texts_held_tx.send(held).is_err() {
                     return;
@@ -271,6 +303,7 @@ pub(super) fn spawn_search_worker(clock: Arc<dyn Clock>) -> SearchWorker {
         commands: cmd_tx,
         results: res_rx,
         texts_held: texts_held_rx,
+        awaited_search,
     }
 }
 
@@ -280,30 +313,49 @@ pub(super) struct SearchWorker {
     pub(super) results: mpsc::Receiver<SearchResponse>,
     /// The sessions without texts held, whenever the count may have changed.
     pub(super) texts_held: mpsc::Receiver<TextsHeld>,
+    /// The generation of the search the app awaits, which the worker reads.
+    pub(super) awaited_search: Arc<AtomicU64>,
 }
 
 /// Start the thread reading the search texts of each batch of copies sent
-/// to it, in parallel, and sending back each batch's reads together. It
-/// stops once the search worker is gone.
-fn spawn_text_reader() -> (mpsc::Sender<CopiesToRead>, mpsc::Receiver<Vec<TextsRead>>) {
-    let (copies_tx, copies_rx) = mpsc::channel::<CopiesToRead>();
-    let (texts_tx, texts_rx) = mpsc::channel::<Vec<TextsRead>>();
+/// to it, in parallel, and replying with each batch's reads together. A
+/// batch whose read panics replies with every copy failed. The thread stops
+/// once the search worker is gone.
+fn spawn_text_reader() -> mpsc::Sender<TextsToRead> {
+    let (batches_tx, batches_rx) = mpsc::channel::<TextsToRead>();
     std::thread::Builder::new()
         .name("search-text-reader".into())
         .spawn(move || {
-            while let Ok(copies) = copies_rx.recv() {
-                if texts_tx.send(copies.read()).is_err() {
-                    return;
-                }
+            while let Ok(TextsToRead { copies, reply }) = batches_rx.recv() {
+                let reads =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| copies.read()))
+                        .unwrap_or_else(|panic| {
+                            let message = panic
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| panic.downcast_ref::<&str>().copied())
+                                .unwrap_or("a panic without a message");
+                            let cause = format!("the search text reader panicked: {message}");
+                            copies.failed(&ReadFailure::Error(cause.into()))
+                        });
+                let _ = reply.send(SearchCommand::TextsRead(reads));
             }
         })
         .expect("failed to spawn search text reader thread");
-    (copies_tx, texts_rx)
+    batches_tx
 }
 
 impl App {
-    pub(super) fn invalidate_search_generation(&mut self) {
+    /// Moves to the next search generation: a response or a search run again
+    /// for an earlier one is not awaited.
+    fn advance_search_generation(&mut self) {
         self.search_generation += 1;
+        self.awaited_search
+            .store(self.search_generation, Ordering::Release);
+    }
+
+    pub(super) fn invalidate_search_generation(&mut self) {
+        self.advance_search_generation();
         self.search_started_at = None;
         self.dispatched_query = None;
         self.shown_results_settled = false;
@@ -314,7 +366,7 @@ impl App {
         self.semantic_search.prewarm_status = None;
         self.semantic_search.last_status = SemanticProgress::Idle;
         self.semantic_search.error = None;
-        self.semantic_search.results.clear();
+        self.semantic_search.clear_results();
     }
 
     fn ensure_semantic_worker(&mut self) {
@@ -349,6 +401,7 @@ impl App {
         let sent = self.search_tx.send(SearchCommand::UpdateData {
             conversations: self.conversations_snapshot.clone(),
             searchable: Arc::new(self.searchable.clone()),
+            texts_reply: self.search_tx.clone(),
         });
         if sent.is_ok() {
             self.search_data_sent += 1;
@@ -360,7 +413,7 @@ impl App {
     /// list's search results can still change without a keystroke.
     pub fn is_reading_search_texts(&self) -> bool {
         self.texts_held.updates_applied < self.search_data_sent
-            || self.texts_held.without.loading > 0
+            || self.texts_held.sessions_without_texts.loading > 0
     }
 
     pub(super) fn semantic_scope_indices(&self) -> Arc<Vec<usize>> {
@@ -432,7 +485,7 @@ impl App {
                 self.semantic_search.prewarm_status = prewarm_status;
             }
             self.semantic_search.error = None;
-            self.semantic_search.results.clear();
+            self.semantic_search.clear_results();
             self.update_filter();
             return;
         }
@@ -471,8 +524,8 @@ impl App {
     /// behind another rearview's rebuild.
     fn dispatch_lexical_search(&mut self, query: String) {
         self.dispatched_query = Some(query.clone());
-        self.semantic_search.results.clear();
-        self.search_generation += 1;
+        self.semantic_search.clear_results();
+        self.advance_search_generation();
         self.search_started_at = Some(self.clock().now());
         self.semantic_search.error = None;
         let _ = self.search_tx.send(SearchCommand::Search {
@@ -486,7 +539,7 @@ impl App {
     /// response fails the generation check, and the semantic worker's
     /// search is cancelled.
     fn abandon_search_in_flight(&mut self) {
-        self.search_generation += 1;
+        self.advance_search_generation();
         self.search_started_at = None;
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
@@ -497,7 +550,7 @@ impl App {
     }
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
-        self.search_generation += 1;
+        self.advance_search_generation();
         self.search_started_at = (!prewarm).then(|| self.clock().now());
         if !prewarm {
             self.dispatched_query = Some(query.clone());
@@ -517,7 +570,7 @@ impl App {
         self.semantic_search.last_status = SemanticProgress::Idle;
         self.semantic_search.error = None;
         if prewarm {
-            self.semantic_search.results.clear();
+            self.semantic_search.clear_results();
         }
         if let Some(cancellation) = &self.semantic_search.cancellation {
             cancellation.cancel();
@@ -589,15 +642,15 @@ impl App {
     pub fn receive_search_results(&mut self) -> bool {
         let mut applied = false;
         while let Ok(held) = self.texts_held_rx.try_recv() {
-            applied |= self.texts_held.without != held.without;
+            applied |= self.texts_held.sessions_without_texts != held.sessions_without_texts;
             self.texts_held = held;
         }
-        while let Ok(mut response) = self.search_rx.try_recv() {
-            if let Some(results) = response.exact_literal_results.take() {
+        while let Ok(response) = self.search_rx.try_recv() {
+            if response.is_exact_literal {
                 if response.generation == self.search_generation
                     && self.list_search_mode == ListSearchMode::Semantic
                 {
-                    self.apply_exact_literal_results(response, results);
+                    self.apply_exact_literal_results(response);
                     applied = true;
                 }
                 continue;
@@ -615,7 +668,7 @@ impl App {
                 }
                 self.lexical_evidence = response.evidence;
                 if response.mode == ListSearchMode::Semantic {
-                    self.semantic_search.results.clear();
+                    self.semantic_search.clear_results();
                 }
                 self.shown_results_query = self.dispatched_query.clone();
                 self.shown_results_settled = response.mode == ListSearchMode::Lexical;
@@ -647,7 +700,7 @@ impl App {
                             }
                         }
                     }
-                    SemanticSearchMessage::Complete(response) => {
+                    SemanticSearchMessage::Complete(mut response) => {
                         if self.list_search_mode == ListSearchMode::Semantic {
                             if response.prewarm
                                 && Some(response.generation)
@@ -658,9 +711,7 @@ impl App {
                                 if response.generation == active_generation {
                                     self.semantic_search.pending_generation = None;
                                     self.semantic_search.pending_status = None;
-                                    self.semantic_search.last_status = response.progress;
-                                    self.semantic_search.error = response.error;
-                                    self.semantic_search.results = response.metadata;
+                                    self.semantic_search.show_results(response);
                                     if !self.query.trim().is_empty() {
                                         self.dispatch_semantic_search(
                                             self.query.trim().to_string(),
@@ -673,10 +724,9 @@ impl App {
                                 self.search_started_at = None;
                                 self.semantic_search.pending_generation = None;
                                 self.semantic_search.pending_status = None;
-                                self.semantic_search.last_status = response.progress;
-                                self.semantic_search.error = response.error;
-                                self.semantic_search.results = response.metadata;
-                                let filtered = self.filter_indices(response.filtered);
+                                let filtered = std::mem::take(&mut response.filtered);
+                                self.semantic_search.show_results(response);
+                                let filtered = self.filter_indices(filtered);
                                 self.shown_results_query = self.dispatched_query.clone();
                                 self.shown_results_settled = true;
                                 self.apply_filtered(filtered);
@@ -691,21 +741,21 @@ impl App {
         applied
     }
 
-    /// Shows `response`'s rows as the semantic search's results, each with
-    /// its entry of `results`.
-    fn apply_exact_literal_results(
-        &mut self,
-        response: SearchResponse,
-        results: HashMap<usize, SemanticResultMetadata>,
-    ) {
+    /// Shows the rows of `response`, the answer to a quoted-only semantic
+    /// query, that the list's filters keep, as the semantic search's exact
+    /// matches.
+    fn apply_exact_literal_results(&mut self, response: SearchResponse) {
+        let filtered = self.filter_indices(response.filtered);
+        let parsed = ParsedQuery::parse(self.dispatched_query.as_deref().unwrap_or_default());
         self.search_started_at = None;
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
         self.semantic_search.last_status = SemanticProgress::Complete;
         self.semantic_search.error = None;
-        self.semantic_search.results = results;
+        self.semantic_search.results =
+            exact_literal_results(&self.conversations, &response.evidence, &filtered, &parsed);
+        self.semantic_search.unreadable = None;
         self.lexical_evidence = response.evidence;
-        let filtered = self.filter_indices(response.filtered);
         self.shown_results_query = self.dispatched_query.clone();
         self.shown_results_settled = true;
         self.apply_filtered(filtered);

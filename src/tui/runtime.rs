@@ -308,7 +308,7 @@ impl Runtime {
             .complete_pending_open(frame_state.frame_width(), OPENING_REDRAW_INTERVAL)
             || self
                 .app
-                .complete_pending_view_refresh(frame_state.viewport_height)
+                .complete_pending_view_refresh(frame_state.viewport_height, Duration::ZERO)
         {
             return Ok(Tick::Continue);
         }
@@ -399,6 +399,7 @@ impl Runtime {
             || self.supervisor.is_running_a_job()
             || self.app.is_reading_fork()
             || self.app.is_reading_search_texts()
+            || self.app.is_reading_open_session()
         {
             Duration::from_millis(50)
         } else if self.app.has_search_work_in_flight() {

@@ -4,6 +4,7 @@
 use super::claude_home::{ClaudeHome, app_reading, serve_list_refresh};
 use super::commit_failure_tests::launched_app;
 use super::refresh_tests::{refresh_found, serve_session_refresh};
+use super::test_waits::{ConnectionGate, VIEWER_READ_LANDS};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
@@ -102,7 +103,7 @@ fn viewer_on_clock(home: &ClaudeHome, clock: Arc<TestClock>) -> App {
 /// the refreshed copy.
 fn press_refresh(app: &mut App) {
     request_refresh(app);
-    assert!(app.complete_pending_view_refresh(VIEWPORT));
+    assert!(app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS));
 }
 
 /// `Ctrl+R`, and the session refresh it asks for, run as the background
@@ -158,9 +159,46 @@ fn refresh_reads_on_next_frame_and_second_press_adds_no_read() {
         !app.is_session_refresh_requested(),
         "the second press doesn't ask for a second refresh"
     );
-    assert!(app.complete_pending_view_refresh(VIEWPORT));
+    assert!(app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS));
     assert!(view_text(&app).contains("message 4"));
-    assert!(!app.complete_pending_view_refresh(VIEWPORT));
+    assert!(!app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS));
+}
+
+#[test]
+fn reload_keeps_old_copy_under_updating_until_its_read_lands() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..30));
+    let mut app = viewer_on(&home);
+    write_messages(&path, &numbered(0..31));
+    let gate = ConnectionGate::closed(app.environment.cache_base().path(), |thread| {
+        thread.name() == Some("viewer-read")
+    });
+
+    request_refresh(&mut app);
+    let waits_for_the_read = !app.complete_pending_view_refresh(VIEWPORT, Duration::ZERO);
+    let old_copy_on_screen = !view_text(&app).contains("message 30");
+    let status = app.open_session_status();
+    app.handle_key(KeyCode::Char('j'), KeyModifiers::empty(), VIEWPORT);
+    let scrolled = view(&app).scroll_offset;
+    gate.open();
+    let landed = app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+
+    assert!(
+        waits_for_the_read && old_copy_on_screen,
+        "the viewer keeps the old copy while the reload's read runs"
+    );
+    assert_eq!(
+        status,
+        Some(OpenSessionStatus::Updating),
+        "the viewer shows the session as updating until the read lands"
+    );
+    assert_eq!(scrolled, 1, "the old copy scrolls while the read runs");
+    assert!(
+        landed && view_text(&app).contains("message 30"),
+        "the reload shows once its read lands"
+    );
+    assert_eq!(app.open_session_status(), None);
 }
 
 #[test]
@@ -180,7 +218,9 @@ fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
         .iter()
         .position(|&index| app.conversations()[index].path != opened_first);
     assert!(app.request_open());
-    assert!(app.finish_pending_open_for_test(80));
+    assert!(crate::tui::app::test_waits::finish_pending_open(
+        &mut app, 80
+    ));
     let next_session = view(&app).conversation_path.clone();
     serve_session_refresh(&mut app);
 
@@ -191,7 +231,7 @@ fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
         "the earlier session's refresh keeps the open session"
     );
     assert!(
-        !app.complete_pending_view_refresh(VIEWPORT),
+        !app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS),
         "the earlier session's refresh doesn't reload the next session's view"
     );
 }
@@ -209,7 +249,7 @@ fn leaving_viewer_with_q_drops_its_pending_reload() {
 
     assert!(matches!(app.app_mode(), AppMode::List));
     assert!(
-        !app.complete_pending_view_refresh(VIEWPORT),
+        !app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS),
         "a closed viewer doesn't draw a reload"
     );
 }
@@ -493,7 +533,7 @@ fn changed_session_under_unreadable_directory_reports_failed_refresh_once() {
             serve_session_refresh(&mut app);
             refreshes += 1;
         }
-        app.complete_pending_view_refresh(VIEWPORT);
+        app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
     }
 
     assert_eq!(
@@ -740,7 +780,7 @@ fn copy_out_of_date_again_on_next_frame_requests_another_refresh() {
     request_refresh(&mut app);
     write_messages(&path, &numbered(0..7));
 
-    assert!(app.complete_pending_view_refresh(VIEWPORT));
+    assert!(app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS));
 
     assert!(
         app.is_open_session_updating(),
@@ -754,7 +794,7 @@ fn copy_out_of_date_again_on_next_frame_requests_another_refresh() {
 fn press_refresh_outside_every_root(app: &mut App) {
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(VIEWPORT);
+    app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
 }
 
 /// The file at `path` opened directly in an environment reading no
@@ -888,7 +928,7 @@ fn opened_directly_as(typed: &Path, environment: Environment) -> App {
         environment,
     );
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(VIEWPORT);
+    app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
     app.check_view_resize(80, VIEWPORT);
     app
 }
@@ -1339,8 +1379,10 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
         let found = crate::agent::service::lexically_rank_scoped(
             conversations,
             phrase,
-            &every_row,
-            crate::agent::search::AgentSearchScope::Global,
+            crate::agent::service::ScopedSessions {
+                indices: &every_row,
+                scope: crate::agent::search::AgentSearchScope::Global,
+            },
             crate::search::mode::SearchMode::Exact,
             &unwindowed,
             &crate::clock::TestClock::default(),
@@ -1361,19 +1403,13 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
             "the semantic route text holds the new name, not the old: {route:?}"
         ));
     }
-    let shared = conversations
-        .iter()
-        .cloned()
-        .map(std::sync::Arc::new)
-        .collect::<Vec<_>>();
-    let preview = super::exact_literal::exact_literal_results(
-        &shared,
-        &in_memory,
-        &[0],
-        &ParsedQuery::parse("\"yakety\""),
-    )
-    .remove(&0)
-    .map(|metadata| metadata.explanation.evidence_preview);
+    let quoted = ParsedQuery::parse("\"yakety\"");
+    let evidence =
+        crate::search::build_session_list_evidence(conversations, &in_memory, &[0], &quoted);
+    let preview =
+        super::exact_literal::exact_literal_results(conversations, &evidence, &[0], &quoted)
+            .remove(&0)
+            .map(|metadata| metadata.explanation.evidence_preview);
     if !preview
         .as_deref()
         .is_some_and(|preview| preview.contains("Yakety"))

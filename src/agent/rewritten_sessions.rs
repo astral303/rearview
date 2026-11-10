@@ -1,6 +1,6 @@
 //! `agent search` over sessions another rearview writes again or removes
 //! while the search reads them: the ranking and the hit read each read the
-//! copy the cache holds, whole, and a session the cache no longer lists
+//! copy the cache holds when they read it, and a session that left the cache
 //! leaves the results.
 
 use crate::agent::refs::AgentConversationKey;
@@ -15,26 +15,19 @@ use crate::history::sqlite_cache::connection::test_hooks::{
 use crate::search::AgentRanking;
 use crate::search::mode::SearchMode;
 use crate::search::test_fixtures::{
-    CachedClaudeSessions, cached_claude_sessions, claude_user_record, october,
+    CachedClaudeSessions, cached_claude_sessions, october_messages as messages,
 };
 use crate::time_filter::TimeFilter;
-
-/// User messages with `texts`, an hour apart from noon on 10 October.
-fn messages(texts: &[&str]) -> Vec<serde_json::Value> {
-    texts
-        .iter()
-        .zip(12..)
-        .map(|(text, hour)| claude_user_record(text, october(10, hour)))
-        .collect()
-}
 
 fn rank(sessions: &CachedClaudeSessions, query: &str) -> AgentRanking {
     let scope = (0..sessions.rows.len()).collect::<Vec<_>>();
     lexically_rank_scoped(
         &sessions.rows,
         query,
-        &scope,
-        crate::agent::search::AgentSearchScope::Global,
+        crate::agent::service::ScopedSessions {
+            indices: &scope,
+            scope: crate::agent::search::AgentSearchScope::Global,
+        },
         SearchMode::Lexical,
         &TimeFilter::default(),
         &TestClock::default(),
@@ -98,7 +91,11 @@ fn hit_read_reads_hit_messages_of_copy_cache_holds_as_it_reads() {
         let sessions =
             cached_claude_sessions(&[("session", messages(&["zebrafish one", "plain"]))]);
         let ranking = rank(&sessions, "zebrafish");
-        assert_eq!(ranking.hit_messages.of(0).unwrap().ordinals, [1]);
+        assert_eq!(
+            ranking.hit_messages.of(0).unwrap().ordinals,
+            [1],
+            "the ranking finds the hit in the first message"
+        );
 
         let rewrite = if rewrites_as_read_opens {
             sessions.rewrite(0, &messages(&["zebrafish elsewhere"]));
@@ -114,7 +111,10 @@ fn hit_read_reads_hit_messages_of_copy_cache_holds_as_it_reads() {
         };
 
         let read = read_hits(&sessions, &ranking, 0).expect("the cache holds the session");
-        assert!(rewrite.as_ref().is_none_or(ReaderAction::has_run));
+        assert!(
+            rewrite.as_ref().is_none_or(ReaderAction::has_run),
+            "the rewrite runs as the hit read opens its reader"
+        );
         assert_eq!(
             numbered_texts(&read),
             expected,
@@ -145,7 +145,10 @@ fn ranking_counts_copy_cache_holds_after_rewrites_during_scan() {
 
     let ranking = rank(&sessions, "quagga");
 
-    assert!(rewrites.iter().all(ReaderAction::has_run));
+    assert!(
+        rewrites.iter().all(ReaderAction::has_run),
+        "every rewrite runs as a reader opens"
+    );
     assert_eq!(ranking.ranked, [0], "the rewritten session ranks");
     assert_eq!(
         ranking.hit_messages.of(0).unwrap().ordinals,
@@ -174,14 +177,17 @@ fn session_removed_during_search_leaves_ranking_or_hit_read() {
 
     let ranking = rank(&sessions, "quagga");
 
-    assert!(remove.has_run());
+    assert!(remove.has_run(), "the removal runs as a reader opens");
     assert_eq!(ranking.ranked, [1], "the removed session is not ranked");
     assert_eq!(
         ranking.left_cache,
         [0],
         "the ranking names the removed session"
     );
-    assert!(ranking.hit_messages.of(0).is_none());
+    assert!(
+        ranking.hit_messages.of(0).is_none(),
+        "the removed session has no hit messages"
+    );
 
     let sessions = both();
     let ranking = rank(&sessions, "quagga");
@@ -190,5 +196,8 @@ fn session_removed_during_search_leaves_ranking_or_hit_read() {
         read_hits(&sessions, &ranking, 0).is_none(),
         "the hit read finds the session left the cache"
     );
-    assert!(read_hits(&sessions, &ranking, 1).is_some());
+    assert!(
+        read_hits(&sessions, &ranking, 1).is_some(),
+        "the hit read of the other session finds it"
+    );
 }

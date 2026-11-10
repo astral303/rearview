@@ -76,6 +76,10 @@ pub(crate) use task_notification::{
 };
 pub use workspace::Workspace;
 
+/// The version of [`Conversation::semantic_route_text`]'s output. A route
+/// text the session cache stored under another version is computed again.
+pub(crate) const SEMANTIC_ROUTE_VERSION: i64 = 1;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(test, derive(strum::EnumIter))]
 pub enum Source {
@@ -300,9 +304,10 @@ impl Conversation {
 
     /// The session's keywords and an excerpt of its text, from its title,
     /// summary, `full_text` and `agent_search_text`, for the agent's semantic
-    /// route. Computed on each call rather than at parse: ranking the
-    /// keywords takes seconds on a large session, and only the agent's
-    /// semantic route reads it.
+    /// route. The parse doesn't compute it: ranking the keywords takes
+    /// seconds on a large session. The session cache stores it per copy
+    /// (`semantic_routes`). Bump [`SEMANTIC_ROUTE_VERSION`] with any change
+    /// to its output.
     pub(crate) fn semantic_route_text(&self) -> String {
         const ROUTE_EVIDENCE_CHARS: usize = 1_000;
         const ROUTE_EVIDENCE_SEGMENTS: usize = 4;

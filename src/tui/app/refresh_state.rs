@@ -6,7 +6,7 @@
 use super::session_store::{
     AWAITED_REFRESH_CHECK_INTERVAL, FinishedRead, FinishedRefresh, SessionCopy, UnlistedSession,
 };
-use super::view_state::{ReloadedSession, SESSION_READ_FAILED};
+use super::view_state::{PendingReload, ReloadedSession, SESSION_READ_FAILED};
 use super::{App, AppMode, DialogMode, DirectFileJob};
 use crate::error::Result;
 use crate::history::listing::{self, SessionOrigin, SessionTimes};
@@ -418,10 +418,11 @@ impl App {
                 entries,
             }) => {
                 state.conversation_source = Some(source);
-                self.pending_view_reload = Some(ReloadedSession::parsed(
-                    crate::tui::viewer::parsed_conversation(entries.clone()),
-                    row.as_deref(),
-                ));
+                self.pending_view_reload =
+                    Some(PendingReload::Ready(Box::new(ReloadedSession::parsed(
+                        crate::tui::viewer::parsed_conversation(entries.clone()),
+                        row.as_deref(),
+                    ))));
                 self.show_opened_file_row(row.map(|row| *row), is_first_read);
                 self.opened_file_entries = Some(entries);
             }
@@ -601,8 +602,8 @@ impl App {
         self.store.take_read(outcome, now)
     }
 
-    /// Record the next step of `read`, the drawing thread's read of the
-    /// session at `path`, now, and return its copy.
+    /// Record the next step of `read`, an interactive read of the session at
+    /// `path`, now, and return its copy.
     pub(super) fn take_interactive<T>(
         &mut self,
         path: &Path,

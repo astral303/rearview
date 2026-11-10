@@ -228,7 +228,10 @@ fn semantic_turns_read_from_copy_keep_terminal_codes_as_parse_does() {
     };
 
     for (read, content) in [
-        ("semantic turns", listed.load_semantic_turns().unwrap()),
+        (
+            "semantic turns",
+            listed.load_held_semantic_turns().unwrap().unwrap().row,
+        ),
         ("content", listed.load_held_content().unwrap().unwrap().row),
     ] {
         assert_eq!(

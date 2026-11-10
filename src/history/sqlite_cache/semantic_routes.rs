@@ -1,11 +1,13 @@
-//! The agent's semantic route text of each session's copy, stored by the
-//! first semantic search that computes it from the copy's texts.
+//! The agent's semantic route text of each session's copy, stored by a
+//! semantic search or semantic cache generation once it computes it from the
+//! copy's texts.
 
 use super::base::CacheBase;
 use super::coordinator::WaitStatus;
 use super::scope::{OperationAccess, OperationScope, Patience};
 use super::{CacheWriter, SqliteCache, refresh};
 use crate::error::Result;
+use crate::history::SEMANTIC_ROUTE_VERSION;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +55,8 @@ pub(crate) struct SemanticRoute {
 }
 
 /// The route text stored for the copy `generation` of the session row
-/// `session` with `custom_title` and `summary`; `None` when none is.
+/// `session` with `custom_title` and `summary`, by this build's route
+/// algorithm; `None` when none is.
 pub(super) fn stored_route(
     connection: &Connection,
     session: i64,
@@ -64,15 +67,22 @@ pub(super) fn stored_route(
     Ok(connection
         .prepare_cached(
             "SELECT text FROM semantic_routes WHERE session = ?1 AND generation = ?2 \
-             AND custom_title IS ?3 AND summary IS ?4",
+             AND custom_title IS ?3 AND summary IS ?4 AND version = ?5",
         )?
-        .query_row(params![session, generation, custom_title, summary], |row| {
-            row.get(0)
-        })
+        .query_row(
+            params![
+                session,
+                generation,
+                custom_title,
+                summary,
+                SEMANTIC_ROUTE_VERSION
+            ],
+            |row| row.get(0),
+        )
         .optional()?)
 }
 
-/// What [`store_routes`] did.
+/// The outcome of [`store_routes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RoutesStored {
     Stored,
@@ -82,33 +92,41 @@ pub(crate) enum RoutesStored {
 
 /// Store each of `routes` whose copy the cache under `base` still holds, as
 /// the refresh owner. Takes refresh ownership without waiting, and writes
-/// nothing while another refresh owns the cache.
+/// nothing while another refresh owns the cache. Fails as
+/// [`OperationScope::finish`] fails when the drive is short of space, even
+/// when the write itself failed first.
 pub(crate) fn store_routes(base: &CacheBase, routes: &[SemanticRoute]) -> Result<RoutesStored> {
     let operation = OperationScope::new(
         base,
         Patience::AtMost(Duration::ZERO),
         Arc::new(WaitStatus::default()),
     );
-    let stored = match operation.acquire_access()? {
+    let stored = store_as_owner(&operation, routes);
+    operation.finish()?;
+    stored
+}
+
+fn store_as_owner(operation: &OperationScope, routes: &[SemanticRoute]) -> Result<RoutesStored> {
+    Ok(match operation.acquire_access()? {
         OperationAccess::Owner(owner) => {
             SqliteCache::open_for_refresh(owner.token())?.store_semantic_routes(routes)?;
             RoutesStored::Stored
         }
         OperationAccess::AsIs => RoutesStored::NotOwner,
-    };
-    operation.finish()?;
-    Ok(stored)
+    })
 }
 
 impl CacheWriter {
-    /// Store each of `routes` whose copy the cache still holds, in one batch.
+    /// Store each of `routes` whose copy the cache still holds, in one batch,
+    /// once the drive holds the free space a write needs.
     pub(super) fn store_semantic_routes(&self, routes: &[SemanticRoute]) -> Result<()> {
+        self.owner.check_space()?;
         let batch = refresh::transaction(&self.connection, &self.owner)?;
         {
             let mut statement = batch.prepare_cached(
                 "INSERT OR REPLACE INTO semantic_routes \
-                 (session, generation, custom_title, summary, text) \
-                 SELECT ?1, ?2, ?3, ?4, ?5 FROM sessions WHERE id = ?1 AND generation = ?2",
+                 (session, generation, custom_title, summary, text, version) \
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6 FROM sessions WHERE id = ?1 AND generation = ?2",
             )?;
             for route in routes {
                 statement.execute(params![
@@ -116,7 +134,8 @@ impl CacheWriter {
                     route.key.generation,
                     route.custom_title,
                     route.summary,
-                    route.text
+                    route.text,
+                    SEMANTIC_ROUTE_VERSION
                 ])?;
             }
         }

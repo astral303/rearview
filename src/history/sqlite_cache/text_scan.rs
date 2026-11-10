@@ -1,9 +1,8 @@
 //! Lexical search's read of many sessions' search texts: `parts` is
 //! scanned without joins, in tasks across threads, each task on a read
-//! connection of its own: row ranges, or for one project's sessions or under
-//! an active window, runs of each session's messages through
-//! `parts_by_message`. A text's row holds its session, its place and its
-//! message number.
+//! connection of its own: row ranges, or under an active window, runs of each
+//! session's messages through `parts_by_message`. A text's row holds its
+//! session, its place and its message number.
 
 use super::{CachedSession, SearchedFields, SqliteCache};
 use crate::error::{AppError, Result};
@@ -67,7 +66,7 @@ fn parts_in_rows(fields: SearchedFields, only: &SessionFilter) -> String {
         "SELECT {SCANNED_PART_COLUMNS} FROM parts WHERE id BETWEEN ?1 AND ?2 \
          AND search_field IN ({}) AND text IS NOT NULL{}",
         fields.part_field_codes(),
-        only.0,
+        only.seeking_rows(),
     )
 }
 
@@ -81,33 +80,21 @@ pub(super) fn parts_of_messages(fields: SearchedFields) -> String {
     )
 }
 
-/// The parts holding search text in `fields` of the session `?1` outside
-/// every message, read through `parts_by_message`.
-fn parts_outside_messages(fields: SearchedFields) -> String {
-    format!(
-        "SELECT {SCANNED_PART_COLUMNS} FROM parts WHERE session = ?1 \
-         AND message_ordinal IS NULL AND search_field IN ({}) AND text IS NOT NULL",
-        fields.part_field_codes(),
-    )
-}
-
 /// Every session's sub-agent metadata parts, outside every entry.
 const SUBAGENT_METADATA_SCAN: &str = "SELECT session, part, text FROM parts WHERE entry IS NULL";
-/// The session `?1`'s sub-agent metadata parts, outside every entry.
-const SESSION_SUBAGENT_METADATA_SCAN: &str =
-    "SELECT session, part, text FROM parts WHERE session = ?1 AND entry IS NULL";
+/// The least and the greatest part id of the session `?1`, each in its own
+/// subquery, as [`KeySplit::bounds_query`] reads a table's.
+const SESSION_PART_BOUNDS: &str = "SELECT (SELECT MIN(id) FROM parts WHERE session = ?1), \
+     (SELECT MAX(id) FROM parts WHERE session = ?1)";
 
 /// The sessions a scan reads, as the command selected them; the selection
-/// decides how the scan reads `parts`.
+/// decides how a windowed scan finds the messages inside its window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScanScope {
-    /// One project's sessions: each session's parts are read through
-    /// `parts_by_message`, which costs what the project holds.
+    /// One project's sessions: each session's messages are read.
     Project,
-    /// Sessions of every workspace, whether or not some are left out: `parts`
-    /// is read in row ranges. Each part read through `parts_by_message` also
-    /// looks up its row, so a scan of most of the cache reads faster in rows'
-    /// order.
+    /// Sessions of every workspace, whether or not some are left out: the
+    /// messages inside the window are read by time, across every session.
     AllWorkspaces,
 }
 
@@ -121,8 +108,8 @@ const MIN_ROWS_PER_RANGE: i64 = 4096;
 /// A scan's visitors, one per task, and the copies it could not read.
 pub(crate) struct ScannedTexts<V> {
     pub(crate) visitors: Vec<V>,
-    /// The position of each copy whose session the cache no longer lists.
-    pub(crate) missing: Vec<usize>,
+    /// The position of each copy whose session left the cache.
+    pub(crate) left_cache: Vec<usize>,
     /// The position of each copy another write replaced before the scan
     /// ended, with the generation of the copy the cache holds now. The
     /// visitors may hold texts of either copy: callers drop them.
@@ -152,13 +139,13 @@ pub(crate) fn scan_search_texts<V: TextVisitor>(
     }
     let mut scanned = ScannedTexts {
         visitors: Vec::new(),
-        missing: Vec::new(),
+        left_cache: Vec::new(),
         replaced: Vec::new(),
     };
     for positions in by_base.into_values() {
         let first = copies[positions[0]];
         let Some(cache) = SqliteCache::open_waiting(&first.base)? else {
-            scanned.missing.extend(positions);
+            scanned.left_cache.extend(positions);
             continue;
         };
         let (found, scan, tasks) = cache.with_read_snapshot(|connection| {
@@ -173,10 +160,10 @@ pub(crate) fn scan_search_texts<V: TextVisitor>(
                 fields,
                 window,
             };
-            let tasks = scan.tasks(connection, scope)?;
+            let tasks = scan.tasks(connection)?;
             Ok((found, scan, tasks))
         })?;
-        scanned.missing.extend(found.missing);
+        scanned.left_cache.extend(found.left_cache);
         scanned.replaced.extend(found.replaced);
         if scan.sessions.is_empty() {
             continue;
@@ -209,7 +196,7 @@ pub(crate) fn scan_search_texts<V: TextVisitor>(
                 scan.sessions.values().map(|&(position, _)| position),
             )
         })?;
-        scanned.missing.extend(rechecked.missing);
+        scanned.left_cache.extend(rechecked.left_cache);
         scanned.replaced.extend(rechecked.replaced);
     }
     Ok(scanned)
@@ -228,13 +215,14 @@ struct Scan {
 }
 
 /// The copies the cache holds at the addresses of some scanned copies, and
-/// the scanned copies missing or replaced, by the copies' positions.
+/// the scanned copies that left the cache or were replaced, by the copies'
+/// positions.
 #[derive(Default)]
 struct ScannedSessions {
     /// The copies the cache holds, by their session's row id.
     current: SessionsById,
-    /// As [`ScannedTexts::missing`].
-    missing: Vec<usize>,
+    /// As [`ScannedTexts::left_cache`].
+    left_cache: Vec<usize>,
     /// As [`ScannedTexts::replaced`].
     replaced: Vec<(usize, i64)>,
 }
@@ -253,18 +241,19 @@ impl ScannedSessions {
                     found.current.insert(stored.id, (position, copy.generation));
                 }
                 Some(stored) => found.replaced.push((position, stored.generation)),
-                None => found.missing.push(position),
+                None => found.left_cache.push(position),
             }
         }
         Ok(found)
     }
 }
 
-/// The scan's condition on a text's session, as SQL appended to a query's
-/// `WHERE` clause: empty when the scan reads every listed session, else
-/// the scanned sessions' ids, so the rows of the others are skipped before
-/// their text is read.
-struct SessionFilter(String);
+/// The scan's condition on a text's session: none when the scan reads every
+/// listed session, else the scanned sessions' ids.
+struct SessionFilter {
+    /// The ids, comma-separated; `None` for every listed session.
+    ids: Option<String>,
+}
 
 impl SessionFilter {
     fn of(connection: &Connection, sessions: &SessionsById) -> Result<Self> {
@@ -274,7 +263,7 @@ impl SessionFilter {
             |row| row.get(0),
         )?;
         if usize::try_from(listed).is_ok_and(|listed| sessions.len() >= listed) {
-            return Ok(Self(String::new()));
+            return Ok(Self { ids: None });
         }
         let mut ids = sessions.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
@@ -283,10 +272,30 @@ impl SessionFilter {
             .map(i64::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        // `+` keeps SQLite from reading the list through `parts_by_message`:
-        // that index does not order a session's rows by id, so each row range
-        // would read every part of every listed session.
-        Ok(Self(format!(" AND +session IN ({ids})")))
+        Ok(Self { ids: Some(ids) })
+    }
+
+    fn reads_every_listed_session(&self) -> bool {
+        self.ids.is_none()
+    }
+
+    /// The condition appended to a `WHERE` clause that SQLite reads through
+    /// `parts_by_session`: each row range reads only the scanned sessions'
+    /// rows.
+    fn seeking_rows(&self) -> String {
+        self.ids
+            .as_ref()
+            .map_or_else(String::new, |ids| format!(" AND session IN ({ids})"))
+    }
+
+    /// The condition appended to the sub-agent metadata scan's `WHERE`
+    /// clause. `+` keeps SQLite from reading every part of the scanned
+    /// sessions through `parts_by_session` to find the few outside every
+    /// entry.
+    fn filtering_subagent_metadata(&self) -> String {
+        self.ids
+            .as_ref()
+            .map_or_else(String::new, |ids| format!(" AND +session IN ({ids})"))
     }
 }
 
@@ -332,10 +341,9 @@ const SESSION_MESSAGES_IN_WINDOW: &str = "SELECT session, ordinal FROM messages 
 pub(super) struct MessagesInWindow(HashMap<i64, Vec<i64>>);
 
 impl MessagesInWindow {
-    /// The messages inside `window` of each of `sessions`, which the
-    /// selection `scope` made: one project's sessions are read one session at
-    /// a time, any other selection through the time of every session's
-    /// messages.
+    /// The messages inside `window` of each of `sessions`. For one project's
+    /// sessions (`scope`), each session's messages are read; for any other
+    /// selection, the messages inside the window across every session.
     fn of_sessions(
         connection: &Connection,
         window: StoredWindow,
@@ -444,48 +452,25 @@ enum ScanTask {
     },
     /// The scanned sessions' sub-agent metadata parts, outside every entry.
     SubagentMetadata,
-    /// The parts holding search text of `session` outside every message.
-    OutsideMessages { session: i64 },
-    /// The sub-agent metadata parts of `session`.
-    SessionSubagentMetadata { session: i64 },
 }
 
 impl Scan {
-    /// The scan's tasks for the selection `scope`, read on `connection`. With
-    /// a window, the parts of each run of messages inside it. Without one,
-    /// for one project's sessions, each session's messages in runs, its text
-    /// outside every message and, when `fields` reads it, its sub-agent
-    /// metadata; for any other selection, the parts in row ranges, then the
+    /// The scan's tasks, read on `connection`. With a window, the parts of
+    /// each run of messages inside it. Without one, the parts in row ranges
+    /// from the scanned sessions' least to their greatest part id, then the
     /// sub-agent metadata when `fields` reads it.
-    fn tasks(&self, connection: &Connection, scope: ScanScope) -> Result<Vec<ScanTask>> {
+    fn tasks(&self, connection: &Connection) -> Result<Vec<ScanTask>> {
         if let Some(window) = &self.window {
             return Ok(window.runs().collect());
         }
-        let reads_subagent_metadata = matches!(self.fields, SearchedFields::Agent);
-        let mut tasks = Vec::new();
-        match scope {
-            ScanScope::Project => {
-                let mut message_count = connection
-                    .prepare_cached("SELECT message_count FROM sessions WHERE id = ?1")?;
-                for &session in self.sessions.keys() {
-                    let count: i64 = message_count.query_row([session], |row| row.get(0))?;
-                    tasks.extend(message_runs(session, 1..=count));
-                    tasks.push(ScanTask::OutsideMessages { session });
-                    if reads_subagent_metadata {
-                        tasks.push(ScanTask::SessionSubagentMetadata { session });
-                    }
-                }
-            }
-            ScanScope::AllWorkspaces => {
-                tasks.extend(
-                    KeySplit::of(connection, "parts", "id")?
-                        .ranges()
-                        .map(ScanTask::Parts),
-                );
-                if reads_subagent_metadata {
-                    tasks.push(ScanTask::SubagentMetadata);
-                }
-            }
+        let split = if self.only.reads_every_listed_session() {
+            KeySplit::of(connection, "parts", "id")?
+        } else {
+            KeySplit::of_sessions_parts(connection, self.sessions.keys().copied())?
+        };
+        let mut tasks = split.ranges().map(ScanTask::Parts).collect::<Vec<_>>();
+        if matches!(self.fields, SearchedFields::Agent) {
+            tasks.push(ScanTask::SubagentMetadata);
         }
         Ok(tasks)
     }
@@ -514,21 +499,49 @@ impl KeySplit {
     /// The split of `table`'s `key`, the first column of an index. An empty
     /// table has no range.
     fn of(connection: &Connection, table: &str, key: &str) -> Result<Self> {
-        let (least, greatest): (Option<i64>, Option<i64>) =
-            connection.query_row(&Self::bounds_query(table, key), [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
+        let bounds = connection.query_row(&Self::bounds_query(table, key), [], |row| {
+            Ok(row.get::<_, Option<i64>>(0)?.zip(row.get(1)?))
+        })?;
+        Ok(Self::spanning(bounds))
+    }
+
+    /// The split of the part ids of `sessions`, from the least to the
+    /// greatest, each end read from `parts_by_session` per session.
+    fn of_sessions_parts(
+        connection: &Connection,
+        sessions: impl Iterator<Item = i64>,
+    ) -> Result<Self> {
+        let mut statement = connection.prepare_cached(SESSION_PART_BOUNDS)?;
+        let mut bounds: Option<(i64, i64)> = None;
+        for session in sessions {
+            let session_bounds = statement.query_row([session], |row| {
+                Ok(row.get::<_, Option<i64>>(0)?.zip(row.get(1)?))
             })?;
-        let (least, greatest) = least.zip(greatest).unwrap_or((1, 0));
+            if let Some((least, greatest)) = session_bounds {
+                bounds = Some(
+                    bounds.map_or((least, greatest), |(all_least, all_greatest)| {
+                        (all_least.min(least), all_greatest.max(greatest))
+                    }),
+                );
+            }
+        }
+        Ok(Self::spanning(bounds))
+    }
+
+    /// The split of the keys from the least to the greatest of `bounds`; no
+    /// range without bounds.
+    fn spanning(bounds: Option<(i64, i64)>) -> Self {
+        let (least, greatest) = bounds.unwrap_or((1, 0));
         let span = (greatest - least).saturating_add(1).max(0);
         let threads = i64::try_from(rayon::current_num_threads()).unwrap_or(1);
         let count = (span / MIN_ROWS_PER_RANGE)
             .clamp(1, threads * RANGES_PER_THREAD)
             .min(span.max(1));
-        Ok(Self {
+        Self {
             least,
             greatest,
             width: ((span + count - 1) / count).max(1),
-        })
+        }
     }
 
     /// The least and the greatest `key` of `table`, each in its own subquery:
@@ -611,17 +624,7 @@ impl TaskScan<'_> {
                 &[session, *ordinals.start(), *ordinals.end()],
                 visitor,
             ),
-            ScanTask::SubagentMetadata => self.scan_subagent_metadata(
-                &format!("{SUBAGENT_METADATA_SCAN}{}", self.scan.only.0),
-                &[],
-                visitor,
-            ),
-            ScanTask::OutsideMessages { session } => {
-                self.scan_parts(&parts_outside_messages(fields), &[session], visitor)
-            }
-            ScanTask::SessionSubagentMetadata { session } => {
-                self.scan_subagent_metadata(SESSION_SUBAGENT_METADATA_SCAN, &[session], visitor)
-            }
+            ScanTask::SubagentMetadata => self.scan_subagent_metadata(visitor),
         }
     }
 
@@ -651,15 +654,14 @@ impl TaskScan<'_> {
         Ok(())
     }
 
-    /// Scans the sub-agent metadata parts, outside every entry.
-    fn scan_subagent_metadata(
-        &mut self,
-        sql: &str,
-        parameters: &[i64],
-        visitor: &mut impl TextVisitor,
-    ) -> Result<()> {
-        let mut statement = self.connection.prepare_cached(sql)?;
-        let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
+    /// Scans the scanned sessions' sub-agent metadata parts, outside every
+    /// entry.
+    fn scan_subagent_metadata(&mut self, visitor: &mut impl TextVisitor) -> Result<()> {
+        let mut statement = self.connection.prepare_cached(&format!(
+            "{SUBAGENT_METADATA_SCAN}{}",
+            self.scan.only.filtering_subagent_metadata()
+        ))?;
+        let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let (session, text) = (row.get(0)?, text_at(row, 2)?);
             let examined = visitor.examine(text);
@@ -829,7 +831,7 @@ mod tests {
         scope: ScanScope,
     ) -> Vec<(usize, PlacedText)> {
         let scanned = scan_search_texts(copies, fields, window, scope, KeepEvery::default).unwrap();
-        assert!(scanned.missing.is_empty(), "the cache holds every copy");
+        assert!(scanned.left_cache.is_empty(), "the cache holds every copy");
         let mut kept = scanned
             .visitors
             .into_iter()
@@ -945,7 +947,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(scanned.missing.is_empty(), "the cache holds every session");
+        assert!(
+            scanned.left_cache.is_empty(),
+            "the cache holds every session"
+        );
         assert_eq!(
             scanned.replaced,
             vec![(1, *replaced.get().expect("a task examined a text"))],
@@ -984,7 +989,7 @@ mod tests {
             }
             .read();
             assert!(
-                texts.iter().all(|(_, texts)| texts.is_some()),
+                texts.iter().all(|(_, texts)| texts.is_ok()),
                 "{read}: every row holds texts"
             );
             assert_eq!(
@@ -1118,10 +1123,29 @@ mod tests {
         }
     }
 
-    /// A scan of some of the listed sessions reads each row range by id, not
-    /// every part of each scanned session once per range.
+    /// The query plan of `query`, each parameter bound to 1.
+    fn plan_of(connection: &Connection, query: &str) -> String {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap();
+        let parameters = vec![1; statement.parameter_count()];
+        statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    /// Each scan statement costs what the scanned rows hold, not what the
+    /// cache holds, only while it reads through its index: a scan of every
+    /// listed session reads row ranges by id, a scan of some reads each
+    /// range's rows of theirs through `parts_by_session`, and their bounds
+    /// come from its ends.
     #[test]
-    fn scan_of_some_sessions_reads_each_row_range_by_id() {
+    fn each_scan_statement_reads_through_its_index_without_scanning_parts() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(super::super::schema::CREATE)
@@ -1135,21 +1159,44 @@ mod tests {
                  (2, 'storage', 'claude', 1, 'b', 'listed', 0, 0, 0, 2)",
             )
             .unwrap();
-        let only = SessionFilter::of(&connection, &HashMap::from([(1, (0, 1))])).unwrap();
-        assert!(!only.0.is_empty(), "a scan of one of two sessions filters");
-        let query = parts_in_rows(SearchedFields::Agent, &only);
-        let plan = connection
-            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
-            .unwrap()
-            .query_map([1, 2], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-            .join("\n");
+        let every =
+            SessionFilter::of(&connection, &HashMap::from([(1, (0, 1)), (2, (1, 2))])).unwrap();
+        let some = SessionFilter::of(&connection, &HashMap::from([(1, (0, 1))])).unwrap();
         assert!(
-            plan.contains("SEARCH parts USING INTEGER PRIMARY KEY"),
-            "{query}: the range is read by id: {plan}"
+            every.reads_every_listed_session() && !some.reads_every_listed_session(),
+            "a scan of one of two sessions filters, a scan of both doesn't"
         );
+        for (query, read) in [
+            (
+                parts_in_rows(SearchedFields::Agent, &every),
+                "SEARCH parts USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)",
+            ),
+            (
+                parts_in_rows(SearchedFields::Agent, &some),
+                "SEARCH parts USING INDEX parts_by_session (session=? AND rowid>? AND rowid<?)",
+            ),
+            (
+                SESSION_PART_BOUNDS.to_owned(),
+                "SEARCH parts USING COVERING INDEX parts_by_session (session=?)",
+            ),
+            (
+                SUBAGENT_METADATA_SCAN.to_owned(),
+                "SEARCH parts USING INDEX sqlite_autoindex_parts_1 (entry=?)",
+            ),
+            (
+                format!(
+                    "{SUBAGENT_METADATA_SCAN}{}",
+                    some.filtering_subagent_metadata()
+                ),
+                "SEARCH parts USING INDEX sqlite_autoindex_parts_1 (entry=?)",
+            ),
+        ] {
+            let plan = plan_of(&connection, &query);
+            assert!(
+                plan.contains(read) && !plan.contains("SCAN parts"),
+                "{query}: the statement reads `{read}`: {plan}"
+            );
+        }
     }
 
     /// A window's read costs the messages inside it, or one session's
@@ -1180,39 +1227,6 @@ mod tests {
                 plan.contains(&format!("SEARCH messages USING INDEX {index} "))
                     && !plan.contains("SCAN messages"),
                 "{query}: the window's messages are read through {index}: {plan}"
-            );
-        }
-    }
-
-    /// The scan of sub-agent metadata, and a project scope's read of a
-    /// session's text outside every message, cost what those parts hold, not
-    /// what every part holds.
-    #[test]
-    fn subagent_metadata_and_outside_messages_scans_search_an_index_without_scanning_parts() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(super::super::schema::CREATE)
-            .unwrap();
-        for query in [
-            SUBAGENT_METADATA_SCAN.to_owned(),
-            SESSION_SUBAGENT_METADATA_SCAN.to_owned(),
-            parts_outside_messages(SearchedFields::Agent),
-        ] {
-            let mut statement = connection
-                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
-                .unwrap();
-            let parameters = vec![1; statement.parameter_count()];
-            let plan = statement
-                .query_map(rusqlite::params_from_iter(parameters), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-                .join("\n");
-            assert!(
-                plan.contains("SEARCH parts USING") && !plan.contains("SCAN parts"),
-                "{query}: the scan reads its parts through an index: {plan}"
             );
         }
     }
@@ -1263,41 +1277,49 @@ mod tests {
     }
 
     #[test]
-    fn project_scope_reads_its_sessions_by_message_and_every_but_one_reads_row_ranges() {
+    fn scan_of_some_sessions_reads_ranges_from_their_least_to_greatest_part_id() {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies(base.path());
-        let every_but_one = copies[1..].iter().collect::<Vec<_>>();
         let cache = SqliteCache::open_waiting(&copies[0].base).unwrap().unwrap();
-        let tasks = |scope| {
-            cache
-                .with_read_snapshot(|connection| {
-                    let sessions =
-                        ScannedSessions::of(connection, &every_but_one, 0..every_but_one.len())?
-                            .current;
-                    Scan {
-                        only: SessionFilter::of(connection, &sessions)?,
-                        sessions,
-                        fields: SearchedFields::Agent,
-                        window: None,
-                    }
-                    .tasks(connection, scope)
-                })
-                .unwrap()
-        };
-        let reads_rows =
-            |task: &ScanTask| matches!(task, ScanTask::Parts(_) | ScanTask::SubagentMetadata);
-        let project = tasks(ScanScope::Project);
-        assert!(
-            project
-                .iter()
-                .any(|task| matches!(task, ScanTask::Messages { .. }))
-                && !project.iter().any(reads_rows),
-            "a project scope reads each session's messages, without row ranges: {project:?}"
+        let scanned = [&copies[1], &copies[2]];
+        let (tasks, bounds) = cache
+            .with_read_snapshot(|connection| {
+                let sessions = ScannedSessions::of(connection, &scanned, 0..scanned.len())?.current;
+                let ids = sessions.keys().map(i64::to_string).collect::<Vec<_>>();
+                let bounds: (i64, i64) = connection.query_row(
+                    &format!(
+                        "SELECT MIN(id), MAX(id) FROM parts WHERE session IN ({})",
+                        ids.join(", ")
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let tasks = Scan {
+                    only: SessionFilter::of(connection, &sessions)?,
+                    sessions,
+                    fields: SearchedFields::Agent,
+                    window: None,
+                }
+                .tasks(connection)?;
+                Ok((tasks, bounds))
+            })
+            .unwrap();
+        let ranges = tasks
+            .iter()
+            .filter_map(|task| match task {
+                ScanTask::Parts(rows) => Some(rows.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges.first().map(|range| *range.start())..=ranges.last().map(|range| *range.end()),
+            Some(bounds.0)..=Some(bounds.1),
+            "the ranges run from the scanned sessions' least to their greatest part id: \
+             {tasks:?}"
         );
-        let all_workspaces = tasks(ScanScope::AllWorkspaces);
         assert!(
-            !all_workspaces.is_empty() && all_workspaces.iter().all(reads_rows),
-            "every session but one is read in row ranges: {all_workspaces:?}"
+            tasks.contains(&ScanTask::SubagentMetadata),
+            "the agent fields' scan reads the sub-agent metadata: {tasks:?}"
         );
     }
 }

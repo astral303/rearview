@@ -150,7 +150,7 @@ fn viewer_text(app: &mut App, heading: &str) -> String {
     press(app, KeyCode::Home);
     for row in 0..app.filtered().len() {
         assert!(app.request_open(), "row {row} opens");
-        app.finish_pending_open_for_test(FRAME_WIDTH as usize);
+        crate::tui::app::test_waits::finish_pending_open(app, FRAME_WIDTH as usize);
         let AppMode::View(state) = app.app_mode() else {
             panic!("row {row} opens a viewer");
         };

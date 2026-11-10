@@ -1,7 +1,8 @@
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::Conversation;
-use crate::history::sqlite_cache::CopyKey;
+use crate::history::sqlite_cache::{CopyKey, SessionKey};
+use crate::search::ReadFailure;
 use crate::search::query::ParsedQuery;
 use crate::semantic::cache::write_embedding_cache;
 use crate::semantic::fastembed::FastembedEmbedder;
@@ -11,6 +12,7 @@ use crate::semantic::index::{
 };
 use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 use crate::tui::app::{SemanticProgress, SemanticResultMetadata};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -59,6 +61,9 @@ pub struct SemanticSearchResponse {
     pub error: Option<String>,
     pub progress: SemanticProgress,
     pub prewarm: bool,
+    /// The listed sessions searched without semantic turns: their read
+    /// failed, and none of an earlier copy are held.
+    pub unreadable: usize,
 }
 
 pub fn spawn_semantic_worker(
@@ -123,20 +128,14 @@ fn run_semantic_worker(
                 error: None,
                 progress: SemanticProgress::Idle,
                 prewarm: request.prewarm,
+                unreadable: 0,
             }));
             continue;
         }
-        let full_corpus = match worker.loaded_corpus_candidates() {
-            Ok(corpus) => corpus,
-            Err(error) => {
-                let _ = res_tx.send(SemanticSearchMessage::Complete(failed_semantic_response(
-                    request.generation,
-                    request.prewarm,
-                    error.to_string(),
-                )));
-                continue;
-            }
-        };
+        let LoadedCorpus {
+            candidates: full_corpus,
+            unreadable,
+        } = worker.loaded_corpus_candidates();
         let scope = worker
             .scope
             .iter()
@@ -151,7 +150,7 @@ fn run_semantic_worker(
             chunk_hits: ChunkHits::None,
             window: crate::time_filter::TimeFilter::default(),
         };
-        let response = match state.has_chunks(&index_request, &cancellation) {
+        let mut response = match state.has_chunks(&index_request, &cancellation) {
             Ok(true) => {
                 if embedder.is_none() {
                     let _ = res_tx.send(SemanticSearchMessage::Progress {
@@ -195,6 +194,7 @@ fn run_semantic_worker(
                 failed_semantic_response(request.generation, request.prewarm, error.to_string())
             }
         };
+        response.unreadable = unreadable;
 
         let _ = res_tx.send(SemanticSearchMessage::Complete(response));
     }
@@ -208,42 +208,83 @@ struct SemanticWorkerState {
     corpus: Arc<Vec<Arc<Conversation>>>,
     scope: Arc<Vec<usize>>,
     pending_search: Option<SemanticSearchRequest>,
-    /// The semantic turns of the copies the corpus's rows read, by copy.
-    semantic_turns: HashMap<CopyKey, HeldTurns>,
+    /// The semantic turns read for each session the corpus's rows list.
+    semantic_turns: HashMap<SessionKey, HeldTurns>,
 }
 
-/// A row with the semantic turns read from its copy, and the row it was
-/// built from.
+/// One session's semantic turns, as the semantic stage reads them.
+#[derive(Default)]
 struct HeldTurns {
-    row: Arc<Conversation>,
+    /// The newest turns read; `None` until a read of the session lands.
+    turns: Option<TurnsRead>,
+    /// The failed read of the copy the row reads, and the corpus version it
+    /// failed in: the copy is read again once the corpus changes.
+    failure: Option<(ReadFailure, u64)>,
+}
+
+/// A copy's semantic turns.
+struct TurnsRead {
+    /// The generation of the copy read: the row's, or a newer copy's that
+    /// replaced it.
+    generation: i64,
+    /// A row with the turns, as the semantic stage reads it. Rows of the same
+    /// copy share it: the stage reads the turns, the path and the session ID
+    /// alone, each the same for every row of the copy.
     loaded: Arc<Conversation>,
 }
 
 impl HeldTurns {
-    /// Reads `row`'s semantic turns from its copy.
-    fn read(row: &Arc<Conversation>) -> Result<Self> {
-        Ok(Self {
-            row: row.clone(),
-            loaded: Arc::new(row.load_semantic_turns()?.into_owned()),
-        })
+    /// The turns to search for a row of `copy`; `None` when they are not
+    /// read, or are of an earlier copy.
+    fn of_copy(&self, copy: &CopyKey) -> Option<&TurnsRead> {
+        self.turns
+            .as_ref()
+            .filter(|turns| turns.generation >= copy.generation)
     }
 
-    /// These turns on `row`, a row reading the same copy. A refresh can
-    /// replace a row without writing its session, such as for a name kept
-    /// beside the transcript.
-    fn for_row(self, row: &Arc<Conversation>) -> Self {
-        if Arc::ptr_eq(&self.row, row) {
-            return self;
-        }
-        let mut loaded = row.as_ref().clone();
-        loaded.semantic_turns = self.loaded.semantic_turns.clone();
-        loaded.semantic_turn_ranges = self.loaded.semantic_turn_ranges.clone();
-        loaded.cached_session = None;
-        Self {
-            row: row.clone(),
-            loaded: Arc::new(loaded),
+    /// True when `copy`'s turns are to be read in corpus version
+    /// `corpus_version`.
+    fn needs_read(&self, copy: &CopyKey, corpus_version: u64) -> bool {
+        self.of_copy(copy).is_none()
+            && self
+                .failure
+                .as_ref()
+                .is_none_or(|(_, failed_in)| *failed_in != corpus_version)
+    }
+
+    /// Holds `read`, the read of a row's turns in corpus version
+    /// `corpus_version`.
+    fn finish_read(&mut self, read: TurnsReadResult, corpus_version: u64) {
+        match read {
+            Ok(turns) => {
+                self.turns = Some(turns);
+                self.failure = None;
+            }
+            Err(failure) => self.failure = Some((failure, corpus_version)),
         }
     }
+}
+
+type TurnsReadResult = std::result::Result<TurnsRead, ReadFailure>;
+
+/// Reads `row`'s semantic turns from the copy the cache holds now.
+fn read_turns(row: &Conversation) -> TurnsReadResult {
+    match row.load_held_semantic_turns() {
+        Ok(Some(held)) => Ok(TurnsRead {
+            generation: held.generation.unwrap_or_default(),
+            loaded: Arc::new(held.row.into_owned()),
+        }),
+        Ok(None) => Err(ReadFailure::NotInCache),
+        Err(error) => Err(ReadFailure::of(&error)),
+    }
+}
+
+/// The corpus's rows as the semantic stage searches them.
+struct LoadedCorpus {
+    candidates: Vec<SemanticIndexCandidate>,
+    /// The cached rows without semantic turns: their read failed, and none
+    /// of an earlier copy are held.
+    unreadable: usize,
 }
 
 enum VersionState {
@@ -343,29 +384,56 @@ impl SemanticWorkerState {
     }
 
     /// The corpus's rows as candidates, each cached row with its semantic
-    /// turns. A copy's turns are read once, and held while a row of the
-    /// corpus reads that copy.
-    fn loaded_corpus_candidates(&mut self) -> Result<Vec<SemanticIndexCandidate>> {
+    /// turns. A session's turns are read once for its copy, the sessions
+    /// not held in parallel, and held while a row of the corpus lists the
+    /// session. A row whose read fails keeps its session's earlier turns;
+    /// without them it has no turns and counts as unreadable.
+    fn loaded_corpus_candidates(&mut self) -> LoadedCorpus {
         let mut held = std::mem::take(&mut self.semantic_turns);
         let mut kept = HashMap::with_capacity(held.len());
-        let candidates = self
-            .full_corpus_candidates()
-            .into_iter()
-            .map(|mut candidate| {
-                if let Some(cached) = &candidate.conversation.cached_session {
-                    let key = cached.copy_key();
-                    let turns = match held.remove(&key).or_else(|| kept.remove(&key)) {
-                        Some(turns) => turns.for_row(&candidate.conversation),
-                        None => HeldTurns::read(&candidate.conversation)?,
-                    };
-                    candidate.conversation = turns.loaded.clone();
-                    kept.insert(key, turns);
-                }
-                Ok(candidate)
-            })
-            .collect();
+        let mut to_read = Vec::new();
+        for row in self.corpus.iter() {
+            let Some(cached) = &row.cached_session else {
+                continue;
+            };
+            let copy = cached.copy_key();
+            if kept.contains_key(&copy.session) {
+                continue;
+            }
+            let turns = held.remove(&copy.session).unwrap_or_default();
+            if turns.needs_read(&copy, self.corpus_version) {
+                to_read.push((copy.session.clone(), row));
+            }
+            kept.insert(copy.session, turns);
+        }
+        let reads = to_read
+            .into_par_iter()
+            .map(|(session, row)| (session, read_turns(row)))
+            .collect::<Vec<_>>();
+        for (session, read) in reads {
+            if let Some(turns) = kept.get_mut(&session) {
+                turns.finish_read(read, self.corpus_version);
+            }
+        }
         self.semantic_turns = kept;
-        candidates
+
+        let mut unreadable = 0;
+        let mut candidates = self.full_corpus_candidates();
+        for candidate in &mut candidates {
+            let Some(cached) = &candidate.conversation.cached_session else {
+                continue;
+            };
+            let copy = cached.copy_key();
+            let turns = self.semantic_turns[&copy.session].turns.as_ref();
+            match turns {
+                Some(turns) => candidate.conversation = Arc::clone(&turns.loaded),
+                None => unreadable += 1,
+            }
+        }
+        LoadedCorpus {
+            candidates,
+            unreadable,
+        }
     }
 
     #[cfg(test)]
@@ -448,6 +516,7 @@ fn semantic_search_response(
         error: None,
         progress: semantic_progress(response.progress),
         prewarm: response.prewarm,
+        unreadable: 0,
     }
 }
 
@@ -459,6 +528,7 @@ fn empty_semantic_response(generation: u64, prewarm: bool) -> SemanticSearchResp
         error: None,
         progress: SemanticProgress::EmptyCorpus,
         prewarm,
+        unreadable: 0,
     }
 }
 
@@ -474,6 +544,7 @@ fn failed_semantic_response(
         error: Some(error),
         progress: SemanticProgress::Failed,
         prewarm,
+        unreadable: 0,
     }
 }
 
@@ -660,56 +731,128 @@ mod tests {
         assert_eq!(candidates[0].conversation.semantic_turns, vec!["visible"]);
     }
 
-    /// A copy's semantic turns are read once while a row reads it: the next
-    /// search reuses the row built from them, and a row replaced without a
-    /// new copy keeps the turns with its own fields.
+    /// `rows`, as the corpus of version `version`.
+    fn update_corpus(worker: &mut SemanticWorkerState, version: u64, rows: &[Conversation]) {
+        worker.apply_command(
+            SemanticWorkerCommand::UpdateCorpus {
+                corpus_version: version,
+                conversations: Arc::new(rows.iter().cloned().map(Arc::new).collect()),
+            },
+            &SemanticCancellationToken::new(),
+        );
+    }
+
+    fn question(text: &str) -> serde_json::Value {
+        crate::search::test_fixtures::claude_user_record(
+            text,
+            crate::search::test_fixtures::october(20, 9),
+        )
+    }
+
+    fn turns_of(corpus: &LoadedCorpus) -> Vec<Vec<String>> {
+        corpus
+            .candidates
+            .iter()
+            .map(|candidate| candidate.conversation.semantic_turns.clone())
+            .collect()
+    }
+
+    /// A copy's semantic turns are read once while a row lists its session:
+    /// the next search, and a row replaced without a new copy, such as on a
+    /// snapshot rebuild or a rename, search the row read for the copy.
     #[test]
     fn cached_rows_semantic_turns_are_read_once_per_copy() {
-        let time = crate::search::test_fixtures::october(20, 9);
         let sessions = crate::search::test_fixtures::cached_claude_sessions(&[(
             "turns",
-            vec![crate::search::test_fixtures::claude_user_record(
-                "held question",
-                time,
-            )],
+            vec![question("held question")],
         )]);
-        let row = Arc::new(sessions.rows[0].clone());
         let mut worker = SemanticWorkerState::default();
-        let cancellation = SemanticCancellationToken::new();
-        let update = |worker: &mut SemanticWorkerState, version, row: &Arc<Conversation>| {
-            worker.apply_command(
-                SemanticWorkerCommand::UpdateCorpus {
-                    corpus_version: version,
-                    conversations: Arc::new(vec![row.clone()]),
-                },
-                &cancellation,
-            );
-        };
-        update(&mut worker, 1, &row);
+        update_corpus(&mut worker, 1, &sessions.rows);
 
-        let first = worker.loaded_corpus_candidates().unwrap();
-        let second = worker.loaded_corpus_candidates().unwrap();
-        let mut renamed = row.as_ref().clone();
+        let first = worker.loaded_corpus_candidates();
+        let second = worker.loaded_corpus_candidates();
+        let mut renamed = sessions.rows[0].clone();
         renamed.custom_title = Some("renamed".to_owned());
-        update(&mut worker, 2, &Arc::new(renamed));
-        let after_rename = worker.loaded_corpus_candidates().unwrap();
+        update_corpus(&mut worker, 2, &[renamed]);
+        let after_rename = worker.loaded_corpus_candidates();
 
         assert_eq!(
-            first[0].conversation.semantic_turns,
-            vec!["held question"],
+            turns_of(&first),
+            [["held question"]],
             "the candidate holds the copy's semantic turns"
         );
-        assert!(
-            Arc::ptr_eq(&first[0].conversation, &second[0].conversation),
-            "the next search reuses the row read for the copy"
+        for (search, corpus) in [("the next search", second), ("a renamed row", after_rename)] {
+            assert!(
+                Arc::ptr_eq(
+                    &first.candidates[0].conversation,
+                    &corpus.candidates[0].conversation
+                ),
+                "{search} searches the row read for the copy"
+            );
+        }
+    }
+
+    /// A row whose copy another write replaced searches the copy the cache
+    /// holds; a row whose session left the cache has no turns and counts as
+    /// unreadable, and the other rows still search theirs.
+    #[test]
+    fn replaced_copy_is_searched_and_removed_session_counts_unreadable() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("replaced", vec![question("first wording")]),
+            ("removed", vec![question("gone question")]),
+            ("kept", vec![question("kept question")]),
+        ]);
+        let mut worker = SemanticWorkerState::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+        sessions.rewrite(0, &[question("second wording")]);
+        sessions.remove(1);
+
+        let corpus = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            turns_of(&corpus),
+            [
+                vec!["second wording".to_owned()],
+                Vec::new(),
+                vec!["kept question".to_owned()]
+            ],
+            "the replaced row searches the copy the cache holds; the removed one, nothing"
         );
         assert_eq!(
-            (
-                after_rename[0].conversation.custom_title.as_deref(),
-                &after_rename[0].conversation.semantic_turns
+            corpus.unreadable, 1,
+            "the removed session counts unreadable"
+        );
+    }
+
+    /// A row of a newer copy whose read fails keeps searching its session's
+    /// earlier turns, and doesn't count as unreadable.
+    #[test]
+    fn failed_read_of_newer_copy_keeps_earlier_turns() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("changed", vec![question("first wording")]),
+            ("kept", vec![question("kept question")]),
+        ]);
+        let mut worker = SemanticWorkerState::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+        let first = worker.loaded_corpus_candidates();
+        sessions.rewrite(0, &[question("second wording")]);
+        let newer = sessions.listed_row(0);
+        sessions.remove(0);
+        update_corpus(&mut worker, 2, &[newer, sessions.rows[1].clone()]);
+
+        let corpus = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            (turns_of(&corpus), corpus.unreadable),
+            (turns_of(&first), 0),
+            "the failed read keeps the session's earlier turns"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &first.candidates[1].conversation,
+                &corpus.candidates[1].conversation
             ),
-            (Some("renamed"), &first[0].conversation.semantic_turns),
-            "a replaced row keeps its copy's turns with its own fields"
+            "the other session's turns stay held"
         );
     }
 

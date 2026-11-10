@@ -19,9 +19,9 @@ pub(super) struct EntrySearch {
     pub(super) derived: Vec<DerivedText>,
 }
 
-/// Where search reads one of an entry's texts: its field, and its position
-/// among the entry's search texts in the order the parse lays them out, so
-/// a read of the cache lays them out as the parse does.
+/// The place of one of an entry's search texts: its field, and its position
+/// among the entry's search texts in the order the parse lays them out. A
+/// read of the cache lays them out by it as the parse does.
 #[derive(Clone, Copy)]
 pub(super) struct TextPlace {
     pub(super) field: SearchField,

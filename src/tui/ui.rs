@@ -16,8 +16,7 @@ use crate::tui::app::{
 };
 use crate::tui::theme::{self, Theme};
 use crate::tui::viewer::{
-    LineStyle, ParsedConversation, RenderedLine, day_at_line, format_coarse_duration,
-    session_dates, short_date,
+    LineStyle, RenderedLine, day_at_line, format_coarse_duration, session_dates, short_date,
 };
 use chrono::{DateTime, Local, NaiveDate};
 use ratatui::layout::Position;
@@ -518,8 +517,7 @@ fn render_semantic_debug_popup(frame: &mut Frame, app: &App) {
 fn header_dates(conv: &HeaderRow, state: &ViewState, today: NaiveDate, zone: Zone) -> String {
     let span = state
         .parsed_conversation
-        .as_deref()
-        .and_then(ParsedConversation::activity_span)
+        .activity_span()
         .map(|(first, last)| (first.with_timezone(&zone), last.with_timezone(&zone)))
         .unwrap_or_else(|| {
             let minutes = conv.duration_minutes.unwrap_or(0);
@@ -1029,9 +1027,8 @@ fn new_messages_badge(state: &ViewState, viewport_height: usize, now: Moment) ->
 /// The day in `zone` of the row at the top of the view, `Oct 03`, with the
 /// year when it differs from `today`'s.
 fn top_row_day(state: &ViewState, today: NaiveDate, zone: Zone) -> Option<String> {
-    let conversation = state.parsed_conversation.as_deref()?;
     let day = day_at_line(
-        conversation,
+        &state.parsed_conversation,
         &state.message_ranges,
         state.scroll_offset,
         zone,
@@ -3430,6 +3427,7 @@ mod tests {
                 error: None,
                 progress: SemanticProgress::Complete,
                 prewarm: false,
+                unreadable: 0,
             }))
             .unwrap();
         app.receive_search_results();
@@ -3632,6 +3630,7 @@ mod tests {
                 error: None,
                 progress: SemanticProgress::Complete,
                 prewarm: false,
+                unreadable: 0,
             }))
             .unwrap();
         app.receive_search_results();
@@ -4378,6 +4377,7 @@ mod tests {
                 error: None,
                 progress: SemanticProgress::Complete,
                 prewarm: false,
+                unreadable: 0,
             }))
             .unwrap();
         app.receive_search_results();

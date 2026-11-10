@@ -1,7 +1,11 @@
-//! [`super::filter_turn`] as written before its fast paths, which the tests
-//! compare it with.
+//! The tests compare [`super::filter_turn`] with this copy of it as written
+//! before its fast paths. The helpers the fast paths left unchanged are the
+//! production ones.
 
-use super::SemanticTurnRole;
+use super::{
+    SemanticTurnRole, contains_any, is_artifact_char, slash_command_args, split_semantic_blocks,
+    strip_tag_pair,
+};
 
 pub(super) fn filter_turn(role: SemanticTurnRole, turn: &str) -> Option<String> {
     let turn = slash_command_args(turn).unwrap_or(turn);
@@ -52,81 +56,6 @@ fn strip_structural_tag_spans(text: &str) -> String {
         stripped = strip_tag_pair(&stripped, open, close);
     }
     stripped
-}
-
-fn strip_tag_pair(text: &str, open: &str, close: &str) -> String {
-    let mut output = String::new();
-    let mut rest = text;
-
-    while let Some(start) = rest.find(open) {
-        output.push_str(&rest[..start]);
-        let after_open = &rest[start + open.len()..];
-        let Some(end) = after_open.find(close) else {
-            rest = "";
-            break;
-        };
-        rest = &after_open[end + close.len()..];
-    }
-
-    output.push_str(rest);
-    output
-}
-
-fn slash_command_args(turn: &str) -> Option<&str> {
-    if !turn.contains("<command-name>") || !turn.contains("</command-name>") {
-        return None;
-    }
-    let args_start = turn.find("<command-args>")? + "<command-args>".len();
-    let args_end = turn[args_start..].find("</command-args>")? + args_start;
-    let args = turn[args_start..args_end].trim();
-    (!args.is_empty()).then_some(args)
-}
-
-fn split_semantic_blocks(text: &str) -> Vec<&str> {
-    let mut blocks = Vec::new();
-    let mut start = 0;
-    let mut previous_artifact = false;
-
-    for (index, ch) in text.char_indices() {
-        let artifact = is_artifact_char(ch);
-        if index > start && artifact != previous_artifact {
-            blocks.push(&text[start..index]);
-            start = index;
-        }
-        previous_artifact = artifact;
-    }
-    if start < text.len() {
-        blocks.push(&text[start..]);
-    }
-    blocks
-}
-
-fn is_artifact_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '─' | '━'
-            | '│'
-            | '┃'
-            | '┌'
-            | '┐'
-            | '└'
-            | '┘'
-            | '├'
-            | '┤'
-            | '┬'
-            | '┴'
-            | '┼'
-            | '╭'
-            | '╮'
-            | '╰'
-            | '╯'
-            | '═'
-            | '║'
-            | '╔'
-            | '╗'
-            | '╚'
-            | '╝'
-    )
 }
 
 fn is_low_value_turn(turn: &str) -> bool {
@@ -205,10 +134,6 @@ fn is_artifact_block(block: &str) -> bool {
         "fn ",
     ];
     contains_any(block, &code_markers) && punctuation > alphanumeric / 4
-}
-
-fn contains_any(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
 }
 
 fn normalize_whitespace(text: &str) -> String {

@@ -404,9 +404,9 @@ pub(super) fn read_messages(
     read_selected(connection, session, places, &selected)
 }
 
-/// Each contributing user and assistant entry of `session` that takes a
-/// message number, with each of its text parts, and each such metadata
-/// entry, in order: everything [`semantic_turn`] reads of an entry. A
+/// Each contributing user and assistant entry of `session` with a message
+/// number, with each of its text parts, and each such metadata entry, in
+/// order: everything [`semantic_turn`] reads of an entry. A
 /// message entry without a text part has no semantic turn.
 const SEMANTIC_ENTRIES: &str = "SELECT e.sequence, m.ordinal, e.kind, e.content, e.text, \
      e.text_codes, p.text, p.text_codes FROM entries e JOIN messages m ON m.id = e.message \
@@ -457,7 +457,7 @@ pub(super) fn read_semantic_texts(
             source,
             string_content: content == Some(CONTENT_STRING),
             text: text.unwrap_or_default(),
-            blocks: 0,
+            block_count: 0,
         };
         read.push_block(block.as_deref());
         entry = Some((sequence, read));
@@ -476,7 +476,7 @@ struct SemanticEntry {
     /// A metadata row's own text; a message's text blocks, joined.
     text: String,
     /// The text blocks read.
-    blocks: usize,
+    block_count: usize,
 }
 
 impl SemanticEntry {
@@ -487,16 +487,16 @@ impl SemanticEntry {
         };
         let joins = match self.source {
             TurnSource::Metadata => false,
-            TurnSource::User if self.string_content => self.blocks == 0,
+            TurnSource::User if self.string_content => self.block_count == 0,
             TurnSource::User | TurnSource::Assistant => true,
         };
         if joins {
-            if self.blocks > 0 {
+            if self.block_count > 0 {
                 self.text.push(' ');
             }
             self.text.push_str(block);
         }
-        self.blocks += 1;
+        self.block_count += 1;
     }
 }
 

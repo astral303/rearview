@@ -1364,8 +1364,10 @@ impl AgentService {
                 lexically_rank_scoped(
                     &conversations,
                     &args.query,
-                    &scoped,
-                    rules.scope,
+                    ScopedSessions {
+                        indices: &scoped,
+                        scope: rules.scope,
+                    },
                     mode,
                     &time,
                     clock,
@@ -1416,8 +1418,12 @@ impl AgentService {
                     &conversations,
                     &keys,
                     &ranking.ranked,
-                    read_session,
-                    |index, key| hit_read_bytes(&ranking, &conversations[index], index, key),
+                    agent::search::SessionReader {
+                        read: read_session,
+                        bytes: |index, key: &agent::refs::AgentConversationKey| {
+                            hit_read_bytes(&ranking, &conversations[index], index, key)
+                        },
+                    },
                     Some(reads),
                 )
             })?;
@@ -1489,7 +1495,7 @@ impl AgentService {
                 let mut output = match semantic {
                     Ok((semantic, semantic_warnings)) => {
                         warnings.borrow_mut().extend(semantic_warnings);
-                        self.fuse_semantic_hits(
+                        let (output, failed_reads) = self.fuse_semantic_hits(
                             semantic,
                             &lexical.copies_read,
                             &inputs,
@@ -1502,7 +1508,9 @@ impl AgentService {
                                     inputs,
                                 )
                             },
-                        )
+                        );
+                        warnings.borrow_mut().extend(failed_reads);
+                        output
                     }
                     Err(error) => {
                         warnings
@@ -2533,7 +2541,7 @@ fn run_agent_semantic_search(
     embedding_budget: EmbeddingBudget,
 ) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
     let inputs = agent_inputs_for_indices(conversations, keys, indices)?;
-    let (semantic, warnings) = run_agent_semantic_hits(
+    let (semantic, mut warnings) = run_agent_semantic_hits(
         service,
         &request.query,
         &inputs,
@@ -2541,19 +2549,26 @@ fn run_agent_semantic_search(
         request.semantic_chunk_hits(),
         request.window,
     )?;
-    let output = service.fuse_semantic_hits(
+    let (output, failed_reads) = service.fuse_semantic_hits(
         semantic,
         &HashMap::new(),
         &inputs,
         keys,
         |semantic, inputs| agent::search::run_global_semantic_search(request, inputs, semantic),
     );
+    warnings.extend(failed_reads);
     Ok((output, warnings))
 }
 
 /// A semantic search's ranked hits and the copies it read them from.
 struct SemanticHalf {
     ranked: RankedHits,
+    reads: SemanticReads,
+}
+
+/// The copies the semantic stage read its sessions from.
+#[derive(Default)]
+struct SemanticReads {
     /// The generation of the cached copy whose messages each session's hits
     /// number, by conversation reference. A session read without a copy is
     /// missing.
@@ -2574,8 +2589,9 @@ impl AgentService {
     /// and the session added to the command's stale sessions, when the
     /// lexical hits number another copy of it (`lexical_copies`), or when the
     /// cache no longer holds that copy as the anchors are read. The sessions
-    /// the semantic stage did not find are added too. The anchor reads, not
-    /// the fusion, are timed as the `hit-metadata` stage.
+    /// the semantic stage did not find are added too. Returns a warning for
+    /// each session whose anchor read failed; its hits keep no anchors. The
+    /// anchor reads, not the fusion, are timed as the `hit-metadata` stage.
     fn fuse_semantic_hits(
         &self,
         semantic: SemanticHalf,
@@ -2586,12 +2602,15 @@ impl AgentService {
             &RankedHits,
             &[agent::search::AgentConversationInput<'_>],
         ) -> agent::search::AgentSearchOutput,
-    ) -> agent::search::AgentSearchOutput {
+    ) -> (agent::search::AgentSearchOutput, Vec<AgentWarning>) {
         let SemanticHalf {
             mut ranked,
-            copies,
-            replaced_rows,
-            left_cache,
+            reads:
+                SemanticReads {
+                    copies,
+                    replaced_rows,
+                    left_cache,
+                },
         } = semantic;
         let inputs: Vec<agent::search::AgentConversationInput<'_>> = inputs
             .iter()
@@ -2615,18 +2634,18 @@ impl AgentService {
             })
             .collect();
         let mut anchor_read = std::time::Duration::ZERO;
-        let output = loop {
+        let (output, failed_reads) = loop {
             ranked.drop_conversations(&changed.iter().map(|input| input.original_index).collect());
             let mut output = fuse(&ranked, &inputs);
             let started = self.clock().now();
-            let unheld = attach_semantic_hit_metadata(self, &mut output, &inputs, &copies);
+            let reads = attach_semantic_hit_anchors(self, &mut output, &inputs, &copies);
             anchor_read += self.clock().elapsed_since(started);
-            if unheld.is_empty() {
-                break output;
+            if reads.left_cache.is_empty() {
+                break (output, reads.failed);
             }
             // Fuse again without them, so the output fills their places from
             // the other sessions' hits.
-            changed.extend(unheld);
+            changed.extend(reads.left_cache);
         };
         self.perf.record(Stage::HitMetadata, anchor_read);
         self.cover_sessions_changed_while_read(
@@ -2635,20 +2654,27 @@ impl AgentService {
                 .chain(changed.iter().map(|input| &input.resolved.key)),
             keys,
         );
-        output
+        (output, failed_reads)
     }
 }
 
+/// The sessions [`attach_semantic_hit_anchors`] found without anchors.
+struct AnchorReads<'i, 'c> {
+    /// The sessions whose copy left the cache, in `inputs`' order.
+    left_cache: Vec<&'i agent::search::AgentConversationInput<'c>>,
+    /// One warning per session whose read failed.
+    failed: Vec<AgentWarning>,
+}
+
 /// Gives each semantic-only hit in `output` the anchors and times of its
-/// focus messages, read from the copy `copies` names for its session. The
-/// sessions whose copy the cache no longer holds, in `inputs`' order. A read
+/// focus messages, read from the copy `copies` names for its session. A read
 /// that fails leaves its hits without anchors.
-fn attach_semantic_hit_metadata<'i, 'c>(
+fn attach_semantic_hit_anchors<'i, 'c>(
     service: &AgentService,
     output: &mut agent::search::AgentSearchOutput,
     inputs: &'i [agent::search::AgentConversationInput<'c>],
     copies: &HashMap<String, i64>,
-) -> Vec<&'i agent::search::AgentConversationInput<'c>> {
+) -> AnchorReads<'i, 'c> {
     let mut focused: HashMap<String, std::collections::BTreeSet<usize>> = HashMap::new();
     for hit in output
         .every_hit()
@@ -2659,7 +2685,10 @@ fn attach_semantic_hit_metadata<'i, 'c>(
             .or_default()
             .extend(hit.focus_range.start..=hit.focus_range.end);
     }
-    let mut unheld = Vec::new();
+    let mut reads = AnchorReads {
+        left_cache: Vec::new(),
+        failed: Vec::new(),
+    };
     for input in inputs {
         let reference = input.resolved.reference.canonical();
         let Some(ordinals) = focused.get(&reference) else {
@@ -2670,19 +2699,20 @@ fn attach_semantic_hit_metadata<'i, 'c>(
             Ok(transcript) => {
                 agent::search::attach_semantic_hit_metadata(output, &input.resolved, &transcript);
             }
-            Err(UnreadMessages::CopyNotHeld) => unheld.push(input),
-            Err(UnreadMessages::Failed) => {}
+            Err(UnreadMessages::CopyLeftCache) => reads.left_cache.push(input),
+            Err(UnreadMessages::Failed(error)) => reads
+                .failed
+                .push(AgentWarning::from_app_error(&error, Some(&reference))),
         }
     }
-    unheld
+    reads
 }
 
 /// A read of a semantic hit's messages that found none to attach.
 enum UnreadMessages {
-    /// The cache no longer holds the copy the hits number.
-    CopyNotHeld,
-    /// The read failed.
-    Failed,
+    /// The copy the hits number left the cache.
+    CopyLeftCache,
+    Failed(AppError),
 }
 
 /// The messages numbered `ordinals` of `input`'s session, read alone from its
@@ -2696,9 +2726,7 @@ fn read_semantic_messages(
     let key = &input.resolved.key;
     let (Some(copy), Some(generation)) = (input.conversation.cached_session.clone(), generation)
     else {
-        return service
-            .load_transcript(key)
-            .map_err(|_| UnreadMessages::Failed);
+        return service.load_transcript(key).map_err(UnreadMessages::Failed);
     };
     let copy = copy.ignoring_source_changes();
     service.perf.time_transcript_parse(key, || {
@@ -2711,10 +2739,10 @@ fn read_semantic_messages(
                     held.agent_messages(&key.path, ordinals).map(Some)
                 })
             })
-            .map_err(|_| UnreadMessages::Failed)?
+            .map_err(UnreadMessages::Failed)?
             .flatten()
             .map(|read| read.transcript)
-            .ok_or(UnreadMessages::CopyNotHeld)
+            .ok_or(UnreadMessages::CopyLeftCache)
     })
 }
 
@@ -2730,12 +2758,16 @@ enum HybridLexicalPass {
 /// Runs a hybrid search's semantic half first, since it reads no
 /// transcripts, then one lexical pass, so each transcript is read at most
 /// once. The semantic half's error is returned with the lexical result, not
-/// raised.
+/// raised, except a cache write short of space: that stops the search, as
+/// every cache write short of space does.
 fn run_hybrid_halves<S, L>(
     semantic: impl FnOnce() -> Result<S>,
     lexical: impl FnOnce(HybridLexicalPass) -> Result<L>,
 ) -> Result<(Result<S>, L)> {
-    let semantic = semantic();
+    let semantic = match semantic() {
+        Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
+        semantic => semantic,
+    };
     let pass = if semantic.is_ok() {
         HybridLexicalPass::ForFusion
     } else {
@@ -2744,6 +2776,9 @@ fn run_hybrid_halves<S, L>(
     Ok((semantic, lexical(pass)?))
 }
 
+/// The semantic hits of `inputs`' sessions for `query`, with the copies they
+/// were read from. Writes the session cache: stores the route texts the read
+/// computed ([`AgentService::store_semantic_routes`]) before ranking.
 fn run_agent_semantic_hits(
     service: &AgentService,
     query: &str,
@@ -2754,10 +2789,10 @@ fn run_agent_semantic_hits(
 ) -> Result<(SemanticHalf, Vec<AgentWarning>)> {
     let SemanticCandidates {
         candidates,
-        read,
+        reads,
         computed_routes,
     } = semantic_candidates(inputs)?;
-    service.store_semantic_routes(&computed_routes);
+    service.store_semantic_routes(&computed_routes)?;
     run_agent_semantic_hits_for_candidates(
         query,
         &candidates,
@@ -2766,42 +2801,39 @@ fn run_agent_semantic_hits(
         window,
         service.clock().clone(),
     )
-    .map(|(ranked, warnings)| (read.with_hits(ranked), warnings))
+    .map(|(ranked, warnings)| (SemanticHalf { ranked, reads }, warnings))
 }
 
 impl AgentService {
     /// Stores `routes`, the route texts the semantic stage computed, when
-    /// this command can take refresh ownership without waiting. A skipped or
-    /// failed write leaves the output as it is: the next semantic search
-    /// computes those routes again. `--perf-stats` reports what was stored.
-    fn store_semantic_routes(&self, routes: &[history::SemanticRoute]) {
+    /// this command can take refresh ownership without waiting. Fails when
+    /// the drive is short of space, as every cache write does. Any other
+    /// skipped or failed write leaves the output as it is: the next semantic
+    /// search computes those routes again. `--perf-stats` reports what was
+    /// stored, or why nothing was.
+    fn store_semantic_routes(&self, routes: &[history::SemanticRoute]) -> Result<()> {
         if routes.is_empty() {
-            return;
+            return Ok(());
         }
         let skipped = match history::store_semantic_routes(self.environment.cache_base(), routes) {
             Ok(history::RoutesStored::Stored) => None,
             Ok(history::RoutesStored::NotOwner) => {
                 Some(agent::perf::RoutesSkipped::AnotherRearview)
             }
-            Err(_) => Some(agent::perf::RoutesSkipped::WriteFailed),
+            Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
+            Err(error) => Some(agent::perf::RoutesSkipped::WriteFailed(error.to_string())),
         };
         self.perf.record_semantic_routes(routes.len(), skipped);
+        Ok(())
     }
 }
 
 /// The semantic stage's candidates, and the copies it read them from.
 struct SemanticCandidates {
     candidates: Vec<semantic::index::SemanticIndexCandidate>,
-    /// A [`SemanticHalf`] without hits.
-    read: SemanticHalf,
+    reads: SemanticReads,
     /// The route texts computed from the copies' texts, to store with them.
     computed_routes: Vec<history::SemanticRoute>,
-}
-
-impl SemanticHalf {
-    fn with_hits(self, ranked: RankedHits) -> Self {
-        Self { ranked, ..self }
-    }
 }
 
 /// The semantic candidates of `inputs`' sessions, each read from the copy
@@ -2816,34 +2848,27 @@ fn semantic_candidates(
         .map(session_candidates)
         .collect::<Vec<_>>();
     let mut candidates = Vec::with_capacity(inputs.len().saturating_mul(2));
-    let mut read = SemanticHalf {
-        ranked: RankedHits {
-            conversations: Vec::new(),
-            chunks: Vec::new(),
-        },
-        copies: HashMap::new(),
-        replaced_rows: HashMap::new(),
-        left_cache: Vec::new(),
-    };
+    let mut reads = SemanticReads::default();
     let mut computed_routes = Vec::new();
     for (input, session) in inputs.iter().zip(sessions) {
         let Some(session) = session? else {
-            read.left_cache.push(input.resolved.key.clone());
+            reads.left_cache.push(input.resolved.key.clone());
             continue;
         };
         if let Some(generation) = session.generation {
-            read.copies
+            reads
+                .copies
                 .insert(input.resolved.reference.canonical(), generation);
         }
         if let Some(row) = session.replaced_row {
-            read.replaced_rows.insert(input.original_index, row);
+            reads.replaced_rows.insert(input.original_index, row);
         }
         computed_routes.extend(session.computed_route);
         candidates.extend(session.candidates);
     }
     Ok(SemanticCandidates {
         candidates,
-        read,
+        reads,
         computed_routes,
     })
 }
@@ -3682,17 +3707,24 @@ fn agent_protocol_options(
     })
 }
 
+/// The sessions an agent command selected: their positions in the
+/// conversations, and the scope the command selected them by.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopedSessions<'s> {
+    pub(crate) indices: &'s [usize],
+    pub(crate) scope: agent::search::AgentSearchScope,
+}
+
 /// The sessions of `scoped` whose cached text matches `query`, best first,
 /// freshness counted to `clock`'s current time; in exact mode, only those
 /// whose cached text holds the whole query as one phrase. With `window`
 /// active, each session is ranked on the text of its messages inside the
 /// window. The ranking also holds each ranked session's hit messages, the
-/// messages its hit read reads. `scope` is the selection `scoped` came from.
+/// messages its hit read reads.
 pub(crate) fn lexically_rank_scoped(
     conversations: &[history::Conversation],
     query: &str,
-    scoped: &[usize],
-    scope: agent::search::AgentSearchScope,
+    scoped: ScopedSessions<'_>,
     mode: SearchMode,
     window: &TimeFilter,
     clock: &dyn Clock,
@@ -3700,6 +3732,7 @@ pub(crate) fn lexically_rank_scoped(
     let texts = search::precompute_agent_search_text(conversations, window);
     let now = clock.wall().with_timezone(&chrono::Local);
     let scoped_set = scoped
+        .indices
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
@@ -3710,7 +3743,7 @@ pub(crate) fn lexically_rank_scoped(
         retrieval_terms(query, mode),
         now,
         |index| scoped_set.contains(&index),
-        match scope {
+        match scoped.scope {
             agent::search::AgentSearchScope::Local => search::ScanScope::Project,
             agent::search::AgentSearchScope::Global => search::ScanScope::AllWorkspaces,
         },
@@ -3827,6 +3860,30 @@ mod tests {
         assert!(semantic.is_err());
         assert_eq!(lexical, "lexical hits");
         assert_eq!(passes, [HybridLexicalPass::Alone]);
+    }
+
+    #[test]
+    fn semantic_half_short_of_space_stops_search_before_lexical_pass() {
+        let mut passes = Vec::new();
+
+        let halves = run_hybrid_halves(
+            || -> Result<()> {
+                Err(AppError::SessionCacheOutOfSpace {
+                    free_bytes: 0,
+                    floor_bytes: 1,
+                })
+            },
+            |pass| {
+                passes.push(pass);
+                Ok(())
+            },
+        );
+
+        assert!(
+            matches!(halves, Err(AppError::SessionCacheOutOfSpace { .. })),
+            "the search fails with the free space: {halves:?}"
+        );
+        assert!(passes.is_empty(), "no lexical pass runs: {passes:?}");
     }
 
     #[test]
@@ -5636,7 +5693,7 @@ mod tests {
     /// transcript: each ranked session's hit messages are none, and its hit
     /// read opens no reader.
     #[test]
-    fn separators_only_query_reads_no_transcript() {
+    fn separators_only_query_doesnt_read_a_transcript() {
         use crate::history::sqlite_cache::connection::test_hooks::{
             ReaderOpening, run_as_a_reader_opens,
         };
@@ -5649,8 +5706,10 @@ mod tests {
         let ranking = lexically_rank_scoped(
             &sessions.rows,
             "- /",
-            &[0, 1],
-            agent::search::AgentSearchScope::Global,
+            ScopedSessions {
+                indices: &[0, 1],
+                scope: agent::search::AgentSearchScope::Global,
+            },
             SearchMode::Lexical,
             &TimeFilter::default(),
             &TestClock::default(),
@@ -5682,11 +5741,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ranking.ranked.len(), 2, "every session ranks");
-        assert!(reads.iter().all(|read| read.transcript.messages.is_empty()));
-        assert!(!reader.has_run(), "the hit reads open no reader");
+        assert!(
+            reads.iter().all(|read| read.transcript.messages.is_empty()),
+            "the hit reads don't read a message"
+        );
+        assert!(!reader.has_run(), "the hit reads don't open a reader");
     }
 
-    /// The read-ahead bound counts a hit read as the share of the transcript
+    /// The read-ahead limit counts a hit read as the share of the transcript
     /// its hit messages hold, not the whole file.
     #[test]
     fn hit_read_counts_share_of_transcript_its_hit_messages_hold() {
@@ -5699,8 +5761,10 @@ mod tests {
         let ranking = lexically_rank_scoped(
             &sessions.rows,
             "zebrafish",
-            &[0],
-            agent::search::AgentSearchScope::Global,
+            ScopedSessions {
+                indices: &[0],
+                scope: agent::search::AgentSearchScope::Global,
+            },
             SearchMode::Lexical,
             &TimeFilter::default(),
             &TestClock::default(),
@@ -5715,15 +5779,7 @@ mod tests {
         );
     }
 
-    /// User messages with `texts`, an hour apart from noon on 10 October.
-    fn october_messages(texts: &[&str]) -> Vec<serde_json::Value> {
-        use crate::search::test_fixtures::{claude_user_record, october};
-        texts
-            .iter()
-            .zip(12..)
-            .map(|(text, hour)| claude_user_record(text, october(10, hour)))
-            .collect()
-    }
+    use crate::search::test_fixtures::october_messages;
 
     /// Each of `rows`' keys, and its search input.
     fn keyed_inputs(
@@ -5819,9 +5875,10 @@ mod tests {
 
     /// A semantic search stores the route text it computed from a copy's
     /// texts, and later searches read it while the copy, the row's title and
-    /// its summary stay; a renamed row or another copy computes it again.
+    /// summary and the route algorithm's version stay; a change to any of
+    /// them computes it again.
     #[test]
-    fn semantic_route_text_is_stored_and_read_until_title_or_copy_changes() {
+    fn semantic_route_text_is_read_as_stored_until_title_summary_version_or_copy_changes() {
         use crate::search::test_fixtures::cached_claude_sessions;
         let sessions = cached_claude_sessions(&[(
             "routed",
@@ -5834,7 +5891,7 @@ mod tests {
             computed[0][0].contains("zebrafish"),
             "the route reads the session's text: {computed:?}"
         );
-        service.store_semantic_routes(&routes);
+        service.store_semantic_routes(&routes).unwrap();
         assert!(
             service
                 .perf
@@ -5843,8 +5900,9 @@ mod tests {
             "the route text is stored"
         );
         // A stored text other than the computed one shows which is read.
-        rusqlite::Connection::open(sessions.cache_path().join("history.sqlite3"))
-            .unwrap()
+        let cache =
+            rusqlite::Connection::open(sessions.cache_path().join("history.sqlite3")).unwrap();
+        cache
             .execute("UPDATE semantic_routes SET text = 'stored route'", [])
             .unwrap();
 
@@ -5859,6 +5917,21 @@ mod tests {
         assert!(
             routes.len() == 1 && route[0][0].contains("renamed"),
             "a renamed row computes its route text again: {route:?}"
+        );
+        let mut summarised = sessions.rows.clone();
+        summarised[0].summary = Some("Aquarium chores".to_owned());
+        let (route, routes) = routes_read(&summarised);
+        assert!(
+            routes.len() == 1 && route[0][0].contains("aquarium"),
+            "a row with another summary computes its route text again: {route:?}"
+        );
+        cache
+            .execute("UPDATE semantic_routes SET version = version - 1", [])
+            .unwrap();
+        let (route, routes) = routes_read(&sessions.rows);
+        assert!(
+            routes.len() == 1 && route[0][0].contains("zebrafish"),
+            "a route text an older route algorithm stored is computed again: {route:?}"
         );
         sessions.rewrite(
             0,
@@ -5889,7 +5962,7 @@ mod tests {
         )
         .unwrap();
 
-        service.store_semantic_routes(&routes);
+        service.store_semantic_routes(&routes).unwrap();
 
         drop(other_refresh);
         assert!(
@@ -5904,6 +5977,60 @@ mod tests {
             routes_read(&sessions.rows).1.len(),
             1,
             "the next read computes the route text again"
+        );
+    }
+
+    /// A route write on a drive short of space fails with the free space and
+    /// deletes the cache database, as every cache write short of space does.
+    #[test]
+    fn semantic_route_write_short_of_space_fails_and_deletes_cache() {
+        use crate::search::test_fixtures::cached_claude_sessions;
+        let sessions = cached_claude_sessions(&[("routed", october_messages(&["zebrafish"]))]);
+        let (_, routes) = routes_read(&sessions.rows);
+        let service = AgentService::new(
+            test_environment(Vec::new(), Some(sessions.cache_path())).with_disk_space(Arc::new(
+                history::sqlite_cache::DriveRunningOut::after(0, || {}),
+            )),
+        );
+
+        let stored = service.store_semantic_routes(&routes);
+
+        assert!(
+            matches!(stored, Err(AppError::SessionCacheOutOfSpace { .. })),
+            "the write fails with the free space: {stored:?}"
+        );
+        assert!(
+            !sessions.cache_path().join("history.sqlite3").exists(),
+            "the cache database is deleted"
+        );
+    }
+
+    /// A route write that fails for another reason leaves the search going;
+    /// `--perf-stats` reports the cause.
+    #[test]
+    fn failed_semantic_route_write_reports_its_cause() {
+        use crate::search::test_fixtures::cached_claude_sessions;
+        let sessions = cached_claude_sessions(&[("routed", october_messages(&["zebrafish"]))]);
+        let (_, routes) = routes_read(&sessions.rows);
+        rusqlite::Connection::open(sessions.cache_path().join("history.sqlite3"))
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE semantic_routes; CREATE TABLE semantic_routes (session INTEGER \
+                 PRIMARY KEY, version INTEGER, generation INTEGER, custom_title TEXT, \
+                 summary TEXT, text TEXT CHECK (text = 'refused'))",
+            )
+            .unwrap();
+        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
+
+        service.store_semantic_routes(&routes).unwrap();
+
+        let records = service.perf.records(None);
+        assert!(
+            records.contains(
+                "perf semantic-routes computed=1 stored=0 skipped=write-failed \
+                 cause=Session cache database error: CHECK constraint failed: text = 'refused'"
+            ),
+            "the record names the write's cause: {records}"
         );
     }
 
@@ -5934,7 +6061,7 @@ mod tests {
             .unwrap();
 
         let SemanticCandidates {
-            candidates, read, ..
+            candidates, reads, ..
         } = semantic_candidates(&inputs).unwrap();
 
         let visible = |index| {
@@ -5970,16 +6097,16 @@ mod tests {
             "the removed session isn't a candidate"
         );
         assert_eq!(
-            read.left_cache,
+            reads.left_cache,
             [keys[2].clone()],
             "the removed session is named"
         );
         assert_eq!(
-            read.copies.get(&inputs[1].resolved.reference.canonical()),
+            reads.copies.get(&inputs[1].resolved.reference.canonical()),
             Some(&held_generation),
             "the replaced session's hits number the held copy"
         );
-        let replaced = &read.replaced_rows[&1];
+        let replaced = &reads.replaced_rows[&1];
         let third_message = october(10, 14).timestamp();
         assert_eq!(
             (replaced.message_count, replaced.message_times.span(3)),
@@ -5992,7 +6119,11 @@ mod tests {
             ),
             "the replaced session's row is counted and timed as the held copy"
         );
-        assert!(!read.replaced_rows.contains_key(&0));
+        assert!(
+            !reads.replaced_rows.contains_key(&0),
+            "the kept session's own row stays: {:?}",
+            reads.replaced_rows.keys()
+        );
 
         let appended = semantic_dialogue_hit(1, agent::refs::MessageRange::single(3));
         let after_the_second_message = agent::search::AgentSearchRequest {
@@ -6005,11 +6136,14 @@ mod tests {
             ..semantic_request()
         };
         let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
-        let output = service.fuse_semantic_hits(
-            read.with_hits(RankedHits {
-                conversations: vec![appended.clone()],
-                chunks: vec![appended],
-            }),
+        let (output, _) = service.fuse_semantic_hits(
+            SemanticHalf {
+                ranked: RankedHits {
+                    conversations: vec![appended.clone()],
+                    chunks: vec![appended],
+                },
+                reads,
+            },
             &HashMap::new(),
             &inputs,
             &keys,
@@ -6055,9 +6189,10 @@ mod tests {
                     conversations: vec![hit.clone()],
                     chunks: vec![hit.clone()],
                 },
-                copies: HashMap::from([(reference.clone(), generation)]),
-                replaced_rows: HashMap::new(),
-                left_cache: Vec::new(),
+                reads: SemanticReads {
+                    copies: HashMap::from([(reference.clone(), generation)]),
+                    ..SemanticReads::default()
+                },
             };
             let lexical_copies = if lexical_reads_another_copy {
                 HashMap::from([(reference.clone(), generation + 1)])
@@ -6073,7 +6208,7 @@ mod tests {
             let service =
                 AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
 
-            let output = service.fuse_semantic_hits(
+            let (output, failed_reads) = service.fuse_semantic_hits(
                 semantic,
                 &lexical_copies,
                 &inputs,
@@ -6081,6 +6216,10 @@ mod tests {
                 |ranked, inputs| {
                     agent::search::run_global_semantic_search(&request, inputs, ranked)
                 },
+            );
+            assert!(
+                failed_reads.is_empty(),
+                "{case}: every anchor read succeeds: {failed_reads:?}"
             );
             let records = warning_records(&service.with_stale_cache_record(Vec::new()));
 
@@ -6103,6 +6242,61 @@ mod tests {
                 assert!(records.is_empty(), "{case}: {records:?}");
             }
         }
+    }
+
+    /// A semantic hit whose anchor read fails keeps its place without
+    /// anchors, and the command warns about its session.
+    #[test]
+    fn semantic_hit_whose_anchor_read_fails_stays_and_warns_about_its_session() {
+        use crate::search::test_fixtures::cached_claude_sessions;
+        let hit = semantic_dialogue_hit(0, agent::refs::MessageRange::single(2));
+        let sessions =
+            cached_claude_sessions(&[("session", october_messages(&["plain", "zebrafish here"]))]);
+        let (keys, inputs) = keyed_inputs(&sessions.rows);
+        let reference = inputs[0].resolved.reference.canonical();
+        let generation = sessions.rows[0]
+            .cached_session
+            .as_ref()
+            .unwrap()
+            .generation();
+        rusqlite::Connection::open(sessions.cache_path().join("history.sqlite3"))
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE parts RENAME TO parts_kept; \
+                 CREATE TABLE parts (id INTEGER PRIMARY KEY)",
+            )
+            .unwrap();
+        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
+
+        let (output, failed_reads) = service.fuse_semantic_hits(
+            SemanticHalf {
+                ranked: RankedHits {
+                    conversations: vec![hit.clone()],
+                    chunks: vec![hit],
+                },
+                reads: SemanticReads {
+                    copies: HashMap::from([(reference.clone(), generation)]),
+                    ..SemanticReads::default()
+                },
+            },
+            &HashMap::new(),
+            &inputs,
+            &keys,
+            |ranked, inputs| {
+                agent::search::run_global_semantic_search(&semantic_request(), inputs, ranked)
+            },
+        );
+
+        let hits = output.every_hit().collect::<Vec<_>>();
+        assert!(
+            hits.len() == 1 && hits[0].anchors.is_empty(),
+            "the hit stays, without anchors: {hits:?}"
+        );
+        let records = warning_records(&failed_reads);
+        assert!(
+            records.len() == 1 && records[0].contains(&format!("ref={reference} ")),
+            "the command warns about the session: {records:?}"
+        );
     }
 
     /// Beside another rearview's refresh, a session the cache recorded as
@@ -7469,8 +7663,10 @@ mod tests {
             lexically_rank_scoped(
                 &conversations,
                 "--isolated",
-                &[0, 1],
-                agent::search::AgentSearchScope::Global,
+                ScopedSessions {
+                    indices: &[0, 1],
+                    scope: agent::search::AgentSearchScope::Global,
+                },
                 mode,
                 &TimeFilter::default(),
                 &clock,
@@ -7502,8 +7698,10 @@ mod tests {
             lexically_rank_scoped(
                 &conversations,
                 "flaky test",
-                &[0],
-                agent::search::AgentSearchScope::Global,
+                ScopedSessions {
+                    indices: &[0],
+                    scope: agent::search::AgentSearchScope::Global,
+                },
                 mode,
                 window,
                 &clock,
@@ -7551,8 +7749,10 @@ mod tests {
             lexically_rank_scoped(
                 conversations,
                 query,
-                &[0, 1, 2],
-                agent::search::AgentSearchScope::Global,
+                ScopedSessions {
+                    indices: &[0, 1, 2],
+                    scope: agent::search::AgentSearchScope::Global,
+                },
                 mode,
                 &TimeFilter::default(),
                 &clock,
@@ -7643,8 +7843,10 @@ mod tests {
             let ranked = lexically_rank_scoped(
                 &conversations,
                 query,
-                &[0],
-                agent::search::AgentSearchScope::Global,
+                ScopedSessions {
+                    indices: &[0],
+                    scope: agent::search::AgentSearchScope::Global,
+                },
                 mode,
                 &request.window,
                 &clock,

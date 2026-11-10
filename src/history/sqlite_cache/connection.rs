@@ -159,10 +159,10 @@ pub(crate) mod test_hooks {
         at_the_first_data_commit(base, FirstDataCommit::Lands, action)
     }
 
-    /// Call `action` once, as a reader opens a connection to the session
-    /// cache database in `base` and `opens` names that reader, before the
-    /// reader runs a statement, until the result drops. A reader is a
-    /// read-only connection.
+    /// Call `action` once, when the reader `opens` names opens its read-only
+    /// connection to the session cache database in `base`, before that
+    /// reader runs a statement. The hook stays installed until the returned
+    /// `ReaderAction` drops.
     pub(crate) fn run_as_a_reader_opens(
         base: &Path,
         opens: ReaderOpening,

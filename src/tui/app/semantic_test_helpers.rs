@@ -39,6 +39,7 @@ pub(crate) fn send_semantic_complete_response(
                 error: None,
                 progress,
                 prewarm: false,
+                unreadable: 0,
             },
         ))
         .unwrap();

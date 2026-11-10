@@ -332,7 +332,7 @@ fn stale_response_with_current_generation_but_old_mode_is_ignored() {
         generation: 7,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
-        exact_literal_results: None,
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -821,6 +821,7 @@ fn semantic_search_worker_returns_lexical_fallback() {
     tx.send(SearchCommand::UpdateData {
         conversations: app.conversations_snapshot.clone(),
         searchable: Arc::new(app.searchable.clone()),
+        texts_reply: tx.clone(),
     })
     .unwrap();
     tx.send(SearchCommand::Search {
@@ -899,10 +900,62 @@ fn quoted_only_semantic_query_shows_search_workers_exact_matches_newest_first() 
         );
     }
     assert!(
+        app.semantic_result_metadata(2).is_none(),
+        "the hit the list's filters hide gets no preview"
+    );
+    assert!(
         last_semantic_search(&drain_semantic_commands(&request_rx)).is_none(),
         "the semantic worker gets no search"
     );
     assert!(!app.has_search_work_in_flight());
+}
+
+/// A quoted-only semantic hit whose phrase the row's preview lacks previews
+/// the first range of its lexical evidence, with context on each side.
+#[test]
+fn quoted_only_semantic_hit_previews_its_first_evidence_range() {
+    let mut row = conversation(
+        Some("body"),
+        "-tmp-body",
+        "11111111-1111-4111-8111-111111111111",
+        "unrelated preview",
+    );
+    row.full_text = format!(
+        "{} the title sentinel {} the title sentinel again",
+        "opening ".repeat(20),
+        "middle ".repeat(20)
+    );
+    row.search_text_lower = search::normalize_for_search(&row.full_text);
+    let mut app = app_with_options(
+        vec![row],
+        vec![],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    connect_semantic_search_channels(&mut app);
+
+    app.query = "\"title sentinel\"".to_string();
+    app.dispatch_search();
+    app.settle_search_for_test();
+
+    let evidence = app.lexical_evidence(0).expect("the hit has evidence");
+    let texts = evidence.texts(&app.conversations()[0]);
+    let &(start, end) = evidence.context_ranges.first().unwrap();
+    let first_range = texts.slice(start..end).into_owned();
+    let preview = &app
+        .semantic_result_metadata(0)
+        .unwrap()
+        .explanation
+        .evidence_preview;
+    assert!(
+        first_range.contains("title sentinel") && preview.contains(first_range.as_str()),
+        "the preview shows the evidence's first range: {preview:?}"
+    );
+    assert!(
+        preview.starts_with('…') && preview.ends_with('…'),
+        "the preview cuts the text on each side: {preview:?}"
+    );
 }
 
 #[test]
@@ -939,7 +992,7 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
-        exact_literal_results: None,
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -969,7 +1022,7 @@ fn empty_lexical_fallback_doesnt_clear_rows_while_semantic_search_is_pending() {
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
-        exact_literal_results: None,
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -998,7 +1051,7 @@ fn semantic_search_ignores_lexical_fallback_after_completion() {
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
-        exact_literal_results: None,
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -1290,7 +1343,7 @@ fn send_semantic_fallback(fallback_tx: &mpsc::Sender<SearchResponse>, filtered: 
             generation: 7,
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
-            exact_literal_results: None,
+            is_exact_literal: false,
         })
         .unwrap();
 }
@@ -1364,7 +1417,7 @@ fn rows_answer_previous_query_until_new_results_land() {
             generation: app.search_generation(),
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
-            exact_literal_results: None,
+            is_exact_literal: false,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -1402,7 +1455,7 @@ fn lexical_app_showing_needle() -> (
             generation: app.search_generation(),
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
-            exact_literal_results: None,
+            is_exact_literal: false,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -1434,7 +1487,7 @@ fn backspacing_to_shown_results_query_abandons_search_and_keeps_rows() {
             generation: abandoned,
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
-            exact_literal_results: None,
+            is_exact_literal: false,
         })
         .unwrap();
     assert!(!app.receive_search_results());
@@ -1492,7 +1545,7 @@ fn backspacing_to_shown_results_query_abandons_semantic_search_too() {
             generation: abandoned,
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
-            exact_literal_results: None,
+            is_exact_literal: false,
         })
         .unwrap();
     send_semantic_complete_response(
@@ -1537,7 +1590,7 @@ fn backspacing_to_semantic_placeholder_doesnt_abandon_search() {
             generation: app.search_generation(),
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
-            exact_literal_results: None,
+            is_exact_literal: false,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -2123,7 +2176,7 @@ fn uuid_dispatch_invalidates_stale_search_response() {
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
-        exact_literal_results: None,
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -2161,7 +2214,7 @@ fn finish_loading_invalidates_stale_loading_search_response() {
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
-        exact_literal_results: None,
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -2288,14 +2341,12 @@ fn single_file_mode_has_no_project_exclusions() {
 }
 
 #[test]
-fn search_bar_counts_sessions_loading_then_sessions_unreadable() {
-    let mut app = app(Vec::new(), Vec::new());
-    let mut shown = |loading, unreadable| {
-        app.texts_held.without = SessionsWithoutTexts {
+fn sessions_without_texts_text_counts_loading_then_unreadable() {
+    let shown = |loading, unreadable| {
+        describe_sessions_without_texts(SessionsWithoutTexts {
             loading,
             unreadable,
-        };
-        app.sessions_without_texts_text()
+        })
     };
 
     assert_eq!(shown(0, 0), "", "every session's texts are held");
@@ -2307,4 +2358,48 @@ fn search_bar_counts_sessions_loading_then_sessions_unreadable() {
         "the unreadable count follows the loading text"
     );
     assert_eq!(shown(1, 2), " · 1 session loading · 2 sessions unreadable");
+}
+
+#[test]
+fn semantic_results_count_sessions_their_search_could_not_read() {
+    let mut app = app_with_semantic_mode(vec![conversation(
+        Some("Visible"),
+        "-tmp-visible",
+        "22222222-2222-4222-8222-222222222222",
+        "needle",
+    )]);
+    let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    // The list's search counts as this test sets it, not as its worker does.
+    app.texts_held_rx = mpsc::channel().1;
+    app.texts_held.sessions_without_texts = SessionsWithoutTexts {
+        loading: 1,
+        unreadable: 5,
+    };
+    app.query = "needle".to_string();
+    app.dispatch_search();
+    let before_results = app.sessions_without_texts_text();
+    response_tx
+        .send(SemanticSearchMessage::Complete(
+            crate::tui::semantic_worker::SemanticSearchResponse {
+                generation: app.search_generation(),
+                filtered: vec![0],
+                metadata: HashMap::new(),
+                error: None,
+                progress: SemanticProgress::Complete,
+                prewarm: false,
+                unreadable: 2,
+            },
+        ))
+        .unwrap();
+    app.receive_search_results();
+
+    assert_eq!(
+        before_results, " · 1 session loading · 5 sessions unreadable",
+        "before the semantic results, the list's search counts its own"
+    );
+    assert_eq!(
+        app.sessions_without_texts_text(),
+        " · 1 session loading · 2 sessions unreadable",
+        "the semantic results count the sessions their search could not read"
+    );
 }

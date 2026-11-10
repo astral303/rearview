@@ -1,11 +1,12 @@
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
-use crate::history::{CacheBase, Conversation, RoutesStored, SemanticContent, Workspace};
+use crate::history::{CacheBase, Conversation, SemanticContent, Workspace};
 use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
 use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 use crate::time_filter::TimeFilter;
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -22,14 +23,18 @@ pub fn run(
     use crate::semantic::output::format_hit;
     use crate::semantic::types::MODEL_NAME;
 
-    let content = load_held_content(&conversations_in_workspace(conversations, workspace))?;
+    let parsed = ParsedQuery::parse(query);
+    let content = searched_content(
+        &conversations_in_workspace(conversations, workspace),
+        &parsed,
+    )?
+    .reporting_left_cache(&mut std::io::stderr());
     let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     if selected.is_empty() {
         eprintln!("{}", no_conversations_message(workspace.is_some()));
         return Ok(());
     }
 
-    let parsed = ParsedQuery::parse(query);
     if parsed.is_effectively_empty() {
         eprintln!("Query is empty.");
         return Ok(());
@@ -130,11 +135,8 @@ pub fn generate_cache(
     use crate::semantic::index::{SemanticIndexProgress, SemanticIndexRequest, SemanticIndexState};
     use crate::semantic::types::ChunkConfig;
 
-    let (content, left_cache) =
-        semantic_content(&conversations_in_workspace(conversations, workspace))?;
-    for row in left_cache {
-        eprintln!("{}", left_cache_message(row));
-    }
+    let content = semantic_content(&conversations_in_workspace(conversations, workspace))?
+        .reporting_left_cache(&mut std::io::stderr());
     let selected = content
         .iter()
         .map(|content| content.held.row.as_ref())
@@ -145,7 +147,7 @@ pub fn generate_cache(
     }
 
     let candidates = semantic_cache_candidates(&content);
-    store_route_texts(base, &content);
+    store_route_texts(base, &content)?;
     let chunks = build_chunks_with_sources(
         candidates.iter().map(|candidate| {
             (
@@ -240,7 +242,11 @@ pub fn debug_search(
     use std::collections::HashMap;
 
     let parsed = ParsedQuery::parse(query);
-    let content = load_held_content(&conversations_in_workspace(conversations, workspace))?;
+    let content = searched_content(
+        &conversations_in_workspace(conversations, workspace),
+        &parsed,
+    )?
+    .reporting_left_cache(&mut std::io::stderr());
     let selected = content.iter().map(|row| row.as_ref()).collect::<Vec<_>>();
     eprint!("{}", format_parsed_query(&parsed));
     eprintln!();
@@ -485,41 +491,26 @@ fn semantic_cache_candidates(
 }
 
 /// Stores the route texts `content`'s reads computed, as a semantic search
-/// stores them, and reports on stderr whether it did.
-fn store_route_texts(base: &CacheBase, content: &[SemanticContent<'_>]) {
+/// stores them. Fails when the drive is short of space; after any other
+/// failure, the next semantic search computes the route texts again.
+fn store_route_texts(base: &CacheBase, content: &[SemanticContent<'_>]) -> Result<()> {
     let routes = content
         .iter()
         .filter_map(|content| content.computed_route.clone())
         .collect::<Vec<_>>();
     if routes.is_empty() {
-        return;
+        return Ok(());
     }
     match crate::history::store_semantic_routes(base, &routes) {
-        Ok(RoutesStored::Stored) => {
-            eprintln!("Semantic cache: stored {} route text(s).", routes.len());
-        }
-        Ok(RoutesStored::NotOwner) => eprintln!(
-            "Semantic cache: route texts not stored: another rearview owns the session cache's refresh."
-        ),
-        Err(error) => eprintln!("Semantic cache: route texts not stored: {error}"),
+        Err(error @ AppError::SessionCacheOutOfSpace { .. }) => Err(error),
+        Ok(_) | Err(_) => Ok(()),
     }
 }
 
 /// The semantic content of each of `rows`, read as
-/// [`Conversation::load_semantic_content`] reads it, and the rows of the
-/// sessions the cache no longer holds, which have none.
-fn semantic_content<'r>(
-    rows: &[&'r Conversation],
-) -> Result<(Vec<SemanticContent<'r>>, Vec<&'r Conversation>)> {
-    let mut content = Vec::with_capacity(rows.len());
-    let mut left_cache = Vec::new();
-    for &row in rows {
-        match row.load_semantic_content()? {
-            Some(read) => content.push(read),
-            None => left_cache.push(row),
-        }
-    }
-    Ok((content, left_cache))
+/// [`Conversation::load_semantic_content`] reads it.
+fn semantic_content<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, SemanticContent<'r>>> {
+    HeldReads::of(rows, Conversation::load_semantic_content)
 }
 
 fn semantic_index_candidates(
@@ -550,38 +541,77 @@ fn conversations_in_workspace<'a>(
         .collect()
 }
 
-/// [`held_content`] of `rows`, with one line on stderr for each session it
-/// leaves out.
-fn load_held_content<'r>(rows: &[&'r Conversation]) -> Result<Vec<Cow<'r, Conversation>>> {
-    let (content, left_cache) = held_content(rows)?;
-    for row in left_cache {
-        eprintln!("{}", left_cache_message(row));
+/// What a semantic search for `parsed` reads of each of `rows`: the search
+/// texts for a query of quoted phrases alone, which it matches exactly;
+/// otherwise the semantic turns alone, as agent search reads them.
+fn searched_content<'r>(
+    rows: &[&'r Conversation],
+    parsed: &ParsedQuery,
+) -> Result<HeldReads<'r, Cow<'r, Conversation>>> {
+    if parsed.is_quoted_only() {
+        held_content(rows)
+    } else {
+        semantic_turns(rows)
     }
-    Ok(content)
 }
 
 /// The content of each of `rows`, read from the copy the session cache holds
-/// now, whichever generation it is, and the rows of the sessions the cache
-/// no longer holds, which have none.
-fn held_content<'r>(
-    rows: &[&'r Conversation],
-) -> Result<(Vec<Cow<'r, Conversation>>, Vec<&'r Conversation>)> {
-    let mut content = Vec::with_capacity(rows.len());
-    let mut left_cache = Vec::new();
-    for &row in rows {
-        match row.load_held_content()? {
-            Some(held) => content.push(held.row),
-            None => left_cache.push(row),
-        }
-    }
-    Ok((content, left_cache))
+/// now, whichever generation it is.
+fn held_content<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, Cow<'r, Conversation>>> {
+    HeldReads::of(rows, |row| {
+        Ok(row.load_held_content()?.map(|held| held.row))
+    })
 }
 
-fn left_cache_message(row: &Conversation) -> String {
-    format!(
-        "Skipped session {}: it is no longer in the session cache.",
-        row.session_id
-    )
+/// Each of `rows` with the semantic turns of the copy the session cache holds
+/// now, read as [`Conversation::load_held_semantic_turns`] reads them.
+fn semantic_turns<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, Cow<'r, Conversation>>> {
+    HeldReads::of(rows, |row| {
+        Ok(row.load_held_semantic_turns()?.map(|held| held.row))
+    })
+}
+
+/// A read of each row's copy the session cache holds now, and the rows of the
+/// sessions the cache no longer holds.
+struct HeldReads<'r, T> {
+    read: Vec<T>,
+    left_cache: Vec<&'r Conversation>,
+}
+
+impl<'r, T: Send> HeldReads<'r, T> {
+    /// `read` of each of `rows`, on the rayon pool; `read` returns `None` for
+    /// a session the cache no longer holds. The first failure in `rows`'
+    /// order fails the read.
+    fn of(
+        rows: &[&'r Conversation],
+        read: impl Fn(&'r Conversation) -> Result<Option<T>> + Sync,
+    ) -> Result<Self> {
+        let results = rows.par_iter().map(|&row| read(row)).collect::<Vec<_>>();
+        let mut reads = Self {
+            read: Vec::with_capacity(rows.len()),
+            left_cache: Vec::new(),
+        };
+        for (&row, result) in rows.iter().zip(results) {
+            match result? {
+                Some(content) => reads.read.push(content),
+                None => reads.left_cache.push(row),
+            }
+        }
+        Ok(reads)
+    }
+
+    /// The reads, after writing one line to `stderr` for each session the
+    /// cache no longer holds.
+    fn reporting_left_cache(self, stderr: &mut impl std::io::Write) -> Vec<T> {
+        for row in self.left_cache {
+            let _ = writeln!(
+                stderr,
+                "Skipped session {}: it is no longer in the session cache.",
+                row.session_id
+            );
+        }
+        self.read
+    }
 }
 
 fn no_conversations_message(local: bool) -> &'static str {
@@ -600,20 +630,14 @@ mod tests {
     use crate::semantic::types::{ChunkConfig, EmbeddingCache};
     use chrono::Local;
 
-    /// Semantic search, cache generation and the debug search read a session
-    /// another rearview wrote again from the copy the cache holds, and skip
-    /// one it removed, naming it. Cache generation reads only the semantic
-    /// content.
+    /// The reads behind the semantic search flags ([`held_content`] for
+    /// quoted phrases alone, [`semantic_turns`] otherwise) and cache
+    /// generation ([`semantic_content`]) read a session another rearview
+    /// wrote again from the copy the cache holds, and write one line to
+    /// stderr naming a session it removed.
     #[test]
     fn held_content_reads_copy_cache_holds_and_skips_removed_session() {
-        use crate::search::test_fixtures::{cached_claude_sessions, claude_user_record, october};
-        let messages = |texts: &[&str]| -> Vec<serde_json::Value> {
-            texts
-                .iter()
-                .zip(12..)
-                .map(|(text, hour)| claude_user_record(text, october(10, hour)))
-                .collect()
-        };
+        use crate::search::test_fixtures::{cached_claude_sessions, october_messages as messages};
         let sessions = cached_claude_sessions(&[
             ("replaced", messages(&["first"])),
             ("removed", messages(&["second"])),
@@ -622,18 +646,28 @@ mod tests {
         sessions.remove(1);
         let rows = sessions.rows.iter().collect::<Vec<_>>();
 
-        let (content, left_cache) = held_content(&rows).unwrap();
-        let (semantic, semantic_left_cache) = semantic_content(&rows).unwrap();
+        let (mut stderr, mut turns_stderr, mut semantic_stderr) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let content = held_content(&rows)
+            .unwrap()
+            .reporting_left_cache(&mut stderr);
+        let read_turns = semantic_turns(&rows)
+            .unwrap()
+            .reporting_left_cache(&mut turns_stderr);
+        let semantic = semantic_content(&rows)
+            .unwrap()
+            .reporting_left_cache(&mut semantic_stderr);
 
         let turns = [vec!["inserted".to_owned(), "first".to_owned()]];
-        assert_eq!(
-            content
-                .iter()
-                .map(|row| row.semantic_turns.clone())
-                .collect::<Vec<_>>(),
-            turns,
-            "the replaced session is read as the cache holds it"
-        );
+        for (read, rows) in [("held", &content), ("semantic turns", &read_turns)] {
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.semantic_turns.clone())
+                    .collect::<Vec<_>>(),
+                turns,
+                "the {read} read reads the replaced session as the cache holds it"
+            );
+        }
         assert_eq!(
             semantic
                 .iter()
@@ -642,20 +676,61 @@ mod tests {
             turns,
             "cache generation reads the replaced session as the cache holds it"
         );
-        let skipped = [format!(
-            "Skipped session {}: it is no longer in the session cache.",
+        let skipped = format!(
+            "Skipped session {}: it is no longer in the session cache.\n",
             sessions.rows[1].session_id
-        )];
-        for left_cache in [left_cache, semantic_left_cache] {
+        );
+        for (read, stderr) in [
+            ("held", stderr),
+            ("semantic turns", turns_stderr),
+            ("semantic", semantic_stderr),
+        ] {
             assert_eq!(
-                left_cache
-                    .iter()
-                    .map(|row| left_cache_message(row))
-                    .collect::<Vec<_>>(),
+                String::from_utf8(stderr).unwrap(),
                 skipped,
-                "the removed session is skipped and named"
+                "the {read} content read names the removed session on stderr"
             );
         }
+    }
+
+    #[test]
+    fn semantic_search_flags_chunk_the_turns_agent_search_reads() {
+        use crate::search::test_fixtures::{cached_claude_sessions, october_messages as messages};
+        use crate::semantic::chunk::build_chunks;
+        let sessions = cached_claude_sessions(&[
+            ("replaced", messages(&["first question", "second answer"])),
+            ("kept", messages(&["third question", "fourth answer"])),
+        ]);
+        sessions.rewrite(
+            0,
+            &messages(&["inserted note", "first question", "second answer"]),
+        );
+        let rows = sessions.rows.iter().collect::<Vec<_>>();
+        let chunks = |rows: &[&Conversation]| {
+            build_chunks(rows, ChunkConfig::default())
+                .into_iter()
+                .map(|chunk| (chunk.conversation_index, chunk.text))
+                .collect::<Vec<_>>()
+        };
+
+        let flags = semantic_turns(&rows).unwrap().read;
+        let agent = rows
+            .iter()
+            .map(|row| row.load_semantic_content().unwrap().unwrap().held.row)
+            .collect::<Vec<_>>();
+
+        let agent_chunks = chunks(&agent.iter().map(Cow::as_ref).collect::<Vec<_>>());
+        assert!(
+            agent_chunks
+                .iter()
+                .any(|(_, text)| text.contains("inserted note")),
+            "the agent read holds the replaced copy's turns: {agent_chunks:?}"
+        );
+        assert_eq!(
+            chunks(&flags.iter().map(Cow::as_ref).collect::<Vec<_>>()),
+            agent_chunks,
+            "the semantic search flags chunk the turns agent search reads"
+        );
     }
 
     /// Cache generation stores the route texts it computed, so the next
@@ -674,15 +749,15 @@ mod tests {
             Arc::new(crate::clock::TestClock::default()),
             crate::history::provider::walk::SystemCanonicaliser::shared(),
         );
-        let (computed, _) = semantic_content(&rows).unwrap();
+        let computed = semantic_content(&rows).unwrap().read;
         assert!(
             computed[0].computed_route.is_some(),
             "the first read computes the route text"
         );
 
-        store_route_texts(&base, &computed);
+        store_route_texts(&base, &computed).unwrap();
 
-        let (stored, _) = semantic_content(&rows).unwrap();
+        let stored = semantic_content(&rows).unwrap().read;
         assert_eq!(
             (stored[0].computed_route.is_none(), &stored[0].route_text),
             (true, &computed[0].route_text),

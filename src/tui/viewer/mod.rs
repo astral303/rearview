@@ -307,8 +307,8 @@ pub struct ViewedConversation {
 }
 
 /// The conversation the cache keeps at `address`, its newest copy read
-/// through `cache`'s interactive read, as the TUI's drawing thread reads it,
-/// for a row whose publication is `publication`.
+/// through `cache`'s interactive read, for a row whose publication is
+/// `publication`.
 pub fn parse_conversation_file_interactively(
     cache: &crate::history::InteractiveCache,
     address: &crate::history::sqlite_cache::SessionAddress,

@@ -70,6 +70,7 @@ enum Contract {
     RootOverride,
     StorageEnvVars,
     RootSpelling,
+    ViewerReadConnections,
     UnreadableDirectory,
     ForeignFileDelete,
 }
@@ -106,6 +107,7 @@ impl Contract {
             Self::RootOverride
             | Self::StorageEnvVars
             | Self::RootSpelling
+            | Self::ViewerReadConnections
             | Self::UnreadableDirectory => true,
         }
     }
@@ -955,6 +957,52 @@ fn provider_declaring_subagents_not_capable_doesnt_report_sub_agent() {
     });
 }
 
+/// Fails when the route algorithm's output changes without a new
+/// `SEMANTIC_ROUTE_VERSION`. The session cache would otherwise keep each
+/// stored route as the old algorithm computed it.
+#[test]
+fn route_text_of_every_record_session_changes_only_with_semantic_route_version() {
+    use sha2::{Digest, Sha256};
+    let sessions = every_record_sessions();
+    // Texts past the route's limits, which the fixtures' texts stay under:
+    // short words reach the keyword count, long words the keywords'
+    // characters, and both the excerpt's.
+    let long_texts = [("w", 1_000), ("keyword", 1_000_000)].map(|(stem, base)| {
+        let mut row = sessions[0].row.clone();
+        row.full_text = (0..3_000)
+            .map(|index| format!("{stem}{} ", base + index % 150 + index % 7))
+            .collect();
+        row
+    });
+    let mut routes = Sha256::new();
+    for row in sessions
+        .iter()
+        .map(|session| &session.row)
+        .chain(&long_texts)
+    {
+        let route = row.semantic_route_text();
+        assert!(
+            !route.is_empty(),
+            "{:?}: the session has a route text",
+            row.source
+        );
+        routes.update(route.len().to_le_bytes());
+        routes.update(route.as_bytes());
+    }
+    assert_eq!(
+        (
+            crate::history::SEMANTIC_ROUTE_VERSION,
+            format!("{:x}", routes.finalize())
+        ),
+        (
+            1,
+            "57a2f17dd4ba85126961b94dde806539c7ca9f6cd1ebb2215db7014e73484120".to_owned()
+        ),
+        "the every-record sessions' route texts change only with a new \
+         SEMANTIC_ROUTE_VERSION: bump it, then record the new digest"
+    );
+}
+
 /// A rename the cache's change detector cannot see, such as a rewritten
 /// sidecar or index, still reaches the next load: a warm load would
 /// otherwise restore the old name from the cache indefinitely.
@@ -1766,7 +1814,7 @@ fn session_reached_through_two_spellings_of_root_lists_once() {
 /// currency on one connection to the session cache.
 #[test]
 fn viewer_reads_listed_rows_copy_on_one_connection() {
-    run_contract(Contract::RootSpelling, |fixture| {
+    run_contract(Contract::ViewerReadConnections, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         fixture.write_every_record_session(home.path(), &fixture.every_record_session());

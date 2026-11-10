@@ -13,16 +13,22 @@ use rusqlite::Connection;
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use std::ops::ControlFlow;
 
+/// Each stored field with its number in the `search_field` columns. Semantic
+/// text has no stored field.
+const STORED_FIELDS: [(SearchField, i64); 4] = [
+    (SearchField::Full, 0),
+    (SearchField::Agent, 1),
+    (SearchField::Thinking, 2),
+    (SearchField::Supplement, 4),
+];
+
 impl SearchField {
     /// The field's number in the `search_field` columns.
     pub(super) fn code(self) -> i64 {
-        match self {
-            Self::Full => 0,
-            Self::Agent => 1,
-            Self::Thinking => 2,
-            Self::Supplement => 4,
-            Self::Semantic => unreachable!("semantic text has no stored field"),
-        }
+        STORED_FIELDS
+            .iter()
+            .find_map(|&(field, code)| (field == self).then_some(code))
+            .expect("semantic text has no stored field")
     }
 }
 
@@ -30,9 +36,9 @@ impl SearchField {
 impl FromSql for SearchField {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         let code = value.as_i64()?;
-        [Self::Full, Self::Agent, Self::Thinking, Self::Supplement]
-            .into_iter()
-            .find(|field| field.code() == code)
+        STORED_FIELDS
+            .iter()
+            .find_map(|&(field, stored)| (stored == code).then_some(field))
             .ok_or(FromSqlError::OutOfRange(code))
     }
 }
@@ -242,9 +248,10 @@ mod tests {
 
     /// One session's read, and a write moving its search places, cost what
     /// the session holds, not what the cache holds, only while each statement
-    /// reads through an index, without sorting. The sub-agent metadata read
-    /// uses the index of those parts alone; a windowed read or scan reads a
-    /// run of messages' parts through `parts_by_message`.
+    /// reads through an index, without sorting: those two through
+    /// `parts_by_session`. The sub-agent metadata read uses the index of
+    /// those parts alone; a windowed read or scan reads a run of messages'
+    /// parts through `parts_by_message`.
     #[test]
     fn each_statement_on_one_sessions_parts_reads_through_an_index_without_sorting() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
@@ -253,13 +260,13 @@ mod tests {
             .unwrap();
         for fields in [SearchedFields::List, SearchedFields::Agent] {
             for (query, index) in [
-                (parts_query(fields), "parts_by_message"),
+                (parts_query(fields), "parts_by_session"),
                 (parts_of_messages_query(fields), "parts_by_message"),
                 (SUBAGENT_METADATA_READ.to_owned(), "parts_outside_entries"),
                 (parts_of_messages(fields), "parts_by_message"),
                 (
                     super::super::entries::SHIFT_SEARCH_PLACES.to_owned(),
-                    "parts_by_message",
+                    "parts_by_session",
                 ),
             ] {
                 let mut statement = connection

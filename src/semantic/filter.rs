@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_turn_gives_reference_implementations_output_for_every_input() {
+    fn filter_turn_gives_reference_implementations_output_for_fast_path_turns_and_fixture_texts() {
         let texts = every_record_texts();
         assert!(
             texts.len() > 100,

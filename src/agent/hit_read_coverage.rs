@@ -16,10 +16,12 @@ use crate::agent::retrieval::{
     segment_texts,
 };
 use crate::agent::search::{
-    AgentSearchRequest, AgentSearchScope, SearchedTranscript, exact_phrase_query,
+    AgentSearchRequest, AgentSearchScope, SearchedTranscript, SessionReader, exact_phrase_query,
     format_agent_output, run_global_lexical_search_reporting,
 };
-use crate::agent::service::{lexically_rank_scoped, read_hit_messages, retrieval_terms};
+use crate::agent::service::{
+    ScopedSessions, lexically_rank_scoped, read_hit_messages, retrieval_terms,
+};
 use crate::agent::time_span::TimeSpan;
 use crate::agent::transcript::AgentTranscript;
 use crate::clock::{Clock, TestClock};
@@ -35,8 +37,8 @@ use std::sync::Mutex;
 
 /// Queries drawn from each kind of term, at most this many of each.
 const QUERIES_PER_KIND: usize = 10;
-/// The cases of each session and window whose hit messages the real scan
-/// selects too, at most.
+/// The most cases per session and window that are also run through the real
+/// scan, to compare its hit messages with the counter's.
 const SCANNED_CASES_PER_WINDOW: usize = 2;
 
 #[test]
@@ -141,8 +143,10 @@ fn literal_ending_in_space_selects_message_whose_text_ends_in_it() {
     let ranking = lexically_rank_scoped(
         &sessions.rows,
         "\"needle \"",
-        &[0],
-        AgentSearchScope::Global,
+        ScopedSessions {
+            indices: &[0],
+            scope: AgentSearchScope::Global,
+        },
         SearchMode::Exact,
         &TimeFilter::default(),
         &TestClock::default(),
@@ -255,8 +259,10 @@ fn hit_messages_hold_every_message_retrieval_finds_for_every_agent() {
             let ranking = lexically_rank_scoped(
                 conversations,
                 query,
-                &[0],
-                AgentSearchScope::Global,
+                ScopedSessions {
+                    indices: &[0],
+                    scope: AgentSearchScope::Global,
+                },
                 mode,
                 &window,
                 &clock,
@@ -348,8 +354,10 @@ fn session_replaced_after_ranking_reads_hit_messages_of_its_new_copy() {
     let ranking = lexically_rank_scoped(
         &conversations,
         &word,
-        &[0],
-        AgentSearchScope::Global,
+        ScopedSessions {
+            indices: &[0],
+            scope: AgentSearchScope::Global,
+        },
         SearchMode::Lexical,
         &TimeFilter::default(),
         &clock,
@@ -415,8 +423,10 @@ impl SearchCase<'_> {
         let ranking = lexically_rank_scoped(
             self.conversations,
             self.query,
-            &[0],
-            AgentSearchScope::Global,
+            ScopedSessions {
+                indices: &[0],
+                scope: AgentSearchScope::Global,
+            },
             request.mode(),
             &self.window,
             self.clock,
@@ -430,22 +440,24 @@ impl SearchCase<'_> {
             self.conversations,
             keys,
             &ranking.ranked,
-            |index, key| {
-                let hits = ranking.hit_messages.of(index).expect("the scan counted it");
-                let searched = read_hit_messages(
-                    self.clock as &dyn Clock,
-                    &wait,
-                    &ranking,
-                    &self.conversations[index],
-                    hits,
-                    key,
-                )?
-                .expect("the cache holds the session");
-                *read.lock().unwrap() =
-                    Some((searched.transcript.messages.len(), searched.message_count));
-                Ok(Some(searched))
+            SessionReader {
+                read: |index, key: &AgentConversationKey| {
+                    let hits = ranking.hit_messages.of(index).expect("the scan counted it");
+                    let searched = read_hit_messages(
+                        self.clock as &dyn Clock,
+                        &wait,
+                        &ranking,
+                        &self.conversations[index],
+                        hits,
+                        key,
+                    )?
+                    .expect("the cache holds the session");
+                    *read.lock().unwrap() =
+                        Some((searched.transcript.messages.len(), searched.message_count));
+                    Ok(Some(searched))
+                },
+                bytes: |_, key: &AgentConversationKey| key.transcript_bytes,
             },
-            |_, key| key.transcript_bytes,
             None,
         )
         .unwrap();
@@ -454,8 +466,12 @@ impl SearchCase<'_> {
             self.conversations,
             keys,
             &ranking.ranked,
-            |_, _| Ok(Some(SearchedTranscript::from(self.whole.clone()))),
-            |_, key| key.transcript_bytes,
+            SessionReader {
+                read: |_, _: &AgentConversationKey| {
+                    Ok(Some(SearchedTranscript::from(self.whole.clone())))
+                },
+                bytes: |_, key: &AgentConversationKey| key.transcript_bytes,
+            },
             None,
         )
         .unwrap();

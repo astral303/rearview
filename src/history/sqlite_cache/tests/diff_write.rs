@@ -270,8 +270,8 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         (
             "parts",
             "SELECT e.sequence, p.part, p.kind, p.search_field, p.entry_sequence, \
-             p.message_ordinal, p.search_position, p.text, p.text_codes, p.call_id, p.name, p.tool, p.json, \
-             p.result_shape FROM parts p \
+             p.message_ordinal, p.search_position, p.text, p.text_codes, p.call_id, p.name, \
+             p.tool, p.json, p.result_shape FROM parts p \
              JOIN entries e ON e.id = p.entry WHERE e.session = ?1 ORDER BY 1, 2"
                 .to_owned(),
         ),

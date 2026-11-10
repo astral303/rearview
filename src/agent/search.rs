@@ -663,6 +663,17 @@ pub fn run_within_search(
     output
 }
 
+/// A global search's reads of one ranked session, each given the session's
+/// index in the conversations and its key.
+pub struct SessionReader<Read, Bytes> {
+    /// The session's hit messages, or its whole transcript; `None` when its
+    /// session left the session cache.
+    pub read: Read,
+    /// About how many bytes `read` reads, for the read-ahead limit; `None`
+    /// when unknown.
+    pub bytes: Bytes,
+}
+
 #[cfg(test)]
 pub fn run_global_lexical_search(
     request: &AgentSearchRequest,
@@ -676,8 +687,12 @@ pub fn run_global_lexical_search(
         conversations,
         keys,
         ranked_indices,
-        |_, key| load_transcript(key).map(|transcript| Some(transcript.into())),
-        |_, key| key.transcript_bytes,
+        SessionReader {
+            read: |_, key: &AgentConversationKey| {
+                load_transcript(key).map(|transcript| Some(transcript.into()))
+            },
+            bytes: |_, key: &AgentConversationKey| key.transcript_bytes,
+        },
         None,
     )
     .map(|run| run.output)
@@ -688,10 +703,7 @@ pub fn run_global_lexical_search(
 /// With a window, a session without hits inside it does not take a place on
 /// the page: the next-ranked session is searched in its place. `reads`, when
 /// collecting, records the time spent matching the searched transcripts.
-/// `read_session` reads the conversation at an index of `conversations`: its
-/// hit messages, or its whole transcript; `None` when its session left the
-/// session cache. `read_bytes` is about how many bytes that read reads, for
-/// the read-ahead bound; `None` when unknown.
+/// `reader` reads the ranked sessions.
 ///
 /// Transcripts are read and searched on several threads, each as soon as it
 /// is read, but their hits are taken in rank order, so the stop rule and the
@@ -701,10 +713,16 @@ pub fn run_global_lexical_search_reporting(
     conversations: &[Conversation],
     keys: &[AgentConversationKey],
     ranked_indices: &[usize],
-    read_session: impl Fn(usize, &AgentConversationKey) -> Result<Option<SearchedTranscript>> + Sync,
-    read_bytes: impl Fn(usize, &AgentConversationKey) -> Option<u64> + Sync,
+    reader: SessionReader<
+        impl Fn(usize, &AgentConversationKey) -> Result<Option<SearchedTranscript>> + Sync,
+        impl Fn(usize, &AgentConversationKey) -> Option<u64> + Sync,
+    >,
     reads: Option<&SearchReads>,
 ) -> Result<LexicalSearchRun> {
+    let SessionReader {
+        read: read_session,
+        bytes: read_bytes,
+    } = reader;
     let mode = request.mode();
     let retrieval_mode = match mode {
         SearchMode::Exact => SearchMode::Exact,
@@ -3570,16 +3588,18 @@ mod tests {
             &conversations,
             &keys,
             &ranked,
-            |_, key| {
-                if key.path == unreadable {
-                    Err(AppError::Io(std::io::Error::other("unreadable")))
-                } else if key.path == left_cache {
-                    Ok(None)
-                } else {
-                    Ok(Some(needle_transcript().into()))
-                }
+            SessionReader {
+                read: |_, key: &AgentConversationKey| {
+                    if key.path == unreadable {
+                        Err(AppError::Io(std::io::Error::other("unreadable")))
+                    } else if key.path == left_cache {
+                        Ok(None)
+                    } else {
+                        Ok(Some(needle_transcript().into()))
+                    }
+                },
+                bytes: |_, key: &AgentConversationKey| key.transcript_bytes,
             },
-            |_, key| key.transcript_bytes,
             None,
         )
         .unwrap();
@@ -3590,14 +3610,16 @@ mod tests {
                 .iter()
                 .map(|(key, _)| &key.path)
                 .collect::<Vec<_>>(),
-            [&unreadable]
+            [&unreadable],
+            "the unreadable session is a failed read"
         );
         assert_eq!(
             run.left_cache
                 .iter()
                 .map(|key| &key.path)
                 .collect::<Vec<_>>(),
-            [&left_cache]
+            [&left_cache],
+            "the session that left the cache is reported apart"
         );
         assert_eq!(
             output.coverage,
@@ -3606,11 +3628,13 @@ mod tests {
                 offset: 0,
                 searched: 5,
                 failed: 2,
-            })
+            }),
+            "both sessions count as failed, and three more are searched in their places"
         );
+        let formatted = format_agent_output(&output);
         assert!(
-            format_agent_output(&output)
-                .contains("continue search offset=5 mode=lexical action=rerun-with-offset\n")
+            formatted.contains("continue search offset=5 mode=lexical action=rerun-with-offset\n"),
+            "the next page starts after the five sessions searched: {formatted}"
         );
     }
 

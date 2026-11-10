@@ -137,7 +137,7 @@ pub struct CommandPerf {
 
 /// The semantic route texts a semantic search computed from the copies'
 /// texts.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ComputedRoutes {
     count: usize,
     /// Why they were not stored; `None` once stored.
@@ -145,18 +145,20 @@ struct ComputedRoutes {
 }
 
 /// Why computed semantic route texts were not stored.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoutesSkipped {
     /// Another rearview owns the refresh.
     AnotherRearview,
-    WriteFailed,
+    /// The write failed with this error.
+    WriteFailed(String),
 }
 
 impl RoutesSkipped {
-    fn name(self) -> &'static str {
+    /// The `skipped=` value, and the cause when the record carries one.
+    fn record(&self) -> String {
         match self {
-            Self::AnotherRearview => "another-rearview",
-            Self::WriteFailed => "write-failed",
+            Self::AnotherRearview => "skipped=another-rearview".to_owned(),
+            Self::WriteFailed(cause) => format!("skipped=write-failed cause={cause}"),
         }
     }
 }
@@ -292,10 +294,10 @@ impl CommandPerf {
 
     /// One `perf` record per stage in the order they ran; one per round of
     /// the targeted refresh, in order; the semantic route texts computed;
-    /// each agent's discovery, cache and
-    /// refresh, agents in the order they loaded; each
-    /// transcript parsed; a global search's reads and retrieval; the
-    /// `peak_memory` in bytes when the platform reports it; then the total.
+    /// each agent's discovery, cache and refresh, agents in the order they
+    /// loaded; each transcript parsed; a global search's reads and
+    /// retrieval; the `peak_memory` in bytes when the platform reports it;
+    /// then the total.
     pub fn records(&self, peak_memory: Option<u64>) -> String {
         let mut records = String::new();
         for (stage, time) in self
@@ -319,12 +321,12 @@ impl CommandPerf {
         {
             let _ = writeln!(records, "perf refresh-round sessions={sessions}");
         }
-        if let Some(routes) = *self
+        if let Some(routes) = &*self
             .semantic_routes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
         {
-            let _ = match routes.skipped {
+            let _ = match &routes.skipped {
                 None => writeln!(
                     records,
                     "perf semantic-routes computed={0} stored={0}",
@@ -332,9 +334,9 @@ impl CommandPerf {
                 ),
                 Some(skipped) => writeln!(
                     records,
-                    "perf semantic-routes computed={} stored=0 skipped={}",
+                    "perf semantic-routes computed={} stored=0 {}",
                     routes.count,
-                    skipped.name()
+                    skipped.record()
                 ),
             };
         }

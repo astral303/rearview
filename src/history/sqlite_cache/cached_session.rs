@@ -337,8 +337,8 @@ impl CachedSession {
     }
 
     /// The copy's entries as it holds them, with its currency for a row whose
-    /// publication is `publication`, in one read snapshot of `cache`: the
-    /// viewer's read.
+    /// publication is `publication`, in one read snapshot of `cache`, as the
+    /// viewer and the export read them.
     pub(crate) fn entries_with_currency(
         &self,
         cache: &SqliteCache,

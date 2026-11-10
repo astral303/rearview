@@ -78,6 +78,25 @@ impl CachedClaudeSessions {
     pub fn remove(&self, index: usize) {
         self.writer(index).remove();
     }
+
+    /// Row `index`'s session as the cache lists it now.
+    pub fn listed_row(&self, index: usize) -> Conversation {
+        use crate::history::Source;
+        use crate::history::sqlite_cache::{CatalogueSession, SqliteCache};
+        let writer = self.writer(index);
+        let cache = SqliteCache::open(&crate::history::sqlite_cache::tests::rearview_at(
+            self.cache.path(),
+        ))
+        .unwrap();
+        let storage = Source::Claude.provider().storage().cache();
+        let Some(CatalogueSession::Listed(row)) = cache
+            .catalogue_session(storage, Source::Claude, &writer.root(), &writer.name, false)
+            .unwrap()
+        else {
+            panic!("the cache lists the session {}", writer.name)
+        };
+        *row
+    }
 }
 
 /// One session of [`CachedClaudeSessions`], written by another rearview.
@@ -151,6 +170,16 @@ pub fn claude_user_record(text: &str, time: DateTime<Local>) -> serde_json::Valu
         "timestamp": time.to_rfc3339(),
         "message": {"role": "user", "content": text}
     })
+}
+
+/// Claude Code user messages with `texts`, an hour apart from noon on
+/// 10 October.
+pub fn october_messages(texts: &[&str]) -> Vec<serde_json::Value> {
+    texts
+        .iter()
+        .zip(12..)
+        .map(|(text, hour)| claude_user_record(text, october(10, hour)))
+        .collect()
 }
 
 /// `day` October 2026 at `hour`, local time.

@@ -1,4 +1,5 @@
-//! The session cache as the TUI's drawing thread reads it.
+//! The session cache as the TUI reads it while it draws: on its drawing
+//! thread, and on the viewer's read threads.
 //!
 //! The drawing thread reads the cache only through [`InteractiveCache`]: it
 //! does not acquire refresh ownership, write any cache or parse a
@@ -22,20 +23,20 @@ use crate::error::Result;
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-/// The session cache base the TUI's drawing thread reads, and its one way to
-/// read it.
+/// The session cache base the TUI reads while it draws, and the drawing
+/// thread's one way to read it.
 #[derive(Clone, Debug)]
 pub struct InteractiveCache {
     base: CacheBase,
 }
 
-/// A drawing-thread read of a session. Its copy comes out only through
+/// An interactive read of a session. Its copy comes out only through
 /// [`Self::into_read`], with the TUI's next step for it.
 pub struct InteractiveRead<T> {
     read: CachedRead<T>,
 }
 
-/// A drawing-thread read's copy of a session, and the TUI's next step for it
+/// An interactive read's copy of a session, and the TUI's next step for it
 /// when the copy is out of date or missing.
 pub enum CachedRead<T> {
     Current(CurrentCopy<T>),
@@ -44,13 +45,13 @@ pub enum CachedRead<T> {
         next: NextStep,
     },
     /// Missing from the cache, or the cache could not be read within the
-    /// drawing thread's wait.
+    /// interactive wait.
     Missing {
         next: NextStep,
     },
 }
 
-/// A copy the drawing thread read as current for the session's row: the
+/// A copy an interactive read found current for the session's row: the
 /// row's own copy, or an [`AdoptedCopy`]. Only [`InteractiveCache::read`]
 /// makes one.
 pub struct CurrentCopy<T>(T, Option<AdoptedCopy>);

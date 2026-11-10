@@ -112,8 +112,9 @@ pub struct ViewState {
     /// shows, as the list or the last refresh read it. The header shows it
     /// over the copy's catalogue row, which holds the title from its parse.
     pub external_title: Option<crate::history::provider::SessionTitle>,
-    /// The open view's conversation as parsed.
-    pub parsed_conversation: Option<Arc<ParsedConversation>>,
+    /// The open view's conversation as parsed; empty until a file opened
+    /// directly is read.
+    pub parsed_conversation: Arc<ParsedConversation>,
     /// Current scroll position (line offset)
     pub scroll_offset: usize,
     /// Pre-rendered conversation lines
@@ -275,7 +276,8 @@ pub enum ListSearchMode {
 }
 
 impl ViewState {
-    /// The view before its first render: timing off, no frame width yet.
+    /// The view before its first render: an empty conversation, timing off,
+    /// no frame width yet.
     pub(super) fn initial(
         conversation_path: PathBuf,
         conversation_source: Option<crate::history::Source>,
@@ -293,7 +295,7 @@ impl ViewState {
             },
             header: None,
             external_title: None,
-            parsed_conversation: None,
+            parsed_conversation: Arc::new(ParsedConversation::empty()),
             scroll_offset: 0,
             rendered_lines: Vec::new(),
             total_lines: 0,

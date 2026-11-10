@@ -21,9 +21,11 @@ mod hit_messages;
 mod in_memory;
 mod raw;
 mod streamed;
+#[cfg(test)]
+pub(crate) use streamed::hit_messages_of_texts;
 
 pub use hit_messages::{HitMessages, RetrievalTerms, SessionHitMessages};
-pub(crate) use in_memory::{CopiesToRead, SessionsWithoutTexts, TextsRead};
+pub(crate) use in_memory::{CopiesToRead, ReadFailure, SessionsWithoutTexts, TextsRead};
 pub use in_memory::{SearchTextsInMemory, SessionSearchTexts};
 use raw::RawQuery;
 
@@ -330,29 +332,6 @@ impl AgentRanking {
             &RawQuery::new(&words, &[], &self.terms.literals),
         )
     }
-}
-
-/// The hit messages `agent search`'s ranking scan finds for `query` under
-/// `retrieval` among one session's `texts`, each with its message number.
-#[cfg(test)]
-pub(crate) fn hit_messages_of_texts<'t>(
-    query: &str,
-    retrieval: &RetrievalTerms,
-    texts: impl IntoIterator<Item = (Option<usize>, &'t str)>,
-) -> Vec<usize> {
-    let window = TimeFilter::default();
-    let surface = SearchSurface::Agent {
-        window: &window,
-        retrieval,
-        scope: ScanScope::AllWorkspaces,
-    };
-    let terms = CountedTerms::of(&ParsedQuery::parse(query), surface);
-    let words = terms.words();
-    streamed::hit_messages_of_texts(
-        &RawQuery::new(&words, &[], &terms.literals),
-        retrieval,
-        texts,
-    )
 }
 
 /// The conversations `scope` keeps that match `query`, best first, and

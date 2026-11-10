@@ -134,7 +134,7 @@ fn count_stored<C: Borrow<Conversation>>(
     })?;
     let counts = &mut stored.counts;
     let hit_messages = &mut stored.hit_messages;
-    for copy in scanned.missing {
+    for copy in scanned.left_cache {
         counts.remove(&indices[copy]);
         stored.left_cache.insert(indices[copy]);
     }
@@ -216,16 +216,25 @@ fn count_alone(
 /// The position of a session read alone, as [`BodyCounter`] counts it.
 const ALONE: usize = 0;
 
-/// The messages of the texts `texts`, each with its message number, that
-/// hold every term `retrieval` requires of `query`, counted as the scan
-/// counts each text it reads.
+/// The hit messages `agent search`'s ranking scan finds for `query` under
+/// `retrieval` among one session's `texts`, each with its message number,
+/// counted as the scan counts each text it reads.
 #[cfg(test)]
-pub(super) fn hit_messages_of_texts<'t>(
-    query: &RawQuery<'_>,
+pub(crate) fn hit_messages_of_texts<'t>(
+    query: &str,
     retrieval: &RetrievalTerms,
     texts: impl IntoIterator<Item = (Option<usize>, &'t str)>,
 ) -> Vec<usize> {
-    let mut counter = BodyCounter::new(query);
+    let window = TimeFilter::default();
+    let surface = SearchSurface::Agent {
+        window: &window,
+        retrieval,
+        scope: ScanScope::AllWorkspaces,
+    };
+    let terms = CountedTerms::of(&crate::search::query::ParsedQuery::parse(query), surface);
+    let words = terms.words();
+    let query = RawQuery::new(&words, &[], &terms.literals);
+    let mut counter = BodyCounter::new(&query);
     for (ordinal, text) in texts {
         counter.count(ALONE, ordinal, text);
     }
@@ -752,6 +761,49 @@ mod tests {
             ranked(),
             before,
             "the replaced session ranks on its new copy's texts"
+        );
+    }
+
+    #[test]
+    fn session_matching_only_its_project_name_scores_its_body_once_its_texts_are_held() {
+        use crate::search::test_fixtures::{cached_claude_sessions, claude_user_record, october};
+        let sessions = cached_claude_sessions(&[(
+            "talk",
+            vec![claude_user_record("plain words", october(10, 12))],
+        )]);
+        let mut rows = sessions.rows.clone();
+        for row in &mut rows {
+            row.project_name = Some("zebrafish".to_owned());
+        }
+        let searchable = precompute_search_text(&rows);
+        let fields = |texts: &SearchTextsInMemory| {
+            try_debug_search(
+                &rows,
+                &searchable,
+                texts,
+                "zebrafish",
+                october(20, 12),
+                |_| true,
+            )
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|(index, score)| {
+                let names = score.fields.iter().map(|field| field.name).collect();
+                (index, names)
+            })
+            .collect::<Vec<(usize, Vec<&str>)>>()
+        };
+
+        assert_eq!(
+            fields(&SearchTextsInMemory::read(&rows)),
+            [(0, vec!["project", "body"])],
+            "a session holding texts scores its body"
+        );
+        assert_eq!(
+            fields(&SearchTextsInMemory::default()),
+            [(0, vec!["project"])],
+            "a session without texts held scores its project name alone"
         );
     }
 

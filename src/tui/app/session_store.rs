@@ -77,7 +77,7 @@ impl FinishedRefresh {
     }
 }
 
-/// A drawing-thread read's copy of a session, its next step recorded.
+/// An interactive read's copy of a session, its next step recorded.
 pub(super) enum SessionCopy<T> {
     Current(CurrentCopy<T>),
     Older(T),
@@ -189,8 +189,8 @@ impl SessionStore {
         read
     }
 
-    /// Record the next step of `read`, the drawing thread's read of the
-    /// session at `path`, at `now`, and return its copy.
+    /// Record the next step of `read`, an interactive read of the session at
+    /// `path`, at `now`, and return its copy.
     pub(super) fn take_interactive<T>(
         &mut self,
         path: &Path,

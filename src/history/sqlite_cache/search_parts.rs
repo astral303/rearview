@@ -2,7 +2,7 @@
 //! for [`crate::history::Conversation::load_held_content`].
 
 use super::search_texts::visit_texts_within;
-use super::{CachedSession, SearchedFields, entries};
+use super::{SearchedFields, entries};
 use crate::error::Result;
 use crate::history::parser::{normalize_full_text, normalize_whitespace};
 use std::ops::ControlFlow;
@@ -20,17 +20,6 @@ pub(crate) struct SearchPart {
     pub(crate) ordinal: Option<usize>,
     pub(crate) field: SearchField,
     pub(crate) text: String,
-}
-
-impl CachedSession {
-    /// Calls `visit` with each message's semantic text the copy stores, as
-    /// [`visit_search_parts`] does, without the search texts.
-    pub(crate) fn stored_semantic_turns(
-        &self,
-        mut visit: impl FnMut(SearchPart),
-    ) -> Result<Option<()>> {
-        self.read(|connection, session, _| visit_semantic_turns(connection, session, &mut visit))
-    }
 }
 
 /// Calls `visit` with each search text the session row `session` stores in

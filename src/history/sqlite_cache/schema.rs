@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 28;
+pub(super) const SCHEMA_VERSION: u32 = 30;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Tables an earlier version held, dropped before [`TABLES`] when the schema
@@ -170,12 +170,14 @@ CREATE TABLE IF NOT EXISTS session_checkpoints (
     ledger BLOB NOT NULL
 );
 
--- The agent's semantic route text of the session's copy `generation`, as
--- the first semantic search that read the copy computed it from its texts
--- and the row's `custom_title` and `summary`. A search reads it only while
--- the session's generation, title and summary are still these.
+-- The agent's semantic route text of the session's copy `generation`,
+-- computed from its texts and the row's `custom_title` and `summary` by
+-- the route algorithm `version` (`SEMANTIC_ROUTE_VERSION`). A semantic
+-- search or semantic cache generation stores it; a read uses it only while
+-- all four are still these.
 CREATE TABLE IF NOT EXISTS semantic_routes (
     session INTEGER PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
     generation INTEGER NOT NULL,
     custom_title TEXT,
     summary TEXT,
@@ -376,9 +378,12 @@ CREATE TABLE IF NOT EXISTS parts (
     result_shape TEXT,
     UNIQUE (entry, part)
 );
--- One session's parts, and a windowed scan's parts of a run of messages, are
--- read through this index.
+-- A windowed read or scan reads the parts of a run of messages through this
+-- index.
 CREATE INDEX IF NOT EXISTS parts_by_message ON parts (session, message_ordinal);
+-- One session's parts, and a scan of some sessions' parts in each row range,
+-- are read through this index, in the rows' order.
+CREATE INDEX IF NOT EXISTS parts_by_session ON parts (session);
 -- A write of a session's parts outside every entry matches them by `part`.
 CREATE UNIQUE INDEX IF NOT EXISTS parts_outside_entries ON parts (session, part)
     WHERE entry IS NULL;

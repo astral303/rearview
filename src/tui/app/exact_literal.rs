@@ -1,36 +1,33 @@
 //! The semantic search's results for a query of quoted phrases alone: the
-//! lexical search's hits, each marked an exact match, with the first match
-//! of a phrase as its evidence. The search worker builds them from the
-//! texts it holds in memory.
+//! lexical search's hits, each marked an exact match, with the first range
+//! of its lexical evidence as its preview.
 
 use super::SemanticResultMetadata;
 use crate::history::Conversation;
-use crate::search::SearchTextsInMemory;
-use crate::search::literal::Literal;
+use crate::search::LexicalEvidence;
 use crate::search::query::ParsedQuery;
-use crate::search::separated_texts::SeparatedTexts;
 use crate::semantic::types::{
     SemanticChunkIdentity, SemanticChunkSource, SemanticExplanation, SemanticQuality,
     SemanticRationaleKind, SemanticScoreBreakdown,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// The metadata of each of `hits`, indices into `conversations`, for the
-/// quoted-only query `parsed`.
+/// quoted-only query `parsed`, previewing each hit from its entry of
+/// `evidence`.
 pub(super) fn exact_literal_results(
-    conversations: &[Arc<Conversation>],
-    texts: &SearchTextsInMemory,
+    conversations: &[Conversation],
+    evidence: &HashMap<usize, LexicalEvidence>,
     hits: &[usize],
     parsed: &ParsedQuery,
 ) -> HashMap<usize, SemanticResultMetadata> {
     hits.iter()
         .map(|&index| {
             let conversation = &conversations[index];
-            let body = texts
-                .get(conversation)
-                .map_or(conversation.full_text.as_str(), |texts| &**texts.joined());
-            let preview = literal_evidence_preview(conversation, body, parsed);
+            let preview = evidence
+                .get(&index)
+                .and_then(|evidence| first_range_window(conversation, evidence))
+                .unwrap_or_else(|| conversation.preview.clone());
             (
                 index,
                 exact_literal_metadata(conversation, index, parsed, preview),
@@ -39,33 +36,12 @@ pub(super) fn exact_literal_results(
         .collect()
 }
 
-/// The first match of one of `parsed`'s phrases in `conversation`'s title
-/// and summary, then `body`, its search texts, then its project name; the
-/// row's preview when none matches.
-fn literal_evidence_preview(
-    conversation: &Conversation,
-    body: &str,
-    parsed: &ParsedQuery,
-) -> String {
-    let texts = SeparatedTexts::new(conversation.title_and_summary_texts().chain([body]));
-    let project = SeparatedTexts::new(conversation.project_name.as_deref());
-    parsed
-        .literals()
-        .iter()
-        .find_map(|literal| {
-            first_match_window(&texts, literal).or_else(|| first_match_window(&project, literal))
-        })
-        .unwrap_or_else(|| conversation.preview.clone())
-}
-
-/// The first match of `literal` in one of `texts`, with up to 80
-/// characters of the joined text on each side.
-fn first_match_window(texts: &SeparatedTexts<'_>, literal: &Literal) -> Option<String> {
+/// The first of `evidence`'s ranges, with up to 80 characters of its texts
+/// on each side; `None` without a range.
+fn first_range_window(conversation: &Conversation, evidence: &LexicalEvidence) -> Option<String> {
     const CONTEXT_CHARS: usize = 80;
-    let (start, end) = texts.texts().find_map(|(offset, text)| {
-        let &(start, end) = literal.match_ranges(text).first()?;
-        Some((offset + start, offset + end))
-    })?;
+    let &(start, end) = evidence.context_ranges.first()?;
+    let texts = evidence.texts(conversation);
     let prefix_start = texts.start_before(start, CONTEXT_CHARS);
     let suffix_end = texts.start_after(end, CONTEXT_CHARS);
     let mut preview = String::new();

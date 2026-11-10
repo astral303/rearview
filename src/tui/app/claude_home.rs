@@ -387,7 +387,7 @@ pub(crate) fn text_of_file_opened_directly(typed: &Path, environment: &Environme
     );
     app.check_view_resize(80, VIEWPORT);
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(VIEWPORT);
+    app.complete_pending_view_refresh(VIEWPORT, super::test_waits::VIEWER_READ_LANDS);
     viewer_text(&app)
 }
 
@@ -424,7 +424,7 @@ pub(crate) fn viewer_lacks_copy(app: &App) -> bool {
 /// worker runs it, then the viewer's read of what the refresh listed.
 pub(crate) fn recover_viewer(app: &mut App) {
     super::refresh_tests::serve_session_refresh(app);
-    assert!(app.complete_pending_view_refresh(VIEWPORT));
+    assert!(app.complete_pending_view_refresh(VIEWPORT, super::test_waits::VIEWER_READ_LANDS));
 }
 
 /// A list `Ctrl+R` of `app` under `window`, run as the background worker

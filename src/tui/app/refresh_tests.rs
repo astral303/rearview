@@ -876,7 +876,9 @@ fn open_requested_before_completion_check_opens_requested_session() {
 
     app.expire_awaited_refresh_check_for_test();
     app.check_awaited_refresh();
-    assert!(app.finish_pending_open_for_test(80));
+    assert!(crate::tui::app::test_waits::finish_pending_open(
+        &mut app, 80
+    ));
 
     let AppMode::View(state) = app.app_mode() else {
         panic!("a session opens: {:?}", status_text(&app));

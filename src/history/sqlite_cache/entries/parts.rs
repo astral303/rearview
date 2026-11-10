@@ -131,8 +131,8 @@ fn search_only_parts<'a>(
     results.chain(derived)
 }
 
-/// Where search reads a block's own part: `None` for a result with items in
-/// `result_items`. Search reads that result through its
+/// The search place of a block's own part; `None` for a result with items
+/// in `result_items`, which search reads through its
 /// [`SearchOnlyKind::ResultText`] part.
 fn block_place(columns: &Columns<'_>, place: Option<TextPlace>) -> Option<TextPlace> {
     place.filter(|_| columns.result_shape != Some(LOSSLESS_ARRAY))

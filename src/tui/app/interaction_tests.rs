@@ -701,7 +701,9 @@ fn pending_open_reads_session_off_drawing_thread_then_enters_viewer() {
         "the list shows Opening… while the read runs"
     );
 
-    assert!(app.finish_pending_open_for_test(80));
+    assert!(crate::tui::app::test_waits::finish_pending_open(
+        &mut app, 80
+    ));
     assert!(matches!(app.app_mode(), AppMode::View(_)));
     assert!(!app.is_opening());
     assert!(!app.complete_pending_open(80, Duration::ZERO));
@@ -731,12 +733,14 @@ fn pending_open_opens_requested_session_after_list_reorders() {
         generation: app.search_generation,
         mode: ListSearchMode::Lexical,
         evidence: std::collections::HashMap::new(),
-        exact_literal_results: None,
+        is_exact_literal: false,
     })
     .unwrap();
     assert!(app.receive_search_results());
     assert_eq!(app.selected(), Some(0));
-    assert!(app.finish_pending_open_for_test(80));
+    assert!(crate::tui::app::test_waits::finish_pending_open(
+        &mut app, 80
+    ));
 
     let AppMode::View(view) = app.app_mode() else {
         panic!("the pending open did not enter the viewer");
@@ -1883,7 +1887,7 @@ fn file_opened_by_non_canonical_path_shows_and_copies_path_as_typed() {
         environment,
     );
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(20);
+    app.complete_pending_view_refresh(20, super::test_waits::VIEWER_READ_LANDS);
     app.set_clipboard_writer_for_test(record_copied_text);
 
     press(&mut app, KeyCode::Char('p'));
@@ -1931,15 +1935,12 @@ fn file_opened_directly_canonicalises_typed_path_once_and_its_root() {
     );
 
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(20);
+    app.complete_pending_view_refresh(20, super::test_waits::VIEWER_READ_LANDS);
 
     let AppMode::View(state) = app.app_mode() else {
         unreachable!()
     };
-    assert!(
-        state.parsed_conversation.is_some() && !state.is_copy_missing,
-        "the viewer reads the session"
-    );
+    assert!(!state.is_copy_missing, "the viewer reads the session");
     assert_eq!(
         canonicaliser.canonicalised(),
         [transcript, home.root().path, cache_directory],

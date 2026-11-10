@@ -440,6 +440,11 @@ fn run_with(
             }
         }
         eprintln!();
+        for conversation in &conversations {
+            if let Some(failure) = texts.read_failure(conversation) {
+                eprintln!("unreadable: {} ({failure})", conversation.path.display());
+            }
+        }
 
         for (rank, (idx, debug)) in results.iter().take(30).enumerate() {
             let conv = &conversations[*idx];
