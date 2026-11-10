@@ -13,7 +13,12 @@ use rayon::prelude::*;
 use std::borrow::{Borrow, Cow};
 use std::sync::Arc;
 
+mod in_memory;
+mod raw;
 mod streamed;
+
+pub use in_memory::{SearchTextsInMemory, SessionSearchTexts};
+use raw::RawQuery;
 
 /// Precomputed search data for a conversation
 #[derive(Clone)]
@@ -226,7 +231,31 @@ pub fn try_search<C: Borrow<Conversation> + Sync>(
     query: &str,
     now: DateTime<Local>,
 ) -> Result<Vec<usize>> {
-    search_with_surface(conversations, searchable, query, now, SearchSurface::List)
+    try_search_with_texts(
+        conversations,
+        searchable,
+        &SearchTextsInMemory::default(),
+        query,
+        now,
+    )
+}
+
+/// [`try_search`], scanning the texts `texts` holds in memory; a session
+/// whose texts it does not hold yet reads them from the session cache.
+pub fn try_search_with_texts<C: Borrow<Conversation> + Sync>(
+    conversations: &[C],
+    searchable: &[SearchableConversation],
+    texts: &SearchTextsInMemory,
+    query: &str,
+    now: DateTime<Local>,
+) -> Result<Vec<usize>> {
+    search_with_surface(
+        conversations,
+        searchable,
+        query,
+        now,
+        SearchSurface::List(texts),
+    )
 }
 
 #[cfg(test)]
@@ -257,21 +286,30 @@ pub fn try_agent_search(
 /// The texts a search matches.
 #[derive(Clone, Copy)]
 enum SearchSurface<'w> {
-    /// The session list's: the conversation's text and its project name.
-    List,
+    /// The session list's: the conversation's text and its project name,
+    /// read from memory for each session whose texts are held there.
+    List(&'w SearchTextsInMemory),
     /// `agent search`'s: also sub-agents' text, thinking and tool calls; with
     /// the window active, only the text of the messages inside it.
     Agent(&'w TimeFilter),
 }
 
-impl SearchSurface<'_> {
+impl<'w> SearchSurface<'w> {
     fn literal_corpus<C: Borrow<Conversation> + Sync>(
         self,
         conversations: &[C],
     ) -> Vec<LiteralCorpusEntry> {
         match self {
-            Self::List => build_literal_corpus(conversations),
+            Self::List(_) => build_literal_corpus(conversations),
             Self::Agent(window) => build_agent_literal_corpus(conversations, window),
+        }
+    }
+
+    /// `conversation`'s texts held in memory, for the session list's search.
+    fn texts_in_memory(self, conversation: &Conversation) -> Option<&'w SessionSearchTexts> {
+        match self {
+            Self::List(texts) => texts.get(conversation),
+            Self::Agent(_) => None,
         }
     }
 
@@ -319,12 +357,21 @@ pub fn debug_search(
     now: DateTime<Local>,
     scope: impl Fn(usize) -> bool + Sync,
 ) -> LexicalDebugSearch {
-    try_debug_search(conversations, searchable, query, now, scope).expect("in-memory search")
+    try_debug_search(
+        conversations,
+        searchable,
+        &SearchTextsInMemory::default(),
+        query,
+        now,
+        scope,
+    )
+    .expect("in-memory search")
 }
 
 pub fn try_debug_search(
     conversations: &[Conversation],
     searchable: &[SearchableConversation],
+    texts: &SearchTextsInMemory,
     query: &str,
     now: DateTime<Local>,
     scope: impl Fn(usize) -> bool + Sync,
@@ -334,7 +381,7 @@ pub fn try_debug_search(
         searchable,
         query,
         now,
-        SearchSurface::List,
+        SearchSurface::List(texts),
         scope,
     )
 }
@@ -361,6 +408,7 @@ fn exact_debug_results<C: Borrow<Conversation> + Sync>(
 ) -> Result<Vec<(usize, ScoreDebug)>> {
     let corpus = surface.literal_corpus(conversations);
     let ranked_time = |index: usize| surface.ranked_time(conversations[index].borrow());
+    let query = RawQuery::new(&[], &[], literals);
     let mut matching = conversations
         .par_iter()
         .enumerate()
@@ -370,7 +418,7 @@ fn exact_debug_results<C: Borrow<Conversation> + Sync>(
             }
             let row = conversation.borrow();
             let matches = if row.cached_session.is_some() {
-                streamed::collect(row, surface, &[], &[], literals)?.matches_literals()
+                streamed::collect(row, surface, &query)?.matches_literals()
             } else {
                 matches_all_literals(&corpus[index].text, literals)
             };
@@ -474,6 +522,7 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
     } else {
         vec![]
     };
+    let raw_query = RawQuery::new(&query_words, &adjacent_pairs, &literal_filters);
 
     let mut scored: Vec<(usize, ScoreDebug, DateTime<Local>)> = searchable
         .par_iter()
@@ -484,13 +533,7 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
             let row = conversations[s.index].borrow();
             let time = surface.ranked_time(row);
             if row.cached_session.is_some() {
-                let counts = streamed::collect(
-                    row,
-                    surface,
-                    &query_words,
-                    &adjacent_pairs,
-                    &literal_filters,
-                )?;
+                let counts = streamed::collect(row, surface, &raw_query)?;
                 let include_project =
                     !matches!(surface, SearchSurface::Agent(window) if window.is_active());
                 return Ok(streamed::score(

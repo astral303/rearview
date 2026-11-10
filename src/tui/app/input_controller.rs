@@ -317,17 +317,15 @@ impl App {
                 None
             }
             KeyCode::Char('p') => {
-                if let AppMode::View(ref state) = self.app_mode {
-                    self.status_message = Some((
-                        state.conversation_path.display().to_string(),
-                        self.clock().now(),
-                    ));
+                if let Some(path) = self.open_session_path_text() {
+                    self.status_message = Some((path, self.clock().now()));
                 }
                 None
             }
             KeyCode::Char('Y') => {
-                let path = state.conversation_path.display().to_string();
-                self.copy_to_clipboard("Path", &path);
+                if let Some(path) = self.open_session_path_text() {
+                    self.copy_to_clipboard("Path", &path);
+                }
                 None
             }
             KeyCode::Char('I') => {

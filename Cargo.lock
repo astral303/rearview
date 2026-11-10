@@ -2526,6 +2526,7 @@ dependencies = [
  "home",
  "indicatif 0.17.11",
  "libc",
+ "memchr",
  "nix",
  "ort",
  "pulldown-cmark",

@@ -584,7 +584,10 @@ fn file_opened_directly_doesnt_read_on_drawing_thread_while_another_process_writ
     mark_every_session_writing(base.path());
     let other = AnotherRearviewsOwner::hold(base.path());
     let mut app = App::new_single_file(
-        row.path.clone(),
+        DirectFile {
+            typed: row.path.clone(),
+            canonical: row.path.clone(),
+        },
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),

@@ -411,9 +411,7 @@ pub(crate) struct SubagentContribution {
 impl SubagentContribution {
     /// Raw text pieces omitted by the dialogue splice: titles, searchable
     /// metadata and nested progress. Keep boundaries and normalise on read.
-    pub(crate) fn search_parts<'a>(
-        entries: impl IntoIterator<Item = &'a LogEntry>,
-    ) -> Vec<(bool, String)> {
+    pub(crate) fn search_parts<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Vec<String> {
         let mut builder = ConversationBuilder {
             keeps_only_text_outside_turns: true,
             ..Default::default()
@@ -426,13 +424,7 @@ impl SubagentContribution {
         leading
             .into_iter()
             .chain(builder.full_text.into_parts())
-            .map(|text| (true, text))
-            .chain(
-                builder
-                    .agent_search_text
-                    .into_parts()
-                    .map(|text| (false, text)),
-            )
+            .chain(builder.agent_search_text.into_parts())
             .collect()
     }
 

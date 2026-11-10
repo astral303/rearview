@@ -834,3 +834,124 @@ fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
 
     assert_eq!(app.idle_wait(), Duration::from_secs(3));
 }
+
+/// Session `a` of `home`, titled `Named session`, cached by a load of its
+/// root through the returned environment. Returns its transcript.
+fn cached_titled_session(home: &ClaudeHome) -> (PathBuf, Environment) {
+    let transcript = home.write("a", 5, &["a question"]);
+    let title = r#"{"type":"custom-title","customTitle":"Named session","sessionId":"a"}"#;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    std::io::Write::write_all(&mut file, format!("{title}\n").as_bytes()).unwrap();
+    let environment = home.environment();
+    home.rows(&environment);
+    (transcript, environment)
+}
+
+/// The spellings of `transcript` a user may type: discovery's, one through a
+/// `..` component, and its canonical path when that differs from discovery's
+/// (on Windows the verbatim `\\?\` form).
+fn typed_spellings(transcript: &Path) -> Vec<PathBuf> {
+    let project = transcript.parent().unwrap();
+    let mut spellings = vec![
+        transcript.to_path_buf(),
+        project
+            .join("..")
+            .join(project.file_name().unwrap())
+            .join(transcript.file_name().unwrap()),
+    ];
+    let canonical = std::fs::canonicalize(transcript).unwrap();
+    if canonical != transcript {
+        spellings.push(canonical);
+    }
+    spellings
+}
+
+/// The file at `typed` opened directly in `environment`, its read shown.
+fn opened_directly_as(typed: &Path, environment: Environment) -> App {
+    let file = DirectFile::resolve(typed.to_path_buf(), environment.canonicaliser()).unwrap();
+    let mut app = App::new_single_file(
+        file,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        environment,
+    );
+    app.serve_direct_file_read();
+    app.complete_pending_view_refresh(VIEWPORT);
+    app.check_view_resize(80, VIEWPORT);
+    app
+}
+
+/// The viewer header's first line, as the frame draws it.
+fn header_line(app: &App) -> String {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, VIEWPORT as u16)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::ui::render(frame, app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, 0)].symbol())
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+#[test]
+fn cached_session_opened_directly_shows_its_header_whatever_spelling() {
+    let home = ClaudeHome::new();
+    let (transcript, environment) = cached_titled_session(&home);
+    let opened_from_list = viewer_on(&home);
+    let expected = header_line(&opened_from_list);
+    assert!(
+        expected.contains("Named session"),
+        "the header of the session opened from the list shows its title: {expected:?}"
+    );
+
+    for typed in typed_spellings(&transcript) {
+        let app = opened_directly_as(&typed, environment.clone());
+
+        assert_eq!(
+            header_line(&app),
+            expected,
+            "the header shows the session's title, project and dates, opened as {typed:?}"
+        );
+    }
+}
+
+#[test]
+fn refresh_of_cached_session_opened_directly_updates_viewer_whatever_spelling() {
+    let home = ClaudeHome::new();
+    let (transcript, environment) = cached_titled_session(&home);
+
+    for (index, typed) in typed_spellings(&transcript).iter().enumerate() {
+        let mut app = opened_directly_as(typed, environment.clone());
+        let follow_up = format!("follow-up {index}");
+        home.append(&transcript, 6 + index as u32, &follow_up);
+        let messages = 2 + index;
+
+        press_refresh(&mut app);
+
+        assert!(
+            view_text(&app).contains(&follow_up),
+            "the viewer shows the refreshed message, opened as {typed:?}"
+        );
+        let counts: Vec<usize> = app
+            .conversations()
+            .iter()
+            .map(|row| row.message_count)
+            .collect();
+        assert_eq!(
+            counts,
+            vec![messages],
+            "the list's one row is the refreshed session, opened as {typed:?}"
+        );
+        assert!(
+            header_line(&app).contains(&format!("{messages} messages")),
+            "the header shows the refreshed message count, opened as {typed:?}"
+        );
+    }
+}

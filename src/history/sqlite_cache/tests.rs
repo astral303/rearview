@@ -9,6 +9,7 @@ mod bounded;
 mod file_keys;
 mod lifecycle;
 mod message_schema;
+mod search_texts;
 mod sources;
 
 const CACHE_KEY: &str = "every-record";

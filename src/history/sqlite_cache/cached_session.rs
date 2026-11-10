@@ -26,7 +26,24 @@ pub struct CachedSession {
     pub(super) checks_source: bool,
 }
 
+/// One copy of a session in the cache. A refresh that rewrites the session
+/// writes a copy with another key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CopyKey {
+    root: PathBuf,
+    cache_key: String,
+    generation: i64,
+}
+
 impl CachedSession {
+    pub(crate) fn copy_key(&self) -> CopyKey {
+        CopyKey {
+            root: self.root.clone(),
+            cache_key: self.cache_key.clone(),
+            generation: self.generation,
+        }
+    }
+
     /// Other message bodies contain only the context needed to render this
     /// range's links, handles and header. Do not render outside `range`.
     pub(crate) fn agent_range(

@@ -1152,10 +1152,14 @@ fn export_after_transcript_grew_waits_for_newest_messages() {
     );
 }
 
-/// The TUI showing the file at `path` opened directly, in `environment`.
+/// The TUI showing the file at `path` opened directly, typed as the cache
+/// finds it, in `environment`.
 fn opened_directly(path: &Path, environment: Environment) -> Runtime {
     let app = App::new_single_file(
-        path.to_path_buf(),
+        DirectFile {
+            typed: path.to_path_buf(),
+            canonical: path.to_path_buf(),
+        },
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),

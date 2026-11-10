@@ -142,7 +142,7 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     assert_ne!(previous, replacement);
 
     assert!(
-        matches!(entries::write(&mut older.connection, previous, old.entries.as_ref().unwrap().as_ref().unwrap(), &|| Ok(()), &owner), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
+        matches!(entries::write(&mut older.connection, previous, old.entries.as_ref().unwrap().as_ref().unwrap(), &std::collections::HashSet::new(), &|| Ok(()), &owner), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
     );
     assert!(
         matches!(older.set_final_status(previous, SessionStatus::Listed, None), Err(AppError::SessionCacheSuperseded(id)) if id == previous)

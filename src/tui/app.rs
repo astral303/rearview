@@ -42,7 +42,7 @@ use search_state::{
 };
 #[allow(unused_imports)]
 pub use types::{
-    Action, AppMode, CountHighlight, DialogMode, Focus, LIST_LINES_PER_ITEM, ListScope,
+    Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, LIST_LINES_PER_ITEM, ListScope,
     ListSearchMode, LoadingState, OpenSessionStatus, SemanticProgress, SemanticResultMetadata,
     TuiSearchOptions, ViewSearchMode, ViewState, list_lines_per_item,
 };
@@ -95,6 +95,9 @@ pub struct App {
     /// The entries of the file opened directly outside every provider's
     /// session roots, as the background worker last parsed them, for exports
     opened_file_entries: Option<crate::history::DisplayEntries>,
+    /// In single-file mode, the file's path as the user typed it. The view's
+    /// `conversation_path` holds the path the cache finds the file by.
+    opened_file_typed_path: Option<PathBuf>,
     /// Configurable keybindings
     keys: KeyBindings,
     /// Whether workspace filter is active (only show current project's conversations)
@@ -272,6 +275,7 @@ impl App {
             single_file_mode: parts.single_file_mode,
             direct_file_read: None,
             opened_file_entries: None,
+            opened_file_typed_path: None,
             keys: parts.keys,
             workspace_filter: parts.workspace_filter,
             workspace: parts.workspace,
@@ -446,19 +450,25 @@ impl App {
         })
     }
 
-    /// Create an app for viewing the file at `path`, reading `environment`.
-    /// It parses nothing: the viewer shows `Loading…` until the background
-    /// worker reads the file (see [`Self::begin_direct_file_read`]).
+    /// Create an app for viewing `file`, reading `environment`. It parses
+    /// nothing: the viewer shows `Loading…` until the background worker
+    /// reads the file (see [`Self::begin_direct_file_read`]).
     pub fn new_single_file(
-        path: PathBuf,
+        file: DirectFile,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         keys: KeyBindings,
         environment: Environment,
     ) -> Self {
         let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
-        let mut view =
-            ViewState::initial(path, None, None, Vec::new(), tool_display, show_thinking);
+        let mut view = ViewState::initial(
+            file.canonical,
+            None,
+            None,
+            Vec::new(),
+            tool_display,
+            show_thinking,
+        );
         view.parsed_conversation = Some(Arc::new(crate::tui::viewer::ParsedConversation::empty()));
         view.is_copy_missing = true;
         let conversations = Vec::new();
@@ -484,10 +494,12 @@ impl App {
             environment,
         });
         app.direct_file_read = Some(DirectFileJob::Requested);
+        app.opened_file_typed_path = Some(file.typed);
         app
     }
 
-    /// [`Self::new_single_file`] with its read of the file served (see
+    /// [`Self::new_single_file`] for the file at `path`, typed as the cache
+    /// finds it, with its read of the file served (see
     /// [`Self::serve_direct_file_read`]) and shown in a viewport 20 rows
     /// high.
     #[cfg(test)]
@@ -499,7 +511,11 @@ impl App {
         environment: Environment,
     ) -> Self {
         const VIEWPORT: usize = 20;
-        let mut app = Self::new_single_file(path, tool_display, show_thinking, keys, environment);
+        let file = DirectFile {
+            typed: path.clone(),
+            canonical: path,
+        };
+        let mut app = Self::new_single_file(file, tool_display, show_thinking, keys, environment);
         app.serve_direct_file_read();
         app.complete_pending_view_refresh(VIEWPORT);
         app
@@ -966,6 +982,9 @@ mod interaction_tests;
 
 #[cfg(test)]
 mod refresh_tests;
+
+#[cfg(test)]
+mod search_texts_tests;
 
 #[cfg(test)]
 mod drawing_thread_tests;

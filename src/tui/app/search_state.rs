@@ -2,13 +2,15 @@ use super::{App, ListSearchMode, SemanticProgress, SemanticResultMetadata};
 use crate::clock::Clock;
 use crate::history::Conversation;
 use crate::history::listing::SessionOrigin;
+use crate::history::sqlite_cache::{CachedSession, CopyKey};
 use crate::search::query::ParsedQuery;
-use crate::search::{self, SearchableConversation};
+use crate::search::{self, SearchTextsInMemory, SearchableConversation, SessionSearchTexts};
 use crate::semantic::types::SemanticCancellationToken;
 use crate::tui::semantic_worker::{
     SemanticSearchMessage, SemanticWorkerCommand, spawn_semantic_worker,
 };
-use chrono::Local;
+use chrono::{DateTime, Local};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +67,10 @@ pub(super) enum SearchCommand {
     },
 }
 
+/// The text reader's read of a copy's search texts; `None` when the read
+/// failed or the cache no longer holds the copy.
+type TextsRead = (CopyKey, Option<Arc<SessionSearchTexts>>);
+
 pub(super) struct SearchResponse {
     pub(super) error: Option<String>,
     pub(super) filtered: Vec<usize>,
@@ -73,7 +79,95 @@ pub(super) struct SearchResponse {
     pub(super) evidence: HashMap<usize, search::LexicalEvidence>,
 }
 
-/// Start the search worker, ranking freshness against `clock`'s time.
+/// A search the worker runs once it has applied every command waiting.
+struct SearchRequest {
+    query: String,
+    generation: u64,
+    mode: ListSearchMode,
+}
+
+/// What the search worker searches: the rows, their search data, and the
+/// search texts read into memory so far.
+struct SearchWorkerState {
+    conversations: Arc<Vec<Arc<Conversation>>>,
+    searchable: Arc<Vec<SearchableConversation>>,
+    texts: SearchTextsInMemory,
+    copies_to_read: mpsc::Sender<Vec<CachedSession>>,
+    texts_read: mpsc::Receiver<TextsRead>,
+}
+
+impl SearchWorkerState {
+    /// Applies `command`, returning the search it asks for.
+    fn apply(&mut self, command: SearchCommand) -> Option<SearchRequest> {
+        match command {
+            SearchCommand::UpdateData {
+                conversations,
+                searchable,
+            } => {
+                self.hold_texts_read();
+                let to_read = self.texts.keep_copies_of(&conversations);
+                if !to_read.is_empty() {
+                    let _ = self.copies_to_read.send(to_read);
+                }
+                self.conversations = conversations;
+                self.searchable = searchable;
+                None
+            }
+            SearchCommand::Search {
+                query,
+                generation,
+                mode,
+            } => Some(SearchRequest {
+                query,
+                generation,
+                mode,
+            }),
+        }
+    }
+
+    /// Holds the texts the reader has read since the last call.
+    fn hold_texts_read(&mut self) {
+        while let Ok((copy, texts)) = self.texts_read.try_recv() {
+            self.texts.finish_read(copy, texts);
+        }
+    }
+
+    fn search(&mut self, request: SearchRequest, now: DateTime<Local>) -> SearchResponse {
+        self.hold_texts_read();
+        let conversations = self.conversations.as_slice();
+        let (filtered, error) = match search::try_search_with_texts(
+            conversations,
+            &self.searchable,
+            &self.texts,
+            &request.query,
+            now,
+        ) {
+            Ok(filtered) => (filtered, None),
+            Err(error) => (
+                (0..conversations.len()).collect(),
+                Some(format!("Search failed: {error}")),
+            ),
+        };
+        let parsed = ParsedQuery::parse(&request.query);
+        let evidence = if error.is_none() {
+            search::build_session_list_evidence(conversations, &self.texts, &filtered, &parsed)
+        } else {
+            HashMap::new()
+        };
+        SearchResponse {
+            error,
+            filtered,
+            generation: request.generation,
+            mode: request.mode,
+            evidence,
+        }
+    }
+}
+
+/// Start the search worker, ranking freshness against `clock`'s time. The
+/// rows' search texts are read into memory on a reader thread of its own;
+/// until a session's texts arrive, its search reads them from the session
+/// cache.
 pub(super) fn spawn_search_worker(
     clock: Arc<dyn Clock>,
 ) -> (mpsc::Sender<SearchCommand>, mpsc::Receiver<SearchResponse>) {
@@ -83,78 +177,55 @@ pub(super) fn spawn_search_worker(
     std::thread::Builder::new()
         .name("search-worker".into())
         .spawn(move || {
-            let mut conversations: Arc<Vec<Arc<Conversation>>> = Arc::new(Vec::new());
-            let mut searchable: Arc<Vec<SearchableConversation>> = Arc::new(Vec::new());
-
-            while let Ok(cmd) = cmd_rx.recv() {
-                match cmd {
-                    SearchCommand::UpdateData {
-                        conversations: c,
-                        searchable: s,
-                    } => {
-                        conversations = c;
-                        searchable = s;
+            let (copies_to_read, texts_read) = spawn_text_reader();
+            let mut state = SearchWorkerState {
+                conversations: Arc::new(Vec::new()),
+                searchable: Arc::new(Vec::new()),
+                texts: SearchTextsInMemory::default(),
+                copies_to_read,
+                texts_read,
+            };
+            while let Ok(command) = cmd_rx.recv() {
+                let Some(mut request) = state.apply(command) else {
+                    continue;
+                };
+                while let Ok(pending) = cmd_rx.try_recv() {
+                    if let Some(newer) = state.apply(pending) {
+                        request = newer;
                     }
-                    SearchCommand::Search {
-                        mut query,
-                        mut generation,
-                        mut mode,
-                    } => {
-                        while let Ok(pending) = cmd_rx.try_recv() {
-                            match pending {
-                                SearchCommand::UpdateData {
-                                    conversations: c,
-                                    searchable: s,
-                                } => {
-                                    conversations = c;
-                                    searchable = s;
-                                }
-                                SearchCommand::Search {
-                                    query: q,
-                                    generation: g,
-                                    mode: m,
-                                } => {
-                                    query = q;
-                                    generation = g;
-                                    mode = m;
-                                }
-                            }
-                        }
-
-                        let now = clock.wall().with_timezone(&Local);
-                        let (filtered, error) = match search::try_search(
-                            conversations.as_slice(),
-                            &searchable,
-                            &query,
-                            now,
-                        ) {
-                            Ok(filtered) => (filtered, None),
-                            Err(error) => (
-                                (0..conversations.len()).collect(),
-                                Some(format!("Search failed: {error}")),
-                            ),
-                        };
-                        let parsed = ParsedQuery::parse(&query);
-                        let evidence = if error.is_none() {
-                            search::build_session_list_evidence(&conversations, &filtered, &parsed)
-                        } else {
-                            HashMap::new()
-                        };
-
-                        let _ = res_tx.send(SearchResponse {
-                            error,
-                            filtered,
-                            generation,
-                            mode,
-                            evidence,
-                        });
-                    }
+                }
+                let now = clock.wall().with_timezone(&Local);
+                if res_tx.send(state.search(request, now)).is_err() {
+                    return;
                 }
             }
         })
         .expect("failed to spawn search worker thread");
 
     (cmd_tx, res_rx)
+}
+
+/// Start the thread reading the search texts of each batch of copies sent
+/// to it, in parallel, and sending each read back. It stops once the search
+/// worker is gone.
+fn spawn_text_reader() -> (mpsc::Sender<Vec<CachedSession>>, mpsc::Receiver<TextsRead>) {
+    let (copies_tx, copies_rx) = mpsc::channel::<Vec<CachedSession>>();
+    let (texts_tx, texts_rx) = mpsc::channel::<TextsRead>();
+    std::thread::Builder::new()
+        .name("search-text-reader".into())
+        .spawn(move || {
+            while let Ok(copies) = copies_rx.recv() {
+                let sent = copies.par_iter().try_for_each(|cached| {
+                    let texts = SessionSearchTexts::read(cached).ok().flatten();
+                    texts_tx.send((cached.copy_key(), texts.map(Arc::new)))
+                });
+                if sent.is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("failed to spawn search text reader thread");
+    (copies_tx, texts_rx)
 }
 
 impl App {

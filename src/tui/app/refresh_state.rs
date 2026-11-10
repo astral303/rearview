@@ -463,7 +463,15 @@ impl App {
             .map(|(index, row)| (row.path.clone(), index))
             .collect();
         let mut edit = ListEdit::default();
-        for FinishedRead { path, read } in reads {
+        for FinishedRead { path, mut read } in reads {
+            if self.is_opened_file(&path)
+                && let SessionRead::Listed(row) = &mut read
+            {
+                // File the row under the viewer's path, which the header and
+                // the viewer's refreshes find it by; the cache restores the
+                // row in discovery's spelling.
+                row.path.clone_from(&path);
+            }
             let unlisted = self.store.take_unlisted(&path);
             match (index_of.get(&path), read) {
                 (Some(&index), read) => edit.apply_reread(index, read),

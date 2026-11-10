@@ -2192,8 +2192,12 @@ fn project_without_name_is_never_excluded() {
 
 #[test]
 fn single_file_mode_has_no_project_exclusions() {
+    let path = PathBuf::from("/tmp/hidden.jsonl");
     let app = App::new_single_file(
-        PathBuf::from("/tmp/hidden.jsonl"),
+        DirectFile {
+            typed: path.clone(),
+            canonical: path,
+        },
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),

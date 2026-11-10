@@ -3,11 +3,12 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 10;
+pub(super) const SCHEMA_VERSION: u32 = 12;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Every table, dropped in this order when the schema changes.
 pub(super) const TABLES: &[&str] = &[
+    "search_texts",
     "subagent_search_parts",
     "result_items",
     "parts",
@@ -24,6 +25,11 @@ pub(super) const TABLES: &[&str] = &[
 
 /// The tables and their indexes. Every table below `sessions` is keyed by
 /// the session it belongs to and deleted with it.
+///
+/// A `text` column the viewer shows holds its text without terminal codes;
+/// the `text_codes` column beside it holds the codes, null for a text without
+/// any (see `split_terminal_codes`). A search-only `text` column holds the
+/// text without codes and drops them.
 pub(super) const CREATE: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -104,12 +110,24 @@ CREATE TABLE IF NOT EXISTS subagent_search_parts (
     session INTEGER NOT NULL,
     file_position INTEGER NOT NULL,
     position INTEGER NOT NULL,
-    sanitise_text INTEGER NOT NULL,
     text TEXT NOT NULL,
     PRIMARY KEY (session, position),
     FOREIGN KEY (session, file_position) REFERENCES session_files (session, position) ON DELETE CASCADE
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS subagent_search_parts_by_file ON subagent_search_parts (session, file_position);
+
+-- Each search text of an entry that no row holds as written, such as a tool
+-- call's header or a task report's text: the text and its search field, as
+-- on the rows that hold text (see `parts`).
+CREATE TABLE IF NOT EXISTS search_texts (
+    id INTEGER PRIMARY KEY,
+    session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    -- Gives the text its message number. Deleted with the session.
+    entry INTEGER NOT NULL,
+    search_field INTEGER NOT NULL,
+    text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS search_texts_by_session ON search_texts (session);
 
 -- The session row's parse errors.
 CREATE TABLE IF NOT EXISTS parse_errors (
@@ -204,9 +222,12 @@ CREATE TABLE IF NOT EXISTS entries (
     -- `string` for user content recorded as one string, `blocks` for content
     -- held in `parts`; null for an entry without content in parts.
     content TEXT,
+    -- Set on the title and the summary search reads, as on `parts`.
+    search_field INTEGER,
     -- The entry's own text: a summary, a title, an agent name, a metadata
     -- row's text.
     text TEXT,
+    text_codes BLOB,
     -- A metadata row's label, or a system record's subtype.
     label TEXT,
     uuid TEXT,
@@ -236,8 +257,13 @@ CREATE TABLE IF NOT EXISTS parts (
     entry INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
     part INTEGER NOT NULL,
     kind TEXT NOT NULL,
+    -- The search field lexical search reads `text` in, or a result's
+    -- `result_items` in; null when search does not read the part. Before
+    -- `text`, so reading it does not read a long text's overflow pages.
+    search_field INTEGER,
     -- Text, thinking, or a result's content recorded as one string.
     text TEXT,
+    text_codes BLOB,
     -- A call's id, or the call a result answers.
     call_id TEXT,
     -- A call's tool name, or a standalone result's.
@@ -259,7 +285,11 @@ CREATE TABLE IF NOT EXISTS result_items (
     part INTEGER NOT NULL REFERENCES parts (id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     kind TEXT NOT NULL,
+    -- 1 for a text item of a result search reads: search reads the part's
+    -- searched items as one text, joined by line breaks.
+    searched INTEGER NOT NULL,
     text TEXT,
+    text_codes BLOB,
     item_type TEXT,
     PRIMARY KEY (part, position)
 ) WITHOUT ROWID;

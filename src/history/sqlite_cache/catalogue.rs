@@ -52,7 +52,6 @@ pub(crate) struct SessionRecord {
 
 pub(super) struct SubagentSearchPart {
     pub(super) file_position: usize,
-    pub(super) sanitise_text: bool,
     pub(super) text: String,
 }
 
@@ -133,9 +132,8 @@ fn read_subagent_search_parts(
                     projection.entries.iter().map(|(_, entry)| entry),
                 )
                 .into_iter()
-                .map(|(full_text, text)| SubagentSearchPart {
+                .map(|text| SubagentSearchPart {
                     file_position: index + 1,
-                    sanitise_text: full_text,
                     text,
                 }),
             );

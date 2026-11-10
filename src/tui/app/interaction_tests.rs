@@ -1833,6 +1833,54 @@ fn copying_path_yields_path_not_session_id() {
 }
 
 #[test]
+fn file_opened_by_non_canonical_path_shows_and_copies_path_as_typed() {
+    let home = ClaudeHome::new();
+    let transcript = home.write("a", 5, &["a question"]);
+    let environment = home.environment();
+    home.rows(&environment);
+    let project = home.project();
+    let typed = project
+        .join("..")
+        .join(project.file_name().unwrap())
+        .join(transcript.file_name().unwrap());
+    let file = DirectFile::resolve(typed.clone(), environment.canonicaliser()).unwrap();
+    assert_ne!(file.canonical, typed, "the typed path is not canonical");
+    let mut app = App::new_single_file(
+        file,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        environment,
+    );
+    app.serve_direct_file_read();
+    app.complete_pending_view_refresh(20);
+    app.set_clipboard_writer_for_test(record_copied_text);
+
+    press(&mut app, KeyCode::Char('p'));
+    let shown = app.status_message.as_ref().map(|(text, _)| text.clone());
+    let copied = copied_by(&mut app, KeyCode::Char('Y'));
+
+    let AppMode::View(state) = app.app_mode() else {
+        unreachable!()
+    };
+    assert!(
+        !state.is_copy_missing,
+        "the viewer reads the session's copy by its canonical path"
+    );
+    let typed_text = typed.display().to_string();
+    assert_eq!(
+        shown.as_ref(),
+        Some(&typed_text),
+        "path display (`p`) shows the path as typed"
+    );
+    assert_eq!(
+        copied,
+        vec![typed_text],
+        "path copy (`Y`) copies the path as typed"
+    );
+}
+
+#[test]
 fn exporting_to_clipboard_copies_generated_content() {
     const JSONL_EXPORT_OPTION: usize = 3;
 

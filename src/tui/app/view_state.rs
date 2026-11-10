@@ -199,6 +199,19 @@ impl App {
         self.store.request_session_refresh(&path);
     }
 
+    /// The open session's path as path display (`p`) and path copy (`Y`)
+    /// show it: a file opened directly as the user typed it.
+    pub(super) fn open_session_path_text(&self) -> Option<String> {
+        let AppMode::View(state) = &self.app_mode else {
+            return None;
+        };
+        let path = self
+            .opened_file_typed_path
+            .as_ref()
+            .unwrap_or(&state.conversation_path);
+        Some(path.display().to_string())
+    }
+
     /// True while the open session's refresh waits, runs or awaits another
     /// refresh, and while the background worker reads the file opened
     /// directly.

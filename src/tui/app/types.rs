@@ -1,3 +1,4 @@
+use crate::history::provider::walk::Canonicaliser;
 use crate::history::{LoadProgress, OtherRearview, Workspace};
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
@@ -181,6 +182,25 @@ pub struct ListScope {
     pub workspace: Option<Workspace>,
     /// Projects whose sessions the list leaves out.
     pub exclude_projects: Vec<String>,
+}
+
+/// A file the user opened directly (`rearview <file>`).
+#[derive(Clone, Debug)]
+pub struct DirectFile {
+    /// The path as the user typed it, which the viewer shows (`p`) and
+    /// copies (`Y`).
+    pub typed: PathBuf,
+    /// The path the cache finds the session's copy by.
+    pub canonical: PathBuf,
+}
+
+impl DirectFile {
+    /// The file at `typed`, resolved through `canonicaliser`. Fails when the
+    /// path does not resolve.
+    pub fn resolve(typed: PathBuf, canonicaliser: &dyn Canonicaliser) -> std::io::Result<Self> {
+        let canonical = canonicaliser.canonicalise(&typed)?;
+        Ok(Self { typed, canonical })
+    }
 }
 
 impl Default for TuiSearchOptions {

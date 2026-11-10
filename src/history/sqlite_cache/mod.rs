@@ -25,11 +25,13 @@ pub(crate) mod refresh;
 mod schema;
 mod scope;
 mod search_parts;
+mod search_texts;
 
 pub use base::{CacheBase, ProcessIdentity};
 #[cfg(test)]
 pub(crate) use base::{DiskSpace, DriveRunningOut};
 pub use cached_session::CachedSession;
+pub(crate) use cached_session::CopyKey;
 pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
 pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
@@ -48,6 +50,7 @@ pub(crate) use read_catalogue::CatalogueSession;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart};
+pub(crate) use search_texts::{SearchText, SearchedFields};
 
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -606,10 +609,18 @@ impl CacheWriter {
         let owner = &self.owner;
         let entries_error = match &record.entries {
             Some(Ok(entries)) => {
+                let subagents = record
+                    .catalogue
+                    .files
+                    .iter()
+                    .filter(|file| file.kind == "subagent")
+                    .map(|file| file.path.as_path())
+                    .collect();
                 entries::write(
                     &mut self.cache.connection,
                     session,
                     entries,
+                    &subagents,
                     check_space,
                     owner,
                 )?;
@@ -617,14 +628,15 @@ impl CacheWriter {
                     check_space()?;
                     let batch = session_transaction(&mut self.cache.connection, session, owner)?;
                     {
-                        let mut statement = batch.prepare_cached("INSERT INTO subagent_search_parts (session, file_position, position, sanitise_text, text) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+                        // Only search reads these texts, without terminal codes, so their
+                        // codes are dropped.
+                        let mut statement = batch.prepare_cached("INSERT INTO subagent_search_parts (session, file_position, position, text) VALUES (?1, ?2, ?3, ?4)")?;
                         for (offset, part) in chunk.iter().enumerate() {
                             statement.execute(params![
                                 session,
                                 part.file_position as i64,
                                 (chunk_index * 20_000 + offset) as i64,
-                                part.sanitise_text,
-                                part.text
+                                crate::agent::sanitize::split_terminal_codes(&part.text).text
                             ])?;
                         }
                     }

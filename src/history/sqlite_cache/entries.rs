@@ -5,9 +5,11 @@
 mod context;
 mod messages;
 mod parts;
+mod search;
 mod threads;
 mod times;
 
+use crate::agent::sanitize::{join_terminal_codes, split_terminal_codes};
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
 use crate::history::{MalformedLine, MalformedLineDetail, TranscriptEntries};
@@ -16,6 +18,7 @@ use crate::log_entry::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::path::Path;
 use threads::Numbering;
@@ -25,21 +28,26 @@ use threads::Numbering;
 /// written.
 const ENTRIES_PER_TRANSACTION: usize = 20_000;
 
-/// Writes `entries`, the entries of the session with id `session`.
+/// Writes `entries`, the entries of the session with id `session`, whose
+/// sub-agent transcripts are `subagents`, with the search field of each of
+/// their search texts.
 pub(super) fn write(
     connection: &mut Connection,
     session: i64,
     entries: &TranscriptEntries,
+    subagents: &HashSet<&Path>,
     check_space: &dyn Fn() -> Result<()>,
     owner: &super::refresh::RefreshToken,
 ) -> Result<()> {
     let mut numbering = Numbering::default();
     let mut message_writer = messages::Writer::new(session);
+    let mut leading = LeadingTexts::default();
     for (chunk_index, chunk) in entries.entries.chunks(ENTRIES_PER_TRANSACTION).enumerate() {
         check_space()?;
         let transaction = super::session_transaction(connection, session, owner)?;
         {
             let mut entry_statement = transaction.prepare_cached(INSERT_ENTRY)?;
+            let mut derived_statement = transaction.prepare_cached(INSERT_SEARCH_TEXT)?;
             let mut part_writer = parts::Writer::new(&transaction)?;
             for (offset, (record, entry)) in chunk.iter().enumerate() {
                 let sequence = (chunk_index * ENTRIES_PER_TRANSACTION + offset) as i64;
@@ -48,6 +56,7 @@ pub(super) fn write(
                 let membership = message_writer.write(&transaction, &placement, entry, &columns)?;
                 let message = membership.map(|membership| membership.id);
                 let metadata_usage = message.is_none().then_some(columns.usage).flatten();
+                let text = columns.text.map(split_terminal_codes);
                 entry_statement.execute(params![
                     session,
                     message,
@@ -59,7 +68,8 @@ pub(super) fn write(
                     columns.kind,
                     columns.timestamp_ms,
                     columns.content,
-                    columns.text,
+                    text.as_ref().map(|text| &*text.text),
+                    text.as_ref().and_then(|text| text.codes.as_deref()),
                     columns.label,
                     columns.uuid,
                     metadata_usage.map(|usage| usage.input_tokens as i64),
@@ -71,11 +81,23 @@ pub(super) fn write(
                     columns.parent_uuid,
                     columns.flag,
                 ])?;
-                part_writer.write(
-                    &transaction,
-                    transaction.last_insert_rowid(),
-                    columns.parts.blocks(),
-                )?;
+                let entry_id = transaction.last_insert_rowid();
+                leading.read(entry_id, entry);
+                let spliced = record
+                    .transcript
+                    .as_deref()
+                    .is_some_and(|path| subagents.contains(path));
+                let blocks = columns.parts.blocks();
+                let search = search::entry_search(entry, blocks, spliced);
+                part_writer.write(&transaction, entry_id, blocks, &search.blocks)?;
+                for derived in &search.derived {
+                    derived_statement.execute(params![
+                        session,
+                        entry_id,
+                        derived.field.code(),
+                        split_terminal_codes(&derived.text).text
+                    ])?;
+                }
             }
         }
         super::refresh::commit(transaction, owner)?;
@@ -88,6 +110,12 @@ pub(super) fn write(
          WHERE session = ?1 AND ordinal IS NOT NULL) WHERE id = ?1",
         [session],
     )?;
+    for entry in [leading.title, leading.summary].into_iter().flatten() {
+        transaction.execute(
+            "UPDATE entries SET search_field = ?1 WHERE id = ?2",
+            params![super::SearchField::Leading.code(), entry],
+        )?;
+    }
     {
         let mut statement = transaction.prepare_cached(
             "INSERT INTO malformed_lines (session, position, line_number, line_content, \
@@ -111,10 +139,39 @@ pub(super) fn write(
 }
 
 const INSERT_ENTRY: &str = "INSERT INTO entries (session, message, contributes, position, sequence, \
-    record_transcript, record_line, kind, timestamp_ms, content, text, label, uuid, \
+    record_transcript, record_line, kind, timestamp_ms, content, text, text_codes, label, uuid, \
     usage_input, usage_output, usage_cache_creation, usage_cache_read, level, duration_ms, \
     parent_uuid, flag) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)";
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)";
+
+/// A search text is read only by search, which reads it without terminal
+/// codes, so its codes are dropped.
+const INSERT_SEARCH_TEXT: &str =
+    "INSERT INTO search_texts (session, entry, search_field, text) VALUES (?1, ?2, ?3, ?4)";
+
+/// The entries holding the session's title and summary, which search reads
+/// with its text: the last custom title, unless it is blank; the last AI
+/// title that is not blank, else the first summary.
+#[derive(Default)]
+struct LeadingTexts {
+    title: Option<i64>,
+    summary: Option<i64>,
+}
+
+impl LeadingTexts {
+    fn read(&mut self, id: i64, entry: &LogEntry) {
+        match entry {
+            LogEntry::Summary { .. } if self.summary.is_none() => self.summary = Some(id),
+            LogEntry::AiTitle { ai_title } if !ai_title.trim().is_empty() => {
+                self.summary = Some(id);
+            }
+            LogEntry::CustomTitle { custom_title } => {
+                self.title = (!custom_title.trim().is_empty()).then_some(id);
+            }
+            _ => {}
+        }
+    }
+}
 
 #[derive(Default)]
 enum Parts<'a> {
@@ -354,9 +411,35 @@ pub(crate) struct StoredEntries {
     pub(super) last_sequence: Option<i64>,
 }
 
+/// What a read is for: the viewer's texts, with their terminal codes and the
+/// lines that did not parse, or search's, without either.
+#[derive(Clone, Copy)]
 pub(super) enum ReadPurpose {
     Display,
     Search,
+}
+
+impl ReadPurpose {
+    /// The stored text in column `text` of `row`; for display, with the
+    /// terminal codes in column `codes` back in place.
+    fn text(self, row: &Row, text: usize, codes: usize) -> rusqlite::Result<Option<String>> {
+        let stored: Option<String> = row.get(text)?;
+        match (self, stored) {
+            (Self::Display, Some(stored)) => match row.get_ref(codes)?.as_blob_or_null()? {
+                Some(stored_codes) => join_terminal_codes(&stored, stored_codes)
+                    .map(Some)
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            codes,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    }),
+                None => Ok(Some(stored)),
+            },
+            (_, stored) => Ok(stored),
+        }
+    }
 }
 
 pub(super) fn read_numbered(
@@ -437,7 +520,7 @@ fn read_selected(
     purpose: ReadPurpose,
 ) -> Result<StoredEntries> {
     let stored = threads::read(connection, session)?;
-    let mut parts = parts::read(connection, selected)?;
+    let mut parts = parts::read(connection, selected, purpose)?;
     let sql = format!(
         "SELECT m.thread, e.id, e.record_transcript, e.record_line, e.kind, e.timestamp_ms, m.role, \
          e.content, e.text, e.label, e.uuid, m.cwd, m.parent_tool_use_id, m.source_tool_use_id, \
@@ -445,7 +528,7 @@ fn read_selected(
          COALESCE(e.usage_output, m.usage_output), \
          COALESCE(e.usage_cache_creation, m.usage_cache_creation), \
          COALESCE(e.usage_cache_read, m.usage_cache_read), e.level, e.duration_ms, e.parent_uuid, e.flag, \
-         m.ordinal, e.contributes, e.sequence \
+         m.ordinal, e.contributes, e.sequence, e.text_codes \
          FROM entries e LEFT JOIN messages m ON m.id = e.message WHERE e.id IN ({}) \
          ORDER BY e.sequence",
         selected.ids,
@@ -478,7 +561,8 @@ fn read_selected(
         };
         let entry = row.get::<_, i64>(1)?;
         let blocks = parts.remove(&entry).unwrap_or_default();
-        entries.push((record, entry_of(row, thread, blocks)?));
+        let entry_text = purpose.text(row, 8, 28)?;
+        entries.push((record, entry_of(row, thread, entry_text, blocks)?));
     }
     let malformed_lines = if matches!(purpose, ReadPurpose::Display) {
         connection
@@ -516,13 +600,17 @@ fn read_selected(
     })
 }
 
+/// The entry `row` holds, with `entry_text`, its own text as the read gives
+/// it, and `blocks`, its content.
 fn entry_of(
     row: &Row,
     thread: Option<&threads::Thread>,
+    entry_text: Option<String>,
     blocks: Vec<ContentBlock>,
 ) -> rusqlite::Result<LogEntry> {
     let kind: String = row.get(4)?;
     let text = |index| row.get::<_, Option<String>>(index);
+    let entry_text = entry_text.unwrap_or_default();
     let timestamp = row.get::<_, Option<i64>>(5)?.map(times::text).transpose()?;
     let usage = || -> rusqlite::Result<Option<TokenUsage>> {
         let Some(input_tokens) = row.get::<_, Option<i64>>(17)? else {
@@ -537,7 +625,7 @@ fn entry_of(
     };
     Ok(match kind.as_str() {
         "summary" => LogEntry::Summary {
-            summary: text(8)?.unwrap_or_default(),
+            summary: entry_text,
         },
         "user" => LogEntry::User {
             message: UserMessage {
@@ -593,18 +681,18 @@ fn entry_of(
             extra: Value::Null,
         },
         "custom-title" => LogEntry::CustomTitle {
-            custom_title: text(8)?.unwrap_or_default(),
+            custom_title: entry_text,
         },
         "ai-title" => LogEntry::AiTitle {
-            ai_title: text(8)?.unwrap_or_default(),
+            ai_title: entry_text,
         },
         "agent-name" => LogEntry::AgentName {
-            agent_name: text(8)?.unwrap_or_default(),
+            agent_name: entry_text,
         },
         "permission-mode" => LogEntry::PermissionMode { extra: Value::Null },
         "pi-metadata" => LogEntry::PiMetadata {
             label: text(9)?.unwrap_or_default(),
-            text: text(8)?.unwrap_or_default(),
+            text: entry_text,
             timestamp,
             searchable: row.get::<_, Option<bool>>(24)?.unwrap_or(true),
             usage: usage()?,

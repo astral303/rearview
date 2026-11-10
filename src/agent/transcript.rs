@@ -1214,23 +1214,24 @@ fn unless_blank(text: String) -> Option<String> {
 fn tool_result_texts(content: &Value) -> Option<Vec<&str>> {
     match content {
         Value::String(text) => Some(vec![text.as_str()]),
-        Value::Array(items) => Some(
-            items
-                .iter()
-                .filter_map(|item| match item {
-                    Value::String(text) => Some(text.as_str()),
-                    Value::Object(map) => {
-                        let ty = map.get("type").and_then(|value| value.as_str());
-                        if ty.is_none() || ty == Some("text") {
-                            map.get("text").and_then(|value| value.as_str())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                })
-                .collect(),
-        ),
+        Value::Array(items) => Some(items.iter().filter_map(tool_result_item_text).collect()),
+        _ => None,
+    }
+}
+
+/// The text a tool result array's `item` holds: a string, or a text item's
+/// text. `None` for any other item.
+pub(crate) fn tool_result_item_text(item: &Value) -> Option<&str> {
+    match item {
+        Value::String(text) => Some(text.as_str()),
+        Value::Object(map) => {
+            let ty = map.get("type").and_then(|value| value.as_str());
+            if ty.is_none() || ty == Some("text") {
+                map.get("text").and_then(|value| value.as_str())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }

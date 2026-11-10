@@ -373,8 +373,7 @@ fn build_context_segments_from_ranges_unchecked(
             .unwrap_or(full_text.len())
             .min(full_text.len());
 
-        let snippet = &full_text[start_byte..end_byte];
-        let sanitized = sanitize_preview(snippet);
+        let sanitized = sanitize_preview(&full_text[start_byte..end_byte]);
 
         // Add ellipsis if there's a gap before this segment
         let has_gap = if i == 0 {

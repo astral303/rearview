@@ -399,12 +399,17 @@ fn run_with(
         let workspace = local_workspace(&environment)?;
 
         let perf = agent::perf::DebugSearchPerf::new(Arc::clone(&clock));
-        let searchable = perf.time("search-data", || {
-            search::precompute_search_text(&conversations)
+        // Searched as the TUI searches, once its search worker holds the
+        // texts in memory.
+        let (searchable, texts) = perf.time("search-data", || {
+            (
+                search::precompute_search_text(&conversations),
+                search::SearchTextsInMemory::read(&conversations),
+            )
         });
         let now = clock.wall().with_timezone(&chrono::Local);
         let debug_search = perf.time("search", || {
-            search::try_debug_search(&conversations, &searchable, query, now, |index| {
+            search::try_debug_search(&conversations, &searchable, &texts, query, now, |index| {
                 workspace
                     .as_ref()
                     .is_none_or(|workspace| workspace.contains(&conversations[index]))
@@ -415,6 +420,7 @@ fn run_with(
         let evidence = perf.time("evidence", || {
             search::build_session_list_evidence(
                 &conversations,
+                &texts,
                 &result_indices,
                 &debug_search.parsed,
             )
@@ -576,9 +582,8 @@ fn run_with(
             )));
         }
         let environment = user_environment()?;
-        // The cache finds the copy of a session by its canonical path.
-        let input_file = environment.canonicaliser().canonicalise(input_file)?;
-        tui::run_single_file(input_file, tool_display, show_thinking, keys, environment)?;
+        let file = tui::DirectFile::resolve(input_file.clone(), environment.canonicaliser())?;
+        tui::run_single_file(file, tool_display, show_thinking, keys, environment)?;
         return Ok(());
     }
 

@@ -1,4 +1,4 @@
-use super::app::{Action, App, AppMode, ListScope, TuiSearchOptions};
+use super::app::{Action, App, AppMode, DirectFile, ListScope, TuiSearchOptions};
 use super::backend::ShowAfterMove;
 use super::supervisor::TaskSupervisor;
 use super::ui;
@@ -15,7 +15,6 @@ use crossterm::event::{
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
 use std::io::{self, BufWriter, Stderr};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -481,18 +480,18 @@ pub fn run_with_loader(
 #[cfg(test)]
 mod tests;
 
-/// The TUI viewing the file at `path`. Fails once the terminal is restored
-/// when the background worker cannot read the file, as for a file no format
+/// The TUI viewing `file`. Fails once the terminal is restored when the
+/// background worker cannot read the file, as for a file no format
 /// recognises.
 pub fn run_single_file(
-    path: PathBuf,
+    file: DirectFile,
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     keys: KeyBindings,
     environment: Environment,
 ) -> Result<()> {
     let mut guard = TerminalGuard::new()?;
-    let app = App::new_single_file(path, tool_display, show_thinking, keys, environment.clone());
+    let app = App::new_single_file(file, tool_display, show_thinking, keys, environment.clone());
     let mut runtime = Runtime::single_file(app, environment);
     loop {
         if let Tick::Exit(_) = runtime.tick(&mut guard.terminal, &mut drain_events)? {

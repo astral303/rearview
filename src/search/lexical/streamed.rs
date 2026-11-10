@@ -1,42 +1,13 @@
-//! Scores cached parts without retaining a session-sized search string.
+//! Scores a session's stored search texts, read from the session cache or
+//! held in memory, without normalising them.
 
+use super::raw::{ADJACENCY_CAP, Counts, PREFIX_CAP, RawMatcher, RawQuery};
 use super::*;
-use crate::error::Result;
-use crate::history::sqlite_cache::{SearchField, SearchPart};
+use crate::error::{AppError, Result};
+use crate::history::sqlite_cache::{CachedSession, SearchText, SearchedFields};
+use std::ops::ControlFlow;
 
-pub(super) struct BodyCounts {
-    contains: Vec<bool>,
-    prefixes: Vec<usize>,
-    adjacency: usize,
-    literals: Vec<bool>,
-    has_text: bool,
-}
-
-impl BodyCounts {
-    fn new(words: &[&str], literals: &[Literal]) -> Self {
-        Self {
-            contains: vec![false; words.len()],
-            prefixes: vec![0; words.len()],
-            adjacency: 0,
-            literals: vec![false; literals.len()],
-            has_text: false,
-        }
-    }
-
-    fn push(&mut self, text: &str, words: &[&str], pairs: &[String], literals: &[Literal]) {
-        self.has_text |= !text.is_empty();
-        let normalized = normalize_for_search(text);
-        for (index, word) in words.iter().enumerate() {
-            self.contains[index] |= normalized.contains(word);
-            self.prefixes[index] =
-                (self.prefixes[index] + count_prefix_matches(&normalized, word, 10)).min(10);
-        }
-        self.adjacency = (self.adjacency + count_adjacent_pairs(&normalized, pairs, 3)).min(3);
-        for (found, literal) in self.literals.iter_mut().zip(literals) {
-            *found |= literal.matches(text);
-        }
-    }
-
+impl Counts {
     pub(super) fn matches_literals(&self) -> bool {
         self.literals.iter().all(|found| *found)
     }
@@ -45,62 +16,77 @@ impl BodyCounts {
 pub(super) fn collect(
     conversation: &Conversation,
     surface: SearchSurface<'_>,
-    words: &[&str],
-    pairs: &[String],
-    literals: &[Literal],
-) -> Result<BodyCounts> {
-    let window = match surface {
-        SearchSurface::List => TimeFilter::default(),
-        SearchSurface::Agent(window) => *window,
+    query: &RawQuery<'_>,
+) -> Result<Counts> {
+    let (fields, window) = match surface {
+        SearchSurface::List(_) => (SearchedFields::List, TimeFilter::default()),
+        SearchSurface::Agent(window) => (SearchedFields::Agent, *window),
     };
-    let mut counts = BodyCounts::new(words, literals);
-    let read = conversation
-        .cached_session
-        .as_ref()
-        .expect("cached row")
-        .search_parts_within(conversation, &window, |part: SearchPart| {
-            let visible = match part.field {
-                SearchField::Full | SearchField::Leading => true,
-                SearchField::Agent | SearchField::Thinking | SearchField::Supplement => {
-                    matches!(surface, SearchSurface::Agent(_))
-                }
-                SearchField::Semantic => false,
-            };
-            let in_window = !window.is_active()
-                || part.ordinal.is_some_and(|ordinal| {
-                    window.contains_message(conversation.message_times.span(ordinal))
-                });
-            if visible && in_window {
-                counts.push(&part.text, words, pairs, literals);
-            }
-        });
-    if !matches!(read, Ok(Some(()))) {
-        let content = conversation.load_content()?;
-        counts = BodyCounts::new(words, literals);
-        if window.is_active() {
-            for text in content.texts_within(&window).into_array() {
-                counts.push(&text, words, pairs, literals);
-            }
-        } else {
-            counts.push(&content.full_text, words, pairs, literals);
-            if matches!(surface, SearchSurface::Agent(_)) {
-                counts.push(&content.agent_search_text, words, pairs, literals);
-                counts.push(&content.thinking_and_tool_call_text, words, pairs, literals);
-            }
+    let mut matcher = query.matcher();
+    let mut counts = if let Some(texts) = surface.texts_in_memory(conversation) {
+        count_in_memory(texts, &mut matcher)
+    } else {
+        let cached = conversation.cached_session.as_ref().expect("cached row");
+        match count_stored(cached, fields, &window, &mut matcher) {
+            Ok(Some(counts)) => counts,
+            // The copy as the cache holds it, as the session's content loads.
+            Ok(None) | Err(_) => count_stored(
+                &cached.clone().ignoring_source_changes().waiting(),
+                fields,
+                &window,
+                &mut matcher,
+            )?
+            .ok_or_else(|| AppError::SessionCacheNotReady {
+                session: conversation.session_id.clone(),
+                reason: "the session is not in the session cache".to_owned(),
+            })?,
         }
-    }
+    };
     if !window.is_active() {
         let project = conversation.project_name.as_deref().unwrap_or_default();
-        for (found, literal) in counts.literals.iter_mut().zip(literals) {
+        for (found, literal) in counts.literals.iter_mut().zip(query.literals()) {
             *found |= literal.matches(project);
         }
     }
     Ok(counts)
 }
 
+/// `matcher`'s counts over `cached`'s search texts in `fields` inside
+/// `window`, read until more text cannot change them; `None` when the cache
+/// no longer holds the copy.
+fn count_stored(
+    cached: &CachedSession,
+    fields: SearchedFields,
+    window: &TimeFilter,
+    matcher: &mut RawMatcher<'_>,
+) -> Result<Option<Counts>> {
+    let mut counts = matcher.counts();
+    let read = cached.visit_search_texts(fields, window, |text: SearchText<'_>| {
+        matcher.count(text.text, &mut counts);
+        if matcher.is_complete(&counts) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })?;
+    Ok(read.map(|()| counts))
+}
+
+/// `matcher`'s counts over `texts`, read until more text cannot change them.
+fn count_in_memory(texts: &SessionSearchTexts, matcher: &mut RawMatcher<'_>) -> Counts {
+    let mut counts = matcher.counts();
+    for text in texts.texts() {
+        matcher.count(text, &mut counts);
+        if matcher.is_complete(&counts) {
+            break;
+        }
+    }
+    counts
+}
+
 pub(super) fn score(
     searchable: &SearchableConversation,
-    body: BodyCounts,
+    body: Counts,
     words: &[&str],
     pairs: &[String],
     time: DateTime<Local>,
@@ -143,14 +129,14 @@ pub(super) fn score(
         if !text.is_empty() {
             let counts = words
                 .iter()
-                .map(|word| count_prefix_matches(text, word, 10))
+                .map(|word| count_prefix_matches(text, word, PREFIX_CAP))
                 .collect::<Vec<_>>();
             fields.push(field_score(
                 name,
                 weight,
                 words,
                 &counts,
-                count_adjacent_pairs(text, pairs, 3),
+                count_adjacent_pairs(text, pairs, ADJACENCY_CAP),
             ));
         }
     }
@@ -209,9 +195,10 @@ mod tests {
     use crate::history::provider::contract_tests::every_record_sessions;
     use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
     use crate::history::sqlite_cache::{CatalogueSession, SessionRecord, SqliteCache};
+    use crate::search::evidence::{LexicalEvidence, build_lexical_evidence};
 
     #[test]
-    fn cached_parts_preserve_scores_literals_and_windows_for_every_provider() {
+    fn cache_and_memory_preserve_scores_evidence_literals_and_windows_for_every_provider() {
         let base = tempfile::tempdir().unwrap();
         let mut cache = SqliteCache::open(&crate::history::sqlite_cache::tests::rearview_at(
             base.path(),
@@ -306,33 +293,30 @@ mod tests {
             ];
             let original = [original];
             let cached = [*cached];
+            let not_read = SearchTextsInMemory::default();
+            let in_memory = SearchTextsInMemory::read(&cached);
+            let held = in_memory
+                .get(&cached[0])
+                .expect("the texts are read into memory");
             for window in &windows {
-                for surface in [SearchSurface::List, SearchSurface::Agent(window)] {
+                for surface in [
+                    SearchSurface::List(&not_read),
+                    SearchSurface::List(&in_memory),
+                    SearchSurface::Agent(window),
+                ] {
                     let original_texts = match surface {
-                        SearchSurface::List => precompute_search_text(&original),
+                        SearchSurface::List(_) => precompute_search_text(&original),
                         SearchSurface::Agent(_) => {
                             precompute_agent_search_text(&original, window).searchable
                         }
                     };
                     let cached_texts = match surface {
-                        SearchSurface::List => precompute_search_text(&cached),
+                        SearchSurface::List(_) => precompute_search_text(&cached),
                         SearchSurface::Agent(_) => {
                             precompute_agent_search_text(&cached, window).searchable
                         }
                     };
-                    for query in [
-                        "session",
-                        "question",
-                        "answer",
-                        "tool",
-                        "steps",
-                        "searchable",
-                        "question answer",
-                        "child tool",
-                        "\"child answer searchable\"",
-                        "tasked_subagent_sentinel",
-                        "unknown_needle",
-                    ] {
+                    for query in QUERIES {
                         let expected = debug_search_with_surface(
                             &original,
                             &original_texts,
@@ -383,6 +367,63 @@ mod tests {
                     }
                 }
             }
+            let mut queries_with_evidence = 0;
+            for query in QUERIES {
+                let parsed = ParsedQuery::parse(query);
+                let read_from_cache = build_lexical_evidence(&cached[0], None, &parsed);
+                let read_from_memory = build_lexical_evidence(&cached[0], Some(held), &parsed);
+                queries_with_evidence += usize::from(read_from_memory.is_some());
+                assert_eq!(
+                    read_from_memory,
+                    read_from_cache,
+                    "{} {query:?}: the evidence in memory is the evidence in the cache",
+                    session.row.source.label()
+                );
+                assert_eq!(
+                    context_line(&cached[0], read_from_memory),
+                    context_line(
+                        &original[0],
+                        build_lexical_evidence(&original[0], None, &parsed)
+                    ),
+                    "{} {query:?}: the context line is the parsed session's",
+                    session.row.source.label()
+                );
+            }
+            assert!(
+                queries_with_evidence > 0,
+                "{}: some query finds evidence",
+                session.row.source.label()
+            );
         }
+    }
+
+    const QUERIES: [&str; 11] = [
+        "session",
+        "question",
+        "answer",
+        "tool",
+        "steps",
+        "searchable",
+        "question answer",
+        "child tool",
+        "\"child answer searchable\"",
+        "tasked_subagent_sentinel",
+        "unknown_needle",
+    ];
+
+    /// The context line a row 80 columns wide shows for `evidence`.
+    fn context_line(
+        conversation: &Conversation,
+        evidence: Option<LexicalEvidence>,
+    ) -> Option<String> {
+        let evidence = evidence?;
+        crate::search::preview::build_context_segments_from_ranges(
+            evidence
+                .source_text
+                .as_deref()
+                .unwrap_or(&conversation.full_text),
+            &evidence.context_ranges,
+            80,
+        )
     }
 }
