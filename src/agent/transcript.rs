@@ -264,12 +264,10 @@ impl AgentTranscript {
         path: impl AsRef<Path>,
     ) -> Result<CachedTranscript> {
         let path = path.as_ref();
-        let stored =
-            crate::history::sqlite_cache::find_cached_session_as_is_without_waiting(base, address)?
-                .map(|cached| cached.numbered_entries(None))
-                .transpose()?
-                .flatten();
-        match stored {
+        let read = crate::history::sqlite_cache::read_copy_without_waiting(base, address, |held| {
+            held.numbered_entries(None)
+        });
+        match crate::history::sqlite_cache::found(read)? {
             Some(stored) => Self::from_stored(path, stored).map(CachedTranscript::Copy),
             None => Ok(CachedTranscript::NotCached),
         }

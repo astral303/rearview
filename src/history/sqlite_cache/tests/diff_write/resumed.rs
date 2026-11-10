@@ -822,15 +822,12 @@ fn load_after_archived_tree_is_retargeted_reads_the_session_whole_once() {
         .iter()
         .find(|row| row.path == bases.session)
         .expect("the load lists the session");
-    let entries = crate::history::sqlite_cache::find_cached_session_waiting(
+    let entries = crate::history::sqlite_cache::read_copy_waiting(
         environment.cache_base(),
         row.cache_address.as_ref().unwrap(),
+        |held| held.entries(),
     )
-    .unwrap()
-    .expect("the load wrote the session's copy")
-    .entries()
-    .unwrap()
-    .expect("the copy holds the session's entries");
+    .expect("the load wrote the session's copy");
     assert!(
         format!("{:?}", entries.entries).contains("alpha"),
         "the copy holds the archived rollout's turn"

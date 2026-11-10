@@ -153,7 +153,7 @@ impl Conversation {
         cached: &CachedSession,
         read_parts: impl FnOnce(&HeldCopy<'_>, &mut ContentBuilder) -> Result<T>,
     ) -> Result<Option<HeldParts<T>>> {
-        let copy = cached.clone().ignoring_source_changes().waiting();
+        let copy = cached.clone().waiting();
         let read = copy.read_held_copy(|held| {
             let mut parts = ContentBuilder::default();
             let result = read_parts(held, &mut parts)?;

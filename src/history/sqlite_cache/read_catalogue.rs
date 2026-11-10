@@ -2,7 +2,7 @@
 
 use super::files::RootKey;
 use super::roots::{Places, StoredPath};
-use super::{CachedSession, Publication, SessionAddress, SessionRoots, SqliteCache};
+use super::{CachedSession, HeldCopy, Publication, SessionAddress, SessionRoots, SqliteCache};
 use crate::agent::diagnostic::AgentWarning;
 use crate::agent::time_span::TimeSpan;
 use crate::error::{AppError, Result};
@@ -148,17 +148,16 @@ impl SqliteCache {
             .remove(key))
     }
 
-    /// The listed catalogue row of the copy at `address`; `None` when the
-    /// cache does not list it.
-    pub(crate) fn catalogue_row_at(
-        &self,
-        address: &SessionAddress,
-    ) -> Result<Option<Conversation>> {
+    /// The listed catalogue row of `held`, read in its snapshot of this
+    /// cache; `None` when the cache does not list it.
+    pub(crate) fn catalogue_row_of(&self, held: &HeldCopy<'_>) -> Result<Option<Conversation>> {
+        let address = held.address;
         let session = self
-            .read_catalogue_through(
+            .catalogue_rows_in(
+                held.connection,
                 address.storage,
                 address.source,
-                address.roots.clone(),
+                &address.roots,
                 false,
                 Some(&address.cache_key),
             )?
@@ -189,66 +188,74 @@ impl SqliteCache {
         key: Option<&str>,
     ) -> Result<HashMap<String, CatalogueSession>> {
         self.with_read_snapshot(|connection| {
-            let places = Places::stored(connection, &roots)?;
-            let sql = format!(
-                "SELECT id, cache_key, status, file_size, mtime_secs, mtime_nsecs, \
-                 session_id, project_path, project_name, cwd, timestamp_ms, preview_first, \
-                 preview_last, summary, custom_title, model, total_tokens, duration_minutes, \
-                 message_count, assistant_messages, is_missing_earlier_turns, entries_error, \
-                 generation FROM sessions WHERE storage = ?1 AND root = ?2 AND {} {}",
-                super::copy_state::SETTLED_ROW,
-                if key.is_some() {
-                    "AND cache_key = ?3"
-                } else {
-                    ""
-                }
-            );
-            let mut parameters = vec![
-                rusqlite::types::Value::from(storage.directory.to_owned()),
-                places.listing_root().into(),
-            ];
-            if let Some(key) = key {
-                parameters.push(key.to_owned().into());
-            }
-            let mut statement = connection.prepare(&sql)?;
-            let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
-            let mut sessions = HashMap::new();
-            while let Some(row) = rows.next()? {
-                let status: String = row.get(2)?;
-                let session = match status.as_str() {
-                    "listed" => {
-                        let Some(files) = transcripts_of(connection, &places, row.get(0)?)? else {
-                            continue;
-                        };
-                        let cached_session = CachedSession {
-                            base: self.base().clone(),
-                            address: SessionAddress::new(
-                                storage,
-                                source,
-                                roots.clone(),
-                                row.get(1)?,
-                            ),
-                            generation: row.get(22)?,
-                            wait: self.wait,
-                            checks_source: true,
-                        };
-                        CatalogueSession::Listed(Box::new(conversation(
-                            connection,
-                            row,
-                            files,
-                            source,
-                            show_last,
-                            cached_session,
-                        )?))
-                    }
-                    "empty" => CatalogueSession::Empty(recorded_warning(row)?),
-                    "unreadable" => CatalogueSession::Unreadable(recorded_warning(row)?),
-                    _ => continue,
-                };
-                sessions.insert(row.get(1)?, session);
-            }
-            Ok(sessions)
+            self.catalogue_rows_in(connection, storage, source, &roots, show_last, key)
         })
+    }
+
+    /// [`Self::read_catalogue_through`] on `connection`, inside its read
+    /// snapshot.
+    fn catalogue_rows_in(
+        &self,
+        connection: &Connection,
+        storage: SessionCache,
+        source: Source,
+        roots: &SessionRoots,
+        show_last: bool,
+        key: Option<&str>,
+    ) -> Result<HashMap<String, CatalogueSession>> {
+        let places = Places::stored(connection, roots)?;
+        let sql = format!(
+            "SELECT id, cache_key, status, file_size, mtime_secs, mtime_nsecs, \
+             session_id, project_path, project_name, cwd, timestamp_ms, preview_first, \
+             preview_last, summary, custom_title, model, total_tokens, duration_minutes, \
+             message_count, assistant_messages, is_missing_earlier_turns, entries_error, \
+             generation FROM sessions WHERE storage = ?1 AND root = ?2 AND {} {}",
+            super::copy_state::SETTLED_ROW,
+            if key.is_some() {
+                "AND cache_key = ?3"
+            } else {
+                ""
+            }
+        );
+        let mut parameters = vec![
+            rusqlite::types::Value::from(storage.directory.to_owned()),
+            places.listing_root().into(),
+        ];
+        if let Some(key) = key {
+            parameters.push(key.to_owned().into());
+        }
+        let mut statement = connection.prepare(&sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
+        let mut sessions = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let status: String = row.get(2)?;
+            let session = match status.as_str() {
+                "listed" => {
+                    let Some(files) = transcripts_of(connection, &places, row.get(0)?)? else {
+                        continue;
+                    };
+                    let cached_session = CachedSession {
+                        base: self.base().clone(),
+                        address: SessionAddress::new(storage, source, roots.clone(), row.get(1)?),
+                        generation: row.get(22)?,
+                        wait: self.wait,
+                    };
+                    CatalogueSession::Listed(Box::new(conversation(
+                        connection,
+                        row,
+                        files,
+                        source,
+                        show_last,
+                        cached_session,
+                    )?))
+                }
+                "empty" => CatalogueSession::Empty(recorded_warning(row)?),
+                "unreadable" => CatalogueSession::Unreadable(recorded_warning(row)?),
+                _ => continue,
+            };
+            sessions.insert(row.get(1)?, session);
+        }
+        Ok(sessions)
     }
 }
 
@@ -462,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_content_is_its_copy_as_it_is_and_replaced_copy_is_miss() {
+    fn rows_content_is_the_copy_the_cache_holds_as_it_is() {
         let home = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
         let path = home.path().join("session.jsonl");
@@ -494,15 +501,6 @@ mod tests {
             panic!("listed fixture")
         };
         cache.write(&write).unwrap();
-        assert!(
-            cached
-                .cached_session
-                .as_ref()
-                .unwrap()
-                .numbered_entries(None)
-                .is_err(),
-            "replaced generations are not silently reused"
-        );
         let held = cached.load_held_content().unwrap().unwrap();
         assert!(
             held.generation > Some(cached.cached_session.as_ref().unwrap().generation())

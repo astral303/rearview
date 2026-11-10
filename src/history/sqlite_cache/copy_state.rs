@@ -6,7 +6,7 @@
 
 use super::files::RootKey;
 use super::{SessionAddress, SessionStatus, catalogue, is_storage_current};
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// The SQL condition on a `sessions` row that holds a listed copy with its
@@ -116,15 +116,16 @@ pub(super) fn listed_session_of(
 ) -> Result<Option<StoredSession>> {
     match RowState::of_session(connection, storage, root_key, cache_key)? {
         RowState::Listed(stored) => Ok(Some(stored)),
-        RowState::BeingWritten | RowState::EntriesKeptOut => {
-            Err(crate::error::AppError::SessionCacheNotReady {
-                session: cache_key.to_owned(),
-                reason: "its cached copy is not ready yet".to_owned(),
-            })
-        }
+        RowState::BeingWritten | RowState::EntriesKeptOut => Err(AppError::SessionCacheNotReady {
+            session: cache_key.to_owned(),
+            reason: "its cached copy is not ready yet".to_owned(),
+        }),
         RowState::NotThere => Ok(None),
     }
 }
+
+/// A read of one copy of a session: its data, or why it holds none.
+pub(crate) type CopyRead<T> = std::result::Result<T, CopyMiss>;
 
 /// Why a read of a session's copy holds no data of it.
 #[derive(Debug)]
@@ -135,6 +136,25 @@ pub(crate) enum CopyMiss {
     /// The session's copy is being written, or its entries were kept out; a
     /// later write lists it.
     NotReady,
+    /// The read failed.
+    ReadError(AppError),
+}
+
+impl From<AppError> for CopyMiss {
+    fn from(error: AppError) -> Self {
+        Self::ReadError(error)
+    }
+}
+
+/// `read` as the viewer, the printout and the agent commands take it: `None`
+/// for a copy that is not there or not ready, which an agent command names
+/// in its `stale-cache` record; a failed read as its error.
+pub(crate) fn found<T>(read: CopyRead<T>) -> Result<Option<T>> {
+    match read {
+        Ok(data) => Ok(Some(data)),
+        Err(CopyMiss::NotThere | CopyMiss::NotReady) => Ok(None),
+        Err(CopyMiss::ReadError(error)) => Err(error),
+    }
 }
 
 #[cfg(test)]

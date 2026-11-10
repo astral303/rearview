@@ -698,14 +698,12 @@ mod tests {
         window: &TimeFilter,
     ) -> Vec<PlacedText> {
         let mut read = Vec::new();
-        let copy = copy.clone().ignoring_source_changes();
-        copy.read_held_copy(|held| {
+        copy.read_copy(|held| {
             held.visit_search_texts(fields, window, |text| {
                 read.push((text.order, text.ordinal, text.text.to_owned()));
                 ControlFlow::Continue(())
             })
         })
-        .unwrap()
         .expect("the cache holds the copy");
         read.sort();
         read

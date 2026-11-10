@@ -533,7 +533,6 @@ pub(crate) fn read_hit_messages(
             copy_generation: Some(hits.generation),
         }));
     }
-    let copy = copy.ignoring_source_changes();
     history::sqlite_cache::read_when_unlocked(
         clock,
         wait,
@@ -713,15 +712,15 @@ enum TargetCopy {
         agent::refs::AgentConversationKey,
         history::provider::StaleCopy,
     ),
-    /// The cache doesn't hold a copy.
+    /// The cache doesn't hold a copy ready to read.
     Missing(agent::refs::AgentConversationKey),
 }
 
 /// The rule a copy's currency for a key is decided by.
 type CopyCurrency = fn(
-    &history::sqlite_cache::CachedSession,
+    &history::sqlite_cache::HeldCopy<'_>,
     &history::sqlite_cache::Publication,
-) -> Result<Option<history::sqlite_cache::Currency>>;
+) -> Result<history::sqlite_cache::Currency>;
 
 /// A targeted read of one session as a command keeps it for its key and
 /// its reads: without the listed row's search texts.
@@ -883,7 +882,7 @@ impl AgentService {
     /// `operation`'s refresh owner, the command brings each other target's
     /// copy up to date first, reading each distinct session once whatever
     /// the number of targets naming it. A target this command read is
-    /// checked as [`history::sqlite_cache::CachedSession::currency_for_publisher`]
+    /// checked as [`history::sqlite_cache::HeldCopy::currency_for_publisher`]
     /// checks it, as the printout checks its copy; one it reads as the
     /// cache holds it, against its transcripts.
     fn refresh_and_check_targets(
@@ -919,11 +918,9 @@ impl AgentService {
         };
         let mut checked = CheckedTargets::default();
         for key in held.into_keys() {
-            checked.add(self.check_target_copy(
-                operation,
-                key,
-                history::sqlite_cache::CachedSession::currency_for_publisher,
-            )?);
+            checked.add(self.check_target_copy(operation, key, |held, publication| {
+                held.currency_for_publisher(publication)
+            })?);
         }
         for target in unchecked {
             let root = keyed
@@ -936,7 +933,7 @@ impl AgentService {
             checked.add(self.check_target_copy(
                 operation,
                 target.clone(),
-                history::sqlite_cache::CachedSession::currency,
+                |held, publication| held.currency(publication),
             )?);
         }
         Ok(checked)
@@ -958,8 +955,11 @@ impl AgentService {
         }
         let base = self.environment.cache_base();
         let currency = operation.read_when_unlocked(|| {
-            history::sqlite_cache::find_cached_copy_without_waiting(base, &target.address)?
-                .map_or(Ok(None), |copy| currency(&copy, &target.publication))
+            history::sqlite_cache::found(history::sqlite_cache::read_copy_without_waiting(
+                base,
+                &target.address,
+                |held| currency(held, &target.publication),
+            ))
         })?;
         Ok(match currency {
             Some(history::sqlite_cache::Currency::Current) => TargetCopy::Current(target),
@@ -1232,6 +1232,19 @@ impl AgentService {
         )
     }
 
+    /// [`Self::read_when_unlocked`] for a read of one copy.
+    fn read_copy_when_unlocked<T>(
+        &self,
+        read: impl FnMut() -> history::sqlite_cache::CopyRead<T>,
+    ) -> history::sqlite_cache::CopyRead<T> {
+        history::sqlite_cache::read_copy_when_unlocked(
+            self.clock().as_ref(),
+            self.perf.load_meter().wait_status(),
+            &history::Cancellation::default(),
+            read,
+        )
+    }
+
     fn load_transcript_for_range(
         &self,
         key: &agent::refs::AgentConversationKey,
@@ -1247,27 +1260,20 @@ impl AgentService {
         if let Some(transcript) = self.bounded_transcripts.borrow().get(&cache_key) {
             return Ok(self.titled_as_listed(key, transcript.clone()));
         }
-        let find_cached = || {
-            history::sqlite_cache::find_cached_session_as_is_without_waiting(
-                self.environment.cache_base(),
-                &key.address,
-            )
-        };
-        if self.read_when_unlocked(find_cached)?.is_none() {
-            return self.load_transcript(key);
-        }
-        let no_longer_cached = || AppError::SessionCacheNotReady {
-            session: key.session_id.clone(),
-            reason: "the session is no longer in the session cache".to_owned(),
-        };
-        let transcript = self.perf.time_transcript_parse(key, || {
-            self.read_when_unlocked(|| {
-                find_cached()?
-                    .ok_or_else(no_longer_cached)?
-                    .agent_range(&key.path, range)?
-                    .ok_or_else(no_longer_cached)
+        let read = self.perf.time_transcript_parse(key, || {
+            self.read_copy_when_unlocked(|| {
+                history::sqlite_cache::read_copy_without_waiting(
+                    self.environment.cache_base(),
+                    &key.address,
+                    |held| held.agent_range(&key.path, range),
+                )
             })
-        })?;
+        });
+        let transcript = match read {
+            Ok(transcript) => transcript,
+            Err(history::sqlite_cache::CopyMiss::ReadError(error)) => return Err(error),
+            Err(_) => return self.load_transcript(key),
+        };
         self.bounded_transcripts
             .borrow_mut()
             .insert(cache_key, transcript.clone());
@@ -2752,7 +2758,6 @@ fn read_semantic_messages(
     else {
         return service.load_transcript(key).map_err(UnreadMessages::Failed);
     };
-    let copy = copy.ignoring_source_changes();
     service.perf.time_transcript_parse(key, || {
         service
             .read_when_unlocked(|| {
@@ -6087,8 +6092,7 @@ mod tests {
             .cached_session
             .as_ref()
             .unwrap()
-            .read_held_copy(|held| Ok(held.generation()))
-            .unwrap()
+            .read_copy(|held| Ok(held.generation()))
             .unwrap();
 
         let SemanticCandidates {
@@ -7124,13 +7128,12 @@ mod tests {
             .into_iter()
             .find(|row| row.path == transcript)
             .unwrap();
-        let generation = history::sqlite_cache::find_cached_session_waiting(
+        let generation = history::sqlite_cache::read_copy_waiting(
             environment.cache_base(),
             row.cache_address.as_ref().unwrap(),
+            |held| Ok(held.generation()),
         )
-        .unwrap()
-        .expect("the load cached the session")
-        .generation();
+        .expect("the load cached the session");
         let key = agent::refs::AgentConversationKey::from_conversation(
             &row,
             &crate::history::path::CanonicalDirectories::of_system(),

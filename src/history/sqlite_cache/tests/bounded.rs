@@ -36,8 +36,7 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
                     .cached_session
                     .as_ref()
                     .unwrap()
-                    .agent_range(&row.path, range)
-                    .unwrap()
+                    .read_copy(|held| held.agent_range(&row.path, range))
                     .unwrap();
                 assert_eq!(actual.messages.len(), expected.messages.len());
                 for full in [false, true] {
@@ -116,8 +115,7 @@ fn bounded_transcript_doesnt_load_unrelated_large_call_and_result_bodies() {
         .cached_session
         .as_ref()
         .unwrap()
-        .agent_range(&source, MessageRange::single(1))
-        .unwrap()
+        .read_copy(|held| held.agent_range(&source, MessageRange::single(1)))
         .unwrap();
     assert_eq!(transcript.messages.len(), 3);
     assert!(
@@ -167,8 +165,7 @@ fn bounded_read_doesnt_read_unselected_call_inputs() {
             .cached_session
             .as_ref()
             .unwrap()
-            .agent_range(&source, MessageRange::single(1))
-            .unwrap()
+            .read_copy(|held| held.agent_range(&source, MessageRange::single(1)))
             .unwrap()
     };
     let before = read();
@@ -337,13 +334,12 @@ fn sql_windows_keep_full_message_spans_and_final_millisecond() {
         .cached_session
         .as_ref()
         .unwrap()
-        .read_held_copy(|held| {
+        .read_copy(|held| {
             held.visit_search_texts(SearchedFields::List, &window, |text| {
                 selected.push((text.order, text.ordinal, text.text.to_owned()));
                 std::ops::ControlFlow::Continue(())
             })
         })
-        .unwrap()
         .unwrap();
     selected.sort();
     assert_eq!(

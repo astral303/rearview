@@ -7,6 +7,7 @@ fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() 
     let session = every_record_sessions().remove(0);
     let row = &session.row;
     let storage = storage_of(row.source);
+    cache.admit_storage(storage).unwrap();
     let root = root_of(&session);
     let stub = stub_of(&session, 1);
     let address = crate::history::sqlite_cache::SessionAddress::new(
@@ -35,11 +36,19 @@ fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() 
                 .unwrap(),
             )
             .unwrap();
-        assert!(cache.copy_at(&address).unwrap().is_none());
+        let read = cache.read_copy_at(&address, |_| Ok(()));
+        assert!(
+            matches!(read, Err(CopyMiss::NotThere)),
+            "{status:?}: a read of the session finds no copy: {read:?}"
+        );
     }
     let record = parsed_record(row.source, &root, &stub);
     cache.write_catalogue(&record, None).unwrap();
-    assert!(cache.copy_at(&address).unwrap().is_none());
+    let read = cache.read_copy_at(&address, |_| Ok(()));
+    assert!(
+        matches!(read, Err(CopyMiss::NotReady)),
+        "a read of a session being written finds its copy not ready: {read:?}"
+    );
 }
 
 #[test]

@@ -184,7 +184,6 @@ fn count_stored<C: Borrow<Conversation>>(
         let index = indices[copy];
         let held = cached_copy(conversations[index].borrow())
             .clone()
-            .ignoring_source_changes()
             .waiting()
             .read_held_copy(|held| {
                 Ok((

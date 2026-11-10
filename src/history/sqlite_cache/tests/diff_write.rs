@@ -335,7 +335,7 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
     let listed = fixture.listed(cache);
     let copy = listed.cached_session.clone().unwrap();
     let mut texts = Vec::new();
-    copy.read_held_copy(|held| {
+    copy.read_copy(|held| {
         held.visit_search_texts(
             SearchedFields::Agent,
             &crate::time_filter::TimeFilter::default(),
@@ -346,7 +346,6 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
             },
         )
     })
-    .unwrap()
     .unwrap();
     texts.sort();
     let texts = texts.into_iter().map(|(_, text)| text).collect::<Vec<_>>();
@@ -1787,7 +1786,7 @@ fn message_renumbered_in_place_moves_its_texts_search_place_for_every_agent() {
 }
 
 #[test]
-fn reader_holding_earlier_generation_sees_it_change() {
+fn reader_holding_earlier_generation_reads_the_copy_the_write_left() {
     let session = every_record_sessions()
         .into_iter()
         .find(|session| session.row.source == Source::Claude)
@@ -1797,7 +1796,8 @@ fn reader_holding_earlier_generation_sees_it_change() {
     without_last_own_entries(&mut before, 1);
     let base = tempfile::tempdir().unwrap();
     let mut cache = cache_holding(base.path(), &fixture, &before);
-    let earlier = fixture.listed(&cache).cached_session.unwrap();
+    let earlier_row = fixture.listed(&cache);
+    let earlier = earlier_row.cached_session.clone().unwrap();
     let session = fixture.session_id(&cache);
 
     cache.write(&fixture.record()).unwrap();
@@ -1807,18 +1807,33 @@ fn reader_holding_earlier_generation_sees_it_change() {
         session,
         "the session row keeps its id"
     );
-    assert!(
-        matches!(
-            earlier.numbered_entries(None),
-            Err(AppError::SessionCacheNotReady { .. })
-        ),
-        "a reader of the earlier generation is refused"
-    );
     let current = fixture.listed(&cache).cached_session.unwrap();
     assert_ne!(
         current.copy_key(),
         earlier.copy_key(),
         "the copy after the write has another key"
     );
-    assert!(current.numbered_entries(None).unwrap().is_some());
+    // The viewer, the printout, `load_cached_as_is`, a range read and an
+    // agent command's target check each read one of these.
+    let reads = |copy: &CachedSession| {
+        copy.read_copy(|held| {
+            Ok(format!(
+                "generation {}\nentries {:?}\nnumbered {:?}\nrange {:?}\ncurrency {:?}",
+                held.generation(),
+                held.entries()?.entries,
+                held.numbered_entries(None)?.transcript.entries,
+                held.agent_range(
+                    &earlier_row.path,
+                    crate::agent::refs::MessageRange::single(1)
+                )?,
+                held.currency(&earlier_row.publication)?,
+            ))
+        })
+        .expect("the cache holds the session")
+    };
+    assert_eq!(
+        reads(&earlier),
+        reads(&current),
+        "each read of a copy found before the write reads the copy the write left"
+    );
 }

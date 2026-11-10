@@ -324,21 +324,20 @@ mod tests {
                 .contains("newest question"),
             "the printout shows the newest message"
         );
-        let copy = crate::history::sqlite_cache::find_cached_session_waiting(
+        let currency = crate::history::sqlite_cache::read_copy_waiting(
             environment.cache_base(),
             row.cache_address.as_ref().unwrap(),
+            |held| {
+                held.currency(&crate::history::sqlite_cache::Publication::Unpublished {
+                    discovered: row.subagents.clone(),
+                })
+            },
         )
-        .unwrap()
         .expect("the cache holds the session");
-        let currency = copy
-            .currency(&crate::history::sqlite_cache::Publication::Unpublished {
-                discovered: row.subagents.clone(),
-            })
-            .unwrap();
         assert!(
             matches!(
                 currency,
-                Some(crate::history::sqlite_cache::Currency::Adopt { .. })
+                crate::history::sqlite_cache::Currency::Adopt { .. }
             ),
             "the printout refreshes the session's cached copy: {currency:?}"
         );
@@ -355,31 +354,39 @@ mod tests {
         let environment = home.environment();
         let rows = home.rows(&environment);
         let row = rows.iter().find(|row| row.path == a).unwrap();
-        let copy = crate::history::sqlite_cache::find_cached_session_waiting(
+        let read_copy = |read: &dyn Fn(
+            &crate::history::sqlite_cache::HeldCopy<'_>,
+        ) -> crate::error::Result<Currency>| {
+            crate::history::sqlite_cache::read_copy_waiting(
+                environment.cache_base(),
+                row.cache_address.as_ref().unwrap(),
+                read,
+            )
+            .expect("the cache holds the session")
+        };
+        let generation = crate::history::sqlite_cache::read_copy_waiting(
             environment.cache_base(),
             row.cache_address.as_ref().unwrap(),
+            |held| Ok(held.generation()),
         )
-        .unwrap()
         .expect("the cache holds the session");
         home.append(&a, 6, "written after the copy");
-        let published = Publication::Published {
-            generation: copy.generation(),
-        };
+        let published = Publication::Published { generation };
         let published_later = Publication::Published {
-            generation: copy.generation() + 1,
+            generation: generation + 1,
         };
 
         assert_eq!(
-            copy.currency_for_publisher(&published).unwrap(),
-            Some(Currency::Current)
+            read_copy(&|held| held.currency_for_publisher(&published)),
+            Currency::Current
         );
         assert_eq!(
-            copy.currency_for_publisher(&published_later).unwrap(),
-            Some(Currency::Older)
+            read_copy(&|held| held.currency_for_publisher(&published_later)),
+            Currency::Older
         );
         assert_eq!(
-            copy.currency(&published).unwrap(),
-            Some(Currency::Older),
+            read_copy(&|held| held.currency(&published)),
+            Currency::Older,
             "a check of the transcripts finds the copy out of date"
         );
     }

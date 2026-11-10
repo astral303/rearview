@@ -24,13 +24,19 @@ fn database_backed_sessions_validate_current_logical_fingerprint() {
         panic!("listed fixture")
     };
     let content = cached.cached_session.as_ref().unwrap();
-    assert!(content.entries().unwrap().is_some());
+    let currency = || {
+        content
+            .read_copy(|held| held.currency(&cached.publication))
+            .unwrap()
+    };
+    assert_eq!(currency(), super::super::Currency::Current);
     let source = rusqlite::Connection::open(&root.path).unwrap();
     assert!(source.execute("UPDATE part SET data = json_set(data, '$.text', 'fresh database text'), time_updated = time_updated + 1 WHERE json_extract(data, '$.type') = 'text'", []).unwrap() > 0);
-    assert!(matches!(
-        content.entries(),
-        Err(AppError::SessionCacheSourceChanged(_))
-    ));
+    assert_eq!(
+        currency(),
+        super::super::Currency::Older,
+        "a changed session database makes its copy older"
+    );
     assert!(
         !cached
             .load_held_content()
@@ -315,8 +321,7 @@ fn bounded_read_doesnt_restore_unrelated_result() {
         .cached_session
         .as_ref()
         .unwrap()
-        .agent_range(&source, crate::agent::refs::MessageRange::single(1))
-        .unwrap()
+        .read_copy(|held| held.agent_range(&source, crate::agent::refs::MessageRange::single(1)))
         .unwrap();
     assert_eq!(bounded.messages.len(), 2);
     assert_eq!(bounded.malformed_lines, [3]);

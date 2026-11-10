@@ -9,18 +9,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// `copy`'s stored semantic turns, read alone from the copy the cache holds.
 fn own_stored_turns(copy: &CachedSession) -> Vec<(usize, String)> {
     let mut turns = Vec::new();
-    copy.clone()
-        .ignoring_source_changes()
-        .read_held_copy(|held| {
-            held.stored_semantic_turns(|part| {
-                turns.push((
-                    part.ordinal.expect("a semantic turn has a message"),
-                    part.text,
-                ));
-            })
+    copy.read_copy(|held| {
+        held.stored_semantic_turns(|part| {
+            turns.push((
+                part.ordinal.expect("a semantic turn has a message"),
+                part.text,
+            ));
         })
-        .unwrap()
-        .expect("the cache holds the copy");
+    })
+    .expect("the cache holds the copy");
     turns
 }
 

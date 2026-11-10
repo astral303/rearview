@@ -2311,7 +2311,11 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
 
     let lookup = super::super::InteractiveCache::at(base.clone())
         .open()
-        .and_then(|cache| cache.map(|cache| cache.copy_at(&address)).transpose());
+        .and_then(|cache| {
+            cache
+                .map(|cache| super::super::found(cache.read_copy_at(&address, |_| Ok(()))))
+                .transpose()
+        });
 
     assert!(matches!(lookup, Err(error) if super::super::is_busy_error(&error)));
     assert_eq!(observe(&base).unwrap(), Observation::Unknown);

@@ -4,8 +4,7 @@
 
 use super::format::RecordLine;
 use super::sqlite_cache::{
-    CachedCopy, CachedSession, Currency, InteractiveCache, InteractiveRead, Publication,
-    SessionAddress,
+    CachedCopy, Currency, HeldCopy, InteractiveCache, InteractiveRead, Publication, SessionAddress,
 };
 use super::{MalformedLine, Source, TranscriptEntries, sniffed_session};
 use crate::error::Result;
@@ -172,45 +171,32 @@ fn printed_session(
             older_copy_reason: None,
         });
     }
-    let copy = match &row.cache_address {
-        Some(address) => {
-            super::sqlite_cache::find_cached_session_waiting(environment.cache_base(), address)?
-        }
-        None => None,
+    let Some(address) = &row.cache_address else {
+        return Err(not_in_the_cache(path));
     };
-    let currency = match &copy {
-        Some(copy) => copy.currency_for_publisher(&row.publication)?,
-        None => None,
-    };
-    let older_copy = match (copy, currency) {
-        (Some(copy), Some(Currency::Current | Currency::Adopt { .. })) => {
-            return Ok(PrintedSession {
-                entries: copy_entries(copy, path)?,
-                older_copy_reason: None,
-            });
-        }
-        (Some(copy), Some(Currency::Older)) => copy,
-        _ => return Err(not_in_the_cache(path)),
+    let read = super::sqlite_cache::read_copy_waiting(environment.cache_base(), address, |held| {
+        Ok((
+            held.currency_for_publisher(&row.publication)?,
+            held.entries()?,
+        ))
+    });
+    let Some((currency, entries)) = super::sqlite_cache::found(read)? else {
+        return Err(not_in_the_cache(path));
     };
     Ok(PrintedSession {
-        entries: copy_entries(older_copy, path)?,
-        older_copy_reason: Some(match operation.stale_cause() {
-            super::StaleCause::AnotherRearview => {
-                "another rearview is refreshing the session cache"
-            }
-            super::StaleCause::WritesStopped => "rearview could not update it in the session cache",
-        }),
+        entries: entries.into(),
+        older_copy_reason: match currency {
+            Currency::Current | Currency::Adopt { .. } => None,
+            Currency::Older => Some(match operation.stale_cause() {
+                super::StaleCause::AnotherRearview => {
+                    "another rearview is refreshing the session cache"
+                }
+                super::StaleCause::WritesStopped => {
+                    "rearview could not update it in the session cache"
+                }
+            }),
+        },
     })
-}
-
-/// The entries of `copy`, the copy of the session at `path`, as the cache
-/// holds them.
-fn copy_entries(copy: CachedSession, path: &Path) -> Result<DisplayEntries> {
-    let entries = copy
-        .ignoring_source_changes()
-        .entries()?
-        .ok_or_else(|| not_in_the_cache(path))?;
-    Ok(entries.into())
 }
 
 /// The printout's failure for the session at `path` when the cache holds no
@@ -232,7 +218,8 @@ pub fn display_log_entries_interactively(
     publication: &Publication,
 ) -> InteractiveRead<DisplayEntries> {
     cache.read(|reader| {
-        let Some((_, entries, currency)) = newest_copy(reader, address, publication)? else {
+        let Some((entries, currency, ())) = newest_copy(reader, address, publication, |_| Ok(()))?
+        else {
             return Ok(None);
         };
         Ok(Some(CachedCopy {
@@ -258,16 +245,19 @@ pub fn viewed_copy_interactively(
     publication: &Publication,
 ) -> InteractiveRead<ViewedCopy> {
     cache.read(|reader| {
-        let Some((session, entries, currency)) = newest_copy(reader, address, publication)? else {
+        let viewed_row = |held: &HeldCopy<'_>| -> Result<Option<Box<super::Conversation>>> {
+            let generation = Publication::Published {
+                generation: held.generation(),
+            };
+            Ok(reader
+                .catalogue_row_of(held)?
+                .filter(|row| row.publication == generation)
+                .map(Box::new))
+        };
+        let Some((entries, currency, row)) = newest_copy(reader, address, publication, viewed_row)?
+        else {
             return Ok(None);
         };
-        let generation = Publication::Published {
-            generation: session.generation(),
-        };
-        let row = reader
-            .catalogue_row_at(address)?
-            .filter(|row| row.publication == generation)
-            .map(Box::new);
         Ok(Some(CachedCopy {
             value: ViewedCopy {
                 entries: DisplayEntries::from(entries),
@@ -280,19 +270,17 @@ pub fn viewed_copy_interactively(
 
 /// The newest copy `reader` holds of the session at `address`, its entries
 /// read as it holds them, with its currency for a row whose publication is
-/// `publication`, on `reader`'s connection; `None` when the cache does not
-/// hold it.
-fn newest_copy(
+/// `publication` and `also`'s read of it, in one read snapshot on `reader`'s
+/// connection; `None` when the cache does not hold it ready.
+fn newest_copy<T>(
     reader: &super::sqlite_cache::SqliteCache,
     address: &SessionAddress,
     publication: &Publication,
-) -> Result<Option<(CachedSession, TranscriptEntries, Currency)>> {
-    let Some(session) = reader.copy_at(address)? else {
-        return Ok(None);
-    };
-    Ok(session
-        .entries_with_currency(reader, publication)?
-        .map(|(entries, currency)| (session, entries, currency)))
+    also: impl FnOnce(&HeldCopy<'_>) -> Result<T>,
+) -> Result<Option<(TranscriptEntries, Currency, T)>> {
+    super::sqlite_cache::found(reader.read_copy_at(address, |held| {
+        Ok((held.entries()?, held.currency(publication)?, also(held)?))
+    }))
 }
 
 /// A bare file's [`sniffed_session`] as the viewer and the terminal printout

@@ -55,7 +55,7 @@ fn hit_messages_give_whole_transcripts_hits_for_every_agent() {
                 .expect("the row reads its copy");
             let whole = AgentTranscript::from_stored(
                 &cached.path,
-                copy.numbered_entries(None).unwrap().unwrap(),
+                copy.read_copy(|held| held.numbered_entries(None)).unwrap(),
             )
             .unwrap();
             let key = AgentConversationKey::from_conversation(
@@ -174,7 +174,7 @@ fn hit_messages_hold_every_message_retrieval_finds_for_every_agent() {
                 .expect("the row reads its copy");
             let whole = AgentTranscript::from_stored(
                 &cached.path,
-                copy.numbered_entries(None).unwrap().unwrap(),
+                copy.read_copy(|held| held.numbered_entries(None)).unwrap(),
             )
             .unwrap();
             ([cached], whole)
@@ -296,7 +296,7 @@ fn messages_read_alone_are_the_whole_transcripts_messages_for_every_agent() {
         let copy = cached.cached_session.clone().unwrap();
         let whole = AgentTranscript::from_stored(
             &cached.path,
-            copy.numbered_entries(None).unwrap().unwrap(),
+            copy.read_copy(|held| held.numbered_entries(None)).unwrap(),
         )
         .unwrap();
         let ordinals = whole
@@ -313,8 +313,7 @@ fn messages_read_alone_are_the_whole_transcripts_messages_for_every_agent() {
             ));
         for selection in selections {
             let read = copy
-                .read_held_copy(|held| held.agent_messages(&cached.path, &selection))
-                .unwrap()
+                .read_copy(|held| held.agent_messages(&cached.path, &selection))
                 .expect("the copy is read");
             let expected = whole
                 .messages
@@ -340,9 +339,11 @@ fn session_replaced_after_ranking_reads_hit_messages_of_its_new_copy() {
     let session = every_record_sessions().remove(0);
     let cached = crate::history::sqlite_cache::tests::cached_row(base.path(), &session);
     let copy = cached.cached_session.clone().unwrap();
-    let whole =
-        AgentTranscript::from_stored(&cached.path, copy.numbered_entries(None).unwrap().unwrap())
-            .unwrap();
+    let whole = AgentTranscript::from_stored(
+        &cached.path,
+        copy.read_copy(|held| held.numbered_entries(None)).unwrap(),
+    )
+    .unwrap();
     let key = AgentConversationKey::from_conversation(
         &cached,
         &crate::history::path::CanonicalDirectories::of_system(),
@@ -622,8 +623,7 @@ fn stored_texts(row: &Conversation, window: TimeFilter) -> Vec<(Option<usize>, S
     row.cached_session
         .clone()
         .expect("the row reads its copy")
-        .ignoring_source_changes()
-        .read_held_copy(|held| {
+        .read_copy(|held| {
             held.visit_search_texts(
                 crate::history::sqlite_cache::SearchedFields::Agent,
                 &window,
@@ -633,7 +633,6 @@ fn stored_texts(row: &Conversation, window: TimeFilter) -> Vec<(Option<usize>, S
                 },
             )
         })
-        .unwrap()
         .expect("the cache holds the copy");
     texts
 }

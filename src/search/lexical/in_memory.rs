@@ -34,7 +34,7 @@ impl SessionSearchTexts {
     /// row of a replaced copy holds the new copy's texts until the rows next
     /// change and name that copy.
     pub(crate) fn read(cached: &CachedSession) -> Result<Option<Self>> {
-        let copy = cached.clone().ignoring_source_changes().waiting();
+        let copy = cached.clone().waiting();
         let mut read = TextsInReadOrder::default();
         let found = copy.read_held_copy(|held| {
             held.visit_search_texts(SearchedFields::List, &TimeFilter::default(), |text| {

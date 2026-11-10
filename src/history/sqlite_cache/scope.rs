@@ -3,6 +3,7 @@
 
 use super::base::CacheBase;
 use super::coordinator::{Coordinator, WaitStatus};
+use super::copy_state::{CopyMiss, CopyRead};
 use super::observer::OtherRearview;
 use super::refresh::{Batch, RefreshOwnership, RefreshToken};
 use crate::error::{AppError, Result};
@@ -282,13 +283,42 @@ pub(crate) fn read_when_unlocked<T>(
     clock: &dyn crate::clock::Clock,
     status: &WaitStatus,
     cancellation: &Cancellation,
-    mut read: impl FnMut() -> Result<T>,
+    read: impl FnMut() -> Result<T>,
 ) -> Result<T> {
+    read_while_busy(clock, status, cancellation, read, super::is_busy_error)
+}
+
+/// [`read_when_unlocked`] for a read of one copy: a read error that is the
+/// busy error waits as that error does.
+pub(crate) fn read_copy_when_unlocked<T>(
+    clock: &dyn crate::clock::Clock,
+    status: &WaitStatus,
+    cancellation: &Cancellation,
+    read: impl FnMut() -> CopyRead<T>,
+) -> CopyRead<T> {
+    read_while_busy(
+        clock,
+        status,
+        cancellation,
+        read,
+        |miss| matches!(miss, CopyMiss::ReadError(error) if super::is_busy_error(error)),
+    )
+}
+
+/// `read`'s result once it no longer fails with an error `is_busy` names, as
+/// [`read_when_unlocked`] waits.
+fn read_while_busy<T, E>(
+    clock: &dyn crate::clock::Clock,
+    status: &WaitStatus,
+    cancellation: &Cancellation,
+    mut read: impl FnMut() -> std::result::Result<T, E>,
+    is_busy: impl Fn(&E) -> bool,
+) -> std::result::Result<T, E> {
     // The wait published before this read's, restored once it ends.
     let mut wait_before: Option<Option<OtherRearview>> = None;
     loop {
         match read() {
-            Err(error) if super::is_busy_error(&error) && !cancellation.is_cancelled() => {
+            Err(error) if is_busy(&error) && !cancellation.is_cancelled() => {
                 wait_before.get_or_insert_with(|| status.current());
                 status.set(Some(OtherRearview::Rebuilding));
                 clock.sleep(UNLOCK_POLL);

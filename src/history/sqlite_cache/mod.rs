@@ -43,17 +43,16 @@ pub use base::{CacheBase, ProcessIdentity};
 pub(crate) use base::{DiskSpace, DriveRunningOut};
 pub(crate) use cached_session::Currency;
 pub(crate) use cached_session::HeldCopy;
-pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
-pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
-pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
 pub use cached_session::{CachedSession, Publication, SessionAddress};
 pub(crate) use cached_session::{CopyKey, SessionKey};
+pub(crate) use cached_session::{read_copy_waiting, read_copy_without_waiting};
 #[cfg(test)]
 pub(crate) use catalogue::RecordEntries;
 pub(crate) use catalogue::{ListedRecord, RecordPlace, SessionRecord, SessionStatus, StubStamps};
 pub use coordinator::WaitStatus;
 pub(crate) use coordinator::{Coordinator, SHUTDOWN_RELEASE_WAIT};
 pub(crate) use copies_scan::CopyOutcome;
+pub(crate) use copy_state::{CopyMiss, CopyRead, found};
 pub(crate) use entries::StoredEntries;
 pub use interactive::{
     AdoptedCopy, CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead,
@@ -67,7 +66,7 @@ pub(crate) use permit::{FOR_FIXTURES, admitted_reads};
 pub(crate) use read_catalogue::CatalogueSession;
 pub(crate) use refresh::FREE_SPACE_FLOOR;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
-pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
+pub(crate) use scope::{LiveOwner, OperationAccess, read_copy_when_unlocked, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart, SemanticTurns};
 pub(crate) use search_texts::SearchedFields;
 pub(crate) use semantic_routes::{
