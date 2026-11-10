@@ -135,6 +135,29 @@ impl EntryPlace {
     }
 }
 
+/// The place search reads an entry's texts at, stored on each part search
+/// reads and on each search text: the entry's sequence, and its message's
+/// ordinal when the entry contributes to the message.
+#[derive(Clone, Copy)]
+pub(super) struct SearchPlace {
+    pub(super) sequence: i64,
+    pub(super) ordinal: Option<i64>,
+}
+
+impl SearchPlace {
+    /// The place of the entry at `index` in `rows`.
+    pub(super) fn of(rows: &SessionRows, index: usize) -> Self {
+        let row = &rows.entries[index];
+        Self {
+            sequence: rows.sequence_of(index) as i64,
+            ordinal: row
+                .message
+                .filter(|_| row.contributes)
+                .and_then(|message| rows.messages[message].ordinal),
+        }
+    }
+}
+
 pub(super) struct RowWriter<'connection> {
     connection: &'connection Connection,
     session: i64,
@@ -160,7 +183,8 @@ impl<'connection> RowWriter<'connection> {
             // A search text is read only by search, which reads it without
             // terminal codes, so its codes are dropped.
             insert_search_text: connection.prepare_cached(
-                "INSERT INTO search_texts (session, entry, search_field, text) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO search_texts (session, entry, search_field, entry_sequence, \
+                 message_ordinal, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?,
             parts: parts::Writer::new(connection)?,
         })
@@ -294,16 +318,17 @@ impl<'connection> RowWriter<'connection> {
         bind_entry(&mut self.insert_entry, self.session, row, &place)?;
         self.insert_entry.raw_execute()?;
         let id = self.connection.last_insert_rowid();
-        self.insert_children(row, id)?;
+        self.insert_children(row, id, SearchPlace::of(rows, index))?;
         Ok(id)
     }
 
     /// Sets every column of the stored entry `id` to `row`'s, at `place`,
-    /// and replaces its parts and search texts.
+    /// and replaces its parts and search texts, at `search`.
     pub(super) fn update_entry(
         &mut self,
         row: &EntryRow,
         place: &EntryPlace,
+        search: SearchPlace,
         id: i64,
     ) -> rusqlite::Result<()> {
         bind_entry(&mut self.update_entry, self.session, row, place)?;
@@ -318,13 +343,26 @@ impl<'connection> RowWriter<'connection> {
         self.connection
             .prepare_cached("DELETE FROM search_texts WHERE entry = ?1")?
             .execute([id])?;
-        self.insert_children(row, id)
+        self.insert_children(row, id, search)
     }
 
     /// Sets the columns of the stored entry `id` that [`EntryRow::digest`]
-    /// hashes to `row`'s, and replaces its parts and search texts. The row
-    /// keeps its place and its message.
+    /// hashes to `row`'s, and replaces its parts and search texts at the
+    /// place its stored entry and message give. The row keeps its place and
+    /// its message.
     pub(super) fn rewrite_content(&mut self, row: &EntryRow, id: i64) -> rusqlite::Result<()> {
+        let search = self
+            .connection
+            .prepare_cached(
+                "SELECT e.sequence, CASE WHEN e.contributes THEN m.ordinal END FROM entries e \
+                 LEFT JOIN messages m ON m.id = e.message WHERE e.id = ?1",
+            )?
+            .query_row([id], |stored| {
+                Ok(SearchPlace {
+                    sequence: stored.get(0)?,
+                    ordinal: stored.get(1)?,
+                })
+            })?;
         let mut statement = self
             .connection
             .prepare_cached(&update_sql("entries", &[ENTRY_CONTENT_COLUMNS]))?;
@@ -339,7 +377,7 @@ impl<'connection> RowWriter<'connection> {
         self.connection
             .prepare_cached("DELETE FROM search_texts WHERE entry = ?1")?
             .execute([id])?;
-        self.insert_children(row, id)
+        self.insert_children(row, id, search)
     }
 
     /// Sets every column of the stored message `id` but its thread and its
@@ -364,12 +402,14 @@ impl<'connection> RowWriter<'connection> {
         Ok(())
     }
 
-    /// Moves the stored entry `id` to `place`, and sets whether search reads
-    /// it as the session's title or summary.
+    /// Moves the stored entry `id` to `place`, and its parts and search texts
+    /// to `search`, and sets whether search reads it as the session's title
+    /// or summary.
     pub(super) fn place_entry(
         &self,
         row: &EntryRow,
         place: &EntryPlace,
+        search: SearchPlace,
         id: i64,
     ) -> rusqlite::Result<()> {
         let mut statement = self
@@ -378,21 +418,79 @@ impl<'connection> RowWriter<'connection> {
         bind_place(&mut statement, self.session, row, place)?;
         statement.raw_bind_parameter(ENTRY_PLACE_COLUMNS.len() + 2, id)?;
         statement.raw_execute()?;
+        let values = params![id, search.sequence, search.ordinal];
+        self.connection
+            .prepare_cached(
+                "UPDATE parts SET entry_sequence = ?2, message_ordinal = ?3 \
+                 WHERE entry = ?1 AND search_field IS NOT NULL",
+            )?
+            .execute(values)?;
+        self.connection
+            .prepare_cached(
+                "UPDATE search_texts SET entry_sequence = ?2, message_ordinal = ?3 \
+                 WHERE entry = ?1",
+            )?
+            .execute(values)?;
         Ok(())
     }
 
-    fn insert_children(&mut self, row: &EntryRow, id: i64) -> rusqlite::Result<()> {
+    /// Sets the search place's ordinal of the parts and search texts of each
+    /// stored entry contributing to the message `message` to `ordinal`, the
+    /// message's new ordinal. An entry moving to another message or changing
+    /// whether it contributes gets its place from [`Self::place_entry`].
+    pub(super) fn renumber_search_places(
+        &self,
+        message: i64,
+        ordinal: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        for table in ["parts", "search_texts"] {
+            self.connection
+                .prepare_cached(&format!(
+                    "UPDATE {table} SET message_ordinal = ?2 WHERE entry IN \
+                     (SELECT id FROM entries WHERE message = ?1 AND contributes) \
+                     AND entry_sequence IS NOT NULL"
+                ))?
+                .execute(params![message, ordinal])?;
+        }
+        Ok(())
+    }
+
+    /// Moves the search place of the parts and search texts of each of the
+    /// session's entries from sequence `from` on by `delta`, as the entries
+    /// moved.
+    pub(super) fn shift_search_places(&self, from: i64, delta: i64) -> rusqlite::Result<()> {
+        for table in ["parts", "search_texts"] {
+            self.connection
+                .prepare_cached(&format!(
+                    "UPDATE {table} SET entry_sequence = entry_sequence + ?3 \
+                     WHERE session = ?1 AND entry_sequence >= ?2"
+                ))?
+                .execute(params![self.session, from, delta])?;
+        }
+        Ok(())
+    }
+
+    fn insert_children(
+        &mut self,
+        row: &EntryRow,
+        id: i64,
+        search: SearchPlace,
+    ) -> rusqlite::Result<()> {
         self.parts.write(
             self.connection,
+            self.session,
             id,
             row.columns.parts.blocks(),
             &row.search.blocks,
+            search,
         )?;
         for derived in &row.search.derived {
             self.insert_search_text.execute(params![
                 self.session,
                 id,
                 derived.field.code(),
+                search.sequence,
+                search.ordinal,
                 split_terminal_codes(&derived.text).text
             ])?;
         }

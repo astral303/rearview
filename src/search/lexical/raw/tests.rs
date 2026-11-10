@@ -72,6 +72,9 @@ const TEXTS: &[&str] = &[
     "swordfish sWord wordy keyword w wo wor",
     "éword wordé 中word word中 ÉWORD—WORD",
     "hello\u{2014}world hello\u{a0}WORLD hello_World",
+    "The theme: then THE thesis; other bathe tHe eee e ee eE Ee",
+    "cache  \t\n refresh, cache_refresh cache-refresh cache / refresh cacherefresh Cache\u{2003}REFRESH",
+    "naïve café Naïve CAFÉ cafés xcafé",
 ];
 
 const QUERIES: &[&str] = &[
@@ -99,6 +102,14 @@ const QUERIES: &[&str] = &[
     "mixed lines",
     "b",
     "x y",
+    "the",
+    "t",
+    "e",
+    "ee",
+    "the theme",
+    "cache refresh",
+    "café",
+    "naïve café",
 ];
 
 const LITERALS: &[&str] = &[

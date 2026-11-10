@@ -1,105 +1,192 @@
-//! Scores a session's stored search texts, read from the session cache or
-//! held in memory, without normalising them.
+//! Scores sessions' stored search texts, read from the session cache or held
+//! in memory, without normalising them.
 
 use super::raw::{ADJACENCY_CAP, Counts, PREFIX_CAP, RawMatcher, RawQuery};
 use super::*;
 use crate::error::{AppError, Result};
-use crate::history::sqlite_cache::{CachedSession, SearchText, SearchedFields};
-use std::ops::ControlFlow;
+use crate::history::sqlite_cache::{CachedSession, ScannedRow, TextVisitor, scan_search_texts};
+use std::collections::HashMap;
 
 impl Counts {
     pub(super) fn matches_literals(&self) -> bool {
         self.literals.iter().all(|found| *found)
     }
+
+    /// Counts nothing found, keeping the lengths.
+    fn clear(&mut self) {
+        self.contains.fill(false);
+        self.prefixes.fill(0);
+        self.adjacency = 0;
+        self.literals.fill(false);
+        self.has_text = false;
+    }
 }
 
-pub(super) fn collect(
-    conversation: &Conversation,
+/// `query`'s counts over the search texts of each conversation at `indices`,
+/// each of which the session cache holds, by index: from the texts held in
+/// memory, or else from the cache. Without a time window, a literal in a
+/// conversation's project name counts as found.
+pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
+    conversations: &[C],
+    indices: &[usize],
     surface: SearchSurface<'_>,
     query: &RawQuery<'_>,
-) -> Result<Counts> {
-    let (fields, window) = match surface {
-        SearchSurface::List(_) => (SearchedFields::List, TimeFilter::default()),
-        SearchSurface::Agent(window) => (SearchedFields::Agent, *window),
-    };
-    let mut matcher = query.matcher();
-    let mut counts = if let Some(texts) = surface.texts_in_memory(conversation) {
-        count_in_memory(texts, &mut matcher)
-    } else {
-        let cached = conversation.cached_session.as_ref().expect("cached row");
-        match count_stored(cached, fields, &window, &mut matcher) {
-            Ok(Some(counts)) => counts,
-            // The copy as the cache holds it, as the session's content loads.
-            Ok(None) | Err(_) => count_stored(
-                &cached.clone().ignoring_source_changes().waiting(),
-                fields,
-                &window,
-                &mut matcher,
-            )?
-            .ok_or_else(|| AppError::SessionCacheNotReady {
-                session: conversation.session_id.clone(),
-                reason: "the session is not in the session cache".to_owned(),
-            })?,
-        }
-    };
+) -> Result<HashMap<usize, Counts>> {
+    let (held, stored): (Vec<_>, Vec<_>) = indices
+        .iter()
+        .map(|&index| {
+            let texts = surface.texts_in_memory(conversations[index].borrow());
+            (index, texts)
+        })
+        .partition(|(_, texts)| texts.is_some());
+    let held = held
+        .into_iter()
+        .filter_map(|(index, texts)| Some((index, texts?)))
+        .collect::<Vec<_>>();
+    let mut counts = chunked::count_held(&held, query);
+    let stored = stored
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    counts.extend(count_stored(conversations, &stored, surface, query)?);
+    let (_, window) = surface.stored_fields();
     if !window.is_active() {
-        let project = conversation.project_name.as_deref().unwrap_or_default();
-        for (found, literal) in counts.literals.iter_mut().zip(query.literals()) {
-            *found |= literal.matches(project);
+        for (index, counts) in &mut counts {
+            let conversation = conversations[*index].borrow();
+            let project = conversation.project_name.as_deref().unwrap_or_default();
+            for (found, literal) in counts.literals.iter_mut().zip(query.literals()) {
+                *found |= literal.matches(project);
+            }
         }
     }
     Ok(counts)
 }
 
-/// `matcher`'s counts over `cached`'s search texts in `fields` inside
-/// `window`, read until more text cannot change them; `None` when the cache
-/// no longer holds the copy.
-fn count_stored(
-    cached: &CachedSession,
-    fields: SearchedFields,
-    window: &TimeFilter,
-    matcher: &mut RawMatcher<'_>,
-) -> Result<Option<Counts>> {
-    let mut counts = matcher.counts();
-    let read = cached.visit_search_texts(fields, window, |text: SearchText<'_>| {
-        matcher.count(text.text, &mut counts);
-        if matcher.is_complete(&counts) {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    })?;
-    Ok(read.map(|()| counts))
-}
-
-/// `matcher`'s counts over `texts`, read until more text cannot change them.
-fn count_in_memory(texts: &SessionSearchTexts, matcher: &mut RawMatcher<'_>) -> Counts {
-    let mut counts = matcher.counts();
-    for text in texts.texts() {
-        matcher.count(text, &mut counts);
-        if matcher.is_complete(&counts) {
-            break;
+/// `query`'s counts over the search texts of each conversation at `indices`,
+/// read from the session cache in one scan, by index. A conversation's
+/// counts hold only the texts holding some of the query: `has_text` is false
+/// when none does, whatever other text it holds (see [`body_has_text`]).
+fn count_stored<C: Borrow<Conversation>>(
+    conversations: &[C],
+    indices: &[usize],
+    surface: SearchSurface<'_>,
+    query: &RawQuery<'_>,
+) -> Result<HashMap<usize, Counts>> {
+    let matcher = query.matcher();
+    let mut counts: HashMap<usize, Counts> = indices
+        .iter()
+        .map(|&index| (index, matcher.counts()))
+        .collect();
+    if indices.is_empty() {
+        return Ok(counts);
+    }
+    let copies = indices
+        .iter()
+        .map(|&index| cached_copy(conversations[index].borrow()))
+        .collect::<Vec<_>>();
+    let (fields, window) = surface.stored_fields();
+    let scanned = scan_search_texts(&copies, fields, &window, || BodyCounter::new(query))?;
+    if let Some((_, error)) = scanned.missing.into_iter().next() {
+        return Err(error);
+    }
+    for counter in scanned.visitors {
+        for (copy, found) in counter.bodies {
+            if let Some(session) = counts.get_mut(&indices[copy]) {
+                session.add(&found);
+            }
         }
     }
-    counts
+    Ok(counts)
 }
 
+fn cached_copy(conversation: &Conversation) -> &CachedSession {
+    conversation.cached_session.as_ref().expect("cached row")
+}
+
+/// One row range's counts of the texts holding some of the query, by the
+/// position of their session in the scanned copies.
+struct BodyCounter<'q> {
+    matcher: RawMatcher<'q>,
+    /// The counts of the text examined last.
+    text: Counts,
+    bodies: HashMap<usize, Counts>,
+}
+
+impl<'q> BodyCounter<'q> {
+    fn new(query: &'q RawQuery<'q>) -> Self {
+        let matcher = query.matcher();
+        let text = matcher.counts();
+        Self {
+            matcher,
+            text,
+            bodies: HashMap::new(),
+        }
+    }
+}
+
+impl TextVisitor for BodyCounter<'_> {
+    fn examine(&mut self, text: &str) -> bool {
+        self.text.clear();
+        self.matcher.count(text, &mut self.text);
+        self.text
+            .contains
+            .iter()
+            .chain(&self.text.literals)
+            .any(|found| *found)
+    }
+
+    fn keep(&mut self, row: &ScannedRow, _text: &str) {
+        let matcher = &self.matcher;
+        self.bodies
+            .entry(row.copy)
+            .or_insert_with(|| matcher.counts())
+            .add(&self.text);
+    }
+}
+
+/// Whether `conversation`'s body holds text, whose counts are `body`: read
+/// from the session cache when `body` came from a scan that found none of
+/// the query.
+pub(super) fn body_has_text(
+    conversation: &Conversation,
+    surface: SearchSurface<'_>,
+    body: &Counts,
+) -> Result<bool> {
+    if body.has_text || surface.texts_in_memory(conversation).is_some() {
+        return Ok(body.has_text);
+    }
+    let (fields, window) = surface.stored_fields();
+    cached_copy(conversation)
+        .clone()
+        .ignoring_source_changes()
+        .waiting()
+        .holds_search_text(fields, &window)?
+        .ok_or_else(|| AppError::SessionCacheNotReady {
+            session: conversation.session_id.clone(),
+            reason: "the session is not in the session cache".to_owned(),
+        })
+}
+
+/// `searchable`'s score from `body`, its counts; `None` when it does not
+/// match. `body_has_text` is read only for a session that matches.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn score(
     searchable: &SearchableConversation,
-    body: Counts,
+    body: &Counts,
+    body_has_text: impl FnOnce() -> Result<bool>,
     words: &[&str],
     pairs: &[String],
     time: DateTime<Local>,
     now: DateTime<Local>,
     include_project: bool,
-) -> Option<ScoreDebug> {
+) -> Result<Option<ScoreDebug>> {
     if !body.matches_literals() {
-        return None;
+        return Ok(None);
     }
     let project = &searchable.project_lower;
     for (index, word) in words.iter().enumerate() {
         if !body.contains[index] && !(include_project && project.contains(word)) {
-            return None;
+            return Ok(None);
         }
     }
     for (index, word) in words.iter().enumerate() {
@@ -111,13 +198,13 @@ pub(super) fn score(
                     .any(|ch| ('\u{4E00}'..='\u{9FFF}').contains(&ch))
             }) {
                 let fresh = freshness_bonus(time, now);
-                return Some(ScoreDebug {
+                return Ok(Some(ScoreDebug {
                     total: words.len() as f64 * 0.5 + fresh,
                     freshness: fresh,
                     fields: Vec::new(),
-                });
+                }));
             }
-            return None;
+            return Ok(None);
         }
     }
     let mut fields = Vec::new();
@@ -140,7 +227,7 @@ pub(super) fn score(
             ));
         }
     }
-    if body.has_text {
+    if body_has_text()? {
         fields.push(field_score(
             "body",
             WEIGHT_BODY,
@@ -153,11 +240,11 @@ pub(super) fn score(
     let total = fields.iter().fold(0.0, |total, field| {
         total + field.tf_score + field.adjacency_score
     }) + fresh;
-    Some(ScoreDebug {
+    Ok(Some(ScoreDebug {
         total,
         freshness: fresh,
         fields,
-    })
+    }))
 }
 
 fn field_score(
@@ -247,13 +334,7 @@ mod tests {
             let (record, row) = parsed_record_and_row(session.row.source, &root, &stub);
             cache.write(&record).unwrap();
             let CatalogueSession::Listed(cached) = cache
-                .catalogue_session(
-                    storage,
-                    session.row.source,
-                    &root.path,
-                    &stub.cache_key,
-                    false,
-                )
+                .catalogue_session(storage, session.row.source, &root, &stub.cache_key, false)
                 .unwrap()
                 .unwrap()
             else {
@@ -387,7 +468,68 @@ mod tests {
         }
     }
 
-    const QUERIES: [&str; 11] = [
+    #[test]
+    fn scan_matches_each_table_and_window_keeps_only_messages_inside_it() {
+        use crate::search::test_fixtures::{cached_claude_sessions, october, window_on_october_10};
+        let at = |day, hour| october(day, hour).to_rfc3339();
+        let records = vec![
+            serde_json::json!({"type": "custom-title", "customTitle": "titleword"}),
+            serde_json::json!({"type": "user", "timestamp": at(1, 12),
+                "message": {"role": "user", "content": "outsideword"}}),
+            serde_json::json!({"type": "user", "timestamp": at(10, 12),
+                "message": {"role": "user", "content": "insideword"}}),
+            serde_json::json!({"type": "assistant", "timestamp": at(10, 13),
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call", "name": "Bash",
+                     "input": {"command": "headerword"}}]}}),
+            serde_json::json!({"type": "user", "timestamp": at(10, 14),
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call",
+                     "content": [{"type": "text", "text": "resultword"}]}]}}),
+        ];
+        let sessions = cached_claude_sessions(&[("session", records)]);
+        let rows = &sessions.rows;
+        let now = october(20, 12);
+        let finds = |window: &TimeFilter, query: &str| {
+            !agent_search(
+                rows,
+                &precompute_agent_search_text(rows, window),
+                query,
+                now,
+            )
+            .is_empty()
+        };
+        let without_window = TimeFilter::default();
+        let window = window_on_october_10();
+        for query in [
+            "titleword",
+            "outsideword",
+            "insideword",
+            "headerword",
+            "resultword",
+        ] {
+            assert!(
+                finds(&without_window, query),
+                "{query:?} is found without a window"
+            );
+        }
+        for query in ["insideword", "headerword", "resultword"] {
+            assert!(
+                finds(&window, query),
+                "{query:?} is found inside the window"
+            );
+        }
+        for query in ["outsideword", "titleword"] {
+            assert!(
+                !finds(&window, query),
+                "{query:?} is left out by the window"
+            );
+        }
+    }
+
+    const QUERIES: [&str; 13] = [
+        "t",
+        "e",
         "session",
         "question",
         "answer",

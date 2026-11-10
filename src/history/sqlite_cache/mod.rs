@@ -29,6 +29,7 @@ mod schema;
 mod scope;
 mod search_parts;
 mod search_texts;
+mod text_scan;
 mod window;
 
 pub use base::{CacheBase, ProcessIdentity};
@@ -54,7 +55,8 @@ pub(crate) use read_catalogue::CatalogueSession;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart};
-pub(crate) use search_texts::{SearchText, SearchedFields};
+pub(crate) use search_texts::SearchedFields;
+pub(crate) use text_scan::{ReadOrder, ScannedRow, TextVisitor, scan_search_texts};
 pub(crate) use window::{InPlaceRow, StoredFile, StoredResume, StoredTurn, WindowUpdate};
 
 use crate::cli::DebugLevel;
@@ -63,7 +65,7 @@ use crate::error::{AppError, Result};
 use crate::history::TranscriptEntries;
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::format::RecordLine;
-use crate::history::provider::SessionCache;
+use crate::history::provider::{SessionCache, SessionRoot};
 use crate::log_entry::LogEntry;
 use connection::Access;
 use entries::path_text;
@@ -269,6 +271,11 @@ impl SqliteCache {
         &self.base
     }
 
+    /// The key this database stores `root`'s sessions under.
+    fn root_key(&self, root: &SessionRoot) -> files::RootKey {
+        files::RootKey::of(root, self.base.canonicaliser().as_ref())
+    }
+
     pub(crate) fn storage_is_current(&self, storage: SessionCache) -> Result<bool> {
         is_storage_current(&self.connection, storage)
     }
@@ -280,7 +287,7 @@ impl SqliteCache {
     pub(crate) fn current_fingerprints(
         &self,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
         discovered: &[crate::history::provider::SessionStub],
     ) -> Result<HashMap<String, CachedFingerprint>> {
         let discovered: HashMap<&str, &crate::history::provider::SessionStub> = discovered
@@ -289,12 +296,16 @@ impl SqliteCache {
             .collect();
         let mut statement = self.connection.prepare_cached(&format!(
             "SELECT cache_key, file_size, mtime_secs, mtime_nsecs, id FROM sessions \
-             WHERE storage = ?1 AND root = ?2 AND status != ?3 AND {}",
+             WHERE storage = ?1 AND root_key = ?2 AND status != ?3 AND {}",
             catalogue::ENTRIES_NOT_FAILED
         ))?;
         let candidates = statement
             .query_map(
-                params![storage.directory, path_text(root), catalogue::WRITING],
+                params![
+                    storage.directory,
+                    self.root_key(root).as_str(),
+                    catalogue::WRITING
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -332,34 +343,40 @@ impl SqliteCache {
         Ok(fingerprints)
     }
 
-    pub(crate) fn stored_keys(&self, storage: SessionCache, root: &Path) -> Result<Vec<String>> {
+    pub(crate) fn stored_keys(
+        &self,
+        storage: SessionCache,
+        root: &SessionRoot,
+    ) -> Result<Vec<String>> {
         Ok(self
             .connection
-            .prepare_cached("SELECT cache_key FROM sessions WHERE storage = ?1 AND root = ?2")?
-            .query_map(params![storage.directory, path_text(root)], |row| {
-                row.get(0)
-            })?
+            .prepare_cached("SELECT cache_key FROM sessions WHERE storage = ?1 AND root_key = ?2")?
+            .query_map(
+                params![storage.directory, self.root_key(root).as_str()],
+                |row| row.get(0),
+            )?
             .collect::<rusqlite::Result<_>>()?)
     }
 
     pub(crate) fn holds(
         &self,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
         stub: &crate::history::provider::SessionStub,
     ) -> Result<bool> {
         let Some(stamp) = stub.fingerprint.stamp() else {
             return Ok(false);
         };
+        let root_key = self.root_key(root);
         self.with_read_snapshot(|connection| {
             let session: Option<i64> = connection.query_row(
                 &format!(
-                    "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
+                    "SELECT id FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3 \
                      AND file_size = ?4 AND mtime_secs = ?5 AND mtime_nsecs = ?6 \
                      AND status != 'writing' AND {}",
                     catalogue::ENTRIES_NOT_FAILED
                 ),
-                params![storage.directory, path_text(root), stub.cache_key, stamp.file_size as i64, stamp.mtime_secs as i64, stamp.mtime_nsecs],
+                params![storage.directory, root_key.as_str(), stub.cache_key, stamp.file_size as i64, stamp.mtime_secs as i64, stamp.mtime_nsecs],
                 |row| row.get(0),
             ).optional()?;
             let Some(session) = session else { return Ok(false) };
@@ -381,7 +398,7 @@ impl SqliteCache {
     pub(crate) fn entries(
         &self,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
         cache_key: &str,
     ) -> Result<Option<TranscriptEntries>> {
         self.with_read_snapshot(|connection| {
@@ -393,7 +410,7 @@ impl SqliteCache {
     pub(crate) fn message_entries(
         &self,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
         cache_key: &str,
         messages: std::ops::RangeInclusive<u64>,
     ) -> Result<Option<TranscriptEntries>> {
@@ -414,12 +431,16 @@ impl SqliteCache {
         &self,
         connection: &Connection,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
         cache_key: &str,
         messages: Option<std::ops::RangeInclusive<u64>>,
     ) -> Result<Option<TranscriptEntries>> {
-        let Some(session) =
-            entries::listed_session_of(connection, storage.directory, &path_text(root), cache_key)?
+        let Some(session) = entries::listed_session_of(
+            connection,
+            storage.directory,
+            &self.root_key(root),
+            cache_key,
+        )?
         else {
             return Ok(None);
         };
@@ -749,10 +770,11 @@ impl CacheWriter {
         Ok(generation)
     }
 
-    /// The keys of `row`'s locator and of each of its files.
+    /// The keys of `row`'s root, its locator and each of its files.
     fn catalogue_keys(&mut self, row: &catalogue::CatalogueRow) -> catalogue::CatalogueKeys {
-        let root = Path::new(&row.root);
+        let root = &row.root;
         catalogue::CatalogueKeys {
+            root: self.root_key(root),
             locator: self.file_keys.of_file_under(root, Path::new(&row.locator)),
             files: row
                 .files
@@ -778,9 +800,9 @@ impl CacheWriter {
         let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
         let session: Option<i64> = batch
             .query_row(
-                "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
+                "SELECT id FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3 \
                  AND status = 'listed' AND entries_error IS NULL",
-                params![row.storage, row.root, row.cache_key],
+                params![row.storage, keys.root.as_str(), row.cache_key],
                 |row| row.get(0),
             )
             .optional()?;
@@ -847,8 +869,8 @@ impl CacheWriter {
         let row = &record.catalogue;
         let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
         batch.execute(
-            "DELETE FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
-            params![row.storage, row.root, row.cache_key],
+            "DELETE FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3",
+            params![row.storage, keys.root.as_str(), row.cache_key],
         )?;
         let generation = next_generation(&batch)?;
         let values = row.values(
@@ -861,7 +883,7 @@ impl CacheWriter {
         );
         let mut statement = batch.prepare_cached(&catalogue::insert_sql())?;
         statement.raw_bind_parameter(1, row.storage)?;
-        statement.raw_bind_parameter(2, &row.root)?;
+        statement.raw_bind_parameter(2, keys.root.as_str())?;
         statement.raw_bind_parameter(3, &row.cache_key)?;
         for (offset, value) in values.iter().enumerate() {
             statement.raw_bind_parameter(offset + 4, value)?;
@@ -908,17 +930,17 @@ impl CacheWriter {
     pub(crate) fn remove(
         &mut self,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
         cache_keys: &[String],
     ) -> Result<()> {
+        let root_key = self.root_key(root);
         let batch = refresh::transaction(&self.connection, &self.owner)?;
         {
             let mut statement = batch.prepare_cached(
-                "DELETE FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
+                "DELETE FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3",
             )?;
-            let root = path_text(root);
             for cache_key in cache_keys {
-                statement.execute(params![storage.directory, root, cache_key])?;
+                statement.execute(params![storage.directory, root_key.as_str(), cache_key])?;
             }
         }
         refresh::commit(batch, &self.owner)?;
@@ -1190,7 +1212,7 @@ pub(crate) enum CacheWrite {
     /// root.
     Removed {
         storage: SessionCache,
-        root: PathBuf,
+        root: SessionRoot,
         cache_keys: Vec<String>,
     },
 }

@@ -11,7 +11,7 @@
 
 use super::rows::{LeadingTexts, SessionRows};
 use super::threads::ThreadOrigin;
-use super::write::{EntryPlace, RowIds, RowWriter};
+use super::write::{EntryPlace, RowIds, RowWriter, SearchPlace};
 use crate::error::Result;
 use crate::history::sqlite_cache::SearchField;
 use rusqlite::{Connection, params};
@@ -104,6 +104,7 @@ pub(in super::super) fn replace_leading(
             .prepare_cached("DELETE FROM entries WHERE id = ?1")?
             .execute([id])?;
     }
+    let mut writer = RowWriter::new(connection, session)?;
     let delta = rows.entries.len() as i64 - stored_count as i64;
     if delta != 0 {
         // Through negative sequences, so no two entries hold one at once.
@@ -125,16 +126,16 @@ pub(in super::super) fn replace_leading(
                  WHERE m.session = ?1 AND t.number = 0))",
             )?
             .execute(params![session, stored_count as i64 + delta, delta])?;
+        writer.shift_search_places(stored_count as i64, delta)?;
     }
     let mut ids = RowIds::new(rows);
-    let mut writer = RowWriter::new(connection, session)?;
     for index in 0..rows.entries.len() {
         let row = &rows.entries[index];
         match stored.get(index) {
             Some(&(_, digest)) if digest == row.digest => {}
             Some(&(id, _)) => {
                 let place = EntryPlace::of(row, rows.sequence_of(index), &ids);
-                writer.update_entry(row, &place, id)?;
+                writer.update_entry(row, &place, SearchPlace::of(rows, index), id)?;
             }
             None => {
                 writer.insert_entry(rows, &mut ids, index)?;
@@ -511,6 +512,11 @@ fn update_messages(
             .prepare_cached("UPDATE messages SET ordinal = NULL WHERE id = ?1")?
             .execute([id])?;
     }
+    let renumbered = changed
+        .iter()
+        .filter(|(_, _, ordinal, new)| ordinal != new)
+        .map(|&(id, _, _, new)| (id, new))
+        .collect::<Vec<_>>();
     let mut kept = Vec::new();
     let mut moved = Vec::new();
     let mut gained = Vec::new();
@@ -536,6 +542,9 @@ fn update_messages(
     };
     for (id, index) in kept.into_iter().chain(moved).chain(gained) {
         writer.update_message(rows, ids, index, id)?;
+    }
+    for (id, ordinal) in renumbered {
+        writer.renumber_search_places(id, ordinal)?;
     }
     Ok(gone.into_iter().map(|(id, _)| id).collect())
 }
@@ -615,8 +624,9 @@ fn update_entries(
     for (entry, index) in kept.into_iter().chain(moved) {
         let row = &rows.entries[index];
         let place = EntryPlace::of(row, rows.sequence_of(index), ids);
+        let search = SearchPlace::of(rows, index);
         if entry.digest != row.digest {
-            writer.update_entry(row, &place, entry.id)?;
+            writer.update_entry(row, &place, search, entry.id)?;
         } else if entry.sequence != place.sequence
             || entry.message != place.message
             || entry.record_transcript != place.transcript
@@ -625,7 +635,7 @@ fn update_entries(
             || entry.position != row.position
             || entry.search_field != row.is_leading.then_some(leading)
         {
-            writer.place_entry(row, &place, entry.id)?;
+            writer.place_entry(row, &place, search, entry.id)?;
         }
     }
     for index in (0..rows.entries.len()).filter(|index| !stored.matched[*index]) {

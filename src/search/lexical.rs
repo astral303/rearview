@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::{PADDED_MESSAGE_SEPARATOR, push_separated};
+use crate::history::sqlite_cache::SearchedFields;
 use crate::search::literal::{
     Literal, LiteralCorpusEntry, build_agent_literal_corpus, build_literal_corpus,
     matches_all_literals,
@@ -13,10 +14,12 @@ use rayon::prelude::*;
 use std::borrow::{Borrow, Cow};
 use std::sync::Arc;
 
+mod chunked;
 mod in_memory;
 mod raw;
 mod streamed;
 
+pub(crate) use in_memory::{CopiesToRead, TextsRead};
 pub use in_memory::{SearchTextsInMemory, SessionSearchTexts};
 use raw::RawQuery;
 
@@ -305,6 +308,14 @@ impl<'w> SearchSurface<'w> {
         }
     }
 
+    /// The stored search fields this surface reads, and its time window.
+    fn stored_fields(self) -> (SearchedFields, TimeFilter) {
+        match self {
+            Self::List(_) => (SearchedFields::List, TimeFilter::default()),
+            Self::Agent(window) => (SearchedFields::Agent, *window),
+        }
+    }
+
     /// `conversation`'s texts held in memory, for the session list's search.
     fn texts_in_memory(self, conversation: &Conversation) -> Option<&'w SessionSearchTexts> {
         match self {
@@ -409,30 +420,36 @@ fn exact_debug_results<C: Borrow<Conversation> + Sync>(
     let corpus = surface.literal_corpus(conversations);
     let ranked_time = |index: usize| surface.ranked_time(conversations[index].borrow());
     let query = RawQuery::new(&[], &[], literals);
-    let mut matching = conversations
-        .par_iter()
-        .enumerate()
-        .map(|(index, conversation)| {
-            if !scope(index) {
-                return Ok(None);
-            }
-            let row = conversation.borrow();
-            let matches = if row.cached_session.is_some() {
-                streamed::collect(row, surface, &query)?.matches_literals()
-            } else {
-                matches_all_literals(&corpus[index].text, literals)
-            };
-            Ok(matches.then_some(index))
+    let in_scope = (0..conversations.len())
+        .filter(|index| scope(*index))
+        .collect::<Vec<_>>();
+    let bodies = streamed::collect_all(
+        conversations,
+        &cached_among(conversations, &in_scope),
+        surface,
+        &query,
+    )?;
+    let mut matching = in_scope
+        .into_par_iter()
+        .filter(|index| match bodies.get(index) {
+            Some(body) => body.matches_literals(),
+            None => matches_all_literals(&corpus[*index].text, literals),
         })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
         .collect::<Vec<_>>();
     matching.sort_unstable_by_key(|index| std::cmp::Reverse(ranked_time(*index)));
     Ok(matching
         .into_iter()
         .map(|index| (index, freshness_only(ranked_time(index), now)))
         .collect())
+}
+
+/// Those of `indices` whose conversation the session cache holds.
+fn cached_among<C: Borrow<Conversation>>(conversations: &[C], indices: &[usize]) -> Vec<usize> {
+    indices
+        .iter()
+        .copied()
+        .filter(|index| conversations[*index].borrow().cached_session.is_some())
+        .collect()
 }
 
 fn browse_debug_results<C: Borrow<Conversation>>(
@@ -523,6 +540,17 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
         vec![]
     };
     let raw_query = RawQuery::new(&query_words, &adjacent_pairs, &literal_filters);
+    let in_scope = searchable
+        .iter()
+        .map(|s| s.index)
+        .filter(|index| scope(*index))
+        .collect::<Vec<_>>();
+    let bodies = streamed::collect_all(
+        conversations,
+        &cached_among(conversations, &in_scope),
+        surface,
+        &raw_query,
+    )?;
 
     let mut scored: Vec<(usize, ScoreDebug, DateTime<Local>)> = searchable
         .par_iter()
@@ -532,19 +560,19 @@ fn search_debug_with_query<C: Borrow<Conversation> + Sync>(
             }
             let row = conversations[s.index].borrow();
             let time = surface.ranked_time(row);
-            if row.cached_session.is_some() {
-                let counts = streamed::collect(row, surface, &raw_query)?;
+            if let Some(body) = bodies.get(&s.index) {
                 let include_project =
                     !matches!(surface, SearchSurface::Agent(window) if window.is_active());
                 return Ok(streamed::score(
                     s,
-                    counts,
+                    body,
+                    || streamed::body_has_text(row, surface, body),
                     &query_words,
                     &adjacent_pairs,
                     time,
                     now,
                     include_project,
-                )
+                )?
                 .map(|debug| (s.index, debug, time)));
             }
             if corpus.as_ref().is_some_and(|corpus| {

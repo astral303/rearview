@@ -2514,6 +2514,7 @@ dependencies = [
 name = "rearview"
 version = "0.6.1"
 dependencies = [
+ "aho-corasick",
  "arboard",
  "bincode",
  "blake3",

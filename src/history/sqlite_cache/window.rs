@@ -9,7 +9,7 @@ use crate::error::{AppError, Result};
 use crate::history::MalformedLine;
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::format::RecordLine;
-use crate::history::provider::{SessionCache, TranscriptRead};
+use crate::history::provider::{SessionCache, SessionRoot, TranscriptRead};
 use crate::history::resumed::{SessionCheckpoint, WholeRead};
 use crate::log_entry::LogEntry;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -73,18 +73,19 @@ impl SqliteCache {
     pub(crate) fn stored_resume(
         &self,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
         cache_key: &str,
         generation: i64,
     ) -> Result<std::result::Result<StoredResume, WholeRead>> {
+        let root_key = self.root_key(root);
         self.with_read_snapshot(|connection| {
             let row: Option<StoredCheckpointRow> = connection
                 .query_row(
                     "SELECT s.id, s.generation, c.sequence, c.checkpoint, c.ledger \
                      FROM sessions s JOIN session_checkpoints c ON c.session = s.id \
-                     WHERE s.storage = ?1 AND s.root = ?2 AND s.cache_key = ?3 \
+                     WHERE s.storage = ?1 AND s.root_key = ?2 AND s.cache_key = ?3 \
                      AND s.status = 'listed' AND s.entries_error IS NULL",
-                    params![storage.directory, path_text(root), cache_key],
+                    params![storage.directory, root_key.as_str(), cache_key],
                     |row| {
                         Ok((
                             row.get(0)?,

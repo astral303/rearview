@@ -1,4 +1,5 @@
 use super::digest::Digest;
+use super::write::SearchPlace;
 use super::{ReadPurpose, Selection};
 use crate::agent::sanitize::split_terminal_codes;
 use crate::agent::transcript::tool_result_item_text;
@@ -17,9 +18,9 @@ impl<'connection> Writer<'connection> {
     pub(super) fn new(connection: &'connection Connection) -> rusqlite::Result<Self> {
         Ok(Self {
             part: connection.prepare(
-                "INSERT INTO parts (entry, part, kind, search_field, text, text_codes, \
-                 call_id, name, tool, json, result_shape) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO parts (session, entry, part, kind, search_field, entry_sequence, \
+                 message_ordinal, text, text_codes, call_id, name, tool, json, result_shape) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?,
             item: connection.prepare(
                 "INSERT INTO result_items (part, position, kind, searched, text, text_codes, \
@@ -28,24 +29,29 @@ impl<'connection> Writer<'connection> {
         })
     }
 
-    /// Writes `blocks`, each read by search in the field `search` holds for
-    /// it.
+    /// Writes `blocks` as the parts of `session`'s entry `entry`, each read
+    /// by search in the field `search` holds for it, at `place`.
     pub(super) fn write(
         &mut self,
         connection: &Connection,
+        session: i64,
         entry: i64,
         blocks: &[ContentBlock],
         search: &[Option<SearchField>],
+        place: SearchPlace,
     ) -> rusqlite::Result<()> {
         for (position, block) in blocks.iter().enumerate() {
             let columns = Columns::of(block);
             let field = search[position];
             let text = columns.text.map(split_terminal_codes);
             self.part.execute(params![
+                session,
                 entry,
                 position as i64,
                 columns.kind,
                 field.map(SearchField::code),
+                field.map(|_| place.sequence),
+                field.and(place.ordinal),
                 text.as_ref().map(|text| &*text.text),
                 text.as_ref().and_then(|text| text.codes.as_deref()),
                 columns.call_id,

@@ -1,7 +1,9 @@
 //! Where a provider keeps its sessions.
 
+use super::walk::Canonicaliser;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// The environment variables and the home, current and temporary
 /// directories a provider resolves its roots from. Tests build their own,
@@ -121,25 +123,49 @@ pub enum RootOrigin {
 
 /// One place a provider stores sessions — a directory tree for file-backed
 /// providers, but any container a provider can enumerate: each root carries its
-/// own session cache, keyed by `path`. How sessions are found inside it is the
-/// provider's own knowledge, stated in its
+/// own session cache, keyed by its [canonical path](Self::canonical_path), so
+/// every spelling of one directory shares one cache. How sessions are found
+/// inside it is the provider's own knowledge, stated in its
 /// [`discover`](super::SessionStorage::discover).
 ///
 /// Roots are [`RootOrigin::Redirected`] unless [`SessionRoot::in_agent_tree`]
 /// says otherwise. That default is the cautious one: a provider that does not
 /// declare a root as its own cannot claim transcripts that name no agent.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct SessionRoot {
     pub path: PathBuf,
     origin: RootOrigin,
+    /// `path` as [`Self::canonical_path`] resolved it. A storage hands each
+    /// load roots of their own, so a load resolves each root once.
+    canonical: OnceLock<PathBuf>,
 }
+
+impl PartialEq for SessionRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.origin == other.origin
+    }
+}
+
+impl Eq for SessionRoot {}
 
 impl SessionRoot {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             origin: RootOrigin::Redirected,
+            canonical: OnceLock::new(),
         }
+    }
+
+    /// `path` resolved through `canonicaliser`, or `path` itself when it
+    /// does not resolve. Resolved on the first call; later calls on this
+    /// root, and on clones made after it, return the same path.
+    pub(crate) fn canonical_path(&self, canonicaliser: &dyn Canonicaliser) -> &Path {
+        self.canonical.get_or_init(|| {
+            canonicaliser
+                .canonicalise(&self.path)
+                .unwrap_or_else(|_| self.path.clone())
+        })
     }
 
     /// Mark this root as part of the agent's own tree rather than a directory

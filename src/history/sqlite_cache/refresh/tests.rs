@@ -435,7 +435,7 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
     send.send(CacheWrite::Session(Box::new(original))).unwrap();
     send.send(CacheWrite::Removed {
         storage: Source::Pi.provider().storage().cache(),
-        root: PathBuf::from("virtual"),
+        root: SessionRoot::new("virtual"),
         cache_keys: vec!["session".to_owned()],
     })
     .unwrap();
@@ -445,7 +445,7 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
         current
             .current_fingerprints(
                 Source::Pi.provider().storage().cache(),
-                Path::new("virtual"),
+                &SessionRoot::new("virtual"),
                 &[]
             )
             .unwrap()["session"]
@@ -815,7 +815,7 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
     send.send(CacheWrite::Session(Box::new(changed))).unwrap();
     send.send(CacheWrite::Removed {
         storage: Source::Pi.provider().storage().cache(),
-        root: PathBuf::from(&original.catalogue.root),
+        root: original.catalogue.root.clone(),
         cache_keys: vec![original.catalogue.cache_key.clone()],
     })
     .unwrap();
@@ -826,7 +826,7 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
         cache
             .holds(
                 Source::Pi.provider().storage().cache(),
-                Path::new(&original.catalogue.root),
+                &original.catalogue.root,
                 &SessionStub {
                     locator: PathBuf::new(),
                     subagents: Vec::new(),

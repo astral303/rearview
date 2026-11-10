@@ -167,15 +167,11 @@ pub(crate) fn read_resumed(
     let Some(cached) = &stored.cached_session else {
         return Ok(Err(WholeRead::NoCheckpoint));
     };
-    let resume = match cache.stored_resume(
-        storage.cache(),
-        &root.path,
-        &stub.cache_key,
-        cached.generation(),
-    )? {
-        Ok(resume) => resume,
-        Err(whole) => return Ok(Err(whole)),
-    };
+    let resume =
+        match cache.stored_resume(storage.cache(), root, &stub.cache_key, cached.generation())? {
+            Ok(resume) => resume,
+            Err(whole) => return Ok(Err(whole)),
+        };
     let stamps = StubStamps::current(stub);
     let reader = storage.transcript_reader();
     // A source without a stamp either time, such as a database's session,

@@ -190,8 +190,8 @@ impl ProcessIdentity {
 
 /// The session cache directory as one rearview reaches it: with that
 /// rearview's [`ProcessIdentity`], the clock its waits and commit times run
-/// on, the free space its writes check, and the canonicaliser its writes key
-/// session files with.
+/// on, the free space its writes check, and the canonicaliser its reads and
+/// writes key session roots and files with.
 #[derive(Clone)]
 pub struct CacheBase {
     path: PathBuf,
@@ -202,8 +202,9 @@ pub struct CacheBase {
 }
 
 impl CacheBase {
-    /// The base at `path`, its writes checking the system's free space and
-    /// keying session files through the file system's canonicalisation.
+    /// The base at `path`, its writes checking the system's free space, and
+    /// its reads and writes keying session roots and files through the file
+    /// system's canonicalisation.
     pub fn new(path: impl Into<PathBuf>, process: ProcessIdentity, clock: Arc<dyn Clock>) -> Self {
         Self {
             path: path.into(),
@@ -214,7 +215,7 @@ impl CacheBase {
         }
     }
 
-    /// This base, its writes keying session files through `canonicaliser`.
+    /// This base, keying session roots and files through `canonicaliser`.
     pub(crate) fn with_canonicaliser(self, canonicaliser: Arc<dyn Canonicaliser>) -> Self {
         Self {
             canonicaliser,

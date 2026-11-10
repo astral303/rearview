@@ -5,6 +5,7 @@
 //! character outside ASCII whose lowercase holds ASCII: LATIN CAPITAL LETTER I
 //! WITH DOT ABOVE lowercases to `i` and a combining dot, KELVIN SIGN to `k`.
 
+use aho_corasick::{AhoCorasick, Input, Span, packed};
 use memchr::arch::all::packedpair::Pair;
 use memchr::memmem;
 use std::sync::LazyLock;
@@ -17,15 +18,37 @@ static DOTTED_CAPITAL_I_FINDER: LazyLock<memmem::Finder<'static>> =
 static KELVIN_SIGN_FINDER: LazyLock<memmem::Finder<'static>> =
     LazyLock::new(|| memmem::Finder::new(KELVIN_SIGN));
 
+/// The needle bytes whose case variants the packed searcher looks for:
+/// Teddy, its SIMD algorithm, fingerprints at most a pattern's first three
+/// bytes, so a longer prefix only multiplies the variants.
+const PREFIX_LEN: usize = 3;
+
 /// A lowercase ASCII needle, found ignoring ASCII case. Built once per
 /// search and used for every text.
 #[derive(Clone, Debug)]
 pub(crate) struct AsciiCaselessFinder {
     needle: Box<[u8]>,
-    /// The needle byte a search looks for first, the rarest in typical text
-    /// by memchr's byte frequencies. Each occurrence of it, in either case,
-    /// is a candidate match to compare.
+    candidates: Candidates,
+    /// The needle byte rarest in typical text, by memchr's byte frequencies.
     anchor: usize,
+}
+
+/// How the finder reaches the needle's next occurrence.
+#[derive(Clone, Debug)]
+enum Candidates {
+    /// An empty needle occurs nowhere.
+    Nowhere,
+    /// Each occurrence of a one-byte needle, in either case.
+    Byte { lower: u8, upper: u8 },
+    /// Each occurrence of the needle's first bytes in any case, by
+    /// aho-corasick's packed searcher, compared with the whole needle.
+    /// aho-corasick's ASCII case-insensitive searcher, which looks for one
+    /// of the needle's bytes in either case, ran 2–5 times slower than this
+    /// on a transcript of code.
+    Prefix(packed::Searcher),
+    /// aho-corasick's ASCII case-insensitive searcher, on a CPU without the
+    /// packed searcher's instructions.
+    Caseless(AhoCorasick),
 }
 
 impl AsciiCaselessFinder {
@@ -36,9 +59,33 @@ impl AsciiCaselessFinder {
                 .all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase()),
             "the needle is lowercase ASCII: {needle:?}"
         );
+        let candidates = match needle {
+            [] => Candidates::Nowhere,
+            [byte] => Candidates::Byte {
+                lower: *byte,
+                upper: byte.to_ascii_uppercase(),
+            },
+            _ => packed::Config::new()
+                .match_kind(packed::MatchKind::LeftmostFirst)
+                .builder()
+                .extend(case_variants(&needle[..needle.len().min(PREFIX_LEN)]))
+                .build()
+                .map_or_else(
+                    || {
+                        Candidates::Caseless(
+                            AhoCorasick::builder()
+                                .ascii_case_insensitive(true)
+                                .build([needle])
+                                .expect("one query word is within the searcher's size limits"),
+                        )
+                    },
+                    Candidates::Prefix,
+                ),
+        };
         let anchor = Pair::new(needle).map_or(0, |pair| usize::from(pair.index1()));
         Self {
             needle: needle.into(),
+            candidates,
             anchor,
         }
     }
@@ -64,26 +111,56 @@ impl AsciiCaselessFinder {
     /// The byte where the needle next occurs in `haystack` from byte `from`,
     /// ignoring ASCII case. An empty needle occurs nowhere.
     pub(crate) fn find(&self, haystack: &[u8], from: usize) -> Option<usize> {
-        let needle = &*self.needle;
-        let last_start = haystack.len().checked_sub(needle.len())?;
-        let lower = *needle.get(self.anchor)?;
-        let upper = lower.to_ascii_uppercase();
-        let mut start = from;
-        while start <= last_start {
-            let window = &haystack[start + self.anchor..=last_start + self.anchor];
-            let offset = if lower == upper {
-                memchr::memchr(lower, window)
-            } else {
-                memchr::memchr2(lower, upper, window)
-            }?;
-            let candidate = start + offset;
-            if haystack[candidate..candidate + needle.len()].eq_ignore_ascii_case(needle) {
-                return Some(candidate);
+        let rest = haystack.get(from..)?;
+        match &self.candidates {
+            Candidates::Nowhere => None,
+            Candidates::Byte { lower, upper } => {
+                memchr::memchr2(*lower, *upper, rest).map(|offset| from + offset)
             }
-            start = candidate + 1;
+            Candidates::Caseless(searcher) => searcher
+                .find(Input::new(haystack).range(from..))
+                .map(|found| found.start()),
+            Candidates::Prefix(searcher) => {
+                let needle = &*self.needle;
+                let last_start = haystack.len().checked_sub(needle.len())?;
+                let mut start = from;
+                while start <= last_start {
+                    let candidate = searcher
+                        .find_in(haystack, Span::from(start..haystack.len()))?
+                        .start();
+                    if candidate > last_start {
+                        return None;
+                    }
+                    if haystack[candidate..candidate + needle.len()].eq_ignore_ascii_case(needle) {
+                        return Some(candidate);
+                    }
+                    start = candidate + 1;
+                }
+                None
+            }
         }
-        None
     }
+}
+
+/// Every spelling of `prefix` in upper and lower case.
+fn case_variants(prefix: &[u8]) -> Vec<Vec<u8>> {
+    prefix.iter().fold(vec![Vec::new()], |variants, byte| {
+        let cases = if byte.is_ascii_alphabetic() {
+            vec![*byte, byte.to_ascii_uppercase()]
+        } else {
+            vec![*byte]
+        };
+        variants
+            .iter()
+            .flat_map(|variant| {
+                cases.iter().map(move |case| {
+                    let mut longer = variant.clone();
+                    longer.push(*case);
+                    longer
+                })
+            })
+            .collect()
+    })
 }
 
 /// The characters outside ASCII whose lowercase holds a letter of a
@@ -130,7 +207,9 @@ mod tests {
 
     #[test]
     fn finder_finds_what_comparing_each_position_finds() {
-        let needles = ["cache", "refresh", "a", "zz", "x9", "_", "elan", "q"];
+        let needles = [
+            "cache", "refresh", "a", "zz", "x9", "_", "elan", "q", "e", "the", "ee",
+        ];
         let haystacks = [
             "",
             "c",
@@ -142,6 +221,9 @@ mod tests {
             "élan ÉLAN elan, café cache ü cache",
             "zzz zZ Zz",
             "x9X9 _x_ q",
+            "The theme: then THE thesis; bathe tHe eee eE Ee",
+            "a text longer than the packed searcher's shortest haystack: CACHE was REFRESHED, \
+             then x9 met élan_q and zz; the cache, the Cache and cAcHe come last: cache",
         ];
         for needle in needles {
             let finder = AsciiCaselessFinder::new(needle.as_bytes());

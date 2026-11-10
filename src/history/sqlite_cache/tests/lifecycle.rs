@@ -57,12 +57,12 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
     );
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .is_empty()
     );
     assert!(matches!(
-        cache.entries(storage, &root.path, CACHE_KEY),
+        cache.entries(storage, &root, CACHE_KEY),
         Err(AppError::SessionCacheNotReady { .. })
     ));
 
@@ -70,13 +70,13 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
     cache.write(&record).unwrap();
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .contains_key(CACHE_KEY)
     );
     assert!(
         !cache
-            .entries(storage, &root.path, CACHE_KEY)
+            .entries(storage, &root, CACHE_KEY)
             .unwrap()
             .unwrap()
             .entries
@@ -104,7 +104,7 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
     let replacement = entries::listed_session_of(
         &newer.connection,
         storage.directory,
-        &path_text(&root.path),
+        &newer.root_key(&root),
         CACHE_KEY,
     )
     .unwrap()
@@ -122,15 +122,12 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
         matches!(older.set_final_status(previous, SessionStatus::Listed, None), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
     );
     assert_eq!(
-        newer
-            .current_fingerprints(storage, &root.path, &[])
-            .unwrap()[CACHE_KEY]
-            .mtime_secs,
+        newer.current_fingerprints(storage, &root, &[]).unwrap()[CACHE_KEY].mtime_secs,
         2
     );
     assert_eq!(
         newer
-            .entries(storage, &root.path, CACHE_KEY)
+            .entries(storage, &root, CACHE_KEY)
             .unwrap()
             .unwrap()
             .entries
@@ -147,7 +144,7 @@ fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
         format!(
             "{:?}",
             newer
-                .entries(storage, &root.path, CACHE_KEY)
+                .entries(storage, &root, CACHE_KEY)
                 .unwrap()
                 .unwrap()
                 .entries
@@ -167,18 +164,16 @@ fn read_snapshot_survives_replacement_between_identity_and_reconstruction() {
             serde_json::json!({"type":"user","message":{"role":"user","content":"old content"}}),
         ]),
     );
+    let root_key = reader.root_key(&root);
     let old = reader.with_read_snapshot(|connection| {
-        let id = entries::listed_session_of(connection, storage.directory, &path_text(&root.path), CACHE_KEY)?.unwrap().id;
+        let id = entries::listed_session_of(connection, storage.directory, &root_key, CACHE_KEY)?.unwrap().id;
         write_test_entries(&mut writer, message_schema::transcript(vec![
             serde_json::json!({"type":"user","message":{"role":"user","content":"new content"}}),
         ]));
         entries::read(connection, id, None)
     }).unwrap();
     assert!(format!("{:?}", old.entries).contains("old content"));
-    let new = reader
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let new = reader.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert!(format!("{:?}", new.entries).contains("new content"));
 }
 
@@ -193,18 +188,18 @@ fn unfinished_session_doesnt_become_reusable_or_leave_deletion_set() {
         .unwrap();
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .is_empty()
     );
-    assert_eq!(cache.stored_keys(storage, &root.path).unwrap(), [CACHE_KEY]);
+    assert_eq!(cache.stored_keys(storage, &root).unwrap(), [CACHE_KEY]);
     assert!(matches!(
-        cache.entries(storage, &root.path, CACHE_KEY),
+        cache.entries(storage, &root, CACHE_KEY),
         Err(AppError::SessionCacheNotReady { .. })
     ));
-    let stored = cache.stored_keys(storage, &root.path).unwrap();
-    cache.remove(storage, &root.path, &stored).unwrap();
-    assert!(cache.stored_keys(storage, &root.path).unwrap().is_empty());
+    let stored = cache.stored_keys(storage, &root).unwrap();
+    cache.remove(storage, &root, &stored).unwrap();
+    assert!(cache.stored_keys(storage, &root).unwrap().is_empty());
 }
 
 #[test]

@@ -24,7 +24,7 @@ fn write_stores_each_text_content_rebuilds_once_for_every_provider() {
             .write(&parsed_record(row.source, &root, &stub))
             .unwrap();
         let CatalogueSession::Listed(listed) = cache
-            .catalogue_session(storage, row.source, &root.path, &stub.cache_key, false)
+            .catalogue_session(storage, row.source, &root, &stub.cache_key, false)
             .unwrap()
             .unwrap()
         else {
@@ -69,7 +69,7 @@ fn rebuilt_texts(copy: &CachedSession, listed: &Conversation) -> Vec<FieldText> 
 /// content drops it.
 fn stored_texts(copy: &CachedSession) -> Vec<FieldText> {
     let mut texts = Vec::new();
-    copy.visit_search_texts(SearchedFields::Agent, &TimeFilter::default(), |text| {
+    copy.read_search_texts(SearchedFields::Agent, &TimeFilter::default(), |text| {
         let normalised = normalize_whitespace(text.text);
         if !normalised.is_empty() {
             texts.push((text.field, text.ordinal, normalised));
@@ -104,10 +104,7 @@ fn code_inside_word_doesnt_split_it_in_any_field_and_display_reads_it_back() {
     let mut cache = admitted_cache(base.path());
     let (storage, root) = write_test_entries(&mut cache, records());
 
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert_eq!(
         format!("{:?}", read.entries),
         format!("{:?}", records().entries),

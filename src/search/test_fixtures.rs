@@ -7,6 +7,76 @@ use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local, TimeZone};
 use std::path::PathBuf;
 
+/// Claude Code sessions in a temporary directory, each cached in a session
+/// cache of its own directory, with their rows as the cache lists them.
+pub struct CachedClaudeSessions {
+    _home: tempfile::TempDir,
+    _cache: tempfile::TempDir,
+    pub rows: Vec<Conversation>,
+}
+
+/// Writes one Claude Code transcript per `(name, records)` pair, each record
+/// one line, and caches each session as a load does.
+pub fn cached_claude_sessions(
+    transcripts: &[(&str, Vec<serde_json::Value>)],
+) -> CachedClaudeSessions {
+    use crate::history::Source;
+    use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
+    use crate::history::sqlite_cache::tests::{parsed_record_and_row, rearview_at};
+    use crate::history::sqlite_cache::{CatalogueSession, SqliteCache};
+
+    let home = tempfile::tempdir().unwrap();
+    let cache_directory = tempfile::tempdir().unwrap();
+    let mut cache = SqliteCache::open(&rearview_at(cache_directory.path())).unwrap();
+    cache.mark_admitted().unwrap();
+    let storage = Source::Claude.provider().storage().cache();
+    cache.admit_storage(storage).unwrap();
+    let root = SessionRoot::new(home.path());
+    let mut rows = Vec::new();
+    for (name, records) in transcripts {
+        let path = home.path().join(format!("{name}.jsonl"));
+        let lines = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, lines).unwrap();
+        let stub = SessionStub {
+            locator: path,
+            subagents: Vec::new(),
+            cache_key: (*name).to_owned(),
+            fingerprint: Fingerprint {
+                size: 1000,
+                modified: Some(std::time::UNIX_EPOCH),
+            },
+        };
+        let (record, _) = parsed_record_and_row(Source::Claude, &root, &stub);
+        cache.write(&record).unwrap();
+        let CatalogueSession::Listed(cached) = cache
+            .catalogue_session(storage, Source::Claude, &root, &stub.cache_key, false)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("the session {name} is listed")
+        };
+        rows.push(*cached);
+    }
+    CachedClaudeSessions {
+        _home: home,
+        _cache: cache_directory,
+        rows,
+    }
+}
+
+/// A Claude Code user message with `text`, sent at `time`.
+pub fn claude_user_record(text: &str, time: DateTime<Local>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "user",
+        "timestamp": time.to_rfc3339(),
+        "message": {"role": "user", "content": text}
+    })
+}
+
 /// `day` October 2026 at `hour`, local time.
 pub fn october(day: u32, hour: u32) -> DateTime<Local> {
     Local

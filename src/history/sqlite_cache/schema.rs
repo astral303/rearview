@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 16;
+pub(super) const SCHEMA_VERSION: u32 = 20;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Every table, dropped in this order when the schema changes.
@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- The storage that found the session: `SessionCache::directory`.
     storage TEXT NOT NULL,
     source TEXT NOT NULL,
+    -- The root's `RootKey`: its canonical path, lowercased on a file system
+    -- that ignores case. Every spelling of the root keys its sessions by it.
+    root_key TEXT NOT NULL,
+    -- The root as the last write's discovery spelled it, as the locator is.
     root TEXT NOT NULL,
     cache_key TEXT NOT NULL,
     -- As discovery spells it.
@@ -86,7 +90,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- from the `last_generation` meta counter. Every write gives the row a
     -- new one, so a reader holding the old number sees the copy change.
     generation INTEGER NOT NULL,
-    UNIQUE (storage, root, cache_key)
+    UNIQUE (storage, root_key, cache_key)
 );
 CREATE INDEX IF NOT EXISTS sessions_by_session_id ON sessions (session_id_key);
 CREATE INDEX IF NOT EXISTS sessions_by_locator ON sessions (locator);
@@ -166,6 +170,9 @@ CREATE TABLE IF NOT EXISTS search_texts (
     -- Gives the text its message number. Deleted with the session.
     entry INTEGER NOT NULL,
     search_field INTEGER NOT NULL,
+    -- As on `parts`.
+    entry_sequence INTEGER NOT NULL,
+    message_ordinal INTEGER,
     text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS search_texts_by_session ON search_texts (session);
@@ -320,6 +327,9 @@ CREATE INDEX IF NOT EXISTS entries_by_search_field ON entries (session, sequence
 -- images and unknown blocks.
 CREATE TABLE IF NOT EXISTS parts (
     id INTEGER PRIMARY KEY,
+    -- The entry's session, so one session's parts are read without its
+    -- entries.
+    session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
     entry INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
     part INTEGER NOT NULL,
     kind TEXT NOT NULL,
@@ -327,6 +337,11 @@ CREATE TABLE IF NOT EXISTS parts (
     -- `result_items` in; null when search does not read the part. Before
     -- `text`, so reading it does not read a long text's overflow pages.
     search_field INTEGER,
+    -- Set with `search_field`: the entry's `sequence`, and the `ordinal` of
+    -- the entry's message when the entry contributes to it. Search places
+    -- the text by these without reading the entry.
+    entry_sequence INTEGER,
+    message_ordinal INTEGER,
     -- Text, thinking, or a result's content recorded as one string.
     text TEXT,
     text_codes BLOB,
@@ -344,6 +359,7 @@ CREATE TABLE IF NOT EXISTS parts (
     result_shape TEXT,
     UNIQUE (entry, part)
 );
+CREATE INDEX IF NOT EXISTS parts_by_session ON parts (session);
 
 -- A result array's original item positions, including reference-only
 -- items. Text is kept separately from image and other opaque payloads.

@@ -988,7 +988,7 @@ impl SessionLoader<'_> {
             if reconciles_deletions && !removed.is_empty() && caches.access.owner().is_some() {
                 let _ = writes.send(CacheWrite::Removed {
                     storage: self.storage.cache(),
-                    root: root.path.clone(),
+                    root: root.clone(),
                     cache_keys: removed,
                 });
             }
@@ -1064,12 +1064,12 @@ impl SessionLoader<'_> {
         self.meter.reading_cache();
         let reading = self.clock().now();
         let cache = database.reader();
-        let current = cache.current_fingerprints(self.storage.cache(), &root.path, stubs)?;
-        let stored = cache.stored_keys(self.storage.cache(), &root.path)?;
+        let current = cache.current_fingerprints(self.storage.cache(), root, stubs)?;
+        let stored = cache.stored_keys(self.storage.cache(), root)?;
         let catalogue = cache.catalogue(
             self.storage.cache(),
             self.storage.source(),
-            &root.path,
+            root,
             self.show_last,
         )?;
         self.meter
@@ -2319,7 +2319,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let keys: HashSet<_> = database
-            .stored_keys(storage.cache(), &root.path)
+            .stored_keys(storage.cache(), &root)
             .unwrap()
             .into_iter()
             .collect();
@@ -2464,7 +2464,7 @@ mod tests {
             .unwrap();
         assert!(
             database
-                .stored_keys(storage.cache(), &root.path)
+                .stored_keys(storage.cache(), &root)
                 .unwrap()
                 .is_empty(),
             "the read doesn't write the database"
@@ -3212,7 +3212,7 @@ mod tests {
             )]
         );
         assert_eq!(
-            stored_keys_under(base.path(), home.storage, &home.root().path),
+            stored_keys_under(base.path(), home.storage, &home.root()),
             [codex_cache_key(&home, &rollout)],
             "the incomplete walk's session is cached"
         );
@@ -3376,7 +3376,7 @@ mod tests {
         SqliteCache::open_waiting(&rearview(cache_base))
             .unwrap()
             .unwrap()
-            .current_fingerprints(home.storage().cache(), &home.root().path, &[])
+            .current_fingerprints(home.storage().cache(), &home.root(), &[])
             .unwrap()
     }
 
@@ -3916,7 +3916,7 @@ mod tests {
         );
         assert_eq!(result.unreadable_directories, vec![blocked]);
         assert_eq!(
-            stored_keys_under(base.path(), home.storage, &home.root().path),
+            stored_keys_under(base.path(), home.storage, &home.root()),
             [codex_cache_key(&home, &rollout)],
             "the incomplete walk's session is cached"
         );
@@ -3996,7 +3996,12 @@ mod tests {
         let recorded = SqliteCache::open_waiting(&rearview(cache_base))
             .unwrap()
             .unwrap()
-            .catalogue(storage.cache(), storage.source(), root, false)
+            .catalogue(
+                storage.cache(),
+                storage.source(),
+                &SessionRoot::new(root),
+                false,
+            )
             .unwrap()
             .remove(cache_key.as_ref());
         match recorded {
@@ -4092,9 +4097,9 @@ mod tests {
                 .unwrap();
             super::super::contract_tests::load_under(fixture, home.path(), base.path());
             let mut database = SqliteCache::open(&rearview(base.path())).unwrap();
-            let keys = database.stored_keys(storage, &root.path).unwrap();
+            let keys = database.stored_keys(storage, &root).unwrap();
             assert_eq!(keys.len(), 1);
-            database.remove(storage, &root.path, &keys).unwrap();
+            database.remove(storage, &root, &keys).unwrap();
             drop(database);
 
             super::super::contract_tests::load_under(fixture, home.path(), base.path());
@@ -4104,7 +4109,7 @@ mod tests {
                 .unwrap();
             assert!(
                 !database
-                    .entries(storage, &root.path, &keys[0])
+                    .entries(storage, &root, &keys[0])
                     .unwrap()
                     .unwrap()
                     .entries
@@ -4129,9 +4134,7 @@ mod tests {
             let database = SqliteCache::open_waiting(&rearview(base.path()))
                 .unwrap()
                 .unwrap();
-            let fingerprint = database
-                .current_fingerprints(storage, &root.path, &[])
-                .unwrap();
+            let fingerprint = database.current_fingerprints(storage, &root, &[]).unwrap();
             assert_eq!(fingerprint.len(), 1);
             let connection =
                 rusqlite::Connection::open(base.path().join(sqlite_cache::DATABASE_FILE_NAME))
@@ -4144,7 +4147,7 @@ mod tests {
                 .unwrap();
             assert!(
                 database
-                    .current_fingerprints(storage, &root.path, &[])
+                    .current_fingerprints(storage, &root, &[])
                     .unwrap()
                     .is_empty()
             );
@@ -4153,9 +4156,7 @@ mod tests {
 
             assert_eq!(rows.len(), 1);
             assert_eq!(
-                database
-                    .current_fingerprints(storage, &root.path, &[])
-                    .unwrap(),
+                database.current_fingerprints(storage, &root, &[]).unwrap(),
                 fingerprint
             );
             let (replacement, error): (i64, Option<String>) = connection
@@ -4310,12 +4311,16 @@ mod tests {
 
     /// The cache keys `base`'s database stores for `home`'s root, sorted.
     fn stored_keys_in(base: &Path, home: &ClaudeHome) -> Vec<String> {
-        stored_keys_under(base, home.storage(), &home.root().path)
+        stored_keys_under(base, home.storage(), &home.root())
     }
 
-    /// The cache keys `base`'s database stores for `storage`'s root at
-    /// `root`, sorted.
-    fn stored_keys_under(base: &Path, storage: &dyn SessionStorage, root: &Path) -> Vec<String> {
+    /// The cache keys `base`'s database stores for `storage`'s `root`,
+    /// sorted.
+    fn stored_keys_under(
+        base: &Path,
+        storage: &dyn SessionStorage,
+        root: &SessionRoot,
+    ) -> Vec<String> {
         let mut keys = SqliteCache::open_waiting(&rearview(base))
             .unwrap()
             .unwrap()
@@ -4411,7 +4416,7 @@ mod tests {
             .into_owned();
         let written = SqliteCache::open(&rearview(cache_base.path()))
             .unwrap()
-            .entries(storage.cache(), &root.path, &cache_key)
+            .entries(storage.cache(), &root, &cache_key)
             .unwrap()
             .expect("the session's rows are written");
         let expected = crate::history::normalized_session(

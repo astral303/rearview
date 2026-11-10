@@ -1575,7 +1575,7 @@ pub(super) mod tests {
         let cached = SqliteCache::open_waiting(&database)
             .unwrap()
             .unwrap()
-            .current_fingerprints(storage.cache(), &root.path, &[])
+            .current_fingerprints(storage.cache(), &root, &[])
             .unwrap();
         assert_eq!(
             cached.len(),

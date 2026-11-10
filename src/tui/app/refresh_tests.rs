@@ -617,7 +617,10 @@ fn load_and_refresh_canonicalise_root_alone_whatever_sub_agent_count() {
 
     let root = std::slice::from_ref(&single.root);
     assert_eq!(single.cold_load, root, "a cold load resolves the root once");
-    assert!(single.warm_load.is_empty(), "a warm load resolves nothing");
+    assert_eq!(
+        single.warm_load, root,
+        "a warm load resolves the root its sessions are keyed under once"
+    );
     assert_eq!(single.refresh, root, "a refresh resolves the root once");
     assert_eq!(
         (
@@ -625,7 +628,7 @@ fn load_and_refresh_canonicalise_root_alone_whatever_sub_agent_count() {
             multiple.warm_load.len(),
             multiple.refresh.len()
         ),
-        (1, 0, 1),
+        (1, 1, 1),
         "four sessions of four sub-agents each resolve no more: {multiple:?}"
     );
 }

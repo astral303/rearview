@@ -59,7 +59,10 @@ use tui::ListSearchMode;
 /// Run `rearview` with the process's arguments on the system clock, print any
 /// error to stderr, and return the exit status.
 pub fn run() -> ExitCode {
-    let Err(error) = try_run(Arc::new(SystemClock::new())) else {
+    let result = history::sqlite_cache::connection::turn_off_memory_statistics()
+        .map_err(AppError::from)
+        .and_then(|()| try_run(Arc::new(SystemClock::new())));
+    let Err(error) = result else {
         return ExitCode::SUCCESS;
     };
     if matches!(error, AppError::SelectionCancelled) {

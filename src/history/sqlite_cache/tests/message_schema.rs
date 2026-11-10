@@ -106,10 +106,7 @@ fn message_links_its_records_and_keeps_its_millisecond_span() {
         0,
         "shared fields are stored on messages"
     );
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert_eq!(
         read.entries[0].1.timestamp(),
         Some("2026-01-01T08:00:00.125Z")
@@ -234,10 +231,7 @@ fn absent_or_unparseable_entry_time_doesnt_become_epoch_zero() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(times, [None, None, Some(0)]);
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert_eq!(read.entries[0].1.timestamp(), None);
     assert_eq!(read.entries[1].1.timestamp(), None);
     assert_eq!(

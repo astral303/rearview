@@ -1368,7 +1368,7 @@ fn cached_keys_under(
             environment.cache_base(),
         )? {
             Some(cache) if cache.storage_is_current(storage.cache())? => {
-                cache.listed_sessions_under(storage.cache(), &root.path, &directories)
+                cache.listed_sessions_under(storage.cache(), root, &directories)
             }
             _ => Ok(Vec::new()),
         })?;
@@ -1443,7 +1443,7 @@ fn cached_recorded_sessions(
             environment.cache_base(),
         )? {
             Some(cache) if cache.storage_is_current(storage.cache())? => {
-                cache.recorded_sessions(storage.cache(), &root.path)
+                cache.recorded_sessions(storage.cache(), root)
             }
             _ => Ok(HashMap::new()),
         })?;
@@ -3145,7 +3145,7 @@ mod tests {
                 .catalogue(
                     provider.storage().cache(),
                     history::Source::Claude,
-                    &storage.root.path,
+                    &storage.root,
                     false,
                 )
                 .unwrap()
@@ -4870,7 +4870,7 @@ mod tests {
                 cache
                     .recorded_sessions(
                         history::Source::Pi.provider().storage().cache(),
-                        directory.path(),
+                        &history::provider::SessionRoot::new(directory.path()),
                     )
                     .unwrap()
             })

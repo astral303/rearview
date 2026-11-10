@@ -1,11 +1,11 @@
 //! Catalogue metadata without loading message bodies.
 
-use super::{CachedSession, SqliteCache, path_text};
+use super::{CachedSession, SqliteCache};
 use crate::agent::diagnostic::AgentWarning;
 use crate::agent::time_span::TimeSpan;
 use crate::error::Result;
 use crate::history::fingerprint::CachedFingerprint;
-use crate::history::provider::{RecordedSession, SessionCache};
+use crate::history::provider::{RecordedSession, SessionCache, SessionRoot};
 use crate::history::{Conversation, MessageTimes, ParseError, Source};
 use chrono::{Local, TimeZone};
 use rusqlite::{Connection, Row};
@@ -36,7 +36,7 @@ impl SqliteCache {
         &self,
         storage: SessionCache,
         source: Source,
-        root: &Path,
+        root: &SessionRoot,
         show_last: bool,
     ) -> Result<HashMap<String, CatalogueSession>> {
         self.read_catalogue(storage, source, root, show_last, None)
@@ -48,16 +48,17 @@ impl SqliteCache {
     pub(crate) fn recorded_sessions(
         &self,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
     ) -> Result<HashMap<String, Option<RecordedSession>>> {
+        let root_key = self.root_key(root);
         self.with_read_snapshot(|connection| {
             let mut statement = connection.prepare(&format!(
                 "SELECT cache_key, status, session_id, cwd FROM sessions \
-                 WHERE storage = ?1 AND root = ?2 AND status != 'writing' AND {}",
+                 WHERE storage = ?1 AND root_key = ?2 AND status != 'writing' AND {}",
                 super::catalogue::ENTRIES_NOT_FAILED
             ))?;
             let mut rows =
-                statement.query(rusqlite::params![storage.directory, path_text(root)])?;
+                statement.query(rusqlite::params![storage.directory, root_key.as_str()])?;
             let mut sessions = HashMap::new();
             while let Some(row) = rows.next()? {
                 let status: String = row.get(1)?;
@@ -80,17 +81,18 @@ impl SqliteCache {
     pub(crate) fn listed_sessions_under(
         &self,
         storage: SessionCache,
-        root: &Path,
+        root: &SessionRoot,
         directories: &[&Path],
     ) -> Result<Vec<ListedSession>> {
+        let root_key = self.root_key(root);
         self.with_read_snapshot(|connection| {
             let mut statement = connection.prepare(&format!(
                 "SELECT id, cache_key, locator, session_id, cwd FROM sessions \
-                 WHERE storage = ?1 AND root = ?2 AND status = 'listed' AND {}",
+                 WHERE storage = ?1 AND root_key = ?2 AND status = 'listed' AND {}",
                 super::catalogue::ENTRIES_NOT_FAILED
             ))?;
             let mut rows =
-                statement.query(rusqlite::params![storage.directory, path_text(root)])?;
+                statement.query(rusqlite::params![storage.directory, root_key.as_str()])?;
             let mut sessions = Vec::new();
             while let Some(row) = rows.next()? {
                 let locator = PathBuf::from(row.get::<_, String>(2)?);
@@ -119,7 +121,7 @@ impl SqliteCache {
         &self,
         storage: SessionCache,
         source: Source,
-        root: &Path,
+        root: &SessionRoot,
         key: &str,
         show_last: bool,
     ) -> Result<Option<CatalogueSession>> {
@@ -132,18 +134,19 @@ impl SqliteCache {
         &self,
         storage: SessionCache,
         source: Source,
-        root: &Path,
+        root: &SessionRoot,
         show_last: bool,
         key: Option<&str>,
     ) -> Result<HashMap<String, CatalogueSession>> {
+        let root_key = self.root_key(root);
         self.with_read_snapshot(|connection| {
             let sql = format!(
                 "SELECT id, cache_key, status, locator, file_size, mtime_secs, mtime_nsecs, \
                  session_id, project_path, project_name, cwd, timestamp_ms, preview_first, \
                  preview_last, summary, custom_title, model, total_tokens, duration_minutes, \
                  message_count, assistant_messages, is_missing_earlier_turns, entries_error, \
-                 generation FROM sessions WHERE storage = ?1 AND root = ?2 AND status != 'writing' \
-                 AND {} {}",
+                 generation FROM sessions WHERE storage = ?1 AND root_key = ?2 \
+                 AND status != 'writing' AND {} {}",
                 super::catalogue::ENTRIES_NOT_FAILED,
                 if key.is_some() {
                     "AND cache_key = ?3"
@@ -153,7 +156,7 @@ impl SqliteCache {
             );
             let mut parameters = vec![
                 rusqlite::types::Value::from(storage.directory.to_owned()),
-                path_text(root).into(),
+                root_key.as_str().to_owned().into(),
             ];
             if let Some(key) = key {
                 parameters.push(key.to_owned().into());
@@ -172,7 +175,7 @@ impl SqliteCache {
                         CachedSession {
                             base: self.base().clone(),
                             storage,
-                            root: root.to_path_buf(),
+                            root_key: root_key.clone(),
                             cache_key: row.get(1)?,
                             generation: row.get(23)?,
                             source,
@@ -334,7 +337,7 @@ mod tests {
         let write = parsed_record(source, &root, &stub);
         cache.write(&write).unwrap();
         let CatalogueSession::Listed(cached) = cache
-            .catalogue_session(storage, source, &root.path, &stub.cache_key, false)
+            .catalogue_session(storage, source, &root, &stub.cache_key, false)
             .unwrap()
             .unwrap()
         else {
@@ -355,7 +358,7 @@ mod tests {
             "the content of a replaced copy isn't read from its transcript"
         );
         let CatalogueSession::Listed(current) = cache
-            .catalogue_session(storage, source, &root.path, &stub.cache_key, false)
+            .catalogue_session(storage, source, &root, &stub.cache_key, false)
             .unwrap()
             .unwrap()
         else {
@@ -390,7 +393,7 @@ mod tests {
             cache.admit_storage(storage).unwrap();
             cache.write(&record).unwrap();
             let mut catalogue = cache
-                .catalogue(storage, original.source, &root.path, false)
+                .catalogue(storage, original.source, &root, false)
                 .unwrap();
             let CatalogueSession::Listed(cached) = catalogue.remove(&stub.cache_key).unwrap()
             else {

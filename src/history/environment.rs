@@ -21,8 +21,8 @@ pub struct Environment {
     cache_base: CacheBase,
     clock: Arc<dyn Clock>,
     lister: Arc<dyn DirectoryLister>,
-    /// Shared with the session cache base, whose writes key session files
-    /// through it.
+    /// Shared with the session cache base, whose reads and writes key session
+    /// roots and files through it.
     canonicaliser: Arc<dyn Canonicaliser>,
     /// Or the error reading it: only a command scoped to the workspace fails
     /// on that error.

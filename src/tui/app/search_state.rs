@@ -2,15 +2,13 @@ use super::{App, ListSearchMode, SemanticProgress, SemanticResultMetadata};
 use crate::clock::Clock;
 use crate::history::Conversation;
 use crate::history::listing::SessionOrigin;
-use crate::history::sqlite_cache::{CachedSession, CopyKey};
 use crate::search::query::ParsedQuery;
-use crate::search::{self, SearchTextsInMemory, SearchableConversation, SessionSearchTexts};
+use crate::search::{self, CopiesToRead, SearchTextsInMemory, SearchableConversation, TextsRead};
 use crate::semantic::types::SemanticCancellationToken;
 use crate::tui::semantic_worker::{
     SemanticSearchMessage, SemanticWorkerCommand, spawn_semantic_worker,
 };
 use chrono::{DateTime, Local};
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -67,10 +65,6 @@ pub(super) enum SearchCommand {
     },
 }
 
-/// The text reader's read of a copy's search texts; `None` when the read
-/// failed or the cache no longer holds the copy.
-type TextsRead = (CopyKey, Option<Arc<SessionSearchTexts>>);
-
 pub(super) struct SearchResponse {
     pub(super) error: Option<String>,
     pub(super) filtered: Vec<usize>,
@@ -92,7 +86,7 @@ struct SearchWorkerState {
     conversations: Arc<Vec<Arc<Conversation>>>,
     searchable: Arc<Vec<SearchableConversation>>,
     texts: SearchTextsInMemory,
-    copies_to_read: mpsc::Sender<Vec<CachedSession>>,
+    copies_to_read: mpsc::Sender<CopiesToRead>,
     texts_read: mpsc::Receiver<TextsRead>,
 }
 
@@ -106,7 +100,7 @@ impl SearchWorkerState {
             } => {
                 self.hold_texts_read();
                 let to_read = self.texts.keep_copies_of(&conversations);
-                if !to_read.is_empty() {
+                if !to_read.copies.is_empty() {
                     let _ = self.copies_to_read.send(to_read);
                 }
                 self.conversations = conversations;
@@ -208,19 +202,17 @@ pub(super) fn spawn_search_worker(
 /// Start the thread reading the search texts of each batch of copies sent
 /// to it, in parallel, and sending each read back. It stops once the search
 /// worker is gone.
-fn spawn_text_reader() -> (mpsc::Sender<Vec<CachedSession>>, mpsc::Receiver<TextsRead>) {
-    let (copies_tx, copies_rx) = mpsc::channel::<Vec<CachedSession>>();
+fn spawn_text_reader() -> (mpsc::Sender<CopiesToRead>, mpsc::Receiver<TextsRead>) {
+    let (copies_tx, copies_rx) = mpsc::channel::<CopiesToRead>();
     let (texts_tx, texts_rx) = mpsc::channel::<TextsRead>();
     std::thread::Builder::new()
         .name("search-text-reader".into())
         .spawn(move || {
             while let Ok(copies) = copies_rx.recv() {
-                let sent = copies.par_iter().try_for_each(|cached| {
-                    let texts = SessionSearchTexts::read(cached).ok().flatten();
-                    texts_tx.send((cached.copy_key(), texts.map(Arc::new)))
-                });
-                if sent.is_err() {
-                    return;
+                for read in copies.read() {
+                    if texts_tx.send(read).is_err() {
+                        return;
+                    }
                 }
             }
         })

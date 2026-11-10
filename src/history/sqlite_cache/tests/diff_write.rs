@@ -113,13 +113,7 @@ impl Fixture {
 
     fn listed(&self, cache: &CacheWriter) -> Conversation {
         let CatalogueSession::Listed(listed) = cache
-            .catalogue_session(
-                self.storage(),
-                self.source(),
-                &self.root.path,
-                CACHE_KEY,
-                false,
-            )
+            .catalogue_session(self.storage(), self.source(), &self.root, CACHE_KEY, false)
             .unwrap()
             .unwrap()
         else {
@@ -233,8 +227,9 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         ),
         (
             "parts",
-            "SELECT e.sequence, p.part, p.kind, p.search_field, p.text, p.text_codes, \
-             p.call_id, p.name, p.tool, p.json, p.result_shape FROM parts p \
+            "SELECT e.sequence, p.part, p.kind, p.search_field, p.entry_sequence, \
+             p.message_ordinal, p.text, p.text_codes, p.call_id, p.name, p.tool, p.json, \
+             p.result_shape FROM parts p \
              JOIN entries e ON e.id = p.entry WHERE e.session = ?1 ORDER BY 1, 2"
                 .to_owned(),
         ),
@@ -247,7 +242,8 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         ),
         (
             "search_texts",
-            "SELECT e.sequence, s.search_field, s.text FROM search_texts s \
+            "SELECT e.sequence, s.search_field, s.entry_sequence, s.message_ordinal, s.text \
+             FROM search_texts s \
              JOIN entries e ON e.id = s.entry WHERE s.session = ?1 ORDER BY e.sequence, s.id"
                 .to_owned(),
         ),
@@ -268,7 +264,7 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         fixture.label()
     );
     let entries = cache
-        .entries(fixture.storage(), &fixture.root.path, CACHE_KEY)
+        .entries(fixture.storage(), &fixture.root, CACHE_KEY)
         .unwrap()
         .unwrap();
     rows.push(format!("read entries {:?}", entries.entries));
@@ -287,16 +283,20 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
     let listed = fixture.listed(cache);
     let copy = listed.cached_session.clone().unwrap();
     let mut texts = Vec::new();
-    copy.visit_search_texts(
+    copy.read_search_texts(
         SearchedFields::Agent,
         &crate::time_filter::TimeFilter::default(),
         |text| {
-            texts.push(format!("{:?} {:?} {}", text.field, text.ordinal, text.text));
+            let placed = format!("{:?} {:?} {}", text.field, text.ordinal, text.text);
+            texts.push((text.order, placed));
             ControlFlow::Continue(())
         },
     )
     .unwrap()
     .unwrap();
+    // The order's search text ids are surrogate ids: sorted by, not shown.
+    texts.sort();
+    let texts = texts.into_iter().map(|(_, text)| text).collect::<Vec<_>>();
     rows.push(format!("search texts {texts:?}"));
     let content = listed.load_content().unwrap();
     rows.push(format!(
@@ -564,6 +564,89 @@ fn entries_appended_to_own_transcript_are_inserted_for_every_agent() {
             fixture.label()
         );
         assert_matches_fresh_write(&cache, &fixture, &record);
+    }
+}
+
+/// The parts whose session is not their entry's.
+fn parts_outside_their_entrys_session(cache: &CacheWriter) -> i64 {
+    cache
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM parts p JOIN entries e ON e.id = p.entry \
+             WHERE p.session != e.session",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn appended_entries_parts_carry_their_session_for_every_agent() {
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let mut before = fixture.record();
+        without_last_own_entries(&mut before, 2);
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = admitted_cache(base.path());
+        cache.admit_storage(fixture.storage()).unwrap();
+        let other = SessionStub {
+            cache_key: "other".to_owned(),
+            ..fixture.stub.clone()
+        };
+        cache
+            .write(&parsed_record(fixture.source(), &fixture.root, &other))
+            .unwrap();
+        cache.write(&before).unwrap();
+        watch_row_writes(&cache.connection);
+
+        cache.write(&fixture.record()).unwrap();
+
+        let writes = take_row_writes(&cache.connection);
+        assert!(
+            writes_of(&writes, "parts", "INSERT") > 0,
+            "{}: the write inserts the appended entries' parts: {writes:?}",
+            fixture.label()
+        );
+        assert_eq!(
+            parts_outside_their_entrys_session(&cache),
+            0,
+            "{}: each part carries its entry's session, of the two sessions held",
+            fixture.label()
+        );
+    }
+}
+
+#[test]
+fn removed_session_deletes_its_parts_and_result_items() {
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &fixture.record());
+
+        cache
+            .remove(fixture.storage(), &fixture.root, &[CACHE_KEY.to_owned()])
+            .unwrap();
+
+        let writes = take_row_writes(&cache.connection);
+        assert!(
+            writes_of(&writes, "parts", "DELETE") > 0,
+            "{}: the session held parts: {writes:?}",
+            fixture.label()
+        );
+        for table in ["parts", "result_items"] {
+            let left: i64 = cache
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                left,
+                0,
+                "{}: the removed session leaves no {table} row",
+                fixture.label()
+            );
+        }
     }
 }
 
@@ -838,6 +921,61 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
             source.label()
         );
     }
+}
+
+/// Removes the text blocks of the first entry of `record` holding one;
+/// returns the entry's index.
+fn without_first_text(record: &mut SessionRecord) -> Option<usize> {
+    let entries = &mut entries_of(record).entries;
+    let is_text = |block: &ContentBlock| matches!(block, ContentBlock::Text { .. });
+    let index = entries
+        .iter_mut()
+        .position(|(_, entry)| blocks_of(entry).is_some_and(|blocks| blocks.iter().any(is_text)))?;
+    blocks_of(&mut entries[index].1)?.retain(|block| !is_text(block));
+    Some(index)
+}
+
+/// Each stored message's ordinal, by its id.
+fn message_ordinals(cache: &CacheWriter) -> BTreeMap<i64, Option<i64>> {
+    cache
+        .connection
+        .prepare("SELECT id, ordinal FROM messages")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn message_renumbered_in_place_moves_its_texts_search_place_for_every_agent() {
+    let mut tested = Vec::new();
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let mut before = fixture.record();
+        if without_first_text(&mut before).is_none() {
+            continue;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let stored = message_ordinals(&cache);
+
+        let record = fixture.record();
+        cache.write(&record).unwrap();
+
+        let renumbered = message_ordinals(&cache)
+            .iter()
+            .any(|(id, ordinal)| stored.get(id).is_some_and(|stored| stored != ordinal));
+        if !renumbered {
+            continue;
+        }
+        assert_matches_fresh_write(&cache, &fixture, &record);
+        tested.push(fixture.source());
+    }
+    assert!(
+        !tested.is_empty(),
+        "a message keeps its row while its ordinal changes for some agent"
+    );
 }
 
 #[test]

@@ -212,7 +212,7 @@ impl SessionLoader<'_> {
             let cache_key =
                 database
                     .reader()
-                    .current_cache_key(self.storage.source(), &root.path, locator)?;
+                    .current_cache_key(self.storage.source(), root, locator)?;
             Ok(cache_key.map(|cache_key| (database, cache_key)))
         });
         let (database, cache_key) = match found {
@@ -528,13 +528,13 @@ impl SessionLoader<'_> {
         external_titles: &HashMap<String, SessionTitle>,
         stub: &SessionStub,
     ) -> Result<Option<SessionRead>> {
-        if !cache.holds(self.storage.cache(), &root.path, stub)? {
+        if !cache.holds(self.storage.cache(), root, stub)? {
             return Ok(None);
         }
         let cached = cache.catalogue_session(
             self.storage.cache(),
             self.storage.source(),
-            &root.path,
+            root,
             &stub.cache_key,
             self.show_last,
         )?;
@@ -559,7 +559,7 @@ impl SessionLoader<'_> {
                 .catalogue_session(
                     self.storage.cache(),
                     self.storage.source(),
-                    &root.path,
+                    root,
                     &stub.cache_key,
                     self.show_last,
                 )
@@ -765,7 +765,7 @@ impl SessionLoader<'_> {
             .catalogue_session(
                 self.storage.cache(),
                 self.storage.source(),
-                &root.path,
+                root,
                 &stub.cache_key,
                 self.show_last,
             )

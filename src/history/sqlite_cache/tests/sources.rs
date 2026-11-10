@@ -17,7 +17,7 @@ fn database_backed_sessions_validate_current_logical_fingerprint() {
         .write(&parsed_record(Source::OpenCode, &root, &stub))
         .unwrap();
     let super::super::CatalogueSession::Listed(cached) = cache
-        .catalogue_session(storage, Source::OpenCode, &root.path, CACHE_KEY, false)
+        .catalogue_session(storage, Source::OpenCode, &root, CACHE_KEY, false)
         .unwrap()
         .unwrap()
     else {
@@ -72,7 +72,7 @@ fn resumed_childs_earlier_files_are_dependencies_before_splicing() {
     std::fs::write(&child.root, earlier.replace("alpha", "omega") + "\n").unwrap();
     assert_eq!(CachedFingerprint::of_file(&child.newest).unwrap(), newest);
     assert!(matches!(
-        cache.entries(storage_of(source), &root.path, CACHE_KEY),
+        cache.entries(storage_of(source), &root, CACHE_KEY),
         Err(AppError::SessionCacheSourceChanged(_))
     ));
 }
@@ -106,7 +106,7 @@ fn catalogue_read_stats_only_files_discovery_didnt_stamp() {
     let storage = storage_of(Source::Codex);
     let is_current = |discovered: &[SessionStub]| {
         cache
-            .current_fingerprints(storage, &root.path, discovered)
+            .current_fingerprints(storage, &root, discovered)
             .unwrap()
             .contains_key(CACHE_KEY)
     };
@@ -167,7 +167,7 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     assert_eq!(kinds, ["locator", "continuation"]);
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .contains_key(CACHE_KEY)
     );
@@ -179,20 +179,17 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     );
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .is_empty()
     );
     assert!(matches!(
-        cache.entries(storage, &root.path, CACHE_KEY),
+        cache.entries(storage, &root, CACHE_KEY),
         Err(AppError::SessionCacheSourceChanged(_))
     ));
     let (rebuilt, _) = source_record(Source::Codex, &thread.newest);
     cache.write(&rebuilt).unwrap();
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     let fresh = normalized_session(
         crate::history::FOR_FIXTURES,
         Source::Codex,
@@ -213,12 +210,12 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     );
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .is_empty()
     );
     assert!(matches!(
-        cache.entries(storage, &root.path, CACHE_KEY),
+        cache.entries(storage, &root, CACHE_KEY),
         Err(AppError::SessionCacheSourceChanged(_))
     ));
     let (missing, _) = source_record(Source::Codex, &thread.newest);
@@ -239,15 +236,12 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     cache.write(&missing).unwrap();
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .contains_key(CACHE_KEY),
         "a session missing earlier turns is current while its files are unchanged"
     );
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert_eq!(
         format!("{:?}", read.entries),
         format!("{:?}", fresh.entries),
@@ -259,7 +253,7 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     cache.write(&recovered).unwrap();
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .contains_key(CACHE_KEY)
     );
@@ -306,7 +300,7 @@ fn bounded_read_doesnt_restore_unrelated_result() {
     cache.write(&record).unwrap();
     let storage = storage_of(Source::Claude);
     let selected = cache
-        .message_entries(storage, &root.path, CACHE_KEY, 1..=1)
+        .message_entries(storage, &root, CACHE_KEY, 1..=1)
         .unwrap()
         .unwrap();
     assert_eq!(selected.entries.len(), 1);
@@ -315,7 +309,7 @@ fn bounded_read_doesnt_restore_unrelated_result() {
     cache.admit_storage(storage).unwrap();
     cache.write(&record).unwrap();
     let super::super::CatalogueSession::Listed(cached) = cache
-        .catalogue_session(storage, Source::Claude, &root.path, CACHE_KEY, false)
+        .catalogue_session(storage, Source::Claude, &root, CACHE_KEY, false)
         .unwrap()
         .unwrap()
     else {
@@ -331,10 +325,7 @@ fn bounded_read_doesnt_restore_unrelated_result() {
     assert_eq!(bounded.messages.len(), 2);
     assert_eq!(bounded.malformed_lines, [3]);
     assert!(format!("{:?}", bounded.messages[0]).contains("requested text"));
-    let full = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let full = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert!(
         format!("{:?}", full.entries).contains("\"original\""),
         "a full read holds the stored result"
@@ -364,7 +355,7 @@ fn text_only_result_arrays_reconstruct_without_fetching_source() {
     cache.write(&record).unwrap();
     std::fs::remove_file(&source).unwrap();
     let read = cache
-        .entries(storage_of(Source::Claude), &root.path, CACHE_KEY)
+        .entries(storage_of(Source::Claude), &root, CACHE_KEY)
         .unwrap()
         .unwrap();
     assert_eq!(serde_json::to_value(&read.entries[0].1).unwrap(), expected);
@@ -392,7 +383,7 @@ fn object_result_reads_from_cache_without_its_source() {
     cache.write(&record).unwrap();
     std::fs::remove_file(&source).unwrap();
     let read = cache
-        .entries(storage_of(Source::Claude), &root.path, CACHE_KEY)
+        .entries(storage_of(Source::Claude), &root, CACHE_KEY)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -427,7 +418,7 @@ fn alternate_windows_path_spelling_matches_cached_generation() {
     let mut cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
     let read = cache
-        .entries(storage_of(Source::Claude), &root.path, CACHE_KEY)
+        .entries(storage_of(Source::Claude), &root, CACHE_KEY)
         .unwrap()
         .unwrap();
     assert!(format!("{:?}", read.entries).contains("original"));

@@ -1,12 +1,12 @@
 //! A catalogue row's content location; connections stay local to each read.
 
-use super::files::{self, FileKey};
+use super::files::{self, FileKey, RootKey};
 use super::{
     CacheBase, ReaderWait, SqliteCache, StoredEntries, entries, is_storage_current, path_text,
 };
 use crate::error::Result;
 use crate::history::TranscriptEntries;
-use crate::history::provider::SessionCache;
+use crate::history::provider::{SessionCache, SessionRoot};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 pub struct CachedSession {
     pub(super) base: CacheBase,
     pub(super) storage: SessionCache,
-    pub(super) root: PathBuf,
+    pub(super) root_key: RootKey,
     pub(super) cache_key: String,
     pub(super) generation: i64,
     pub(super) source: crate::history::Source,
@@ -30,7 +30,7 @@ pub struct CachedSession {
 /// copy another key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CopyKey {
-    root: PathBuf,
+    root_key: RootKey,
     cache_key: String,
     generation: i64,
 }
@@ -48,7 +48,7 @@ impl CachedSession {
 
     pub(crate) fn copy_key(&self) -> CopyKey {
         CopyKey {
-            root: self.root.clone(),
+            root_key: self.root_key.clone(),
             cache_key: self.cache_key.clone(),
             generation: self.generation,
         }
@@ -138,7 +138,7 @@ impl CachedSession {
             let Some(stored) = entries::listed_session_of(
                 connection,
                 self.storage.directory,
-                &path_text(&self.root),
+                &self.root_key,
                 &self.cache_key,
             )?
             else {
@@ -164,14 +164,17 @@ impl CachedSession {
 
     fn validate_source(&self, connection: &Connection, session: i64) -> Result<()> {
         files::validate(connection, session)?;
-        let logical: Option<(String, crate::history::fingerprint::CachedFingerprint)> = connection.query_row(
-            "SELECT s.locator, s.file_size, s.mtime_secs, s.mtime_nsecs FROM sessions s \
+        // Look the locator up under the stored root, which the write spelled
+        // as it spelled the locator: another spelling lists it under another
+        // path.
+        let logical: Option<(String, String, crate::history::fingerprint::CachedFingerprint)> = connection.query_row(
+            "SELECT s.root, s.locator, s.file_size, s.mtime_secs, s.mtime_nsecs FROM sessions s \
              JOIN session_files f ON f.session = s.id WHERE s.id = ?1 AND f.kind = 'locator' AND f.file_size IS NULL",
-            [session], |row| Ok((row.get(0)?, crate::history::fingerprint::CachedFingerprint { file_size: row.get::<_, i64>(1)? as u64, mtime_secs: row.get::<_, i64>(2)? as u64, mtime_nsecs: row.get(3)? })),
+            [session], |row| Ok((row.get(0)?, row.get(1)?, crate::history::fingerprint::CachedFingerprint { file_size: row.get::<_, i64>(2)? as u64, mtime_secs: row.get::<_, i64>(3)? as u64, mtime_nsecs: row.get(4)? })),
         ).optional()?;
-        if let Some((locator, expected)) = logical {
+        if let Some((root, locator, expected)) = logical {
             let current = self.source.provider().storage().current_fingerprint(
-                &crate::history::provider::SessionRoot::new(&self.root),
+                &crate::history::provider::SessionRoot::new(root),
                 Path::new(&locator),
             )?;
             if current != Some(expected) {
@@ -263,13 +266,14 @@ impl SqliteCache {
     pub(crate) fn current_cache_key(
         &self,
         source: crate::history::Source,
-        root: &Path,
+        root: &SessionRoot,
         path: &Path,
     ) -> Result<Option<String>> {
+        let root_key = self.root_key(root);
         self.with_read_snapshot(|connection| {
             let Some((copy, session)) = self
                 .listed_copy(connection, source, path)?
-                .filter(|(copy, _)| copy.root == root)
+                .filter(|(copy, _)| copy.root_key == root_key)
             else {
                 return Ok(None);
             };
@@ -291,16 +295,16 @@ impl SqliteCache {
     ) -> Result<Option<(CachedSession, i64)>> {
         let storage = source.provider().storage().cache();
         let stored: Option<(i64, i64, String, String)> = connection.query_row(
-            "SELECT id, generation, root, cache_key FROM sessions WHERE storage = ?1 AND (locator = ?2 OR file_key = ?3) AND status = 'listed' ORDER BY id LIMIT 1",
+            "SELECT id, generation, root_key, cache_key FROM sessions WHERE storage = ?1 AND (locator = ?2 OR file_key = ?3) AND status = 'listed' ORDER BY id LIMIT 1",
             params![storage.directory, path_text(path), FileKey::of_canonical(path).as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).optional()?;
-        Ok(stored.map(|(session, generation, root, cache_key)| {
+        Ok(stored.map(|(session, generation, root_key, cache_key)| {
             (
                 CachedSession {
                     base: self.base().clone(),
                     storage,
-                    root: root.into(),
+                    root_key: RootKey::stored(root_key),
                     cache_key,
                     generation,
                     source,

@@ -1,6 +1,7 @@
 use super::path_text;
 use crate::error::{AppError, Result};
 use crate::history::fingerprint::CachedFingerprint;
+use crate::history::provider::SessionRoot;
 use crate::history::provider::walk::Canonicaliser;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
@@ -33,13 +34,38 @@ impl FileKey {
 /// Windows and macOS file systems ignore case by default; Linux's do not.
 const IGNORES_CASE: bool = cfg!(any(windows, target_os = "macos"));
 
-/// The keys of the session files one cache writer writes. Each directory
-/// is canonicalised at most once: a session root for every file beneath it,
-/// and the directory of a file outside the root.
+/// The text every spelling of one session root shares, as [`FileKey`] keys a
+/// file: the root's canonical path, lowercased on a file system that ignores
+/// case. The `sessions` table keys each session by it, so a root named with
+/// either separator, through `..` or through a link reads and writes one
+/// copy of each session.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RootKey(String);
+
+impl RootKey {
+    /// The key of `root`, whose canonical path `canonicaliser` resolves once
+    /// per root.
+    pub(super) fn of(root: &SessionRoot, canonicaliser: &dyn Canonicaliser) -> Self {
+        Self(FileKey::of_canonical(root.canonical_path(canonicaliser)).0)
+    }
+
+    /// A key as the database stores it.
+    pub(super) fn stored(text: String) -> Self {
+        Self(text)
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The keys of the session files one cache writer writes. A file beneath
+/// its session root joins the root's canonical path; the directory of a
+/// file outside the root is canonicalised at most once.
 pub(super) struct FileKeys {
     canonicaliser: Arc<dyn Canonicaliser>,
     /// Each directory's canonical path, or its spelling when it does not
-    /// resolve, as a locator inside a database file does not.
+    /// resolve.
     canonical_directories: HashMap<PathBuf, PathBuf>,
 }
 
@@ -55,9 +81,13 @@ impl FileKeys {
     /// it: the root's canonical path joined with the file's path beneath
     /// the root. A file outside the root joins its directory's canonical
     /// path instead.
-    pub(super) fn of_file_under(&mut self, root: &Path, file: &Path) -> FileKey {
-        match file.strip_prefix(root) {
-            Ok(beneath) => FileKey::of_canonical(&self.canonical(root).join(beneath)),
+    pub(super) fn of_file_under(&mut self, root: &SessionRoot, file: &Path) -> FileKey {
+        match file.strip_prefix(&root.path) {
+            Ok(beneath) => FileKey::of_canonical(
+                &root
+                    .canonical_path(self.canonicaliser.as_ref())
+                    .join(beneath),
+            ),
             Err(_) => match (file.parent(), file.file_name()) {
                 (Some(directory), Some(name)) => {
                     FileKey::of_canonical(&self.canonical(directory).join(name))

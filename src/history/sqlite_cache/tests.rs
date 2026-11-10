@@ -165,10 +165,7 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
         )
         .unwrap();
 
-        let read = cache
-            .entries(storage, &root.path, CACHE_KEY)
-            .unwrap()
-            .unwrap();
+        let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
 
         let malformed = |entries: &TranscriptEntries| {
             entries
@@ -372,10 +369,7 @@ fn every_tool_result_is_stored_and_other_opaque_payloads_keep_only_their_positio
     }));
     let storage = storage_of(Source::Claude);
     cache.write(&record).unwrap();
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert_eq!(read.entries[0].0, original_record);
     let LogEntry::User {
         message:
@@ -576,10 +570,7 @@ fn subagent_metadata_is_shared_across_transactions_and_preserves_origins() {
         )
         .unwrap();
     assert_eq!(raw_wrappers, 0);
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert_eq!(read.entries[20_000].0.transcript.as_ref(), Some(&first));
     assert_eq!(read.entries[20_001].0.transcript.as_ref(), Some(&second));
     let LogEntry::Progress { data, extra } = &read.entries[20_002].1 else {
@@ -642,10 +633,7 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
     .unwrap()));
     let mut cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     let LogEntry::User {
         message:
             UserMessage {
@@ -678,7 +666,7 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
 
     std::fs::write(&source, lines.replace("image-result", "replaced-result")).unwrap();
     assert!(
-        cache.entries(storage, &root.path, CACHE_KEY).is_err(),
+        cache.entries(storage, &root, CACHE_KEY).is_err(),
         "a changed source doesn't silently supply a different result"
     );
 }
@@ -701,9 +689,7 @@ fn writing_session_again_replaces_its_rows() {
 
     write(&mut cache, 2);
 
-    let current = cache
-        .current_fingerprints(storage, &root.path, &[])
-        .unwrap();
+    let current = cache.current_fingerprints(storage, &root, &[]).unwrap();
     assert_eq!(
         current
             .get(CACHE_KEY)
@@ -722,10 +708,7 @@ fn writing_session_again_replaces_its_rows() {
         &row.subagents,
     )
     .unwrap();
-    let read = cache
-        .entries(storage, &root.path, CACHE_KEY)
-        .unwrap()
-        .unwrap();
+    let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     assert_eq!(read.entries.len(), expected.entries.len());
 }
 
@@ -745,9 +728,7 @@ fn storage_written_under_another_schema_version_loses_its_sessions() {
         .unwrap();
 
     cache.admit_storage(storage).unwrap();
-    let kept = cache
-        .current_fingerprints(storage, &root.path, &[])
-        .unwrap();
+    let kept = cache.current_fingerprints(storage, &root, &[]).unwrap();
     cache
         .admit_storage(SessionCache {
             schema_version: storage.schema_version + 1,
@@ -758,7 +739,7 @@ fn storage_written_under_another_schema_version_loses_its_sessions() {
     assert_eq!(kept.len(), 1, "the same version keeps the sessions");
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .is_empty()
     );
@@ -785,7 +766,7 @@ fn session_still_being_written_is_not_current() {
 
     assert!(
         cache
-            .current_fingerprints(storage, &root.path, &[])
+            .current_fingerprints(storage, &root, &[])
             .unwrap()
             .is_empty()
     );
@@ -804,7 +785,7 @@ fn removed_session_leaves_no_rows() {
         .unwrap();
 
     cache
-        .remove(storage, &root.path, &[CACHE_KEY.to_owned()])
+        .remove(storage, &root, &[CACHE_KEY.to_owned()])
         .unwrap();
 
     for table in schema::TABLES.iter().filter(|table| **table != "meta") {

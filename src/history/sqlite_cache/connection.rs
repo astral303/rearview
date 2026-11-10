@@ -29,7 +29,12 @@ pub(super) fn open(
     busy_timeout: Duration,
 ) -> rusqlite::Result<Connection> {
     let connection = match access {
-        Access::ReadOnly => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
+        // Without SQLite's lock on each call: rusqlite's `Connection` is not
+        // `Sync`, which keeps two threads from using one connection at once.
+        Access::ReadOnly => Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?,
         Access::ReadWrite => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?,
         Access::Create => Connection::open(path)?,
     };
@@ -51,6 +56,29 @@ pub(super) fn open(
         connection.pragma_update(None, "wal_autocheckpoint", 0)?;
     }
     Ok(connection)
+}
+
+/// Turn off SQLite's memory statistics: while they are on, every allocation
+/// and free in any connection takes one process-wide mutex. SQLite accepts
+/// this only before it initialises, when the process opens its first
+/// connection.
+pub(crate) fn turn_off_memory_statistics() -> rusqlite::Result<()> {
+    // SAFETY: `SQLITE_CONFIG_MEMSTATUS` takes one int argument. SQLite
+    // refuses the call with `SQLITE_MISUSE` once it is initialised.
+    let code = unsafe {
+        rusqlite::ffi::sqlite3_config(
+            rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS,
+            std::ffi::c_int::from(false),
+        )
+    };
+    if code == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("turning off SQLite's memory statistics".to_owned()),
+        ))
+    }
 }
 
 /// Set SQLite's `SQLITE_FCNTL_PERSIST_WAL` on `connection`'s main database.

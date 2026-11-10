@@ -647,19 +647,19 @@ pub(super) struct StoredSession {
     pub(super) generation: i64,
 }
 
-/// The row of the listed session `storage` found at `cache_key` under
-/// `root`.
+/// The row of the listed session `storage` found at `cache_key` under the
+/// root of `root_key`.
 pub(super) fn listed_session_of(
     connection: &Connection,
     storage: &str,
-    root: &str,
+    root_key: &super::files::RootKey,
     cache_key: &str,
 ) -> Result<Option<StoredSession>> {
     let row: Option<(i64, i64, String, Option<String>)> = connection
         .query_row(
             "SELECT id, generation, status, CASE WHEN status = 'listed' THEN entries_error END \
-             FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
-            params![storage, root, cache_key],
+             FROM sessions WHERE storage = ?1 AND root_key = ?2 AND cache_key = ?3",
+            params![storage, root_key.as_str(), cache_key],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;

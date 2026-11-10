@@ -1,12 +1,16 @@
 //! A session's stored search texts as lexical search reads them: each text
-//! without terminal codes, with its search field and message number, borrowed
-//! from SQLite, in one query.
+//! without terminal codes, with its search field, message number and place
+//! in the session, borrowed from SQLite. Each table holding search text is
+//! read through its index on the session, without joins.
 
+use super::text_scan::{
+    ReadOrder, StoredEntry, StoredMessage, StoredWindow, Table, field_of, text_at, text_ordinal,
+};
 use super::{CachedSession, SearchField};
 use crate::error::Result;
 use crate::time_filter::TimeFilter;
-use rusqlite::types::Type;
-use rusqlite::{Row, params};
+use rusqlite::Connection;
+use rusqlite::types::ValueRef;
 use std::ops::ControlFlow;
 
 impl SearchField {
@@ -23,7 +27,7 @@ impl SearchField {
     }
 
     /// The field numbered `code` in the `search_field` columns.
-    fn of_code(code: i64) -> Option<Self> {
+    pub(super) fn of_code(code: i64) -> Option<Self> {
         [
             Self::Full,
             Self::Agent,
@@ -46,12 +50,39 @@ pub(crate) enum SearchedFields {
     Agent,
 }
 
+impl SearchedFields {
+    /// The fields read in the `search_field` columns of `parts` and
+    /// `search_texts`.
+    fn part_fields(self) -> &'static [SearchField] {
+        match self {
+            Self::List => &[SearchField::Full],
+            Self::Agent => &[SearchField::Full, SearchField::Agent, SearchField::Thinking],
+        }
+    }
+
+    /// The codes of [`Self::part_fields`], as an SQL list.
+    pub(super) fn part_field_codes(self) -> String {
+        self.part_fields()
+            .iter()
+            .map(|field| field.code().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// True when `field` is one of [`Self::part_fields`].
+    pub(super) fn reads_part_field(self, field: SearchField) -> bool {
+        self.part_fields().contains(&field)
+    }
+}
+
 /// One stored search text.
 pub(crate) struct SearchText<'a> {
     pub(crate) field: SearchField,
     /// The number of the message the text belongs to; `None` for the title,
     /// the summary and other text outside every message.
     pub(crate) ordinal: Option<usize>,
+    /// The text's place in its session.
+    pub(crate) order: ReadOrder,
     /// A text, or the text items of one tool result joined by line breaks.
     pub(crate) text: &'a str,
 }
@@ -59,182 +90,359 @@ pub(crate) struct SearchText<'a> {
 impl CachedSession {
     /// Calls `visit` with each search text in `fields`; with `window` active,
     /// only the texts of messages inside it, without the title, the summary
-    /// or text outside every message. Stops when `visit` breaks.
-    pub(crate) fn visit_search_texts(
+    /// or text outside every message. The texts come table by table, each
+    /// placed in the session by its `order`. Stops when `visit` breaks.
+    pub(crate) fn read_search_texts(
         &self,
         fields: SearchedFields,
         window: &TimeFilter,
         mut visit: impl FnMut(SearchText<'_>) -> ControlFlow<()>,
     ) -> Result<Option<()>> {
         self.read(|connection, session| {
-            let mut statement = connection.prepare_cached(&query(fields, window.is_active()))?;
-            let mut rows = if window.is_active() {
-                let after = window
-                    .after
-                    .map_or(i64::MIN, |after| after.timestamp().saturating_mul(1000));
-                let before = window.before.map_or(i64::MAX, |before| {
-                    before.timestamp().saturating_mul(1000).saturating_add(999)
-                });
-                statement.query(params![session, after, before])?
-            } else {
-                statement.query([session])?
-            };
-            let mut items = ResultItems::default();
-            while let Some(row) = rows.next()? {
-                let text = row.get_ref(2)?.as_str().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
-                })?;
-                let flow = match row.get::<_, Option<i64>>(3)? {
-                    Some(part) if items.part == Some(part) => {
-                        items.push(text);
-                        ControlFlow::Continue(())
-                    }
-                    Some(part) => {
-                        let flow = items.visit(&mut visit);
-                        items.start(part, Metadata::of(row)?, text);
-                        flow
-                    }
-                    None => {
-                        let metadata = Metadata::of(row)?;
-                        if items.visit(&mut visit).is_break() {
-                            ControlFlow::Break(())
-                        } else {
-                            visit(metadata.text(text))
-                        }
-                    }
-                };
-                if flow.is_break() {
-                    return Ok(());
-                }
-            }
-            let _ = items.visit(&mut visit);
+            let read = SessionRead::new(connection, session, fields, StoredWindow::of(window))?;
+            let _ = read.visit_texts(&mut visit)?;
             Ok(())
         })
     }
-}
 
-/// The query reading a session's search texts in `fields`, inside the
-/// window `?2` to `?3` when `windowed`: rows of field, message number, text,
-/// and for a result's text item, the result's part.
-fn query(fields: SearchedFields, windowed: bool) -> String {
-    let field_codes = match fields {
-        SearchedFields::List => format!("= {}", SearchField::Full.code()),
-        SearchedFields::Agent => format!(
-            "IN ({}, {}, {})",
-            SearchField::Full.code(),
-            SearchField::Agent.code(),
-            SearchField::Thinking.code()
-        ),
-    };
-    let (ordinal, messages, inside) = if windowed {
-        (
-            "m.ordinal",
-            "JOIN messages m ON m.id = e.message",
-            " AND e.contributes AND m.ordinal IS NOT NULL AND m.last_ms >= ?2 AND m.first_ms <= ?3",
-        )
-    } else {
-        (
-            "CASE WHEN e.contributes THEN m.ordinal END",
-            "LEFT JOIN messages m ON m.id = e.message",
-            "",
-        )
-    };
-    let mut sql = format!(
-        "SELECT p.search_field, {ordinal}, p.text, NULL FROM entries e \
-         JOIN parts p ON p.entry = e.id {messages} \
-         WHERE e.session = ?1 AND p.search_field {field_codes} AND p.text IS NOT NULL{inside} \
-         UNION ALL \
-         SELECT p.search_field, {ordinal}, i.text, p.id FROM entries e \
-         JOIN parts p ON p.entry = e.id JOIN result_items i ON i.part = p.id {messages} \
-         WHERE e.session = ?1 AND p.search_field {field_codes} AND p.text IS NULL \
-         AND i.searched{inside} \
-         UNION ALL \
-         SELECT s.search_field, {ordinal}, s.text, NULL FROM entries e \
-         JOIN search_texts s ON s.entry = e.id {messages} \
-         WHERE e.session = ?1 AND s.search_field {field_codes}{inside}"
-    );
-    if !windowed {
-        sql.push_str(
-            " UNION ALL SELECT search_field, NULL, text, NULL FROM entries \
-             WHERE session = ?1 AND search_field IS NOT NULL AND text IS NOT NULL",
-        );
-        if matches!(fields, SearchedFields::Agent) {
-            sql.push_str(&format!(
-                " UNION ALL SELECT {}, NULL, text, NULL \
-                 FROM subagent_search_parts WHERE session = ?1",
-                SearchField::Supplement.code()
-            ));
-        }
+    /// True when a search text in `fields`, within `window` as
+    /// [`Self::read_search_texts`] reads it, holds more than whitespace.
+    pub(crate) fn holds_search_text(
+        &self,
+        fields: SearchedFields,
+        window: &TimeFilter,
+    ) -> Result<Option<bool>> {
+        let mut holds = false;
+        let read = self.read_search_texts(fields, window, |text| {
+            holds = !text.text.trim().is_empty();
+            if holds {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        Ok(read.map(|()| holds))
     }
-    sql
 }
 
-/// A row's field and message number.
-#[derive(Clone, Copy)]
-struct Metadata {
+const ENTRIES: &str = "SELECT id, message, contributes, sequence FROM entries WHERE session = ?1";
+/// The session's messages with their times, which a window reads.
+const MESSAGES_WITH_TIMES: &str =
+    "SELECT id, ordinal, first_ms, last_ms FROM messages WHERE session = ?1";
+/// The session's messages without their times, read from the index on
+/// `(session, ordinal)` alone.
+const MESSAGES: &str = "SELECT id, ordinal, NULL, NULL FROM messages WHERE session = ?1";
+/// The searched text items of the result part `?1`, in order.
+const RESULT_ITEMS: &str =
+    "SELECT text FROM result_items WHERE part = ?1 AND searched ORDER BY position";
+/// The titles, summaries and other texts entries hold themselves.
+const ENTRY_TEXTS: &str = "SELECT search_field, sequence, text FROM entries \
+     WHERE session = ?1 AND search_field IS NOT NULL AND text IS NOT NULL";
+const SUBAGENT_PARTS: &str = "SELECT position, text FROM subagent_search_parts WHERE session = ?1";
+
+/// The session `?1`'s parts in `fields`: those holding text, and results,
+/// whose text `result_items` holds.
+fn parts_query(fields: SearchedFields) -> String {
+    format!(
+        "SELECT id, entry, search_field, part, text FROM parts \
+         WHERE session = ?1 AND search_field IN ({})",
+        fields.part_field_codes()
+    )
+}
+
+fn search_texts_query(fields: SearchedFields) -> String {
+    format!(
+        "SELECT id, entry, search_field, text FROM search_texts \
+         WHERE session = ?1 AND search_field IN ({})",
+        fields.part_field_codes()
+    )
+}
+
+/// A read of one session's search texts, with its entries and messages read
+/// first to place each text.
+struct SessionRead<'c> {
+    connection: &'c Connection,
+    session: i64,
+    fields: SearchedFields,
+    window: Option<StoredWindow>,
+    entries: ById<StoredEntry>,
+    messages: ById<StoredMessage>,
+}
+
+/// Rows by their id, sorted by it: a session's rows are read in another
+/// order, and a hash map of a large session's rows took longer to build.
+struct ById<T>(Vec<(i64, T)>);
+
+impl<T: Copy> ById<T> {
+    fn sorted(mut rows: Vec<(i64, T)>) -> Self {
+        rows.sort_unstable_by_key(|(id, _)| *id);
+        Self(rows)
+    }
+
+    fn get(&self, id: i64) -> Option<T> {
+        let index = self.0.binary_search_by_key(&id, |(id, _)| *id).ok()?;
+        Some(self.0[index].1)
+    }
+}
+
+/// A result part whose text `result_items` holds, placed in the session.
+struct ResultPart {
+    id: i64,
     field: SearchField,
     ordinal: Option<usize>,
+    order: ReadOrder,
 }
 
-impl Metadata {
-    fn of(row: &Row) -> rusqlite::Result<Self> {
-        let code: i64 = row.get(0)?;
-        let field = SearchField::of_code(code).ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                Type::Integer,
-                format!("unknown search field {code}").into(),
-            )
-        })?;
+impl<'c> SessionRead<'c> {
+    fn new(
+        connection: &'c Connection,
+        session: i64,
+        fields: SearchedFields,
+        window: Option<StoredWindow>,
+    ) -> Result<Self> {
+        let entries = connection
+            .prepare_cached(ENTRIES)?
+            .query_map([session], |row| {
+                Ok((
+                    row.get(0)?,
+                    StoredEntry {
+                        message: row.get(1)?,
+                        contributes: row.get(2)?,
+                        sequence: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let messages = connection
+            .prepare_cached(if window.is_some() {
+                MESSAGES_WITH_TIMES
+            } else {
+                MESSAGES
+            })?
+            .query_map([session], |row| {
+                Ok((
+                    row.get(0)?,
+                    StoredMessage {
+                        ordinal: row.get(1)?,
+                        first_ms: row.get(2)?,
+                        last_ms: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(Self {
-            field,
-            ordinal: row
-                .get::<_, Option<i64>>(1)?
-                .and_then(|ordinal| usize::try_from(ordinal).ok()),
+            connection,
+            session,
+            fields,
+            window,
+            entries: ById::sorted(entries),
+            messages: ById::sorted(messages),
         })
     }
 
-    fn text(self, text: &str) -> SearchText<'_> {
-        SearchText {
-            field: self.field,
-            ordinal: self.ordinal,
-            text,
-        }
-    }
-}
-
-/// The text items of one tool result, joined by line breaks as search reads
-/// them. The buffer is reused from one result to the next.
-#[derive(Default)]
-struct ResultItems {
-    part: Option<i64>,
-    metadata: Option<Metadata>,
-    text: String,
-}
-
-impl ResultItems {
-    fn start(&mut self, part: i64, metadata: Metadata, text: &str) {
-        self.part = Some(part);
-        self.metadata = Some(metadata);
-        self.text.clear();
-        self.text.push_str(text);
-    }
-
-    fn push(&mut self, text: &str) {
-        self.text.push('\n');
-        self.text.push_str(text);
-    }
-
-    /// Visits the result being joined, if any, and empties the buffers.
-    fn visit(
-        &mut self,
+    /// Visits each text, table by table, until `visit` breaks.
+    fn visit_texts(
+        &self,
         visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
-    ) -> ControlFlow<()> {
-        self.part = None;
-        match self.metadata.take() {
-            Some(metadata) => visit(metadata.text(&self.text)),
-            None => ControlFlow::Continue(()),
+    ) -> Result<ControlFlow<()>> {
+        let ControlFlow::Continue(results) = self.visit_parts(visit)? else {
+            return Ok(ControlFlow::Break(()));
+        };
+        if self.visit_results(&results, visit)?.is_break()
+            || self.visit_search_texts(visit)?.is_break()
+        {
+            return Ok(ControlFlow::Break(()));
         }
+        if self.window.is_some() {
+            return Ok(ControlFlow::Continue(()));
+        }
+        if self.visit_entry_texts(visit)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        match self.fields {
+            SearchedFields::List => Ok(ControlFlow::Continue(())),
+            SearchedFields::Agent => self.visit_subagent_parts(visit),
+        }
+    }
+
+    /// Visits the parts holding text; returns the results among the parts.
+    fn visit_parts(
+        &self,
+        visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<(), Vec<ResultPart>>> {
+        let mut statement = self.connection.prepare_cached(&parts_query(self.fields))?;
+        let mut rows = statement.query([self.session])?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            let field = field_of(row.get(2)?)?;
+            let Some((ordinal, order)) = self.place(row.get(1)?, Table::Parts, row.get(3)?, 0)
+            else {
+                continue;
+            };
+            match row.get_ref(4)? {
+                ValueRef::Null => results.push(ResultPart {
+                    id: row.get(0)?,
+                    field,
+                    ordinal,
+                    order: ReadOrder {
+                        table: Table::ResultItems,
+                        ..order
+                    },
+                }),
+                _ => {
+                    let text = SearchText {
+                        field,
+                        ordinal,
+                        order,
+                        text: text_at(row, 4)?,
+                    };
+                    if visit(text).is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(results))
+    }
+
+    /// Visits the searched text items of each of `results` that holds any,
+    /// joined by line breaks as search reads them.
+    fn visit_results(
+        &self,
+        results: &[ResultPart],
+        visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        let mut statement = self.connection.prepare_cached(RESULT_ITEMS)?;
+        let mut joined = String::new();
+        for result in results {
+            joined.clear();
+            let mut items = statement.query([result.id])?;
+            let mut holds_items = false;
+            while let Some(item) = items.next()? {
+                if holds_items {
+                    joined.push('\n');
+                }
+                joined.push_str(text_at(item, 0)?);
+                holds_items = true;
+            }
+            if holds_items {
+                let text = SearchText {
+                    field: result.field,
+                    ordinal: result.ordinal,
+                    order: result.order,
+                    text: &joined,
+                };
+                if visit(text).is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn visit_search_texts(
+        &self,
+        visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        let mut statement = self
+            .connection
+            .prepare_cached(&search_texts_query(self.fields))?;
+        let mut rows = statement.query([self.session])?;
+        while let Some(row) = rows.next()? {
+            let Some((ordinal, order)) =
+                self.place(row.get(1)?, Table::SearchTexts, 0, row.get(0)?)
+            else {
+                continue;
+            };
+            let text = SearchText {
+                field: field_of(row.get(2)?)?,
+                ordinal,
+                order,
+                text: text_at(row, 3)?,
+            };
+            if visit(text).is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Visits the titles, summaries and other texts outside every message
+    /// that entries hold themselves.
+    fn visit_entry_texts(
+        &self,
+        visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        let mut statement = self.connection.prepare_cached(ENTRY_TEXTS)?;
+        let mut rows = statement.query([self.session])?;
+        while let Some(row) = rows.next()? {
+            let text = SearchText {
+                field: field_of(row.get(0)?)?,
+                ordinal: None,
+                order: ReadOrder {
+                    table: Table::Entries,
+                    sequence: row.get(1)?,
+                    part: 0,
+                    item: 0,
+                },
+                text: text_at(row, 2)?,
+            };
+            if visit(text).is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn visit_subagent_parts(
+        &self,
+        visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        let mut statement = self.connection.prepare_cached(SUBAGENT_PARTS)?;
+        let mut rows = statement.query([self.session])?;
+        while let Some(row) = rows.next()? {
+            let text = SearchText {
+                field: SearchField::Supplement,
+                ordinal: None,
+                order: ReadOrder {
+                    table: Table::SubagentSearchParts,
+                    sequence: 0,
+                    part: 0,
+                    item: row.get(0)?,
+                },
+                text: text_at(row, 1)?,
+            };
+            if visit(text).is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// The message number and place of a text of `entry` in `table`, at
+    /// `part` and `item` in the entry; `None` when the window leaves the text
+    /// out, or the session holds no such entry.
+    fn place(
+        &self,
+        entry: i64,
+        table: Table,
+        part: i64,
+        item: i64,
+    ) -> Option<(Option<usize>, ReadOrder)> {
+        let stored = self.entries.get(entry)?;
+        let message = stored
+            .message
+            .and_then(|message| self.messages.get(message));
+        let ordinal = text_ordinal(stored, message, self.window)?;
+        Some((
+            ordinal,
+            ReadOrder {
+                table,
+                sequence: stored.sequence,
+                part,
+                item,
+            },
+        ))
     }
 }
 
@@ -242,31 +450,36 @@ impl ResultItems {
 mod tests {
     use super::*;
 
-    /// Search texts come in entry order only while the query walks the
-    /// session's entries and looks up each one's texts.
+    /// One session's read costs what the session holds, not what the cache
+    /// holds, only while each statement reads through an index.
     #[test]
-    fn query_reads_one_sessions_texts_through_its_entries() {
+    fn each_statement_reads_through_an_index_without_scanning_a_table() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
             .execute_batch(super::super::schema::CREATE)
             .unwrap();
         for fields in [SearchedFields::List, SearchedFields::Agent] {
-            for windowed in [false, true] {
-                let parameters: &[i64] = if windowed { &[1, 0, 0] } else { &[1] };
+            for query in [
+                ENTRIES,
+                MESSAGES,
+                MESSAGES_WITH_TIMES,
+                &parts_query(fields),
+                RESULT_ITEMS,
+                &search_texts_query(fields),
+                ENTRY_TEXTS,
+                SUBAGENT_PARTS,
+            ] {
                 let plan = connection
-                    .prepare(&format!("EXPLAIN QUERY PLAN {}", query(fields, windowed)))
+                    .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
                     .unwrap()
-                    .query_map(rusqlite::params_from_iter(parameters), |row| {
-                        row.get::<_, String>(3)
-                    })
+                    .query_map([1], |row| row.get::<_, String>(3))
                     .unwrap()
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .unwrap()
                     .join("\n");
                 assert!(
-                    plan.contains("SEARCH s USING INDEX search_texts_by_entry")
-                        && !plan.contains("SCAN"),
-                    "the query reads each entry's search texts by entry, scanning no table: {plan}"
+                    plan.contains("SEARCH") && !plan.contains("SCAN"),
+                    "{query}: the statement searches an index and scans no table: {plan}"
                 );
             }
         }

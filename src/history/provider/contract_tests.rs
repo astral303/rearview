@@ -65,6 +65,7 @@ enum Contract {
     WorkspaceSessionsDir,
     RootOverride,
     StorageEnvVars,
+    RootSpelling,
     UnreadableDirectory,
     ForeignFileDelete,
 }
@@ -98,7 +99,10 @@ impl Contract {
             Self::WorkspaceSessionsDir => provider.workspace_sessions_dir().is_capable(),
             Self::WarmCacheRename => rename,
             Self::ForeignFileDelete => delete,
-            Self::RootOverride | Self::StorageEnvVars | Self::UnreadableDirectory => true,
+            Self::RootOverride
+            | Self::StorageEnvVars
+            | Self::RootSpelling
+            | Self::UnreadableDirectory => true,
         }
     }
 }
@@ -1447,6 +1451,71 @@ fn listed_environment_variables_decide_every_root() {
     });
 }
 
+/// The agent's directory named another way, as a user who sets the agent's
+/// variable in two shells names it, keys the sessions the first name cached:
+/// the load restores each of them, parses none, and the cache keeps one copy
+/// of each.
+#[test]
+fn other_spelling_of_root_restores_sessions_first_spelling_cached() {
+    run_contract(Contract::RootSpelling, |fixture| {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let ids = fixture.ids();
+        fixture.write_session(&home, ids.session);
+        fixture.write_session(&home, ids.other);
+        let cached = load_under(fixture, &home, cache.path()).len();
+        assert_eq!(cached, 2, "the first load lists both sessions");
+
+        for spelling in other_spellings(directory.path(), &home) {
+            let rows = load_under(fixture, &spelling, cache.path());
+
+            assert!(
+                rows.len() == cached && rows.iter().all(|row| row.cached_session.is_some()),
+                "a load through {} restores every session without parsing it",
+                spelling.display()
+            );
+            assert_eq!(
+                stored_session_count(cache.path()),
+                cached,
+                "the cache keeps one copy of each session after a load through {}",
+                spelling.display()
+            );
+        }
+    });
+}
+
+/// Other names of `home`, a directory in `directory`, that the file system
+/// resolves to it: through `..`, with forward slashes on Windows, and
+/// through a symbolic link on Unix.
+fn other_spellings(directory: &Path, home: &Path) -> Vec<PathBuf> {
+    let elsewhere = directory.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let mut spellings = vec![elsewhere.join("..").join(home.file_name().unwrap())];
+    #[cfg(windows)]
+    spellings.push(PathBuf::from(home.to_string_lossy().replace('\\', "/")));
+    #[cfg(unix)]
+    {
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(home, &link).unwrap();
+        spellings.push(link);
+    }
+    spellings
+}
+
+/// Every session row the session cache under `cache_base` holds, whatever
+/// its root.
+fn stored_session_count(cache_base: &Path) -> usize {
+    let database = cache_base.join(crate::history::sqlite_cache::DATABASE_FILE_NAME);
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap() as usize
+}
+
 /// A directory discovery cannot list hides no session: the other
 /// directories still list, discovery reports the directory, and the cached
 /// sessions under it stay listed from the session cache, by the list and by
@@ -1547,7 +1616,7 @@ fn cached_keys(environment: &Environment, root: &SessionRoot) -> Vec<String> {
     let mut keys = SqliteCache::open_waiting(environment.cache_base())
         .unwrap()
         .unwrap()
-        .stored_keys(storage.cache(), &root.path)
+        .stored_keys(storage.cache(), root)
         .unwrap();
     keys.sort();
     keys

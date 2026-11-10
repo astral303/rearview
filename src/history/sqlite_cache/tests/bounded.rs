@@ -20,7 +20,7 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
         cache.admit_storage(storage).unwrap();
         cache.write(&record).unwrap();
         let super::super::CatalogueSession::Listed(cached) = cache
-            .catalogue_session(storage, row.source, &root.path, &stub.cache_key, false)
+            .catalogue_session(storage, row.source, &root, &stub.cache_key, false)
             .unwrap()
             .unwrap()
         else {
@@ -106,7 +106,7 @@ fn bounded_transcript_doesnt_load_unrelated_large_call_and_result_bodies() {
     cache.admit_storage(storage).unwrap();
     cache.write(&record).unwrap();
     let super::super::CatalogueSession::Listed(cached) = cache
-        .catalogue_session(storage, Source::Claude, &root.path, CACHE_KEY, false)
+        .catalogue_session(storage, Source::Claude, &root, CACHE_KEY, false)
         .unwrap()
         .unwrap()
     else {
@@ -145,7 +145,7 @@ fn sql_windows_keep_full_message_spans_and_final_millisecond() {
     cache.admit_storage(storage).unwrap();
     cache.write(&record).unwrap();
     let super::super::CatalogueSession::Listed(cached) = cache
-        .catalogue_session(storage, Source::Claude, &root.path, CACHE_KEY, false)
+        .catalogue_session(storage, Source::Claude, &root, CACHE_KEY, false)
         .unwrap()
         .unwrap()
     else {

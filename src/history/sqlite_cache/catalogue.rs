@@ -2,7 +2,7 @@
 //! record a load hands the database writer.
 
 use super::entries::path_text;
-use super::files::FileKey;
+use super::files::{FileKey, RootKey};
 use super::positional::PositionalRow;
 use crate::history::fingerprint::{CachedFingerprint, FileStamp};
 use crate::history::parser::{SessionTranscripts, SubagentSearchPart};
@@ -202,7 +202,7 @@ impl SessionRecord {
 pub(super) struct CatalogueRow {
     pub(super) storage: &'static str,
     pub(super) source: &'static str,
-    pub(super) root: String,
+    pub(super) root: SessionRoot,
     pub(super) cache_key: String,
     pub(super) locator: String,
     pub(super) status: SessionStatus,
@@ -259,15 +259,18 @@ impl SessionFile {
     }
 }
 
-/// The [`FileKey`] of a row's locator and of each of its files, in order.
+/// The [`RootKey`] of a row's root, and the [`FileKey`] of its locator and
+/// of each of its files, in order.
 pub(super) struct CatalogueKeys {
+    pub(super) root: RootKey,
     pub(super) locator: FileKey,
     pub(super) files: Vec<FileKey>,
 }
 
 /// The `sessions` columns [`CatalogueRow::values`] gives, after `storage`,
-/// `root` and `cache_key`.
+/// `root_key` and `cache_key`.
 const COLUMNS: &[&str] = &[
+    "root",
     "source",
     "locator",
     "file_key",
@@ -296,14 +299,14 @@ const COLUMNS: &[&str] = &[
     "generation",
 ];
 
-/// `INSERT` of a `sessions` row: `storage`, `root` and `cache_key` (`?1` to
-/// `?3`), then [`CatalogueRow::values`].
+/// `INSERT` of a `sessions` row: `storage`, `root_key` and `cache_key` (`?1`
+/// to `?3`), then [`CatalogueRow::values`].
 pub(super) fn insert_sql() -> String {
     let parameters: Vec<String> = (4..COLUMNS.len() + 4)
         .map(|index| format!("?{index}"))
         .collect();
     format!(
-        "INSERT INTO sessions (storage, root, cache_key, {}) VALUES (?1, ?2, ?3, {})",
+        "INSERT INTO sessions (storage, root_key, cache_key, {}) VALUES (?1, ?2, ?3, {})",
         COLUMNS.join(", "),
         parameters.join(", ")
     )
@@ -348,6 +351,7 @@ impl CatalogueRow {
     ) -> Vec<Value> {
         let text = |text: &Option<String>| Value::from(text.clone());
         vec![
+            path_text(&self.root.path).into(),
             self.source.to_owned().into(),
             self.locator.clone().into(),
             keys.locator.as_str().to_owned().into(),
@@ -464,7 +468,7 @@ impl CatalogueRow {
         Some(Self {
             storage: storage.directory,
             source: source.label(),
-            root: path_text(&root.path),
+            root: root.clone(),
             cache_key: stub.cache_key.clone(),
             locator: path_text(&stub.locator),
             status,
