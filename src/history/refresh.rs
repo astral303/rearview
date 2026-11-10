@@ -126,7 +126,7 @@ pub enum RefreshOutcome {
 ///
 /// An agent whose discovery fails keeps what the list holds of it. The
 /// refresh fails when every agent's discovery does, and when a write finds
-/// the cache's drive short of space.
+/// the cache's drive low on space.
 pub fn refresh_sessions(
     environment: &Environment,
     known: &KnownSessions,

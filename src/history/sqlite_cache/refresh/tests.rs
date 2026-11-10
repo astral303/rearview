@@ -88,6 +88,11 @@ pub(crate) struct AnotherRearviewsOwner {
 }
 
 impl AnotherRearviewsOwner {
+    /// The longest the test waits for the other rearview to acquire
+    /// ownership and start its activity before it fails: a watchdog for a
+    /// hang.
+    const ACQUIRES_WITHIN: Duration = Duration::from_secs(60);
+
     pub(crate) fn hold(base: &Path) -> Self {
         Self::start(base, OwnerActivity::Idle)
     }
@@ -103,7 +108,7 @@ impl AnotherRearviewsOwner {
             });
         });
         is_ready
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Self::ACQUIRES_WITHIN)
             .expect("another rearview acquires ownership");
         Self {
             base: base.to_path_buf(),
@@ -1246,12 +1251,12 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
-/// Once a write found the drive short of space, the checkpoint after the
+/// Once a write found the drive low on space, the checkpoint after the
 /// writes, the cache writer's close, the ownership's release and a refresh
 /// connection closing last leave the write-ahead log uncopied: copying it
 /// would grow the database by the load's pages.
 #[test]
-fn checkpoints_after_drive_found_short_of_space_leave_log_uncopied() {
+fn checkpoints_after_drive_found_low_on_space_leave_log_uncopied() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path()).with_free_space(900_000_000);
     let owner = owner_of_written_cache(&base);
@@ -1325,7 +1330,7 @@ fn failed_low_space_deletion_leaves_database_at_its_size() {
     );
 }
 
-/// Once a write found the drive short of space, a cache writer whose setup
+/// Once a write found the drive low on space, a cache writer whose setup
 /// fails after `journal_mode = WAL` opened the write-ahead log, here at
 /// `foreign_keys`, leaves the database at its size: its connection closes
 /// without copying the log into the database.
@@ -1579,7 +1584,7 @@ fn connection_moved_and_used_is_held_by_its_new_thread_in_debug_check() {
     );
 }
 
-/// Sets `base`'s low-space latch as a first write on a drive short of
+/// Sets `base`'s low-space latch as a first write on a drive low on
 /// space does: the write's ownership checks the space, fails, and is
 /// released.
 fn latch_low_space_as_first_write_does(base: &CacheBase) {
@@ -1587,7 +1592,7 @@ fn latch_low_space_as_first_write_does(base: &CacheBase) {
     owner.token().check_space().unwrap_err();
 }
 
-/// A free-space check on a drive short of space waits for its owner's turn
+/// A free-space check on a drive low on space waits for its owner's turn
 /// while a parse group holds it, and the TUI's quit revokes the write
 /// permission meanwhile. The check fails without setting the low-space
 /// latch, so the quit's read of the latch is final.
@@ -1618,7 +1623,7 @@ fn space_check_waiting_for_turn_when_quit_revokes_permission_leaves_latch_clear(
     assert!(!base.low_space().is_set(), "the latch stays clear");
 }
 
-/// A free-space check on a drive short of space outlasts the TUI exit's wait
+/// A free-space check on a drive low on space outlasts the TUI exit's wait
 /// for it and answers once the wait gave up. The check fails and leaves the
 /// low-space latch clear, as rearview read it at exit.
 #[test]

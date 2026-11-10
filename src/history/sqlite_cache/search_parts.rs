@@ -93,9 +93,9 @@ pub(super) fn visit_semantic_turns(
 pub(crate) struct SemanticTurns {
     texts: Vec<String>,
     ranges: Vec<MessageRange>,
-    /// Each ordinal's place in `texts`; `None` while every ordinal pushed is
-    /// at least the one before it, and a repeated ordinal continues the last
-    /// turn.
+    /// Each ordinal's place in `texts`, built when an ordinal is pushed below
+    /// the one before it. `None` until then: a repeated ordinal continues the
+    /// last turn, and a greater one starts the next.
     places: Option<HashMap<usize, usize>>,
 }
 

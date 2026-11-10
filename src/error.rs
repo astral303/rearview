@@ -183,7 +183,7 @@ pub enum AppError {
 }
 
 /// The session cache database's deletion after a write found its drive
-/// short of space.
+/// low on space.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CacheDeletion {
     /// Not run yet.
@@ -234,8 +234,8 @@ pub(crate) fn low_space_rest(outcome: &CacheDeletion) -> String {
     )
 }
 
-/// `bytes` in gigabytes, rounded down to one decimal place, so a drive
-/// short of the floor never reads as holding it.
+/// `bytes` in gigabytes, rounded down to one decimal place, so the message
+/// doesn't show a drive below the floor as holding it.
 fn gigabytes_down_to_a_tenth(bytes: u64) -> String {
     let tenths = bytes / 100_000_000;
     format!("{}.{}", tenths / 10, tenths % 10)

@@ -117,8 +117,8 @@ impl Conversation {
         Ok(Self::with_scanned_turns_of(rows, scanned))
     }
 
-    /// `rows` with `scanned`, the scan of their copies' semantic turns, as
-    /// [`Self::load_held_semantic_turns_of`] gives them.
+    /// `rows` with their semantic turns; `scanned` holds one scan result per
+    /// row, in order.
     pub(in crate::history) fn with_scanned_turns_of(
         rows: &[(&Conversation, &CachedSession)],
         scanned: Vec<ScannedTurns>,
@@ -157,42 +157,39 @@ impl Conversation {
         let read = copy.read_held_copy(|held| {
             let mut parts = ContentBuilder::default();
             let result = read_parts(held, &mut parts)?;
-            // The row's own copy keeps the row's times, read with the row.
-            let replaced_times = if held.generation() == cached.generation() {
-                None
+            let times = if held.generation() == cached.generation() {
+                HeldTimes::OfTheRow
             } else {
-                Some(held.message_times()?)
+                let (message_count, message_times) = held.message_times()?;
+                HeldTimes::OfTheCopy(message_count, message_times)
             };
-            Ok((parts, result, replaced_times, held.generation()))
+            Ok((parts, result, times, held.generation()))
         })?;
-        Ok(read.map(|(parts, result, replaced_times, generation)| {
-            self.with_parts(parts, generation, replaced_times, result)
+        Ok(read.map(|(parts, result, times, generation)| {
+            self.with_parts(parts, generation, times).holding(result)
         }))
     }
 
     /// This row with `turns`, scanned from the row's own copy, of
-    /// `generation`: the row keeps its message count and times.
+    /// `generation`.
     fn with_scanned_turns(&self, turns: SemanticTurns, generation: i64) -> HeldParts<()> {
         self.with_parts(
             ContentBuilder::of_semantic_turns(turns),
             generation,
-            None,
-            (),
+            HeldTimes::OfTheRow,
         )
     }
 
-    /// This row with `parts`, read of the copy of `generation`, and with
-    /// `replaced_times`, the message count and times of a copy that replaced
-    /// the row's.
-    fn with_parts<T>(
+    /// This row with `parts`, read of the copy of `generation`, counted and
+    /// timed as `times` gives.
+    fn with_parts(
         &self,
         parts: ContentBuilder,
         generation: i64,
-        replaced_times: Option<(usize, MessageTimes)>,
-        result: T,
-    ) -> HeldParts<T> {
+        times: HeldTimes,
+    ) -> HeldParts<()> {
         let mut row = self.clone();
-        if let Some((message_count, message_times)) = replaced_times {
+        if let HeldTimes::OfTheCopy(message_count, message_times) = times {
             row.message_count = message_count;
             row.message_times = message_times;
         }
@@ -200,9 +197,17 @@ impl Conversation {
         HeldParts {
             row,
             generation,
-            result,
+            result: (),
         }
     }
+}
+
+/// The message count and times a row read of a held copy is given.
+enum HeldTimes {
+    /// The row's own, read with the row: the copy read is the row's.
+    OfTheRow,
+    /// The count and times of the copy that replaced the row's.
+    OfTheCopy(usize, MessageTimes),
 }
 
 /// A row with the parts read of the copy the cache holds.
@@ -212,6 +217,16 @@ pub(crate) struct HeldParts<T> {
     pub(crate) generation: i64,
     /// The result of the read's `read_parts`.
     result: T,
+}
+
+impl HeldParts<()> {
+    fn holding<T>(self, result: T) -> HeldParts<T> {
+        HeldParts {
+            row: self.row,
+            generation: self.generation,
+            result,
+        }
+    }
 }
 
 /// A row's content, read by [`Conversation::load_held_content`].

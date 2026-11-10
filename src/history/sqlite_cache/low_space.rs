@@ -1,5 +1,5 @@
 //! The session cache database's deletion after a write found its drive
-//! short of space. The write sets its base's low-space latch, and the
+//! low on space. The write sets its base's low-space latch, and the
 //! operation stops and releases its ownership. Once no write of this
 //! rearview can set the latch, the command reporting the error runs the
 //! deletion and prints the deletion's outcome.
@@ -12,7 +12,7 @@ use crate::error::{AppError, CacheDeletion};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-/// A base's finding that its drive is short of space, and the deletion it
+/// A base's finding that its drive is low on space, and the deletion it
 /// asks for, shared by the base's clones.
 pub(crate) struct Latch {
     state: Mutex<State>,
@@ -147,7 +147,7 @@ impl Latch {
         }
     }
 
-    /// True once a write found the drive short of space.
+    /// True once a write found the drive low on space.
     pub(crate) fn is_set(&self) -> bool {
         !matches!(*self.state(), State::Clear)
     }
@@ -189,7 +189,7 @@ impl Latch {
     }
 }
 
-/// Run `base`'s low-space deletion after a write found its drive short of
+/// Run `base`'s low-space deletion after a write found its drive low on
 /// space, and return the deletion's outcome; `None` while the latch is
 /// clear. A later call returns the first call's outcome without deleting.
 /// Call once no write of this rearview can set the latch: after its workers

@@ -8,7 +8,7 @@ identifiers.
 | agent | A coding agent whose sessions rearview reads, such as Claude Code or Codex. In code, an agent's provider reads its sessions; see [PROVIDERS.md](PROVIDERS.md). | |
 | ignored | Skipped and reported: `Codex │ 12 ignored: compressed sessions unsupported`. | not read, unread |
 | limit | The most a count, size or length may reach: a line limit, a budget. | cap, bound |
-| low space | The session cache's drive holding less free space than the 1 GB a cache write needs; `low_space` in identifiers. Prose may call the drive "short of space". | |
+| low space | The session cache's drive holding less free space than the 1 GB a cache write needs; `low_space` in identifiers. "Low on space" is its predicate form: the drive is low on space. | short of space |
 | nested sub-agent | A sub-agent's own sub-agent. | grandchild |
 | permanent error | Any error that is not a transient error. | |
 | session | One conversation with an agent, as the list shows it. | rollout (kept in code as the name of Codex's transcript file) |

@@ -43,8 +43,8 @@ pub(in super::super) fn update_tail(
 }
 
 /// Makes `rows`, the rows of the session's leading entries, the stored
-/// rows at sequence 0 on, which hold as many entries: an unchanged row is
-/// kept, a changed one updated in place.
+/// rows at sequence 0 on: an unchanged row is kept, a changed one updated
+/// in place. The session stores an entry at each of `rows`' sequences.
 pub(in super::super) fn replace_leading(
     connection: &Connection,
     session: i64,
@@ -59,6 +59,11 @@ pub(in super::super) fn replace_leading(
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    debug_assert_eq!(
+        stored.len(),
+        rows.entries.len(),
+        "the session stores an entry at each leading sequence"
+    );
     let mut writer = RowWriter::new(connection, session, places)?;
     let ids = RowIds::new(rows);
     for (index, (row, &(id, digest))) in rows.entries.iter().zip(&stored).enumerate() {

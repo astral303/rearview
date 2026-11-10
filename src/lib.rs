@@ -91,7 +91,7 @@ impl ReachedBase {
 /// End a command that returned `result` over the session cache `base`:
 /// write its error to `stderr`, and return true when rearview exits with
 /// failure, with the result of the writes to `stderr`. Once a write of
-/// `base` found the drive short of space, and the low-space deletion has
+/// `base` found the drive low on space, and the low-space deletion has
 /// not run, the deletion decides the exit, whatever `result` holds: write
 /// the low-space message's first sentence, delete the cache database, then
 /// write the deletion's outcome. A failed first write still runs the
@@ -3111,7 +3111,7 @@ mod agent_command_tests {
         }
     }
 
-    /// A load whose cache write finds the drive short of space, reported to
+    /// A load whose cache write finds the drive low on space, reported to
     /// a stderr whose first write or flush fails: the cache database is
     /// still deleted, and the write's error returned.
     #[test]

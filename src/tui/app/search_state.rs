@@ -34,7 +34,22 @@ pub(super) struct SemanticSearchState {
     pub(super) cancellation: Option<SemanticCancellationToken>,
 }
 
+/// Leaving the TUI cancels the semantic worker's active request.
+impl Drop for SemanticSearchState {
+    fn drop(&mut self) {
+        self.cancel_active_request();
+    }
+}
+
 impl SemanticSearchState {
+    /// Cancels the semantic worker's active request. The worker keeps its
+    /// model, loading or loaded, for the next request.
+    fn cancel_active_request(&self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+
     fn clear_results(&mut self) {
         self.results.clear();
         self.unreadable = None;
@@ -261,9 +276,7 @@ impl App {
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
         self.semantic_search.error = None;
-        if let Some(cancellation) = &self.semantic_search.cancellation {
-            cancellation.cancel();
-        }
+        self.semantic_search.cancel_active_request();
     }
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
@@ -289,9 +302,7 @@ impl App {
         if prewarm {
             self.semantic_search.clear_results();
         }
-        if let Some(cancellation) = &self.semantic_search.cancellation {
-            cancellation.cancel();
-        }
+        self.semantic_search.cancel_active_request();
         if !prewarm && ParsedQuery::parse(&query).is_quoted_only() {
             // The search worker answers it over the texts it holds.
             let _ = self.search_tx.send(SearchCommand::Search {
@@ -655,6 +666,9 @@ impl App {
             ListSearchMode::Lexical => ListSearchMode::Semantic,
             ListSearchMode::Semantic => ListSearchMode::Lexical,
         };
+        if self.list_search_mode == ListSearchMode::Lexical {
+            self.semantic_search.cancel_active_request();
+        }
         self.invalidate_search_generation();
         if self.list_search_mode == ListSearchMode::Semantic && self.query.trim().is_empty() {
             self.prewarm_semantic_cache();

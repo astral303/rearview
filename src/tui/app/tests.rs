@@ -1939,6 +1939,58 @@ fn prewarm_generation_keeps_search_polling_until_completion() {
     assert!(app.has_search_work_in_flight());
 }
 
+/// An app in semantic mode searching for "needle", and the cancellation of
+/// the semantic worker's active request.
+fn app_with_active_semantic_request() -> (App, crate::semantic::types::SemanticCancellationToken) {
+    let mut app = app_with_options(
+        vec![conversation(
+            Some("Visible"),
+            "-tmp-visible",
+            "22222222-2222-4222-8222-222222222222",
+            "needle",
+        )],
+        vec![],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    let (request_tx, _request_rx) = mpsc::channel();
+    let (_response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.query = "needle".to_string();
+    let cancellation = crate::semantic::types::SemanticCancellationToken::new();
+    let active_request = cancellation.child();
+    app.semantic_search.cancellation = Some(cancellation);
+    (app, active_request)
+}
+
+#[test]
+fn switching_to_lexical_mode_cancels_the_active_semantic_request() {
+    let (mut app, active_request) = app_with_active_semantic_request();
+
+    app.toggle_list_search_mode();
+
+    assert_eq!(app.list_search_mode, ListSearchMode::Lexical);
+    assert!(
+        active_request.is_cancelled(),
+        "the semantic request is cancelled"
+    );
+}
+
+#[test]
+fn leaving_the_tui_cancels_the_active_semantic_request() {
+    let (app, active_request) = app_with_active_semantic_request();
+
+    app.into_conversations();
+
+    assert!(
+        active_request.is_cancelled(),
+        "the semantic request is cancelled"
+    );
+}
+
 #[test]
 fn semantic_query_interrupts_prewarm_and_keeps_activity_until_query_starts() {
     let mut app = app_with_options(

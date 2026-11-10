@@ -39,7 +39,7 @@ pub enum Stage {
     Search,
     Render,
     /// Deleting the session cache database after a write found its drive
-    /// short of space.
+    /// low on space.
     CacheDeletion,
 }
 

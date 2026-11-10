@@ -420,8 +420,8 @@ fn place(
     let own_read = own_window.map_or(&resume.files[0].read, |window| &window.read);
     let mut leading = reader.leading_entries(&stub.locator, own_read)?;
     let leading_titles = take_leading_titles(&mut leading);
-    // A write rewrites the stored leading rows in place: a resumed read never
-    // moves the entries after them.
+    // A resumed write rewrites the stored leading rows in place and doesn't
+    // move the entries after them.
     if leading.len() != resume.leading_rows || leading_digest(&leading) != checkpoint.leading_digest
     {
         return Ok(Err(WholeRead::LeadingChanged));

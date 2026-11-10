@@ -39,10 +39,13 @@ struct BaseState {
 }
 
 /// This rearview's open connections to a base, as [`CacheBase::open_connection`]
-/// counts them. Refresh ownership's own connections, the low-space
-/// deletion's among them, and the observer's read are not counted: each
-/// opens and closes within one call, and the deletion doesn't wait for
-/// them, so a thread holding one cannot wait for itself.
+/// counts them. Two kinds of connection go uncounted, each opened and closed
+/// within one call:
+/// - refresh ownership's own connections, the deletion's among them
+/// - the observer's read
+///
+/// The low-space deletion doesn't wait for them, so a thread holding one
+/// doesn't wait for itself.
 #[derive(Default)]
 struct Connections {
     open: usize,
@@ -364,8 +367,8 @@ impl CacheBase {
 
     /// Refuse this rearview's new connections to this base (see
     /// [`Self::open_connection`]) until the result drops, and wait up to
-    /// `wait` for the open ones to close. Call on a thread that holds none
-    /// of them: the wait would end only at `wait`.
+    /// `wait` for the open ones to close. Call on a thread that doesn't hold
+    /// any of them: the wait would end only at `wait`.
     pub(super) fn refuse_connections(&self, wait: Duration) -> RefusedConnections {
         let mut connections = self.state.connections();
         #[cfg(debug_assertions)]
@@ -399,7 +402,7 @@ impl CacheBase {
     }
 
     /// This base's low-space latch: set once a write of the base found its
-    /// drive short of space (see [`low_space::run_deletion`]).
+    /// drive low on space (see [`low_space::run_deletion`]).
     pub(crate) fn low_space(&self) -> &low_space::Latch {
         &self.state.low_space
     }

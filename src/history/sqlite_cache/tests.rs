@@ -14,6 +14,7 @@ mod message_schema;
 mod record_from_parse;
 mod search_texts;
 mod sources;
+mod transcript_references;
 
 const CACHE_KEY: &str = "every-record";
 
@@ -1140,6 +1141,34 @@ fn one_kib_cache_is_rebuilt_at_selected_size() {
             .pragma_query_value(None, "page_size", |row| row.get::<_, u32>(0))
             .unwrap(),
         PAGE_SIZE
+    );
+}
+
+#[test]
+fn writer_keeps_temporary_storage_in_memory_and_reader_keeps_default() {
+    // `PRAGMA temp_store` values.
+    const DEFAULT: i64 = 0;
+    const MEMORY: i64 = 2;
+    let base = tempfile::tempdir().unwrap();
+    let writer = admitted_cache(base.path());
+    let reader = SqliteCache::open_waiting_at_most(&rearview_at(base.path()), WAITING_BUSY_TIMEOUT)
+        .unwrap()
+        .expect("the admitted cache opens for reading");
+    let temp_store = |connection: &Connection| {
+        connection
+            .pragma_query_value(None, "temp_store", |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+
+    assert_eq!(
+        temp_store(&writer.connection),
+        MEMORY,
+        "the writer keeps its statement journals in memory"
+    );
+    assert_eq!(
+        temp_store(&reader.connection),
+        DEFAULT,
+        "the reader keeps SQLite's default temporary storage"
     );
 }
 

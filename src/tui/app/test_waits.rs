@@ -6,8 +6,25 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// Longer than a viewer's read of a fixture session takes.
-pub(crate) const VIEWER_READ_LANDS: Duration = Duration::from_secs(10);
+/// The longest a test waits for a viewer's read of a fixture session before
+/// it fails: a watchdog for a read that never lands.
+pub(crate) const VIEWER_READ_LANDS: Duration = Duration::from_secs(60);
+
+/// Shows the open session's pending reload, as
+/// [`App::complete_pending_view_refresh`] does, waiting up to
+/// [`VIEWER_READ_LANDS`] for its read. False when no reload is pending;
+/// panics when its read doesn't land in time, so a slow run fails at the wait
+/// and not at a later assertion.
+pub(crate) fn finish_pending_view_reload(app: &mut App, viewport_height: usize) -> bool {
+    if app.pending_view_reload.is_none() {
+        return false;
+    }
+    assert!(
+        app.complete_pending_view_refresh(viewport_height, VIEWER_READ_LANDS),
+        "the open session's reload read lands within {VIEWER_READ_LANDS:?}"
+    );
+    true
+}
 
 /// [`App::complete_pending_open`] until the viewer shows the session, or the
 /// open fails, failing after [`VIEWER_READ_LANDS`]. True when an open was

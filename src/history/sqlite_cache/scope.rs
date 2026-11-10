@@ -55,7 +55,7 @@ pub(crate) enum OperationAccess<'s> {
 
 /// An operation's refresh ownership while it may write and parse: its write
 /// permission stands, the operation is not cancelled, and no write found the
-/// drive short of space. Only [`OperationScope::acquire_access`] makes one.
+/// drive low on space. Only [`OperationScope::acquire_access`] makes one.
 pub(crate) struct LiveOwner<'s> {
     scope: &'s OperationScope,
     token: RefreshToken,
@@ -142,8 +142,8 @@ impl OperationScope {
     /// once its write permission is revoked or it is cancelled, and keeps
     /// the ownership until [`Self::finish`]. Fails
     /// on a database error other than a busy lock, when cancelled while
-    /// waiting for ownership, and once a write found the cache's drive short
-    /// of space (see [`Self::finish`]).
+    /// waiting for ownership, and once a write found the cache's drive low
+    /// on space (see [`Self::finish`]).
     pub(crate) fn acquire_access(&self) -> Result<OperationAccess<'_>> {
         let coordinator = &self.coordinator;
         if let Some(error) = coordinator.base().low_space().error() {

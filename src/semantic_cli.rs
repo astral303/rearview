@@ -491,7 +491,7 @@ fn semantic_cache_candidates(
 }
 
 /// Stores the route texts `content`'s reads computed. Fails when the drive
-/// is short of space; after any other failure, the next semantic search
+/// is low on space; after any other failure, the next semantic search
 /// computes the route texts again.
 fn store_route_texts(base: &CacheBase, content: &[SemanticContent<'_>]) -> Result<()> {
     let routes = content

@@ -990,8 +990,8 @@ mod tests {
             .join("\n")
     }
 
-    /// Each scan statement reads through its index, so it costs what the
-    /// scanned rows hold, not what the cache holds:
+    /// Each scan statement reads through its index, at a cost that follows
+    /// the scanned rows, not the cache's size:
     /// - a scan of every listed session reads row ranges by id;
     /// - a scan of some sessions reads their rows in each range through
     ///   `parts_by_session`;

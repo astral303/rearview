@@ -29,7 +29,7 @@ pub(crate) struct ScannedCopies<R> {
 #[derive(Debug)]
 pub(crate) enum CopyOutcome {
     /// The reads hold the copy's content, read from the session row of this
-    /// id; a copy without tasks holds none.
+    /// id; they don't hold any content of a copy without tasks.
     Scanned(i64),
     NoLongerCached,
     /// Another write replaced the copy before the scan ended; the cache now
@@ -73,13 +73,15 @@ pub(super) trait CopiesScan: Sync {
         Some(read)
     }
     /// Called on the task's thread when a task of the copy at `copy` fails or
-    /// finds the database gone: the copy's reads are dropped.
+    /// finds the database gone, before the scan ends: an implementation
+    /// holding reads of the copy can drop them here.
     fn copy_failed(&self, _copy: usize) {}
 }
 
-/// How one task ended.
+/// A task's outcome.
 enum TaskEnd<R> {
-    Kept(Option<R>),
+    /// The task's read, when [`CopiesScan::task_ended`] keeps it.
+    Succeeded(Option<R>),
     /// The cache base's database is gone.
     DatabaseGone,
     Failed(AppError),
@@ -157,7 +159,7 @@ pub(super) fn scan_copies<S: CopiesScan>(
                         Ok(Some(cache)) => match cache
                             .with_read_snapshot(|connection| scan.read(connection, task))
                         {
-                            Ok(read) => TaskEnd::Kept(scan.task_ended(read)),
+                            Ok(read) => TaskEnd::Succeeded(scan.task_ended(read)),
                             Err(error) => TaskEnd::Failed(error),
                         },
                         Ok(None) => TaskEnd::DatabaseGone,
@@ -172,7 +174,7 @@ pub(super) fn scan_copies<S: CopiesScan>(
             .collect::<Vec<_>>();
         for (copy, end) in task_ends {
             match (copy, end) {
-                (_, TaskEnd::Kept(read)) => reads.extend(read),
+                (_, TaskEnd::Succeeded(read)) => reads.extend(read),
                 (Some(copy), TaskEnd::DatabaseGone) => {
                     outcomes[copy] = Some(CopyOutcome::NoLongerCached);
                 }
@@ -283,11 +285,13 @@ mod tests {
 
     /// A scan whose planning stamps the database with another schema
     /// version, so that every task finds the cache gone: one task per copy,
-    /// or one task of every copy.
+    /// or one task of every copy. `failed` records each copy
+    /// [`CopiesScan::copy_failed`] is called for.
     struct DatabaseGoneScan {
         database: std::path::PathBuf,
         sessions: SessionsById,
         task_per_copy: bool,
+        failed: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     }
 
     impl CopiesScan for DatabaseGoneScan {
@@ -299,13 +303,13 @@ mod tests {
                 "UPDATE meta SET value = 'another' WHERE key = 'schema_version'",
                 [],
             )?;
-            Ok(match self.task_per_copy {
-                true => self
-                    .sessions
+            Ok(if self.task_per_copy {
+                self.sessions
                     .values()
                     .map(|&(copy, _)| Some(copy))
-                    .collect(),
-                false => vec![None],
+                    .collect()
+            } else {
+                vec![None]
             })
         }
 
@@ -316,6 +320,10 @@ mod tests {
         fn read(&self, _: &Connection, _: Option<usize>) -> Result<()> {
             panic!("no task reads a database that is gone")
         }
+
+        fn copy_failed(&self, copy: usize) {
+            self.failed.lock().unwrap().push(copy);
+        }
     }
 
     #[test]
@@ -324,12 +332,14 @@ mod tests {
             let base = tempfile::tempdir().unwrap();
             let copies = every_record_copies(base.path());
             let references = copies.iter().collect::<Vec<_>>();
+            let failed = std::sync::Arc::default();
 
             let scanned = scan_copies(&references, |_, sessions| {
                 Ok(DatabaseGoneScan {
                     database: super::super::database_path(copies[0].base.path()),
                     sessions,
                     task_per_copy,
+                    failed: std::sync::Arc::clone(&failed),
                 })
             })
             .unwrap();
@@ -343,7 +353,104 @@ mod tests {
                  {:?}",
                 scanned.copies
             );
+            let mut failed = failed.lock().unwrap().clone();
+            failed.sort_unstable();
+            let expected = if task_per_copy {
+                (0..copies.len()).collect()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                failed, expected,
+                "task per copy {task_per_copy}: the scan calls `copy_failed` for each task's copy"
+            );
         }
+    }
+
+    /// A scan of one task per copy, in copy order, whose task of the first
+    /// copy fails; `events` records each task's read and each copy
+    /// [`CopiesScan::copy_failed`] is called for, in order.
+    struct FirstTaskFailingScan {
+        sessions: SessionsById,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl CopiesScan for FirstTaskFailingScan {
+        type Task = usize;
+        type Read = usize;
+
+        fn tasks(&self, _: &Connection) -> Result<Vec<usize>> {
+            let mut copies = self
+                .sessions
+                .values()
+                .map(|&(copy, _)| copy)
+                .collect::<Vec<_>>();
+            copies.sort_unstable();
+            Ok(copies)
+        }
+
+        fn copy_of(&self, task: &usize) -> Option<usize> {
+            Some(*task)
+        }
+
+        fn read(&self, _: &Connection, task: usize) -> Result<usize> {
+            self.events.lock().unwrap().push(format!("read {task}"));
+            if task == 0 {
+                Err(AppError::SessionCache(rusqlite::Error::InvalidQuery))
+            } else {
+                Ok(task)
+            }
+        }
+
+        fn copy_failed(&self, copy: usize) {
+            self.events.lock().unwrap().push(format!("failed {copy}"));
+        }
+    }
+
+    /// One thread reads the tasks in order, so the hook runs before the
+    /// next task's read only when the failing task's thread calls it.
+    #[test]
+    fn failed_task_reports_its_copy_failed_before_the_next_task_reads() {
+        let base = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(base.path());
+        let references = copies.iter().collect::<Vec<_>>();
+        let events = std::sync::Arc::default();
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        let scanned = one_thread
+            .install(|| {
+                scan_copies(&references, |_, sessions| {
+                    Ok(FirstTaskFailingScan {
+                        sessions,
+                        events: std::sync::Arc::clone(&events),
+                    })
+                })
+            })
+            .unwrap();
+
+        assert_eq!(
+            events.lock().unwrap()[..3],
+            ["read 0", "failed 0", "read 1"],
+            "the scan calls `copy_failed` for the failing task's copy as that task ends"
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.starts_with("failed"))
+                .count(),
+            1,
+            "the scan calls `copy_failed` for the failing task's copy alone"
+        );
+        assert!(
+            matches!(scanned.copies[0], CopyOutcome::Failed(_)),
+            "the copy fails: {:?}",
+            scanned.copies[0]
+        );
     }
 
     /// The split of a table holding rows of `ids`.

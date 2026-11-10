@@ -1276,7 +1276,7 @@ impl AgentService {
 
     /// Runs `command`, writing `protocol agent-progress` records to stderr
     /// while it runs and, with `--perf-stats`, its `perf` records after.
-    /// Once a write of the command found the cache's drive short of space,
+    /// Once a write of the command found the cache's drive low on space,
     /// the command deletes the cache database and fails with the low-space
     /// error, whatever it returned, so its record reports the deletion's
     /// outcome.
@@ -2782,8 +2782,8 @@ enum HybridLexicalPass {
 /// Runs a hybrid search's semantic half first, since it reads no
 /// transcripts, then one lexical pass, so each transcript is read at most
 /// once. The semantic half's error is returned with the lexical result, not
-/// raised, except a cache write short of space: that stops the search, as
-/// every cache write short of space does.
+/// raised, except a cache write's finding the drive low on space: that stops
+/// the search, as it stops every command.
 fn run_hybrid_halves<S, L>(
     semantic: impl FnOnce() -> Result<S>,
     lexical: impl FnOnce(HybridLexicalPass) -> Result<L>,
@@ -2831,7 +2831,7 @@ fn run_agent_semantic_hits(
 impl AgentService {
     /// Stores `routes`, the route texts the semantic stage computed, when
     /// this command can take refresh ownership without waiting. Fails when
-    /// the drive is short of space. Any other
+    /// the drive is low on space. Any other
     /// skipped or failed write leaves the output as it is: the next semantic
     /// search computes those routes again. `--perf-stats` reports what was
     /// stored, or why nothing was.
@@ -3887,7 +3887,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_half_short_of_space_stops_search_before_lexical_pass() {
+    fn semantic_half_finding_drive_low_on_space_stops_search_before_lexical_pass() {
         let mut passes = Vec::new();
 
         let halves = run_hybrid_halves(
@@ -6005,11 +6005,11 @@ mod tests {
         );
     }
 
-    /// A route write on a drive short of space fails with the free space and
+    /// A route write on a drive low on space fails with the free space and
     /// sets the cache's low-space latch. The low-space deletion then empties
     /// the cache database.
     #[test]
-    fn semantic_route_write_short_of_space_fails_and_deletes_cache() {
+    fn semantic_route_write_finding_drive_low_on_space_fails_and_deletes_cache() {
         use crate::search::test_fixtures::cached_claude_sessions;
         let sessions = cached_claude_sessions(&[("routed", october_messages(&["zebrafish"]))]);
         let (_, routes) = routes_read(&sessions.rows);
@@ -6705,10 +6705,10 @@ mod tests {
         );
     }
 
-    /// A command whose cache write finds the drive short of space records
+    /// A command whose cache write finds the drive low on space records
     /// the cache database's deletion as its `cache-deletion` stage.
     #[test]
-    fn command_whose_cache_write_finds_drive_short_records_cache_deletion_stage() {
+    fn command_whose_cache_write_finds_drive_low_on_space_records_cache_deletion_stage() {
         let sessions = CachedClaudeSessions::new();
         sessions.append_to_the_changed_session();
         let service = AgentService::new(
@@ -7327,10 +7327,10 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
     }
 
-    /// A cache write that finds the drive short of space, at the first, the
+    /// A cache write that finds the drive low on space, at the first, the
     /// middle or the last write, stops the command before its next parse.
     #[test]
-    fn command_whose_cache_write_finds_drive_short_doesnt_parse_after_it() {
+    fn command_whose_cache_write_finds_drive_low_on_space_doesnt_parse_after_it() {
         use history::sqlite_cache::DriveRunningOut;
         let template = crate::tui::claude_home::ChangedSessionsTemplate::new();
         let checks = {
@@ -7366,11 +7366,11 @@ mod tests {
     }
 
     /// On a first fill of two agents' sessions, a write of the first agent's
-    /// load finds the drive short of space, and the command returns early at
+    /// load finds the drive low on space, and the command returns early at
     /// the second agent's. Its record reports the deletion's outcome:
     /// deferred while another rearview holds the database open.
     #[test]
-    fn command_returning_early_short_of_space_reports_deletion_another_rearview_defers() {
+    fn command_returning_early_on_drive_low_on_space_reports_deletion_another_rearview_defers() {
         use crate::tui::claude_home::{held_open_by_another_rearview, two_agents_first_fill};
         let (environment, cache, _homes) = two_agents_first_fill();
         let environment = environment
@@ -7397,9 +7397,10 @@ mod tests {
 
     /// A `within`, `read` or `outline` of an unknown session ID fails with
     /// the low-space record, not the reference's, once the first fill found
-    /// the drive short of space, and deletes the cache database.
+    /// the drive low on space, and deletes the cache database.
     #[test]
-    fn reference_command_whose_session_isnt_found_after_fill_short_of_space_deletes_cache() {
+    fn reference_command_whose_session_isnt_found_after_fill_finds_drive_low_on_space_deletes_cache()
+     {
         use crate::tui::claude_home::two_agents_first_fill;
         let unknown = "00000000-0000-4000-8000-000000000000";
         for arguments in [

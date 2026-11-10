@@ -639,7 +639,7 @@ impl RefreshToken {
             .expect("the low-space latch was just set"))
     }
 
-    /// True once a write of this owner's base found its drive short of
+    /// True once a write of this owner's base found its drive low on
     /// space.
     pub(crate) fn is_low_space(&self) -> bool {
         self.base.low_space().is_set()
@@ -1092,7 +1092,9 @@ pub(super) fn exclusive_transaction<'a>(
 }
 
 /// Commit `batch` with `owner`'s commit time. A failure revokes `owner`'s
-/// write permission.
+/// write permission, except a row left referencing a deleted one, which
+/// SQLite reports at the commit: dropping `batch` rolls that batch back
+/// alone, and the owner's later batches go on.
 pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
     owner.verify(&batch).inspect_err(|_| owner.revoke())?;
     let changed = batch
@@ -1105,11 +1107,54 @@ pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> 
         owner.replaced();
         return Err(AppError::SessionCacheRefreshLost);
     }
-    // Revoke before rollback releases the writer lock to queued writes.
-    batch
-        .execute_batch("COMMIT")
-        .inspect_err(|_| owner.revoke())?;
-    Ok(())
+    batch.execute_batch("COMMIT").map_err(|error| {
+        if is_foreign_key_failure(&error) {
+            return foreign_key_failure(&batch, error);
+        }
+        // Revoke before rollback releases the writer lock to queued writes.
+        owner.revoke();
+        error.into()
+    })
+}
+
+fn is_foreign_key_failure(error: &rusqlite::Error) -> bool {
+    error
+        .sqlite_error()
+        .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY)
+}
+
+/// `error`, a commit's foreign-key failure in `batch`, still open. Debug
+/// builds name the referencing and the referenced tables, which SQLite's
+/// own message leaves out.
+fn foreign_key_failure(batch: &WriteBatch<'_>, error: rusqlite::Error) -> AppError {
+    if cfg!(debug_assertions)
+        && let Ok(violations) = foreign_key_violations(batch)
+        && !violations.is_empty()
+    {
+        return rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some(format!("FOREIGN KEY constraint failed: {violations}")),
+        )
+        .into();
+    }
+    error.into()
+}
+
+/// Each table of `batch` holding a row whose reference is missing, with the
+/// table it references.
+fn foreign_key_violations(batch: &WriteBatch<'_>) -> rusqlite::Result<String> {
+    let mut statement = batch
+        .prepare("SELECT DISTINCT \"table\", parent FROM pragma_foreign_key_check ORDER BY 1, 2")?;
+    let violations = statement
+        .query_map([], |row| {
+            Ok(format!(
+                "a row of {} references a missing row of {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(violations.join("; "))
 }
 
 #[cfg(test)]

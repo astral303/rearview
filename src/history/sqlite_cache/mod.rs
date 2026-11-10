@@ -494,8 +494,8 @@ struct WindowRows<'a> {
 }
 
 impl<'a> WindowRows<'a> {
-    /// The rows of `update`, whose entries from the checkpoint on are
-    /// `entries` and whose rows changed in place hold `in_place_entries`.
+    /// The rows of `update`: `entries` are its entries from the checkpoint
+    /// on, and `in_place_entries` its rows changed in place.
     fn of(
         update: &'a window::WindowUpdate,
         entries: &'a TranscriptEntries,
@@ -561,6 +561,12 @@ impl CacheWriter {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        // Keep statement journals in memory. SQLite moves a journal past 64 KiB
+        // to a temporary file, and writes the transaction's later statement
+        // journals there too. Each update moving a session's entries keeps a
+        // journal as large as the rows it changes; removals don't keep one
+        // (see the `transcripts` table).
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
         // A write that compares a session with its stored rows prepares about
         // forty statements; keep each prepared across the sessions of a load.
         connection.set_prepared_statement_cache_capacity(64);
@@ -669,7 +675,7 @@ impl CacheWriter {
     /// page a reader still needs, without waiting for readers or writers.
     /// Call it once a batch of writes ends. Connections that write do not
     /// checkpoint automatically, and a long-running TUI's log grows until a
-    /// checkpoint runs. Skipped once a write found the drive short of space:
+    /// checkpoint runs. Skipped once a write found the drive low on space:
     /// the copy would grow the database the low-space deletion empties.
     pub(crate) fn checkpoint_after_writes(&self) -> Result<()> {
         if self.owner.is_low_space() {

@@ -249,9 +249,8 @@ mod tests {
     /// One session's read costs what the session holds, not what the cache
     /// holds, only while each statement reads through an index, without
     /// sorting: the read through `parts_by_session`. The sub-agent metadata
-    /// read uses the index of
-    /// those parts alone; a windowed read or scan reads a run of messages'
-    /// parts through `parts_by_message`.
+    /// read uses the index of those parts alone; a windowed read or scan
+    /// reads a run of messages' parts through `parts_by_message`.
     #[test]
     fn each_statement_on_one_sessions_parts_reads_through_an_index_without_sorting() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();

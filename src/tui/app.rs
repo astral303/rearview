@@ -365,10 +365,9 @@ impl App {
     }
 
     fn semantic_search_state(available: bool) -> SemanticSearchState {
-        SemanticSearchState {
-            available,
-            ..Default::default()
-        }
+        let mut state = SemanticSearchState::default();
+        state.available = available;
+        state
     }
 
     /// Create a new app with all conversations pre-loaded, reading
@@ -515,7 +514,7 @@ impl App {
         };
         let mut app = Self::new_single_file(file, tool_display, show_thinking, keys, environment);
         app.serve_direct_file_read();
-        app.complete_pending_view_refresh(VIEWPORT, test_waits::VIEWER_READ_LANDS);
+        test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
         app
     }
 

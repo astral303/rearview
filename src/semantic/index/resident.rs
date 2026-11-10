@@ -223,6 +223,22 @@ impl ResidentIndex {
         })
     }
 
+    /// True when a conversation of `scope`, a part of the last refresh's
+    /// corpus, holds a prepared chunk.
+    pub(super) fn has_chunks_in(&self, scope: &[SemanticIndexCandidate]) -> bool {
+        let scope = scope
+            .iter()
+            .map(|candidate| (candidate.index, candidate.source))
+            .collect::<HashSet<_>>();
+        self.corpus.iter().any(|(position, key)| {
+            scope.contains(position)
+                && self
+                    .conversations
+                    .get(key)
+                    .is_some_and(|conversation| !conversation.chunks.is_empty())
+        })
+    }
+
     /// The prepared chunks of `scope`'s conversations, in corpus order.
     pub(super) fn scoped(
         &self,
@@ -272,22 +288,4 @@ pub(super) struct PendingConversation {
     position: Position,
     conversation: Arc<Conversation>,
     chunk_count: usize,
-}
-
-/// True when any candidate in `full_corpus` builds at least one chunk.
-pub(super) fn corpus_has_chunks(
-    full_corpus: &[SemanticIndexCandidate],
-    chunk_config: ChunkConfig,
-) -> bool {
-    full_corpus.iter().any(|candidate| {
-        !build_chunks_with_sources(
-            std::iter::once((
-                candidate.index,
-                candidate.source,
-                candidate.conversation.as_ref(),
-            )),
-            chunk_config,
-        )
-        .is_empty()
-    })
 }

@@ -202,7 +202,7 @@ fn press_ctrl(app: &mut App, code: KeyCode) -> Option<Action> {
 /// grown since.
 const VIEWER_ACTIONS: &[AppAction] = &[
     ("the viewer reload", |app, _| {
-        app.complete_pending_view_refresh(VIEWPORT, super::test_waits::VIEWER_READ_LANDS);
+        super::test_waits::finish_pending_view_reload(app, VIEWPORT);
     }),
     ("a frame", |app, _| app.re_render_view(VIEWPORT)),
     ("a viewer Ctrl+R", |app, _| {
@@ -334,9 +334,16 @@ impl CachedEveryRecordSession {
     }
 
     /// An app over the session's row reading `environment`, the drawing
-    /// thread's, with the workspace toggle naming the home.
+    /// thread's, with the workspace toggle naming the home. The row reads the
+    /// case's copy of the cache: a row reading the template would have each
+    /// case's search worker hold the template open while another case copies
+    /// it, and the copy fails on Windows.
     fn app_listing(&self, environment: Environment) -> App {
-        let mut app = app_reading(vec![self.row.clone()], environment);
+        let mut row = self.row.clone();
+        row.cached_session = row
+            .cached_session
+            .map(|copy| copy.in_copied_cache(environment.cache_base().clone()));
+        let mut app = app_reading(vec![row], environment);
         app.set_clipboard_writer_for_test(|_| Ok(ClipboardDestination::System));
         app.workspace = Some(workspace_at_home(self.home.path()));
         app
@@ -448,6 +455,11 @@ fn no_app_action_parses_writes_or_waits_beside_another_rearviews_activity() {
         finish_a_refresh_of_the_open_session(&mut app, &session.row.path);
         app
     };
+    let template_connections = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&template_connections);
+    let _template_hooks = test_hooks::on_every_connection(session.template.path(), move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
     std::thread::scope(|scope| {
         for activity in OTHER_REARVIEWS {
             scope.spawn(move || {
@@ -491,6 +503,11 @@ fn no_app_action_parses_writes_or_waits_beside_another_rearviews_activity() {
             });
         }
     });
+    assert_eq!(
+        template_connections.load(Ordering::SeqCst),
+        0,
+        "no case connects to the template the cases copy"
+    );
 }
 
 /// Behind another rearview's commit, the viewer's reload and opening a
@@ -501,7 +518,7 @@ fn no_app_action_parses_writes_or_waits_beside_another_rearviews_activity() {
 fn every_providers_session_opens_and_reloads_behind_another_rearviews_commit() {
     const READS: &[AppAction] = &[
         ("the viewer reload", |app, _| {
-            app.complete_pending_view_refresh(VIEWPORT, super::test_waits::VIEWER_READ_LANDS);
+            super::test_waits::finish_pending_view_reload(app, VIEWPORT);
         }),
         ("closing the viewer", |app, _| app.exit_view_mode()),
         ("opening the session", |app, _| app.enter_view_mode(80)),

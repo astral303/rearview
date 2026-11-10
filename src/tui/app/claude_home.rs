@@ -387,7 +387,7 @@ pub(crate) fn text_of_file_opened_directly(typed: &Path, environment: &Environme
     );
     app.check_view_resize(80, VIEWPORT);
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(VIEWPORT, super::test_waits::VIEWER_READ_LANDS);
+    super::test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
     viewer_text(&app)
 }
 
@@ -424,7 +424,7 @@ pub(crate) fn viewer_lacks_copy(app: &App) -> bool {
 /// worker runs it, then the viewer's read of what the refresh listed.
 pub(crate) fn recover_viewer(app: &mut App) {
     super::refresh_tests::serve_session_refresh(app);
-    assert!(app.complete_pending_view_refresh(VIEWPORT, super::test_waits::VIEWER_READ_LANDS));
+    assert!(super::test_waits::finish_pending_view_reload(app, VIEWPORT));
 }
 
 /// A list `Ctrl+R` of `app` under `window`, run as the background worker
@@ -525,6 +525,10 @@ impl TemplateCache {
         Self(cache)
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+
     /// A new session cache directory holding a copy of every file here.
     pub(crate) fn copy(&self) -> tempfile::TempDir {
         let copy = tempfile::tempdir().unwrap();
@@ -541,7 +545,8 @@ fn copy_directory(from: &Path, to: &Path) {
             std::fs::create_dir(&target).unwrap();
             copy_directory(&entry.path(), &target);
         } else {
-            std::fs::copy(entry.path(), &target).unwrap();
+            std::fs::copy(entry.path(), &target)
+                .unwrap_or_else(|error| panic!("copy {}: {error}", entry.path().display()));
         }
     }
 }

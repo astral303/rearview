@@ -140,7 +140,7 @@ impl TaskSupervisor {
             let operation = operation(&environment);
             let changed = change.make(&operation);
             // Ignore the finish: only a cache write that found the drive
-            // short of space fails it, and a rename or delete writes none.
+            // low on space fails it, and a rename or delete writes none.
             let _ = operation.finish();
             let _ = outcome.send(changed);
         }));

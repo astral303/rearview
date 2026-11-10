@@ -1887,7 +1887,7 @@ fn file_opened_by_non_canonical_path_shows_and_copies_path_as_typed() {
         environment,
     );
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(20, super::test_waits::VIEWER_READ_LANDS);
+    super::test_waits::finish_pending_view_reload(&mut app, 20);
     app.set_clipboard_writer_for_test(record_copied_text);
 
     press(&mut app, KeyCode::Char('p'));
@@ -1935,7 +1935,7 @@ fn file_opened_directly_canonicalises_typed_path_once_and_its_root() {
     );
 
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(20, super::test_waits::VIEWER_READ_LANDS);
+    super::test_waits::finish_pending_view_reload(&mut app, 20);
 
     let AppMode::View(state) = app.app_mode() else {
         unreachable!()

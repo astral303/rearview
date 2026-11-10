@@ -82,7 +82,7 @@ impl Coordinator {
     /// - An ownership with its turn held by a write batch or a free-space
     ///   check is released in one attempt, without waiting: a write batch
     ///   holds the writer lock until it ends.
-    /// - An ownership left by a failed release stays this rearview's until its
+    /// - After a failed release, the ownership stays this rearview's until its
     ///   operation ends or another rearview takes it over.
     pub(crate) fn shutdown(&self, busy_lock_wait: Duration) {
         let Ok(base) = self.base.canonical() else {

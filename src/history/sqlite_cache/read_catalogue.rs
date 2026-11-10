@@ -418,11 +418,11 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    /// A Claude session holding two user messages that the numbering numbers
-    /// but that show no preview, so neither holds a semantic turn: one whose
-    /// later text block holds `<local-command-stdout>`, and a task report
-    /// with an empty summary and a result. A question and two answers around
-    /// them hold turns.
+    /// A Claude session holding a question, two answers, and between them two
+    /// numbered user messages without a semantic turn, as they don't show a
+    /// preview:
+    /// - a message with `<local-command-stdout>` in its later text block;
+    /// - a task report with an empty summary and a result.
     fn claude_session_with_unshown_user_messages(home: &Path) -> AgentSession {
         let path = home
             .join("-tmp-claude-unshown-messages")

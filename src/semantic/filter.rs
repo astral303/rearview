@@ -183,10 +183,11 @@ fn split_semantic_blocks(text: &str) -> Vec<&str> {
     blocks
 }
 
+/// Unicode's Box Drawing block. Every [`ARTIFACT_CHARS`] entry lies in it.
+const BOX_DRAWING: std::ops::RangeInclusive<char> = '\u{2500}'..='\u{257f}';
+
 fn is_artifact_char(ch: char) -> bool {
-    // Skip the list for a character outside the Box Drawing block, which
-    // holds every entry.
-    ('\u{2500}'..='\u{257f}').contains(&ch) && ARTIFACT_CHARS.contains(&ch)
+    BOX_DRAWING.contains(&ch) && ARTIFACT_CHARS.contains(&ch)
 }
 
 fn is_low_value_turn(turn: &str) -> bool {
@@ -254,6 +255,16 @@ mod reference;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_listed_artifact_char_lies_in_box_drawing() {
+        for ch in ARTIFACT_CHARS {
+            assert!(
+                BOX_DRAWING.contains(ch),
+                "{ch:?} lies in the Box Drawing block, so `is_artifact_char` finds it"
+            );
+        }
+    }
 
     /// Turns that reach each of `filter_turn`'s fast paths, and the branch
     /// beside it.

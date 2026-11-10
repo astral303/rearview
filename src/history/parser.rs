@@ -1249,8 +1249,9 @@ struct UserTurnText {
     preview: String,
     /// The search text of each part, one entry per part.
     search_parts: Vec<String>,
-    /// The turn's own text, which [`semantic_turn`] embeds.
-    text: String,
+    /// The text [`semantic_turn`] embeds: a task report's summary and body,
+    /// any other turn's own text.
+    semantic_text: String,
     /// A slash command as `agent read` shows it, `/name args`.
     skill_preview: Option<String>,
 }
@@ -1312,49 +1313,79 @@ pub(crate) enum TurnSource {
     Metadata,
 }
 
-/// The semantic turn of an entry whose text is `text`: a user message's
-/// string or its text blocks joined as [`extract_text_from_blocks`] joins
-/// them, an assistant reply's text blocks joined, or a metadata row's text,
-/// each with its terminal codes. A user's task report embeds as its summary
-/// and body. `None` when [`filter_turn`] keeps nothing.
-pub(crate) fn semantic_turn(source: TurnSource, text: &str) -> Option<String> {
+/// The semantic turn of an entry whose text is `text`, with its terminal
+/// codes:
+/// - a user message's [`UserTurnText::semantic_text`]
+/// - an assistant reply's text blocks joined
+/// - a metadata row's text
+///
+/// `None` when [`filter_turn`] keeps nothing. Bump
+/// [`SEMANTIC_TURN_VERSION`](crate::semantic::filter::SEMANTIC_TURN_VERSION)
+/// when what this returns changes.
+fn semantic_turn(source: TurnSource, text: &str) -> Option<String> {
     match source {
-        TurnSource::User => match parse_task_report(text) {
-            Some(report) => filter_turn(SemanticTurnRole::User, &report.search_text()),
-            None => filter_turn(SemanticTurnRole::User, text),
-        },
+        TurnSource::User => filter_turn(SemanticTurnRole::User, text),
         TurnSource::Assistant => filter_turn(SemanticTurnRole::Assistant, text),
         TurnSource::Metadata => filter_turn(SemanticTurnRole::User, text),
     }
 }
 
 /// The semantic turn of `entry`, counted only once its message is numbered:
-/// a user message's text when the message shows a preview, an assistant
-/// reply's text blocks joined, or a metadata row's text. The parse and the
-/// session cache take each entry's turn from here. `None` for any other
-/// entry, and when [`filter_turn`] keeps nothing.
+/// - a user message's [`UserTurnText::semantic_text`], when the message
+///   shows a preview
+/// - an assistant reply's text blocks joined
+/// - a metadata row's text
+///
+/// `None` for any other entry, and when [`filter_turn`] keeps nothing. The
+/// session cache reads each entry's turn from here; the parse calls
+/// [`shown_user_turn`] and [`assistant_semantic_turn`] on the texts it has
+/// extracted. Bump
+/// [`SEMANTIC_TURN_VERSION`](crate::semantic::filter::SEMANTIC_TURN_VERSION)
+/// when the entries with a turn change.
 pub(crate) fn entry_semantic_turn(entry: &LogEntry) -> Option<String> {
     match entry {
         LogEntry::User { message, .. } => {
             let UserTurnText {
                 preview,
-                text,
+                semantic_text,
                 skill_preview,
                 ..
             } = user_turn_text_of(extract_text_from_user(&message.content), Vec::new);
-            shown_user_preview(preview, skill_preview)?;
-            semantic_turn(TurnSource::User, &text)
+            shown_user_turn(preview, skill_preview, &semantic_text)?.semantic_turn
         }
         LogEntry::Assistant { message, .. } => {
-            let text = extract_text_from_assistant(message);
-            if text.is_empty() {
-                return None;
-            }
-            semantic_turn(TurnSource::Assistant, &text)
+            assistant_semantic_turn(&extract_text_from_assistant(message))
         }
         LogEntry::PiMetadata { text, .. } => semantic_turn(TurnSource::Metadata, text),
         _ => None,
     }
+}
+
+/// A user message's shown preview and its semantic turn.
+struct ShownUserTurn {
+    preview: String,
+    semantic_turn: Option<String>,
+}
+
+/// The preview of a user message whose [`UserTurnText::semantic_text`] is
+/// `semantic_text`, with its semantic turn; `None` when the message doesn't
+/// show a preview.
+fn shown_user_turn(
+    preview: String,
+    skill_preview: Option<String>,
+    semantic_text: &str,
+) -> Option<ShownUserTurn> {
+    Some(ShownUserTurn {
+        preview: shown_user_preview(preview, skill_preview)?,
+        semantic_turn: semantic_turn(TurnSource::User, semantic_text),
+    })
+}
+
+fn assistant_semantic_turn(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    semantic_turn(TurnSource::Assistant, text)
 }
 
 /// The preview a user message shows: its skill's, else its own unless that
@@ -1389,12 +1420,12 @@ fn user_blocks_text(blocks: &[ContentBlock]) -> UserTurnText {
 /// [`user_turn_text`] for a turn whose text is `text`; `search_texts` gives
 /// the search text of each of its parts.
 fn user_turn_text_of(text: String, search_texts: impl FnOnce() -> Vec<String>) -> UserTurnText {
-    let (preview, search_parts) = match parse_task_report(&text) {
+    let (preview, search_parts, semantic_text) = match parse_task_report(&text) {
         Some(report) => {
             let search = report.search_text();
-            (report.summary, vec![search])
+            (report.summary, vec![search.clone()], search)
         }
-        None => (text.clone(), search_texts()),
+        None => (text.clone(), search_texts(), text),
     };
     let skill_preview = extract_skill_preview(&preview);
     UserTurnText {
@@ -1402,7 +1433,7 @@ fn user_turn_text_of(text: String, search_texts: impl FnOnce() -> Vec<String>) -
             .clone()
             .map_or(search_parts, |skill_preview| vec![skill_preview]),
         preview,
-        text,
+        semantic_text,
         skill_preview,
     }
 }
@@ -1505,8 +1536,8 @@ impl ConversationBuilder {
                 let UserTurnText {
                     preview: preview_text,
                     search_parts,
+                    semantic_text,
                     skill_preview,
-                    ..
                 } = user_turn_text(&message.content);
 
                 if preview_text.is_empty() && search_parts.iter().all(String::is_empty) {
@@ -1518,18 +1549,19 @@ impl ConversationBuilder {
                 }
 
                 self.push_turn_search_parts(ordinal, search_parts);
-                let Some(shown_preview) = shown_user_preview(preview_text, skill_preview) else {
-                    return;
-                };
                 let Some(numbered) = numbered else {
                     return;
                 };
-                if let Some(turn) = entry_semantic_turn(entry) {
+                let Some(shown) = shown_user_turn(preview_text, skill_preview, &semantic_text)
+                else {
+                    return;
+                };
+                if let Some(turn) = shown.semantic_turn {
                     self.semantic_turns.push(turn);
                     self.semantic_turn_ranges
                         .push(MessageRange::single(numbered.ordinal));
                 }
-                self.fold.add_user_preview(shown_preview);
+                self.fold.add_user_preview(shown.preview);
             }
             LogEntry::Assistant { message, .. } => {
                 if let Some(model) = &message.model {
@@ -1556,7 +1588,7 @@ impl ConversationBuilder {
                     return;
                 }
                 let message_range = MessageRange::single(numbered.ordinal);
-                let turn = entry_semantic_turn(entry);
+                let turn = assistant_semantic_turn(&preview_text);
                 match message.id.as_deref() {
                     Some(_) => {
                         if let Some(turn) = turn {

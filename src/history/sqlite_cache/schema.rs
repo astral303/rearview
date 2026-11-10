@@ -5,7 +5,7 @@ use crate::semantic::filter::SEMANTIC_TURN_VERSION;
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 39;
+pub(super) const SCHEMA_VERSION: u32 = 40;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The `meta` key holding the [`SEMANTIC_TURN_VERSION`] of the stored
 /// `semantic_turns`. A database holding another is emptied and rebuilt, as
@@ -213,7 +213,11 @@ CREATE TABLE IF NOT EXISTS parse_errors (
 ) WITHOUT ROWID;
 
 -- The transcripts other than the session's own that entries were read
--- from: sub-agents', and earlier transcripts a session continues.
+-- from: sub-agents', and earlier transcripts a session continues. The
+-- references to a transcript (`threads.transcript`,
+-- `entries.record_transcript`, `entries.child`) are checked at the commit:
+-- checked at each statement, they make SQLite keep a statement journal, as
+-- large as the removal, for each statement deleting a transcript.
 CREATE TABLE IF NOT EXISTS transcripts (
     id INTEGER PRIMARY KEY,
     session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
@@ -230,7 +234,7 @@ CREATE TABLE IF NOT EXISTS threads (
     id INTEGER PRIMARY KEY,
     session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
     number INTEGER NOT NULL,
-    transcript INTEGER REFERENCES transcripts (id),
+    transcript INTEGER REFERENCES transcripts (id) DEFERRABLE INITIALLY DEFERRED,
     label TEXT,
     nickname TEXT,
     role TEXT,
@@ -292,7 +296,7 @@ CREATE TABLE IF NOT EXISTS entries (
     contributes INTEGER NOT NULL CHECK (contributes IN (0, 1)),
     position INTEGER NOT NULL,
     sequence INTEGER NOT NULL,
-    record_transcript INTEGER REFERENCES transcripts (id),
+    record_transcript INTEGER REFERENCES transcripts (id) DEFERRABLE INITIALLY DEFERRED,
     record_line INTEGER NOT NULL,
     kind TEXT NOT NULL,
     -- The time the entry carries: its own, or a sub-agent turn's.
@@ -324,7 +328,7 @@ CREATE TABLE IF NOT EXISTS entries (
     splice_key TEXT,
     -- The sub-agent transcript a spliced turn came from; null for the
     -- session's own entries.
-    child INTEGER REFERENCES transcripts (id),
+    child INTEGER REFERENCES transcripts (id) DEFERRABLE INITIALLY DEFERRED,
     -- A hash of the columns the row stores besides its place in the session
     -- and its message (`message`, `contributes`, `position`, `sequence`,
     -- `record_transcript`, `child`). A changed entry keeps its columns when
@@ -345,10 +349,11 @@ CREATE INDEX IF NOT EXISTS entries_by_time ON entries (timestamp_ms)
 
 -- Each user, assistant and metadata entry's semantic turn, as
 -- `entry_semantic_turn` computes it from the entry as written, terminal
--- codes included. Entries without a semantic turn have no row. The semantic
--- stage reads a session's turns from here alone. A write moving an entry moves its turn in the same function;
--- the key is checked at the commit, as the two rows move in separate
--- statements. A deleted entry deletes its turn.
+-- codes included. An entry without a semantic turn doesn't have a row. The
+-- semantic stage reads a session's turns from here alone. A write moving an
+-- entry moves its turn in the same function; the key is checked at the
+-- commit, as the two rows move in separate statements. A deleted entry
+-- deletes its turn.
 CREATE TABLE IF NOT EXISTS semantic_turns (
     session INTEGER NOT NULL,
     sequence INTEGER NOT NULL,

@@ -325,7 +325,7 @@ impl Runtime {
     /// The action the TUI exited with, `exit`, and the rows the list holds,
     /// once the supervisor's drop waited for the free-space checks begun
     /// before the exit. Fails with the low-space error once a write found
-    /// the cache's drive short of space, whatever the exit: rearview then
+    /// the cache's drive low on space, whatever the exit: rearview then
     /// deletes the cache and stops (see [`crate::finish_command`]).
     pub(crate) fn finish(self, exit: Result<Action>) -> Result<(Action, Vec<Conversation>)> {
         let Self {
@@ -366,7 +366,7 @@ impl Runtime {
     }
 
     /// Hand a finished refresh to the app. Fails when the refresh found the
-    /// cache's drive short of space: rearview stops.
+    /// cache's drive low on space: rearview stops.
     fn receive_refresh(&mut self) -> Result<()> {
         let Some(outcome) = self.supervisor.finished_refresh() else {
             return Ok(());

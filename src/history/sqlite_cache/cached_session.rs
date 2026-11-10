@@ -256,6 +256,12 @@ impl CachedSession {
         Self { generation, ..self }
     }
 
+    /// This session, reading the cache under `base`, a file copy of its own.
+    #[cfg(test)]
+    pub(crate) fn in_copied_cache(self, base: CacheBase) -> Self {
+        Self { base, ..self }
+    }
+
     pub(crate) fn address(&self) -> &SessionAddress {
         &self.address
     }

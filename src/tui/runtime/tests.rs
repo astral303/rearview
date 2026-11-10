@@ -23,8 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::Instant;
 
-/// The longest a test ticks while the load or a refresh runs.
-const BACKGROUND_WORK_LIMIT: Duration = Duration::from_secs(10);
+/// The longest a test ticks while the load or a refresh runs before it
+/// fails: a watchdog for a hang, not a limit on how fast the TUI responds.
+const BACKGROUND_WORK_LIMIT: Duration = Duration::from_secs(60);
 
 /// The TUI launched over `home`'s sessions with the test's own session cache:
 /// the list, filled by the streaming load.
@@ -227,7 +228,7 @@ fn tick_until_error(runtime: &mut Runtime, terminal: &mut Terminal<TestBackend>)
 
 /// Finish the command whose TUI over the session cache `base` stopped with
 /// `error`, as rearview does: delete the cache database when a write found
-/// its drive short of space. The stderr it writes.
+/// its drive low on space. The stderr it writes.
 fn finish_tui_command(error: AppError, base: &crate::history::CacheBase) -> String {
     let mut report = Vec::new();
     let (failed, written) = crate::finish_command(Err(error), Some(base), &mut report);
@@ -270,12 +271,12 @@ fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space(
 }
 
 /// On a first fill of two agents' sessions, a write of the first agent's
-/// load finds the drive short of space, and the launch returns early at the
+/// load finds the drive low on space, and the launch returns early at the
 /// second agent's. Once the TUI stops, the report runs the deletion and
 /// prints its outcome: deferred while another rearview holds the database
 /// open.
 #[test]
-fn launch_returning_early_short_of_space_reports_deletion_another_rearview_defers() {
+fn launch_returning_early_on_drive_low_on_space_reports_deletion_another_rearview_defers() {
     let (environment, cache, _homes) = two_agents_first_fill();
     let environment = environment
         .with_disk_space(Arc::new(
@@ -301,11 +302,11 @@ fn launch_returning_early_short_of_space_reports_deletion_another_rearview_defer
 }
 
 /// The user quits while the launch's first free-space check runs on a drive
-/// short of space. The TUI exits without the error; once the free-space
+/// low on space. The TUI exits without the error; once the free-space
 /// check ends, rearview reports the low-space message and deletes the cache
 /// database.
 #[test]
-fn quit_while_launch_finds_drive_short_reports_low_space_once_check_ends() {
+fn quit_while_launch_finds_drive_low_on_space_reports_low_space_once_check_ends() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
     let cache = tempfile::tempdir().unwrap();
@@ -397,11 +398,11 @@ impl crate::history::sqlite_cache::DiskSpace for DriveRunningOutOnCall {
 }
 
 /// The user resumes a listed session while a list refresh's cache write is
-/// finding the drive short of space. Once the TUI stops, rearview doesn't
+/// finding the drive low on space. Once the TUI stops, rearview doesn't
 /// launch the agent: it reports the low-space message and deletes the cache
 /// database.
 #[test]
-fn resume_while_refresh_finds_drive_short_reports_low_space_without_launching_agent() {
+fn resume_while_refresh_finds_drive_low_on_space_reports_low_space_without_launching_agent() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
     let cache = tempfile::tempdir().unwrap();

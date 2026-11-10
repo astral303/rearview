@@ -24,6 +24,8 @@ where
 {
     let mut chunks = Vec::new();
     for (conversation_index, source, conversation) in conversations {
+        #[cfg(test)]
+        CONVERSATIONS_CHUNKED.with(|chunked| chunked.set(chunked.get() + 1));
         let semantic_turns = conversation
             .semantic_turns
             .iter()
@@ -55,6 +57,25 @@ where
         }
     }
     chunks
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The conversations [`build_chunks_with_sources`] built chunks of on
+    /// this thread.
+    pub(crate) static CONVERSATIONS_CHUNKED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// True when [`build_chunks_with_sources`] builds at least one chunk of
+/// `conversation`: one of its semantic turns with a message range holds text
+/// other than whitespace.
+pub fn builds_any_chunk(conversation: &Conversation) -> bool {
+    conversation
+        .semantic_turns
+        .iter()
+        .zip(&conversation.semantic_turn_ranges)
+        .any(|(text, _)| !text.trim().is_empty())
 }
 
 #[derive(Clone, Copy)]
@@ -341,6 +362,48 @@ mod tests {
         );
 
         assert!(build_chunks(&[&conversation], ChunkConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn builds_any_chunk_agrees_with_the_chunks_built() {
+        let mut without_range =
+            test_conversation("/projects/project-a/session-1.jsonl", Vec::new());
+        without_range.semantic_turns = vec!["text past the ranges".to_string()];
+        let conversations = [
+            test_conversation("/projects/project-a/session-1.jsonl", Vec::new()),
+            test_conversation(
+                "/projects/project-a/session-1.jsonl",
+                vec![
+                    "".to_string(),
+                    "   ".to_string(),
+                    "\u{2003}\n\t".to_string(),
+                ],
+            ),
+            test_conversation(
+                "/projects/project-a/session-1.jsonl",
+                vec!["  ".to_string(), " text ".to_string()],
+            ),
+            without_range,
+        ];
+
+        for conversation in &conversations {
+            for config in [
+                ChunkConfig::default(),
+                ChunkConfig {
+                    target_chars: 2,
+                    overlap_chars: 1,
+                    context_turns: 1,
+                },
+            ] {
+                assert_eq!(
+                    builds_any_chunk(conversation),
+                    !build_chunks(&[conversation], config).is_empty(),
+                    "turns {:?}, ranges {:?}",
+                    conversation.semantic_turns,
+                    conversation.semantic_turn_ranges
+                );
+            }
+        }
     }
 
     #[test]

@@ -423,8 +423,6 @@ pub(crate) struct WindowUpdate {
 }
 
 impl WindowUpdate {
-    /// Each row changed in place's record and entry, in the shape the rows
-    /// of a session's entries are built from.
     pub(super) fn in_place_entries(&self) -> Vec<(RecordLine, LogEntry)> {
         self.in_place
             .iter()

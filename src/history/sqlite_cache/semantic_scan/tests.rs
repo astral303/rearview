@@ -88,7 +88,7 @@ fn failed_copy_drops_its_waiting_turns_and_doesnt_add_later_reads() {
 
     assert!(
         copy.waiting.is_empty() && copy.turns.is_empty(),
-        "the failed copy holds no turns"
+        "the failed copy doesn't hold any turns"
     );
 }
 

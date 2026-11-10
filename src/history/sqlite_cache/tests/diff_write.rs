@@ -589,7 +589,7 @@ fn later_write_of_session_with_files_under_two_roots_matches_fresh_write() {
     assert_matches_fresh_write(&cache, &fixture, &record);
 }
 
-/// The part rows `write` builds, one set per entry each time.
+/// The number of times `write` builds an entry's part rows.
 fn part_row_builds(write: impl FnOnce()) -> usize {
     use crate::history::sqlite_cache::entries::PART_ROW_BUILDS;
     PART_ROW_BUILDS.with(|builds| builds.set(0));
@@ -597,8 +597,8 @@ fn part_row_builds(write: impl FnOnce()) -> usize {
     PART_ROW_BUILDS.with(std::cell::Cell::get)
 }
 
-/// The entry rows `cache` stores.
-fn stored_entries(cache: &CacheWriter) -> usize {
+/// The number of entry rows `cache` stores.
+fn stored_entry_count(cache: &CacheWriter) -> usize {
     cache
         .connection
         .query_row("SELECT COUNT(*) FROM entries", [], |row| {
@@ -622,7 +622,7 @@ fn parse_equal_to_stored_session_writes_no_entry_rows_for_every_agent() {
 
         assert_eq!(
             builds,
-            stored_entries(&cache),
+            stored_entry_count(&cache),
             "{}: comparing unchanged entries builds each entry's part rows once, for its \
              digests",
             fixture.label()
@@ -1141,7 +1141,7 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
         );
         assert_eq!(
             builds,
-            stored_entries(&cache) + 1,
+            stored_entry_count(&cache) + 1,
             "{}: the write builds each entry's part rows for its digests, and the changed \
              entry's again to write them",
             fixture.label()
@@ -1170,10 +1170,10 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
     }
 }
 
-/// Asserts that the write of `fixture`'s record over `before`, whose rows
-/// `writes` counts, wrote the semantic turn of the entry at `changed` once
-/// when the turn changed and not otherwise, and stored its new turn. Returns
-/// whether the turn changed.
+/// Asserts that the write of `fixture`'s record over `before` wrote the
+/// semantic turn of the entry at `changed` once when the turn changed and
+/// not otherwise, and stored its new turn; `writes` counts the write's rows.
+/// Returns whether the turn changed.
 fn assert_changed_turn_written(
     cache: &CacheWriter,
     writes: &BTreeMap<(String, String), i64>,

@@ -108,7 +108,7 @@ impl ProviderHistory {
     /// changed session whose cached row `left_out` holds keeps that row
     /// unread.
     ///
-    /// Fails when a write finds the cache's drive short of space; any other
+    /// Fails when a write finds the cache's drive low on space; any other
     /// provider failure is the provider's.
     fn load(
         environment: &Environment,
@@ -877,11 +877,11 @@ mod tests {
         received.try_iter().last().expect("the launch reports")
     }
 
-    /// A cache write that finds the drive short of space, at the first, the
+    /// A cache write that finds the drive low on space, at the first, the
     /// middle or the last write, stops the TUI's launch before its next
     /// parse.
     #[test]
-    fn launch_whose_cache_write_finds_drive_short_doesnt_parse_after_it() {
+    fn launch_whose_cache_write_finds_drive_low_on_space_doesnt_parse_after_it() {
         use crate::history::sqlite_cache::DriveRunningOut;
         use crate::tui::claude_home::ChangedSessionsTemplate;
         let template = ChangedSessionsTemplate::new();

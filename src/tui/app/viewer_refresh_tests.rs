@@ -4,7 +4,7 @@
 use super::claude_home::{ClaudeHome, app_reading, serve_list_refresh};
 use super::commit_failure_tests::launched_app;
 use super::refresh_tests::{refresh_found, serve_session_refresh};
-use super::test_waits::{ConnectionGate, VIEWER_READ_LANDS};
+use super::test_waits::ConnectionGate;
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
@@ -103,7 +103,7 @@ fn viewer_on_clock(home: &ClaudeHome, clock: Arc<TestClock>) -> App {
 /// the refreshed copy.
 fn press_refresh(app: &mut App) {
     request_refresh(app);
-    assert!(app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS));
+    assert!(test_waits::finish_pending_view_reload(app, VIEWPORT));
 }
 
 /// `Ctrl+R`, and the session refresh it asks for, run as the background
@@ -159,9 +159,9 @@ fn refresh_reads_on_next_frame_and_second_press_adds_no_read() {
         !app.is_session_refresh_requested(),
         "the second press doesn't ask for a second refresh"
     );
-    assert!(app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS));
+    assert!(test_waits::finish_pending_view_reload(&mut app, VIEWPORT));
     assert!(view_text(&app).contains("message 4"));
-    assert!(!app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS));
+    assert!(!test_waits::finish_pending_view_reload(&mut app, VIEWPORT));
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn reload_keeps_old_copy_under_updating_until_its_read_lands() {
     app.handle_key(KeyCode::Char('j'), KeyModifiers::empty(), VIEWPORT);
     let scrolled = view(&app).scroll_offset;
     gate.open();
-    let landed = app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+    let landed = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
 
     assert!(
         waits_for_the_read && old_copy_on_screen,
@@ -221,10 +221,10 @@ fn refresh_finishing_during_gated_read_queues_one_read_after_it() {
     request_refresh(&mut app);
     let waits_for_the_first_read = !app.complete_pending_view_refresh(VIEWPORT, Duration::ZERO);
     gate.open();
-    let first_landed = app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+    let first_landed = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
     let reads_again = app.is_reading_open_session();
     let status_between = app.open_session_status();
-    let second_landed = app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+    let second_landed = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
 
     assert!(
         waits_for_the_first_read,
@@ -245,7 +245,7 @@ fn refresh_finishing_during_gated_read_queues_one_read_after_it() {
         "the newer refresh's read shows the newest messages"
     );
     assert!(
-        !app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS),
+        !test_waits::finish_pending_view_reload(&mut app, VIEWPORT),
         "no further read follows"
     );
 }
@@ -280,7 +280,7 @@ fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
         "the earlier session's refresh keeps the open session"
     );
     assert!(
-        !app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS),
+        !test_waits::finish_pending_view_reload(&mut app, VIEWPORT),
         "the earlier session's refresh doesn't reload the next session's view"
     );
 }
@@ -298,7 +298,7 @@ fn leaving_viewer_with_q_drops_its_pending_reload() {
 
     assert!(matches!(app.app_mode(), AppMode::List));
     assert!(
-        !app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS),
+        !test_waits::finish_pending_view_reload(&mut app, VIEWPORT),
         "a closed viewer doesn't draw a reload"
     );
 }
@@ -478,7 +478,7 @@ fn message_copy_during_read_waits_for_it_though_newer_refresh_fails() {
     request_refresh(&mut app);
     let copied_during_read = COPIED.with(|copied| copied.borrow().clone());
     gate.open();
-    let landed = app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+    let landed = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
     // The read found its copy older than the file and asked for a refresh,
     // which fails as the newer one did.
     serve_session_refresh(&mut app);
@@ -634,7 +634,7 @@ fn changed_session_under_unreadable_directory_reports_failed_refresh_once() {
             serve_session_refresh(&mut app);
             refreshes += 1;
         }
-        app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+        test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
     }
 
     assert_eq!(
@@ -881,7 +881,7 @@ fn copy_out_of_date_again_on_next_frame_requests_another_refresh() {
     request_refresh(&mut app);
     write_messages(&path, &numbered(0..7));
 
-    assert!(app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS));
+    assert!(test_waits::finish_pending_view_reload(&mut app, VIEWPORT));
 
     assert!(
         app.is_open_session_updating(),
@@ -895,7 +895,7 @@ fn copy_out_of_date_again_on_next_frame_requests_another_refresh() {
 fn press_refresh_outside_every_root(app: &mut App) {
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+    test_waits::finish_pending_view_reload(app, VIEWPORT);
 }
 
 /// The file at `path` opened directly in an environment reading no
@@ -1029,7 +1029,7 @@ fn opened_directly_as(typed: &Path, environment: Environment) -> App {
         environment,
     );
     app.serve_direct_file_read();
-    app.complete_pending_view_refresh(VIEWPORT, VIEWER_READ_LANDS);
+    test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
     app.check_view_resize(80, VIEWPORT);
     app
 }

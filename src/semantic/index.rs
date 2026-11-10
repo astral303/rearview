@@ -7,6 +7,7 @@ use crate::semantic::cache::{
 };
 #[cfg(test)]
 use crate::semantic::chunk::build_chunks_with_sources;
+use crate::semantic::chunk::builds_any_chunk;
 use crate::semantic::embed::{SemanticEmbedder, embed_valid_query};
 use crate::semantic::filter::matches_every_literal;
 use crate::semantic::rank::rank_prepared;
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 mod resident;
-use resident::{CorpusSignature, ResidentIndex, corpus_has_chunks};
+use resident::{CorpusSignature, ResidentIndex};
 
 #[derive(Clone)]
 pub struct SemanticIndexCandidate {
@@ -86,6 +87,10 @@ impl SemanticIndexState {
         self.clock.clone()
     }
 
+    /// True when `request` has chunks to work on: a prewarm in the full
+    /// corpus, a ranking request in its scope. Answers from the resident
+    /// index when it was refreshed for the request's corpus, and otherwise
+    /// from the candidates' semantic turns, without building their chunks.
     pub fn has_chunks(
         &self,
         request: &SemanticIndexRequest<'_>,
@@ -94,12 +99,21 @@ impl SemanticIndexState {
         if cancellation.is_cancelled() {
             return Err(AppError::SemanticSearchCancelled);
         }
+        let candidates = if request.prewarm {
+            request.full_corpus
+        } else {
+            request.scope
+        };
         if self.signature_matches(request) {
-            return Ok(self.resident.chunk_count() > 0);
+            return Ok(self.resident.has_chunks_in(candidates));
         }
-        Ok(corpus_has_chunks(request.full_corpus, self.chunk_config))
+        Ok(any_builds_a_chunk(candidates))
     }
 
+    /// Records that `request`'s full corpus doesn't hold any chunks, once
+    /// [`Self::has_chunks`] didn't find any for it. Keeps the index when a
+    /// ranking request's scope doesn't hold any but the rest of the corpus
+    /// does.
     pub fn clear_empty(
         &mut self,
         request: &SemanticIndexRequest<'_>,
@@ -108,9 +122,18 @@ impl SemanticIndexState {
         if cancellation.is_cancelled() {
             return Err(AppError::SemanticSearchCancelled);
         }
+        if !request.prewarm && any_builds_a_chunk(request.full_corpus) {
+            return Ok(());
+        }
         self.signature = Some(CorpusSignature::of(request.full_corpus));
         self.resident.clear();
         Ok(())
+    }
+
+    /// Drops the index built for the corpus; the embedding cache stays.
+    pub fn clear_corpus(&mut self) {
+        self.signature = None;
+        self.resident.clear();
     }
 
     pub fn refresh_passages(
@@ -319,6 +342,12 @@ impl SemanticIndexState {
             clock,
         }
     }
+}
+
+fn any_builds_a_chunk(candidates: &[SemanticIndexCandidate]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| builds_any_chunk(&candidate.conversation))
 }
 
 /// Each candidate conversation's message times, by its index in the corpus.
@@ -1525,6 +1554,50 @@ mod tests {
             !state
                 .has_chunks(&empty_request, &SemanticCancellationToken::new())
                 .unwrap()
+        );
+    }
+
+    /// Each repeated query asks whether its scope holds chunks before it
+    /// waits for the model.
+    #[test]
+    fn has_chunks_answers_for_the_scope_without_building_chunks() {
+        use crate::semantic::chunk::CONVERSATIONS_CHUNKED;
+        let conversations = vec![
+            conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]),
+            conversation("/projects/project-a/session-b.jsonl", vec!["  "]),
+        ];
+        let (query, candidates) = request("alpha", conversations, vec![0, 1]);
+        let full = index_request(&query, &candidates);
+        let (mut state, mut embedder) = prepare_indexed_state(&full, ChunkConfig::default());
+        let answers_by_scope = |state: &SemanticIndexState| {
+            let chunked_before = CONVERSATIONS_CHUNKED.with(std::cell::Cell::get);
+            let answers = [&candidates[..1], &candidates[1..]].map(|scope| {
+                let request = SemanticIndexRequest {
+                    scope,
+                    ..index_request(&query, &candidates)
+                };
+                state
+                    .has_chunks(&request, &SemanticCancellationToken::new())
+                    .unwrap()
+            });
+            let chunked = CONVERSATIONS_CHUNKED.with(std::cell::Cell::get) - chunked_before;
+            (answers, chunked)
+        };
+
+        let before_refresh = answers_by_scope(&state);
+        run_refresh(&mut state, &full, &mut embedder).expect("the index refreshes");
+        let refreshed = answers_by_scope(&state);
+
+        assert_eq!(
+            before_refresh,
+            ([true, false], 0),
+            "the index not refreshed for the corpus answers from the semantic turns"
+        );
+        assert!(state.signature_matches(&full));
+        assert_eq!(
+            refreshed,
+            ([true, false], 0),
+            "the index refreshed for the corpus answers from its chunks"
         );
     }
 

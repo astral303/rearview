@@ -66,7 +66,7 @@ pub(super) fn open_counted(
 }
 
 /// A connection to a cache base's database. Once a write of the base found
-/// its drive short of space, it closes without copying the write-ahead log
+/// its drive low on space, it closes without copying the write-ahead log
 /// into the database: the copy needs the space the drive lacks.
 pub(super) struct CacheConnection {
     connection: Connection,
@@ -270,9 +270,10 @@ pub(crate) mod test_hooks {
         at_the_first_data_commit(base, FirstDataCommit::Lands, action)
     }
 
-    /// Call `action` once, as the read-only connection `opens` picks opens to
-    /// the session cache database in `base`, before it runs a statement. The
-    /// hook stays installed until the returned `ReaderAction` drops.
+    /// Call `action` once, before the first statement of the read-only
+    /// connection `opens` picks among those to the session cache database in
+    /// `base`. The hook stays installed until the returned `ReaderAction`
+    /// drops.
     pub(crate) fn run_as_a_reader_opens(
         base: &Path,
         opens: ReaderOpening,
@@ -546,8 +547,8 @@ pub(crate) mod test_hooks {
             const { std::cell::RefCell::new(None) };
     }
 
-    /// Run `action` when the next connection [`super::open`] opens on this
-    /// thread first meets a lock, inside that connection's busy wait. The
+    /// Run `action` inside the busy wait of the next session cache connection
+    /// this thread opens, when that connection first meets a lock. The
     /// connection then retries at once, and waits out the rest of its busy
     /// timeout as SQLite's handler does; a connection without a busy
     /// timeout gives up after the action. A test releases a lock inside the
