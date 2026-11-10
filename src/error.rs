@@ -202,10 +202,11 @@ pub enum CacheDeletion {
 
 impl CacheDeletion {
     /// The sentence the low-space message gives this deletion, with its
-    /// leading space; empty when the database is deleted or soon will be.
+    /// leading space; empty while the deletion is pending.
     fn sentence(&self) -> String {
         match self {
-            Self::Pending | Self::Deleted => String::new(),
+            Self::Pending => String::new(),
+            Self::Deleted => " The session cache was deleted.".to_owned(),
             Self::Deferred => {
                 " The session cache was not deleted: another rearview has it open.".to_owned()
             }
@@ -301,6 +302,15 @@ mod tests {
             outcome,
         }
         .to_string()
+    }
+
+    #[test]
+    fn low_space_message_reports_a_completed_deletion() {
+        assert_eq!(
+            low_space_message(CacheDeletion::Deleted),
+            "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+             The session cache was deleted. Free some space and run rearview again."
+        );
     }
 
     #[test]

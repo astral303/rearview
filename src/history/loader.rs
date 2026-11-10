@@ -856,7 +856,8 @@ mod tests {
         assert!(failed, "rearview exits with failure");
         assert_eq!(
             String::from_utf8(report).unwrap(),
-            "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
+            "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+             The session cache was deleted. Free some space and run rearview again.\n"
         );
         assert!(
             super::super::sqlite_cache::is_emptied(cache.path()),

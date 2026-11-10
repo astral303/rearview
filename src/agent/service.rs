@@ -6833,7 +6833,7 @@ mod tests {
         };
         assert_eq!(
             record,
-            "protocol agent-error kind=io detail=rearview:%20not%20enough%20disk%20space%20for%20the%20session%20cache%20%280.9%20GB%20free%2C%20needs%20at%20least%201%20GB%29.%20Free%20some%20space%20and%20run%20rearview%20again.\n"
+            "protocol agent-error kind=io detail=rearview:%20not%20enough%20disk%20space%20for%20the%20session%20cache%20%280.9%20GB%20free%2C%20needs%20at%20least%201%20GB%29.%20The%20session%20cache%20was%20deleted.%20Free%20some%20space%20and%20run%20rearview%20again.\n"
         );
         assert!(
             history::sqlite_cache::is_emptied(sessions.cache_base.path()),

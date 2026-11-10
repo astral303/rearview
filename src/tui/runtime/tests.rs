@@ -262,7 +262,8 @@ fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space(
 
     assert_eq!(
         report,
-        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
+        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+         The session cache was deleted. Free some space and run rearview again.\n"
     );
     assert!(
         crate::history::sqlite_cache::is_emptied(cache.path()),
@@ -355,7 +356,8 @@ fn quit_while_launch_finds_drive_low_on_space_reports_low_space_once_check_ends(
     assert!(failed, "rearview exits with failure");
     assert_eq!(
         String::from_utf8(report).unwrap(),
-        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
+        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+         The session cache was deleted. Free some space and run rearview again.\n"
     );
     assert!(
         crate::history::sqlite_cache::is_emptied(cache.path()),
@@ -468,7 +470,8 @@ fn resume_while_refresh_finds_drive_low_on_space_reports_low_space_without_launc
     assert!(failed, "rearview exits with failure");
     assert_eq!(
         String::from_utf8(report).unwrap(),
-        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). Free some space and run rearview again.\n"
+        "rearview: not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+         The session cache was deleted. Free some space and run rearview again.\n"
     );
     assert!(
         crate::history::sqlite_cache::is_emptied(cache.path()),
