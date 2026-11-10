@@ -225,8 +225,8 @@ fn rewritten_summary_changes_row_as_full_read_does() {
     write_records(&session.own, &records);
     assert_eq!(
         session.update().outcome,
-        Err(WholeRead::LeadingChanged),
-        "a title Grok generated again reads the session whole"
+        Ok(()),
+        "a title Grok generated again resumes with the new title"
     );
 
     session.write_summary(
@@ -237,8 +237,8 @@ fn rewritten_summary_changes_row_as_full_read_does() {
     write_records(&session.own, &records);
     assert_eq!(
         session.update().outcome,
-        Err(WholeRead::LeadingChanged),
-        "a generated title replaced by a chosen one reads the session whole"
+        Ok(()),
+        "a generated title replaced by a chosen one resumes with the chosen one"
     );
 
     session.write_summary(

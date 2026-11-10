@@ -2066,18 +2066,18 @@ fn project_path_of(conversation: &Conversation) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("unknown"))
 }
 
-/// Show `title`, a title stored beside the transcript, on `conversation`.
-/// True when the row's title changed.
+/// Shows `title`, a title stored outside the transcript, on `conversation`
+/// in place of both its title and summary: a chosen title replaces a
+/// generated one, and the reverse. An agent that keeps the title outside
+/// the transcript doesn't write any other title or summary. True when the
+/// row's title or summary changed.
 pub fn apply_external_title(conversation: &mut Conversation, title: &SessionTitle) -> bool {
     conversation.external_title = Some(title.clone());
-    let (shown, title) = match title {
-        SessionTitle::Custom(title) => (&mut conversation.custom_title, title),
-        SessionTitle::Generated(title) => (&mut conversation.summary, title),
-    };
-    if shown.as_deref() == Some(title.as_str()) {
+    let shown = title.as_title_and_summary();
+    if (&conversation.custom_title, &conversation.summary) == (&shown.0, &shown.1) {
         return false;
     }
-    *shown = Some(title.clone());
+    (conversation.custom_title, conversation.summary) = shown;
     true
 }
 

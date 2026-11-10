@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::{PADDED_MESSAGE_SEPARATOR, push_separated};
+use crate::history::parser::normalize_whitespace;
 use crate::history::sqlite_cache::SearchedFields;
 use crate::search::literal::{
     Literal, LiteralCorpusEntry, build_agent_literal_corpus, build_literal_corpus,
@@ -185,18 +186,31 @@ fn searchable_conversation_with(
         Vec::new()
     };
 
+    // The title and the summary are read with whitespace collapsed, as a
+    // search of the session cache's texts reads them.
+    let leading_lower = conv
+        .leading_texts()
+        .map(|text| normalize_for_search(&normalize_whitespace(text)))
+        .collect::<Vec<_>>();
     // Stage 1 reads the body and the project name as one text; the body field
     // scores the part before the project name.
     let mut text_lower = String::with_capacity(
-        conv.search_text_lower.len()
-            + agent_texts
-                .iter()
-                .map(|text| text.len() + PADDED_MESSAGE_SEPARATOR.len())
-                .sum::<usize>()
+        leading_lower
+            .iter()
+            .chain(&agent_texts)
+            .map(|text| text.len() + PADDED_MESSAGE_SEPARATOR.len())
+            .sum::<usize>()
+            + conv.search_text_lower.len()
             + project_lower.len()
             + 1,
     );
-    text_lower.push_str(&conv.search_text_lower);
+    for text in leading_lower
+        .iter()
+        .map(String::as_str)
+        .chain([conv.search_text_lower.as_str()])
+    {
+        push_separated(&mut text_lower, text);
+    }
     for agent_text in &agent_texts {
         push_separated(&mut text_lower, agent_text);
     }

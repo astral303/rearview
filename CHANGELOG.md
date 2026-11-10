@@ -43,6 +43,9 @@
 - Fix session paths shown with both `/` and `\` on Windows when an agent's
   directory variable, such as `CODEX_HOME`, is spelled with `/`. Those paths
   now show with `\` alone.
+- Fix the list's search matching a Codex, Grok Build or Kimi Code
+  session's old name after a rename, and missing the new one, until its
+  transcript changed. `agent within` now shows the new name too.
 
 ### Changes
 

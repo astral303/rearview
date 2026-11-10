@@ -993,6 +993,64 @@ fn rename_reaches_next_load_through_warm_cache() {
     });
 }
 
+/// An agent that keeps a session's title outside the transcript doesn't
+/// write any other title or summary, before a rename and after one: the
+/// parse names that title alone. `apply_external_title` relies on it to
+/// replace both.
+#[test]
+fn session_titled_outside_its_transcript_parses_that_title_alone() {
+    let mut titled_outside = Vec::new();
+    for fixture in registered_fixtures() {
+        let source = fixture.provider().source();
+        let home = tempfile::tempdir().unwrap();
+        fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+        let [stub] = <[_; 1]>::try_from(fixture.discover_under(home.path()))
+            .unwrap_or_else(|stubs| panic!("{source:?}: one session in the home: {stubs:?}"));
+        let root = fixture.root_under(home.path());
+        for renamed in [false, true] {
+            if renamed {
+                fixture
+                    .renamer()
+                    .rename_session(
+                        crate::history::FOR_FIXTURES,
+                        &stub.locator,
+                        "Chosen name",
+                        TestClock::default().wall(),
+                    )
+                    .unwrap();
+            }
+            let (_, row) =
+                crate::history::sqlite_cache::tests::parsed_record_and_row(source, &root, &stub);
+            let Some(title) = fixture
+                .storage()
+                .external_titles(&root)
+                .remove(&row.session_id)
+            else {
+                continue;
+            };
+            titled_outside.push((source, title.clone()));
+            assert_eq!(
+                (row.custom_title, row.summary),
+                title.as_title_and_summary(),
+                "{source:?}, renamed {renamed}: the parse names the title outside the transcript \
+                 alone"
+            );
+        }
+    }
+    assert!(
+        titled_outside
+            .iter()
+            .any(|(_, title)| matches!(title, SessionTitle::Generated(_))),
+        "some fixture keeps a generated title outside its transcript: {titled_outside:?}"
+    );
+    assert!(
+        titled_outside
+            .iter()
+            .any(|(_, title)| matches!(title, SessionTitle::Custom(_))),
+        "some fixture keeps a chosen title outside its transcript: {titled_outside:?}"
+    );
+}
+
 #[test]
 fn session_id_resolves_to_its_session_with_its_sub_agents() {
     run_contract(Contract::SessionIdLookup, |fixture| {

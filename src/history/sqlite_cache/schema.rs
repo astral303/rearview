@@ -3,13 +3,16 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 21;
+pub(super) const SCHEMA_VERSION: u32 = 25;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// Tables an earlier version held, dropped before [`TABLES`] when the schema
+/// changes.
+pub(super) const RETIRED_TABLES: &[&str] =
+    &["message_times", "search_texts", "subagent_search_parts"];
 
 /// Every table, dropped in this order when the schema changes.
 pub(super) const TABLES: &[&str] = &[
-    "search_texts",
-    "subagent_search_parts",
     "result_items",
     "parts",
     "entries",
@@ -81,6 +84,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     timestamp_ms INTEGER,
     preview_first TEXT,
     preview_last TEXT,
+    -- The last parse's summary and title, with any terminal codes the agent
+    -- wrote in them. A load shows a title kept outside the transcript in
+    -- their place (`apply_external_title`).
     summary TEXT,
     custom_title TEXT,
     model TEXT,
@@ -162,35 +168,6 @@ CREATE TABLE IF NOT EXISTS session_checkpoints (
     checkpoint BLOB NOT NULL,
     ledger BLOB NOT NULL
 );
-
--- Searchable child metadata omitted by the dialogue splice, one text part
--- per row. It has no message number and is excluded by active time windows.
-CREATE TABLE IF NOT EXISTS subagent_search_parts (
-    session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
-    -- The `session_files` position of the sub-agent transcript holding the
-    -- text.
-    file_position INTEGER NOT NULL,
-    position INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    PRIMARY KEY (session, position)
-) WITHOUT ROWID;
-
--- Each search text of an entry that no row holds as written, such as a tool
--- call's header or a task report's text: the text and its search field, as
--- on the rows that hold text (see `parts`).
-CREATE TABLE IF NOT EXISTS search_texts (
-    id INTEGER PRIMARY KEY,
-    session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
-    -- Gives the text its message number. Deleted with the session.
-    entry INTEGER NOT NULL,
-    search_field INTEGER NOT NULL,
-    -- As on `parts`.
-    entry_sequence INTEGER NOT NULL,
-    message_ordinal INTEGER,
-    text TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS search_texts_by_session ON search_texts (session);
-CREATE INDEX IF NOT EXISTS search_texts_by_entry ON search_texts (entry);
 
 -- The session row's parse errors.
 CREATE TABLE IF NOT EXISTS parse_errors (
@@ -292,8 +269,6 @@ CREATE TABLE IF NOT EXISTS entries (
     -- `string` for user content recorded as one string, `blocks` for content
     -- held in `parts`; null for an entry without content in parts.
     content TEXT,
-    -- Set on the title and the summary search reads, as on `parts`.
-    search_field INTEGER,
     -- The entry's own text: a summary, a title, an agent name, a metadata
     -- row's text.
     text TEXT,
@@ -321,9 +296,8 @@ CREATE TABLE IF NOT EXISTS entries (
     child INTEGER REFERENCES transcripts (id),
     -- A hash of what the row stores besides its place in the session and
     -- its message (`message`, `contributes`, `position`, `sequence`,
-    -- `record_transcript`, `search_field`), with its parts, result items and
-    -- search texts. A write keeps the row and its children when the new
-    -- entry hashes the same.
+    -- `record_transcript`), with its parts and result items. A write keeps
+    -- the row and its children when the new entry hashes the same.
     digest INTEGER NOT NULL,
     UNIQUE (session, sequence)
 );
@@ -334,30 +308,39 @@ CREATE INDEX IF NOT EXISTS entries_by_child ON entries (child, record_line)
     WHERE child IS NOT NULL;
 CREATE INDEX IF NOT EXISTS entries_by_time ON entries (timestamp_ms)
     WHERE timestamp_ms IS NOT NULL;
--- A resumed write finds the title and the summary search reads before its
--- checkpoint here, when an entry after it takes their place.
-CREATE INDEX IF NOT EXISTS entries_by_search_field ON entries (session, sequence)
-    WHERE search_field IS NOT NULL;
 
 -- Each content part retains its original position, including reference-only
--- images and unknown blocks.
+-- images and unknown blocks. After an entry's blocks come the parts search
+-- alone reads, each with only its search field, its search place and its
+-- text, without terminal codes: a part of kind `result-text` for each
+-- searched result with items in `result_items`, the text items joined by
+-- line breaks, then a part of kind `derived` for each search text of the
+-- entry not held as written by a block, such as a tool call's header or a
+-- task report's text. A part of kind `subagent-metadata`, outside every
+-- entry, holds a sub-agent transcript's text outside its spliced turns.
+-- `agent search` reads it without an active time window.
 CREATE TABLE IF NOT EXISTS parts (
     id INTEGER PRIMARY KEY,
-    -- The entry's session, so one session's parts are read without its
+    -- The part's session, so one session's parts are read without its
     -- entries.
     session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
-    entry INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+    -- Null for a part outside every entry, numbered by `part` in its
+    -- session.
+    entry INTEGER REFERENCES entries (id) ON DELETE CASCADE,
     part INTEGER NOT NULL,
     kind TEXT NOT NULL,
-    -- The search field lexical search reads `text` in, or a result's
-    -- `result_items` in; null when search does not read the part. Before
-    -- `text`, so reading it does not read a long text's overflow pages.
+    -- The search field lexical search reads `text` in; null when search
+    -- does not read the part. Before `text`, so reading it does not read a
+    -- long text's overflow pages.
     search_field INTEGER,
-    -- Set with `search_field`: the entry's `sequence`, and the `ordinal` of
-    -- the entry's message when the entry contributes to it. Search places
-    -- the text by these without reading the entry.
+    -- Set with `search_field` on an entry's part: the entry's `sequence`,
+    -- and the `ordinal` of the entry's message when the entry contributes
+    -- to it. Search places the text by these without reading the entry.
     entry_sequence INTEGER,
     message_ordinal INTEGER,
+    -- A `subagent-metadata` part's `session_files` position of the
+    -- sub-agent transcript holding the text.
+    file_position INTEGER,
     -- Text, thinking, or a result's content recorded as one string.
     text TEXT,
     text_codes BLOB,
@@ -376,6 +359,9 @@ CREATE TABLE IF NOT EXISTS parts (
     UNIQUE (entry, part)
 );
 CREATE INDEX IF NOT EXISTS parts_by_session ON parts (session);
+-- A write of a session's parts outside every entry matches them by `part`.
+CREATE UNIQUE INDEX IF NOT EXISTS parts_outside_entries ON parts (session, part)
+    WHERE entry IS NULL;
 
 -- A result array's original item positions, including reference-only
 -- items. Text is kept separately from image and other opaque payloads.
@@ -383,9 +369,6 @@ CREATE TABLE IF NOT EXISTS result_items (
     part INTEGER NOT NULL REFERENCES parts (id) ON DELETE CASCADE,
     position INTEGER NOT NULL,
     kind TEXT NOT NULL,
-    -- 1 for a text item of a result search reads: search reads the part's
-    -- searched items as one text, joined by line breaks.
-    searched INTEGER NOT NULL,
     text TEXT,
     text_codes BLOB,
     item_type TEXT,

@@ -119,6 +119,6 @@ fn read_outside_every_root(environment: &Environment, path: &Path) -> Result<Dir
     Ok(DirectFileRead::Bare {
         source: projection.source,
         row,
-        entries: TranscriptEntries::of_projection(projection).into(),
+        entries: TranscriptEntries::of_projection_without_leading_titles(projection).into(),
     })
 }

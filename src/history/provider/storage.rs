@@ -176,6 +176,17 @@ pub enum SessionTitle {
     Generated(String),
 }
 
+impl SessionTitle {
+    /// This title as a conversation's custom title and summary: a custom
+    /// title sets the title, a generated one the summary.
+    pub(crate) fn as_title_and_summary(&self) -> (Option<String>, Option<String>) {
+        match self {
+            Self::Custom(title) => (Some(title.clone()), None),
+            Self::Generated(title) => (None, Some(title.clone())),
+        }
+    }
+}
+
 /// How a provider finds and parses the sessions under its roots.
 pub trait SessionStorage: Sync {
     /// Whose sessions these are. A redirected root can hold a sibling agent's

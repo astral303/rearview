@@ -2106,7 +2106,7 @@ fn preview_and_context(
         lexical_evidence.filter(|_| !semantic_mode || semantic_metadata.is_none());
     let lexical_context = lexical_evidence.and_then(|evidence| {
         build_context_segments_from_ranges(
-            evidence.source_text.as_deref().unwrap_or(&conv.full_text),
+            &evidence.texts(conv),
             &evidence.context_ranges,
             max_preview_len,
         )
@@ -2133,12 +2133,7 @@ fn preview_and_context(
 
     let context = if lexical_context.is_none() && frame_inputs.query.needs_literal_context(&preview)
     {
-        build_literal_context_segments(
-            &conv.full_text,
-            &preview,
-            frame_inputs.query,
-            width.saturating_sub(4),
-        )
+        build_literal_context_segments(conv, &preview, frame_inputs.query, width.saturating_sub(4))
     } else {
         None
     };
@@ -4323,7 +4318,7 @@ mod tests {
         )
         .unwrap();
         let ctx = build_context_segments_from_ranges(
-            &conversation.full_text,
+            &evidence.texts(&conversation),
             &evidence.context_ranges,
             120,
         )

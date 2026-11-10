@@ -101,7 +101,7 @@ pub fn timed_messages_conversation(
     title: Option<&str>,
 ) -> Conversation {
     let texts = messages.iter().map(|(text, _)| *text).collect::<Vec<_>>();
-    let (full_text, full_text_starts) = text_with_starts(title, &texts, messages.len());
+    let (full_text, full_text_starts) = text_with_starts(&texts, messages.len());
     let spans = messages
         .iter()
         .map(|(_, time)| Some(TimeSpan::from_seconds(time.timestamp(), time.timestamp())))
@@ -132,26 +132,22 @@ pub fn with_agent_texts(
     let message_count = conversation.message_count;
     let starts = &mut conversation.message_text_starts;
     (conversation.agent_search_text, starts.agent_search_text) =
-        text_with_starts(None, subagent_texts, message_count);
+        text_with_starts(subagent_texts, message_count);
     (
         conversation.thinking_and_tool_call_text,
         starts.thinking_and_tool_call_text,
-    ) = text_with_starts(None, thinking_and_tool_call_texts, message_count);
+    ) = text_with_starts(thinking_and_tool_call_texts, message_count);
     conversation
 }
 
-/// `leading`, then `texts` as the text of messages m1, m2, …, and where each
-/// message's text starts.
-fn text_with_starts(
-    leading: Option<&str>,
-    texts: &[&str],
-    message_count: usize,
-) -> (String, MessageStarts) {
+/// `texts` as the text of messages m1, m2, …, and where each message's text
+/// starts.
+fn text_with_starts(texts: &[&str], message_count: usize) -> (String, MessageStarts) {
     let mut builder = MessageTextBuilder::default();
     for (index, text) in texts.iter().enumerate() {
         builder.push(Some(index + 1), (*text).to_owned());
     }
-    builder.finish(leading, message_count, str::to_owned)
+    builder.finish(message_count, str::to_owned)
 }
 
 /// A session of one message, written at `timestamp`.
@@ -164,8 +160,7 @@ pub fn one_message_conversation(
 ) -> Conversation {
     let mut builder = MessageTextBuilder::default();
     builder.push(Some(1), text.to_string());
-    let (full_text, full_text_starts) =
-        builder.finish(title.into_iter().chain(summary), 1, str::to_owned);
+    let (full_text, full_text_starts) = builder.finish(1, str::to_owned);
 
     Conversation {
         source: crate::history::Source::Claude,

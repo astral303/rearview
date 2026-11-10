@@ -1,11 +1,12 @@
 //! Match selection and truncation for list-row previews: which slice of a
 //! preview to show at a width, and where the query matches inside it.
 
-use crate::history::MESSAGE_SEPARATOR;
+use crate::history::{Conversation, MESSAGE_SEPARATOR};
 use crate::search::evidence::select_hidden_context_ranges;
 use crate::search::literal::{Literal, match_literal_ranges};
 use crate::search::normalize_for_search;
 use crate::search::query::ParsedQuery;
+use crate::search::separated_texts::SeparatedTexts;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Truncate text to max_width chars, adding "…" suffix if truncated.
@@ -206,9 +207,10 @@ fn truncate_around_match(text: &str, query: &str, max_width: usize) -> String {
     )
 }
 
-/// Build a context string showing snippets around hidden matches in full_text.
+/// Build a context string showing snippets around hidden matches in the
+/// row's title, summary and `full_text`.
 ///
-/// Selection is cluster-based: collect every term hit in `full_text`, group
+/// Selection is cluster-based: collect every term hit in those texts, group
 /// nearby hits into clusters, then rank clusters by:
 ///
 /// 1. how many *missing* (not-in-preview) terms they cover,
@@ -219,15 +221,15 @@ fn truncate_around_match(text: &str, query: &str, max_width: usize) -> String {
 ///
 /// This makes the literal phrase `audio generation` win over a far-apart pair
 /// of `audio` + `generation` occurrences in unrelated boilerplate.
-/// Operates on raw full_text and sanitizes each extracted slice independently.
+/// Operates on the raw texts and sanitizes each extracted slice independently.
 pub(crate) fn build_literal_context_segments(
-    full_text: &str,
+    conversation: &Conversation,
     preview: &str,
     query: &HighlightQuery,
     max_width: usize,
 ) -> Option<String> {
     build_context_segments_with_specs(
-        full_text,
+        &SeparatedTexts::of_row(conversation),
         preview,
         &query.literal_context_specs(),
         max_width,
@@ -241,7 +243,12 @@ fn build_context_segments_for_query(
     query: &HighlightQuery,
     max_width: usize,
 ) -> Option<String> {
-    build_context_segments_with_specs(full_text, preview, &query.context_specs(), max_width)
+    build_context_segments_with_specs(
+        &SeparatedTexts::new([full_text]),
+        preview,
+        &query.context_specs(),
+        max_width,
+    )
 }
 
 #[cfg(test)]
@@ -252,7 +259,7 @@ fn build_context_segments(
     max_width: usize,
 ) -> Option<String> {
     build_context_segments_with_specs(
-        full_text,
+        &SeparatedTexts::new([full_text]),
         preview,
         &HighlightQuery::normalized_context_specs(query),
         max_width,
@@ -260,7 +267,7 @@ fn build_context_segments(
 }
 
 pub(crate) fn build_context_segments_from_ranges(
-    full_text: &str,
+    full_text: &SeparatedTexts<'_>,
     hidden_matches: &[(usize, usize)],
     max_width: usize,
 ) -> Option<String> {
@@ -272,7 +279,7 @@ pub(crate) fn build_context_segments_from_ranges(
 }
 
 fn build_context_segments_with_specs(
-    full_text: &str,
+    full_text: &SeparatedTexts<'_>,
     preview: &str,
     specs: &[ContextMatchSpec],
     max_width: usize,
@@ -290,7 +297,6 @@ fn build_context_segments_with_specs(
         .iter()
         .any(|spec| matches!(spec, ContextMatchSpec::Normalized(_)));
     let preview_normalized = has_normalized_specs.then(|| NormalizedText::new(preview));
-    let full_text_normalized = has_normalized_specs.then(|| NormalizedText::new(full_text));
 
     let mut missing_mask: u64 = 0;
     let mut missing_count = 0u32;
@@ -304,7 +310,7 @@ fn build_context_segments_with_specs(
         }
     }
 
-    let all_hits = find_all_spec_hits(full_text, &specs, full_text_normalized.as_ref());
+    let all_hits = find_all_spec_hits(full_text, &specs, has_normalized_specs);
     if all_hits.is_empty() {
         return None;
     }
@@ -317,8 +323,12 @@ fn build_context_segments_with_specs(
     // informative cluster across the whole document. Worst case it picks one
     // that overlaps preview content, which is still the best snippet we have.
     if missing_count == 0 {
-        let preview_hit_count =
-            find_all_spec_hits(preview, &specs, preview_normalized.as_ref()).len();
+        let preview_hit_count = find_all_spec_hits(
+            &SeparatedTexts::new([preview]),
+            &specs,
+            has_normalized_specs,
+        )
+        .len();
         if all_hits.len() <= preview_hit_count {
             return None;
         }
@@ -335,7 +345,7 @@ fn build_context_segments_with_specs(
 }
 
 fn build_context_segments_from_ranges_unchecked(
-    full_text: &str,
+    full_text: &SeparatedTexts<'_>,
     hidden_matches: &[(usize, usize)],
     max_width: usize,
 ) -> Option<String> {
@@ -349,31 +359,21 @@ fn build_context_segments_from_ranges_unchecked(
     let mut prev_end_byte: usize = 0;
 
     for (i, &(match_start, match_end)) in hidden_matches.iter().enumerate() {
-        let match_char_len = full_text[match_start..match_end].chars().count();
+        let match_char_len = full_text.slice(match_start..match_end).chars().count();
         let context_chars = budget_per_segment
             .saturating_sub(match_char_len)
             .saturating_sub(2) // reserve for "…" on each side
             / 2;
 
         // Find char boundaries for the context window in raw full_text
-        let mut start_byte = full_text[..match_start]
-            .char_indices()
-            .rev()
-            .nth(context_chars)
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        let mut start_byte = full_text.start_before(match_start, context_chars);
 
         // Prevent overlapping with previous segment
         start_byte = start_byte.max(prev_end_byte);
 
-        let end_byte = full_text[match_end..]
-            .char_indices()
-            .nth(context_chars)
-            .map(|(idx, _)| match_end + idx)
-            .unwrap_or(full_text.len())
-            .min(full_text.len());
+        let end_byte = full_text.start_after(match_end, context_chars);
 
-        let sanitized = sanitize_preview(&full_text[start_byte..end_byte]);
+        let sanitized = sanitize_preview(&full_text.slice(start_byte..end_byte));
 
         // Add ellipsis if there's a gap before this segment
         let has_gap = if i == 0 {
@@ -717,22 +717,29 @@ fn dedupe_context_specs(specs: &[ContextMatchSpec]) -> Vec<ContextMatchSpec> {
     deduped
 }
 
+/// Every spec's hits in `texts`, sorted by start, each text normalised once
+/// when `normalize` is set, each searched on its own: a hit doesn't cross a
+/// separator.
 fn find_all_spec_hits(
-    text: &str,
+    texts: &SeparatedTexts<'_>,
     specs: &[ContextMatchSpec],
-    normalized: Option<&NormalizedText>,
+    normalize: bool,
 ) -> Vec<TermHit> {
+    let normalized = texts
+        .texts()
+        .map(|(_, text)| normalize.then(|| NormalizedText::new(text)))
+        .collect::<Vec<_>>();
     let mut all_hits = Vec::new();
     for (term_idx, spec) in specs.iter().enumerate() {
-        all_hits.extend(
-            spec.find_ranges(text, normalized)
-                .into_iter()
-                .map(|(start, end)| TermHit {
-                    start,
-                    end,
+        for ((offset, text), normalized) in texts.texts().zip(&normalized) {
+            all_hits.extend(spec.find_ranges(text, normalized.as_ref()).into_iter().map(
+                |(start, end)| TermHit {
+                    start: offset + start,
+                    end: offset + end,
                     term_idx,
-                }),
-        );
+                },
+            ));
+        }
     }
     all_hits.sort_unstable_by_key(|hit| hit.start);
     all_hits

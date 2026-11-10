@@ -427,7 +427,7 @@ fn empty_semantic_response(generation: u64, prewarm: bool) -> SemanticSearchResp
     }
 }
 
-fn exact_literal_semantic_response(
+pub(in crate::tui) fn exact_literal_semantic_response(
     generation: u64,
     prewarm: bool,
     conversations: &[Arc<Conversation>],
@@ -480,6 +480,7 @@ fn literal_evidence_preview(
     parsed: &ParsedQuery,
     visible_preview: &str,
 ) -> String {
+    let full_text = conversation.full_text_after_leading_texts();
     parsed
         .literals()
         .iter()
@@ -487,9 +488,9 @@ fn literal_evidence_preview(
         .chain(parsed.literals().iter())
         .find_map(|literal| {
             literal
-                .match_ranges(&conversation.full_text)
+                .match_ranges(&full_text)
                 .first()
-                .map(|range| evidence_window(&conversation.full_text, *range))
+                .map(|range| evidence_window(&full_text, *range))
                 .or_else(|| {
                     conversation.project_name.as_deref().and_then(|project| {
                         literal

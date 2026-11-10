@@ -549,8 +549,7 @@ impl CacheWriter {
         // Do not discard the existing cache until exclusion and the journal
         // transition have succeeded. Interrupted rebuilds remain retryable.
         let batch = refresh::transaction_in_turn(&self.connection, &self.owner, &turn)?;
-        batch.execute_batch("DROP TABLE IF EXISTS message_times")?;
-        for table in schema::TABLES {
+        for table in schema::RETIRED_TABLES.iter().chain(schema::TABLES) {
             batch.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
         }
         refresh::commit(batch, &self.owner)?;
@@ -736,11 +735,8 @@ impl CacheWriter {
                 )?
                 .execute(params![session, place.root, place.path, launch_call])?;
         }
-        let mut leading =
+        let leading =
             entries::SessionRows::from(&update.leading, subagents, &entries::RowsStart::default());
-        if update.checkpoint.fold.has_entry_title() {
-            leading.yield_title();
-        }
         entries::replace_leading(
             &batch,
             session,
@@ -759,7 +755,6 @@ impl CacheWriter {
             numbering: fold.numbering().clone(),
             positions: fold.positions(),
             sequence,
-            leading: entries::stored_leading(&batch, session, sequence)?,
         };
         let tail = entries::SessionRows::from(&entries.entries, subagents, &start);
         entries::update_tail(&batch, session, places, &tail)?;
@@ -1189,7 +1184,7 @@ fn write_search_parts(
         .iter()
         .map(|(position, values)| Ok((*position, catalogue::file_place_of(values)?)))
         .collect::<Result<_>>()?;
-    let table = positional::SUBAGENT_SEARCH_PARTS;
+    let table = positional::SUBAGENT_METADATA_PARTS;
     let stored = table.stored(connection, session)?;
     table.write(
         connection,

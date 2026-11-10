@@ -49,16 +49,18 @@ impl RecordContent {
     }
 
     /// The record of `row`'s session as `normalized_session` and a fresh
-    /// parse of each sub-agent transcript read it.
+    /// parse of each sub-agent transcript read it. The record's entries don't
+    /// hold a title the agent keeps outside the transcript.
     fn of_fresh_reads(row: &Conversation) -> Self {
         let format = row.source.provider().format();
-        let entries = normalized_session(
+        let mut entries = normalized_session(
             crate::history::FOR_FIXTURES,
             row.source,
             &row.path,
             &row.subagents,
         )
         .unwrap();
+        crate::history::parser::take_leading_titles(&mut entries.entries);
         let mut search_parts = Vec::new();
         let mut transcripts: BTreeSet<PathBuf> = entries
             .entries

@@ -25,9 +25,6 @@ pub(in super::super) struct SessionRows<'a> {
     /// `first_sequence` is its `sequence`.
     pub(super) entries: Vec<EntryRow<'a>>,
     pub(super) first_sequence: usize,
-    /// The sequences of the stored entries before `first_sequence` that
-    /// held the title or the summary search reads, and no longer do.
-    pub(in super::super) superseded_leading: Vec<usize>,
 }
 
 pub(super) struct EntryRow<'a> {
@@ -41,8 +38,6 @@ pub(super) struct EntryRow<'a> {
     /// The index of the entry's transcript in [`SessionRows::transcripts`]
     /// when its thread's origin names another one.
     pub(super) transcript: Option<usize>,
-    /// True for the title or the summary search reads.
-    pub(super) is_leading: bool,
     /// The timestamp text the splice orders the entry by.
     pub(super) splice_key: Option<&'a str>,
     /// The index in [`SessionRows::transcripts`] of the sub-agent
@@ -101,9 +96,6 @@ pub(in super::super) struct RowsStart {
     /// The next position in each thread, by thread number.
     pub(in super::super) positions: HashMap<i64, i64>,
     pub(in super::super) sequence: usize,
-    /// The stored entries before them holding the title and the summary
-    /// search reads.
-    pub(in super::super) leading: LeadingTexts,
 }
 
 impl<'a> SessionRows<'a> {
@@ -121,13 +113,11 @@ impl<'a> SessionRows<'a> {
     ) -> Self {
         let mut numbering = Numbering::resumed(&start.numbering, &start.positions);
         let mut messages = Messages::resumed(&start.numbering);
-        let mut leading = start.leading;
         let mut rows = Vec::with_capacity(entries.len());
         for (index, (record, entry)) in entries.iter().enumerate() {
             let placement = numbering.place(record, entry);
             let columns = EntryColumns::of(entry);
             let membership = messages.add(index, &placement, entry, &columns);
-            leading.read(start.sequence + index, entry);
             let child = record
                 .transcript
                 .as_deref()
@@ -151,7 +141,6 @@ impl<'a> SessionRows<'a> {
                 contributes: membership.is_some_and(|membership| membership.contributes),
                 position: placement.position,
                 transcript: placement.transcript,
-                is_leading: false,
                 splice_key,
                 child,
                 digest: 0,
@@ -159,25 +148,12 @@ impl<'a> SessionRows<'a> {
             row.digest = row.digest();
             rows.push(row);
         }
-        let is_leading =
-            |sequence: &usize| [leading.title, leading.summary].contains(&Some(*sequence));
-        for sequence in [leading.title, leading.summary].into_iter().flatten() {
-            if let Some(index) = sequence.checked_sub(start.sequence) {
-                rows[index].is_leading = true;
-            }
-        }
-        let superseded_leading = [start.leading.title, start.leading.summary]
-            .into_iter()
-            .flatten()
-            .filter(|sequence| !is_leading(sequence))
-            .collect();
         Self {
             transcripts: numbering.transcripts,
             threads: numbering.threads,
             messages: messages.rows,
             entries: rows,
             first_sequence: start.sequence,
-            superseded_leading,
         }
     }
 
@@ -186,45 +162,11 @@ impl<'a> SessionRows<'a> {
         self.first_sequence + index
     }
 
-    /// Leave the title search reads to an entry after these rows, the rows
-    /// of a session's leading entries, which names its own.
-    pub(in super::super) fn yield_title(&mut self) {
-        for row in &mut self.entries {
-            if row.columns.kind == "custom-title" {
-                row.is_leading = false;
-            }
-        }
-    }
-
     /// The number of messages that take a printed number.
     pub(in super::super) fn message_count(&self) -> i64 {
         self.messages
             .iter()
             .filter(|message| message.ordinal.is_some())
             .count() as i64
-    }
-}
-
-/// The entries holding the session's title and summary, which search reads
-/// with its text, by sequence: the last custom title, unless it is blank;
-/// the last AI title that is not blank, else the first summary.
-#[derive(Clone, Copy, Default)]
-pub(in super::super) struct LeadingTexts {
-    pub(in super::super) title: Option<usize>,
-    pub(in super::super) summary: Option<usize>,
-}
-
-impl LeadingTexts {
-    fn read(&mut self, sequence: usize, entry: &LogEntry) {
-        match entry {
-            LogEntry::Summary { .. } if self.summary.is_none() => self.summary = Some(sequence),
-            LogEntry::AiTitle { ai_title } if !ai_title.trim().is_empty() => {
-                self.summary = Some(sequence);
-            }
-            LogEntry::CustomTitle { custom_title } => {
-                self.title = (!custom_title.trim().is_empty()).then_some(sequence);
-            }
-            _ => {}
-        }
     }
 }

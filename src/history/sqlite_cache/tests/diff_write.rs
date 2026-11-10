@@ -21,7 +21,6 @@ const ENTRY_TABLES: &[&str] = &[
     "transcripts",
     "parts",
     "result_items",
-    "search_texts",
 ];
 
 /// Counts each row inserted, updated or deleted in [`ENTRY_TABLES`] through
@@ -226,9 +225,10 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
             "SELECT * FROM malformed_lines WHERE session = ?1 ORDER BY position".to_owned(),
         ),
         (
-            "subagent_search_parts",
-            "SELECT position, file_position, text FROM subagent_search_parts \
-             WHERE session = ?1 ORDER BY position"
+            "parts outside entries",
+            "SELECT part, kind, search_field, entry_sequence, message_ordinal, file_position, \
+             text, text_codes, call_id, name, tool, json, result_shape FROM parts \
+             WHERE session = ?1 AND entry IS NULL ORDER BY part"
                 .to_owned(),
         ),
         (
@@ -259,7 +259,7 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
             "entries",
             format!(
                 "SELECT e.sequence, e.position, e.contributes, {}, tr.path, e.record_line, \
-                 e.kind, e.timestamp_ms, e.content, e.search_field, e.text, e.text_codes, \
+                 e.kind, e.timestamp_ms, e.content, e.text, e.text_codes, \
                  e.label, e.uuid, e.usage_input, e.usage_output, e.usage_cache_creation, \
                  e.usage_cache_read, e.level, e.duration_ms, e.parent_uuid, e.flag, e.digest \
                  FROM entries e LEFT JOIN transcripts tr ON tr.id = e.record_transcript \
@@ -277,16 +277,9 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         ),
         (
             "result_items",
-            "SELECT e.sequence, p.part, i.position, i.kind, i.searched, i.text, i.text_codes, \
+            "SELECT e.sequence, p.part, i.position, i.kind, i.text, i.text_codes, \
              i.item_type FROM result_items i JOIN parts p ON p.id = i.part \
              JOIN entries e ON e.id = p.entry WHERE e.session = ?1 ORDER BY 1, 2, 3"
-                .to_owned(),
-        ),
-        (
-            "search_texts",
-            "SELECT e.sequence, s.search_field, s.entry_sequence, s.message_ordinal, s.text \
-             FROM search_texts s \
-             JOIN entries e ON e.id = s.entry WHERE s.session = ?1 ORDER BY e.sequence, s.id"
                 .to_owned(),
         ),
     ] {
@@ -329,14 +322,13 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
         SearchedFields::Agent,
         &crate::time_filter::TimeFilter::default(),
         |text| {
-            let placed = format!("{:?} {:?} {}", text.field, text.ordinal, text.text);
+            let placed = format!("{:?} {:?} {}", text.order, text.ordinal, text.text);
             texts.push((text.order, placed));
             ControlFlow::Continue(())
         },
     )
     .unwrap()
     .unwrap();
-    // The order's search text ids are surrogate ids: sorted by, not shown.
     texts.sort();
     let texts = texts.into_iter().map(|(_, text)| text).collect::<Vec<_>>();
     rows.push(format!("search texts {texts:?}"));
@@ -603,6 +595,97 @@ fn parse_equal_to_stored_session_writes_no_entry_rows_for_every_agent() {
         );
         assert_matches_fresh_write(&cache, &fixture, &record);
     }
+}
+
+/// A title the agent keeps outside the transcript is a field of the session
+/// row: a rename, a second rename and the agent's files restored don't write
+/// any entry row. A fixture without a title has one added, then removed; a
+/// fixture with one has it changed.
+#[test]
+fn title_outside_transcript_renamed_doesnt_write_entry_rows_for_every_agent() {
+    use super::search_texts::{rename, writable};
+    use crate::history::provider::contract_tests::copy_tree;
+    let mut renamed_outside = Vec::new();
+    for session in every_record_sessions() {
+        let (home, copy) = writable(session);
+        let home = home.expect("the copy has a home");
+        let saved = tempfile::tempdir().unwrap();
+        copy_tree(home.path(), saved.path());
+        let source = copy.row.source;
+        let path = copy.row.path.clone();
+        let mut fixture = Fixture::of(copy);
+        let mut original = fixture.record();
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &original);
+        let session_id = fixture.session_id(&cache);
+        let original_title = fixture.listed(&cache).custom_title;
+
+        let restamp = |fixture: &mut Fixture| {
+            if source == Source::OpenCode {
+                // The stub carries the database's stamp, and a rename moves it.
+                fixture.stub.fingerprint = opencode_fingerprint(&fixture.root, &path);
+            }
+        };
+        rename(source, &path, "Renamed by hand");
+        restamp(&mut fixture);
+        let transcript_records = |record: &mut SessionRecord| {
+            entries_of(record)
+                .entries
+                .iter()
+                .filter(|(line, entry)| !crate::history::parser::is_leading_title(line, entry))
+                .count()
+        };
+        if transcript_records(&mut fixture.record()) != transcript_records(&mut original) {
+            // The agent records a rename in the transcript.
+            continue;
+        }
+        renamed_outside.push(source);
+        let restore = || {
+            std::fs::remove_dir_all(home.path()).unwrap();
+            copy_tree(saved.path(), home.path());
+        };
+        /// A case, the title the session row names after it, and the change
+        /// to the agent's files that makes it.
+        type Step<'a> = (&'a str, Option<String>, &'a dyn Fn());
+        let steps: [Step<'_>; 3] = [
+            ("the rename", Some("Renamed by hand".to_owned()), &|| {}),
+            ("a second rename", Some("Renamed again".to_owned()), &|| {
+                rename(source, &path, "Renamed again");
+            }),
+            ("the files restored", original_title, &restore),
+        ];
+        for (case, expected, change) in steps {
+            change();
+            restamp(&mut fixture);
+            let record = fixture.record();
+            cache.write(&record).unwrap();
+            assert_eq!(
+                take_row_writes(&cache.connection),
+                BTreeMap::new(),
+                "{}: {case} doesn't write any entry row",
+                fixture.label()
+            );
+            assert_eq!(
+                fixture.listed(&cache).custom_title,
+                expected,
+                "{}: {case} names the session row's title",
+                fixture.label()
+            );
+            assert_matches_fresh_write(&cache, &fixture, &record);
+        }
+        assert_eq!(
+            fixture.session_id(&cache),
+            session_id,
+            "{}: the session row keeps its id",
+            fixture.label()
+        );
+    }
+    assert_eq!(
+        renamed_outside,
+        [Source::Codex, Source::OpenCode, Source::Kimi, Source::Grok],
+        "the agents keeping a renamed title outside the transcript: Claude, Pi and OMP append \
+         the rename to it"
+    );
 }
 
 #[test]

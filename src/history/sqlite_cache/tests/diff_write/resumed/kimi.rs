@@ -272,8 +272,8 @@ fn rewritten_state_changes_row_as_full_read_does() {
     write_lines(&session.own, &lines);
     assert_eq!(
         session.update().outcome,
-        Err(WholeRead::LeadingChanged),
-        "a generated title replaced by a chosen one reads the session whole"
+        Ok(()),
+        "a generated title replaced by a chosen one resumes with the chosen one"
     );
 
     session.write_state("/tmp/kimi-project", "Another name", "custom", 4);

@@ -42,14 +42,14 @@ pub(crate) struct SessionCheckpoint {
 }
 
 /// A hash of the leading entries `entries` open with, the session's own at
-/// line 0, besides custom titles, which a resumed read replaces; empty when
+/// line 0, besides the titles a resumed read replaces; empty when
 /// there are none. The fold before a checkpoint holds what the others set,
-/// such as a summary from a title the agent generated.
+/// such as a model.
 pub(crate) fn leading_digest(entries: &[(RecordLine, LogEntry)]) -> String {
     let others: Vec<String> = entries
         .iter()
         .take_while(|(record, _)| record.line == 0 && record.transcript.is_none())
-        .filter(|(_, entry)| !matches!(entry, LogEntry::CustomTitle { .. }))
+        .filter(|(record, entry)| !super::parser::is_leading_title(record, entry))
         .map(|(_, entry)| serde_json::to_string(entry).expect("an entry serializes"))
         .collect();
     if others.is_empty() {

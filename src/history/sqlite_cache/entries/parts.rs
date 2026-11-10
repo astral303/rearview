@@ -1,12 +1,14 @@
 use super::digest::Digest;
+use super::search::EntrySearch;
 use super::write::SearchPlace;
 use super::{ReadPurpose, Selection};
-use crate::agent::sanitize::split_terminal_codes;
+use crate::agent::sanitize::{split_terminal_codes, without_terminal_codes};
 use crate::agent::transcript::tool_result_item_text;
 use crate::history::sqlite_cache::SearchField;
 use crate::log_entry::{ContentBlock, Tool};
 use rusqlite::{Connection, Row, Statement, params};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 pub(super) struct Writer<'connection> {
@@ -23,26 +25,27 @@ impl<'connection> Writer<'connection> {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?,
             item: connection.prepare(
-                "INSERT INTO result_items (part, position, kind, searched, text, text_codes, \
-                 item_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO result_items (part, position, kind, text, text_codes, item_type) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?,
         })
     }
 
-    /// Writes `blocks` as the parts of `session`'s entry `entry`, each read
-    /// by search in the field `search` holds for it, at `place`.
+    /// Writes `session`'s entry `entry` as its parts at `place`: one part for
+    /// each of `blocks`, in the field `search` gives it, then the search-only
+    /// parts of `search` (see [`search_only_parts`]).
     pub(super) fn write(
         &mut self,
         connection: &Connection,
         session: i64,
         entry: i64,
         blocks: &[ContentBlock],
-        search: &[Option<SearchField>],
+        search: &EntrySearch,
         place: SearchPlace,
     ) -> rusqlite::Result<()> {
         for (position, block) in blocks.iter().enumerate() {
             let columns = Columns::of(block);
-            let field = search[position];
+            let field = block_field(&columns, search.blocks[position]);
             let text = columns.text.map(split_terminal_codes);
             self.part.execute(params![
                 session,
@@ -61,24 +64,83 @@ impl<'connection> Writer<'connection> {
                 columns.result_shape
             ])?;
             let part = connection.last_insert_rowid();
-            for (position, item) in result_items(block, &columns, field).enumerate() {
+            for (position, item) in result_items(block, &columns).enumerate() {
                 let text = item.text.map(split_terminal_codes);
                 self.item.execute(params![
                     part,
                     position as i64,
                     item.kind,
-                    item.searched,
                     text.as_ref().map(|text| &*text.text),
                     text.as_ref().and_then(|text| text.codes.as_deref()),
                     item.item_type
                 ])?;
             }
         }
+        for (offset, (kind, field, text)) in search_only_parts(blocks, search).enumerate() {
+            self.part.execute(params![
+                session,
+                entry,
+                (blocks.len() + offset) as i64,
+                kind,
+                field.code(),
+                place.sequence,
+                place.ordinal,
+                search_only_text(&text),
+                None::<&str>,
+                None::<&str>,
+                None::<&str>,
+                None::<&str>,
+                None::<&str>,
+                None::<&str>
+            ])?;
+        }
         Ok(())
     }
 }
 
-/// Feeds `digest` what [`Writer::write`] stores of `blocks` and `search`.
+/// The parts search alone reads, numbered after the entry's blocks, each as
+/// its kind, field and text: a [`RESULT_TEXT`] part for each searched result
+/// with items in `result_items`, in block order, then a [`DERIVED`] part for
+/// each derived text.
+fn search_only_parts<'a>(
+    blocks: &'a [ContentBlock],
+    search: &'a EntrySearch,
+) -> impl Iterator<Item = (&'static str, SearchField, Cow<'a, str>)> {
+    let results = blocks
+        .iter()
+        .zip(&search.blocks)
+        .filter_map(|(block, field)| {
+            let field = (*field)?;
+            let items = stored_items(block, &Columns::of(block))?;
+            Some((RESULT_TEXT, field, Cow::Owned(searched_items_text(items))))
+        });
+    let derived = search
+        .derived
+        .iter()
+        .map(|derived| (DERIVED, derived.field, Cow::Borrowed(derived.text.as_str())));
+    results.chain(derived)
+}
+
+/// The field a block's own part is read in: `None` for a result with items
+/// in `result_items`. Search reads that result through its [`RESULT_TEXT`]
+/// part.
+fn block_field(columns: &Columns<'_>, field: Option<SearchField>) -> Option<SearchField> {
+    field.filter(|_| columns.result_shape != Some(LOSSLESS_ARRAY))
+}
+
+/// The search text of a result with `items`: each text item without
+/// terminal codes, joined by line breaks.
+pub(super) fn searched_items_text(items: &[Value]) -> String {
+    items
+        .iter()
+        .filter_map(tool_result_item_text)
+        .map(without_terminal_codes)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Feeds `digest` what [`Writer::write`] stores of `blocks` and `search`'s
+/// fields of them.
 pub(super) fn digest(digest: &mut Digest, blocks: &[ContentBlock], search: &[Option<SearchField>]) {
     digest.number(Some(blocks.len() as i64));
     for (block, field) in blocks.iter().zip(search) {
@@ -96,10 +158,9 @@ pub(super) fn digest(digest: &mut Digest, blocks: &[ContentBlock], search: &[Opt
             digest.text(text);
         }
         let mut items = 0;
-        for item in result_items(block, &columns, *field) {
+        for item in result_items(block, &columns) {
             items += 1;
             digest.text(Some(item.kind));
-            digest.flag(Some(item.searched));
             digest.text(item.text);
             digest.text(item.item_type);
         }
@@ -110,27 +171,30 @@ pub(super) fn digest(digest: &mut Digest, blocks: &[ContentBlock], search: &[Opt
 /// A `result_items` row's columns.
 struct ItemColumns<'a> {
     kind: &'static str,
-    searched: bool,
     text: Option<&'a str>,
     item_type: Option<&'a str>,
 }
 
-/// The items `result_items` holds for `block`, whose part's columns are
-/// `columns` and whose search field is `field`: none unless the block is a
-/// result whose items the part stores.
-fn result_items<'a>(
-    block: &'a ContentBlock,
-    columns: &Columns<'_>,
-    field: Option<SearchField>,
-) -> impl Iterator<Item = ItemColumns<'a>> {
-    let items = match block {
+/// The items of `block` when it is a result with items in `result_items`.
+/// `columns` are the block's part's columns.
+fn stored_items<'a>(block: &'a ContentBlock, columns: &Columns<'_>) -> Option<&'a [Value]> {
+    match block {
         ContentBlock::ToolResult {
             content: Some(Value::Array(items)),
             ..
-        } if columns.result_shape == Some(LOSSLESS_ARRAY) => items.as_slice(),
-        _ => &[],
-    };
-    items.iter().map(move |value| {
+        } if columns.result_shape == Some(LOSSLESS_ARRAY) => Some(items),
+        _ => None,
+    }
+}
+
+/// The items `result_items` holds for `block`. `columns` are the block's
+/// part's columns.
+fn result_items<'a>(
+    block: &'a ContentBlock,
+    columns: &Columns<'_>,
+) -> impl Iterator<Item = ItemColumns<'a>> {
+    let items = stored_items(block, columns).unwrap_or_default();
+    items.iter().map(|value| {
         let (kind, text, item_type) = match value {
             Value::String(text) => ("string", Some(text.as_str()), None),
             Value::Object(object) => (
@@ -142,7 +206,6 @@ fn result_items<'a>(
         };
         ItemColumns {
             kind,
-            searched: field.is_some() && tool_result_item_text(value).is_some(),
             text,
             item_type,
         }
@@ -221,6 +284,24 @@ impl<'a> Columns<'a> {
     }
 }
 
+/// The kind of a part holding a search text no block holds as written.
+pub(in crate::history::sqlite_cache) const DERIVED: &str = "derived";
+/// The kind of a part holding the search text of a result with items in
+/// `result_items`.
+pub(in crate::history::sqlite_cache) const RESULT_TEXT: &str = "result-text";
+/// The kind of a sub-agent metadata part, outside every entry: a sub-agent
+/// transcript's text outside its spliced turns. Only `agent search` reads
+/// it.
+pub(in crate::history::sqlite_cache) const SUBAGENT_METADATA: &str = "subagent-metadata";
+/// The kinds of the parts only search reads: a display read leaves them out.
+const SEARCH_ONLY_KINDS: [&str; 3] = [DERIVED, RESULT_TEXT, SUBAGENT_METADATA];
+
+/// The text a part of a [`SEARCH_ONLY_KINDS`] kind stores for `text`:
+/// without its terminal codes, as search reads it.
+pub(in crate::history::sqlite_cache) fn search_only_text(text: &str) -> Cow<'_, str> {
+    split_terminal_codes(text).text
+}
+
 /// A result array whose every item is a string or a text item:
 /// `result_items` holds it.
 const LOSSLESS_ARRAY: &str = "array";
@@ -286,8 +367,10 @@ pub(super) fn read(
     let mut blocks: Blocks = HashMap::new();
     let mut statement = connection.prepare(&format!(
         "SELECT p.entry, p.id, p.kind, p.text, p.text_codes, p.call_id, p.name, p.tool, p.json, \
-         p.result_shape FROM parts p WHERE p.entry IN ({}) ORDER BY p.entry, p.part",
+         p.result_shape FROM parts p WHERE p.entry IN ({}) AND p.kind NOT IN ({}) \
+         ORDER BY p.entry, p.part",
         selected.ids,
+        SEARCH_ONLY_KINDS.map(|kind| format!("'{kind}'")).join(", "),
     ))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&selected.parameters))?;
     while let Some(row) = rows.next()? {

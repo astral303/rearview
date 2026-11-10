@@ -6,7 +6,6 @@ use crate::history::Conversation;
 use crate::history::parser::{
     normalize_full_text, normalize_whitespace, search_parts_of_entry, semantic_text_of_entry,
 };
-use crate::log_entry::LogEntry;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +14,6 @@ pub(crate) enum SearchField {
     Full,
     Agent,
     Thinking,
-    Leading,
     Supplement,
     Semantic,
 }
@@ -46,8 +44,6 @@ impl CachedSession {
             // transcripts alike.
             let subagents: HashSet<&Path> = row.subagents.iter().map(PathBuf::as_path).collect();
             let mut after = -1;
-            let mut summary = None;
-            let mut title = None;
             loop {
                 let batch = entries::read_search_batch(connection, session, places, after, window)?;
                 let Some(last) = batch.last_sequence else {
@@ -57,19 +53,6 @@ impl CachedSession {
                     batch.transcript.entries.into_iter().zip(batch.numbers)
                 {
                     let ordinal = number.map(|number| number.ordinal);
-                    match &entry {
-                        LogEntry::Summary { summary: text } if summary.is_none() => {
-                            summary = Some(text.clone())
-                        }
-                        LogEntry::AiTitle { ai_title } if !ai_title.trim().is_empty() => {
-                            summary = Some(ai_title.trim().to_owned())
-                        }
-                        LogEntry::CustomTitle { custom_title } => {
-                            title = (!custom_title.trim().is_empty())
-                                .then(|| custom_title.trim().to_owned())
-                        }
-                        _ => {}
-                    }
                     let spliced = record
                         .transcript
                         .as_deref()
@@ -107,15 +90,8 @@ impl CachedSession {
             if window.is_active() {
                 return Ok(());
             }
-            for text in [title, summary].into_iter().flatten() {
-                visit(SearchPart {
-                    ordinal: None,
-                    field: SearchField::Leading,
-                    text: normalize_whitespace(&text),
-                });
-            }
             let mut statement = connection.prepare(
-                "SELECT text FROM subagent_search_parts WHERE session = ?1 ORDER BY position",
+                "SELECT text FROM parts WHERE session = ?1 AND entry IS NULL ORDER BY part",
             )?;
             let mut parts = statement.query([session])?;
             while let Some(part) = parts.next()? {

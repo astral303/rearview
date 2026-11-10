@@ -9,11 +9,10 @@
 //! matches the stored thread of the same origin; a transcript the stored
 //! transcript of the same place: its root and its path below it.
 
-use super::rows::{LeadingTexts, SessionRows};
+use super::rows::SessionRows;
 use super::threads::ThreadOrigin;
 use super::write::{EntryPlace, RowIds, RowWriter, SearchPlace};
 use crate::error::Result;
-use crate::history::sqlite_cache::SearchField;
 use crate::history::sqlite_cache::roots::{StoredPath, WrittenPlaces};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
@@ -33,51 +32,14 @@ pub(in super::super) fn update(
 
 /// Makes the stored entries of `session` from `rows`' first sequence on the
 /// rows of `rows`, inside the caller's transaction. Every entry before it
-/// keeps its row, its message, its thread and its transcript, but for the
-/// title or the summary search reads moving into `rows`.
+/// keeps its row, its message, its thread and its transcript.
 pub(in super::super) fn update_tail(
     connection: &Connection,
     session: i64,
     places: &WrittenPlaces,
     rows: &SessionRows,
 ) -> Result<()> {
-    update_scope(connection, session, places, rows, Scope::Tail)?;
-    for sequence in &rows.superseded_leading {
-        connection
-            .prepare_cached(
-                "UPDATE entries SET search_field = NULL WHERE session = ?1 AND sequence = ?2",
-            )?
-            .execute(params![session, *sequence as i64])?;
-    }
-    Ok(())
-}
-
-/// The stored entries of `session` before `sequence` holding the title and
-/// the summary search reads.
-pub(in super::super) fn stored_leading(
-    connection: &Connection,
-    session: i64,
-    sequence: usize,
-) -> Result<LeadingTexts> {
-    let mut leading = LeadingTexts::default();
-    let mut statement = connection.prepare_cached(
-        "SELECT sequence, kind FROM entries WHERE session = ?1 AND search_field = ?2 \
-         AND sequence < ?3",
-    )?;
-    let mut found = statement.query(params![
-        session,
-        SearchField::Leading.code(),
-        sequence as i64
-    ])?;
-    while let Some(row) = found.next()? {
-        let sequence = row.get::<_, i64>(0)? as usize;
-        if row.get::<_, String>(1)? == "custom-title" {
-            leading.title = Some(sequence);
-        } else {
-            leading.summary = Some(sequence);
-        }
-    }
-    Ok(leading)
+    update_scope(connection, session, places, rows, Scope::Tail)
 }
 
 /// Makes `rows`, the rows of the session's leading entries, the stored
@@ -101,9 +63,6 @@ pub(in super::super) fn replace_leading(
         })?
         .collect::<rusqlite::Result<_>>()?;
     for (id, _) in stored.iter().skip(rows.entries.len()) {
-        connection
-            .prepare_cached("DELETE FROM search_texts WHERE entry = ?1")?
-            .execute([id])?;
         connection
             .prepare_cached("DELETE FROM entries WHERE id = ?1")?
             .execute([id])?;
@@ -378,7 +337,6 @@ struct StoredEntry {
     contributes: bool,
     position: i64,
     record_transcript: Option<i64>,
-    search_field: Option<i64>,
     digest: i64,
     child: Option<i64>,
     /// The index of the new entry at its place.
@@ -425,16 +383,16 @@ impl StoredEntries {
         // as a read gives it.
         let mut statement = connection.prepare_cached(
             "SELECT e.id, e.sequence, e.message, e.contributes, e.position, e.record_transcript, \
-             e.search_field, e.digest, e.record_line, \
-             COALESCE(e.child, e.record_transcript, t.transcript), e.child \
+             e.digest, e.record_line, COALESCE(e.child, e.record_transcript, t.transcript), \
+             e.child \
              FROM entries e LEFT JOIN messages m ON m.id = e.message \
              LEFT JOIN threads t ON t.id = m.thread WHERE e.session = ?1 AND e.sequence >= ?2 \
              ORDER BY e.sequence",
         )?;
         let mut found = statement.query(params![session, rows.first_sequence as i64])?;
         while let Some(row) = found.next()? {
-            let line: i64 = row.get(8)?;
-            let place = match row.get::<_, Option<i64>>(9)? {
+            let line: i64 = row.get(7)?;
+            let place = match row.get::<_, Option<i64>>(8)? {
                 Some(transcript) => transcripts.get(&transcript).map(|index| Some(*index)),
                 None => Some(None),
             };
@@ -451,9 +409,8 @@ impl StoredEntries {
                 contributes: row.get(3)?,
                 position: row.get(4)?,
                 record_transcript: row.get(5)?,
-                search_field: row.get(6)?,
-                digest: row.get(7)?,
-                child: row.get(10)?,
+                digest: row.get(6)?,
+                child: row.get(9)?,
                 matched: index,
             });
         }
@@ -601,9 +558,6 @@ fn update_entries(
         .filter(|entry| entry.matched.is_none())
     {
         connection
-            .prepare_cached("DELETE FROM search_texts WHERE entry = ?1")?
-            .execute([entry.id])?;
-        connection
             .prepare_cached("DELETE FROM entries WHERE id = ?1")?
             .execute([entry.id])?;
     }
@@ -637,7 +591,6 @@ fn update_entries(
             order
         }
     };
-    let leading = SearchField::Leading.code();
     for (entry, index) in kept.into_iter().chain(moved) {
         let row = &rows.entries[index];
         let place = EntryPlace::of(row, rows.sequence_of(index), ids);
@@ -650,7 +603,6 @@ fn update_entries(
             || entry.child != place.child
             || entry.contributes != row.contributes
             || entry.position != row.position
-            || entry.search_field != row.is_leading.then_some(leading)
         {
             writer.place_entry(row, &place, search, entry.id)?;
         }

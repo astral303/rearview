@@ -15,7 +15,7 @@ use crate::history::format::RecordLine;
 use crate::history::format::splice::{Spliced, SubagentThread, subagent_turns, walk_spliced};
 use crate::history::parser::{
     SubagentSearchPart, SubagentShare, adds_search_parts, fold_tail, folded_row,
-    parse_errors_of_lines, resumed_thread_fold, session_time, subagent_share,
+    parse_errors_of_lines, resumed_thread_fold, session_time, subagent_share, take_leading_titles,
 };
 use crate::history::path::CanonicalDirectories;
 use crate::history::provider::transcript_reads::resume as resume_read;
@@ -70,8 +70,8 @@ pub(crate) enum WholeRead {
     SubagentUnreadable,
     /// The session's files are unchanged, though its stamp is not.
     NoFileChanged,
-    /// The session's leading entries besides its custom title changed, such
-    /// as a title the agent generated.
+    /// The session's leading entries besides its titles changed, such as
+    /// Grok's model.
     LeadingChanged,
     /// A changed sub-agent changes a turn before the checkpoint beyond its
     /// content, or removes one.
@@ -102,7 +102,7 @@ impl WholeRead {
             Self::SubagentRemoved => "a sub-agent transcript was removed",
             Self::SubagentUnreadable => "a new sub-agent transcript could not be read",
             Self::NoFileChanged => "no file changed",
-            Self::LeadingChanged => "the session's title changed",
+            Self::LeadingChanged => "the session's leading entries changed",
             Self::TurnBeforeCheckpointChanged => "a sub-agent changed a turn before the checkpoint",
             Self::EntryBeforeCheckpoint => "a new entry sorts before the checkpoint",
             Self::ReplyAcrossCheckpoint => "a reply continues across the checkpoint",
@@ -346,11 +346,13 @@ fn leading_title(entries: &[(RecordLine, LogEntry)]) -> Option<String> {
     })
 }
 
-/// What the changed transcripts put after the checkpoint, and in place
+/// Entries the changed transcripts appended after the checkpoint or replaced
 /// before it.
 struct Placed {
+    /// The leading entries the cache stores: those besides the titles.
     leading: Vec<(RecordLine, LogEntry)>,
-    leading_title: Option<String>,
+    /// The titles [`take_leading_titles`] removes from the leading entries.
+    leading_titles: Vec<LogEntry>,
     tail: Vec<(RecordLine, LogEntry)>,
     in_place: Vec<InPlaceRow>,
     launch_calls: Vec<Option<String>>,
@@ -375,11 +377,11 @@ fn place(
     let linker = storage.thread_linker();
     let checkpoint = &resume.checkpoint;
     let own_read = own_window.map_or(&resume.files[0].read, |window| &window.read);
-    let leading = reader.leading_entries(&stub.locator, own_read)?;
+    let mut leading = reader.leading_entries(&stub.locator, own_read)?;
+    let leading_titles = take_leading_titles(&mut leading);
     if leading_digest(&leading) != checkpoint.leading_digest {
         return Ok(Err(WholeRead::LeadingChanged));
     }
-    let title = leading_title(&leading);
 
     // Link the windows, and read whole each thread the links change outside
     // its window.
@@ -650,7 +652,7 @@ fn place(
     }
     Ok(Ok(Placed {
         leading,
-        leading_title: title,
+        leading_titles,
         tail,
         in_place,
         launch_calls: link.launch_calls,
@@ -781,7 +783,7 @@ fn finish(
     let start = checkpoint.fold.clone().with_leading_entries_moved(moved);
     let (fold, next_fold) = fold_tail(
         &start,
-        placed.leading_title.as_deref(),
+        &placed.leading_titles,
         &placed.tail,
         &subagents,
         place.as_ref().map(|(sequence, _)| *sequence),

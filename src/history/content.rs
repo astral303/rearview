@@ -38,7 +38,6 @@ struct ContentBuilder {
     full: MessageTextBuilder,
     agent: MessageTextBuilder,
     thinking: MessageTextBuilder,
-    leading: Vec<String>,
     supplement: Vec<String>,
     semantic: Vec<String>,
     semantic_ranges: Vec<MessageRange>,
@@ -51,7 +50,6 @@ impl ContentBuilder {
             SearchField::Full => self.full.push(part.ordinal, part.text),
             SearchField::Agent => self.agent.push(part.ordinal, part.text),
             SearchField::Thinking => self.thinking.push(part.ordinal, part.text),
-            SearchField::Leading => self.leading.push(part.text),
             SearchField::Supplement => self.supplement.push(part.text),
             SearchField::Semantic => {
                 let ordinal = part.ordinal.expect("a semantic turn has a message");
@@ -69,19 +67,16 @@ impl ContentBuilder {
 
     fn finish(self, row: &mut Conversation) {
         let identity = |text: &str| text.to_owned();
-        (row.full_text, row.message_text_starts.full_text) = self.full.finish(
-            self.leading.iter().map(String::as_str),
-            row.message_count,
-            identity,
-        );
+        (row.full_text, row.message_text_starts.full_text) =
+            self.full.finish(row.message_count, identity);
         (
             row.agent_search_text,
             row.message_text_starts.agent_search_text,
-        ) = self.agent.finish([], row.message_count, identity);
+        ) = self.agent.finish(row.message_count, identity);
         (
             row.thinking_and_tool_call_text,
             row.message_text_starts.thinking_and_tool_call_text,
-        ) = self.thinking.finish([], row.message_count, identity);
+        ) = self.thinking.finish(row.message_count, identity);
         for text in self.supplement {
             push_separated(&mut row.agent_search_text, &text);
         }

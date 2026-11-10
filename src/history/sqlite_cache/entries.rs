@@ -26,7 +26,8 @@ use serde_json::Value;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
-pub(super) use diff::{replace_leading, rewrite_in_place, stored_leading, update, update_tail};
+pub(super) use diff::{replace_leading, rewrite_in_place, update, update_tail};
+pub(super) use parts::{DERIVED, RESULT_TEXT, SUBAGENT_METADATA, search_only_text};
 pub(super) use rows::{RowsStart, SessionRows};
 
 /// Entries a first write of a session writes per transaction, so a session
@@ -327,9 +328,13 @@ pub(crate) struct StoredEntries {
     pub(crate) transcript: TranscriptEntries,
     pub(crate) numbers: Vec<Option<crate::agent::message_numbering::Numbered>>,
     pub(super) last_sequence: Option<i64>,
+    /// The session row's title and summary: a title the agent keeps outside
+    /// the transcript doesn't have an entry.
+    pub(crate) custom_title: Option<String>,
+    pub(crate) summary: Option<String>,
 }
 
-/// What a read is for: the viewer's texts, with their terminal codes and the
+/// A read's purpose: the viewer's texts, with their terminal codes and the
 /// lines that did not parse, or search's, without either.
 #[derive(Clone, Copy)]
 pub(super) enum ReadPurpose {
@@ -492,6 +497,9 @@ pub(super) fn read_selected(
     } else {
         Vec::new()
     };
+    let (custom_title, summary) = connection
+        .prepare_cached("SELECT custom_title, summary FROM sessions WHERE id = ?1")?
+        .query_row([session], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(StoredEntries {
         transcript: TranscriptEntries {
             entries,
@@ -499,6 +507,8 @@ pub(super) fn read_selected(
         },
         numbers,
         last_sequence,
+        custom_title,
+        summary,
     })
 }
 

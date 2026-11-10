@@ -86,7 +86,9 @@ impl SessionFormat for CodexRolloutFormat {
         threads.retain(|subagent| !discarded.paths.contains(&*subagent.transcript));
         link_subagent_threads(&thread.projection.entries, &mut threads);
         let view = super::spliced(thread.projection, threads);
-        Ok(Some(TranscriptEntries::of_projection(view)))
+        Ok(Some(
+            TranscriptEntries::of_projection_without_leading_titles(view),
+        ))
     }
 }
 

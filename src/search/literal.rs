@@ -458,7 +458,7 @@ pub fn matches_all_literals(text: &str, literals: &[Literal]) -> bool {
 }
 
 /// True when each literal matches within one of the texts `agent search`
-/// reads: the session's `full_text`, `agent_search_text` and
+/// reads: the session's title, summary, `full_text`, `agent_search_text` and
 /// `thinking_and_tool_call_text`, and its project name. With `window` active,
 /// only the text of its messages inside the window, without the project name.
 pub fn agent_conversation_matches_all_literals(
@@ -469,12 +469,16 @@ pub fn agent_conversation_matches_all_literals(
     let fields: Vec<Cow<'_, str>> = if window.is_active() {
         conversation.texts_within(window).into_array().into()
     } else {
-        vec![
-            Cow::Borrowed(conversation.full_text.as_str()),
-            Cow::Borrowed(conversation.agent_search_text.as_str()),
-            Cow::Borrowed(conversation.thinking_and_tool_call_text.as_str()),
-            Cow::Borrowed(conversation.project_name.as_deref().unwrap_or_default()),
-        ]
+        conversation
+            .leading_texts()
+            .chain([
+                conversation.full_text.as_str(),
+                conversation.agent_search_text.as_str(),
+                conversation.thinking_and_tool_call_text.as_str(),
+                conversation.project_name.as_deref().unwrap_or_default(),
+            ])
+            .map(Cow::Borrowed)
+            .collect()
     };
     literals
         .iter()
@@ -514,7 +518,12 @@ pub fn exact_fallback(
 /// across two of them.
 fn literal_text(conversation: &Conversation, include_agent_text: bool) -> String {
     let mut text = String::new();
-    push_separated(&mut text, &conversation.full_text);
+    for piece in conversation
+        .leading_texts()
+        .chain([conversation.full_text.as_str()])
+    {
+        push_separated(&mut text, piece);
+    }
     if include_agent_text {
         push_separated(&mut text, &conversation.agent_search_text);
         push_separated(&mut text, &conversation.thinking_and_tool_call_text);

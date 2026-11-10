@@ -24,8 +24,9 @@ impl Counts {
 
 /// `query`'s counts over the search texts of each conversation at `indices`,
 /// each of which the session cache holds, by index: from the texts held in
-/// memory, or else from the cache. Without a time window, a literal in a
-/// conversation's project name counts as found.
+/// memory, or else from the cache. Without a time window, the counts also
+/// hold the row's title and summary, and a literal in a conversation's
+/// project name counts as found.
 pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     indices: &[usize],
@@ -51,8 +52,12 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
     counts.extend(count_stored(conversations, &stored, surface, query)?);
     let (_, window) = surface.stored_fields();
     if !window.is_active() {
+        let mut matcher = query.matcher();
         for (index, counts) in &mut counts {
             let conversation = conversations[*index].borrow();
+            for text in conversation.leading_texts() {
+                matcher.count(text, counts);
+            }
             let project = conversation.project_name.as_deref().unwrap_or_default();
             for (found, literal) in counts.literals.iter_mut().zip(query.literals()) {
                 *found |= literal.matches(project);
@@ -555,10 +560,7 @@ mod tests {
     ) -> Option<String> {
         let evidence = evidence?;
         crate::search::preview::build_context_segments_from_ranges(
-            evidence
-                .source_text
-                .as_deref()
-                .unwrap_or(&conversation.full_text),
+            &evidence.texts(conversation),
             &evidence.context_ranges,
             80,
         )

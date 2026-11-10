@@ -5,8 +5,6 @@
 //! when it built them from the entry.
 
 use super::parts;
-use crate::agent::sanitize::without_terminal_codes;
-use crate::agent::transcript::tool_result_item_text;
 use crate::history::parser::{normalize_full_text, search_parts_of_entry};
 use crate::history::sqlite_cache::SearchField;
 use crate::log_entry::{ContentBlock, LogEntry};
@@ -104,14 +102,7 @@ impl<'a> BlockText<'a> {
             ContentBlock::ToolResult {
                 content: Some(Value::Array(items)),
                 ..
-            } if parts::stores_items(items) => Cow::Owned(
-                items
-                    .iter()
-                    .filter_map(tool_result_item_text)
-                    .map(without_terminal_codes)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            } if parts::stores_items(items) => Cow::Owned(parts::searched_items_text(items)),
             _ => return None,
         };
         let searched = normalize_full_text(&stored);

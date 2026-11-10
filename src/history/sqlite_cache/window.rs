@@ -343,9 +343,9 @@ fn stored_search_parts(
     session: i64,
 ) -> Result<Vec<(PathBuf, String)>> {
     let mut statement = connection.prepare_cached(
-        "SELECT f.root, f.path, p.text FROM subagent_search_parts p \
+        "SELECT f.root, f.path, p.text FROM parts p \
          JOIN session_files f ON f.session = p.session AND f.position = p.file_position \
-         WHERE p.session = ?1 ORDER BY p.position",
+         WHERE p.session = ?1 AND p.entry IS NULL ORDER BY p.part",
     )?;
     let mut rows = statement.query([session])?;
     let mut parts = Vec::new();

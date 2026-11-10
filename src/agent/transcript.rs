@@ -327,12 +327,23 @@ impl AgentTranscript {
             .iter()
             .map(|line| line.line_number)
             .collect();
-        Self::from_entries_with_numbers(
+        Ok(Self::from_entries_with_numbers(
             path,
             stored.transcript.entries,
             malformed,
             Some(stored.numbers),
-        )
+        )?
+        .titled(stored.custom_title, stored.summary))
+    }
+
+    /// This transcript under its session row's `custom_title` and `summary`.
+    /// The entries do not hold a title the agent keeps outside the
+    /// transcript.
+    pub(crate) fn titled(mut self, custom_title: Option<String>, summary: Option<String>) -> Self {
+        let shown = |text: Option<String>| text.filter(|text| !text.trim().is_empty());
+        self.custom_title = shown(custom_title);
+        self.summary = shown(summary);
+        self
     }
 
     fn from_entries_with_numbers(

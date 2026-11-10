@@ -42,11 +42,17 @@ struct RowFacts {
     /// True once a non-empty part entered the row's search text.
     has_search_text: bool,
     cwd: Option<PathBuf>,
+    /// The first summary after the leading entries, or a later AI title in
+    /// its place.
     summary: Option<String>,
-    /// The title the session's leading entries name: those a resumed read
-    /// derives again on every read, such as a title kept outside the
-    /// transcript.
+    /// True when `summary` is an AI title's. It replaces the leading summary.
+    is_summary_ai_title: bool,
+    /// The leading entries' custom title, such as a title kept outside the
+    /// transcript. A resumed read sets it again on every read.
     leading_title: Option<String>,
+    /// The leading entries' summary, such as a title the agent generated and
+    /// keeps outside the transcript.
+    leading_summary: Option<String>,
     /// The last title an entry after the leading ones set: `Some(None)` for
     /// a blank one, which clears the title.
     entry_title: Option<Option<String>>,
@@ -175,13 +181,6 @@ impl FoldCheckpoint {
 
     pub(crate) fn numbering(&self) -> &NumberingCheckpoint {
         &self.numbering
-    }
-
-    /// True when an entry before the checkpoint, past the leading ones,
-    /// names a title: the session's title is then that entry's, whatever
-    /// the leading entries name.
-    pub(crate) fn has_entry_title(&self) -> bool {
-        self.facts.entry_title.is_some()
     }
 
     /// This checkpoint with the transcript of each thread it numbers
@@ -433,30 +432,46 @@ impl RowFold {
         }
     }
 
-    pub(crate) fn set_summary(&mut self, summary: &str) {
-        let trimmed = summary.trim();
+    /// Sets the summary to `ai_title`, an AI title entry's text, unless it is
+    /// blank. It replaces the leading summary and every summary entry's.
+    pub(crate) fn set_summary(&mut self, ai_title: &str) {
+        let trimmed = ai_title.trim();
         if !trimmed.is_empty() {
             self.facts.summary = Some(trimmed.to_owned());
+            self.facts.is_summary_ai_title = true;
         }
     }
 
-    /// Set the title a custom title entry names; `leading` for one of the
-    /// session's leading entries.
-    pub(crate) fn set_title(&mut self, title: &str, leading: bool) {
-        let trimmed = title.trim();
-        let title = (!trimmed.is_empty()).then(|| trimmed.to_owned());
-        if leading {
-            self.facts.leading_title = title;
-        } else {
-            self.facts.entry_title = Some(title);
+    /// Set the title a custom title entry names.
+    pub(crate) fn set_title(&mut self, title: &str) {
+        self.facts.entry_title = Some(shown_title(title));
+    }
+
+    /// Sets the leading title from `entry` when it is a custom title, and the
+    /// leading summary when it is an AI title. A later custom title replaces
+    /// the leading title, and a later AI title the leading summary.
+    pub(crate) fn add_leading_title(&mut self, entry: &crate::log_entry::LogEntry) {
+        use crate::log_entry::LogEntry;
+        match entry {
+            LogEntry::CustomTitle { custom_title } => {
+                self.facts.leading_title = shown_title(custom_title);
+            }
+            LogEntry::AiTitle { ai_title } => {
+                if let Some(summary) = shown_title(ai_title) {
+                    self.facts.leading_summary = Some(summary);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Replace the title of the session's leading entries with `title`'s.
-    pub(crate) fn replace_leading_title(&mut self, title: Option<&str>) {
+    /// Replaces the leading title and summary with those `titles` set, the
+    /// title entries [`super::parser::take_leading_titles`] returns.
+    pub(crate) fn replace_leading_titles(&mut self, titles: &[crate::log_entry::LogEntry]) {
         self.facts.leading_title = None;
-        if let Some(title) = title {
-            self.set_title(title, true);
+        self.facts.leading_summary = None;
+        for title in titles {
+            self.add_leading_title(title);
         }
     }
 
@@ -467,8 +482,15 @@ impl RowFold {
         }
     }
 
+    /// The summary as the entries set it in order, the leading ones first.
     pub(crate) fn summary(&self) -> Option<&String> {
-        self.facts.summary.as_ref()
+        if self.facts.is_summary_ai_title {
+            return self.facts.summary.as_ref();
+        }
+        self.facts
+            .leading_summary
+            .as_ref()
+            .or(self.facts.summary.as_ref())
     }
 
     /// The token total so far.
@@ -511,7 +533,7 @@ impl RowFold {
             preview_first,
             preview_last,
             cwd: self.facts.cwd.clone(),
-            summary: self.facts.summary.clone(),
+            summary: self.summary().cloned(),
             custom_title: self.custom_title().cloned(),
             model: self.facts.model.clone(),
             total_tokens: self.total_tokens(),
@@ -549,6 +571,12 @@ impl RowFold {
                 .finish_after(count, (1..=resumed_at).map(|ordinal| stored.span(ordinal))),
         }
     }
+}
+
+/// `title` trimmed; `None` for a blank one, which clears the title.
+fn shown_title(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn usage_total(usage: &TokenUsage) -> u64 {

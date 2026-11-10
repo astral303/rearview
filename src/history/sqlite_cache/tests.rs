@@ -92,19 +92,7 @@ fn source_record(source: Source, path: &Path) -> (SessionRecord, SessionRoot) {
 /// `session`'s stub, as discovery would find its transcripts at `modified`.
 pub(super) fn stub_of(session: &AgentSession, modified_secs: u64) -> SessionStub {
     let fingerprint = if session.row.source == Source::OpenCode {
-        let root = root_of(session);
-        let stamp = session
-            .row
-            .source
-            .provider()
-            .storage()
-            .current_fingerprint(&root, &session.row.path)
-            .unwrap()
-            .unwrap();
-        Fingerprint {
-            size: stamp.file_size,
-            modified: Some(UNIX_EPOCH + Duration::new(stamp.mtime_secs, stamp.mtime_nsecs)),
-        }
+        opencode_fingerprint(&root_of(session), &session.row.path)
     } else {
         Fingerprint {
             size: 1_000,
@@ -116,6 +104,21 @@ pub(super) fn stub_of(session: &AgentSession, modified_secs: u64) -> SessionStub
         subagents: session.row.subagents.clone(),
         cache_key: CACHE_KEY.to_owned(),
         fingerprint,
+    }
+}
+
+/// The stamp of the OpenCode session at `locator` under `root`, as its
+/// storage reads it from the database.
+pub(super) fn opencode_fingerprint(root: &SessionRoot, locator: &Path) -> Fingerprint {
+    let stamp = Source::OpenCode
+        .provider()
+        .storage()
+        .current_fingerprint(root, locator)
+        .unwrap()
+        .unwrap();
+    Fingerprint {
+        size: stamp.file_size,
+        modified: Some(UNIX_EPOCH + Duration::new(stamp.mtime_secs, stamp.mtime_nsecs)),
     }
 }
 
@@ -201,19 +204,23 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(malformed_details(&read), malformed_details(&expected));
-        assert_eq!(
-            canonical_message_times(
-                AgentTranscript::from_entries(&row.path, read.entries.clone(), malformed(&read))
-                    .unwrap()
-            ),
-            canonical_message_times(
-                AgentTranscript::from_entries(
-                    &row.path,
-                    expected.entries.clone(),
-                    malformed(&expected)
-                )
+        // A title the agent keeps outside the transcript doesn't have an
+        // entry: the transcript reads it from the session row, as a numbered
+        // read does.
+        let read_transcript =
+            AgentTranscript::from_entries(&row.path, read.entries.clone(), malformed(&read))
                 .unwrap()
-            ),
+                .titled(restored.custom_title.clone(), restored.summary.clone());
+        let expected_transcript = AgentTranscript::from_entries(
+            &row.path,
+            expected.entries.clone(),
+            malformed(&expected),
+        )
+        .unwrap()
+        .titled(row.custom_title.clone(), row.summary.clone());
+        assert_eq!(
+            canonical_message_times(read_transcript),
+            canonical_message_times(expected_transcript),
             "{:?} agent messages",
             row.source,
         );

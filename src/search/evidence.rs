@@ -3,6 +3,7 @@ use crate::search::byte_search::{AsciiCaselessFinder, NonAsciiCapitals};
 use crate::search::lexical::{SearchTextsInMemory, SessionSearchTexts};
 use crate::search::literal::Literal;
 use crate::search::query::ParsedQuery;
+use crate::search::separated_texts::SeparatedTexts;
 use crate::text_match::{is_word_start, normalize_for_search};
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -10,10 +11,23 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LexicalEvidence {
-    /// The text `context_ranges` index; `None` for the conversation's
-    /// `full_text`.
-    pub source_text: Option<Arc<str>>,
+    /// The row's title and summary as the evidence read them: a refresh can
+    /// retitle the row before the evidence is built again.
+    leading: Vec<String>,
+    /// The session's other texts, shared with the texts held in memory;
+    /// `None` for the conversation's `full_text`.
+    body: Option<Arc<str>>,
+    /// Ranges in `leading`, then `body`, each after a separator.
     pub context_ranges: Vec<(usize, usize)>,
+}
+
+impl LexicalEvidence {
+    /// The texts `context_ranges` index, `conversation` being the row the
+    /// evidence was built for.
+    pub(crate) fn texts<'a>(&'a self, conversation: &'a Conversation) -> SeparatedTexts<'a> {
+        let body = self.body.as_deref().unwrap_or(&conversation.full_text);
+        SeparatedTexts::new(self.leading.iter().map(String::as_str).chain([body]))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -101,9 +115,10 @@ pub fn build_session_list_evidence<C: Borrow<Conversation>>(
         .collect()
 }
 
-/// The evidence for `conversation` in its search texts: `texts`, those held
-/// in memory, or else the texts its copy in the session cache holds, read
-/// now. A conversation the cache does not hold reads its `full_text`.
+/// The evidence for `conversation` in its search texts: its row's title and
+/// summary, then `texts`, those held in memory, or else the texts its copy
+/// in the session cache holds, read now. A conversation the cache doesn't
+/// hold reads its `full_text` in place of `texts`.
 pub fn build_lexical_evidence(
     conversation: &Conversation,
     texts: Option<&SessionSearchTexts>,
@@ -122,12 +137,15 @@ pub fn build_lexical_evidence(
         }
         (None, None) => None,
     };
-    let full_text = texts.map_or(conversation.full_text.as_str(), |texts| texts.joined());
-    let ranges = select_context_ranges(full_text, &conversation.preview, &specs)?;
-    Some(LexicalEvidence {
-        source_text: texts.map(|texts| Arc::clone(texts.joined())),
-        context_ranges: ranges,
-    })
+    let mut evidence = LexicalEvidence {
+        leading: conversation.leading_texts().map(str::to_owned).collect(),
+        body: texts.map(|texts| Arc::clone(texts.joined())),
+        context_ranges: Vec::new(),
+    };
+    let ranges =
+        select_context_ranges(&evidence.texts(conversation), &conversation.preview, &specs)?;
+    evidence.context_ranges = ranges;
+    Some(evidence)
 }
 
 fn evidence_specs(parsed: &ParsedQuery) -> Vec<EvidenceSpec> {
@@ -176,7 +194,7 @@ fn dedupe_specs(specs: &[EvidenceSpec]) -> Vec<EvidenceSpec> {
 }
 
 fn select_context_ranges(
-    full_text: &str,
+    full_text: &SeparatedTexts<'_>,
     preview: &str,
     specs: &[EvidenceSpec],
 ) -> Option<Vec<(usize, usize)>> {
@@ -195,7 +213,7 @@ fn select_context_ranges(
     }
 
     if missing_count == 0 {
-        let preview_hit_count = find_all_spec_hits(preview, specs).len();
+        let preview_hit_count = find_all_spec_hits(&SeparatedTexts::new([preview]), specs).len();
         if all_hits.len() <= preview_hit_count {
             return None;
         }
@@ -209,7 +227,7 @@ fn select_context_ranges(
 }
 
 pub(crate) fn select_hidden_context_ranges(
-    full_text: &str,
+    full_text: &SeparatedTexts<'_>,
     hits: &[(usize, usize, usize)],
     missing_mask: u64,
     missing_count: u32,
@@ -234,7 +252,7 @@ pub(crate) fn select_hidden_context_ranges(
             let new_span = new_end.saturating_sub(last.start);
             if close_enough && new_span <= max_cluster_span_bytes {
                 if term_idx != last.last_term_idx && start >= last.last_hit_end {
-                    let gap = &full_text[last.last_hit_end..start];
+                    let gap = full_text.slice(last.last_hit_end..start);
                     if !gap.is_empty() && gap.chars().all(|c| !c.is_alphanumeric()) {
                         last.adjacent_pairs += 1;
                     }
@@ -315,14 +333,18 @@ pub(crate) fn select_hidden_context_ranges(
     )
 }
 
-fn find_all_spec_hits(text: &str, specs: &[EvidenceSpec]) -> Vec<TermHit> {
+/// Every spec's hits in `texts`, sorted by start, each text searched on its
+/// own: a hit doesn't cross a separator.
+fn find_all_spec_hits(texts: &SeparatedTexts<'_>, specs: &[EvidenceSpec]) -> Vec<TermHit> {
     let mut all_hits = Vec::new();
     for (term_idx, spec) in specs.iter().enumerate() {
-        all_hits.extend(spec.ranges(text).into_iter().map(|(start, end)| TermHit {
-            start,
-            end,
-            term_idx,
-        }));
+        for (offset, text) in texts.texts() {
+            all_hits.extend(spec.ranges(text).into_iter().map(|(start, end)| TermHit {
+                start: offset + start,
+                end: offset + end,
+                term_idx,
+            }));
+        }
     }
     all_hits.sort_unstable_by_key(|hit| hit.start);
     all_hits
@@ -529,6 +551,44 @@ mod tests {
             ] {
                 assert_term_ranges_match_reading_each_character(text, row.source.label());
             }
+        }
+    }
+
+    #[test]
+    fn titled_rows_context_line_is_that_of_its_titles_joined_ahead_of_its_text() {
+        let body = "a body that mentions deepgram, then audio_generation and plans";
+        let mut titled = conversation("unrelated preview", body);
+        titled.custom_title = Some("Deepgram plans".to_owned());
+        titled.summary = Some("audio generation notes".to_owned());
+        let mut joined_text = String::new();
+        for text in ["Deepgram plans", "audio generation notes", body] {
+            crate::history::message_texts::push_separated(&mut joined_text, text);
+        }
+        let joined = conversation("unrelated preview", &joined_text);
+        let line = |row: &Conversation, query: &str| {
+            let evidence = build_lexical_evidence(row, None, &ParsedQuery::parse(query))?;
+            crate::search::preview::build_context_segments_from_ranges(
+                &evidence.texts(row),
+                &evidence.context_ranges,
+                40,
+            )
+        };
+
+        for query in [
+            "deepgram",
+            "plans",
+            "notes body",
+            "generation",
+            "\"audio_generation\"",
+            "plans audio",
+        ] {
+            let expected = line(&joined, query);
+            assert!(expected.is_some(), "{query:?} finds a context line");
+            assert_eq!(
+                line(&titled, query),
+                expected,
+                "{query:?}: the context line reads the titles ahead of the text"
+            );
         }
     }
 

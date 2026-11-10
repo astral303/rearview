@@ -571,9 +571,8 @@ impl CatalogueRow {
             .collect()
     }
 
-    /// The row's sub-agent transcripts' `subagent_search_parts` rows of
-    /// `parts`, keyed by the place of the transcript holding each, which
-    /// `keys` gives.
+    /// The sub-agent metadata parts of `parts`, each keyed by its
+    /// transcript's file in `keys`.
     pub(super) fn search_part_rows(
         keys: &CatalogueKeys,
         parts: &[SubagentSearchPart],
@@ -583,11 +582,10 @@ impl CatalogueRow {
             .map(|part| PositionalRow {
                 key: keys.files.get(part.file_position).cloned(),
                 values: vec![
+                    super::entries::SUBAGENT_METADATA.to_owned().into(),
+                    super::SearchField::Supplement.code().into(),
                     (part.file_position as i64).into(),
-                    // Only search reads these texts, without terminal codes,
-                    // so their codes are dropped.
-                    crate::agent::sanitize::split_terminal_codes(&part.text)
-                        .text
+                    super::entries::search_only_text(&part.text)
                         .into_owned()
                         .into(),
                 ],

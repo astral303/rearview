@@ -75,12 +75,12 @@ fn message_links_its_records_and_keeps_its_millisecond_span() {
         .connection
         .query_row(
             "SELECT COUNT(*) FROM parts p JOIN entries e ON e.id=p.entry \
-         JOIN messages m ON m.id=e.message WHERE m.ordinal=2",
+         JOIN messages m ON m.id=e.message WHERE m.ordinal=2 AND p.kind <> 'derived'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(linked_parts, 3);
+    assert_eq!(linked_parts, 3, "message 2's entries hold its three blocks");
     assert_eq!(
         cache
             .connection

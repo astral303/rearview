@@ -7,6 +7,7 @@ pub mod literal;
 pub mod mode;
 pub mod preview;
 pub mod query;
+pub(crate) mod separated_texts;
 #[cfg(test)]
 pub mod test_fixtures;
 

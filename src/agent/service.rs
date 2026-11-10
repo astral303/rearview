@@ -442,12 +442,20 @@ pub struct AgentService {
     >,
     bounded_transcripts:
         RefCell<HashMap<(PathBuf, usize, usize), agent::transcript::AgentTranscript>>,
+    /// The title and summary of each target, by path, as the command's read
+    /// of it listed them or as its agent keeps them outside the transcript.
+    /// A transcript's own are its last parse's: a name kept outside the
+    /// transcript can change without the transcript.
+    target_titles: RefCell<HashMap<PathBuf, TitleAndSummary>>,
     /// The stale sessions the command has met so far; the command prints
     /// them in one record when it renders.
     stale_coverage: RefCell<Option<StaleCoverage>>,
     perf: CommandPerf,
     environment: history::Environment,
 }
+
+/// A session's custom title and summary.
+type TitleAndSummary = (Option<String>, Option<String>);
 
 pub fn execute(command: AgentCommand, environment: history::Environment) -> Result<String> {
     AgentService::new(environment).execute(command)
@@ -613,14 +621,16 @@ type CopyCurrency = fn(
 ) -> Result<Option<history::sqlite_cache::Currency>>;
 
 /// A targeted read of one session as a command keeps it for its key and
-/// its reads: without the listed row's texts.
+/// its reads: without the listed row's search texts.
 enum TargetRead {
-    /// The read listed the session: the row's address, sub-agents and
-    /// publication of its copy.
+    /// The read listed the session: the row's address, sub-agents,
+    /// publication of its copy, and title and summary.
     Listed {
         address: history::sqlite_cache::SessionAddress,
         subagents: Vec<PathBuf>,
         publication: history::sqlite_cache::Publication,
+        custom_title: Option<String>,
+        summary: Option<String>,
         unwritten: history::provider::UnwrittenParse,
     },
     /// The read did not list the session.
@@ -639,6 +649,8 @@ impl TargetRead {
                     .expect("a row a targeted read lists has its cache address"),
                 subagents: row.subagents,
                 publication: row.publication,
+                custom_title: row.custom_title,
+                summary: row.summary,
                 unwritten,
             },
             (read, unwritten) => Self::Unlisted { read, unwritten },
@@ -652,6 +664,7 @@ impl AgentService {
         Self {
             transcripts: RefCell::default(),
             bounded_transcripts: RefCell::default(),
+            target_titles: RefCell::default(),
             stale_coverage: RefCell::default(),
             perf: CommandPerf::new(Arc::clone(environment.clock())),
             environment,
@@ -779,6 +792,9 @@ impl AgentService {
             }
             history::sqlite_cache::OperationAccess::Owner(_) => Vec::new(),
             history::sqlite_cache::OperationAccess::AsIs => {
+                for target in &unread {
+                    self.hold_outside_title(target, keyed);
+                }
                 unread.iter().map(|target| (*target).clone()).collect()
             }
         };
@@ -898,6 +914,8 @@ impl AgentService {
                 address,
                 subagents,
                 publication,
+                custom_title,
+                summary,
                 unwritten,
             } => {
                 let key = agent::refs::AgentConversationKey {
@@ -906,6 +924,9 @@ impl AgentService {
                     publication,
                     ..target.clone()
                 };
+                self.target_titles
+                    .borrow_mut()
+                    .insert(key.path.clone(), (custom_title, summary));
                 if let history::provider::UnwrittenParse::Entries(entries) = unwritten {
                     self.keep_parsed_transcript(&key, entries);
                 }
@@ -915,6 +936,44 @@ impl AgentService {
                 self.keep_unlisted_read(operation, target, read, unwritten)?;
                 Ok(target.clone())
             }
+        }
+    }
+
+    /// Holds the title `target`'s agent keeps outside its transcript, read
+    /// from the target's own root. The command calls it for a target it
+    /// reads as the cache holds it: the copy's title is its last parse's.
+    fn hold_outside_title(&self, target: &agent::refs::AgentConversationKey, keyed: &KeyedReads) {
+        let storage = self
+            .environment
+            .storages()
+            .iter()
+            .find(|storage| storage.source() == target.source);
+        let root = keyed
+            .roots
+            .get(&target.source)
+            .and_then(|roots| roots.iter().find(|root| root.holds(&target.path)));
+        let (Some(storage), Some(root)) = (storage, root) else {
+            return;
+        };
+        if let Some(title) = storage.external_titles(root).remove(&target.session_id) {
+            self.target_titles
+                .borrow_mut()
+                .insert(target.path.clone(), title.as_title_and_summary());
+        }
+    }
+
+    /// `transcript`, the transcript of `key`'s session, under the title and
+    /// summary the command holds for the session, when it holds them.
+    fn titled_as_held(
+        &self,
+        key: &agent::refs::AgentConversationKey,
+        transcript: agent::transcript::AgentTranscript,
+    ) -> agent::transcript::AgentTranscript {
+        match self.target_titles.borrow().get(&key.path) {
+            Some((custom_title, summary)) => {
+                transcript.titled(custom_title.clone(), summary.clone())
+            }
+            None => transcript,
         }
     }
 
@@ -1069,7 +1128,7 @@ impl AgentService {
         }
         let cache_key = (key.path.clone(), range.start, range.end);
         if let Some(transcript) = self.bounded_transcripts.borrow().get(&cache_key) {
-            return Ok(transcript.clone());
+            return Ok(self.titled_as_held(key, transcript.clone()));
         }
         let find_cached = || {
             history::sqlite_cache::find_cached_session_as_is_without_waiting(
@@ -1095,7 +1154,7 @@ impl AgentService {
         self.bounded_transcripts
             .borrow_mut()
             .insert(cache_key, transcript.clone());
-        Ok(transcript)
+        Ok(self.titled_as_held(key, transcript))
     }
 
     /// Runs `command`, writing `protocol agent-progress` records to stderr
@@ -1129,16 +1188,22 @@ impl AgentService {
         key: &agent::refs::AgentConversationKey,
     ) -> Result<agent::transcript::AgentTranscript> {
         let path: &Path = &key.path;
-        if let Some(cached) = self.transcripts.borrow().get(path) {
-            return cached.clone().map_err(AppError::from);
-        }
-        let loaded = self
-            .perf
-            .time_transcript_parse(key, || self.read_transcript(key));
-        self.transcripts
-            .borrow_mut()
-            .insert(path.to_path_buf(), loaded.clone());
-        loaded.map_err(AppError::from)
+        let held = self.transcripts.borrow().get(path).cloned();
+        let loaded = match held {
+            Some(held) => held,
+            None => {
+                let loaded = self
+                    .perf
+                    .time_transcript_parse(key, || self.read_transcript(key));
+                self.transcripts
+                    .borrow_mut()
+                    .insert(path.to_path_buf(), loaded.clone());
+                loaded
+            }
+        };
+        loaded
+            .map(|transcript| self.titled_as_held(key, transcript))
+            .map_err(AppError::from)
     }
 
     /// Keeps `transcripts` for later reads in this command.
@@ -4777,6 +4842,127 @@ mod tests {
         assert_eq!(admitted_reads::count(&locator) - before, 1);
     }
 
+    /// `agent within` of a session renamed outside its unchanged transcript
+    /// after its copy was written shows the name the list shows, whether the
+    /// command keeps the cache or reads it while another rearview keeps it.
+    #[test]
+    fn within_of_session_renamed_outside_its_transcript_shows_new_name() {
+        let mut wrong = Vec::new();
+        for source in [
+            history::Source::Codex,
+            history::Source::Kimi,
+            history::Source::Grok,
+        ] {
+            let fixture = history::provider::contract_tests::registered_fixtures()
+                .into_iter()
+                .find(|fixture| fixture.provider().source() == source)
+                .unwrap();
+            let home = tempfile::tempdir().unwrap();
+            fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+            let [stub] = <[_; 1]>::try_from(fixture.discover_under(home.path())).unwrap();
+            let locator = stub.locator;
+            let rename = |title: &str| {
+                fixture
+                    .renamer()
+                    .rename_session(
+                        crate::history::FOR_FIXTURES,
+                        &locator,
+                        title,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap();
+            };
+            rename("Zebrafish plans");
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            let run = |args: &[&str]| {
+                AgentService::new(test_environment(vec![storage], Some(cache.path())))
+                    .execute(agent_command(args))
+                    .unwrap_or_else(crate::error_report)
+            };
+            let sessions = run(&["sessions", "--all"]);
+            let reference = sessions
+                .split_whitespace()
+                .find_map(|atom| atom.strip_prefix("ref="))
+                .expect("agent sessions lists the session")
+                .to_owned();
+            rename("Yakety release");
+
+            let within = ["within", &reference, "the"];
+            let kept = run(&within);
+            let other_refresh = history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
+                &history::CacheBase::new(
+                    cache.path(),
+                    history::ProcessIdentity::default(),
+                    Arc::new(TestClock::default()),
+                    SystemCanonicaliser::shared(),
+                ),
+            )
+            .unwrap();
+            let read_as_is = run(&within);
+            drop(other_refresh);
+
+            for (access, output) in [
+                ("keeping the cache", kept),
+                ("reading the cache as it is", read_as_is),
+            ] {
+                if !output.contains("Yakety release") || output.contains("Zebrafish") {
+                    wrong.push(format!(
+                        "{source:?}, {access}: the hits show the new name:\n{output}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// When the write to an empty cache fails, `agent within` titles the hits
+    /// from the read's row, the title kept outside the transcript included.
+    #[test]
+    fn within_of_session_whose_write_fails_prints_what_its_copy_prints() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let home = tempfile::tempdir().unwrap();
+            fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let run = |cache: &Path, args: &[&str]| {
+                AgentService::new(test_environment(vec![storage], Some(cache)))
+                    .execute(agent_command(args))
+                    .unwrap_or_else(crate::error_report)
+            };
+            let cached = crate::tui::claude_home::admitted_cache();
+            let sessions = run(cached.path(), &["sessions", "--all"]);
+            let reference = sessions
+                .split_whitespace()
+                .find_map(|atom| atom.strip_prefix("ref="))
+                .expect("agent sessions lists the session")
+                .to_owned();
+            let within = ["within", &reference, "the"];
+            let uncached = crate::tui::claude_home::admitted_cache();
+            let failing = fail_the_first_data_commit(uncached.path(), || {});
+
+            let from_parse = run(uncached.path(), &within);
+            drop(failing);
+            let from_copy = run(cached.path(), &within);
+
+            let source = fixture.provider().source();
+            if from_parse != from_copy {
+                wrong.push(format!(
+                    "{source:?}: the parse prints what the copy prints; the parse:\n{from_parse}\n\
+                     the copy:\n{from_copy}"
+                ));
+            }
+            if !from_copy.contains("\ntitle ") {
+                wrong.push(format!(
+                    "{source:?}: the query finds a titled hit:\n{from_copy}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
     /// `agent read` of each provider's session without a row reads the
     /// transcript once on an empty cache, and prints what it printed then
     /// when read again from the cache.
@@ -5800,6 +5986,8 @@ mod tests {
                     publication: Publication::Published {
                         generation: published,
                     },
+                    custom_title: None,
+                    summary: None,
                     unwritten: history::provider::UnwrittenParse::Nothing,
                 },
             );

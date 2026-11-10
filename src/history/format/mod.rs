@@ -208,7 +208,8 @@ pub trait SessionFormat: Sync {
         path: &Path,
         subagents: &[PathBuf],
     ) -> Result<Option<TranscriptEntries>> {
-        Ok(view_projection(self, permit, path, subagents)?.map(TranscriptEntries::of_projection))
+        Ok(view_projection(self, permit, path, subagents)?
+            .map(TranscriptEntries::of_projection_without_leading_titles))
     }
 }
 

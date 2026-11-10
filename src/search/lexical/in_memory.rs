@@ -6,8 +6,7 @@ use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
-    CachedSession, CopyKey, ReadOrder, ScannedRow, SearchField, SearchedFields, TextVisitor,
-    scan_search_texts,
+    CachedSession, CopyKey, ReadOrder, ScannedRow, SearchedFields, TextVisitor, scan_search_texts,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -17,9 +16,10 @@ use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 
 /// One session's search texts in the session list's fields, as the session
-/// cache stores them: the title and the summary, the text outside every
-/// message, then each message's texts in message order, each after a
-/// separator as `full_text` lays out its parts.
+/// cache stores them: the text outside every message, then each message's
+/// texts in message order, each after a separator as `full_text` lays out
+/// its parts. The title and the summary are the row's (see
+/// [`Conversation::leading_texts`]).
 pub struct SessionSearchTexts {
     joined: Arc<str>,
     /// Each text's byte range in `joined`.
@@ -34,7 +34,7 @@ impl SessionSearchTexts {
         let mut read = TextsInReadOrder::default();
         let found =
             copy.read_search_texts(SearchedFields::List, &TimeFilter::default(), |text| {
-                let placement = Placement::of(text.field, text.ordinal);
+                let placement = Placement::of(text.ordinal);
                 read.push((placement, text.order), text.text);
                 ControlFlow::Continue(())
             })?;
@@ -59,21 +59,19 @@ impl SessionSearchTexts {
     }
 }
 
-/// Where a text goes in the session's layout: the title and the summary
-/// first, then the text outside every message, then each message's texts.
+/// A text's place in the session's layout: the text outside every message,
+/// then each message's texts.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Placement {
-    Leading,
     OutsideMessages,
     Message(usize),
 }
 
 impl Placement {
-    fn of(field: SearchField, ordinal: Option<usize>) -> Self {
-        match (field, ordinal) {
-            (SearchField::Leading, _) => Self::Leading,
-            (_, None) => Self::OutsideMessages,
-            (_, Some(ordinal)) => Self::Message(ordinal),
+    fn of(ordinal: Option<usize>) -> Self {
+        match ordinal {
+            None => Self::OutsideMessages,
+            Some(ordinal) => Self::Message(ordinal),
         }
     }
 }
@@ -272,7 +270,7 @@ impl TextVisitor for TextCollector {
     }
 
     fn keep(&mut self, row: &ScannedRow, text: &str) {
-        let placement = Placement::of(row.field, row.ordinal);
+        let placement = Placement::of(row.ordinal);
         self.by_copy
             .entry(row.copy)
             .or_default()

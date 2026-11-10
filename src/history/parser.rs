@@ -276,19 +276,19 @@ pub(crate) fn adds_search_parts(entries: &[(RecordLine, LogEntry)]) -> bool {
 }
 
 /// The session row's fold resumed from `checkpoint`, its leading entries
-/// naming `leading_title`, over `tail`, the session's entries from the
+/// naming `leading_titles`, over `tail`, the session's entries from the
 /// checkpoint on in the view's order, where a spliced turn comes from one of
 /// `subagents`; with the fold as it stood before the entry at
 /// `checkpoint_at` of `tail`.
 pub(crate) fn fold_tail(
     checkpoint: &FoldCheckpoint,
-    leading_title: Option<&str>,
+    leading_titles: &[LogEntry],
     tail: &[(RecordLine, LogEntry)],
     subagents: &std::collections::HashSet<&Path>,
     checkpoint_at: Option<usize>,
 ) -> (RowFold, Option<FoldCheckpoint>) {
     let mut fold = RowFold::resumed(checkpoint);
-    fold.replace_leading_title(leading_title);
+    fold.replace_leading_titles(leading_titles);
     let mut builder = ConversationBuilder {
         fold,
         checkpoint_at,
@@ -454,6 +454,44 @@ pub fn process_linked_session(
     ))
 }
 
+/// Removes from `entries` the titles a format gives at line 0 of the
+/// session's own transcript, and returns them in order. They are the
+/// session's fields, not its entries: a title added or removed doesn't move
+/// any entry.
+pub(crate) fn take_leading_titles(entries: &mut Vec<(RecordLine, LogEntry)>) -> Vec<LogEntry> {
+    // Reorder only the line-0 entries: a format gives them ahead of the
+    // transcript's.
+    let leading = entries
+        .iter()
+        .take_while(|(record, _)| record.line == 0 && record.transcript.is_none())
+        .count();
+    let prefix = &mut entries[..leading];
+    prefix.sort_by_key(|(record, entry)| !is_leading_title(record, entry));
+    let titles = prefix
+        .iter()
+        .take_while(|(record, entry)| is_leading_title(record, entry))
+        .count();
+    let taken = entries.drain(..titles).map(|(_, entry)| entry).collect();
+    debug_assert!(
+        !entries
+            .iter()
+            .any(|(record, entry)| is_leading_title(record, entry)),
+        "a format gives its line-0 titles ahead of the transcript's entries"
+    );
+    taken
+}
+
+/// True when `entry`, from `record`, is a title at line 0 of the session's
+/// own transcript.
+pub(crate) fn is_leading_title(record: &RecordLine, entry: &LogEntry) -> bool {
+    record.line == 0
+        && record.transcript.is_none()
+        && matches!(
+            entry,
+            LogEntry::CustomTitle { .. } | LogEntry::AiTitle { .. }
+        )
+}
+
 fn row_with_subagents(
     stub: &SessionStub,
     mut session: SessionProjection,
@@ -462,6 +500,7 @@ fn row_with_subagents(
     debug_level: Option<DebugLevel>,
     clock: &dyn Clock,
 ) -> ParsedSession {
+    let leading_titles = take_leading_titles(&mut session.entries);
     let steps = walk_steps(&session.entries, &subagents.marks, |mark| {
         (
             &mark.record,
@@ -474,6 +513,7 @@ fn row_with_subagents(
     let spliced = spliced_conversation_with_checkpoint(
         stub.locator.clone(),
         &session,
+        &leading_titles,
         &subagents.marks,
         place.as_ref().map(|(sequence, _)| *sequence),
         RowDating::new(stub.fingerprint.modified, clock),
@@ -484,7 +524,7 @@ fn row_with_subagents(
         Err(reason) => {
             return Err(UnlistedSession::with_subagent_turns(
                 reason,
-                TranscriptEntries::of_projection(session),
+                TranscriptEntries::of_projection_without_leading_titles(session),
                 subagents,
             ));
         }
@@ -503,7 +543,7 @@ fn row_with_subagents(
     let own_earlier_transcripts = std::mem::take(&mut session.earlier_transcripts);
     let own_read = std::mem::replace(&mut session.transcript_read, TranscriptRead::full_read());
     let mut transcripts = SessionTranscripts::new(
-        TranscriptEntries::of_projection(session),
+        TranscriptEntries::of_projection_without_leading_titles(session),
         own_earlier_transcripts,
         own_read,
         subagents,
@@ -1046,27 +1086,34 @@ pub(crate) fn conversation_from_projection(
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> ParsedRow {
-    spliced_conversation_from_projection(path, projection, &[], dating, debug_level)
+    let leading_titles = projection
+        .entries
+        .iter()
+        .filter(|(record, entry)| is_leading_title(record, entry))
+        .map(|(_, entry)| entry.clone())
+        .collect::<Vec<_>>();
+    spliced_conversation_with_checkpoint(
+        path,
+        projection,
+        &leading_titles,
+        &[],
+        None,
+        dating,
+        debug_level,
+    )
+    .map(|(conversation, _)| conversation)
 }
 
-/// [`conversation_from_projection`], each sub-agent turn in `marks` numbered
-/// where the view splices it in.
-fn spliced_conversation_from_projection(
-    path: PathBuf,
-    projection: &SessionProjection,
-    marks: &[SubagentMark],
-    dating: RowDating<'_>,
-    debug_level: Option<DebugLevel>,
-) -> ParsedRow {
-    spliced_conversation_with_checkpoint(path, projection, marks, None, dating, debug_level)
-        .map(|(conversation, _)| conversation)
-}
-
-/// [`spliced_conversation_from_projection`], with the row's fold as it
-/// stood before the entry at `checkpoint_at` in the view's order.
+/// [`conversation_from_projection`] with `leading_titles`, the projection's
+/// titles [`take_leading_titles`] returns, each sub-agent turn in `marks`
+/// numbered where the view splices it in, and with the row's fold as it
+/// stood before the entry at `checkpoint_at` in the view's order. Skips a
+/// leading title left in the projection's entries and sets the titles from
+/// `leading_titles`.
 fn spliced_conversation_with_checkpoint(
     path: PathBuf,
     projection: &SessionProjection,
+    leading_titles: &[LogEntry],
     marks: &[SubagentMark],
     checkpoint_at: Option<usize>,
     dating: RowDating<'_>,
@@ -1077,7 +1124,16 @@ fn spliced_conversation_with_checkpoint(
         checkpoint_at,
         ..ConversationBuilder::default()
     };
-    builder.push_spliced_records(&projection.entries, marks);
+    for title in leading_titles {
+        builder.fold.add_leading_title(title);
+    }
+    builder.push_spliced_records(
+        projection
+            .entries
+            .iter()
+            .filter(|(record, entry)| !is_leading_title(record, entry)),
+        marks,
+    );
     let checkpoint = builder.checkpoint.take();
     let timestamp = session_time(
         builder.fold.latest_activity(),
@@ -1299,8 +1355,7 @@ impl ConversationBuilder {
         self.push_steps(entries.into_iter().map(|entry| (None, entry)), marks);
     }
 
-    /// [`Self::push_spliced`] for entries with their records: the session's
-    /// own entries at line 0 are its leading entries, and each entry's
+    /// [`Self::push_spliced`] for entries with their records: each entry's
     /// thread is its record's.
     fn push_spliced_records<'a>(
         &mut self,
@@ -1359,7 +1414,6 @@ impl ConversationBuilder {
     /// Push `entry`, read at `record` when the caller knows it.
     fn push_record(&mut self, record: Option<&RecordLine>, entry: &LogEntry) {
         let transcript = record.and_then(|record| record.transcript.as_deref());
-        let is_leading = record.is_some_and(|record| record.line == 0 && transcript.is_none());
         let folded = self
             .fold
             .place_parent(entry, ThreadIdentity::of(entry, transcript));
@@ -1469,7 +1523,7 @@ impl ConversationBuilder {
             }
             LogEntry::Summary { summary } => self.fold.add_summary(summary),
             LogEntry::AiTitle { ai_title } => self.fold.set_summary(ai_title),
-            LogEntry::CustomTitle { custom_title } => self.fold.set_title(custom_title, is_leading),
+            LogEntry::CustomTitle { custom_title } => self.fold.set_title(custom_title),
             LogEntry::PiMetadata {
                 label,
                 text,
@@ -1578,17 +1632,14 @@ impl ConversationBuilder {
         let message_count = folded.message_count;
         let custom_title = folded.custom_title.clone();
         let summary = folded.summary.clone();
-        let (full_text, full_text_starts) = self.full_text.finish(
-            title_and_summary(&custom_title, &summary),
-            message_count,
-            normalize_full_text,
-        );
-        let (agent_search_text, agent_search_text_starts) =
-            self.agent_search_text
-                .finish([], message_count, normalize_whitespace);
+        let (full_text, full_text_starts) =
+            self.full_text.finish(message_count, normalize_full_text);
+        let (agent_search_text, agent_search_text_starts) = self
+            .agent_search_text
+            .finish(message_count, normalize_whitespace);
         let (thinking_and_tool_call_text, thinking_and_tool_call_text_starts) = self
             .thinking_and_tool_call_text
-            .finish([], message_count, normalize_whitespace);
+            .finish(message_count, normalize_whitespace);
 
         // Pre-normalize search text to avoid re-normalizing on every startup
         let search_text_lower = normalize_for_search(&full_text);
@@ -1704,7 +1755,7 @@ pub(crate) fn folded_row(
     })
 }
 
-/// The text `full_text` opens with, outside every message.
+/// The text a sub-agent transcript's `text_outside_turns` opens with.
 fn title_and_summary<'a>(
     custom_title: &'a Option<String>,
     summary: &'a Option<String>,
@@ -2444,7 +2495,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_included_in_full_text() {
+    fn search_reads_summary_ahead_of_full_text() {
         let content = [
             r#"{"type": "summary", "summary": "Important topic discussion", "leafUuid": "abc123"}"#
                 .to_string(),
@@ -2455,8 +2506,9 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(
-            conv.full_text.contains("Important topic discussion"),
-            "Summary should be included in full_text for searching"
+            conv.full_text_after_leading_texts()
+                .starts_with("Important topic discussion"),
+            "search reads the summary ahead of the full text"
         );
     }
 
@@ -2528,7 +2580,7 @@ mod tests {
     }
 
     #[test]
-    fn ai_title_included_in_full_text() {
+    fn search_reads_ai_title_ahead_of_full_text() {
         let content = [
             r#"{"type":"ai-title","aiTitle":"ai-title-search-sentinel","sessionId":"abc"}"#
                 .to_string(),
@@ -2538,7 +2590,11 @@ mod tests {
         .join("\n");
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
-        assert!(conv.full_text.contains("ai-title-search-sentinel"));
+        assert!(
+            conv.full_text_after_leading_texts()
+                .starts_with("ai-title-search-sentinel"),
+            "search reads the AI title ahead of the full text"
+        );
     }
 
     // === Model and token extraction ===
@@ -2644,7 +2700,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_title_included_in_full_text() {
+    fn search_reads_custom_title_ahead_of_full_text() {
         let content = [
             r#"{"type": "custom-title", "customTitle": "unique-session-name", "sessionId": "abc"}"#
                 .to_string(),
@@ -2655,8 +2711,9 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(
-            conv.full_text.contains("unique-session-name"),
-            "Custom title should be included in full_text for searching"
+            conv.full_text_after_leading_texts()
+                .starts_with("unique-session-name"),
+            "search reads the custom title ahead of the full text"
         );
     }
 
@@ -2933,6 +2990,8 @@ mod tests {
                 "{excluded} leaked into {semantic:?}"
             );
         }
+        let searched = conv.full_text_after_leading_texts();
+        let searched_lower = crate::search::lexical::searchable_conversation(&conv, 0).text_lower;
         for included in [
             "summary lexical sentinel",
             "title lexical sentinel",
@@ -2940,14 +2999,12 @@ mod tests {
             "local stdout lexical sentinel",
         ] {
             assert!(
-                conv.full_text.contains(included),
-                "{included} missing from {}",
-                conv.full_text
+                searched.contains(included),
+                "{included} missing from {searched}"
             );
             assert!(
-                conv.search_text_lower.contains(included),
-                "{included} missing from {}",
-                conv.search_text_lower
+                searched_lower.contains(included),
+                "{included} missing from {searched_lower}"
             );
         }
         assert!(!conv.full_text.contains("/cwd/private-sentinel"));
@@ -3287,7 +3344,7 @@ mod tests {
     }
 
     #[test]
-    fn title_opens_search_text_before_every_message() {
+    fn title_leads_searched_text_and_stays_out_of_full_text() {
         let content = [
             r#"{"type":"custom-title","customTitle":"Named session"}"#.to_owned(),
             user_msg("question", None),
@@ -3299,8 +3356,13 @@ mod tests {
         let starts = &conv.message_text_starts.full_text;
 
         assert_eq!(
-            conv.full_text,
-            "Named session \u{1e} question \u{1e} answer"
+            conv.full_text_after_leading_texts(),
+            "Named session \u{1e} question \u{1e} answer",
+            "search reads the title ahead of every message"
+        );
+        assert_eq!(
+            conv.full_text, "question \u{1e} answer",
+            "the full text holds the messages alone"
         );
         assert_eq!(
             starts.text_of(
@@ -3310,7 +3372,8 @@ mod tests {
                     end: conv.message_count
                 }]
             ),
-            " \u{1e} question \u{1e} answer"
+            "question \u{1e} answer",
+            "the messages' slice holds every message"
         );
     }
 

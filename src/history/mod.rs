@@ -37,6 +37,7 @@ pub(crate) mod workspace;
 
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Local};
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 // Re-export public API
@@ -139,9 +140,12 @@ pub struct TranscriptEntries {
 }
 
 impl TranscriptEntries {
-    /// A format's projected entries. A projection records only a malformed
-    /// line's number.
-    fn of_projection(projection: format::SessionProjection) -> Self {
+    /// A format's projected entries, after [`parser::take_leading_titles`]
+    /// removes the leading title entries, so every view numbers the entries
+    /// as the session cache stores them. A projection records only a
+    /// malformed line's number.
+    fn of_projection_without_leading_titles(mut projection: format::SessionProjection) -> Self {
+        parser::take_leading_titles(&mut projection.entries);
         Self {
             entries: projection.entries,
             malformed_lines: projection
@@ -243,7 +247,7 @@ pub struct Conversation {
     /// Custom session title set by user via /rename (from type=custom-title JSONL entry)
     pub custom_title: Option<String>,
     /// The title stored beside the transcript that the row shows in place
-    /// of its parsed `custom_title` or `summary`; `None` when it shows the
+    /// of its parsed `custom_title` and `summary`; `None` when it shows the
     /// parsed ones.
     pub external_title: Option<provider::SessionTitle>,
     /// Model name from assistant messages (e.g., "claude-opus-4-5-20251101")
@@ -269,17 +273,42 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    /// The session's keywords and an excerpt of its text, from `full_text`
-    /// and `agent_search_text`, for the agent's semantic route. Computed on
-    /// each call rather than at parse: ranking the keywords takes seconds on
-    /// a large session, and only the agent's semantic route reads it.
+    /// The row's title, then its summary. Search reads them from the row,
+    /// ahead of the session's other texts, to match a name changed outside
+    /// the transcript.
+    pub(crate) fn leading_texts(&self) -> impl Iterator<Item = &str> {
+        [&self.custom_title, &self.summary]
+            .into_iter()
+            .filter_map(|text| text.as_deref())
+    }
+
+    /// [`Self::leading_texts`], then `full_text`, each after a separator.
+    pub(crate) fn full_text_after_leading_texts(&self) -> Cow<'_, str> {
+        let mut leading = self.leading_texts().peekable();
+        if leading.peek().is_none() {
+            return Cow::Borrowed(&self.full_text);
+        }
+        let mut text = String::new();
+        for piece in leading.chain([self.full_text.as_str()]) {
+            message_texts::push_separated(&mut text, piece);
+        }
+        Cow::Owned(text)
+    }
+
+    /// The session's keywords and an excerpt of its text, from its title,
+    /// summary, `full_text` and `agent_search_text`, for the agent's semantic
+    /// route. Computed on each call rather than at parse: ranking the
+    /// keywords takes seconds on a large session, and only the agent's
+    /// semantic route reads it.
     pub(crate) fn semantic_route_text(&self) -> String {
         const ROUTE_EVIDENCE_CHARS: usize = 1_000;
         const ROUTE_EVIDENCE_SEGMENTS: usize = 4;
         const ROUTE_KEYWORDS: usize = 100;
         const ROUTE_KEYWORD_CHARS: usize = 800;
 
-        let mut text = message_texts::without_message_separators(&self.full_text).into_owned();
+        let mut text =
+            message_texts::without_message_separators(&self.full_text_after_leading_texts())
+                .into_owned();
         if !self.agent_search_text.is_empty() {
             text.push(' ');
             text.push_str(&message_texts::without_message_separators(

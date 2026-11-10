@@ -98,18 +98,22 @@ fn row_fold_resumed_at_every_split_equals_whole_fold_for_every_agent() {
             .expect("the session is listed");
         let row = listed.row;
         let (view, _) = listed.transcripts.into_entries_and_search_parts();
-        let entries = &view.entries;
         let subagents: HashSet<&Path> = stub.subagents.iter().map(PathBuf::as_path).collect();
-        let title = entries.iter().find_map(|(record, entry)| match entry {
-            LogEntry::CustomTitle { custom_title }
-                if record.line == 0 && record.transcript.is_none() =>
-            {
-                Some(custom_title.trim().to_owned())
-            }
-            _ => None,
-        });
+        // The stored view doesn't hold a leading title. A resumed read
+        // removes the titles from the leading entries, as here.
+        let mut leading = source
+            .provider()
+            .storage()
+            .transcript_reader()
+            .leading_entries(
+                &stub.locator,
+                &crate::history::provider::TranscriptRead::full_read(),
+            )
+            .unwrap();
+        let titles = crate::history::parser::take_leading_titles(&mut leading);
+        let entries = &view.entries;
         let start = FoldCheckpoint::default();
-        let (whole, _) = fold_tail(&start, title.as_deref(), entries, &subagents, None);
+        let (whole, _) = fold_tail(&start, &titles, entries, &subagents, None);
         let whole_row = folded_row(&whole, &stub.locator, None)
             .unwrap_or_else(|_| panic!("{}: the whole fold lists a row", source.label()));
         assert_eq!(
@@ -126,16 +130,9 @@ fn row_fold_resumed_at_every_split_equals_whole_fold_for_every_agent() {
             if !reply_ids(&entries[..split]).is_disjoint(&reply_ids(&entries[split..])) {
                 continue;
             }
-            let (_, checkpoint) =
-                fold_tail(&start, title.as_deref(), entries, &subagents, Some(split));
+            let (_, checkpoint) = fold_tail(&start, &titles, entries, &subagents, Some(split));
             let checkpoint = checkpoint.expect("a fold keeps its checkpoint at every split");
-            let (resumed, _) = fold_tail(
-                &checkpoint,
-                title.as_deref(),
-                &entries[split..],
-                &subagents,
-                None,
-            );
+            let (resumed, _) = fold_tail(&checkpoint, &titles, &entries[split..], &subagents, None);
             assert_eq!(
                 finished(&resumed, &stub.locator),
                 whole_facts,

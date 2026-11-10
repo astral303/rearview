@@ -1,10 +1,11 @@
-//! Lexical search's read of many sessions' search texts: each table holding
-//! search text is scanned on its own, without joins, in row ranges across
+//! Lexical search's read of many sessions' search texts: `parts` is
+//! scanned without joins, in row ranges across
 //! threads, each range on a read connection of its own. A text's row holds
 //! its session and its place; its entry and message are looked up only
 //! within an active window, and only when the caller keeps the text.
 
-use super::{CachedSession, SearchField, SearchedFields, SqliteCache, entries};
+use super::entries::{DERIVED, RESULT_TEXT};
+use super::{CachedSession, SearchedFields, SqliteCache, entries};
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -16,22 +17,20 @@ use std::ops::RangeInclusive;
 pub(crate) struct ScannedRow {
     /// The position of the text's session in the scanned copies.
     pub(crate) copy: usize,
-    pub(crate) field: SearchField,
     /// As [`super::search_texts::SearchText::ordinal`].
     pub(crate) ordinal: Option<usize>,
     /// The text's place in its session.
     pub(crate) order: ReadOrder,
 }
 
-/// A text's place in its session's order: the table it comes from, then its
-/// entry's place in the session, then its part's and item's place in the
-/// entry.
+/// A text's place in its session's order: its layout group, then its
+/// entry's place in the session, then its part's place in the entry, or
+/// among the parts outside every entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ReadOrder {
-    pub(super) table: Table,
+    pub(super) group: LayoutGroup,
     pub(super) sequence: i64,
     pub(super) part: i64,
-    pub(super) item: i64,
 }
 
 /// The caller's side of a scan, one per row range.
@@ -43,16 +42,33 @@ pub(crate) trait TextVisitor: Send {
     fn keep(&mut self, row: &ScannedRow, text: &str);
 }
 
-/// The tables holding search text, in the order of their texts in a
-/// session.
+/// The groups of `parts` holding search text, in the order a session's
+/// joined search text lays them out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Table {
-    Parts,
-    ResultItems,
-    SearchTexts,
-    Entries,
-    SubagentSearchParts,
+pub(super) enum LayoutGroup {
+    /// Blocks' parts.
+    BlockParts,
+    /// Parts of kind `result-text`.
+    ResultTexts,
+    /// Parts of kind `derived`.
+    DerivedParts,
+    /// Parts of kind `subagent-metadata`, outside every entry.
+    SubagentMetadata,
 }
+
+impl LayoutGroup {
+    /// The group of a part of `kind` holding search text.
+    pub(super) fn of_part(kind: &str) -> Self {
+        match kind {
+            DERIVED => Self::DerivedParts,
+            RESULT_TEXT => Self::ResultTexts,
+            _ => Self::BlockParts,
+        }
+    }
+}
+
+/// Every session's sub-agent metadata parts, outside every entry.
+const SUBAGENT_METADATA_SCAN: &str = "SELECT session, part, text FROM parts WHERE entry IS NULL";
 
 /// Row ranges a scan of each large table is split into, per thread: rows
 /// differ in size by orders of magnitude, so many small ranges keep every
@@ -119,7 +135,7 @@ pub(crate) fn scan_search_texts<V: TextVisitor>(
                 .into_par_iter()
                 .map_init(
                     || None,
-                    |reader: &mut Option<SqliteCache>, (table, rows)| {
+                    |reader: &mut Option<SqliteCache>, (group, rows)| {
                         let cache = open_once(reader, &first.base, first)?;
                         let mut visitor = visitor();
                         cache.with_read_snapshot(|connection| {
@@ -130,7 +146,7 @@ pub(crate) fn scan_search_texts<V: TextVisitor>(
                                 entry: None,
                                 message: None,
                             };
-                            range.scan(table, rows, &mut visitor)
+                            range.scan(group, rows, &mut visitor)
                         })?;
                         Ok(visitor)
                     },
@@ -230,26 +246,15 @@ impl StoredWindow {
 }
 
 impl Scan<'_> {
-    /// Each table to scan with the row ranges it is split into.
-    fn tasks(&self, cache: &SqliteCache) -> Result<Vec<(Table, RangeInclusive<i64>)>> {
-        let connection = &cache.connection;
-        let mut tasks = Vec::new();
-        for (table, name, key) in [
-            (Table::Parts, "parts", "id"),
-            (Table::ResultItems, "result_items", "part"),
-            (Table::SearchTexts, "search_texts", "id"),
-        ] {
-            tasks.extend(
-                KeySplit::of(connection, name, key)?
-                    .ranges()
-                    .map(|rows| (table, rows)),
-            );
-        }
-        if self.window.is_none() {
-            tasks.push((Table::Entries, i64::MIN..=i64::MAX));
-            if matches!(self.fields, SearchedFields::Agent) {
-                tasks.push((Table::SubagentSearchParts, i64::MIN..=i64::MAX));
-            }
+    /// Each scan with the rows it reads: the entries' parts in row ranges,
+    /// then the sub-agent metadata in one range when `fields` reads it.
+    fn tasks(&self, cache: &SqliteCache) -> Result<Vec<(LayoutGroup, RangeInclusive<i64>)>> {
+        let mut tasks = KeySplit::of(&cache.connection, "parts", "id")?
+            .ranges()
+            .map(|rows| (LayoutGroup::BlockParts, rows))
+            .collect::<Vec<_>>();
+        if self.window.is_none() && matches!(self.fields, SearchedFields::Agent) {
+            tasks.push((LayoutGroup::SubagentMetadata, i64::MIN..=i64::MAX));
         }
         Ok(tasks)
     }
@@ -401,27 +406,26 @@ struct RangeScan<'s> {
 impl RangeScan<'_> {
     fn scan(
         &mut self,
-        table: Table,
+        group: LayoutGroup,
         rows: RangeInclusive<i64>,
         visitor: &mut impl TextVisitor,
     ) -> Result<()> {
-        match table {
-            Table::Parts => self.scan_parts(rows, visitor),
-            Table::ResultItems => self.scan_result_items(rows, visitor),
-            Table::SearchTexts => self.scan_search_texts(rows, visitor),
-            Table::Entries => self.scan_entries(visitor),
-            Table::SubagentSearchParts => self.scan_subagent_parts(visitor),
+        match group {
+            LayoutGroup::BlockParts | LayoutGroup::ResultTexts | LayoutGroup::DerivedParts => {
+                self.scan_parts(rows, visitor)
+            }
+            LayoutGroup::SubagentMetadata => self.scan_subagent_metadata(visitor),
         }
     }
 
+    /// Scans the parts holding search text, of every kind.
     fn scan_parts(
         &mut self,
         rows: RangeInclusive<i64>,
         visitor: &mut impl TextVisitor,
     ) -> Result<()> {
         let mut statement = self.connection.prepare_cached(&format!(
-            "SELECT session, entry, entry_sequence, message_ordinal, search_field, part, text \
-             FROM parts \
+            "SELECT session, entry, entry_sequence, message_ordinal, part, kind, text FROM parts \
              WHERE id BETWEEN ?1 AND ?2 AND search_field IN ({}) AND text IS NOT NULL",
             self.scan.fields.part_field_codes()
         ))?;
@@ -431,138 +435,17 @@ impl RangeScan<'_> {
             if !visitor.examine(text) {
                 continue;
             }
-            let field = field_of(row.get(4)?)?;
-            let order = (Table::Parts, row.get(5)?, 0);
-            if let Some(scanned) = self.entry_row(TextOf::at(row)?, field, order)? {
+            let order = (LayoutGroup::of_part(text_at(row, 5)?), row.get(4)?);
+            if let Some(scanned) = self.entry_row(TextOf::at(row)?, order)? {
                 visitor.keep(&scanned, text);
             }
         }
         Ok(())
     }
 
-    /// Scans the searched text items of each result, joined by line breaks
-    /// as search reads them.
-    fn scan_result_items(
-        &mut self,
-        rows: RangeInclusive<i64>,
-        visitor: &mut impl TextVisitor,
-    ) -> Result<()> {
-        let mut statement = self.connection.prepare_cached(
-            "SELECT part, text FROM result_items \
-             WHERE part BETWEEN ?1 AND ?2 AND searched ORDER BY part, position",
-        )?;
-        let mut rows = statement.query([rows.start(), rows.end()])?;
-        let mut joined = String::new();
-        let mut current = None;
-        while let Some(row) = rows.next()? {
-            let part: i64 = row.get(0)?;
-            let text = text_at(row, 1)?;
-            if current == Some(part) {
-                joined.push('\n');
-            } else {
-                if let Some(previous) = current {
-                    self.keep_result(previous, &joined, visitor)?;
-                }
-                current = Some(part);
-                joined.clear();
-            }
-            joined.push_str(text);
-        }
-        if let Some(previous) = current {
-            self.keep_result(previous, &joined, visitor)?;
-        }
-        Ok(())
-    }
-
-    fn keep_result(&mut self, part: i64, text: &str, visitor: &mut impl TextVisitor) -> Result<()> {
-        if !visitor.examine(text) {
-            return Ok(());
-        }
-        let stored: Option<(TextOf, Option<i64>, i64, bool)> = self
-            .connection
-            .prepare_cached(
-                "SELECT session, entry, entry_sequence, message_ordinal, search_field, part, \
-                 text IS NULL FROM parts WHERE id = ?1 AND search_field IS NOT NULL",
-            )?
-            .query_row([part], |row| {
-                Ok((TextOf::at(row)?, row.get(4)?, row.get(5)?, row.get(6)?))
-            })
-            .optional()?;
-        let Some((of, Some(code), number, true)) = stored else {
-            return Ok(());
-        };
-        let field = field_of(code)?;
-        if !self.scan.fields.reads_part_field(field) {
-            return Ok(());
-        }
-        let order = (Table::ResultItems, number, 0);
-        if let Some(scanned) = self.entry_row(of, field, order)? {
-            visitor.keep(&scanned, text);
-        }
-        Ok(())
-    }
-
-    fn scan_search_texts(
-        &mut self,
-        rows: RangeInclusive<i64>,
-        visitor: &mut impl TextVisitor,
-    ) -> Result<()> {
-        let mut statement = self.connection.prepare_cached(&format!(
-            "SELECT session, entry, entry_sequence, message_ordinal, search_field, id, text \
-             FROM search_texts WHERE id BETWEEN ?1 AND ?2 AND search_field IN ({})",
-            self.scan.fields.part_field_codes()
-        ))?;
-        let mut rows = statement.query([rows.start(), rows.end()])?;
-        while let Some(row) = rows.next()? {
-            let text = text_at(row, 6)?;
-            if !visitor.examine(text) {
-                continue;
-            }
-            let field = field_of(row.get(4)?)?;
-            let order = (Table::SearchTexts, 0, row.get(5)?);
-            if let Some(scanned) = self.entry_row(TextOf::at(row)?, field, order)? {
-                visitor.keep(&scanned, text);
-            }
-        }
-        Ok(())
-    }
-
-    /// Scans the titles, summaries and other texts entries hold themselves,
-    /// outside every message, through the index of the entries holding one.
-    fn scan_entries(&mut self, visitor: &mut impl TextVisitor) -> Result<()> {
-        let mut statement = self.connection.prepare_cached(
-            "SELECT session, search_field, sequence, text FROM entries \
-             INDEXED BY entries_by_search_field \
-             WHERE search_field IS NOT NULL AND text IS NOT NULL",
-        )?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let text = text_at(row, 3)?;
-            if !visitor.examine(text) {
-                continue;
-            }
-            if let Some(copy) = self.copy_of(row.get(0)?)? {
-                let scanned = ScannedRow {
-                    copy,
-                    field: field_of(row.get(1)?)?,
-                    ordinal: None,
-                    order: ReadOrder {
-                        table: Table::Entries,
-                        sequence: row.get(2)?,
-                        part: 0,
-                        item: 0,
-                    },
-                };
-                visitor.keep(&scanned, text);
-            }
-        }
-        Ok(())
-    }
-
-    fn scan_subagent_parts(&mut self, visitor: &mut impl TextVisitor) -> Result<()> {
-        let mut statement = self
-            .connection
-            .prepare_cached("SELECT session, position, text FROM subagent_search_parts")?;
+    /// Scans the sub-agent metadata parts, outside every entry.
+    fn scan_subagent_metadata(&mut self, visitor: &mut impl TextVisitor) -> Result<()> {
+        let mut statement = self.connection.prepare_cached(SUBAGENT_METADATA_SCAN)?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let text = text_at(row, 2)?;
@@ -572,13 +455,11 @@ impl RangeScan<'_> {
             if let Some(copy) = self.copy_of(row.get(0)?)? {
                 let scanned = ScannedRow {
                     copy,
-                    field: SearchField::Supplement,
                     ordinal: None,
                     order: ReadOrder {
-                        table: Table::SubagentSearchParts,
+                        group: LayoutGroup::SubagentMetadata,
                         sequence: 0,
-                        part: 0,
-                        item: row.get(1)?,
+                        part: row.get(1)?,
                     },
                 };
                 visitor.keep(&scanned, text);
@@ -587,14 +468,13 @@ impl RangeScan<'_> {
         Ok(())
     }
 
-    /// The row of the text `of` describes, in `field`, at `(table, part,
-    /// item)` in its entry; `None` when its session is not scanned, or the
-    /// window leaves the text out.
+    /// The row of the text `of` describes, in `group` at `part` in its entry;
+    /// `None` when its session is not scanned, or the window leaves the text
+    /// out.
     fn entry_row(
         &mut self,
         of: TextOf,
-        field: SearchField,
-        (table, part, item): (Table, i64, i64),
+        (group, part): (LayoutGroup, i64),
     ) -> Result<Option<ScannedRow>> {
         let Some(copy) = self.copy_of(of.session)? else {
             return Ok(None);
@@ -608,13 +488,11 @@ impl RangeScan<'_> {
         };
         Ok(Some(ScannedRow {
             copy,
-            field,
             ordinal: place.ordinal,
             order: ReadOrder {
-                table,
+                group,
                 sequence: place.sequence,
                 part,
-                item,
             },
         }))
     }
@@ -723,17 +601,6 @@ pub(super) fn text_at<'r>(row: &'r rusqlite::Row<'_>, index: usize) -> rusqlite:
     })
 }
 
-pub(super) fn field_of(code: i64) -> Result<SearchField> {
-    SearchField::of_code(code).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Integer,
-            format!("unknown search field {code}").into(),
-        )
-        .into()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::CatalogueSession;
@@ -744,8 +611,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ops::ControlFlow;
 
-    /// A text with its place in its session, field code and message number.
-    type PlacedText = (ReadOrder, i64, Option<usize>, String);
+    /// A text with its place in its session and message number.
+    type PlacedText = (ReadOrder, Option<usize>, String);
 
     /// Every kept text with the position of its copy.
     #[derive(Default)]
@@ -759,18 +626,15 @@ mod tests {
         }
 
         fn keep(&mut self, row: &ScannedRow, text: &str) {
-            self.kept.push((
-                row.copy,
-                (row.order, row.field.code(), row.ordinal, text.to_owned()),
-            ));
+            self.kept
+                .push((row.copy, (row.order, row.ordinal, text.to_owned())));
         }
     }
 
     /// Each agent's every-record session cached in one database, as their
-    /// copies. No fixture's sub-agent holds text the splice leaves out, and
-    /// no fixture's searched part belongs to an entry without a message, so
-    /// the first session gets a sub-agent search part, and each entry
-    /// without a message a searched part, written directly.
+    /// copies. The first session gets a sub-agent metadata part, and each
+    /// entry without a message a searched part, written directly: the
+    /// fixtures don't hold either.
     fn every_record_copies(base: &std::path::Path) -> Vec<CachedSession> {
         let mut cache = admitted_cache(base);
         let copies = every_record_sessions()
@@ -797,8 +661,8 @@ mod tests {
         cache
             .connection
             .execute(
-                "INSERT INTO subagent_search_parts (session, file_position, position, text) \
-                 SELECT MIN(id), 1, 0, 'child metadata' FROM sessions",
+                "INSERT INTO parts (session, part, kind, search_field, file_position, text) \
+                 SELECT MIN(id), 0, 'subagent-metadata', 4, 1, 'child metadata' FROM sessions",
                 [],
             )
             .unwrap();
@@ -842,12 +706,7 @@ mod tests {
         let mut read = Vec::new();
         let copy = copy.clone().ignoring_source_changes();
         copy.read_search_texts(fields, window, |text| {
-            read.push((
-                text.order,
-                text.field.code(),
-                text.ordinal,
-                text.text.to_owned(),
-            ));
+            read.push((text.order, text.ordinal, text.text.to_owned()));
             ControlFlow::Continue(())
         })
         .unwrap()
@@ -857,31 +716,31 @@ mod tests {
     }
 
     #[test]
-    fn every_table_holding_search_text_contributes_texts() {
+    fn every_layout_group_contributes_texts() {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies(base.path());
         let copies = copies.iter().collect::<Vec<_>>();
 
         let kept = kept_rows(&copies, SearchedFields::Agent, &TimeFilter::default());
-        let tables = kept
+        let groups = kept
             .iter()
-            .map(|(_, (order, ..))| order.table)
+            .map(|(_, (order, ..))| order.group)
             .collect::<BTreeSet<_>>();
         assert_eq!(
-            tables,
+            groups,
             BTreeSet::from([
-                Table::Parts,
-                Table::ResultItems,
-                Table::SearchTexts,
-                Table::Entries,
-                Table::SubagentSearchParts
+                LayoutGroup::BlockParts,
+                LayoutGroup::ResultTexts,
+                LayoutGroup::DerivedParts,
+                LayoutGroup::SubagentMetadata
             ]),
-            "parts, result items, search texts, entries and sub-agent search parts each hold a text"
+            "block parts, result texts, derived parts and sub-agent metadata parts each hold a text"
         );
         assert!(
-            kept.iter()
-                .any(|(_, (order, _, ordinal, _))| order.table == Table::Parts
-                    && ordinal.is_none()),
+            kept.iter().any(
+                |(_, (order, ordinal, _))| order.group == LayoutGroup::BlockParts
+                    && ordinal.is_none()
+            ),
             "a part outside every message holds a text"
         );
     }
@@ -956,13 +815,7 @@ mod tests {
         connection
             .execute_batch(super::super::schema::CREATE)
             .unwrap();
-        for (table, key) in [
-            ("parts", "id"),
-            ("result_items", "part"),
-            ("search_texts", "id"),
-            ("entries", "id"),
-            ("messages", "id"),
-        ] {
+        for (table, key) in [("parts", "id"), ("entries", "id"), ("messages", "id")] {
             let query = KeySplit::bounds_query(table, key);
             let plan = connection
                 .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
@@ -978,6 +831,28 @@ mod tests {
                 "{query}: the bounds come from the ends of an index, without a scan: {plan}"
             );
         }
+    }
+
+    /// The scan of sub-agent metadata costs what those parts hold, not what
+    /// every part holds.
+    #[test]
+    fn subagent_metadata_scan_searches_an_index_without_scanning_parts() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(super::super::schema::CREATE)
+            .unwrap();
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {SUBAGENT_METADATA_SCAN}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("SEARCH parts USING") && !plan.contains("SCAN parts"),
+            "the scan reads the parts outside every entry through an index: {plan}"
+        );
     }
 
     #[test]
@@ -1006,8 +881,8 @@ mod tests {
                     assert_eq!(
                         read_by_range(copy, fields, &window),
                         from_scan,
-                        "{:?}, window {window:?}: the range reads return the scan's texts, \
-                         places and fields",
+                        "{:?}, window {window:?}: the range reads return the scan's texts and \
+                         places",
                         copy.address().source
                     );
                 }
