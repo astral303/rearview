@@ -2641,7 +2641,10 @@ pub(super) mod tests {
         let [parsed] = parsed.as_slice() else {
             panic!("{} sessions when parsed", parsed.len());
         };
-        assert_eq!(parsed.agent_search_text, kept_only.agent_search_text);
+        assert_eq!(
+            parsed.load_held_content().unwrap().row.agent_search_text,
+            kept_only.agent_search_text
+        );
         let [restored] = restored.as_slice() else {
             panic!("{} sessions when restored", restored.len());
         };
@@ -2754,16 +2757,14 @@ pub(super) mod tests {
         };
         let first = load_rows(&storage, cache_base.path());
         assert_eq!(first.len(), 1);
-        assert!(
-            first[0]
-                .agent_search_text
-                .contains("child answer searchable")
-        );
-        assert!(
-            !first[0]
-                .agent_search_text
-                .contains("later sub-agent answer")
-        );
+        let first_text = first[0]
+            .load_held_content()
+            .unwrap()
+            .row
+            .agent_search_text
+            .clone();
+        assert!(first_text.contains("child answer searchable"));
+        assert!(!first_text.contains("later sub-agent answer"));
 
         let mut grown = std::fs::OpenOptions::new()
             .append(true)

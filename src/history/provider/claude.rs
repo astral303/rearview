@@ -1301,15 +1301,16 @@ pub(crate) mod tests {
         assert!(session.message_count > alone.message_count);
         assert_eq!(session.message_count, opened.messages.len());
         assert_eq!(session.total_tokens, alone.total_tokens + thread_tokens);
+        let content = session.load_held_content().unwrap().row;
         for sentinel in [
             "EXPLORE_SUBAGENT_SENTINEL",
             "GENERAL_SUBAGENT_SENTINEL",
             "NESTED_SUBAGENT_SENTINEL",
         ] {
-            assert!(session.agent_search_text.contains(sentinel), "{sentinel}");
-            assert!(!session.full_text.contains(sentinel), "{sentinel}");
+            assert!(content.agent_search_text.contains(sentinel), "{sentinel}");
+            assert!(!content.full_text.contains(sentinel), "{sentinel}");
         }
-        assert!(session.full_text.contains("PARENT_ANSWER_SENTINEL"));
+        assert!(content.full_text.contains("PARENT_ANSWER_SENTINEL"));
 
         let restored = load_the_one_session(root.path(), cache.path());
         assert!(
@@ -1329,9 +1330,10 @@ pub(crate) mod tests {
         let root = fixture_root();
         let cache = tempfile::tempdir().unwrap();
         let session = load_the_one_session(root.path(), cache.path());
+        let content = session.load_held_content().unwrap().row;
 
-        assert!(!session.full_text.contains("NESTED_SUBAGENT_SENTINEL"));
-        let route_text = session.semantic_route_text();
+        assert!(!content.full_text.contains("NESTED_SUBAGENT_SENTINEL"));
+        let route_text = content.semantic_route_text();
         assert!(
             route_text.contains("NESTED_SUBAGENT_SENTINEL"),
             "{route_text}"
@@ -1515,7 +1517,13 @@ pub(crate) mod tests {
                 read.subagents,
                 FIXTURE_SUBAGENTS.map(|name| subagents_dir.join(name))
             );
-            assert!(read.agent_search_text.contains("NESTED_SUBAGENT_SENTINEL"));
+            assert!(
+                read.load_held_content()
+                    .unwrap()
+                    .row
+                    .agent_search_text
+                    .contains("NESTED_SUBAGENT_SENTINEL")
+            );
         }
     }
 

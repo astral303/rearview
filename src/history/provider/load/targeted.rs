@@ -692,6 +692,9 @@ impl SessionLoader<'_> {
             return reads;
         }
         let writes_database = matches!(database, Some(CacheDatabase::Writer(_)));
+        let copies = database
+            .as_ref()
+            .map(|database| database.reader().copy_handles());
         let to_parse: Vec<(&SessionStub, Option<Conversation>)> = to_parse
             .into_iter()
             .map(|stub| {
@@ -750,23 +753,29 @@ impl SessionLoader<'_> {
                     };
                     reads.push(match parsed {
                         SessionParse::Whole(raw, record) => {
-                            let (generation, unwritten_entries) = match record {
+                            let (generation, is_written, unwritten_entries) = match record {
                                 ParseRecord::Record(record) => {
                                     let generation = write(&mut database, &record);
                                     let is_written =
                                         generation.is_some() && record.writes_its_entries();
                                     let unwritten =
                                         (!is_written).then(|| record.into_parsed_entries());
-                                    (generation, unwritten.flatten())
+                                    (generation, is_written, unwritten.flatten())
                                 }
-                                ParseRecord::NotRecorded => (None, None),
-                                ParseRecord::Unbuilt(entries) => (None, Some(entries)),
+                                ParseRecord::NotRecorded => (None, false, None),
+                                ParseRecord::Unbuilt(entries) => (None, false, Some(entries)),
                             };
-                            let mut raw = match (*raw, generation) {
-                                (RawRead::Parsed(row), Some(generation)) => {
+                            let mut raw = match (*raw, generation, &copies) {
+                                (RawRead::Parsed(mut row), Some(generation), Some(copies))
+                                    if is_written =>
+                                {
+                                    row.publish_as(copies.at(place.address_of(stub), generation));
+                                    RawRead::Parsed(row)
+                                }
+                                (RawRead::Parsed(row), Some(generation), _) => {
                                     RawRead::Parsed(published_at(row, generation))
                                 }
-                                (raw, _) => raw,
+                                (raw, ..) => raw,
                             };
                             let unwritten = match unwritten_entries {
                                 Some(entries) => UnwrittenParse::Entries(entries),

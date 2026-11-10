@@ -288,22 +288,23 @@ impl App {
     }
 
     /// The launch's cache writes stopped part way: ask for a session refresh
-    /// of every row it parsed rather than restored, and of each of `stale`,
-    /// the sessions it read from older copies or left unlisted. Each of
-    /// `stale` the list does not hold is tracked as found by discovery.
+    /// of every row without a copy, parsed by the launch with a write that
+    /// didn't land, and of each of `stale`, the sessions it read from older
+    /// copies or left unlisted. Each of `stale` the list does not hold is
+    /// tracked as found by discovery.
     pub fn refresh_what_the_launch_could_not_cache(&mut self, stale: Vec<StaleSession>) {
         let listed: HashSet<PathBuf> = self
             .conversations
             .iter()
             .map(|row| row.path.clone())
             .collect();
-        let parsed: Vec<PathBuf> = self
+        let unwritten: Vec<PathBuf> = self
             .conversations
             .iter()
             .filter(|row| row.cached_session.is_none())
             .map(|row| row.path.clone())
             .collect();
-        for path in parsed {
+        for path in unwritten {
             self.store.request_session_refresh(&path);
         }
         for session in stale {

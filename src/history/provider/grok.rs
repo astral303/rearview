@@ -1201,14 +1201,15 @@ pub(super) mod tests {
 
         let listed = load_under(&GrokFixture, home.path(), cache.path());
         assert_eq!(listed.len(), 1);
-        let text = format!("{} {}", listed[0].full_text, listed[0].agent_search_text);
+        let content = listed[0].load_held_content().unwrap().row;
+        let text = format!("{} {}", content.full_text, content.agent_search_text);
         assert_eq!(text.matches("the spawn prompt").count(), 1, "{text}");
         assert!(
-            listed[0]
+            content
                 .agent_search_text
                 .contains("grok child answer searchable")
         );
-        assert!(!listed[0].full_text.contains("grok child answer searchable"));
+        assert!(!content.full_text.contains("grok child answer searchable"));
     }
 
     #[test]

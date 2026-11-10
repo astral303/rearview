@@ -17,9 +17,9 @@ use crate::history::resumed::{ResumeContext, ResumedSession, WholeRead, read_res
 use crate::history::shard_files;
 use crate::history::sqlite_cache::refresh::RefreshToken;
 use crate::history::sqlite_cache::{
-    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, ListedRecord,
-    LiveOwner, NextStep, OperationAccess, OperationScope, Publication, RecordPlace, SessionAddress,
-    SessionRecord, SessionStatus, SqliteCache, StubStamps, WriteOutcome,
+    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, CopyHandles, InteractiveCache,
+    ListedRecord, LiveOwner, NextStep, OperationAccess, OperationScope, Publication, RecordPlace,
+    SessionAddress, SessionRecord, SessionStatus, SqliteCache, StubStamps, WriteOutcome,
 };
 use crate::history::{
     Conversation, Environment, FilterTerm, ParsePermit, Source, TranscriptEntries,
@@ -1078,6 +1078,7 @@ impl SessionLoader<'_> {
         } = snapshot;
         let reconciles_deletions = caches.deletions == Deletions::Reconcile;
         let debug_level = self.debug_level;
+        let copies = database.reader().copy_handles();
         std::thread::scope(|scope| {
             let (writes, received) = mpsc::sync_channel(DATABASE_WRITE_QUEUE_LENGTH);
             let writer = match database {
@@ -1093,6 +1094,7 @@ impl SessionLoader<'_> {
                 current: &current,
                 writes: &writes,
                 catalogue: &catalogue,
+                copies,
             };
             let loaded = self.load_root_writing(
                 root,
@@ -1283,6 +1285,23 @@ impl SessionLoader<'_> {
             .filter(|(_, outcome)| outcome.is_none())
             .map(|(index, _)| index)
             .collect();
+        // A parsed row whose write landed with its entries reads its texts
+        // from that copy; until then, and when the write does not land, it
+        // holds its own.
+        let mut in_flight = WritesInFlight::default();
+        let publish_written = |outcomes: &mut Vec<Option<RootRead>>,
+                               index: usize,
+                               generation: Option<i64>| {
+            if let (Some(generation), Some(database), Some(RootRead::Read(RawRead::Parsed(row)))) =
+                (generation, database, &mut outcomes[index])
+            {
+                row.publish_as(
+                    database
+                        .copies
+                        .at(place.address_of(&stubs[index]), generation),
+                );
+            }
+        };
         let unparsed = self.parse_in_groups(
             caches.access,
             &to_parse,
@@ -1331,7 +1350,11 @@ impl SessionLoader<'_> {
                                 && let (Some(database), Some(record)) =
                                     (database, record.into_record())
                             {
-                                database.write(record);
+                                let writes_its_entries = record.writes_its_entries();
+                                let written = database.write(record);
+                                if writes_its_entries {
+                                    in_flight.push(index, written);
+                                }
                             }
                             RootRead::Read(*outcome)
                         }
@@ -1345,8 +1368,12 @@ impl SessionLoader<'_> {
                         }
                     });
                 }
+                in_flight.settle_landed(|index, generation| {
+                    publish_written(&mut outcomes, index, generation)
+                });
             },
         );
+        in_flight.settle_all(|index, generation| publish_written(&mut outcomes, index, generation));
         for &index in unparsed {
             let stub = &stubs[index];
             outcomes[index] = Some(copy_as_it_is(stub, database, &external_titles));
@@ -1730,6 +1757,9 @@ struct DatabaseWrites<'a> {
     current: &'a HashMap<String, CachedFingerprint>,
     writes: &'a mpsc::SyncSender<CacheWrite>,
     catalogue: &'a HashMap<String, CatalogueSession>,
+    /// The handles of the copies the writes make, reading as the
+    /// catalogue's rows read.
+    copies: CopyHandles,
 }
 
 impl<'a> DatabaseWrites<'a> {
@@ -1766,13 +1796,72 @@ impl<'a> DatabaseWrites<'a> {
     }
 }
 
-/// `row`, whose write gave its copy `generation`, as that copy.
+/// `row`, whose write gave its copy `generation`, as that copy. A row
+/// without a copy, which its own texts serve, keeps them.
 fn published_at(mut row: Conversation, generation: i64) -> Conversation {
-    row.cached_session = row
-        .cached_session
-        .map(|cached| cached.of_generation(generation));
-    row.publication = Publication::Published { generation };
+    match row.cached_session.take() {
+        Some(copy) => row.publish_as(copy.of_generation(generation)),
+        None => row.publication = Publication::Published { generation },
+    }
     row
+}
+
+/// The whole parses of a root load whose writes are queued with their
+/// entries, by the index of each parse's outcome, in queue order.
+#[derive(Default)]
+struct WritesInFlight(std::collections::VecDeque<(usize, mpsc::Receiver<WriteOutcome>)>);
+
+impl WritesInFlight {
+    fn push(&mut self, index: usize, outcome: mpsc::Receiver<WriteOutcome>) {
+        self.0.push_back((index, outcome));
+    }
+
+    /// [`Self::settle_all`] for the writes the writer has settled so far,
+    /// without waiting for the rest.
+    fn settle_landed(&mut self, settle: impl FnMut(usize, Option<i64>)) {
+        self.settle_while(
+            |outcome| match outcome.try_recv() {
+                Ok(outcome) => Some(outcome.ok().flatten()),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+            },
+            settle,
+        );
+    }
+
+    /// Waits for every write, in queue order, and hands `settle` each index
+    /// with the generation its write gave the copy: `None` when the write
+    /// failed, kept the earlier copy, or was dropped unwritten. A writer
+    /// that stops drops the writes it leaves queued, so the wait ends.
+    fn settle_all(&mut self, settle: impl FnMut(usize, Option<i64>)) {
+        self.settle_while(
+            |outcome| {
+                Some(
+                    outcome
+                        .recv()
+                        .ok()
+                        .and_then(|outcome| outcome.ok().flatten()),
+                )
+            },
+            settle,
+        );
+    }
+
+    /// Settles the writes in queue order while `generation_of` finds the
+    /// outcome of the first.
+    fn settle_while(
+        &mut self,
+        generation_of: impl Fn(&mpsc::Receiver<WriteOutcome>) -> Option<Option<i64>>,
+        mut settle: impl FnMut(usize, Option<i64>),
+    ) {
+        while let Some((index, outcome)) = self.0.front() {
+            let Some(generation) = generation_of(outcome) else {
+                return;
+            };
+            settle(*index, generation);
+            self.0.pop_front();
+        }
+    }
 }
 
 /// `read`, a read of `stub`'s session from a copy as it is, whose row
@@ -3855,6 +3944,224 @@ mod tests {
         );
     }
 
+    /// A session a load or a targeted read parses reads its texts from the
+    /// copy its write made, as a row restored from the cache does, for every
+    /// agent.
+    #[test]
+    fn parsed_session_whose_write_lands_reads_its_texts_from_its_copy_for_every_agent() {
+        for fixture in super::super::contract_tests::registered_fixtures() {
+            let session = fixture.every_record_session();
+            let parsed = &session.row;
+            let home = tempfile::tempdir().unwrap();
+            fixture.write_every_record_session(home.path(), &session);
+            let storage = super::super::contract_tests::kept_storage_under(fixture, home.path());
+            let mut locator: Option<PathBuf> = None;
+            for targeted in [false, true] {
+                let case = format!("{:?}, targeted {targeted}", parsed.source);
+                let base = admitted_cache_base();
+
+                let row = match &locator {
+                    Some(locator) => listed_row(cache_session_with_cache(
+                        storage,
+                        base.path(),
+                        locator,
+                        false,
+                    )),
+                    None => load_sessions_with_cache(storage, base.path(), false, None)
+                        .unwrap()
+                        .pop(),
+                }
+                .unwrap_or_else(|| panic!("{case}: the session is listed"));
+                locator.get_or_insert_with(|| row.path.clone());
+
+                let copy = row
+                    .cached_session
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{case}: the row reads its copy"));
+                assert_eq!(
+                    row.publication,
+                    Publication::Published {
+                        generation: copy.generation()
+                    },
+                    "{case}: the row is published at its write's generation"
+                );
+                assert!(
+                    [
+                        &row.full_text,
+                        &row.agent_search_text,
+                        &row.thinking_and_tool_call_text,
+                        &row.search_text_lower,
+                    ]
+                    .iter()
+                    .all(|text| text.is_empty())
+                        && row.semantic_turns.is_empty(),
+                    "{case}: the row holds none of its parse's texts"
+                );
+                let content = row.load_held_content().unwrap().row;
+                assert_eq!(
+                    (
+                        &content.full_text,
+                        &content.agent_search_text,
+                        &content.thinking_and_tool_call_text,
+                        &content.message_text_starts,
+                    ),
+                    (
+                        &parsed.full_text,
+                        &parsed.agent_search_text,
+                        &parsed.thinking_and_tool_call_text,
+                        &parsed.message_text_starts,
+                    ),
+                    "{case}: the copy holds the parse's texts"
+                );
+            }
+        }
+    }
+
+    /// `run`'s result, failing the test once `run` takes longer than a load
+    /// of a few sessions could: a load that waits for a write the writer
+    /// dropped never returns.
+    fn within_watchdog<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> T {
+        const LIMIT: Duration = Duration::from_secs(120);
+        let (finished, result) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = finished.send(run());
+        });
+        result
+            .recv_timeout(LIMIT)
+            .unwrap_or_else(|_| panic!("the load didn't end within {LIMIT:?}"))
+    }
+
+    /// The rows a load of `READ_BATCH_LENGTH + 1` new sessions lists through
+    /// an empty cache, with every refresh owner commit from the one numbered
+    /// `failing_from` failing, the cache they read, and the owner's commits.
+    fn load_new_sessions_failing_from(
+        failing_from: Option<usize>,
+    ) -> (Vec<Conversation>, tempfile::TempDir, usize) {
+        let base = admitted_cache_base();
+        let home = ClaudeHome::new();
+        for index in 0..=READ_BATCH_LENGTH {
+            home.write(&format!("session-{index}"), index as u32, &["a question"]);
+        }
+        let commits = OwnerCommits::counted(base.path(), failing_from, home.watch());
+        let environment = environment_of(base.path());
+        let operation = waiting_operation(&environment);
+        let rows = load_sessions(
+            &environment,
+            home.storage(),
+            LoadOptions::default(),
+            &operation,
+            &mut |_, _| {},
+        )
+        .unwrap()
+        .conversations;
+        let _ = operation.finish();
+        let commits = commits.commits.load(Ordering::SeqCst);
+        (rows, base, commits)
+    }
+
+    /// A refresh owner commit of the writer that fails stops the writer
+    /// with the load's later writes queued, and the writer drops them: the
+    /// load ends, every row whose write landed reads its copy, and every
+    /// other row keeps its parse's texts.
+    #[test]
+    fn load_whose_writer_commit_fails_ends_and_keeps_unwritten_rows_texts() {
+        let (_, _, clean_commits) = load_new_sessions_failing_from(None);
+        let mut rows_keeping_texts = 0;
+        // Commit 0 records the acquisition: failing it fails the load.
+        for failing_from in 1..clean_commits {
+            let (rows, _base, _) =
+                within_watchdog(move || load_new_sessions_failing_from(Some(failing_from)));
+            for row in &rows {
+                let case = format!("failing from commit {failing_from}, {}", row.session_id);
+                match &row.cached_session {
+                    Some(_) => assert!(
+                        row.full_text.is_empty()
+                            && row
+                                .load_held_content()
+                                .unwrap()
+                                .row
+                                .full_text
+                                .contains("a question"),
+                        "{case}: a row with a copy reads its texts from the copy"
+                    ),
+                    None => {
+                        assert!(
+                            row.full_text.contains("a question"),
+                            "{case}: a row whose write didn't land keeps its texts"
+                        );
+                        rows_keeping_texts += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            rows_keeping_texts > 0,
+            "a failed commit leaves a parsed session unwritten"
+        );
+    }
+
+    /// A writer that ends with writes queued, as once its owner loses write
+    /// permission, drops them: the load's wait for their outcomes ends, and
+    /// each reads as not written.
+    #[test]
+    fn writes_queued_when_the_writer_ends_read_as_not_written() {
+        let base = admitted_cache_base();
+        let root = tempfile::tempdir().unwrap();
+        let root = SessionRoot::new(root.path());
+        let place = sqlite_cache::RecordPlace {
+            storage: Source::Pi.provider().storage().cache(),
+            source: Source::Pi,
+            roots: sqlite_cache::SessionRoots::of_system(&root),
+            directories: &crate::history::path::CanonicalDirectories::of_system(),
+            linker: Source::Pi.provider().storage().thread_linker(),
+            reader: Source::Pi.provider().storage().transcript_reader(),
+        };
+        let ownership = RefreshOwnership::acquire_for_test(&rearview(base.path())).unwrap();
+        let writer = SqliteCache::open_for_refresh(ownership.token()).unwrap();
+        let (writes, received) = mpsc::sync_channel(DATABASE_WRITE_QUEUE_LENGTH);
+        let mut in_flight = WritesInFlight::default();
+        for index in 0..DATABASE_WRITE_QUEUE_LENGTH {
+            let stub = SessionStub {
+                locator: root.path.join(format!("session-{index}.jsonl")),
+                subagents: Vec::new(),
+                cache_key: format!("session-{index}"),
+                fingerprint: Fingerprint {
+                    size: 100,
+                    modified: Some(UNIX_EPOCH + Duration::from_secs(1)),
+                },
+            };
+            let record = SessionRecord::unlisted(
+                &place,
+                &stub,
+                SessionStatus::Empty,
+                "an empty session".to_owned(),
+            )
+            .unwrap()
+            .unwrap();
+            let (write, outcome) = CacheWrite::session(record);
+            writes.send(write).unwrap();
+            in_flight.push(index, outcome);
+        }
+        ownership.token().revoke();
+        let writing =
+            std::thread::spawn(move || sqlite_cache::apply_writes(writer, received, None));
+
+        let settled = within_watchdog(move || {
+            let mut settled = Vec::new();
+            in_flight.settle_all(|index, generation| settled.push((index, generation)));
+            drop(writes);
+            settled
+        });
+
+        writing.join().unwrap();
+        assert_eq!(
+            settled,
+            (0..DATABASE_WRITE_QUEUE_LENGTH)
+                .map(|index| (index, None))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// The observations of one [`load_changed_sessions`].
     struct ChangedSessionsLoad {
         rows: Vec<Conversation>,
@@ -5418,7 +5725,8 @@ mod tests {
                     "{label}: the third load restores the copy of a transcript that stopped \
                      growing, without parsing or writing it"
                 );
-                let fresh = session.load(admitted_cache_base().path());
+                let fresh_base = admitted_cache_base();
+                let fresh = session.load(fresh_base.path());
                 let facts = |rows: &[Conversation]| {
                     rows.iter()
                         .map(|row| {
@@ -5536,7 +5844,8 @@ mod tests {
         });
         home.watch().mark();
 
-        load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
+        let listed =
+            load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
 
         assert_eq!(
             home.watch().sessions_parsed_after_mark(),
@@ -5551,30 +5860,40 @@ mod tests {
             (vec![None], stored),
             "the earlier copy stays with its entries, unwritten"
         );
+        let [row] = listed.as_slice() else {
+            panic!("{} rows listed", listed.len());
+        };
+        assert!(
+            row.cached_session.is_none() && row.full_text.contains("another question"),
+            "the row keeps its parse's texts, which no copy holds"
+        );
     }
 
-    /// A read of a home's sessions into the session cache under a base.
-    type CachingRead = fn(&ClaudeHome, &Path);
+    /// A read of a home's sessions into the session cache under a base, and
+    /// the row it lists.
+    type CachingRead = fn(&ClaudeHome, &Path) -> Conversation;
 
     #[test]
     fn transcript_shortened_after_load_read_it_fails_record() {
         let loads: [(&str, CachingRead); 2] = [
             ("a load", |home, base| {
-                load_sessions_with_cache(home.storage(), base, false, None).unwrap();
+                load_sessions_with_cache(home.storage(), base, false, None)
+                    .unwrap()
+                    .pop()
+                    .expect("the session is listed")
             }),
             ("a targeted read", |home, base| {
                 let stub = discovered_stub(home, &home.transcript("changed"));
                 let environment = environment_listing_home(base, home);
-                let (read, _) = SessionLoader::new(
+                SessionLoader::new(
                     &environment,
                     home.storage(),
                     false,
                     None,
                     AgentMeter::UNMETERED,
                 )
-                .cache_one(&home.root(), stub)
-                .into_parts();
-                assert!(matches!(read, SessionRead::Listed(_)));
+                .cache_row(&home.root(), &stub)
+                .expect("the session is listed")
             }),
         ];
         for (name, load) in loads {
@@ -5591,8 +5910,12 @@ mod tests {
                 file.set_len(length - 1).unwrap();
             });
 
-            load(&home, base.path());
+            let row = load(&home, base.path());
 
+            assert!(
+                row.cached_session.is_none() && row.full_text.contains("a question"),
+                "{name} keeps the row's texts, which the copy doesn't hold"
+            );
             let error: Option<String> =
                 rusqlite::Connection::open(base.path().join(sqlite_cache::DATABASE_FILE_NAME))
                     .unwrap()

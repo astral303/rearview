@@ -200,8 +200,9 @@ pub struct ParseError {
 
 #[derive(Clone)]
 pub struct Conversation {
-    /// The persisted content for a catalogue-only row. Parsed rows and
-    /// synthetic conversations carry their content in the fields below.
+    /// The persisted content of a row restored from the cache, or parsed
+    /// and written with its entries. A parsed row whose write didn't land
+    /// and a synthetic conversation carry their content in the fields below.
     pub cached_session: Option<sqlite_cache::CachedSession>,
     /// The address of this row's session in the session cache. The viewer,
     /// the printout and the agent commands read the session through it.

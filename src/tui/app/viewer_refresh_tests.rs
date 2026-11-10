@@ -1277,7 +1277,8 @@ fn every_reader_finds_session_by_name_renamed_outside_its_transcript() {
 enum Launch {
     /// Read from the copy an earlier load wrote.
     OverCache,
-    /// Parsed by the list's own first load.
+    /// Parsed by the list's own first load, whose write makes the copy the
+    /// row reads.
     OnEmptyCache,
 }
 
@@ -1321,10 +1322,9 @@ fn renamed_session_misses(
     if admitted_reads::count(&locator) != reads_before {
         wrong.push(format!("{case}: the refresh doesn't read the transcript"));
     }
-    assert_eq!(
+    assert!(
         app.conversations[0].cached_session.is_some(),
-        matches!(launch, Launch::OverCache),
-        "{case}: the list's row reads the cache, or holds its parse's texts in memory"
+        "{case}: the list's row reads the cache, restored from it or parsed and written"
     );
     wrong.extend(
         reader_misses(&app, &body_word)

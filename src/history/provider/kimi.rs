@@ -1637,15 +1637,16 @@ pub(super) mod tests {
 
         let listed = load_under(&KimiFixture, home.path(), cache.path());
         assert_eq!(listed.len(), 1);
+        let content = listed[0].load_held_content().unwrap().row;
         assert_eq!(
-            listed[0]
+            content
                 .agent_search_text
                 .matches("kimi child answer searchable")
                 .count(),
             2,
             "each sub-agent wire's text reaches the row once"
         );
-        assert!(!listed[0].full_text.contains("kimi child answer searchable"));
+        assert!(!content.full_text.contains("kimi child answer searchable"));
     }
 
     /// Semantic and hybrid `agent search` route to a session by its
@@ -1733,8 +1734,9 @@ pub(super) mod tests {
         assert_eq!(listed[0].path, wire);
         assert_eq!(listed[0].message_count, alone.message_count);
         assert_eq!(listed[0].total_tokens, alone.total_tokens);
-        assert_eq!(listed[0].full_text, alone.full_text);
-        assert_eq!(listed[0].agent_search_text, alone.agent_search_text);
+        let content = listed[0].load_held_content().unwrap().row;
+        assert_eq!(content.full_text, alone.full_text);
+        assert_eq!(content.agent_search_text, alone.agent_search_text);
         let cached = SqliteCache::open_waiting(&database)
             .unwrap()
             .unwrap()

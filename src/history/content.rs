@@ -4,8 +4,8 @@ use super::Conversation;
 use super::MessageTimes;
 use super::message_texts::{MessageTextBuilder, push_separated};
 use super::sqlite_cache::{
-    self, CachedSession, CopyRead, HeldCopy, RouteKey, ScannedCopy, ScannedTurns, SearchField,
-    SearchPart, SemanticRoute, SemanticTurns,
+    self, CachedSession, CopyRead, HeldCopy, Publication, RouteKey, ScannedCopy, ScannedTurns,
+    SearchField, SearchPart, SemanticRoute, SemanticTurns,
 };
 use crate::error::Result;
 use rayon::prelude::*;
@@ -93,6 +93,19 @@ impl Conversation {
         self.thinking_and_tool_call_text = String::new();
         self.search_text_lower = String::new();
         self.message_text_starts = Default::default();
+    }
+
+    /// Makes this row `copy`, the copy its write made: the row drops its
+    /// texts and reads them from that copy, as a row restored from the cache
+    /// does, and the command that built it reads that generation as current.
+    pub(crate) fn publish_as(&mut self, copy: CachedSession) {
+        self.clear_search_texts();
+        self.semantic_turns = Vec::new();
+        self.semantic_turn_ranges = Vec::new();
+        self.publication = Publication::Published {
+            generation: copy.generation(),
+        };
+        self.cached_session = Some(copy);
     }
 
     /// `rows`, pairs of a row and its copy, with the semantic turns of the
