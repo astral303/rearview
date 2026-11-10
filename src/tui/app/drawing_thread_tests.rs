@@ -577,7 +577,7 @@ fn opening_session_another_process_is_writing_waits_for_that_refresh() {
 }
 
 #[test]
-fn file_opened_directly_reads_nothing_on_drawing_thread_while_another_process_writes_it() {
+fn file_opened_directly_doesnt_read_on_drawing_thread_while_another_process_writes_it() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let row = cached_session(home.path(), base.path());
@@ -810,11 +810,10 @@ fn app_listing_home_over_cache(home: &ClaudeHome, base: &Path, clock: Arc<dyn Cl
     )
 }
 
-/// Eighth-pass findings (Claude F7, Codex F1): the drawing thread's check
-/// for a refresh's completion opened a writable connection and took
-/// SQLite's writer lock.
+/// The drawing thread's check for a refresh's completion reads the refresh
+/// owner without taking SQLite's writer lock.
 #[test]
-fn completion_check_opens_no_writable_connection() {
+fn completion_check_doesnt_open_writable_connection() {
     let home = ClaudeHome::new();
     let base = tempfile::tempdir().unwrap();
     let a = home.write("a", 5, &["a"]);
@@ -845,9 +844,8 @@ fn completion_check_opens_no_writable_connection() {
     drop(other_refresh);
 }
 
-/// Eighth-pass finding (Claude F7): a completion check beside another
-/// connection's write transaction, while no refresh owned the cache,
-/// reported another rearview's refresh.
+/// Another connection's write transaction, while no refresh owns the cache,
+/// is not another rearview's refresh.
 #[test]
 fn completion_check_beside_write_without_owner_doesnt_report_another_rearview() {
     let home = ClaudeHome::new();
@@ -871,9 +869,9 @@ fn completion_check_beside_write_without_owner_doesnt_report_another_rearview() 
     drop(write_without_an_owner);
 }
 
-/// Eighth-pass finding (Codex F3): after another rearview took over this
-/// process's expired refresh and began a rebuild, its unreadable owner read
-/// as this process's refresh, hiding the waiting label.
+/// After another rearview takes over this process's expired refresh and
+/// begins a rebuild, the refresh owner cannot be read. The completion check
+/// reports another rearview, so the waiting label shows.
 #[test]
 fn another_rearviews_rebuild_after_takeover_doesnt_read_as_this_processs_refresh() {
     let home = ClaudeHome::new();

@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn command_finishing_before_first_interval_writes_no_record() {
+    fn command_finishing_before_first_interval_doesnt_write_record() {
         let perf = CommandPerf::new(std::sync::Arc::new(crate::clock::TestClock::default()));
         let mut out = Vec::new();
 

@@ -557,7 +557,7 @@ impl AgentService {
         window: &TimeFilter,
     ) -> Result<history::OperationScope> {
         let base = self.environment.cache_base();
-        if let history::sqlite_cache::OperationAccess::Owner(_) = operation.access()? {
+        if let history::sqlite_cache::OperationAccess::Owner(_) = operation.acquire_access()? {
             self.refresh_targets(targets, &operation)?;
             if !operation.has_lost_write_permission() {
                 return Ok(operation);
@@ -594,7 +594,7 @@ impl AgentService {
                         history::Patience::UntilAcquired,
                         Arc::clone(self.perf.load_meter().wait_status()),
                     );
-                    waiting.access()?;
+                    waiting.acquire_access()?;
                     self.refresh_targets(targets, &waiting)?;
                     return Ok(waiting);
                 }
@@ -627,7 +627,7 @@ impl AgentService {
             let is_listed = outcomes
                 .iter()
                 .any(history::provider::SessionOutcome::is_listed);
-            if !is_listed && let Some(permit) = operation.parse_permit()? {
+            if !is_listed && let Some(permit) = operation.acquire_ownership_and_parse_permit()? {
                 self.keep_uncached_transcript(permit, target);
             }
         }
@@ -1408,7 +1408,7 @@ fn recorded_sessions(
         return Ok(cached);
     }
     if matches!(
-        operation.access()?,
+        operation.acquire_access()?,
         history::sqlite_cache::OperationAccess::AsIs
     ) {
         return Ok(cached);
@@ -2717,13 +2717,14 @@ mod tests {
     ) -> history::provider::LoadedSessions {
         let environment = test_environment(Vec::new(), Some(cache_base));
         let operation = waiting_operation(&environment);
+        let options = history::provider::LoadOptions {
+            left_out,
+            ..history::provider::LoadOptions::default()
+        };
         let loaded = history::provider::load_sessions(
             &environment,
             storage,
-            false,
-            None,
-            AgentMeter::UNMETERED,
-            left_out,
+            options,
             &operation,
             &mut |_, _| {},
         )
@@ -3356,8 +3357,8 @@ mod tests {
         agent::diagnostic::format_warning_records(warnings).1
     }
 
-    /// Rule 7: while another rearview refreshes, a selection reads the cache
-    /// as it is and names the session whose transcript changed since.
+    /// While another rearview refreshes, a selection reads the cache as it is
+    /// and names the session whose transcript changed since.
     #[test]
     fn selection_beside_another_refresh_reads_cache_and_names_changed_session() {
         let sessions = CachedClaudeSessions::new();
@@ -3382,8 +3383,8 @@ mod tests {
         );
     }
 
-    /// Rule 7: a session the cache has never held counts as changed, without
-    /// the end of cached data.
+    /// A session the cache has never held counts as changed, and its record
+    /// leaves out `cached-until`.
     #[test]
     fn selection_beside_another_refresh_names_session_cache_lacks_without_cached_until() {
         let sessions = CachedClaudeSessions::new();
@@ -3411,8 +3412,8 @@ mod tests {
         );
     }
 
-    /// Rule 7: a window that ends inside the cached copy's messages misses
-    /// nothing the cache lacks.
+    /// A window that ends inside the cached copy's messages misses nothing
+    /// the cache lacks.
     #[test]
     fn selection_whose_window_ends_inside_cached_messages_doesnt_warn() {
         let sessions = CachedClaudeSessions::new();
@@ -4607,9 +4608,9 @@ mod tests {
         );
     }
 
-    /// Rule 8: a cache write that finds less than 1 GB free on the cache's
-    /// drive stops the command with an `agent-error` record naming the free
-    /// space, and the cache database is deleted.
+    /// A cache write that finds less than 1 GB free on the cache's drive
+    /// stops the command with an `agent-error` record naming the free space,
+    /// and the cache database is deleted.
     #[test]
     fn command_whose_cache_write_finds_less_than_gigabyte_free_reports_agent_error() {
         let sessions = CachedClaudeSessions::new();
@@ -4714,7 +4715,7 @@ mod tests {
     /// A cache write that finds the drive short of space, at the first, the
     /// middle or the last write, stops the command before its next parse.
     #[test]
-    fn command_whose_cache_write_finds_drive_short_parses_nothing_after_it() {
+    fn command_whose_cache_write_finds_drive_short_doesnt_parse_after_it() {
         use history::sqlite_cache::DriveRunningOut;
         let template = crate::tui::claude_home::ChangedSessionsTemplate::new();
         let checks = {

@@ -97,19 +97,54 @@ pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex;
 
-    /// The file system's listing, recording each directory it lists and
-    /// refusing the directories a test names, as a directory the user cannot
-    /// read refuses.
-    #[derive(Debug, Default)]
+    /// The file system's listing, recording each directory it lists,
+    /// running the actions a test schedules before a listing, and refusing
+    /// the directories a test names, as a directory the user cannot read
+    /// refuses.
+    #[derive(Default)]
     pub(crate) struct ScriptedLister {
-        refused: Mutex<Vec<PathBuf>>,
+        /// Each refused directory with the number of its first refused
+        /// listing.
+        refused: Mutex<Vec<(PathBuf, usize)>>,
+        actions: Mutex<Vec<ListingAction>>,
         listed: Mutex<Vec<PathBuf>>,
+    }
+
+    /// An action a test runs before the `listing`th listing of `directory`.
+    struct ListingAction {
+        directory: PathBuf,
+        listing: usize,
+        action: std::sync::Arc<dyn Fn() + Send + Sync>,
     }
 
     impl ScriptedLister {
         /// Refuse every later listing of `directory` with a permission error.
         pub(crate) fn refuse(&self, directory: &Path) {
-            self.refused.lock().unwrap().push(directory.to_path_buf());
+            self.refuse_from_listing(directory, self.times_listed(directory) + 1);
+        }
+
+        /// Refuse the `listing`th listing of `directory`, counted from the
+        /// first, and every one after it.
+        pub(crate) fn refuse_from_listing(&self, directory: &Path, listing: usize) {
+            self.refused
+                .lock()
+                .unwrap()
+                .push((directory.to_path_buf(), listing));
+        }
+
+        /// Run `action` before the `listing`th listing of `directory`,
+        /// counted from the first.
+        pub(crate) fn run_before_listing(
+            &self,
+            directory: &Path,
+            listing: usize,
+            action: impl Fn() + Send + Sync + 'static,
+        ) {
+            self.actions.lock().unwrap().push(ListingAction {
+                directory: directory.to_path_buf(),
+                listing,
+                action: std::sync::Arc::new(action),
+            });
         }
 
         /// The number of times `directory` was listed, refused listings
@@ -126,13 +161,31 @@ pub(crate) mod test_support {
 
     impl DirectoryLister for ScriptedLister {
         fn list(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
-            self.listed.lock().unwrap().push(directory.to_path_buf());
+            let listing = {
+                let mut listed = self.listed.lock().unwrap();
+                listed.push(directory.to_path_buf());
+                listed.iter().filter(|listed| *listed == directory).count()
+            };
+            // Cloned out so an action can list or schedule without a deadlock.
+            let actions: Vec<_> = self
+                .actions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|scheduled| {
+                    scheduled.directory == directory && scheduled.listing == listing
+                })
+                .map(|scheduled| std::sync::Arc::clone(&scheduled.action))
+                .collect();
+            for action in actions {
+                action();
+            }
             if self
                 .refused
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|refused| refused == directory)
+                .any(|(refused, from)| refused == directory && listing >= *from)
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,

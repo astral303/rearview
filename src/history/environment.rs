@@ -218,10 +218,7 @@ pub(crate) mod test_support {
         crate::history::provider::load_sessions(
             &environment,
             storage,
-            false,
-            None,
-            crate::history::load_meter::AgentMeter::UNMETERED,
-            crate::history::provider::LeftOutRows::NONE,
+            crate::history::provider::LoadOptions::default(),
             &waiting_operation(&environment),
             &mut |_, _| {},
         )

@@ -3960,7 +3960,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_waiting_for_this_processs_own_refresh_show_no_refresh_label() {
+    fn rows_waiting_for_this_processs_own_refresh_dont_show_refresh_label() {
         let mut list = lexical_list_app();
         list.await_refresh_for_test(std::iter::empty(), AwaitedRefresh::ThisProcess);
         let dir = tempfile::tempdir().unwrap();

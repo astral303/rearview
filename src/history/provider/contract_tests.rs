@@ -657,10 +657,7 @@ fn rows_loaded_through(environment: &Environment) -> Vec<Conversation> {
     let rows = super::load_sessions(
         environment,
         environment.storages()[0],
-        false,
-        None,
-        AgentMeter::UNMETERED,
-        super::LeftOutRows::NONE,
+        super::LoadOptions::default(),
         &operation,
         &mut |_, _| {},
     )

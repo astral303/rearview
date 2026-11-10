@@ -3,7 +3,8 @@
 use super::listing::{self, SessionOrigin, SessionTimes};
 use super::load_meter::{AgentMeter, LoadMeter};
 use super::provider::{
-    Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions, UnreadableDirectory,
+    Deleted, DiscoveredSession, FoundSession, LeftOutRows, LoadOptions, SkippedSessions,
+    UnreadableDirectory,
 };
 use super::sqlite_cache::{
     AwaitedRefresh, Cancellation, Observation, OperationScope, OtherRearview, Patience,
@@ -124,13 +125,16 @@ impl ProviderHistory {
                 .roots()
                 .is_ok_and(|roots| roots.iter().any(|root| root.path.exists()));
             let source = storage.source();
+            let options = LoadOptions {
+                show_last,
+                debug_level,
+                meter: AgentMeter::of(meter, source),
+                left_out,
+            };
             let loaded = super::provider::load_sessions(
                 environment,
                 storage,
-                show_last,
-                debug_level,
-                AgentMeter::of(meter, source),
-                left_out,
+                options,
                 operation,
                 &mut |done, total| {
                     report(LoaderMessage::Progress(LoadProgress {
@@ -608,7 +612,7 @@ pub fn delete_empty_sessions(
     );
     let candidates = find_empty_sessions(environment, scope, &operation)?;
     let summary = if delete {
-        let permit = operation.acquired_parse_permit()?;
+        let permit = operation.wait_for_ownership_and_parse_permit()?;
         delete_each(candidates, |session| {
             super::provider::delete_session(permit, session.source, &session.path)
         })?
@@ -796,8 +800,8 @@ mod tests {
         assert_eq!(attempted, ["failing"]);
     }
 
-    /// Rule 8: a cache write that finds less than 1 GB free on the cache's
-    /// drive stops the command, which prints the free space.
+    /// A cache write that finds less than 1 GB free on the cache's drive
+    /// stops the command, which prints the free space.
     #[test]
     fn load_whose_cache_write_finds_less_than_gigabyte_free_deletes_cache_and_fails() {
         use crate::tui::claude_home::ClaudeHome;
@@ -846,7 +850,7 @@ mod tests {
     /// middle or the last write, stops the TUI's launch before its next
     /// parse.
     #[test]
-    fn launch_whose_cache_write_finds_drive_short_parses_nothing_after_it() {
+    fn launch_whose_cache_write_finds_drive_short_doesnt_parse_after_it() {
         use crate::history::sqlite_cache::DriveRunningOut;
         use crate::tui::claude_home::ChangedSessionsTemplate;
         let template = ChangedSessionsTemplate::new();

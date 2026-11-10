@@ -220,8 +220,8 @@ fn second_refresh_doesnt_begin_while_one_runs() {
     assert!(app.begin_refresh().is_some());
 }
 
-/// Rule 5: a list `Ctrl+R` pressed while another job runs waits, one at
-/// most, and begins once that job's outcome is applied.
+/// A list `Ctrl+R` pressed while another job runs waits, one at most, and
+/// begins once that job's outcome is applied.
 #[test]
 fn ctrl_r_pressed_twice_while_refresh_runs_requests_one_list_refresh() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);

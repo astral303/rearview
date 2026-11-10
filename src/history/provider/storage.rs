@@ -466,7 +466,7 @@ impl SessionStorage for WatchedStorage {
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
     ) -> Result<ParsedSession> {
-        self.watch.begin_parse();
+        self.watch.begin_parse(&stub.locator);
         self.inner
             .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
@@ -474,23 +474,37 @@ impl SessionStorage for WatchedStorage {
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
         self.inner.external_titles(root)
     }
+
+    fn remove_superseded_cache(&self, cache_base: &Path) {
+        self.inner.remove_superseded_cache(cache_base)
+    }
 }
 
-/// The parses of [`WatchedStorage`]s, as a test watches them: how many
-/// began after a moment the test marks, and a hold that keeps each parse
-/// from running until the test releases it.
+/// The parses of [`WatchedStorage`]s, as a test watches them: the sessions
+/// parsed, how many parses began after a moment the test marks, an action
+/// run as each parse begins, and a hold that keeps each parse from running
+/// until the test releases it.
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct ParseWatch(std::sync::Arc<ParseWatchState>);
 
 #[cfg(test)]
+type ParseAction = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Default)]
 struct ParseWatchState {
-    begun: std::sync::atomic::AtomicUsize,
+    parses: std::sync::Mutex<Vec<BegunParse>>,
     is_marked: std::sync::atomic::AtomicBool,
-    begun_after_mark: std::sync::atomic::AtomicUsize,
+    action: std::sync::Mutex<Option<ParseAction>>,
     is_held: std::sync::Mutex<bool>,
     released: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct BegunParse {
+    locator: std::path::PathBuf,
+    is_after_mark: bool,
 }
 
 #[cfg(test)]
@@ -504,14 +518,47 @@ impl ParseWatch {
 
     /// The parses that began after [`Self::mark`].
     pub(crate) fn parses_after_mark(&self) -> usize {
-        self.0
-            .begun_after_mark
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.sessions_parsed_after_mark().len()
     }
 
     /// The parses that began.
     pub(crate) fn parses_begun(&self) -> usize {
-        self.0.begun.load(std::sync::atomic::Ordering::SeqCst)
+        self.0.parses.lock().unwrap().len()
+    }
+
+    /// The locator of each session whose parse began, once per parse,
+    /// sorted.
+    pub(crate) fn parsed_sessions(&self) -> Vec<std::path::PathBuf> {
+        self.locators_parsed(|_| true)
+    }
+
+    /// [`Self::parsed_sessions`] for the parses that began after
+    /// [`Self::mark`].
+    pub(crate) fn sessions_parsed_after_mark(&self) -> Vec<std::path::PathBuf> {
+        self.locators_parsed(|parse| parse.is_after_mark)
+    }
+
+    fn locators_parsed(
+        &self,
+        is_included: impl Fn(&BegunParse) -> bool,
+    ) -> Vec<std::path::PathBuf> {
+        let mut locators: Vec<_> = self
+            .0
+            .parses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|parse| is_included(parse))
+            .map(|parse| parse.locator.clone())
+            .collect();
+        locators.sort();
+        locators
+    }
+
+    /// Run `action` as each later parse begins, on the parsing thread,
+    /// before the parse reads its transcript.
+    pub(crate) fn run_as_each_parse_begins(&self, action: impl Fn() + Send + Sync + 'static) {
+        *self.0.action.lock().unwrap() = Some(std::sync::Arc::new(action));
     }
 
     /// Keep every later parse from running until [`Self::release`].
@@ -525,11 +572,16 @@ impl ParseWatch {
         self.0.released.notify_all();
     }
 
-    fn begin_parse(&self) {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.0.begun.fetch_add(1, SeqCst);
-        if self.0.is_marked.load(SeqCst) {
-            self.0.begun_after_mark.fetch_add(1, SeqCst);
+    fn begin_parse(&self, locator: &Path) {
+        self.0.parses.lock().unwrap().push(BegunParse {
+            locator: locator.to_path_buf(),
+            is_after_mark: self.0.is_marked.load(std::sync::atomic::Ordering::SeqCst),
+        });
+        // Cloned out so parses running in parallel don't wait for each
+        // other's action.
+        let action = self.0.action.lock().unwrap().clone();
+        if let Some(action) = action {
+            action();
         }
         let mut is_held = self.0.is_held.lock().unwrap();
         while *is_held {

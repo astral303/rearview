@@ -288,7 +288,7 @@ impl SessionStorage for ClaudeStorage {
 
 /// The magic each per-project cache file of releases up to v0.3.1 opens
 /// with.
-const PROJECT_CACHE_MAGIC: &[u8; 8] = b"CLHIST01";
+pub(super) const PROJECT_CACHE_MAGIC: &[u8; 8] = b"CLHIST01";
 
 /// Remove the per-project cache of releases up to v0.3.1, kept in
 /// `projects/` under `cache_base`, or in `config-<hash>/projects/` for a

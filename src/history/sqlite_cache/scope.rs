@@ -55,7 +55,7 @@ pub(crate) enum OperationAccess<'s> {
 
 /// An operation's refresh ownership while it may write and parse: its write
 /// permission stands, the operation is not cancelled, and no write found the
-/// drive short of space. Only [`OperationScope::access`] makes one.
+/// drive short of space. Only [`OperationScope::acquire_access`] makes one.
 pub(crate) struct LiveOwner<'s> {
     scope: &'s OperationScope,
     token: RefreshToken,
@@ -154,14 +154,15 @@ impl OperationScope {
         }
     }
 
-    /// This operation's access to the cache now, acquiring refresh ownership
-    /// on the first call that needs it. An operation that owns the refresh
-    /// reads the cache as it is once its write permission is revoked or it
-    /// is cancelled, and keeps the ownership until [`Self::finish`]. Fails
+    /// Acquire this operation's access to the cache now. The first call that
+    /// needs refresh ownership waits for it as the operation's patience
+    /// allows. An operation that owns the refresh reads the cache as it is
+    /// once its write permission is revoked or it is cancelled, and keeps
+    /// the ownership until [`Self::finish`]. Fails
     /// on a database error other than a busy lock, when cancelled while
     /// waiting for ownership, and once a write found the cache's drive short
     /// of space (see [`Self::finish`]).
-    pub(crate) fn access(&self) -> Result<OperationAccess<'_>> {
+    pub(crate) fn acquire_access(&self) -> Result<OperationAccess<'_>> {
         let coordinator = &self.coordinator;
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         held.abort_when_out_of_space(coordinator.base());
@@ -226,27 +227,33 @@ impl OperationScope {
         }
     }
 
-    /// The permit this operation parses transcripts with as the live
-    /// refresh owner, acquiring ownership as [`Self::access`] does; `None`
-    /// while it reads the cache as it is.
-    pub(crate) fn parse_permit(&self) -> Result<Option<super::ParsePermit<'_>>> {
-        Ok(match self.access()? {
+    /// Acquire refresh ownership as [`Self::acquire_access`] does: the first
+    /// call waits as long as the operation's [`Patience`] allows. Returns the
+    /// permit to parse transcripts with while this operation is the live
+    /// owner, and `None` while it reads the cache as it is. Fails as
+    /// `acquire_access` fails.
+    pub(crate) fn acquire_ownership_and_parse_permit(
+        &self,
+    ) -> Result<Option<super::ParsePermit<'_>>> {
+        Ok(match self.acquire_access()? {
             OperationAccess::Owner(_) => Some(super::permit::ParsePermit::owner()),
             OperationAccess::AsIs => None,
         })
     }
 
-    /// [`Self::parse_permit`] of an operation that waits as long as another
-    /// rearview keeps the cache, so it always acquires ownership. Fails as
-    /// acquiring it fails, and with [`AppError::SessionCacheRefreshLost`]
-    /// once the ownership is no longer live.
-    pub(crate) fn acquired_parse_permit(&self) -> Result<super::ParsePermit<'_>> {
+    /// Wait until this operation acquires refresh ownership, for as long as
+    /// another rearview keeps the cache, and return the permit to parse
+    /// transcripts with. Panics unless the operation's patience is
+    /// [`Patience::UntilAcquired`]. Fails as [`Self::acquire_access`] fails,
+    /// and with [`AppError::SessionCacheRefreshLost`] once the ownership is no
+    /// longer live.
+    pub(crate) fn wait_for_ownership_and_parse_permit(&self) -> Result<super::ParsePermit<'_>> {
         assert_eq!(
             self.patience,
             Patience::UntilAcquired,
             "only an operation that waits until it acquires ownership is sure to own the cache"
         );
-        self.parse_permit()?
+        self.acquire_ownership_and_parse_permit()?
             .ok_or(AppError::SessionCacheRefreshLost)
     }
 
