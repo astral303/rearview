@@ -37,6 +37,7 @@ pub use base::{CacheBase, ProcessIdentity};
 #[cfg(test)]
 pub(crate) use base::{DiskSpace, DriveRunningOut};
 pub(crate) use cached_session::CopyKey;
+pub(crate) use cached_session::CopyRead;
 pub(crate) use cached_session::Currency;
 pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
 pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
@@ -842,7 +843,7 @@ impl CacheWriter {
                 check_space()?;
                 let batch = session_transaction(&mut self.cache.connection, session, owner)?;
                 write_malformed_lines(&batch, session, entries)?;
-                write_search_parts(&batch, session, record, &keys, &[])?;
+                write_subagent_metadata(&batch, session, record, &keys, &[])?;
                 refresh::commit(batch, owner)?;
                 None
             }
@@ -1066,7 +1067,7 @@ fn write_transcript_reads(
 
 /// Updates the stored session row `session` to `record`'s, with
 /// `message_count`, and writes its files, their reads, its checkpoint, its
-/// parse errors and its search parts. Returns the generation it gave the
+/// parse errors and its sub-agent metadata parts. Returns the generation it gave the
 /// row.
 fn write_catalogue_rows(
     connection: &Connection,
@@ -1086,7 +1087,7 @@ fn write_catalogue_rows(
     statement.raw_execute()?;
     drop(statement);
     let stored_files = positional::SESSION_FILES.stored(connection, session)?;
-    write_search_parts(connection, session, record, keys, &stored_files)?;
+    write_subagent_metadata(connection, session, record, keys, &stored_files)?;
     positional::SESSION_FILES.write(
         connection,
         session,
@@ -1171,9 +1172,9 @@ fn write_malformed_lines(
     )
 }
 
-/// Writes the search parts of `record`, whose files `keys` places, and
+/// Writes the sub-agent metadata parts of `record`, whose files `keys` places, and
 /// whose session's stored files were `stored_files` before this write.
-fn write_search_parts(
+fn write_subagent_metadata(
     connection: &Connection,
     session: i64,
     record: &SessionRecord,
@@ -1189,7 +1190,7 @@ fn write_search_parts(
     table.write(
         connection,
         session,
-        &catalogue::CatalogueRow::search_part_rows(keys, &record.search_parts),
+        &catalogue::CatalogueRow::subagent_metadata_rows(keys, &record.subagent_metadata),
         stored,
         |values| {
             Ok(stored_places

@@ -480,7 +480,7 @@ fn literal_evidence_preview(
     parsed: &ParsedQuery,
     visible_preview: &str,
 ) -> String {
-    let full_text = conversation.full_text_after_leading_texts();
+    let full_text = conversation.full_text_after_title_and_summary();
     parsed
         .literals()
         .iter()

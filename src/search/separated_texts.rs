@@ -2,7 +2,6 @@
 //! without copying them: the evidence and the context line read a row's
 //! title and summary ahead of its other texts this way.
 
-use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use std::borrow::Cow;
 use std::ops::Range;
@@ -30,15 +29,6 @@ impl<'a> SeparatedTexts<'a> {
             len += text.len();
         }
         Self { segments, len }
-    }
-
-    /// `conversation`'s title and summary, then its `full_text`.
-    pub(crate) fn of_row(conversation: &'a Conversation) -> Self {
-        Self::new(
-            conversation
-                .leading_texts()
-                .chain([conversation.full_text.as_str()]),
-        )
     }
 
     pub(crate) fn len(&self) -> usize {

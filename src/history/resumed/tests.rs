@@ -97,7 +97,7 @@ fn row_fold_resumed_at_every_split_equals_whole_fold_for_every_agent() {
             .unwrap()
             .expect("the session is listed");
         let row = listed.row;
-        let (view, _) = listed.transcripts.into_entries_and_search_parts();
+        let (view, _) = listed.transcripts.into_entries_and_subagent_metadata();
         let subagents: HashSet<&Path> = stub.subagents.iter().map(PathBuf::as_path).collect();
         // The stored view doesn't hold a leading title. A resumed read
         // removes the titles from the leading entries, as here.

@@ -111,6 +111,24 @@ pub struct CachedSession {
     pub(super) checks_source: bool,
 }
 
+/// A read of one copy of a session.
+pub(crate) enum CopyRead<T> {
+    Read(T),
+    /// Another write replaced the copy: the cache holds the copy of
+    /// `generation` at its address.
+    Replaced {
+        generation: i64,
+    },
+}
+
+/// Some messages of a session, read whole.
+pub(crate) struct MessagesRead {
+    /// The transcript holding the messages read alone.
+    pub(crate) transcript: crate::agent::transcript::AgentTranscript,
+    /// The number of the session's last message.
+    pub(crate) message_count: usize,
+}
+
 /// One copy of a session in the cache. Every write of the session gives its
 /// copy another key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -281,6 +299,42 @@ impl CachedSession {
         &self,
         read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
     ) -> Result<Option<T>> {
+        match self.read_copy(read)? {
+            Some(CopyRead::Read(result)) => Ok(Some(result)),
+            Some(CopyRead::Replaced { .. }) => Err(AppError::SessionCacheNotReady {
+                session: self.address.cache_key.clone(),
+                reason: "catalogue generation changed".to_owned(),
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// The messages numbered `ordinals` of the copy, each whole, as the
+    /// viewer shows them, and the session's message count, read through the
+    /// index on the message numbers. `None` as for [`Self::read`].
+    pub(crate) fn agent_messages(
+        &self,
+        path: &Path,
+        ordinals: &[usize],
+    ) -> Result<Option<CopyRead<MessagesRead>>> {
+        self.read_copy(|connection, session, places| {
+            let stored = entries::read_messages(connection, session, places, ordinals)?;
+            let message_count: Option<i64> = connection
+                .prepare_cached("SELECT MAX(ordinal) FROM messages WHERE session = ?1")?
+                .query_row([session], |row| row.get(0))?;
+            Ok(MessagesRead {
+                transcript: crate::agent::transcript::AgentTranscript::from_stored(path, stored)?,
+                message_count: message_count.map_or(0, |count| count as usize),
+            })
+        })
+    }
+
+    /// [`Self::read`], reporting a copy another write replaced at the
+    /// address.
+    fn read_copy<T>(
+        &self,
+        read: impl FnOnce(&Connection, i64, &Places) -> Result<T>,
+    ) -> Result<Option<CopyRead<T>>> {
         let Some(cache) = self.wait.open(&self.base)? else {
             return Ok(None);
         };
@@ -300,10 +354,9 @@ impl CachedSession {
             };
             let session = stored.id;
             if stored.generation != self.generation {
-                return Err(AppError::SessionCacheNotReady {
-                    session: address.cache_key.clone(),
-                    reason: "catalogue generation changed".to_owned(),
-                });
+                return Ok(Some(CopyRead::Replaced {
+                    generation: stored.generation,
+                }));
             }
             let places = Places::stored(connection, &address.roots)?;
             let result = (|| {
@@ -317,7 +370,7 @@ impl CachedSession {
                 Ok(result)
             })();
             match result {
-                Ok(result) => Ok(Some(result)),
+                Ok(result) => Ok(Some(CopyRead::Read(result))),
                 Err(AppError::StoredRootUnknown { .. }) => Ok(None),
                 Err(error) => Err(error),
             }

@@ -6,7 +6,7 @@ use super::entries::path_text;
 use super::positional::{PositionalRow, PositionalTable, SESSION_FILES, TRANSCRIPT_READS};
 use super::roots::{FilePlace, Places, SessionRoots, StoredPath, WrittenPlaces};
 use crate::history::fingerprint::{CachedFingerprint, FileStamp};
-use crate::history::parser::{SessionTranscripts, SubagentSearchPart};
+use crate::history::parser::{SessionTranscripts, SubagentMetadataPart};
 use crate::history::path::CanonicalDirectories;
 use crate::history::provider::{
     RecordedSession, SessionCache, SessionStub, ThreadLinker, TranscriptRead,
@@ -55,7 +55,7 @@ pub(crate) struct SessionRecord {
     /// listed, as [`crate::agent::diagnostic::AgentWarning::to_recorded`]
     /// writes it; `None` for a listed one.
     pub(super) unlisted_reason: Option<String>,
-    pub(super) search_parts: Vec<SubagentSearchPart>,
+    pub(super) subagent_metadata: Vec<SubagentMetadataPart>,
     /// The checkpoint a resumed read of the session starts from; `None` for
     /// a session whose next change is read whole.
     pub(super) checkpoint: Option<CheckpointRecord>,
@@ -209,13 +209,13 @@ impl SessionRecord {
             Ok(Some(catalogue)) => catalogue,
             Ok(None) => {
                 return ListedRecord::WithoutFingerprint(
-                    transcripts.into_entries_and_search_parts().0,
+                    transcripts.into_entries_and_subagent_metadata().0,
                 );
             }
             Err(error) => {
                 return ListedRecord::Failed {
                     error,
-                    entries: transcripts.into_entries_and_search_parts().0,
+                    entries: transcripts.into_entries_and_subagent_metadata().0,
                 };
             }
         };
@@ -229,9 +229,9 @@ impl SessionRecord {
                 ledger: std::mem::take(&mut transcripts.ledger),
                 linker: place.linker,
             });
-        let (entries, search_parts) = transcripts.into_entries_and_search_parts();
-        let (entries, search_parts) = match added {
-            Ok(()) => (RecordEntries::Written(entries), search_parts),
+        let (entries, subagent_metadata) = transcripts.into_entries_and_subagent_metadata();
+        let (entries, subagent_metadata) = match added {
+            Ok(()) => (RecordEntries::Written(entries), subagent_metadata),
             Err(error) => (
                 RecordEntries::Unwritten {
                     reason: error.to_string(),
@@ -244,7 +244,7 @@ impl SessionRecord {
             catalogue,
             entries: Some(entries),
             unlisted_reason: None,
-            search_parts,
+            subagent_metadata,
             checkpoint,
             update: None,
         }))
@@ -280,7 +280,7 @@ impl SessionRecord {
         conversation: &Conversation,
         reads: HashMap<PathBuf, (TranscriptRead, Vec<u8>)>,
         entries: TranscriptEntries,
-        search_parts: Vec<SubagentSearchPart>,
+        subagent_metadata: Vec<SubagentMetadataPart>,
         checkpoint: Option<(SessionCheckpoint, Vec<u8>)>,
         update: super::window::WindowUpdate,
     ) -> crate::error::Result<Option<Self>> {
@@ -308,7 +308,7 @@ impl SessionRecord {
             catalogue,
             entries: Some(RecordEntries::Written(entries)),
             unlisted_reason: None,
-            search_parts,
+            subagent_metadata,
             checkpoint,
             update: Some(Box::new(update)),
         }))
@@ -333,7 +333,7 @@ impl SessionRecord {
             catalogue,
             entries: None,
             unlisted_reason: Some(reason),
-            search_parts: Vec::new(),
+            subagent_metadata: Vec::new(),
             checkpoint: None,
             update: None,
         }))
@@ -573,22 +573,24 @@ impl CatalogueRow {
 
     /// The sub-agent metadata parts of `parts`, each keyed by its
     /// transcript's file in `keys`.
-    pub(super) fn search_part_rows(
+    pub(super) fn subagent_metadata_rows(
         keys: &CatalogueKeys,
-        parts: &[SubagentSearchPart],
+        parts: &[SubagentMetadataPart],
     ) -> Vec<PositionalRow<Option<StoredPath>>> {
         parts
             .iter()
-            .map(|part| PositionalRow {
-                key: keys.files.get(part.file_position).cloned(),
-                values: vec![
-                    super::entries::SUBAGENT_METADATA.to_owned().into(),
-                    super::SearchField::Supplement.code().into(),
-                    (part.file_position as i64).into(),
-                    super::entries::search_only_text(&part.text)
-                        .into_owned()
-                        .into(),
-                ],
+            .map(|part| {
+                let (kind, text) =
+                    super::entries::SearchOnlyKind::SubagentMetadata.columns(&part.text);
+                PositionalRow {
+                    key: keys.files.get(part.file_position).cloned(),
+                    values: vec![
+                        kind.to_owned().into(),
+                        super::SearchField::Supplement.code().into(),
+                        (part.file_position as i64).into(),
+                        text.into_owned().into(),
+                    ],
+                }
             })
             .collect()
     }

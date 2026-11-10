@@ -7,6 +7,7 @@ use super::refresh_tests::{refresh_found, serve_session_refresh};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
+use crate::history::provider::contract_tests::{EXTERNAL_TITLE_RENAMES, Naming, name_session};
 use crate::history::{SessionChanges, Source, UpdatedSession};
 use std::path::Path;
 
@@ -1118,17 +1119,7 @@ fn every_reader_finds_session_by_name_renamed_outside_its_transcript() {
     // Each agent's list runs on a thread of its own: a list marks its
     // thread as the drawing thread, and the drawing thread doesn't parse a
     // transcript.
-    use Naming::{Chosen, Generated};
-    let renames = [
-        (Source::Codex, Chosen, Chosen),
-        (Source::Kimi, Chosen, Chosen),
-        (Source::Kimi, Generated, Chosen),
-        (Source::Kimi, Chosen, Generated),
-        (Source::Grok, Chosen, Chosen),
-        (Source::Grok, Generated, Chosen),
-        (Source::Grok, Chosen, Generated),
-    ];
-    let wrong = renames
+    let wrong = EXTERNAL_TITLE_RENAMES
         .into_iter()
         .flat_map(|rename| [(rename, Launch::OverCache), (rename, Launch::OnEmptyCache)])
         .flat_map(|(rename, launch)| {
@@ -1149,59 +1140,9 @@ enum Launch {
     OnEmptyCache,
 }
 
-/// The origin of a session's name kept outside its transcript.
-#[derive(Clone, Copy, Debug)]
-enum Naming {
-    /// The user chose it, through the agent's renamer.
-    Chosen,
-    /// The agent generated it.
-    Generated,
-}
-
-/// Names `source`'s session at `locator` `title`, as `naming` names it.
-fn name_session(source: Source, locator: &Path, title: &str, naming: Naming) {
-    let rewrite = |file: &Path, fields: serde_json::Value| {
-        let mut value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
-        for (field, text) in fields.as_object().unwrap() {
-            value[field] = text.clone();
-        }
-        std::fs::write(file, value.to_string()).unwrap();
-    };
-    match (naming, source) {
-        (Naming::Chosen, _) => {
-            let crate::history::provider::Capability::Capable(renamer) = source.provider().rename()
-            else {
-                panic!("{source:?} renames a session");
-            };
-            renamer
-                .rename_session(
-                    crate::history::FOR_FIXTURES,
-                    locator,
-                    title,
-                    chrono::Utc::now(),
-                )
-                .unwrap();
-        }
-        (Naming::Generated, Source::Kimi) => rewrite(
-            &crate::history::format::kimi::wire_location(locator)
-                .session_dir
-                .join("state.json"),
-            serde_json::json!({"title": title, "titleKind": "generated", "isCustomTitle": false}),
-        ),
-        (Naming::Generated, Source::Grok) => rewrite(
-            &locator.with_file_name(crate::history::format::grok::SUMMARY_FILE),
-            serde_json::json!({"generated_title": title, "title_is_manual": false}),
-        ),
-        (Naming::Generated, source) => panic!("{source:?} doesn't generate a title"),
-    }
-}
-
 /// The misses [`every_reader_finds_session_by_name_renamed_outside_its_transcript`]
-/// reports for `source`'s session named "Zebrafish plans" as the first
-/// naming names it, then "Yakety release" as the second does, after
-/// `launch`. The search runs after the second naming, then again after the
-/// transcript gains a line.
+/// reports for one rename after `launch`. The second check after a
+/// transcript append catches a resumed read that brings back the old name.
 fn renamed_session_misses(
     (source, first, second): (Source, Naming, Naming),
     launch: Launch,
@@ -1277,7 +1218,6 @@ fn reader_misses(app: &App, body_word: &str) -> Vec<String> {
     })
 }
 
-/// Appends a copy of the last line of the transcript at `locator`.
 fn append_copy_of_last_line(locator: &Path) {
     let text = std::fs::read_to_string(locator).unwrap();
     let last = text.lines().last().expect("the transcript holds a line");
@@ -1300,10 +1240,10 @@ fn list_search_misses(
     let mut wrong = Vec::new();
     let in_memory = crate::search::SearchTextsInMemory::read(conversations);
     for (texts, read) in [
-        (&in_memory, "in memory"),
+        (&in_memory, "with the texts held in memory"),
         (
             &crate::search::SearchTextsInMemory::default(),
-            "from the cache",
+            "without held texts",
         ),
     ] {
         for (query, expected) in [
@@ -1338,8 +1278,7 @@ fn list_search_misses(
 /// filter, the agent's semantic route and the semantic worker's exact
 /// preview.
 fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
-    use crate::search::lexical::{precompute_agent_search_text, try_agent_search};
-    use crate::search::literal::agent_conversation_matches_all_literals;
+    use crate::search::lexical::{RetrievalTerms, precompute_agent_search_text, try_agent_search};
     use crate::search::preview::{
         HighlightQuery, build_context_segments_from_ranges, build_literal_context_segments,
     };
@@ -1347,7 +1286,10 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
     let mut wrong = Vec::new();
     let row = &conversations[0];
     let in_memory = crate::search::SearchTextsInMemory::read(conversations);
-    for (texts, read) in [(in_memory.get(row), "in memory"), (None, "from the cache")] {
+    for (texts, read) in [
+        (in_memory.get(row), "with the texts held in memory"),
+        (None, "without held texts"),
+    ] {
         let evidence = crate::search::evidence::build_lexical_evidence(
             row,
             texts,
@@ -1372,26 +1314,42 @@ fn other_reader_misses(conversations: &[Conversation]) -> Vec<String> {
     let unwindowed = crate::time_filter::TimeFilter::default();
     let agent_texts = precompute_agent_search_text(conversations, &unwindowed);
     for (query, expected) in [("yakety", 1), ("zebrafish", 0)] {
-        let found = try_agent_search(conversations, &agent_texts, query, chrono::Local::now())
-            .unwrap()
-            .len();
+        let found = try_agent_search(
+            conversations,
+            &agent_texts,
+            query,
+            RetrievalTerms::WordsAndLiterals,
+            chrono::Local::now(),
+            |_| true,
+        )
+        .unwrap()
+        .ranked
+        .len();
         if found != expected {
             wrong.push(format!(
                 "agent search {query:?} finds {expected} session(s), not {found}"
             ));
         }
     }
-    let content = conversations[0].load_content().unwrap();
-    for (phrase, expected) in [("\"yakety release\"", true), ("\"zebrafish\"", false)] {
-        let parsed = ParsedQuery::parse(phrase);
-        let matched =
-            agent_conversation_matches_all_literals(&content, parsed.literals(), &unwindowed);
-        if matched != expected {
+    for (phrase, expected) in [("yakety \"yakety release\"", 1), ("\"zebrafish\"", 0)] {
+        let found = try_agent_search(
+            conversations,
+            &agent_texts,
+            phrase,
+            RetrievalTerms::Literals,
+            chrono::Local::now(),
+            |_| true,
+        )
+        .unwrap()
+        .ranked
+        .len();
+        if found != expected {
             wrong.push(format!(
-                "agent search's exact filter matches {phrase}: {expected}, not {matched}"
+                "agent search's exact filter {phrase:?} finds {expected} session(s), not {found}"
             ));
         }
     }
+    let content = conversations[0].load_content().unwrap();
     let route = content.semantic_route_text().to_lowercase();
     if !route.contains("yakety") || route.contains("zebrafish") {
         wrong.push(format!(

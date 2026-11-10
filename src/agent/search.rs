@@ -154,20 +154,54 @@ pub struct AgentSearchOutput {
     pub coverage: Option<SessionCoverage>,
 }
 
-/// Which transcripts a lexical search hands back after searching them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TranscriptRetention {
-    DropAfterSearch,
-    /// Keep the transcripts of sessions with hits, for a caller that reads
-    /// them again.
-    KeepWithHits,
-}
-
 pub struct LexicalSearchRun {
     pub output: AgentSearchOutput,
-    pub kept_transcripts: Vec<(AgentConversationKey, AgentTranscript)>,
     /// The sessions whose transcript failed to load, in rank order.
     pub failed_reads: Vec<(AgentConversationKey, AppError)>,
+}
+
+/// A ranked session's transcript as a lexical search reads it.
+pub struct SearchedTranscript {
+    /// Every message, or the messages holding the query's terms alone.
+    pub transcript: AgentTranscript,
+    /// The number of the session's last message.
+    pub message_count: usize,
+}
+
+impl From<AgentTranscript> for SearchedTranscript {
+    /// Every message of `transcript`.
+    fn from(transcript: AgentTranscript) -> Self {
+        Self {
+            message_count: transcript.messages.len(),
+            transcript,
+        }
+    }
+}
+
+impl SearchedTranscript {
+    fn messages(&self) -> SessionMessages<'_> {
+        SessionMessages {
+            transcript: &self.transcript,
+            message_count: self.message_count,
+        }
+    }
+}
+
+/// The messages of a session retrieval searches, as [`SearchedTranscript`]
+/// holds them.
+#[derive(Clone, Copy)]
+struct SessionMessages<'t> {
+    transcript: &'t AgentTranscript,
+    message_count: usize,
+}
+
+impl<'t> SessionMessages<'t> {
+    fn whole(transcript: &'t AgentTranscript) -> Self {
+        Self {
+            transcript,
+            message_count: transcript.messages.len(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -556,7 +590,7 @@ pub fn run_within_search(
             request.top,
             conversation,
             resolved,
-            transcript,
+            SessionMessages::whole(transcript),
             mode,
             request.window,
         ),
@@ -571,7 +605,7 @@ pub fn run_within_search(
                     candidate_depth,
                     conversation,
                     resolved,
-                    transcript,
+                    SessionMessages::whole(transcript),
                     SearchMode::Lexical,
                     request.window,
                 ),
@@ -609,8 +643,7 @@ pub fn run_global_lexical_search(
         conversations,
         keys,
         ranked_indices,
-        TranscriptRetention::DropAfterSearch,
-        load_transcript,
+        |_, key| load_transcript(key).map(SearchedTranscript::from),
         None,
     )
     .map(|run| run.output)
@@ -621,6 +654,8 @@ pub fn run_global_lexical_search(
 /// With a window, a session without hits inside it does not take a place on
 /// the page: the next-ranked session is searched in its place. `reads`, when
 /// collecting, records the time spent matching the searched transcripts.
+/// `load_transcript` reads the transcript of the conversation at an index of
+/// `conversations`.
 ///
 /// Transcripts are read and searched on several threads, each as soon as it
 /// is read, but their hits are taken in rank order, so the stop rule and the
@@ -630,8 +665,7 @@ pub fn run_global_lexical_search_reporting(
     conversations: &[Conversation],
     keys: &[AgentConversationKey],
     ranked_indices: &[usize],
-    retention: TranscriptRetention,
-    load_transcript: impl Fn(&AgentConversationKey) -> Result<AgentTranscript> + Sync,
+    load_transcript: impl Fn(usize, &AgentConversationKey) -> Result<SearchedTranscript> + Sync,
     reads: Option<&SearchReads>,
 ) -> Result<LexicalSearchRun> {
     let mode = request.mode();
@@ -653,9 +687,13 @@ pub fn run_global_lexical_search_reporting(
         .iter()
         .skip(request.session_offset)
         .take(candidates)
-        .map(|index| {
-            let conversation = conversations.get(*index)?;
-            Some((conversation, resolved_by_path.get(&conversation.path)?))
+        .map(|&index| {
+            let conversation = conversations.get(index)?;
+            Some((
+                index,
+                conversation,
+                resolved_by_path.get(&conversation.path)?,
+            ))
         })
         .collect::<Vec<_>>();
     let hits_per_session = request
@@ -664,7 +702,6 @@ pub fn run_global_lexical_search_reporting(
 
     let mut hits = Vec::new();
     let mut conversations_with_hits = std::collections::HashSet::new();
-    let mut kept_transcripts = Vec::new();
     let mut failed_reads = Vec::new();
     let mut retrieval_time = std::time::Duration::ZERO;
     let mut failed = 0;
@@ -672,14 +709,14 @@ pub fn run_global_lexical_search_reporting(
     let searched = scan_in_order(
         &page,
         sessions_still_wanted(request, 0, 0),
-        |session| session.map_or(Some(0), |(_, resolved)| resolved.key.transcript_bytes),
-        |session| session.map(|(_, resolved)| load_transcript(&resolved.key)),
+        |session| session.map_or(Some(0), |(_, _, resolved)| resolved.key.transcript_bytes),
+        |session| session.map(|(index, _, resolved)| load_transcript(index, &resolved.key)),
         |session, read| {
-            let (Some((conversation, resolved)), Some(read)) = (*session, read) else {
+            let (Some((_, conversation, resolved)), Some(read)) = (*session, read) else {
                 return SessionSearch::Unsearchable;
             };
-            let transcript = match read {
-                Ok(transcript) => transcript,
+            let searched = match read {
+                Ok(searched) => searched,
                 Err(error) => return SessionSearch::Failed { resolved, error },
             };
             let (hits, retrieval_time) = time_retrieval(reads, || {
@@ -688,17 +725,14 @@ pub fn run_global_lexical_search_reporting(
                     hits_per_session,
                     conversation,
                     resolved,
-                    &transcript,
+                    searched.messages(),
                     retrieval_mode,
                     request.window,
                 )
             });
-            let transcript = (retention == TranscriptRetention::KeepWithHits && !hits.is_empty())
-                .then_some(transcript);
             SessionSearch::Searched {
                 resolved,
                 hits,
-                transcript,
                 retrieval_time,
             }
         },
@@ -715,15 +749,11 @@ pub fn run_global_lexical_search_reporting(
                 SessionSearch::Searched {
                     resolved,
                     hits: session_hits,
-                    transcript,
                     retrieval_time: session_retrieval_time,
                 } => {
                     retrieval_time += session_retrieval_time;
                     if !session_hits.is_empty() {
                         conversations_with_hits.insert(resolved.reference.canonical());
-                    }
-                    if let Some(transcript) = transcript {
-                        kept_transcripts.push((resolved.key.clone(), transcript));
                     }
                     hits.extend(session_hits);
                 }
@@ -761,7 +791,6 @@ pub fn run_global_lexical_search_reporting(
                 failed,
             }),
         },
-        kept_transcripts,
         failed_reads,
     })
 }
@@ -802,8 +831,6 @@ enum SessionSearch<'a> {
     Searched {
         resolved: &'a ResolvedConversation,
         hits: Vec<AgentOutputHit>,
-        /// Kept only under [`TranscriptRetention::KeepWithHits`].
-        transcript: Option<AgentTranscript>,
         retrieval_time: std::time::Duration,
     },
 }
@@ -955,7 +982,7 @@ fn retrieval_hits(
     limit: usize,
     conversation: &Conversation,
     resolved: &ResolvedConversation,
-    transcript: &AgentTranscript,
+    messages: SessionMessages<'_>,
     mode: SearchMode,
     window: TimeFilter,
 ) -> Vec<AgentOutputHit> {
@@ -964,9 +991,11 @@ fn retrieval_hits(
     } else {
         query.to_string()
     };
+    let transcript = messages.transcript;
     retrieve_agent_hits_for_target(
         AgentTranscriptSearchTarget {
             transcript,
+            message_count: messages.message_count,
             conversation_ref: Some(&resolved.reference.canonical()),
             timestamp: Some(conversation.timestamp),
         },
@@ -3428,12 +3457,11 @@ mod tests {
             &conversations,
             &keys,
             &ranked,
-            TranscriptRetention::DropAfterSearch,
-            |key| {
+            |_, key| {
                 if key.path == unreadable {
                     Err(AppError::Io(std::io::Error::other("unreadable")))
                 } else {
-                    Ok(needle_transcript())
+                    Ok(needle_transcript().into())
                 }
             },
             None,

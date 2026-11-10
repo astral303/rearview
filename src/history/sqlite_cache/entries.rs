@@ -27,8 +27,10 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 
 pub(super) use diff::{replace_leading, rewrite_in_place, update, update_tail};
-pub(super) use parts::{DERIVED, RESULT_TEXT, SUBAGENT_METADATA, search_only_text};
+pub(super) use parts::{DERIVED, RESULT_TEXT, SearchOnlyKind};
 pub(super) use rows::{RowsStart, SessionRows};
+#[cfg(test)]
+pub(super) use write::SHIFT_SEARCH_PLACES;
 
 /// Entries a first write of a session writes per transaction, so a session
 /// of hundreds of thousands of entries does not hold the database's write
@@ -380,6 +382,30 @@ pub(super) fn read_numbered(
     )
 }
 
+/// The entries of the messages of `session` numbered `ordinals`, each
+/// message whole, read through the index on the message numbers.
+pub(super) fn read_messages(
+    connection: &Connection,
+    session: i64,
+    places: &Places,
+    ordinals: &[usize],
+) -> Result<StoredEntries> {
+    let ordinals = format!(
+        "[{}]",
+        ordinals
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let selected = Selection::of(
+        "SELECT e.id FROM messages m JOIN entries e ON e.message = m.id \
+         WHERE m.session = ?1 AND m.ordinal IN (SELECT value FROM json_each(?2))",
+        vec![session.into(), ordinals.into()],
+    );
+    read_selected(connection, session, places, &selected, ReadPurpose::Display)
+}
+
 /// Render the returned transcript only within `messages`; other bodies
 /// contain reference context, never an empty successful content read.
 pub(super) fn read_range(
@@ -499,7 +525,12 @@ pub(super) fn read_selected(
     };
     let (custom_title, summary) = connection
         .prepare_cached("SELECT custom_title, summary FROM sessions WHERE id = ?1")?
-        .query_row([session], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        .query_row([session], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?
+        .ok_or_else(|| AppError::SessionCacheNotReady {
+            session: format!("session row {session}"),
+            reason: "the cache does not hold that row".to_owned(),
+        })?;
     Ok(StoredEntries {
         transcript: TranscriptEntries {
             entries,

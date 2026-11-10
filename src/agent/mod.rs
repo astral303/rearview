@@ -1,6 +1,8 @@
 pub mod call_links;
 pub mod diagnostic;
 pub mod hidden_parts;
+#[cfg(test)]
+mod hit_read_coverage;
 pub mod message_numbering;
 #[cfg(test)]
 mod message_numbering_coverage;

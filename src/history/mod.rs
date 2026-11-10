@@ -276,15 +276,15 @@ impl Conversation {
     /// The row's title, then its summary. Search reads them from the row,
     /// ahead of the session's other texts, to match a name changed outside
     /// the transcript.
-    pub(crate) fn leading_texts(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn title_and_summary_texts(&self) -> impl Iterator<Item = &str> {
         [&self.custom_title, &self.summary]
             .into_iter()
             .filter_map(|text| text.as_deref())
     }
 
-    /// [`Self::leading_texts`], then `full_text`, each after a separator.
-    pub(crate) fn full_text_after_leading_texts(&self) -> Cow<'_, str> {
-        let mut leading = self.leading_texts().peekable();
+    /// [`Self::title_and_summary_texts`], then `full_text`, each after a separator.
+    pub(crate) fn full_text_after_title_and_summary(&self) -> Cow<'_, str> {
+        let mut leading = self.title_and_summary_texts().peekable();
         if leading.peek().is_none() {
             return Cow::Borrowed(&self.full_text);
         }
@@ -307,7 +307,7 @@ impl Conversation {
         const ROUTE_KEYWORD_CHARS: usize = 800;
 
         let mut text =
-            message_texts::without_message_separators(&self.full_text_after_leading_texts())
+            message_texts::without_message_separators(&self.full_text_after_title_and_summary())
                 .into_owned();
         if !self.agent_search_text.is_empty() {
             text.push(' ');

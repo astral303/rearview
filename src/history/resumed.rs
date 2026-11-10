@@ -319,7 +319,7 @@ pub(crate) struct ThreadFold {
     /// sub-agent transcript's contribution folds them.
     pub(crate) fold: FoldCheckpoint,
     /// True when the transcript's entries from the stable cursor on add to
-    /// its search parts.
+    /// its metadata parts.
     pub(crate) has_parts_after_stable: bool,
     /// The title the transcript's leading entries name.
     pub(crate) title: Option<String>,

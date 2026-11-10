@@ -57,9 +57,9 @@ fn write_stores_each_text_content_rebuilds_once_for_every_provider() {
     }
 }
 
-/// The texts in `fields` that `listed`'s content rebuilds from the entries
-/// of `copy`, its copy, as `Conversation::load_content` reads them. Semantic
-/// text is not stored.
+/// Rebuilds the texts in `fields` from the entries of `copy`, `listed`'s
+/// copy, as `Conversation::load_content` reads them. Semantic text is not
+/// stored.
 fn rebuilt_texts(
     copy: &CachedSession,
     listed: &Conversation,
@@ -98,10 +98,10 @@ fn stored_texts(copy: &CachedSession, fields: SearchedFields) -> Vec<PlacedText>
     texts
 }
 
-/// The lines of a Claude session holding every kind of text the list's
-/// search reads: a title and a summary, a reply written as two records, a
-/// tool result's items after a text block in its entry, and a command's
-/// derived text.
+/// The lines of a Claude session holding a text of each layout group the
+/// list's search reads: a title and a summary, a reply written as two
+/// records, a tool result's items ahead of a text block in its entry, and a
+/// command's derived text.
 fn every_layout_kind_lines() -> Vec<String> {
     let user = |content: serde_json::Value| serde_json::json!({"type": "user", "message": {"role": "user", "content": content}});
     let reply = |content: serde_json::Value| {
@@ -135,23 +135,20 @@ fn every_layout_kind_lines() -> Vec<String> {
 
 /// `body` after the row's title and summary, each after a separator: the
 /// text the list's evidence reads.
-fn after_leading_texts(row: &Conversation, body: &str) -> String {
+fn after_title_and_summary(row: &Conversation, body: &str) -> String {
     let mut text = String::new();
-    for piece in row.leading_texts().chain([body]) {
+    for piece in row.title_and_summary_texts().chain([body]) {
         crate::history::message_texts::push_separated(&mut text, piece);
     }
     text
 }
 
-/// The parse lays out a row's list search texts in each entry's block
-/// order, whitespace collapsed. The cache's copy keeps the text as written
-/// and groups each message's texts by kind: blocks, then results' items,
-/// then derived texts. The two orders differ only in the snippets a context
-/// line picks: scores read each text alone. The session's derived text is a
-/// message of its own: the test doesn't observe its place after the blocks.
-/// The order doesn't change `agent search`'s output: it doesn't match a
-/// query across the separator between two texts, tool-call headers
-/// included, and reads its hits from the transcript.
+/// The parse lays out a row's list search texts in block order, whitespace
+/// collapsed; the cache keeps them as written and groups each message's
+/// texts by kind: blocks, results' items, then derived texts. Only a
+/// context line's snippets differ: scores and `agent search` read each text
+/// alone. The derived text is a message of its own, which leaves its place
+/// after the blocks unpinned.
 #[test]
 fn parse_lays_out_texts_in_block_order_and_cache_groups_them_by_kind() {
     let laid_out_by_kind = [
@@ -184,7 +181,7 @@ fn parse_lays_out_texts_in_block_order_and_cache_groups_them_by_kind() {
     let (_, parsed) =
         parsed_record_and_row(Source::Claude, &root_of(&session), &stub_of(&session, 1));
     assert_eq!(
-        parsed.full_text_after_leading_texts(),
+        parsed.full_text_after_title_and_summary(),
         laid_out_in_block_order,
         "the parse lays out the texts in block order"
     );
@@ -199,8 +196,17 @@ fn parse_lays_out_texts_in_block_order_and_cache_groups_them_by_kind() {
         cache.write(&record).unwrap();
         if written < lines.len() {
             std::fs::write(&path, lines.join("\n")).unwrap();
-            let (record, _) = source_record(Source::Claude, &path);
-            cache.write(&record).unwrap();
+            let session = AgentSession::new(Source::Claude, path.clone(), Vec::new(), Vec::new());
+            let update = super::diff_write::resumed::update_stored(
+                &mut cache,
+                base.path(),
+                &super::diff_write::Fixture::of(session),
+            );
+            assert_eq!(
+                update.outcome,
+                Ok(()),
+                "the update reads on from the copy the write left"
+            );
         }
         let CatalogueSession::Listed(listed) = cache
             .catalogue_session(
@@ -221,13 +227,13 @@ fn parse_lays_out_texts_in_block_order_and_cache_groups_them_by_kind() {
             .expect("the cache holds the copy");
         laid_out.push((
             format!("the copy {read} left"),
-            after_leading_texts(&listed, cached.joined()),
+            after_title_and_summary(&listed, cached.joined()),
         ));
         let rows = [*listed];
         let scanned = crate::search::SearchTextsInMemory::read(&rows);
         laid_out.push((
             format!("a scan of the copy {read} left"),
-            after_leading_texts(&rows[0], scanned.get(&rows[0]).unwrap().joined()),
+            after_title_and_summary(&rows[0], scanned.get(&rows[0]).unwrap().joined()),
         ));
     }
     for (read, text) in laid_out {
@@ -235,34 +241,31 @@ fn parse_lays_out_texts_in_block_order_and_cache_groups_them_by_kind() {
     }
 }
 
-/// A session's title and summary, trimmed.
-type TitleAndSummary = (Option<String>, Option<String>);
-
 #[test]
 fn search_reads_the_title_and_summary_the_parse_names_for_every_provider() {
     let mut titled = 0;
     for session in every_record_sessions() {
         let source = session.row.source;
-        let (searched, parsed) = searched_and_parsed_titles(&session);
-        titled += usize::from(parsed.0.is_some());
+        let (searched, parsed) = searched_texts_and_parse(&session);
+        titled += usize::from(parsed.custom_title.is_some());
         assert_eq!(
             searched,
-            parsed,
+            title_and_summary(&parsed),
             "{}: search reads the title and summary the parse names",
             source.label()
         );
 
         let (_copy, renamed) = renamed_copy(session, "  Renamed by hand  ");
-        let (searched, parsed) = searched_and_parsed_titles(&renamed);
+        let (searched, parsed) = searched_texts_and_parse(&renamed);
         assert_eq!(
-            searched.0.as_deref(),
+            searched.first().map(String::as_str),
             Some("Renamed by hand"),
-            "{}: search reads the title the rename gave",
+            "{}: search reads the title the rename gave first",
             source.label()
         );
         assert_eq!(
             searched,
-            parsed,
+            title_and_summary(&parsed),
             "{}: search reads the renamed title and the summary the parse names",
             source.label()
         );
@@ -270,18 +273,31 @@ fn search_reads_the_title_and_summary_the_parse_names_for_every_provider() {
     assert!(titled > 1, "some fixtures hold titles before the rename");
 
     for (case, _copy, session) in sessions_with_generated_titles() {
-        let (searched, parsed) = searched_and_parsed_titles(&session);
-        assert!(searched.1.is_some(), "{case}: search reads a summary");
+        let (searched, parsed) = searched_texts_and_parse(&session);
+        assert!(
+            parsed.summary.is_some(),
+            "{case}: the parse names a summary"
+        );
         assert_eq!(
-            searched, parsed,
+            searched,
+            title_and_summary(&parsed),
             "{case}: search reads the summary the parse names"
         );
     }
 }
 
-/// The title and the summary search reads in the row of `session`'s copy
-/// once a load writes it, and those its parse names.
-fn searched_and_parsed_titles(session: &AgentSession) -> (TitleAndSummary, TitleAndSummary) {
+/// `row`'s title, then its summary, each trimmed, as far as it has them.
+fn title_and_summary(row: &Conversation) -> Vec<String> {
+    [&row.custom_title, &row.summary]
+        .into_iter()
+        .flatten()
+        .map(|text| text.trim().to_owned())
+        .collect()
+}
+
+/// The title and summary search reads in the row of `session`'s copy once a
+/// load writes it, each trimmed, and the row its parse lists.
+fn searched_texts_and_parse(session: &AgentSession) -> (Vec<String>, Conversation) {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let row = &session.row;
@@ -298,19 +314,10 @@ fn searched_and_parsed_titles(session: &AgentSession) -> (TitleAndSummary, Title
     else {
         panic!("listed fixture")
     };
-    let trimmed = |text: Option<String>| text.map(|text| text.trim().to_owned());
-    let mut leading = listed.leading_texts().map(|text| text.trim().to_owned());
-    let parsed = (trimmed(parsed.custom_title), trimmed(parsed.summary));
-    let searched = match parsed {
-        (Some(_), Some(_)) => (leading.next(), leading.next()),
-        (Some(_), None) => (leading.next(), None),
-        (None, _) => (None, leading.next()),
-    };
-    assert_eq!(
-        leading.next(),
-        None,
-        "search reads two leading texts at most"
-    );
+    let searched = listed
+        .title_and_summary_texts()
+        .map(|text| text.trim().to_owned())
+        .collect();
     (searched, parsed)
 }
 

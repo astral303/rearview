@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::history::format::RecordLine;
 use crate::history::format::splice::{Spliced, SubagentThread, subagent_turns, walk_spliced};
 use crate::history::parser::{
-    SubagentSearchPart, SubagentShare, adds_search_parts, fold_tail, folded_row,
+    SubagentMetadataPart, SubagentShare, adds_subagent_metadata, fold_tail, folded_row,
     parse_errors_of_lines, resumed_thread_fold, session_time, subagent_share, take_leading_titles,
 };
 use crate::history::path::CanonicalDirectories;
@@ -304,7 +304,7 @@ fn bytes_read(
 
 /// How the changed `window` of the sub-agent transcript at `path`, whose
 /// share at its stable cursor is `fold`, is taken in: a window, unless its
-/// title changed or its entries add search parts, which read it whole.
+/// title changed or its entries add metadata parts, which read it whole.
 fn resumed_change(
     reader: &dyn crate::history::provider::TranscriptReader,
     permit: ParsePermit<'_>,
@@ -316,7 +316,7 @@ fn resumed_change(
         let title = leading_title(&reader.leading_entries(path, &window.read)?);
         if title == fold.title
             && !fold.has_parts_after_stable
-            && !adds_search_parts(&window.entries)
+            && !adds_subagent_metadata(&window.entries)
         {
             return Ok(Change::Window(window));
         }
@@ -735,7 +735,7 @@ fn finish(
     let mut thread_tokens = 0;
     let mut has_transient_read_error = false;
     let mut is_missing_earlier_turns = false;
-    let mut search_parts = Vec::new();
+    let mut subagent_metadata = Vec::new();
     for (index, thread) in threads.iter().enumerate() {
         let (read, fold) = match &thread.change {
             Change::Unchanged => (
@@ -752,15 +752,15 @@ fn finish(
             Change::Whole(share) => (share.read.clone(), share.fold.clone()),
         };
         let parts: Vec<String> = match &thread.change {
-            Change::Whole(share) => share.search_parts.clone(),
+            Change::Whole(share) => share.subagent_metadata.clone(),
             _ => resume
-                .search_parts
+                .subagent_metadata
                 .iter()
                 .filter(|(path, _)| path == thread.path)
                 .map(|(_, text)| text.clone())
                 .collect(),
         };
-        search_parts.extend(parts.into_iter().map(|text| SubagentSearchPart {
+        subagent_metadata.extend(parts.into_iter().map(|text| SubagentMetadataPart {
             file_position: index + 1,
             text,
         }));
@@ -887,7 +887,7 @@ fn finish(
             entries: placed.tail,
             malformed_lines,
         },
-        search_parts,
+        subagent_metadata,
         next_checkpoint,
         update,
     )?;

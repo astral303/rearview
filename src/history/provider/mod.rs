@@ -55,7 +55,7 @@ pub use outcome::{SessionOutcome, SessionRead, UnwrittenParse};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 pub use storage::{
     DiscoveredSessions, Fingerprint, IgnoredSessions, ResolvedSession, SessionCache,
-    SessionStorage, SessionStub, SessionTitle, UnreadableDirectory,
+    SessionStorage, SessionStub, SessionTitle, TitleAndSummary, UnreadableDirectory,
 };
 #[cfg(test)]
 pub(crate) use storage::{ParseWatch, RootedStorage, StorageUnderHome, WatchedStorage};

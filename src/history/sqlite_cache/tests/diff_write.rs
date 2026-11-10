@@ -3,7 +3,7 @@
 //! earlier version of a parse, then the parse, and compares the stored
 //! session with a fresh write of the parse in another database.
 
-mod resumed;
+pub(super) mod resumed;
 
 use super::*;
 use crate::history::provider::contract_tests::AgentSession;
@@ -61,7 +61,7 @@ fn writes_of(writes: &BTreeMap<(String, String), i64>, table: &str, operation: &
         .unwrap_or_default()
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     source: Source,
     root: SessionRoot,
     stub: SessionStub,
@@ -70,7 +70,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn of(session: AgentSession) -> Self {
+    pub(super) fn of(session: AgentSession) -> Self {
         Self {
             source: session.row.source,
             root: root_of(&session),
@@ -416,7 +416,7 @@ fn subagent_spliced_mid_session(record: &mut SessionRecord) -> Option<(PathBuf, 
 }
 
 /// `record` without the sub-agent transcript at `path`: its entries, its
-/// file and its search parts.
+/// file and its metadata parts.
 fn without_subagent(record: &mut SessionRecord, path: &Path) {
     entries_of(record)
         .entries
@@ -429,9 +429,9 @@ fn without_subagent(record: &mut SessionRecord, path: &Path) {
         .unwrap();
     record.catalogue.files.remove(position);
     record
-        .search_parts
+        .subagent_metadata
         .retain(|part| part.file_position != position);
-    for part in &mut record.search_parts {
+    for part in &mut record.subagent_metadata {
         if part.file_position > position {
             part.file_position -= 1;
         }

@@ -76,7 +76,7 @@ impl UnlistedSession {
     pub(crate) fn of_another_agent(listed: ListedSession) -> Self {
         Self {
             reason: UnlistedReason::ForeignTranscript,
-            entries: Some(listed.transcripts.into_entries_and_search_parts().0),
+            entries: Some(listed.transcripts.into_entries_and_subagent_metadata().0),
         }
     }
 
@@ -196,22 +196,22 @@ impl SessionTranscripts {
     }
 
     /// The entries the viewer reads, each sub-agent turn spliced into the
-    /// session's own, and the sub-agents' search parts.
-    pub(crate) fn into_entries_and_search_parts(
+    /// session's own, and the sub-agents' metadata parts.
+    pub(crate) fn into_entries_and_subagent_metadata(
         self,
-    ) -> (TranscriptEntries, Vec<SubagentSearchPart>) {
+    ) -> (TranscriptEntries, Vec<SubagentMetadataPart>) {
         let entries = TranscriptEntries {
             entries: splice_turns(self.own.entries, self.subagents.turns),
             malformed_lines: self.own.malformed_lines,
         };
-        (entries, self.subagents.search_parts)
+        (entries, self.subagents.subagent_metadata)
     }
 }
 
 /// A sub-agent transcript read whole, as a resumed read takes it in.
 pub(crate) struct SubagentShare {
     pub(crate) fold: ThreadFold,
-    pub(crate) search_parts: Vec<String>,
+    pub(crate) subagent_metadata: Vec<String>,
     pub(crate) thread: SubagentThread,
     pub(crate) read: TranscriptRead,
 }
@@ -220,12 +220,12 @@ pub(crate) struct SubagentShare {
 /// resumed read takes it in.
 pub(crate) fn subagent_share(path: &Path, mut projection: SessionProjection) -> SubagentShare {
     let (_, fold) = SubagentContribution::of_projection(&projection);
-    let search_parts =
-        SubagentContribution::search_parts(projection.entries.iter().map(|(_, entry)| entry));
+    let subagent_metadata =
+        SubagentContribution::metadata_texts(projection.entries.iter().map(|(_, entry)| entry));
     let read = std::mem::replace(&mut projection.transcript_read, TranscriptRead::full_read());
     SubagentShare {
         fold,
-        search_parts,
+        subagent_metadata,
         thread: SubagentThread::of_projection(path, projection),
         read,
     }
@@ -262,7 +262,7 @@ pub(crate) fn resumed_thread_fold(
             .map_or_else(|| fold.last_timestamp.clone(), str::to_owned),
         fold: checkpoint.unwrap_or_default(),
         has_parts_after_stable: stable_index.is_some_and(|index| {
-            !SubagentContribution::search_parts(entries[index..].iter().map(|(_, entry)| entry))
+            !SubagentContribution::metadata_texts(entries[index..].iter().map(|(_, entry)| entry))
                 .is_empty()
         }),
         total_tokens: builder.fold.total_tokens(),
@@ -270,9 +270,9 @@ pub(crate) fn resumed_thread_fold(
     }
 }
 
-/// True when `entries` add to their sub-agent transcript's search parts.
-pub(crate) fn adds_search_parts(entries: &[(RecordLine, LogEntry)]) -> bool {
-    !SubagentContribution::search_parts(entries.iter().map(|(_, entry)| entry)).is_empty()
+/// True when `entries` add to their sub-agent transcript's metadata parts.
+pub(crate) fn adds_subagent_metadata(entries: &[(RecordLine, LogEntry)]) -> bool {
+    !SubagentContribution::metadata_texts(entries.iter().map(|(_, entry)| entry)).is_empty()
 }
 
 /// The session row's fold resumed from `checkpoint`, its leading entries
@@ -335,9 +335,9 @@ fn spliced_mark(
     })
 }
 
-/// One search part of a sub-agent transcript: text outside its spliced
+/// One metadata part of a sub-agent transcript: text outside its spliced
 /// turns.
-pub(crate) struct SubagentSearchPart {
+pub(crate) struct SubagentMetadataPart {
     /// The transcript's position among the row's sub-agents, from 1.
     pub(crate) file_position: usize,
     pub(crate) text: String,
@@ -454,17 +454,28 @@ pub fn process_linked_session(
     ))
 }
 
-/// Removes from `entries` the titles a format gives at line 0 of the
-/// session's own transcript, and returns them in order. They are the
-/// session's fields, not its entries: a title added or removed doesn't move
-/// any entry.
-pub(crate) fn take_leading_titles(entries: &mut Vec<(RecordLine, LogEntry)>) -> Vec<LogEntry> {
-    // Reorder only the line-0 entries: a format gives them ahead of the
-    // transcript's.
-    let leading = entries
+/// The titles a format gives at line 0 of the session's own transcript, in
+/// order. They are the session's fields, not its entries: a title added or
+/// removed doesn't move any entry.
+fn leading_titles(entries: &[(RecordLine, LogEntry)]) -> impl Iterator<Item = &LogEntry> {
+    entries[..line_zero_entries(entries)]
+        .iter()
+        .filter(|(record, entry)| is_leading_title(record, entry))
+        .map(|(_, entry)| entry)
+}
+
+/// The number of entries at the start of `entries` from line 0 of the
+/// session's own transcript: a format gives them ahead of the transcript's.
+fn line_zero_entries(entries: &[(RecordLine, LogEntry)]) -> usize {
+    entries
         .iter()
         .take_while(|(record, _)| record.line == 0 && record.transcript.is_none())
-        .count();
+        .count()
+}
+
+/// Removes [`leading_titles`] from `entries` and returns them.
+pub(crate) fn take_leading_titles(entries: &mut Vec<(RecordLine, LogEntry)>) -> Vec<LogEntry> {
+    let leading = line_zero_entries(entries);
     let prefix = &mut entries[..leading];
     prefix.sort_by_key(|(record, entry)| !is_leading_title(record, entry));
     let titles = prefix
@@ -710,7 +721,7 @@ pub(crate) struct SubagentReads {
 pub(crate) struct SubagentTranscripts {
     /// Every sub-agent turn, in the view's splice order.
     turns: Vec<SubagentTurn>,
-    search_parts: Vec<SubagentSearchPart>,
+    subagent_metadata: Vec<SubagentMetadataPart>,
     sources: BTreeSet<PathBuf>,
     earlier_transcripts: Vec<FileStamp>,
     /// What the read of each sub-agent transcript leaves for the next, by
@@ -724,14 +735,15 @@ impl SubagentTranscripts {
     /// Add `read`, the sub-agent transcript at `path`, at `file_position`
     /// among the row's sub-agents, counted from 1.
     pub(crate) fn add(&mut self, file_position: usize, path: &Path, read: SubagentRecordParts) {
-        self.search_parts.extend(
-            read.search_parts
-                .into_iter()
-                .map(|text| SubagentSearchPart {
-                    file_position,
-                    text,
-                }),
-        );
+        self.subagent_metadata
+            .extend(
+                read.metadata_texts
+                    .into_iter()
+                    .map(|text| SubagentMetadataPart {
+                        file_position,
+                        text,
+                    }),
+            );
         self.sources.extend(read.sources);
         self.earlier_transcripts.extend(read.earlier_transcripts);
         self.reads.insert(path.to_path_buf(), read.transcript_read);
@@ -742,7 +754,7 @@ impl SubagentTranscripts {
 /// One sub-agent transcript's part of its session's record, beside its
 /// turns.
 pub(crate) struct SubagentRecordParts {
-    search_parts: Vec<String>,
+    metadata_texts: Vec<String>,
     /// The transcripts the records came from, beside the sub-agent's own.
     sources: BTreeSet<PathBuf>,
     earlier_transcripts: Vec<FileStamp>,
@@ -760,7 +772,7 @@ impl SubagentRecordParts {
         earlier_transcripts: Vec<FileStamp>,
     ) -> Self {
         Self {
-            search_parts: SubagentContribution::search_parts(
+            metadata_texts: SubagentContribution::metadata_texts(
                 entries.iter().map(|(_, entry)| entry),
             ),
             sources: entries
@@ -962,7 +974,9 @@ pub(crate) struct SubagentContribution {
 impl SubagentContribution {
     /// Raw text pieces omitted by the dialogue splice: titles, searchable
     /// metadata and nested progress. Keep boundaries and normalise on read.
-    pub(crate) fn search_parts<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Vec<String> {
+    pub(crate) fn metadata_texts<'a>(
+        entries: impl IntoIterator<Item = &'a LogEntry>,
+    ) -> Vec<String> {
         let mut builder = ConversationBuilder {
             keeps_only_text_outside_turns: true,
             ..Default::default()
@@ -1027,7 +1041,7 @@ impl SubagentContribution {
                 .to_owned(),
             fold: checkpoint.unwrap_or_default(),
             has_parts_after_stable: stable_index.is_some_and(|index| {
-                !Self::search_parts(entries[index..].iter().map(|(_, entry)| entry)).is_empty()
+                !Self::metadata_texts(entries[index..].iter().map(|(_, entry)| entry)).is_empty()
             }),
             title: projection.title.clone(),
             total_tokens: contribution.total_tokens,
@@ -1086,11 +1100,8 @@ pub(crate) fn conversation_from_projection(
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> ParsedRow {
-    let leading_titles = projection
-        .entries
-        .iter()
-        .filter(|(record, entry)| is_leading_title(record, entry))
-        .map(|(_, entry)| entry.clone())
+    let leading_titles = leading_titles(&projection.entries)
+        .cloned()
         .collect::<Vec<_>>();
     spliced_conversation_with_checkpoint(
         path,
@@ -2506,7 +2517,7 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(
-            conv.full_text_after_leading_texts()
+            conv.full_text_after_title_and_summary()
                 .starts_with("Important topic discussion"),
             "search reads the summary ahead of the full text"
         );
@@ -2591,7 +2602,7 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(
-            conv.full_text_after_leading_texts()
+            conv.full_text_after_title_and_summary()
                 .starts_with("ai-title-search-sentinel"),
             "search reads the AI title ahead of the full text"
         );
@@ -2711,7 +2722,7 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(
-            conv.full_text_after_leading_texts()
+            conv.full_text_after_title_and_summary()
                 .starts_with("unique-session-name"),
             "search reads the custom title ahead of the full text"
         );
@@ -2990,7 +3001,7 @@ mod tests {
                 "{excluded} leaked into {semantic:?}"
             );
         }
-        let searched = conv.full_text_after_leading_texts();
+        let searched = conv.full_text_after_title_and_summary();
         let searched_lower = crate::search::lexical::searchable_conversation(&conv, 0).text_lower;
         for included in [
             "summary lexical sentinel",
@@ -3356,7 +3367,7 @@ mod tests {
         let starts = &conv.message_text_starts.full_text;
 
         assert_eq!(
-            conv.full_text_after_leading_texts(),
+            conv.full_text_after_title_and_summary(),
             "Named session \u{1e} question \u{1e} answer",
             "search reads the title ahead of every message"
         );

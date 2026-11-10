@@ -2,7 +2,7 @@
 
 use super::outcome::{SessionOutcome, SessionRead, UnwrittenParse};
 use super::storage::{DiscoveredSessions, ResolvedSession, SessionStub, UnreadableDirectory};
-use super::{Fingerprint, SessionRoot, SessionStorage, SessionTitle};
+use super::{Fingerprint, SessionRoot, SessionStorage, SessionTitle, TitleAndSummary};
 use crate::agent::diagnostic::AgentWarning;
 use crate::agent::transcript::{read_failure_warning, unlisted_warning};
 use crate::cli::DebugLevel;
@@ -1900,7 +1900,7 @@ impl ParseRecord {
             (RawRead::Parsed(conversation), Some(transcripts))
                 if !conversation.has_transient_read_error =>
             {
-                Self::Unbuilt(transcripts.into_entries_and_search_parts().0)
+                Self::Unbuilt(transcripts.into_entries_and_subagent_metadata().0)
             }
             _ => Self::NotRecorded,
         }
@@ -2067,18 +2067,20 @@ fn project_path_of(conversation: &Conversation) -> PathBuf {
 }
 
 /// Shows `title`, a title stored outside the transcript, on `conversation`
-/// in place of both its title and summary: a chosen title replaces a
-/// generated one, and the reverse. An agent that keeps the title outside
-/// the transcript doesn't write any other title or summary. True when the
-/// row's title or summary changed.
+/// as [`TitleAndSummary::shown`] decides. An agent that keeps the title
+/// outside the transcript doesn't write any other title or summary. True
+/// when the row's title or summary changed.
 pub fn apply_external_title(conversation: &mut Conversation, title: &SessionTitle) -> bool {
     conversation.external_title = Some(title.clone());
-    let shown = title.as_title_and_summary();
-    if (&conversation.custom_title, &conversation.summary) == (&shown.0, &shown.1) {
-        return false;
-    }
-    (conversation.custom_title, conversation.summary) = shown;
-    true
+    let row = TitleAndSummary {
+        custom_title: conversation.custom_title.take(),
+        summary: conversation.summary.take(),
+    };
+    let shown = TitleAndSummary::shown(&row, Some(title));
+    let changed = shown != row;
+    conversation.custom_title = shown.custom_title;
+    conversation.summary = shown.summary;
+    changed
 }
 
 /// A session another provider owns is not an error: roots can overlap, and a

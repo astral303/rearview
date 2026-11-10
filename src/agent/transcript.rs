@@ -6,6 +6,7 @@ use crate::agent::visibility::ContentVisibility;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
 use crate::history::parser::UnlistedReason;
+use crate::history::provider::{SessionTitle, TitleAndSummary};
 use crate::history::task_notification::{ReportKind, ReportSender};
 use crate::history::{
     TaskReport, blocks_task_report, extract_skill_preview, parse_task_report, user_task_report,
@@ -333,17 +334,32 @@ impl AgentTranscript {
             malformed,
             Some(stored.numbers),
         )?
-        .titled(stored.custom_title, stored.summary))
+        .titled(TitleAndSummary {
+            custom_title: stored.custom_title,
+            summary: stored.summary,
+        }))
     }
 
-    /// This transcript under its session row's `custom_title` and `summary`.
+    /// This transcript under `shown`, its session row's title and summary.
     /// The entries do not hold a title the agent keeps outside the
     /// transcript.
-    pub(crate) fn titled(mut self, custom_title: Option<String>, summary: Option<String>) -> Self {
-        let shown = |text: Option<String>| text.filter(|text| !text.trim().is_empty());
-        self.custom_title = shown(custom_title);
-        self.summary = shown(summary);
+    pub(crate) fn titled(mut self, shown: TitleAndSummary) -> Self {
+        let unless_blank = |text: Option<String>| text.filter(|text| !text.trim().is_empty());
+        self.custom_title = unless_blank(shown.custom_title);
+        self.summary = unless_blank(shown.summary);
         self
+    }
+
+    /// This transcript, a copy the cache holds, under the title and summary
+    /// [`TitleAndSummary::shown`] decides from the copy's and `external`, the
+    /// title the agent keeps outside the transcript.
+    pub(crate) fn titled_with_external_title(self, external: Option<&SessionTitle>) -> Self {
+        let copy = TitleAndSummary {
+            custom_title: self.custom_title.clone(),
+            summary: self.summary.clone(),
+        };
+        let shown = TitleAndSummary::shown(&copy, external);
+        self.titled(shown)
     }
 
     fn from_entries_with_numbers(

@@ -37,8 +37,8 @@ struct CodexSession {
 }
 
 /// One update's read.
-struct Update {
-    outcome: std::result::Result<(), WholeRead>,
+pub(in crate::history::sqlite_cache::tests) struct Update {
+    pub(in crate::history::sqlite_cache::tests) outcome: std::result::Result<(), WholeRead>,
     transcripts_read: usize,
     bytes_read: u64,
     /// The entries a resumed read derives from the checkpoint on.
@@ -151,7 +151,11 @@ impl CodexSession {
 /// writes the read, or writes its parse when it is read whole, as a load
 /// does; asserts the listed row and the stored session match a fresh parse
 /// and write.
-fn update_stored(cache: &mut OwnedCache, base: &Path, fixture: &Fixture) -> Update {
+pub(in crate::history::sqlite_cache::tests) fn update_stored(
+    cache: &mut OwnedCache,
+    base: &Path,
+    fixture: &Fixture,
+) -> Update {
     let source = fixture.source();
     let stored = fixture.listed(cache);
     let reader = SqliteCache::open_waiting(&rearview_at(base))

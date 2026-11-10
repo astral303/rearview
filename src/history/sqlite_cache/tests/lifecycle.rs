@@ -193,6 +193,29 @@ fn read_snapshot_survives_replacement_between_identity_and_reconstruction() {
 }
 
 #[test]
+fn read_of_session_row_cache_doesnt_hold_fails_naming_row() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = admitted_cache(base.path());
+    let (storage, root) = write_test_entries(&mut cache, message_schema::transcript(Vec::new()));
+    let roots = cache.session_roots(&root);
+    let failure = cache
+        .with_read_snapshot(|connection| {
+            let id =
+                entries::listed_session_of(connection, storage.directory, roots.key(), CACHE_KEY)?
+                    .unwrap()
+                    .id;
+            let places = super::super::roots::Places::stored(connection, &roots)?;
+            entries::read(connection, id + 1, &places, None).map(|_| ())
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        failure.contains("session row") && failure.contains("does not hold"),
+        "the failure names the session row: {failure}"
+    );
+}
+
+#[test]
 fn unfinished_session_doesnt_become_reusable_or_leave_deletion_set() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());

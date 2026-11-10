@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 struct RecordContent {
     entries: String,
     malformed_lines: Vec<(usize, Option<String>)>,
-    search_parts: Vec<(usize, String)>,
+    subagent_metadata: Vec<(usize, String)>,
     files: BTreeSet<(&'static str, PathBuf)>,
 }
 
@@ -34,8 +34,8 @@ impl RecordContent {
         Self {
             entries: format!("{:?}", entries.entries),
             malformed_lines: malformed_lines(entries),
-            search_parts: record
-                .search_parts
+            subagent_metadata: record
+                .subagent_metadata
                 .iter()
                 .map(|part| (part.file_position, part.text.clone()))
                 .collect(),
@@ -53,15 +53,14 @@ impl RecordContent {
     /// hold a title the agent keeps outside the transcript.
     fn of_fresh_reads(row: &Conversation) -> Self {
         let format = row.source.provider().format();
-        let mut entries = normalized_session(
+        let entries = normalized_session(
             crate::history::FOR_FIXTURES,
             row.source,
             &row.path,
             &row.subagents,
         )
         .unwrap();
-        crate::history::parser::take_leading_titles(&mut entries.entries);
-        let mut search_parts = Vec::new();
+        let mut subagent_metadata = Vec::new();
         let mut transcripts: BTreeSet<PathBuf> = entries
             .entries
             .iter()
@@ -80,8 +79,8 @@ impl RecordContent {
                     .iter()
                     .filter_map(|(record, _)| record.transcript.as_deref().map(Path::to_path_buf)),
             );
-            search_parts.extend(
-                SubagentContribution::search_parts(
+            subagent_metadata.extend(
+                SubagentContribution::metadata_texts(
                     projection.entries.iter().map(|(_, entry)| entry),
                 )
                 .into_iter()
@@ -105,7 +104,7 @@ impl RecordContent {
         Self {
             entries: format!("{:?}", entries.entries),
             malformed_lines: malformed_lines(&entries),
-            search_parts,
+            subagent_metadata,
             files,
         }
     }

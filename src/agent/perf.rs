@@ -2,6 +2,7 @@
 //! stderr, and the stage an agent command is in for its progress record.
 
 use crate::agent::refs::AgentConversationKey;
+use crate::agent::search::SearchedTranscript;
 use crate::agent::transcript::AgentTranscript;
 use crate::clock::{Clock, Moment};
 use crate::history::load_meter::{AgentLoad, ItemCount, LoadMeter, LoadStep};
@@ -337,6 +338,7 @@ pub struct SearchReads {
     clock: Arc<dyn Clock>,
     sessions_opened: AtomicUsize,
     transcript_bytes: AtomicU64,
+    messages_read: AtomicUsize,
     read_nanos: AtomicU64,
     retrieval: Mutex<Duration>,
 }
@@ -347,20 +349,29 @@ impl SearchReads {
             clock,
             sessions_opened: AtomicUsize::new(0),
             transcript_bytes: AtomicU64::new(0),
+            messages_read: AtomicUsize::new(0),
             read_nanos: AtomicU64::new(0),
             retrieval: Mutex::new(Duration::ZERO),
         }
     }
 
-    /// Runs `read`, a read of `key`'s transcript, recording its time and the
-    /// transcript's size.
-    pub fn time_read<T>(&self, key: &AgentConversationKey, read: impl FnOnce() -> T) -> T {
+    /// Runs `read`, a read of some or all of `key`'s transcript's messages,
+    /// recording its time, the transcript's size and the messages it read.
+    pub fn time_read<E>(
+        &self,
+        key: &AgentConversationKey,
+        read: impl FnOnce() -> Result<SearchedTranscript, E>,
+    ) -> Result<SearchedTranscript, E> {
         let started = self.clock.now();
         let result = read();
         let elapsed = self.clock.elapsed_since(started);
         self.sessions_opened.fetch_add(1, Ordering::Relaxed);
         self.transcript_bytes
             .fetch_add(key.transcript_bytes.unwrap_or(0), Ordering::Relaxed);
+        if let Ok(searched) = &result {
+            self.messages_read
+                .fetch_add(searched.transcript.messages.len(), Ordering::Relaxed);
+        }
         self.read_nanos.fetch_add(
             u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -381,10 +392,11 @@ impl SearchReads {
     fn write_records(&self, records: &mut String) {
         let _ = writeln!(
             records,
-            "perf reads sessions={} transcript-bytes={} thread-ms={}",
+            "perf reads sessions={} transcript-bytes={} thread-ms={} messages={}",
             self.sessions_opened.load(Ordering::Relaxed),
             self.transcript_bytes.load(Ordering::Relaxed),
-            Duration::from_nanos(self.read_nanos.load(Ordering::Relaxed)).as_millis()
+            Duration::from_nanos(self.read_nanos.load(Ordering::Relaxed)).as_millis(),
+            self.messages_read.load(Ordering::Relaxed)
         );
         let _ = writeln!(
             records,
@@ -531,8 +543,12 @@ mod tests {
         let perf = perf();
         perf.time(Stage::Load, || ());
         perf.time(Stage::TranscriptSearch, || {
-            perf.search_reads().time_read(&key_of(5), || ());
-            perf.search_reads().time_read(&key_of(3), || ());
+            let _ = perf
+                .search_reads()
+                .time_read(&key_of(5), || Ok::<_, ()>(transcript_of(2).into()));
+            let _ = perf
+                .search_reads()
+                .time_read(&key_of(3), || Ok::<_, ()>(transcript_of(1).into()));
         });
 
         let records = perf.records(None);
@@ -552,6 +568,10 @@ mod tests {
             records.contains("perf reads sessions=2 transcript-bytes=8 "),
             "{records}"
         );
+        assert!(
+            records.contains(" messages=3\n"),
+            "the reads count the messages each returned: {records}"
+        );
     }
 
     #[test]
@@ -561,12 +581,16 @@ mod tests {
 
         perf.time(Stage::Load, || clock.sleep(Duration::from_millis(40)));
         perf.search_reads()
-            .time_read(&key_of(1), || clock.sleep(Duration::from_millis(25)));
+            .time_read(&key_of(1), || {
+                clock.sleep(Duration::from_millis(25));
+                Ok::<_, ()>(transcript_of(1).into())
+            })
+            .unwrap();
         clock.advance(Duration::from_millis(5));
 
         let records = perf.records(None);
         assert!(records.contains("perf stage=load ms=40\n"), "{records}");
-        assert!(records.contains(" thread-ms=25\n"), "{records}");
+        assert!(records.contains(" thread-ms=25 "), "{records}");
         assert!(records.contains("perf total ms=70\n"), "{records}");
     }
 

@@ -176,13 +176,29 @@ pub enum SessionTitle {
     Generated(String),
 }
 
-impl SessionTitle {
-    /// This title as a conversation's custom title and summary: a custom
-    /// title sets the title, a generated one the summary.
-    pub(crate) fn as_title_and_summary(&self) -> (Option<String>, Option<String>) {
-        match self {
-            Self::Custom(title) => (Some(title.clone()), None),
-            Self::Generated(title) => (None, Some(title.clone())),
+/// A session's custom title and summary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TitleAndSummary {
+    pub custom_title: Option<String>,
+    pub summary: Option<String>,
+}
+
+impl TitleAndSummary {
+    /// The title and summary a session shows: those of `copy`, its row or
+    /// transcript, unless its agent keeps a title outside the transcript.
+    /// `external`, that title, then replaces both: a custom one sets the
+    /// title, a generated one the summary.
+    pub fn shown(copy: &Self, external: Option<&SessionTitle>) -> Self {
+        match external {
+            Some(SessionTitle::Custom(title)) => Self {
+                custom_title: Some(title.clone()),
+                summary: None,
+            },
+            Some(SessionTitle::Generated(title)) => Self {
+                custom_title: None,
+                summary: Some(title.clone()),
+            },
+            None => copy.clone(),
         }
     }
 }

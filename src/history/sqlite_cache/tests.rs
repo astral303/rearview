@@ -1,7 +1,7 @@
 use super::*;
 use crate::clock::{Clock, TestClock};
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
-use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
+use crate::history::provider::{Fingerprint, SessionRoot, SessionStub, TitleAndSummary};
 use crate::history::{Conversation, DisplayEntries, Source, normalized_session};
 use entries::path_text;
 use std::time::{Duration, UNIX_EPOCH};
@@ -25,6 +25,21 @@ pub(crate) fn rearview_at(directory: &Path) -> CacheBase {
         std::sync::Arc::new(TestClock::default()),
         crate::history::provider::walk::SystemCanonicaliser::shared(),
     )
+}
+
+/// Gives the session `copy` reads a generation no write gave, as a write of
+/// another copy of it does, and returns that generation.
+pub(crate) fn replace_copy(copy: &super::CachedSession) -> i64 {
+    let cache = SqliteCache::open(&copy.base).unwrap();
+    cache
+        .connection
+        .query_row(
+            "UPDATE sessions SET generation = generation + 1000000 WHERE generation = ?1 \
+             RETURNING generation",
+            [copy.generation],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 pub(super) fn admitted_cache(base: &Path) -> super::OwnedCache {
@@ -80,6 +95,26 @@ pub(crate) fn parsed_record(
     stub: &SessionStub,
 ) -> SessionRecord {
     parsed_record_and_row(source, root, stub).0
+}
+
+/// `session`'s row as the catalogue lists it after its parse is written to
+/// the cache in `base`: a row reading its copy.
+pub(crate) fn cached_row(base: &Path, session: &AgentSession) -> Conversation {
+    let mut cache = admitted_cache(base);
+    let source = session.row.source;
+    let storage = storage_of(source);
+    cache.admit_storage(storage).unwrap();
+    let root = root_of(session);
+    let stub = stub_of(session, 1);
+    cache.write(&parsed_record(source, &root, &stub)).unwrap();
+    let CatalogueSession::Listed(listed) = cache
+        .catalogue_session(storage, source, &root, &stub.cache_key, false)
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("listed fixture")
+    };
+    *listed
 }
 
 fn source_record(source: Source, path: &Path) -> (SessionRecord, SessionRoot) {
@@ -210,14 +245,20 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
         let read_transcript =
             AgentTranscript::from_entries(&row.path, read.entries.clone(), malformed(&read))
                 .unwrap()
-                .titled(restored.custom_title.clone(), restored.summary.clone());
+                .titled(TitleAndSummary {
+                    custom_title: restored.custom_title.clone(),
+                    summary: restored.summary.clone(),
+                });
         let expected_transcript = AgentTranscript::from_entries(
             &row.path,
             expected.entries.clone(),
             malformed(&expected),
         )
         .unwrap()
-        .titled(row.custom_title.clone(), row.summary.clone());
+        .titled(TitleAndSummary {
+            custom_title: row.custom_title.clone(),
+            summary: row.summary.clone(),
+        });
         assert_eq!(
             canonical_message_times(read_transcript),
             canonical_message_times(expected_transcript),

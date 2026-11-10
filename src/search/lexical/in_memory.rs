@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// cache stores them: the text outside every message, then each message's
 /// texts in message order, each after a separator as `full_text` lays out
 /// its parts. The title and the summary are the row's (see
-/// [`Conversation::leading_texts`]).
+/// [`Conversation::title_and_summary_texts`]).
 pub struct SessionSearchTexts {
     joined: Arc<str>,
     /// Each text's byte range in `joined`.
@@ -223,12 +223,24 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
         .into_iter()
         .map(|(copy, _)| copy)
         .collect::<HashSet<_>>();
+    // The row of a copy another write replaced holds the new copy's texts
+    // until the rows next change and name that copy.
+    let replaced = scanned.replaced.into_iter().collect::<HashMap<_, _>>();
     pieces
         .into_par_iter()
         .enumerate()
         .map(|(copy, pieces)| {
-            let texts = (!missing.contains(&copy)).then(|| Arc::new(laid_out(pieces)));
-            (copies[copy].copy_key(), texts)
+            let cached = &copies[copy];
+            let texts = match replaced.get(&copy) {
+                Some(&generation) => {
+                    SessionSearchTexts::read(&cached.clone().of_generation(generation))
+                        .ok()
+                        .flatten()
+                        .map(Arc::new)
+                }
+                None => (!missing.contains(&copy)).then(|| Arc::new(laid_out(pieces))),
+            };
+            (cached.copy_key(), texts)
         })
         .collect()
 }

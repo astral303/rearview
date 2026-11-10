@@ -26,9 +26,9 @@ pub(crate) struct StoredResume {
     pub(crate) checkpoint: SessionCheckpoint,
     pub(crate) ledger: Vec<u8>,
     pub(crate) malformed_lines: Vec<MalformedLine>,
-    /// Each stored sub-agent search part: the path of its transcript and
+    /// Each stored sub-agent metadata part: the path of its transcript and
     /// its text.
-    pub(crate) search_parts: Vec<(PathBuf, String)>,
+    pub(crate) subagent_metadata: Vec<(PathBuf, String)>,
     /// The stored rows of the session's leading entries, at sequence 0 on.
     pub(crate) leading_rows: usize,
     /// The session's roots, which place its stored paths.
@@ -128,7 +128,7 @@ impl SqliteCache {
                 checkpoint,
                 ledger,
                 malformed_lines: entries::read_malformed_lines(connection, session)?,
-                search_parts: stored_search_parts(connection, &places, session)?,
+                subagent_metadata: stored_subagent_metadata(connection, &places, session)?,
                 leading_rows: connection.query_row(
                     "SELECT COUNT(*) FROM entries WHERE session = ?1 AND record_line = 0 \
                      AND child IS NULL AND record_transcript IS NULL AND sequence < ?2",
@@ -337,7 +337,7 @@ fn stored_files(connection: &Connection, places: &Places, session: i64) -> Resul
     Ok(files)
 }
 
-fn stored_search_parts(
+fn stored_subagent_metadata(
     connection: &Connection,
     places: &Places,
     session: i64,

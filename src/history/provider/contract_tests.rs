@@ -27,6 +27,7 @@ use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
     RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionProvider, SessionRead,
     SessionRenamer, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored, SubagentFinder,
+    TitleAndSummary,
 };
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
@@ -1029,9 +1030,13 @@ fn session_titled_outside_its_transcript_parses_that_title_alone() {
                 continue;
             };
             titled_outside.push((source, title.clone()));
+            let parsed = TitleAndSummary {
+                custom_title: row.custom_title,
+                summary: row.summary,
+            };
             assert_eq!(
-                (row.custom_title, row.summary),
-                title.as_title_and_summary(),
+                TitleAndSummary::shown(&parsed, Some(&title)),
+                parsed,
                 "{source:?}, renamed {renamed}: the parse names the title outside the transcript \
                  alone"
             );
@@ -1049,6 +1054,66 @@ fn session_titled_outside_its_transcript_parses_that_title_alone() {
             .any(|(_, title)| matches!(title, SessionTitle::Custom(_))),
         "some fixture keeps a chosen title outside its transcript: {titled_outside:?}"
     );
+}
+
+/// The origin of a session's name kept outside its transcript.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Naming {
+    /// The user chose it, through the agent's renamer.
+    Chosen,
+    /// The agent generated it.
+    Generated,
+}
+
+/// Each rename of a name kept outside the transcript that an agent writes:
+/// the agent, how it names the session first, then how it renames it.
+pub(crate) const EXTERNAL_TITLE_RENAMES: [(Source, Naming, Naming); 7] = [
+    (Source::Codex, Naming::Chosen, Naming::Chosen),
+    (Source::Kimi, Naming::Chosen, Naming::Chosen),
+    (Source::Kimi, Naming::Generated, Naming::Chosen),
+    (Source::Kimi, Naming::Chosen, Naming::Generated),
+    (Source::Grok, Naming::Chosen, Naming::Chosen),
+    (Source::Grok, Naming::Generated, Naming::Chosen),
+    (Source::Grok, Naming::Chosen, Naming::Generated),
+];
+
+/// Writes `title` where the agent does: a chosen one through its renamer, a
+/// generated one into the file beside the transcript.
+pub(crate) fn name_session(source: Source, locator: &Path, title: &str, naming: Naming) {
+    let rewrite = |file: &Path, fields: serde_json::Value| {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        for (field, text) in fields.as_object().unwrap() {
+            value[field] = text.clone();
+        }
+        std::fs::write(file, value.to_string()).unwrap();
+    };
+    match (naming, source) {
+        (Naming::Chosen, _) => {
+            let Capability::Capable(renamer) = source.provider().rename() else {
+                panic!("{source:?} renames a session");
+            };
+            renamer
+                .rename_session(
+                    crate::history::FOR_FIXTURES,
+                    locator,
+                    title,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+        }
+        (Naming::Generated, Source::Kimi) => rewrite(
+            &crate::history::format::kimi::wire_location(locator)
+                .session_dir
+                .join("state.json"),
+            serde_json::json!({"title": title, "titleKind": "generated", "isCustomTitle": false}),
+        ),
+        (Naming::Generated, Source::Grok) => rewrite(
+            &locator.with_file_name(crate::history::format::grok::SUMMARY_FILE),
+            serde_json::json!({"generated_title": title, "title_is_manual": false}),
+        ),
+        (Naming::Generated, source) => panic!("{source:?} doesn't generate a title"),
+    }
 }
 
 #[test]

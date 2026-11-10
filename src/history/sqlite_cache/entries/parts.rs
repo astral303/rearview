@@ -77,6 +77,7 @@ impl<'connection> Writer<'connection> {
             }
         }
         for (offset, (kind, field, text)) in search_only_parts(blocks, search).enumerate() {
+            let (kind, text) = kind.columns(&text);
             self.part.execute(params![
                 session,
                 entry,
@@ -85,7 +86,7 @@ impl<'connection> Writer<'connection> {
                 field.code(),
                 place.sequence,
                 place.ordinal,
-                search_only_text(&text),
+                text,
                 None::<&str>,
                 None::<&str>,
                 None::<&str>,
@@ -99,31 +100,38 @@ impl<'connection> Writer<'connection> {
 }
 
 /// The parts search alone reads, numbered after the entry's blocks, each as
-/// its kind, field and text: a [`RESULT_TEXT`] part for each searched result
-/// with items in `result_items`, in block order, then a [`DERIVED`] part for
-/// each derived text.
+/// its kind, field and text: a [`SearchOnlyKind::ResultText`] part for each
+/// searched result with items in `result_items`, in block order, then a
+/// [`SearchOnlyKind::Derived`] part for each derived text.
 fn search_only_parts<'a>(
     blocks: &'a [ContentBlock],
     search: &'a EntrySearch,
-) -> impl Iterator<Item = (&'static str, SearchField, Cow<'a, str>)> {
+) -> impl Iterator<Item = (SearchOnlyKind, SearchField, Cow<'a, str>)> {
     let results = blocks
         .iter()
         .zip(&search.blocks)
         .filter_map(|(block, field)| {
             let field = (*field)?;
             let items = stored_items(block, &Columns::of(block))?;
-            Some((RESULT_TEXT, field, Cow::Owned(searched_items_text(items))))
+            Some((
+                SearchOnlyKind::ResultText,
+                field,
+                Cow::Owned(searched_items_text(items)),
+            ))
         });
-    let derived = search
-        .derived
-        .iter()
-        .map(|derived| (DERIVED, derived.field, Cow::Borrowed(derived.text.as_str())));
+    let derived = search.derived.iter().map(|derived| {
+        (
+            SearchOnlyKind::Derived,
+            derived.field,
+            Cow::Borrowed(derived.text.as_str()),
+        )
+    });
     results.chain(derived)
 }
 
 /// The field a block's own part is read in: `None` for a result with items
-/// in `result_items`. Search reads that result through its [`RESULT_TEXT`]
-/// part.
+/// in `result_items`. Search reads that result through its
+/// [`SearchOnlyKind::ResultText`] part.
 fn block_field(columns: &Columns<'_>, field: Option<SearchField>) -> Option<SearchField> {
     field.filter(|_| columns.result_shape != Some(LOSSLESS_ARRAY))
 }
@@ -284,23 +292,45 @@ impl<'a> Columns<'a> {
     }
 }
 
-/// The kind of a part holding a search text no block holds as written.
-pub(in crate::history::sqlite_cache) const DERIVED: &str = "derived";
-/// The kind of a part holding the search text of a result with items in
-/// `result_items`.
-pub(in crate::history::sqlite_cache) const RESULT_TEXT: &str = "result-text";
-/// The kind of a sub-agent metadata part, outside every entry: a sub-agent
-/// transcript's text outside its spliced turns. Only `agent search` reads
-/// it.
-pub(in crate::history::sqlite_cache) const SUBAGENT_METADATA: &str = "subagent-metadata";
-/// The kinds of the parts only search reads: a display read leaves them out.
-const SEARCH_ONLY_KINDS: [&str; 3] = [DERIVED, RESULT_TEXT, SUBAGENT_METADATA];
-
-/// The text a part of a [`SEARCH_ONLY_KINDS`] kind stores for `text`:
-/// without its terminal codes, as search reads it.
-pub(in crate::history::sqlite_cache) fn search_only_text(text: &str) -> Cow<'_, str> {
-    split_terminal_codes(text).text
+/// The kind of a part only search reads: a display read leaves it out.
+/// Writers store such a part through [`Self::columns`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::history::sqlite_cache) enum SearchOnlyKind {
+    /// A search text no block holds as written.
+    Derived,
+    /// The search text of a result with items in `result_items`.
+    ResultText,
+    /// A sub-agent transcript's text outside its spliced turns, outside
+    /// every entry. `agent search` reads it.
+    SubagentMetadata,
 }
+
+impl SearchOnlyKind {
+    const ALL: [Self; 3] = [Self::Derived, Self::ResultText, Self::SubagentMetadata];
+
+    /// The part's `kind` column.
+    pub(in crate::history::sqlite_cache) const fn name(self) -> &'static str {
+        match self {
+            Self::Derived => "derived",
+            Self::ResultText => "result-text",
+            Self::SubagentMetadata => "subagent-metadata",
+        }
+    }
+
+    /// The `kind` and `text` columns of a part of this kind holding `text`:
+    /// the text without its terminal codes, as search reads it.
+    pub(in crate::history::sqlite_cache) fn columns(
+        self,
+        text: &str,
+    ) -> (&'static str, Cow<'_, str>) {
+        (self.name(), split_terminal_codes(text).text)
+    }
+}
+
+/// [`SearchOnlyKind::Derived`]'s `kind` column.
+pub(in crate::history::sqlite_cache) const DERIVED: &str = SearchOnlyKind::Derived.name();
+/// [`SearchOnlyKind::ResultText`]'s `kind` column.
+pub(in crate::history::sqlite_cache) const RESULT_TEXT: &str = SearchOnlyKind::ResultText.name();
 
 /// A result array whose every item is a string or a text item:
 /// `result_items` holds it.
@@ -370,7 +400,9 @@ pub(super) fn read(
          p.result_shape FROM parts p WHERE p.entry IN ({}) AND p.kind NOT IN ({}) \
          ORDER BY p.entry, p.part",
         selected.ids,
-        SEARCH_ONLY_KINDS.map(|kind| format!("'{kind}'")).join(", "),
+        SearchOnlyKind::ALL
+            .map(|kind| format!("'{}'", kind.name()))
+            .join(", "),
     ))?;
     let mut rows = statement.query(rusqlite::params_from_iter(&selected.parameters))?;
     while let Some(row) = rows.next()? {

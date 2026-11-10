@@ -7,9 +7,10 @@
 //! holding a character lowercasing to ASCII takes the exact path, one
 //! character at a time through the normalisation, as do words outside ASCII.
 
+use super::hit_messages::{MessageTerms, RetrievalTerms};
 use crate::search::byte_search::{AsciiCaselessFinder, DOTTED_CAPITAL_I, KELVIN_SIGN};
 use crate::search::literal::Literal;
-use crate::text_match::is_word_separator;
+use crate::text_match::{contains_cjk, is_word_separator};
 
 /// The most prefix matches a word counts in a session's body.
 pub(super) const PREFIX_CAP: usize = 10;
@@ -48,6 +49,18 @@ impl<'q> RawQuery<'q> {
         self.literals
     }
 
+    /// The terms a message must hold to be a hit message under `terms`.
+    pub(super) fn required_terms(&self, terms: RetrievalTerms) -> MessageTerms {
+        let literals = MessageTerms::first(self.literals.len());
+        match terms {
+            RetrievalTerms::WordsAndLiterals => MessageTerms {
+                words: MessageTerms::first(self.words.len()),
+                literals,
+            },
+            RetrievalTerms::Literals => MessageTerms { words: 0, literals },
+        }
+    }
+
     /// A matcher for one session's texts.
     pub(super) fn matcher(&self) -> RawMatcher<'_> {
         RawMatcher {
@@ -74,6 +87,22 @@ impl RawMatcher<'_> {
             adjacency: 0,
             literals: vec![false; self.query.literals.len()],
             has_text: false,
+        }
+    }
+
+    /// The terms `counts`, the counts of one text, hold as `agent search`'s
+    /// retrieval matches a message: a word starting a word of the text, or a
+    /// word holding CJK anywhere in it, and a literal inside it.
+    pub(super) fn message_terms(&self, counts: &Counts) -> MessageTerms {
+        let words = self
+            .query
+            .words
+            .iter()
+            .zip(counts.prefixes.iter().zip(&counts.contains))
+            .map(|(word, (&prefixes, &contains))| prefixes > 0 || (word.holds_cjk && contains));
+        MessageTerms {
+            words: MessageTerms::bits(words),
+            literals: MessageTerms::bits(counts.literals.iter().copied()),
         }
     }
 
@@ -199,6 +228,7 @@ struct Pattern {
     /// that is also its suffix: where a partial match resumes.
     resume_at: Vec<usize>,
     ascii: Option<AsciiForm>,
+    holds_cjk: bool,
 }
 
 enum AsciiForm {
@@ -258,6 +288,7 @@ impl Pattern {
             chars,
             resume_at,
             ascii,
+            holds_cjk: contains_cjk(text),
         }
     }
 }

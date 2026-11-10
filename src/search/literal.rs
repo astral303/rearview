@@ -5,7 +5,7 @@ use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
 use memchr::memmem;
 use rayon::prelude::*;
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -457,34 +457,6 @@ pub fn matches_all_literals(text: &str, literals: &[Literal]) -> bool {
     literals.iter().all(|literal| literal.matches(text))
 }
 
-/// True when each literal matches within one of the texts `agent search`
-/// reads: the session's title, summary, `full_text`, `agent_search_text` and
-/// `thinking_and_tool_call_text`, and its project name. With `window` active,
-/// only the text of its messages inside the window, without the project name.
-pub fn agent_conversation_matches_all_literals(
-    conversation: &Conversation,
-    literals: &[Literal],
-    window: &TimeFilter,
-) -> bool {
-    let fields: Vec<Cow<'_, str>> = if window.is_active() {
-        conversation.texts_within(window).into_array().into()
-    } else {
-        conversation
-            .leading_texts()
-            .chain([
-                conversation.full_text.as_str(),
-                conversation.agent_search_text.as_str(),
-                conversation.thinking_and_tool_call_text.as_str(),
-                conversation.project_name.as_deref().unwrap_or_default(),
-            ])
-            .map(Cow::Borrowed)
-            .collect()
-    };
-    literals
-        .iter()
-        .all(|literal| fields.iter().any(|field| literal.matches(field)))
-}
-
 pub fn match_literal_ranges(text: &str, literals: &[Literal]) -> Vec<(usize, usize)> {
     literals
         .iter()
@@ -519,7 +491,7 @@ pub fn exact_fallback(
 fn literal_text(conversation: &Conversation, include_agent_text: bool) -> String {
     let mut text = String::new();
     for piece in conversation
-        .leading_texts()
+        .title_and_summary_texts()
         .chain([conversation.full_text.as_str()])
     {
         push_separated(&mut text, piece);
@@ -791,31 +763,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_literal_matches_in_any_cached_text() {
-        let conversation =
-            conversation_with_agent_texts("main reply", "sub-agent reply", "thought it through");
-
-        for phrase in ["main reply", "sub-agent reply", "thought it through"] {
-            assert!(
-                agent_conversation_matches_all_literals(
-                    &conversation,
-                    &[Literal::new(phrase.to_owned())],
-                    &TimeFilter::default(),
-                ),
-                "{phrase}"
-            );
-        }
-    }
-
-    #[test]
     fn agent_literal_spanning_two_cached_texts_doesnt_match() {
         let conversation = conversation_with_agent_texts("ends with alpha", "beta starts", "");
 
-        assert!(!agent_conversation_matches_all_literals(
-            &conversation,
-            &[Literal::new("alpha beta".to_owned())],
-            &TimeFilter::default(),
-        ));
         assert!(
             build_agent_literal_corpus(&[conversation], &TimeFilter::default())
                 .iter()

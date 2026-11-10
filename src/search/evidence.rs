@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub struct LexicalEvidence {
     /// The row's title and summary as the evidence read them: a refresh can
     /// retitle the row before the evidence is built again.
-    leading: Vec<String>,
+    title_and_summary: Vec<String>,
     /// The session's other texts, shared with the texts held in memory;
     /// `None` for the conversation's `full_text`.
     body: Option<Arc<str>>,
@@ -26,7 +26,12 @@ impl LexicalEvidence {
     /// evidence was built for.
     pub(crate) fn texts<'a>(&'a self, conversation: &'a Conversation) -> SeparatedTexts<'a> {
         let body = self.body.as_deref().unwrap_or(&conversation.full_text);
-        SeparatedTexts::new(self.leading.iter().map(String::as_str).chain([body]))
+        SeparatedTexts::new(
+            self.title_and_summary
+                .iter()
+                .map(String::as_str)
+                .chain([body]),
+        )
     }
 }
 
@@ -138,7 +143,10 @@ pub fn build_lexical_evidence(
         (None, None) => None,
     };
     let mut evidence = LexicalEvidence {
-        leading: conversation.leading_texts().map(str::to_owned).collect(),
+        title_and_summary: conversation
+            .title_and_summary_texts()
+            .map(str::to_owned)
+            .collect(),
         body: texts.map(|texts| Arc::clone(texts.joined())),
         context_ranges: Vec::new(),
     };
@@ -555,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn titled_rows_context_line_is_that_of_its_titles_joined_ahead_of_its_text() {
+    fn titled_rows_context_line_is_that_of_its_title_and_summary_joined_ahead_of_its_text() {
         let body = "a body that mentions deepgram, then audio_generation and plans";
         let mut titled = conversation("unrelated preview", body);
         titled.custom_title = Some("Deepgram plans".to_owned());

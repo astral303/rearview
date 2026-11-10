@@ -4,7 +4,7 @@
 //! the session, without joins.
 
 use super::text_scan::{
-    LayoutGroup, ReadOrder, StoredEntry, StoredMessage, StoredWindow, text_at, text_ordinal,
+    LayoutGroup, MessagesInWindow, ReadOrder, StoredPlace, StoredWindow, text_at,
 };
 use super::{CachedSession, SearchField};
 use crate::error::Result;
@@ -83,34 +83,8 @@ impl CachedSession {
             Ok(())
         })
     }
-
-    /// True when a search text in `fields`, within `window` as
-    /// [`Self::read_search_texts`] reads it, holds more than whitespace.
-    pub(crate) fn holds_search_text(
-        &self,
-        fields: SearchedFields,
-        window: &TimeFilter,
-    ) -> Result<Option<bool>> {
-        let mut holds = false;
-        let read = self.read_search_texts(fields, window, |text| {
-            holds = !text.text.trim().is_empty();
-            if holds {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })?;
-        Ok(read.map(|()| holds))
-    }
 }
 
-const ENTRIES: &str = "SELECT id, message, contributes, sequence FROM entries WHERE session = ?1";
-/// The session's messages with their times, which a window reads.
-const MESSAGES_WITH_TIMES: &str =
-    "SELECT id, ordinal, first_ms, last_ms FROM messages WHERE session = ?1";
-/// The session's messages without their times, read from the index on
-/// `(session, ordinal)` alone.
-const MESSAGES: &str = "SELECT id, ordinal, NULL, NULL FROM messages WHERE session = ?1";
 /// The session `?1`'s sub-agent metadata parts, outside every entry.
 /// `ORDER BY part` makes SQLite read them through `parts_outside_entries`,
 /// the index of those parts alone, not through the index of every part of
@@ -121,37 +95,18 @@ const SUBAGENT_METADATA_READ: &str =
 /// The session `?1`'s parts holding search text in `fields`.
 fn parts_query(fields: SearchedFields) -> String {
     format!(
-        "SELECT entry, part, kind, text FROM parts \
+        "SELECT part, kind, entry_sequence, message_ordinal, text FROM parts \
          WHERE session = ?1 AND search_field IN ({})",
         fields.part_field_codes()
     )
 }
 
-/// A read of one session's search texts, with its entries and messages read
-/// first to place each text.
+/// A read of one session's search texts, each placed by its part's row.
 struct SessionRead<'c> {
     connection: &'c Connection,
     session: i64,
     fields: SearchedFields,
-    window: Option<StoredWindow>,
-    entries: ById<StoredEntry>,
-    messages: ById<StoredMessage>,
-}
-
-/// Rows by their id, sorted by it: a session's rows are read in another
-/// order, and a hash map of a large session's rows took longer to build.
-struct ById<T>(Vec<(i64, T)>);
-
-impl<T: Copy> ById<T> {
-    fn sorted(mut rows: Vec<(i64, T)>) -> Self {
-        rows.sort_unstable_by_key(|(id, _)| *id);
-        Self(rows)
-    }
-
-    fn get(&self, id: i64) -> Option<T> {
-        let index = self.0.binary_search_by_key(&id, |(id, _)| *id).ok()?;
-        Some(self.0[index].1)
-    }
+    window: Option<MessagesInWindow>,
 }
 
 impl<'c> SessionRead<'c> {
@@ -161,43 +116,14 @@ impl<'c> SessionRead<'c> {
         fields: SearchedFields,
         window: Option<StoredWindow>,
     ) -> Result<Self> {
-        let entries = connection
-            .prepare_cached(ENTRIES)?
-            .query_map([session], |row| {
-                Ok((
-                    row.get(0)?,
-                    StoredEntry {
-                        message: row.get(1)?,
-                        contributes: row.get(2)?,
-                        sequence: row.get(3)?,
-                    },
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        let messages = connection
-            .prepare_cached(if window.is_some() {
-                MESSAGES_WITH_TIMES
-            } else {
-                MESSAGES
-            })?
-            .query_map([session], |row| {
-                Ok((
-                    row.get(0)?,
-                    StoredMessage {
-                        ordinal: row.get(1)?,
-                        first_ms: row.get(2)?,
-                        last_ms: row.get(3)?,
-                    },
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
+        let window = window
+            .map(|window| MessagesInWindow::of_session(connection, window, session))
+            .transpose()?;
         Ok(Self {
             connection,
             session,
             fields,
             window,
-            entries: ById::sorted(entries),
-            messages: ById::sorted(messages),
         })
     }
 
@@ -226,14 +152,20 @@ impl<'c> SessionRead<'c> {
         let mut statement = self.connection.prepare_cached(&parts_query(self.fields))?;
         let mut rows = statement.query([self.session])?;
         while let Some(row) = rows.next()? {
-            let group = LayoutGroup::of_part(text_at(row, 2)?);
-            let Some((ordinal, order)) = self.place(row.get(0)?, group, row.get(1)?) else {
+            let place = StoredPlace::at(row, (2, 3))?;
+            if let Some(window) = &self.window
+                && !window.holds(self.session, place.ordinal)
+            {
                 continue;
-            };
+            }
             let text = SearchText {
-                ordinal,
-                order,
-                text: text_at(row, 3)?,
+                ordinal: place.message(),
+                order: ReadOrder {
+                    group: LayoutGroup::of_part(text_at(row, 1)?),
+                    sequence: place.sequence,
+                    part: row.get(0)?,
+                },
+                text: text_at(row, 4)?,
             };
             if visit(text).is_break() {
                 return Ok(ControlFlow::Break(()));
@@ -264,71 +196,53 @@ impl<'c> SessionRead<'c> {
         }
         Ok(ControlFlow::Continue(()))
     }
-
-    /// The message number and place of a text of `entry` in `group`, at
-    /// `part` in the entry; `None` when the window leaves the text out, or
-    /// the session doesn't hold `entry`.
-    fn place(
-        &self,
-        entry: i64,
-        group: LayoutGroup,
-        part: i64,
-    ) -> Option<(Option<usize>, ReadOrder)> {
-        let stored = self.entries.get(entry)?;
-        let message = stored
-            .message
-            .and_then(|message| self.messages.get(message));
-        let ordinal = text_ordinal(stored, message, self.window)?;
-        Some((
-            ordinal,
-            ReadOrder {
-                group,
-                sequence: stored.sequence,
-                part,
-            },
-        ))
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::text_scan::parts_of_messages;
     use super::*;
 
-    /// One session's read costs what the session holds, not what the cache
-    /// holds, only while each statement reads through an index. The sub-agent
-    /// metadata read uses the index of those parts alone.
+    /// One session's read, and a write moving its search places, cost what
+    /// the session holds, not what the cache holds, only while each statement
+    /// reads through an index, without sorting. The sub-agent metadata read
+    /// uses the index of those parts alone; a windowed scan reads one
+    /// message's parts through `parts_by_message`.
     #[test]
-    fn each_statement_reads_through_an_index_without_scanning_a_table() {
+    fn each_statement_on_one_sessions_parts_reads_through_an_index_without_sorting() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
             .execute_batch(super::super::schema::CREATE)
             .unwrap();
         for fields in [SearchedFields::List, SearchedFields::Agent] {
             for (query, index) in [
-                (ENTRIES, None),
-                (MESSAGES, None),
-                (MESSAGES_WITH_TIMES, None),
-                (parts_query(fields).as_str(), None),
-                (SUBAGENT_METADATA_READ, Some("parts_outside_entries")),
+                (parts_query(fields), "parts_by_message"),
+                (SUBAGENT_METADATA_READ.to_owned(), "parts_outside_entries"),
+                (parts_of_messages(fields), "parts_by_message"),
+                (
+                    super::super::entries::SHIFT_SEARCH_PLACES.to_owned(),
+                    "parts_by_message",
+                ),
             ] {
-                let plan = connection
+                let mut statement = connection
                     .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
-                    .unwrap()
-                    .query_map([1], |row| row.get::<_, String>(3))
+                    .unwrap();
+                let parameters = vec![1; statement.parameter_count()];
+                let plan = statement
+                    .query_map(rusqlite::params_from_iter(parameters), |row| {
+                        row.get::<_, String>(3)
+                    })
                     .unwrap()
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .unwrap()
                     .join("\n");
                 assert!(
-                    plan.contains("SEARCH") && !plan.contains("SCAN"),
-                    "{query}: the statement searches an index without scanning a table: {plan}"
+                    plan.contains(&format!("SEARCH parts USING INDEX {index} "))
+                        && !plan.contains("SCAN")
+                        && !plan.contains("TEMP B-TREE"),
+                    "{query}: the statement reads through {index} without scanning or sorting: \
+                     {plan}"
                 );
-                if let Some(index) = index {
-                    assert!(
-                        plan.contains(&format!("INDEX {index} ")),
-                        "{query}: the statement reads through {index}: {plan}"
-                    );
-                }
             }
         }
     }

@@ -26,6 +26,11 @@ impl RowIds {
     }
 }
 
+/// Moves the search place of the session `?1`'s parts from sequence `?2` on
+/// by `?3`.
+pub(in crate::history::sqlite_cache) const SHIFT_SEARCH_PLACES: &str = "UPDATE parts SET entry_sequence = entry_sequence + ?3 \
+     WHERE session = ?1 AND entry_sequence >= ?2";
+
 /// The columns an entry's place in its session sets.
 const ENTRY_PLACE_COLUMNS: &[&str] = &[
     "message",
@@ -439,10 +444,7 @@ impl<'connection> RowWriter<'connection> {
     /// moved.
     pub(super) fn shift_search_places(&self, from: i64, delta: i64) -> rusqlite::Result<()> {
         self.connection
-            .prepare_cached(
-                "UPDATE parts SET entry_sequence = entry_sequence + ?3 \
-                 WHERE session = ?1 AND entry_sequence >= ?2",
-            )?
+            .prepare_cached(SHIFT_SEARCH_PLACES)?
             .execute(params![self.session, from, delta])?;
         Ok(())
     }

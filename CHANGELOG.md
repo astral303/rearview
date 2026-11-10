@@ -45,7 +45,9 @@
   now show with `\` alone.
 - Fix the list's search matching a Codex, Grok Build or Kimi Code
   session's old name after a rename, and missing the new one, until its
-  transcript changed. `agent within` now shows the new name too.
+  transcript changed. A Grok Build or Kimi Code session renamed from its
+  generated title no longer shows that title beside its new name, and
+  `agent within` now shows the new name too.
 
 ### Changes
 

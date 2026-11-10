@@ -2,7 +2,6 @@ use crate::agent;
 use crate::agent::diagnostic::{AgentError, AgentErrorKind, AgentWarning, AgentWarningKind};
 use crate::agent::perf::{CommandPerf, Stage};
 use crate::agent::progress::{ProgressRecords, ProgressSchedule, run_reporting_progress};
-use crate::agent::search::TranscriptRetention;
 use crate::cli::{self, AgentCommand, AgentOutlineArgs, AgentReadArgs};
 use crate::clock::{Clock, Zone};
 use crate::config;
@@ -19,7 +18,6 @@ use crate::semantic;
 use crate::semantic::rank::RankedHits;
 use crate::semantic::types::{ChunkHits, EmbeddingBudget};
 use crate::time_filter::TimeFilter;
-use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -442,20 +440,17 @@ pub struct AgentService {
     >,
     bounded_transcripts:
         RefCell<HashMap<(PathBuf, usize, usize), agent::transcript::AgentTranscript>>,
-    /// The title and summary of each target, by path, as the command's read
-    /// of it listed them or as its agent keeps them outside the transcript.
-    /// A transcript's own are its last parse's: a name kept outside the
-    /// transcript can change without the transcript.
-    target_titles: RefCell<HashMap<PathBuf, TitleAndSummary>>,
+    /// The title and summary of each target the command's read listed, by
+    /// path, as the listed row shows them. A transcript's own are its last
+    /// parse's: a name kept outside the transcript can change without the
+    /// transcript.
+    target_titles_and_summaries: RefCell<HashMap<PathBuf, history::provider::TitleAndSummary>>,
     /// The stale sessions the command has met so far; the command prints
     /// them in one record when it renders.
     stale_coverage: RefCell<Option<StaleCoverage>>,
     perf: CommandPerf,
     environment: history::Environment,
 }
-
-/// A session's custom title and summary.
-type TitleAndSummary = (Option<String>, Option<String>);
 
 pub fn execute(command: AgentCommand, environment: history::Environment) -> Result<String> {
     AgentService::new(environment).execute(command)
@@ -499,6 +494,67 @@ fn read_cached_transcript(
         })
 }
 
+/// The hit messages `hits` of `conversation`, a ranked session, read alone
+/// from the copy the ranking counted, with its failure worded for the agent
+/// protocol. When another write replaced that copy since, the new copy's
+/// hit messages are counted alone and read from it.
+pub(crate) fn read_hit_messages(
+    clock: &dyn Clock,
+    wait: &history::WaitStatus,
+    ranking: &search::AgentRanking,
+    conversation: &history::Conversation,
+    hits: &search::SessionHitMessages,
+    key: &agent::refs::AgentConversationKey,
+) -> std::result::Result<agent::search::SearchedTranscript, AgentError> {
+    let not_cached = || AppError::SessionCacheNotReady {
+        session: key.session_id.clone(),
+        reason: "the session is not in the session cache".to_owned(),
+    };
+    let read = |copy: &history::sqlite_cache::CachedSession, ordinals: &[usize]| {
+        history::sqlite_cache::read_when_unlocked(
+            clock,
+            wait,
+            &history::Cancellation::default(),
+            || copy.agent_messages(&key.path, ordinals),
+        )?
+        .ok_or_else(not_cached)
+    };
+    let found = (|| {
+        let copy = conversation
+            .cached_session
+            .clone()
+            .ok_or_else(not_cached)?
+            .ignoring_source_changes()
+            .of_generation(hits.generation);
+        let read = match read(&copy, &hits.ordinals)? {
+            history::sqlite_cache::CopyRead::Read(read) => read,
+            history::sqlite_cache::CopyRead::Replaced { generation } => {
+                let copy = copy.of_generation(generation);
+                let hits = ranking
+                    .hit_messages_alone(copy.clone())?
+                    .ok_or_else(not_cached)?;
+                match read(&copy, &hits.ordinals)? {
+                    history::sqlite_cache::CopyRead::Read(read) => read,
+                    history::sqlite_cache::CopyRead::Replaced { .. } => {
+                        return Err(AppError::SessionCacheNotReady {
+                            session: key.session_id.clone(),
+                            reason: "catalogue generation changed".to_owned(),
+                        });
+                    }
+                }
+            }
+        };
+        Ok(agent::search::SearchedTranscript {
+            transcript: read.transcript,
+            message_count: read.message_count,
+        })
+    })();
+    found.map_err(|error| match error {
+        AppError::Agent(error) => error,
+        error => AgentError::io(Some(&key.path.to_string_lossy()), error.to_string()),
+    })
+}
+
 /// `key`'s transcript parsed with the refresh owner's `permit`, for a session
 /// the cache holds no copy of, its failure worded for the agent protocol.
 fn parse_uncached_transcript(
@@ -528,19 +584,24 @@ fn command_operation(base: &history::CacheBase, meter: &LoadMeter) -> history::O
 /// The keys of the sessions a command reads, by path, as holding the cache
 /// for reading left them.
 #[derive(Default)]
-struct HeldTargets(HashMap<PathBuf, agent::refs::AgentConversationKey>);
+struct HeldTargets {
+    keys: HashMap<PathBuf, agent::refs::AgentConversationKey>,
+    /// The root of each target read as the cache holds it, by path. The
+    /// copy's title is its last parse's.
+    roots_read_as_is: HashMap<PathBuf, history::provider::SessionRoot>,
+}
 
 impl HeldTargets {
     fn keep(&mut self, key: agent::refs::AgentConversationKey) {
-        self.0.insert(key.path.clone(), key);
+        self.keys.insert(key.path.clone(), key);
     }
 
     fn into_keys(self) -> impl Iterator<Item = agent::refs::AgentConversationKey> {
-        self.0.into_values()
+        self.keys.into_values()
     }
 
     fn holds(&self, target: &agent::refs::AgentConversationKey) -> bool {
-        self.0.contains_key(&target.path)
+        self.keys.contains_key(&target.path)
     }
 
     /// The held key of `target`, a session the cache was held for.
@@ -548,9 +609,18 @@ impl HeldTargets {
         &self,
         target: &agent::refs::AgentConversationKey,
     ) -> &agent::refs::AgentConversationKey {
-        self.0
+        self.keys
             .get(&target.path)
             .expect("the cache was held for the target")
+    }
+
+    /// The root `target` was read under as the cache holds it; `None` for a
+    /// target the command read and listed or parsed.
+    fn root_read_as_is(
+        &self,
+        target: &agent::refs::AgentConversationKey,
+    ) -> Option<&history::provider::SessionRoot> {
+        self.roots_read_as_is.get(&target.path)
     }
 }
 
@@ -588,11 +658,17 @@ impl CheckedTargets {
 
     /// These targets, with `retried` in place of their earlier check.
     fn with_retried(mut self, retried: Self) -> Self {
-        for key in retried.held.into_keys() {
+        let HeldTargets {
+            keys,
+            roots_read_as_is,
+        } = retried.held;
+        for key in keys.into_values() {
             self.stale_copies.remove(&key.path);
             self.missing_copies.remove(&key.path);
+            self.held.roots_read_as_is.remove(&key.path);
             self.held.keep(key);
         }
+        self.held.roots_read_as_is.extend(roots_read_as_is);
         self.stale_copies.extend(retried.stale_copies);
         self.missing_copies.extend(retried.missing_copies);
         self
@@ -629,8 +705,7 @@ enum TargetRead {
         address: history::sqlite_cache::SessionAddress,
         subagents: Vec<PathBuf>,
         publication: history::sqlite_cache::Publication,
-        custom_title: Option<String>,
-        summary: Option<String>,
+        title_and_summary: history::provider::TitleAndSummary,
         unwritten: history::provider::UnwrittenParse,
     },
     /// The read did not list the session.
@@ -649,8 +724,10 @@ impl TargetRead {
                     .expect("a row a targeted read lists has its cache address"),
                 subagents: row.subagents,
                 publication: row.publication,
-                custom_title: row.custom_title,
-                summary: row.summary,
+                title_and_summary: history::provider::TitleAndSummary {
+                    custom_title: row.custom_title,
+                    summary: row.summary,
+                },
                 unwritten,
             },
             (read, unwritten) => Self::Unlisted { read, unwritten },
@@ -664,7 +741,7 @@ impl AgentService {
         Self {
             transcripts: RefCell::default(),
             bounded_transcripts: RefCell::default(),
-            target_titles: RefCell::default(),
+            target_titles_and_summaries: RefCell::default(),
             stale_coverage: RefCell::default(),
             perf: CommandPerf::new(Arc::clone(environment.clock())),
             environment,
@@ -779,7 +856,7 @@ impl AgentService {
                 None => unread.push(target),
             }
         }
-        let unchecked: Vec<agent::refs::AgentConversationKey> = match operation.acquire_access()? {
+        let unchecked: Vec<&agent::refs::AgentConversationKey> = match operation.acquire_access()? {
             history::sqlite_cache::OperationAccess::Owner(_) if !unread.is_empty() => {
                 self.perf.record_refresh_round(unread.len());
                 let refreshed = self.perf.time(Stage::Refresh, || {
@@ -791,12 +868,7 @@ impl AgentService {
                 Vec::new()
             }
             history::sqlite_cache::OperationAccess::Owner(_) => Vec::new(),
-            history::sqlite_cache::OperationAccess::AsIs => {
-                for target in &unread {
-                    self.hold_outside_title(target, keyed);
-                }
-                unread.iter().map(|target| (*target).clone()).collect()
-            }
+            history::sqlite_cache::OperationAccess::AsIs => unread,
         };
         let mut checked = CheckedTargets::default();
         for key in held.into_keys() {
@@ -807,9 +879,19 @@ impl AgentService {
             )?);
         }
         for target in unchecked {
+            let root = keyed
+                .roots
+                .get(&target.source)
+                .and_then(|roots| roots.iter().find(|root| root.holds(&target.path)));
+            if let Some(root) = root {
+                checked
+                    .held
+                    .roots_read_as_is
+                    .insert(target.path.clone(), root.clone());
+            }
             checked.add(self.check_target_copy(
                 operation,
-                target,
+                target.clone(),
                 history::sqlite_cache::CachedSession::currency,
             )?);
         }
@@ -914,8 +996,7 @@ impl AgentService {
                 address,
                 subagents,
                 publication,
-                custom_title,
-                summary,
+                title_and_summary,
                 unwritten,
             } => {
                 let key = agent::refs::AgentConversationKey {
@@ -924,9 +1005,9 @@ impl AgentService {
                     publication,
                     ..target.clone()
                 };
-                self.target_titles
+                self.target_titles_and_summaries
                     .borrow_mut()
-                    .insert(key.path.clone(), (custom_title, summary));
+                    .insert(key.path.clone(), title_and_summary);
                 if let history::provider::UnwrittenParse::Entries(entries) = unwritten {
                     self.keep_parsed_transcript(&key, entries);
                 }
@@ -939,40 +1020,30 @@ impl AgentService {
         }
     }
 
-    /// Holds the title `target`'s agent keeps outside its transcript, read
-    /// from the target's own root. The command calls it for a target it
-    /// reads as the cache holds it: the copy's title is its last parse's.
-    fn hold_outside_title(&self, target: &agent::refs::AgentConversationKey, keyed: &KeyedReads) {
-        let storage = self
-            .environment
+    /// The title `key`'s agent keeps outside the session's transcript, read
+    /// with every other such title under `root`, the session's root.
+    fn read_external_title(
+        &self,
+        key: &agent::refs::AgentConversationKey,
+        root: &history::provider::SessionRoot,
+    ) -> Option<history::provider::SessionTitle> {
+        self.environment
             .storages()
             .iter()
-            .find(|storage| storage.source() == target.source);
-        let root = keyed
-            .roots
-            .get(&target.source)
-            .and_then(|roots| roots.iter().find(|root| root.holds(&target.path)));
-        let (Some(storage), Some(root)) = (storage, root) else {
-            return;
-        };
-        if let Some(title) = storage.external_titles(root).remove(&target.session_id) {
-            self.target_titles
-                .borrow_mut()
-                .insert(target.path.clone(), title.as_title_and_summary());
-        }
+            .find(|storage| storage.source() == key.source)?
+            .external_titles(root)
+            .remove(&key.session_id)
     }
 
     /// `transcript`, the transcript of `key`'s session, under the title and
-    /// summary the command holds for the session, when it holds them.
+    /// summary the command's read listed for the session, when it listed it.
     fn titled_as_held(
         &self,
         key: &agent::refs::AgentConversationKey,
         transcript: agent::transcript::AgentTranscript,
     ) -> agent::transcript::AgentTranscript {
-        match self.target_titles.borrow().get(&key.path) {
-            Some((custom_title, summary)) => {
-                transcript.titled(custom_title.clone(), summary.clone())
-            }
+        match self.target_titles_and_summaries.borrow().get(&key.path) {
+            Some(shown) => transcript.titled(shown.clone()),
             None => transcript,
         }
     }
@@ -1206,21 +1277,6 @@ impl AgentService {
             .map_err(AppError::from)
     }
 
-    /// Keeps `transcripts` for later reads in this command.
-    fn keep_transcripts(
-        &self,
-        transcripts: Vec<(
-            agent::refs::AgentConversationKey,
-            agent::transcript::AgentTranscript,
-        )>,
-    ) {
-        self.transcripts.borrow_mut().extend(
-            transcripts
-                .into_iter()
-                .map(|(key, transcript)| (key.path, Ok(transcript))),
-        );
-    }
-
     fn search(&self, args: &cli::AgentSearchArgs) -> Result<String> {
         let perf = &self.perf;
         let reads = perf.search_reads();
@@ -1239,11 +1295,6 @@ impl AgentService {
             ..
         } = self.select_sessions(&SelectionRules::new(time, &args.scope, &agent_config))?;
         let (environment, wait) = (&self.environment, perf.load_meter().wait_status());
-        let load_transcript = |key: &agent::refs::AgentConversationKey| {
-            reads.time_read(key, || {
-                read_cached_transcript(environment, wait, key).map_err(AppError::from)
-            })
-        };
         let request = agent::search::AgentSearchRequest {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_SEARCH_TOP, agent_config.top),
@@ -1280,17 +1331,32 @@ impl AgentService {
                 ),
             ));
         };
-        let search_transcripts = |request: &agent::search::AgentSearchRequest,
-                                  retention: TranscriptRetention|
+        let search_transcripts = |request: &agent::search::AgentSearchRequest|
          -> Result<agent::search::LexicalSearchRun> {
-            let ranked = rank()?;
+            let ranking = rank()?;
+            let load_transcript = |index: usize, key: &agent::refs::AgentConversationKey| {
+                reads.time_read(key, || {
+                    match ranking.hit_messages.of(index) {
+                        Some(hits) => read_hit_messages(
+                            environment.clock().as_ref(),
+                            wait,
+                            &ranking,
+                            &conversations[index],
+                            hits,
+                            key,
+                        ),
+                        None => read_cached_transcript(environment, wait, key)
+                            .map(agent::search::SearchedTranscript::from),
+                    }
+                    .map_err(AppError::from)
+                })
+            };
             let run = perf.time(Stage::TranscriptSearch, || {
                 agent::search::run_global_lexical_search_reporting(
                     request,
                     &conversations,
                     &keys,
-                    &ranked,
-                    retention,
+                    &ranking.ranked,
                     load_transcript,
                     Some(reads),
                 )
@@ -1302,7 +1368,7 @@ impl AgentService {
         };
         match mode {
             SearchMode::Lexical | SearchMode::Exact => {
-                let run = search_transcripts(&request, TranscriptRetention::DropAfterSearch)?;
+                let run = search_transcripts(&request)?;
                 let mut output = run.output;
                 apply_configured_render_policy(&mut output, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner());
@@ -1353,19 +1419,15 @@ impl AgentService {
                         })
                     },
                     |pass| match pass {
-                        HybridLexicalPass::ForFusion => search_transcripts(
-                            &agent::search::hybrid_lexical_request(&request),
-                            TranscriptRetention::KeepWithHits,
-                        ),
-                        HybridLexicalPass::Alone => {
-                            search_transcripts(&request, TranscriptRetention::DropAfterSearch)
+                        HybridLexicalPass::ForFusion => {
+                            search_transcripts(&agent::search::hybrid_lexical_request(&request))
                         }
+                        HybridLexicalPass::Alone => search_transcripts(&request),
                     },
                 )?;
                 let mut output = match semantic {
                     Ok((semantic, semantic_warnings)) => {
                         warnings.borrow_mut().extend(semantic_warnings);
-                        self.keep_transcripts(lexical.kept_transcripts);
                         let mut output = agent::search::run_global_hybrid_search(
                             &request,
                             lexical.output,
@@ -1467,9 +1529,15 @@ impl AgentService {
         .map_err(|error| failure_after_warnings(error, &warnings))?;
         let (operation, targets) =
             self.hold_cache_for_reading(operation, &[&resolved.key], &keys, &window, reads)?;
+        let key = targets.of_target(&resolved.key);
         let transcript = perf
             .time(Stage::Transcript, || {
-                self.load_transcript(targets.of_target(&resolved.key))
+                let transcript = self.load_transcript(key)?;
+                Ok(match targets.root_read_as_is(key) {
+                    Some(root) => transcript
+                        .titled_with_external_title(self.read_external_title(key, root).as_ref()),
+                    None => transcript,
+                })
             })
             .map_err(|error| target_error(error, &resolved))?;
         warnings.extend(transcript_warning(
@@ -2418,20 +2486,65 @@ fn attach_input_transcript_metadata(
     output: &mut agent::search::AgentSearchOutput,
     inputs: &[agent::search::AgentConversationInput<'_>],
 ) {
-    let referenced = output
+    let mut focused: HashMap<String, std::collections::BTreeSet<usize>> = HashMap::new();
+    for hit in output
         .hits
         .iter()
         .chain(output.groups.iter().flat_map(|group| group.hits.iter()))
-        .map(|hit| hit.conversation_ref.clone())
-        .collect::<std::collections::HashSet<_>>();
+    {
+        focused
+            .entry(hit.conversation_ref.clone())
+            .or_default()
+            .extend(hit.focus_range.start..=hit.focus_range.end);
+    }
     for input in inputs {
-        if !referenced.contains(input.resolved.reference.canonical().as_str()) {
+        let Some(ordinals) = focused.get(input.resolved.reference.canonical().as_str()) else {
             continue;
-        }
-        if let Ok(transcript) = service.load_transcript(&input.resolved.key) {
+        };
+        let ordinals = ordinals.iter().copied().collect::<Vec<_>>();
+        if let Ok(transcript) = load_messages(service, input, &ordinals) {
             agent::search::attach_transcript_metadata(output, &input.resolved, &transcript);
         }
     }
+}
+
+/// The messages numbered `ordinals` of `input`'s session, read alone from the
+/// copy its row reads, or from the copy another write replaced it with; the
+/// whole transcript for a row without a copy.
+fn load_messages(
+    service: &AgentService,
+    input: &agent::search::AgentConversationInput<'_>,
+    ordinals: &[usize],
+) -> Result<agent::transcript::AgentTranscript> {
+    let key = &input.resolved.key;
+    let Some(copy) = input.conversation.cached_session.clone() else {
+        return service.load_transcript(key);
+    };
+    let copy = copy.ignoring_source_changes();
+    let read = |copy: &history::sqlite_cache::CachedSession| {
+        service.read_when_unlocked(|| copy.agent_messages(&key.path, ordinals))
+    };
+    let not_cached = || AppError::SessionCacheNotReady {
+        session: key.session_id.clone(),
+        reason: "the session is not in the session cache".to_owned(),
+    };
+    service.perf.time_transcript_parse(key, || {
+        let read = match read(&copy)?.ok_or_else(not_cached)? {
+            history::sqlite_cache::CopyRead::Read(read) => read,
+            history::sqlite_cache::CopyRead::Replaced { generation } => {
+                match read(&copy.of_generation(generation))?.ok_or_else(not_cached)? {
+                    history::sqlite_cache::CopyRead::Read(read) => read,
+                    history::sqlite_cache::CopyRead::Replaced { .. } => {
+                        return Err(AppError::SessionCacheNotReady {
+                            session: key.session_id.clone(),
+                            reason: "catalogue generation changed".to_owned(),
+                        });
+                    }
+                }
+            }
+        };
+        Ok(read.transcript)
+    })
 }
 
 /// The lexical pass a hybrid search runs after its semantic half.
@@ -3279,44 +3392,38 @@ fn agent_protocol_options(
 /// whose cached text holds the whole query as one phrase. With `window`
 /// active, each session is ranked on the text of its messages inside the
 /// window.
-fn lexically_rank_scoped(
+pub(crate) fn lexically_rank_scoped(
     conversations: &[history::Conversation],
     query: &str,
     scoped: &[usize],
     mode: SearchMode,
     window: &TimeFilter,
     clock: &dyn Clock,
-) -> Result<Vec<usize>> {
+) -> Result<search::AgentRanking> {
     let texts = search::precompute_agent_search_text(conversations, window);
     let now = clock.wall().with_timezone(&chrono::Local);
-    let ranked_all = search::try_agent_search(conversations, &texts, query, now)?;
     let scoped_set = scoped
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    let ranked = ranked_all
-        .into_iter()
-        .filter(|index| scoped_set.contains(index))
-        .collect::<Vec<_>>();
-    if mode != SearchMode::Exact {
-        return Ok(ranked);
-    }
-    let phrase = search::query::ParsedQuery::parse(&agent::search::exact_phrase_query(query));
-    Ok(ranked
-        .into_par_iter()
-        .map(|index| -> Result<_> {
-            let content = conversations[index].load_content()?;
-            Ok(search::literal::agent_conversation_matches_all_literals(
-                &content,
-                phrase.literals(),
-                window,
-            )
-            .then_some(index))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect())
+    // Exact mode ranks as lexical mode does and also requires the phrase: a
+    // quoted literal is a filter that adds nothing to the score. Its hits
+    // need the phrase alone.
+    let (ranked_query, retrieval) = match mode {
+        SearchMode::Exact => (
+            format!("{query} {}", agent::search::exact_phrase_query(query)),
+            search::RetrievalTerms::Literals,
+        ),
+        _ => (query.to_owned(), search::RetrievalTerms::WordsAndLiterals),
+    };
+    search::try_agent_search(
+        conversations,
+        &texts,
+        &ranked_query,
+        retrieval,
+        now,
+        |index| scoped_set.contains(&index),
+    )
 }
 
 pub(crate) fn resolve_agent_conversation_arg(
@@ -4844,15 +4951,14 @@ mod tests {
 
     /// `agent within` of a session renamed outside its unchanged transcript
     /// after its copy was written shows the name the list shows, whether the
-    /// command keeps the cache or reads it while another rearview keeps it.
+    /// command keeps the cache or reads it while another rearview keeps it,
+    /// for each rename an agent writes.
     #[test]
     fn within_of_session_renamed_outside_its_transcript_shows_new_name() {
+        use history::provider::contract_tests::{EXTERNAL_TITLE_RENAMES, name_session};
         let mut wrong = Vec::new();
-        for source in [
-            history::Source::Codex,
-            history::Source::Kimi,
-            history::Source::Grok,
-        ] {
+        for (source, first, second) in EXTERNAL_TITLE_RENAMES {
+            let case = format!("{source:?} {first:?} then {second:?}");
             let fixture = history::provider::contract_tests::registered_fixtures()
                 .into_iter()
                 .find(|fixture| fixture.provider().source() == source)
@@ -4861,18 +4967,7 @@ mod tests {
             fixture.write_every_record_session(home.path(), &fixture.every_record_session());
             let [stub] = <[_; 1]>::try_from(fixture.discover_under(home.path())).unwrap();
             let locator = stub.locator;
-            let rename = |title: &str| {
-                fixture
-                    .renamer()
-                    .rename_session(
-                        crate::history::FOR_FIXTURES,
-                        &locator,
-                        title,
-                        chrono::Utc::now(),
-                    )
-                    .unwrap();
-            };
-            rename("Zebrafish plans");
+            name_session(source, &locator, "Zebrafish plans", first);
             let storage =
                 history::provider::contract_tests::kept_storage_under(fixture, home.path());
             let cache = crate::tui::claude_home::admitted_cache();
@@ -4887,7 +4982,7 @@ mod tests {
                 .find_map(|atom| atom.strip_prefix("ref="))
                 .expect("agent sessions lists the session")
                 .to_owned();
-            rename("Yakety release");
+            name_session(source, &locator, "Yakety release", second);
 
             let within = ["within", &reference, "the"];
             let kept = run(&within);
@@ -4909,7 +5004,7 @@ mod tests {
             ] {
                 if !output.contains("Yakety release") || output.contains("Zebrafish") {
                     wrong.push(format!(
-                        "{source:?}, {access}: the hits show the new name:\n{output}"
+                        "{case}, {access}: the hits show the new name:\n{output}"
                     ));
                 }
             }
@@ -5986,8 +6081,7 @@ mod tests {
                     publication: Publication::Published {
                         generation: published,
                     },
-                    custom_title: None,
-                    summary: None,
+                    title_and_summary: history::provider::TitleAndSummary::default(),
                     unwritten: history::provider::UnwrittenParse::Nothing,
                 },
             );
@@ -6557,6 +6651,7 @@ mod tests {
                 &clock,
             )
             .unwrap()
+            .ranked
         };
         let exact = rank(SearchMode::Exact);
         let lexical = rank(SearchMode::Lexical);
@@ -6579,7 +6674,9 @@ mod tests {
         let window_on_october_10 = search::test_fixtures::window_on_october_10();
         let clock = TestClock::default();
         let rank = |mode, window: &TimeFilter| {
-            lexically_rank_scoped(&conversations, "flaky test", &[0], mode, window, &clock).unwrap()
+            lexically_rank_scoped(&conversations, "flaky test", &[0], mode, window, &clock)
+                .unwrap()
+                .ranked
         };
 
         assert_eq!(rank(SearchMode::Exact, &TimeFilter::default()), [0]);
@@ -6654,7 +6751,8 @@ mod tests {
             };
             let ranked =
                 lexically_rank_scoped(&conversations, query, &[0], mode, &request.window, &clock)
-                    .unwrap();
+                    .unwrap()
+                    .ranked;
             let output = agent::search::run_global_lexical_search(
                 &request,
                 &conversations,

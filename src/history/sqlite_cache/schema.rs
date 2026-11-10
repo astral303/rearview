@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 25;
+pub(super) const SCHEMA_VERSION: u32 = 26;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Tables an earlier version held, dropped before [`TABLES`] when the schema
@@ -358,7 +358,9 @@ CREATE TABLE IF NOT EXISTS parts (
     result_shape TEXT,
     UNIQUE (entry, part)
 );
-CREATE INDEX IF NOT EXISTS parts_by_session ON parts (session);
+-- One session's parts, and a windowed scan's parts of one message, are read
+-- through this index.
+CREATE INDEX IF NOT EXISTS parts_by_message ON parts (session, message_ordinal);
 -- A write of a session's parts outside every entry matches them by `part`.
 CREATE UNIQUE INDEX IF NOT EXISTS parts_outside_entries ON parts (session, part)
     WHERE entry IS NULL;
