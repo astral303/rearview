@@ -6,7 +6,7 @@
 
 use crate::history::{DisplayEntries, EntryOrigin};
 use crate::log_entry::LogEntry;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -130,6 +130,8 @@ pub struct RenderOptions {
     /// False under `--render`: task reports and sub-agent replies render
     /// whole. Tool results ignore it.
     pub can_expand: bool,
+    /// The local date the day labels name relative to.
+    pub today: NaiveDate,
 }
 
 /// Tracks the line range of a single message (User or Assistant entry) in the rendered output
@@ -376,7 +378,7 @@ fn render_entries(
         .is_summary()
         .then(|| session_agent(entries))
         .flatten();
-    let mut day_labels = DayLabels::new(options.show_timing);
+    let mut day_labels = DayLabels::new(options.show_timing, options.today);
     for (parsed_idx, parsed) in entries.iter().enumerate() {
         if let Some(day) = day_labels.new_day_at(&parsed.entry) {
             // A run ends at midnight: the label sits between its rows and the

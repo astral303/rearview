@@ -3,6 +3,7 @@
 //! [`App::apply_session_changes`].
 
 use super::{App, AppMode, DialogMode, RefreshState};
+use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::provider::{SessionRead, apply_external_title, reread_sessions};
 use crate::history::{
@@ -79,6 +80,7 @@ impl ListEdit {
 pub(super) fn read_listed_sessions(
     rows: &[&Conversation],
     show_last: bool,
+    clock: &dyn Clock,
 ) -> Vec<Option<SessionRead>> {
     let mut by_source: Vec<(crate::history::Source, Vec<usize>)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
@@ -95,7 +97,7 @@ pub(super) fn read_listed_sessions(
         let locators: Vec<&Path> = indices.iter().map(|&i| rows[i].path.as_path()).collect();
         for (&index, mut read) in indices
             .iter()
-            .zip(reread_sessions(source, &locators, show_last))
+            .zip(reread_sessions(source, &locators, show_last, clock))
         {
             if let Some(SessionRead::Listed(session)) = &mut read {
                 let row = rows[index];

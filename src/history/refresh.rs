@@ -9,11 +9,13 @@ use super::provider::{
 };
 use super::{Conversation, FilterTerm, Source};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -93,10 +95,11 @@ pub struct UpdatedSession {
 pub fn refresh_in_background(
     known: KnownSessions,
     options: RefreshOptions,
+    clock: Arc<dyn Clock>,
 ) -> Receiver<Result<SessionChanges>> {
     let (outcome, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = outcome.send(refresh_sessions(&known, options));
+        let _ = outcome.send(refresh_sessions(&known, options, clock.as_ref()));
     });
     receiver
 }
@@ -109,6 +112,7 @@ pub fn refresh_in_background(
 pub(crate) fn refresh_sessions(
     known: &KnownSessions,
     options: RefreshOptions,
+    clock: &dyn Clock,
 ) -> Result<SessionChanges> {
     let sources = provider::providers()
         .iter()
@@ -120,6 +124,7 @@ pub(crate) fn refresh_sessions(
             options.show_last,
             options.debug_level,
             needs_reading,
+            clock,
         )
     })
 }

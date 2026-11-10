@@ -9,7 +9,7 @@ use crate::agent::refs::ResolvedConversation;
 use crate::agent::time_span::{output_offset, time_atoms, tz_atom};
 use crate::history::{Conversation, MessagesInWindow};
 use crate::time_filter::TimeFilter;
-use chrono::FixedOffset;
+use chrono::{DateTime, FixedOffset, Utc};
 use std::cmp::Reverse;
 
 const AGENT_SESSIONS_TITLE_CHARS: usize = 120;
@@ -87,16 +87,18 @@ pub fn list_sessions<'a>(
 
 #[cfg(test)]
 pub fn format_sessions(listing: &SessionListing, budget: Option<usize>) -> String {
-    format_sessions_with_warnings(listing, budget, &[])
+    format_sessions_with_warnings(listing, budget, &[], crate::clock::TestClock::start_wall())
 }
 
 /// The `agent-sessions` records: as many `session` records as fit in
 /// `budget` beside every warning record, a `continue sessions` record naming
 /// the offset of the next page, then the warning records, whole.
+/// `written_at` sets the `tz=` offset of a listing that does not show a time.
 pub fn format_sessions_with_warnings(
     listing: &SessionListing,
     budget: Option<usize>,
     warnings: &[AgentWarning],
+    written_at: DateTime<Utc>,
 ) -> String {
     let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = warning_atoms(warning_count, &warning_records);
@@ -105,6 +107,7 @@ pub fn format_sessions_with_warnings(
             .sessions
             .iter()
             .find_map(|session| session.in_window.times),
+        written_at,
     );
     let records = listing
         .sessions
@@ -184,9 +187,10 @@ mod tests {
     use super::*;
     use crate::agent::test_support::resolved_conversation;
     use crate::agent::time_span::TimeSpan;
+    use crate::clock::TestClock;
     use crate::history::MessageTimes;
     use crate::semantic::test_fixtures::SemanticConversationFixture;
-    use chrono::{Local, TimeZone};
+    use chrono::{Local, Offset, TimeZone};
 
     /// An hour and a minute on 2026-10-14, local time.
     type Minute = (u32, u32);
@@ -265,7 +269,41 @@ mod tests {
 
     /// ` tz=` the offset of the times of `listing`'s first session.
     fn tz_of(listing: &SessionListing) -> String {
-        tz_atom(output_offset(listing.sessions[0].in_window.times))
+        tz_atom(output_offset(
+            listing.sessions[0].in_window.times,
+            TestClock::start_wall(),
+        ))
+    }
+
+    /// The records of `listing` beside `warnings`, written at the test
+    /// clock's time.
+    fn records_with_warnings(
+        listing: &SessionListing,
+        budget: Option<usize>,
+        warnings: &[AgentWarning],
+    ) -> String {
+        format_sessions_with_warnings(listing, budget, warnings, TestClock::start_wall())
+    }
+
+    /// January and July: in a zone with daylight saving time, one of them is
+    /// in it.
+    #[test]
+    fn an_empty_listing_names_the_local_offset_at_the_time_it_is_written() {
+        let listing = listing(&[], &TimeFilter::default(), 0, 10);
+
+        for utc in ["2026-01-14T15:00:00Z", "2026-07-14T15:00:00Z"] {
+            let written_at = DateTime::parse_from_rfc3339(utc).unwrap().to_utc();
+            let local_offset = written_at.with_timezone(&Local).offset().fix();
+
+            let output = format_sessions_with_warnings(&listing, None, &[], written_at);
+
+            assert!(
+                output.starts_with(&format!(
+                    "protocol agent-sessions cut=none chars=none tz={local_offset}\n"
+                )),
+                "{output}"
+            );
+        }
     }
 
     /// The smallest budget that holds a `cut=tail` header naming it and the
@@ -398,12 +436,12 @@ mod tests {
     fn budget_short_of_every_record_omits_session_and_keeps_warning_whole() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
         let warnings = [AgentWarning::ignored("an ignored term".to_string())];
-        let unbudgeted = format_sessions_with_warnings(&listing, None, &warnings);
+        let unbudgeted = records_with_warnings(&listing, None, &warnings);
         let warning_record = format!("{}\n", unbudgeted.lines().last().unwrap());
-        let roomy = format_sessions_with_warnings(&listing, Some(100_000), &warnings);
+        let roomy = records_with_warnings(&listing, Some(100_000), &warnings);
         let budget = roomy.chars().count() - 30;
 
-        let output = format_sessions_with_warnings(&listing, Some(budget), &warnings);
+        let output = records_with_warnings(&listing, Some(budget), &warnings);
 
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
@@ -426,7 +464,7 @@ mod tests {
     fn budget_too_small_for_any_session_keeps_warning_whole() {
         let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
         let warnings = [AgentWarning::ignored("an ignored term".to_string())];
-        let unbudgeted = format_sessions_with_warnings(&listing, None, &warnings);
+        let unbudgeted = records_with_warnings(&listing, None, &warnings);
         let warning_record = format!("{}\n", unbudgeted.lines().last().unwrap());
         let body = [
             " warnings=1 warning-records=1",
@@ -437,7 +475,7 @@ mod tests {
         .concat();
         let budget = budget_with_header(body.chars().count(), &tz_of(&listing));
 
-        let output = format_sessions_with_warnings(&listing, Some(budget), &warnings);
+        let output = records_with_warnings(&listing, Some(budget), &warnings);
 
         assert!(output.chars().count() <= budget, "{output}");
         assert!(output.contains("listed=0\n"), "{output}");

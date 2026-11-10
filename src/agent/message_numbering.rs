@@ -178,7 +178,7 @@ mod tests {
     use crate::agent::test_support::assert_row_numbers_messages_as_transcript;
     use crate::agent::transcript::{AgentTranscript, agent_part_text};
     use crate::history::format::RecordLine;
-    use crate::history::parser::conversation_from_entries;
+    use crate::history::parser::{RowDating, conversation_from_entries};
     use crate::history::{Conversation, Source};
     use crate::log_entry::LogEntry;
     use serde_json::{Value, json};
@@ -225,7 +225,7 @@ mod tests {
             &entries,
             &[],
             Vec::new(),
-            None,
+            RowDating::new(None, &crate::clock::TestClock::default()),
             None,
         )
         .expect("a session holding a prompt is listed")

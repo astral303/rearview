@@ -1,3 +1,4 @@
+use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::Conversation;
 use crate::search::literal::{build_literal_corpus, exact_fallback};
@@ -5,8 +6,15 @@ use crate::search::query::ParsedQuery;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
 use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 use crate::time_filter::TimeFilter;
+use std::sync::Arc;
 
-pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool) -> Result<()> {
+pub fn run(
+    query: &str,
+    conversations: &[Conversation],
+    top: usize,
+    local: bool,
+    clock: Arc<dyn Clock>,
+) -> Result<()> {
     use crate::semantic::cache::write_embedding_cache;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::index::{SemanticIndexRequest, SemanticIndexState};
@@ -45,7 +53,7 @@ pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool)
         chunk_hits: ChunkHits::None,
         window: TimeFilter::default(),
     };
-    let mut state = SemanticIndexState::new();
+    let mut state = SemanticIndexState::new(clock.clone());
     let cancellation = SemanticCancellationToken::new();
     if !state.has_chunks(&request, &cancellation)? {
         state.clear_empty(&request, &cancellation)?;
@@ -55,7 +63,9 @@ pub fn run(query: &str, conversations: &[Conversation], top: usize, local: bool)
 
     let mut embedder = FastembedEmbedder::new()?;
     let (refresh, response) =
-        refresh_and_rank_interactive(&request, &mut state, &mut embedder, write_embedding_cache)?;
+        refresh_and_rank_interactive(&request, &mut state, &mut embedder, |cache| {
+            write_embedding_cache(cache, clock.as_ref())
+        })?;
 
     eprintln!(
         "Semantic search: searching {} cached chunk(s) from {} recent conversation(s) with fastembed {MODEL_NAME}",
@@ -103,7 +113,11 @@ fn megabytes(bytes: u64) -> u64 {
     (bytes + BYTES_PER_MEGABYTE / 2) / BYTES_PER_MEGABYTE
 }
 
-pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()> {
+pub fn generate_cache(
+    conversations: &[Conversation],
+    local: bool,
+    clock: Arc<dyn Clock>,
+) -> Result<()> {
     use crate::semantic::cache::{MAX_CACHE_ENTRIES, embedding_cache_key, write_embedding_cache};
     use crate::semantic::chunk::build_chunks_with_sources;
     use crate::semantic::fastembed::FastembedEmbedder;
@@ -152,7 +166,7 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
         chunk_hits: ChunkHits::None,
         window: TimeFilter::default(),
     };
-    let mut state = SemanticIndexState::new();
+    let mut state = SemanticIndexState::new(clock.clone());
     for (key, entry) in &mut state.cache.entries {
         entry.protected &= core_keys.contains(key);
     }
@@ -174,14 +188,14 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
                 eprintln!("Semantic cache: embedded {completed}/{total} changed chunk(s)");
             }
         },
-        write_embedding_cache,
+        |cache| write_embedding_cache(cache, clock.as_ref()),
     )?;
     for key in &core_keys {
         if let Some(entry) = state.cache.entries.get_mut(key) {
             entry.protected = true;
         }
     }
-    write_embedding_cache(&state.cache);
+    write_embedding_cache(&state.cache, clock.as_ref());
 
     eprintln!(
         "Semantic cache: cached {} chunk(s) from {} recent conversation(s).",
@@ -192,7 +206,12 @@ pub fn generate_cache(conversations: &[Conversation], local: bool) -> Result<()>
     Ok(())
 }
 
-pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) -> Result<()> {
+pub fn debug_search(
+    query: &str,
+    conversations: &[Conversation],
+    local: bool,
+    clock: &dyn Clock,
+) -> Result<()> {
     use crate::semantic::cache::{
         cache_contains_text, cache_miss_count, cached_chunks, embedding_cache_file_path,
         read_embedding_cache,
@@ -312,7 +331,7 @@ pub fn debug_search(query: &str, conversations: &[Conversation], local: bool) ->
         return Ok(());
     }
 
-    let cache = read_embedding_cache(chunk_config);
+    let cache = read_embedding_cache(chunk_config, clock);
     let missing = cache_miss_count(&chunks, &cache);
     let cached_count = chunks.len().saturating_sub(missing);
     eprintln!(
@@ -575,8 +594,11 @@ mod tests {
         let selected = vec![&conversations[0]];
         let candidates = semantic_index_candidates(&selected);
         let cache = crate::semantic::cache::empty_embedding_cache(ChunkConfig::default());
-        let state =
-            crate::semantic::index::SemanticIndexState::with_cache(ChunkConfig::default(), cache);
+        let state = crate::semantic::index::SemanticIndexState::with_cache(
+            ChunkConfig::default(),
+            cache,
+            Arc::new(crate::clock::TestClock::default()),
+        );
         let mut embedder = FakeEmbedder::new(query_embedding);
         embedder.query_error = query_error;
 
@@ -751,7 +773,14 @@ mod tests {
 
     #[test]
     fn empty_corpus_returns_before_model_initialization() {
-        run("cache", &[], 1, false).expect("empty corpus returns");
+        run(
+            "cache",
+            &[],
+            1,
+            false,
+            Arc::new(crate::clock::TestClock::default()),
+        )
+        .expect("empty corpus returns");
     }
 
     #[test]

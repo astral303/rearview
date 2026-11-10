@@ -1,4 +1,4 @@
-use crate::history::LoadProgress;
+use crate::history::{LoadProgress, Workspace};
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
@@ -132,7 +132,7 @@ pub struct ViewState {
 /// the total in the bottom bar's line count shows in the session ID color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CountHighlight {
-    pub until: std::time::Instant,
+    pub until: crate::clock::Moment,
     /// Messages the refresh added below a reader at the bottom. While the view
     /// stays at the bottom, a `↓ N new` badge covers the start of the last
     /// content row.
@@ -153,6 +153,18 @@ pub enum ViewSearchMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TuiSearchOptions {
     pub default_mode: ListSearchMode,
+}
+
+/// The sessions a list starts out showing.
+#[derive(Default)]
+pub struct ListScope {
+    /// True when the list starts filtered to `workspace` (`--local`).
+    pub workspace_filter: bool,
+    /// The workspace the filter narrows to; `None` when the current
+    /// directory could not be read.
+    pub workspace: Option<Workspace>,
+    /// Projects whose sessions the list leaves out.
+    pub exclude_projects: Vec<String>,
 }
 
 impl Default for TuiSearchOptions {

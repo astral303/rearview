@@ -2,6 +2,7 @@
 
 use super::{RootEnvironment, SessionRoot};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::cache::CachedFingerprint;
 use crate::history::{Conversation, FilterTerm, Source};
@@ -206,12 +207,15 @@ pub trait SessionStorage: Sync {
     /// `on_transcript_read` is called once for each transcript read, the
     /// session's own and each sub-agent's, so a load can report progress
     /// inside a session with many sub-agents.
+    ///
+    /// A row without any time is dated `clock`'s current time.
     fn parse_session(
         &self,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>>;
 
     /// Titles stored beside the transcripts rather than in them, by session id.
@@ -269,9 +273,10 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         self.inner
-            .parse_session(stub, root, debug_level, on_transcript_read)
+            .parse_session(stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -309,8 +314,9 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
-        (**self).parse_session(stub, root, debug_level, on_transcript_read)
+        (**self).parse_session(stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {

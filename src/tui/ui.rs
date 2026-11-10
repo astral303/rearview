@@ -1,3 +1,4 @@
+use crate::clock::Moment;
 use crate::config::KeyBindings;
 use crate::history::{Conversation, LoadProgress};
 use crate::search::LexicalEvidence;
@@ -18,7 +19,7 @@ use crate::tui::viewer::{
     LineStyle, ParsedConversation, RenderedLine, day_at_line, format_coarse_duration,
     session_dates, short_date,
 };
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use ratatui::layout::Position;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph};
@@ -173,8 +174,8 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         render_list_status_bar(frame, app, chunks[2]);
     } else if *app.dialog_mode() == DialogMode::ConfirmDelete {
         render_confirm_dialog(frame, chunks[2]);
-    } else if let Some((msg, instant)) = app.status_message()
-        && instant.elapsed() < STATUS_TTL
+    } else if let Some((msg, shown)) = app.status_message()
+        && app.clock().elapsed_since(*shown) < STATUS_TTL
     {
         render_status_message(frame, msg, chunks[2]);
     } else {
@@ -479,9 +480,10 @@ fn render_semantic_debug_popup(frame: &mut Frame, app: &App) {
 }
 
 /// The header's dates: the session's range, `Sep 26 – Oct 03`, or the last
-/// message's day and time within one day. Taken from the open view's messages
-/// once parsed, otherwise from the row's last timestamp and duration.
-fn header_dates(conv: &Conversation, state: &ViewState) -> String {
+/// message's day and time within one day, each with the year when it
+/// differs from `today`'s. Taken from the open view's messages once parsed,
+/// otherwise from the row's last timestamp and duration.
+fn header_dates(conv: &Conversation, state: &ViewState, today: NaiveDate) -> String {
     let span = state
         .parsed_conversation
         .as_deref()
@@ -492,7 +494,7 @@ fn header_dates(conv: &Conversation, state: &ViewState) -> String {
             let first = conv.timestamp - chrono::Duration::minutes(minutes as i64);
             (first, conv.timestamp)
         });
-    session_dates(&span.0, &span.1, Local::now().date_naive())
+    session_dates(&span.0, &span.1, today)
 }
 
 /// Check if the header (with summary) fits on a single line given terminal width
@@ -577,8 +579,9 @@ pub fn view_layout_rects(area: Rect, app: &App, state: &ViewState) -> ViewLayout
         .iter()
         .find(|c| c.path == state.conversation_path);
     let has_summary = conv.is_some_and(|c| c.summary.is_some());
-    let fits_single_line =
-        conv.is_some_and(|c| header_fits_single_line(c, &header_dates(c, state), area.width));
+    let fits_single_line = conv.is_some_and(|c| {
+        header_fits_single_line(c, &header_dates(c, state, app.today()), area.width)
+    });
     let header_height = if has_summary && !fits_single_line {
         3
     } else {
@@ -605,7 +608,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
     let layout = view_layout_rects(frame.area(), app, state);
 
     render_view_header(frame, app, state, layout.header);
-    render_view_content(frame, state, layout.content);
+    render_view_content(frame, state, layout.content, app.clock().now());
 
     if state.search_mode == ViewSearchMode::Typing {
         render_search_input(frame, state, layout.status);
@@ -674,7 +677,7 @@ fn render_view_header(frame: &mut Frame, app: &App, state: &ViewState, area: Rec
             .unwrap_or(0); // + " · "
         let model_len = model.as_ref().map(|m| m.len() + 3).unwrap_or(0); // + " · "
         let duration_len = duration.as_ref().map(|d| d.len() + 3).unwrap_or(0); // + " · "
-        let timestamp = header_dates(conv, state);
+        let timestamp = header_dates(conv, state, app.today());
         let base_len = 2
             + project.len()
             + 3
@@ -872,7 +875,8 @@ fn gutter_span(mark: GutterMark) -> Span<'static> {
     Span::styled(glyph, Style::default().fg(rgb(color)))
 }
 
-fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
+/// The open session's rows, drawn at `now` on the list's clock.
+fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect, now: Moment) {
     let visible_height = area.height as usize;
     let visible_rows = state.scroll_offset..state.scroll_offset + visible_height;
     let highlights = match_highlights(state, visible_rows);
@@ -927,7 +931,7 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect) {
     let content = Paragraph::new(visible_lines);
     frame.render_widget(content, area);
 
-    if let Some(badge) = new_messages_badge(state, visible_height, std::time::Instant::now())
+    if let Some(badge) = new_messages_badge(state, visible_height, now)
         && area.height > 0
     {
         let badge_area = Rect {
@@ -963,12 +967,18 @@ impl std::fmt::Display for ScrollPosition {
     }
 }
 
-fn scroll_position(state: &ViewState) -> ScrollPosition {
+/// The scroll position of `state`, a top row's day dated relative to
+/// `today`.
+fn scroll_position(state: &ViewState, today: NaiveDate) -> ScrollPosition {
     let total = state.total_lines.max(1).to_string();
     let width = total.len().max(4);
     let top = state.scroll_offset + 1;
     let padding = " ".repeat(width - total.len());
-    let after_total = match state.show_timing.then(|| top_row_day(state)).flatten() {
+    let after_total = match state
+        .show_timing
+        .then(|| top_row_day(state, today))
+        .flatten()
+    {
         Some(day) => format!(" {day}]{padding}"),
         None => format!("{padding}]"),
     };
@@ -981,11 +991,7 @@ fn scroll_position(state: &ViewState) -> ScrollPosition {
 
 /// `  ↓ N new  `, the messages a refresh added below a reader at the bottom,
 /// while the refresh's highlight lasts and the view is still at the bottom.
-fn new_messages_badge(
-    state: &ViewState,
-    viewport_height: usize,
-    now: std::time::Instant,
-) -> Option<String> {
+fn new_messages_badge(state: &ViewState, viewport_height: usize, now: Moment) -> Option<String> {
     let highlight = state
         .count_highlight
         .filter(|highlight| now < highlight.until)?;
@@ -995,11 +1001,12 @@ fn new_messages_badge(
         .then(|| format!("  ↓ {count} new  "))
 }
 
-/// The day of the row at the top of the view, `Oct 03`.
-fn top_row_day(state: &ViewState) -> Option<String> {
+/// The day of the row at the top of the view, `Oct 03`, with the year when
+/// it differs from `today`'s.
+fn top_row_day(state: &ViewState, today: NaiveDate) -> Option<String> {
     let conversation = state.parsed_conversation.as_deref()?;
     let day = day_at_line(conversation, &state.message_ranges, state.scroll_offset)?;
-    Some(short_date(day, Local::now().date_naive()))
+    Some(short_date(day, today))
 }
 
 fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
@@ -1009,8 +1016,8 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
     }
 
     // Check for status message first
-    if let Some((msg, instant)) = app.status_message()
-        && instant.elapsed() < STATUS_TTL
+    if let Some((msg, shown)) = app.status_message()
+        && app.clock().elapsed_since(*shown) < STATUS_TTL
     {
         let status_line = Line::from(vec![
             Span::raw("  "),
@@ -1022,11 +1029,11 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
         return;
     }
 
-    let scroll_pos = scroll_position(state);
+    let scroll_pos = scroll_position(state, app.today());
     let scroll_pos_style = Style::default().fg(rgb(th().text_secondary));
     let total_style = if state
         .count_highlight
-        .is_some_and(|highlight| std::time::Instant::now() < highlight.until)
+        .is_some_and(|highlight| app.clock().now() < highlight.until)
     {
         Style::default().fg(rgb(th().session_id))
     } else {
@@ -1837,7 +1844,7 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
         source_label_column: app
             .has_multiple_sources()
             .then(crate::history::provider::list_label_column_width),
-        now: Local::now(),
+        now: app.clock().wall().with_timezone(&Local),
     };
 
     let lines_per_item = list_lines_per_item(app.list_search_mode(), app.shown_results_query());
@@ -2343,6 +2350,7 @@ fn highlight_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::{Clock, TestClock};
     use crate::history::{Conversation, Source};
     use crate::search::query::ParsedQuery;
     use crate::semantic::types::{
@@ -2351,7 +2359,7 @@ mod tests {
     };
     use crate::tui::actions_menu::MenuAvailability;
     use crate::tui::app::{
-        CountHighlight, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
+        CountHighlight, ListScope, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
     };
     use crate::tui::semantic_worker::{SemanticSearchMessage, SemanticSearchResponse};
     use crate::tui::viewer::ToolDisplayMode;
@@ -2360,7 +2368,7 @@ mod tests {
     use ratatui::backend::{Backend, TestBackend};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
 
     #[test]
     fn loading_status_names_source_being_loaded_and_sessions_so_far() {
@@ -2451,6 +2459,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            Arc::new(TestClock::default()),
         );
         app.check_view_resize(80, 17);
         app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), 17);
@@ -2462,8 +2471,9 @@ mod tests {
 
         let backend = TestBackend::new(80, 17);
         let mut terminal = Terminal::new(backend).unwrap();
+        let now = app.clock().now();
         terminal
-            .draw(|frame| render_view_content(frame, state, frame.area()))
+            .draw(|frame| render_view_content(frame, state, frame.area(), now))
             .unwrap();
 
         let run = &state.message_ranges[0];
@@ -2496,10 +2506,10 @@ mod tests {
         }
     }
 
-    /// A timestamp in the current year, so its date carries no year.
+    /// A timestamp in the test clock's year, so its date carries no year.
     fn this_year(rest: &str) -> String {
         use chrono::Datelike;
-        format!("{}-{rest}", Local::now().year())
+        format!("{}-{rest}", TestClock::start_wall().year())
     }
 
     fn local_day(timestamp: &str) -> chrono::NaiveDate {
@@ -2531,6 +2541,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            Arc::new(TestClock::default()),
         );
         app.check_view_resize(80, 6);
         app
@@ -2549,14 +2560,17 @@ mod tests {
         let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
         let app = session_view(&dir, &asked, &answered);
 
-        let today = Local::now().date_naive();
+        let today = app.today();
         let expected = format!(
             "{} – {}",
             short_date(local_day(&asked), today),
             short_date(local_day(&answered), today)
         );
         let conversation = &app.conversations()[0];
-        assert_eq!(header_dates(conversation, view_state(&app)), expected);
+        assert_eq!(
+            header_dates(conversation, view_state(&app), today),
+            expected
+        );
     }
 
     #[test]
@@ -2570,11 +2584,14 @@ mod tests {
             .with_timezone(&Local);
         let expected = format!(
             "{} {}",
-            short_date(last.date_naive(), Local::now().date_naive()),
+            short_date(last.date_naive(), app.today()),
             last.format("%H:%M")
         );
         let conversation = &app.conversations()[0];
-        assert_eq!(header_dates(conversation, view_state(&app)), expected);
+        assert_eq!(
+            header_dates(conversation, view_state(&app), app.today()),
+            expected
+        );
     }
 
     #[test]
@@ -2584,19 +2601,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
         let mut app = session_view(&dir, &asked, &answered);
-        let today = Local::now().date_naive();
+        let today = app.today();
         let first_day = short_date(local_day(&asked), today);
         let last_day = short_date(local_day(&answered), today);
 
-        let untimed = scroll_position(view_state(&app)).to_string();
+        let untimed = scroll_position(view_state(&app), today).to_string();
         assert!(!untimed.contains(&first_day), "{untimed}");
 
         app.handle_key(KeyCode::Char('i'), KeyModifiers::empty(), 4);
-        let top = scroll_position(view_state(&app)).to_string();
+        let top = scroll_position(view_state(&app), today).to_string();
         assert!(top.contains(&format!(" {first_day}]")), "{top}");
 
         app.handle_key(KeyCode::Char('G'), KeyModifiers::empty(), 4);
-        let bottom = scroll_position(view_state(&app)).to_string();
+        let bottom = scroll_position(view_state(&app), today).to_string();
         assert!(bottom.contains(&format!(" {last_day}]")), "{bottom}");
     }
 
@@ -2618,6 +2635,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            Arc::new(TestClock::default()),
         );
         app.check_view_resize(80, 17);
         for key in "/cache rebuild"
@@ -2641,8 +2659,9 @@ mod tests {
         };
 
         let mut terminal = Terminal::new(TestBackend::new(frame_width as u16, 17)).unwrap();
+        let now = app.clock().now();
         terminal
-            .draw(|frame| render_view_content(frame, state, frame.area()))
+            .draw(|frame| render_view_content(frame, state, frame.area(), now))
             .unwrap();
 
         let found = &state.search_matches[0];
@@ -2783,6 +2802,10 @@ mod tests {
     }
 
     fn semantic_app() -> App {
+        semantic_app_on(Arc::new(TestClock::default()))
+    }
+
+    fn semantic_app_on(clock: Arc<TestClock>) -> App {
         App::new_with_options(
             vec![test_conversation()],
             ToolDisplayMode::Truncated,
@@ -2792,11 +2815,20 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
+            clock,
         )
     }
 
     fn semantic_searching_app(query: &str, progress: SemanticProgress) -> App {
-        let mut app = semantic_app();
+        semantic_searching_app_on(query, progress, Arc::new(TestClock::default()))
+    }
+
+    fn semantic_searching_app_on(
+        query: &str,
+        progress: SemanticProgress,
+        clock: Arc<TestClock>,
+    ) -> App {
+        let mut app = semantic_app_on(clock);
         let (response_tx, response_rx) = mpsc::channel();
         app.set_query_for_test(query);
         app.set_semantic_receiver_for_test(7, response_rx);
@@ -3016,6 +3048,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            Arc::new(TestClock::default()),
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
 
@@ -3065,6 +3098,7 @@ mod tests {
             false,
             KeyBindings::default(),
             vec![],
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test("lexical query");
         let width = 80;
@@ -3092,6 +3126,7 @@ mod tests {
             false,
             KeyBindings::default(),
             vec![],
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test(query);
         app.update_filter_for_test();
@@ -3106,35 +3141,22 @@ mod tests {
         terminal
     }
 
-    /// A start ten seconds back is past the spinner delay however slowly the
-    /// test runs, so the test does not depend on the wall clock.
-    fn search_started_long_ago(app: &mut App) {
-        app.set_search_started_at_for_test(
-            std::time::Instant::now() - std::time::Duration::from_secs(10),
-        );
-    }
-
-    /// A start an hour ahead reads as zero elapsed, so the delay has not
-    /// passed however slowly the test runs.
-    fn search_started_within_the_delay(app: &mut App) {
-        app.set_search_started_at_for_test(
-            std::time::Instant::now() + std::time::Duration::from_secs(3600),
-        );
-    }
-
-    fn search_started_ago(app: &mut App, elapsed: std::time::Duration) {
-        app.set_search_started_at_for_test(std::time::Instant::now() - elapsed);
+    /// The search in flight has run for `elapsed` of `clock`'s time.
+    fn search_running_for(app: &mut App, clock: &TestClock, elapsed: std::time::Duration) {
+        app.set_search_started_at_for_test(clock.now());
+        clock.advance(elapsed);
     }
 
     /// The query is typed but not yet filtered, so the rows and the count on
     /// screen are the previous query's.
-    fn lexical_app_mid_search(query: &str) -> App {
+    fn lexical_app_mid_search(query: &str, clock: Arc<TestClock>) -> App {
         let mut app = App::new(
             vec![test_conversation()],
             ToolDisplayMode::Truncated,
             false,
             KeyBindings::default(),
             vec![],
+            clock,
         );
         app.set_query_for_test(query);
         app
@@ -3142,8 +3164,9 @@ mod tests {
 
     #[test]
     fn search_still_running_after_spinner_delay_replaces_count_with_searching() {
-        let mut app = lexical_app_mid_search("m100");
-        search_started_long_ago(&mut app);
+        let clock = Arc::new(TestClock::default());
+        let mut app = lexical_app_mid_search("m100", clock.clone());
+        search_running_for(&mut app, &clock, std::time::Duration::from_secs(10));
 
         let line = row_text(&draw_search_bar(&app), 0);
         assert!(line.contains("searching"), "{line:?}");
@@ -3152,8 +3175,9 @@ mod tests {
 
     #[test]
     fn search_running_past_second_counts_whole_seconds_beside_searching() {
-        let mut app = lexical_app_mid_search("m100");
-        search_started_ago(&mut app, std::time::Duration::from_millis(2500));
+        let clock = Arc::new(TestClock::default());
+        let mut app = lexical_app_mid_search("m100", clock.clone());
+        search_running_for(&mut app, &clock, std::time::Duration::from_millis(2500));
 
         let line = row_text(&draw_search_bar(&app), 0);
         assert!(line.contains("searching 2s"), "{line:?}");
@@ -3161,8 +3185,9 @@ mod tests {
 
     #[test]
     fn search_running_under_second_shows_no_seconds_beside_searching() {
-        let mut app = lexical_app_mid_search("m100");
-        search_started_ago(&mut app, std::time::Duration::from_millis(500));
+        let clock = Arc::new(TestClock::default());
+        let mut app = lexical_app_mid_search("m100", clock.clone());
+        search_running_for(&mut app, &clock, std::time::Duration::from_millis(500));
 
         let line = row_text(&draw_search_bar(&app), 0);
         assert!(line.contains("searching"), "{line:?}");
@@ -3172,8 +3197,9 @@ mod tests {
 
     #[test]
     fn search_just_dispatched_keeps_previous_count() {
-        let mut app = lexical_app_mid_search("m100");
-        search_started_within_the_delay(&mut app);
+        let clock = Arc::new(TestClock::default());
+        let mut app = lexical_app_mid_search("m100", clock.clone());
+        search_running_for(&mut app, &clock, std::time::Duration::ZERO);
 
         let line = row_text(&draw_search_bar(&app), 0);
         assert!(line.contains("1/1"), "{line:?}");
@@ -3182,8 +3208,9 @@ mod tests {
 
     #[test]
     fn semantic_search_still_running_keeps_its_mode_label_beside_searching() {
-        let mut app = semantic_searching_app("m100", SemanticProgress::Ranking);
-        search_started_long_ago(&mut app);
+        let clock = Arc::new(TestClock::default());
+        let mut app = semantic_searching_app_on("m100", SemanticProgress::Ranking, clock.clone());
+        search_running_for(&mut app, &clock, std::time::Duration::from_secs(10));
 
         let line = row_text(&draw_search_bar(&app), 0);
         assert!(line.contains("sem "), "{line:?}");
@@ -3197,6 +3224,32 @@ mod tests {
             .draw(|frame| render_list(frame, app, frame.area()))
             .unwrap();
         terminal_contents(&terminal)
+    }
+
+    #[test]
+    fn a_rows_age_is_counted_to_the_lists_clock() {
+        let last_message = Local.with_ymd_and_hms(2026, 3, 4, 10, 0, 0).unwrap();
+        let conversation = Conversation {
+            timestamp: last_message,
+            ..test_conversation()
+        };
+        let clock = Arc::new(TestClock::default());
+        let app = App::new(
+            vec![conversation],
+            ToolDisplayMode::Truncated,
+            false,
+            KeyBindings::default(),
+            vec![],
+            clock.clone(),
+        );
+
+        clock.set_wall((last_message + chrono::Duration::hours(2)).to_utc());
+        let two_hours_later = render_list_contents(&app, 100, 4);
+        clock.set_wall((last_message + chrono::Duration::days(1)).to_utc());
+        let a_day_later = render_list_contents(&app, 100, 4);
+
+        assert!(two_hours_later.contains("2 hours ago"), "{two_hours_later}");
+        assert!(a_day_later.contains("yesterday"), "{a_day_later}");
     }
 
     /// While a search runs, the results on screen still answer the previous
@@ -3215,6 +3268,7 @@ mod tests {
             false,
             KeyBindings::default(),
             vec![],
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test("alpha");
         app.update_filter_for_test();
@@ -3484,6 +3538,7 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test("sentinel");
         let (response_tx, response_rx) = mpsc::channel();
@@ -3541,10 +3596,9 @@ mod tests {
             ToolDisplayMode::Truncated,
             false,
             KeyBindings::default(),
-            false,
-            None,
-            vec![],
+            ListScope::default(),
             TuiSearchOptions::default(),
+            Arc::new(TestClock::default()),
         );
 
         assert_eq!(refresh_key_fg(&app), rgb(th().dim_key));
@@ -3594,6 +3648,7 @@ mod tests {
             ToolDisplayMode::Hidden,
             false,
             KeyBindings::default(),
+            Arc::new(TestClock::default()),
         );
         app.check_view_resize(160, 10);
         app
@@ -3610,17 +3665,12 @@ mod tests {
         row_text(&terminal, 0)
     }
 
-    /// A highlight lasting `seconds` from now (in the past when negative),
-    /// with `arrived_below` messages added below a reader at the bottom.
-    fn highlight_for(seconds: i64, arrived_below: Option<usize>) -> CountHighlight {
-        let now = std::time::Instant::now();
-        let offset = std::time::Duration::from_secs(seconds.unsigned_abs());
+    /// A highlight lasting `seconds` from `app`'s time, zero for one that has
+    /// just ended, with `arrived_below` messages added below a reader at the
+    /// bottom.
+    fn highlight_for(app: &App, seconds: u64, arrived_below: Option<usize>) -> CountHighlight {
         CountHighlight {
-            until: if seconds >= 0 {
-                now + offset
-            } else {
-                now - offset
-            },
+            until: app.clock().now() + std::time::Duration::from_secs(seconds),
             arrived_below,
         }
     }
@@ -3664,7 +3714,8 @@ mod tests {
         let app = viewer_app(&dir);
         let secondary = rgb(th().text_secondary);
 
-        let (plain, total) = slot_colors(&status_bar_with(&app, Some(highlight_for(3, None))));
+        let (plain, total) =
+            slot_colors(&status_bar_with(&app, Some(highlight_for(&app, 3, None))));
         assert!(plain.iter().all(|&color| color == secondary), "{plain:?}");
         assert!(!total.is_empty());
         assert!(
@@ -3672,7 +3723,7 @@ mod tests {
             "{total:?}"
         );
 
-        for highlight in [Some(highlight_for(-1, None)), None] {
+        for highlight in [Some(highlight_for(&app, 0, None)), None] {
             let (plain, total) = slot_colors(&status_bar_with(&app, highlight));
             assert!(
                 plain.iter().chain(&total).all(|&color| color == secondary),
@@ -3686,8 +3737,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = viewer_app(&dir);
 
-        let with_badge = row_text(&status_bar_with(&app, Some(highlight_for(3, Some(2)))), 0);
-        let without = row_text(&status_bar_with(&app, Some(highlight_for(3, None))), 0);
+        let with_badge = row_text(
+            &status_bar_with(&app, Some(highlight_for(&app, 3, Some(2)))),
+            0,
+        );
+        let without = row_text(
+            &status_bar_with(&app, Some(highlight_for(&app, 3, None))),
+            0,
+        );
 
         assert_eq!(with_badge, without);
         assert!(!with_badge.contains('↓'), "{with_badge:?}");
@@ -3714,8 +3771,9 @@ mod tests {
             ..state.clone()
         };
         let mut terminal = Terminal::new(TestBackend::new(80, CONTENT_HEIGHT)).unwrap();
+        let now = app.clock().now();
         terminal
-            .draw(|frame| render_view_content(frame, &state, frame.area()))
+            .draw(|frame| render_view_content(frame, &state, frame.area(), now))
             .unwrap();
         terminal
     }
@@ -3731,7 +3789,7 @@ mod tests {
         let app = session_view(&dir, &asked, &answered);
         const BADGE: &str = "  ↓ 2 new  ";
 
-        let terminal = content_with(&app, true, Some(highlight_for(3, Some(2))));
+        let terminal = content_with(&app, true, Some(highlight_for(&app, 3, Some(2))));
 
         let last = CONTENT_HEIGHT - 1;
         let row = row_text(&terminal, last);
@@ -3749,7 +3807,11 @@ mod tests {
         let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
         let app = session_view(&dir, &asked, &answered);
 
-        let expired = all_rows(&content_with(&app, true, Some(highlight_for(-1, Some(2)))));
+        let expired = all_rows(&content_with(
+            &app,
+            true,
+            Some(highlight_for(&app, 0, Some(2))),
+        ));
 
         assert_eq!(expired, all_rows(&content_with(&app, true, None)));
     }
@@ -3760,7 +3822,11 @@ mod tests {
         let (asked, answered) = (this_year("09-26T12:00:00Z"), this_year("09-28T12:00:00Z"));
         let app = session_view(&dir, &asked, &answered);
 
-        let rows = all_rows(&content_with(&app, false, Some(highlight_for(3, Some(2)))));
+        let rows = all_rows(&content_with(
+            &app,
+            false,
+            Some(highlight_for(&app, 3, Some(2))),
+        ));
 
         assert_eq!(rows, all_rows(&content_with(&app, false, None)));
     }
@@ -3802,6 +3868,7 @@ mod tests {
             false,
             KeyBindings::default(),
             vec![],
+            Arc::new(TestClock::default()),
         )
     }
 
@@ -4042,6 +4109,7 @@ mod tests {
             false,
             KeyBindings::default(),
             vec![],
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test("hiddenneedle");
         app.set_lexical_evidence_for_test(0, evidence);
@@ -4068,6 +4136,7 @@ mod tests {
             false,
             KeyBindings::default(),
             vec![],
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test("\"hidden_literal\"");
         let backend = TestBackend::new(80, 8);
@@ -4098,6 +4167,7 @@ mod tests {
             false,
             KeyBindings::default(),
             vec![],
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test("\"hidden_literal\"");
         app
@@ -4196,6 +4266,7 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test("semantic \"audio_generation\"");
         let (response_tx, response_rx) = mpsc::channel();
@@ -4273,6 +4344,7 @@ mod tests {
             TuiSearchOptions {
                 default_mode: ListSearchMode::Semantic,
             },
+            Arc::new(TestClock::default()),
         );
         app.set_query_for_test("semantic \"alpha_exact\" \"beta_exact\"");
         complete_semantic_search(

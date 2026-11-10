@@ -8,9 +8,11 @@ use super::{
     SourceLabels, SubagentFinder, walk,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, pi_log};
 use crate::history::{Conversation, Source, parser, pi_loader};
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
 pub struct PiProvider;
@@ -95,8 +97,8 @@ impl SessionProvider for PiProvider {
 }
 
 impl SessionRenamer for PiProvider {
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
-        pi_log::append_session_rename(path, title)
+    fn rename_session(&self, path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()> {
+        pi_log::append_session_rename(path, title, renamed_at)
     }
 }
 
@@ -170,8 +172,15 @@ impl SessionStorage for PiStorage {
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
-        parser::process_session_file(stub, &pi_log::PI_LOG, debug_level, on_transcript_read)
+        parser::process_session_file(
+            stub,
+            &pi_log::PI_LOG,
+            debug_level,
+            on_transcript_read,
+            clock,
+        )
     }
 }
 

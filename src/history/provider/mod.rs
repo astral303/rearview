@@ -58,6 +58,7 @@ use super::format::SessionFormat;
 use super::{Source, Workspace};
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::error::{AppError, Result};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -258,7 +259,9 @@ pub trait SessionProvider: Sync {
 /// Gives a session a user-chosen title, for a provider declaring
 /// [`SessionProvider::rename`] Capable.
 pub trait SessionRenamer: Sync {
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()>;
+    /// Title the session at `path`. A format that records when a session
+    /// was renamed records `renamed_at`.
+    fn rename_session(&self, path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()>;
 }
 
 /// Deletes a session, for a provider declaring [`SessionProvider::delete`]

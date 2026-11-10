@@ -687,15 +687,6 @@ fn finish_resolution(
     }
 }
 
-pub fn conversation_keys_from_conversations(
-    conversations: &[Conversation],
-) -> Result<Vec<AgentConversationKey>> {
-    conversations
-        .iter()
-        .map(AgentConversationKey::from_conversation)
-        .collect()
-}
-
 fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
     if let Some(hex) = reference.strip_prefix(HANDLE_PREFIX) {
         if hex.len() < MIN_PREFIX_HEX_LEN {

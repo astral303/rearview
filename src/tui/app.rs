@@ -1,3 +1,4 @@
+use crate::clock::{Clock, Moment};
 use crate::config::KeyBindings;
 use crate::history::{
     Conversation, ExcludedProjects, FilterTerm, LoadProgress, SessionChanges, SkippedSessions,
@@ -16,6 +17,7 @@ use crate::tui::viewer::ToolDisplayMode;
 use crate::tui::viewer::ToolOutputId;
 #[cfg(test)]
 use chrono::Local;
+use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -38,9 +40,9 @@ use search_state::{
 };
 #[allow(unused_imports)]
 pub use types::{
-    Action, AppMode, CountHighlight, DialogMode, Focus, LIST_LINES_PER_ITEM, ListSearchMode,
-    LoadingState, SemanticProgress, SemanticResultMetadata, TuiSearchOptions, ViewSearchMode,
-    ViewState, list_lines_per_item,
+    Action, AppMode, CountHighlight, DialogMode, Focus, LIST_LINES_PER_ITEM, ListScope,
+    ListSearchMode, LoadingState, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
+    ViewSearchMode, ViewState, list_lines_per_item,
 };
 
 /// App state
@@ -76,7 +78,7 @@ pub struct App {
     /// Main app mode (list or view)
     app_mode: AppMode,
     /// Status message with timestamp for auto-clear
-    status_message: Option<(String, std::time::Instant)>,
+    status_message: Option<(String, Moment)>,
     /// Persistent view setting: tool display mode
     tool_display: ToolDisplayMode,
     /// Persistent view setting: whether to show thinking blocks
@@ -105,7 +107,7 @@ pub struct App {
     search_generation: u64,
     /// When the search in flight on the worker thread was dispatched; `None`
     /// once its results are on screen
-    search_started_at: Option<std::time::Instant>,
+    search_started_at: Option<Moment>,
     /// The trimmed query the search in flight or the results on screen
     /// answer; `None` once they are stale
     dispatched_query: Option<String>,
@@ -166,6 +168,7 @@ pub struct App {
     /// The `fork` declaration the actions menu shows as loading, read on a
     /// background thread.
     fork_read: Option<ForkRead>,
+    clock: Arc<dyn Clock>,
 }
 
 /// A `fork` declaration read on a background thread for the actions menu.
@@ -227,12 +230,14 @@ struct AppParts {
     search_rx: mpsc::Receiver<SearchResponse>,
     list_search_mode: ListSearchMode,
     semantic_search: SemanticSearchState,
+    clock: Arc<dyn Clock>,
 }
 
 impl App {
     fn from_parts(parts: AppParts) -> Self {
         let missing_earlier_turns =
             crate::history::missing_earlier_turns_terms(&parts.conversations);
+        let reader_clock = parts.clock.clone();
         Self {
             conversations_snapshot: parts.conversations_snapshot,
             semantic_corpus_version: 1,
@@ -277,12 +282,15 @@ impl App {
             skipped_sessions: SkippedSessions::default(),
             refresh: RefreshState::Idle,
             changed_during_refresh: HashSet::new(),
-            session_reader: Box::new(refresh_state::read_listed_sessions),
+            session_reader: Box::new(move |rows, show_last| {
+                refresh_state::read_listed_sessions(rows, show_last, reader_clock.as_ref())
+            }),
             show_last: false,
             selection_anchor: None,
             clipboard_writer: copy_to_system_clipboard,
             fork_if_known: known_fork,
             fork_read: None,
+            clock: parts.clock,
         }
     }
 
@@ -298,7 +306,7 @@ impl App {
     }
 
     fn set_status(&mut self, message: String) {
-        self.status_message = Some((message, std::time::Instant::now()));
+        self.status_message = Some((message, self.clock.now()));
     }
 
     fn conversation_snapshot(conversations: &[Conversation]) -> Arc<Vec<Arc<Conversation>>> {
@@ -335,6 +343,7 @@ impl App {
         show_thinking: bool,
         keys: KeyBindings,
         exclude_projects: Vec<String>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self::new_with_options(
             conversations,
@@ -343,6 +352,7 @@ impl App {
             keys,
             exclude_projects,
             TuiSearchOptions::default(),
+            clock,
         )
     }
 
@@ -354,6 +364,7 @@ impl App {
         keys: KeyBindings,
         exclude_projects: Vec<String>,
         search_options: TuiSearchOptions,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         let searchable = search::precompute_search_text(&conversations);
         let excluded_projects = exclude_projects.into_iter().collect();
@@ -365,7 +376,7 @@ impl App {
             None,
         );
         let selected = if filtered.is_empty() { None } else { Some(0) };
-        let (search_tx, search_rx) = spawn_search_worker();
+        let (search_tx, search_rx) = spawn_search_worker(clock.clone());
         let conversations_snapshot = Self::conversation_snapshot(&conversations);
 
         Self::send_initial_search_data(&search_tx, conversations_snapshot.clone(), &searchable);
@@ -390,6 +401,7 @@ impl App {
             search_rx,
             list_search_mode: Self::list_search_mode_from_options(search_options),
             semantic_search: Self::semantic_search_state(true),
+            clock,
         })
     }
 
@@ -398,13 +410,12 @@ impl App {
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         keys: KeyBindings,
-        workspace_filter: bool,
-        workspace: Option<Workspace>,
-        exclude_projects: Vec<String>,
+        scope: ListScope,
         search_options: TuiSearchOptions,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         let conversations = Vec::new();
-        let (search_tx, search_rx) = spawn_search_worker();
+        let (search_tx, search_rx) = spawn_search_worker(clock.clone());
 
         Self::from_parts(AppParts {
             conversations_snapshot: Self::conversation_snapshot(&conversations),
@@ -422,13 +433,14 @@ impl App {
             single_file_mode: false,
             is_opened_file_stored: false,
             keys,
-            workspace_filter,
-            workspace,
-            excluded_projects: exclude_projects.into_iter().collect(),
+            workspace_filter: scope.workspace_filter,
+            workspace: scope.workspace,
+            excluded_projects: scope.exclude_projects.into_iter().collect(),
             search_tx,
             search_rx,
             list_search_mode: Self::list_search_mode_from_options(search_options),
             semantic_search: Self::semantic_search_state(true),
+            clock,
         })
     }
 
@@ -439,6 +451,7 @@ impl App {
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         keys: KeyBindings,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self::new_single_file_with_stored_check(
             path,
@@ -447,6 +460,7 @@ impl App {
             show_thinking,
             keys,
             crate::history::provider::is_stored_session,
+            clock,
         )
     }
 
@@ -459,11 +473,12 @@ impl App {
         show_thinking: bool,
         keys: KeyBindings,
         is_stored: StoredSessionCheck,
+        clock: Arc<dyn Clock>,
     ) -> Self {
-        let (search_tx, search_rx) = spawn_search_worker();
+        let (search_tx, search_rx) = spawn_search_worker(clock.clone());
 
         let is_opened_file_stored = header_names_a_stored_session(&path, source, is_stored);
-        let parsed = read_single_file(&path, source, is_opened_file_stored)
+        let parsed = read_single_file(&path, source, is_opened_file_stored, clock.as_ref())
             .ok()
             .flatten();
 
@@ -507,7 +522,16 @@ impl App {
             search_rx,
             list_search_mode: ListSearchMode::Lexical,
             semantic_search: Self::semantic_search_state(false),
+            clock,
         })
+    }
+
+    pub fn clock(&self) -> &dyn Clock {
+        self.clock.as_ref()
+    }
+
+    pub fn today(&self) -> NaiveDate {
+        self.clock.today()
     }
 
     pub fn keys(&self) -> &KeyBindings {
@@ -648,7 +672,7 @@ impl App {
         &self.app_mode
     }
 
-    pub fn status_message(&self) -> Option<&(String, std::time::Instant)> {
+    pub fn status_message(&self) -> Option<&(String, Moment)> {
         self.status_message.as_ref()
     }
 
@@ -707,7 +731,7 @@ impl App {
     /// shows nothing, so a fast keystroke does not flicker. A new keystroke
     /// restarts the seconds, so the drop to none shows the restart.
     pub fn search_status_text(&self) -> Option<String> {
-        let elapsed = self.search_started_at?.elapsed();
+        let elapsed = self.clock.elapsed_since(self.search_started_at?);
         if elapsed < SEARCH_SPINNER_DELAY {
             return None;
         }
@@ -722,7 +746,7 @@ impl App {
     }
 
     #[cfg(test)]
-    pub fn set_search_started_at_for_test(&mut self, started_at: std::time::Instant) {
+    pub fn set_search_started_at_for_test(&mut self, started_at: Moment) {
         self.search_started_at = Some(started_at);
     }
 
@@ -731,7 +755,7 @@ impl App {
         const STATUS_TTL: Duration = Duration::from_secs(3);
         self.status_message
             .as_ref()
-            .and_then(|(_, instant)| STATUS_TTL.checked_sub(instant.elapsed()))
+            .and_then(|(_, shown)| STATUS_TTL.checked_sub(self.clock.elapsed_since(*shown)))
     }
 
     /// How long the open session's count highlight lasts, if one is showing.
@@ -742,7 +766,7 @@ impl App {
         state
             .count_highlight?
             .until
-            .checked_duration_since(std::time::Instant::now())
+            .checked_duration_since(self.clock.now())
     }
 
     /// How long until something timed on screen changes by itself: a status
@@ -911,14 +935,16 @@ fn read_single_file(
     path: &Path,
     source: crate::history::Source,
     is_stored: bool,
+    clock: &dyn Clock,
 ) -> crate::error::Result<Option<Conversation>> {
     let modified = std::fs::metadata(path)
         .and_then(|file| file.modified())
         .ok();
-    let Some(mut conversation) = source
-        .provider()
-        .format()
-        .parse_conversation(path, modified, None)?
+    let Some(mut conversation) = source.provider().format().parse_conversation(
+        path,
+        crate::history::parser::RowDating::new(modified, clock),
+        None,
+    )?
     else {
         return Ok(None);
     };

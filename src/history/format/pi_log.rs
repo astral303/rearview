@@ -13,7 +13,7 @@ use crate::history::Source;
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -739,7 +739,9 @@ fn pi_usage(value: &Value) -> Option<TokenUsage> {
     })
 }
 
-pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
+/// Append a `session_info` record titling the Pi session at `path`, written
+/// at `renamed_at`.
+pub fn append_session_rename(path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()> {
     let projection = PI_LOG.parse_transcript(path)?.ok_or_else(|| {
         AppError::ConfigError(format!("{} is not a valid Pi session", path.display()))
     })?;
@@ -753,23 +755,12 @@ pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
             ids.insert(id.to_owned());
         }
     }
-    let id = (0u64..)
-        .map(|counter| {
-            let seed = format!(
-                "{}:{}:{}",
-                projection.header.id,
-                Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                counter
-            );
-            blake3::hash(seed.as_bytes()).to_hex()[..8].to_owned()
-        })
-        .find(|id| !ids.contains(id))
-        .expect("unbounded ID sequence has a free value");
+    let id = unused_record_id(&projection.header.id, renamed_at, &ids);
     let entry = json!({
         "type": "session_info",
         "id": id,
         "parentId": projection.leaf_id,
-        "timestamp": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        "timestamp": renamed_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         "name": title.replace(['\r', '\n'], " ").trim(),
     });
     let mut file = OpenOptions::new().append(true).open(path)?;
@@ -777,14 +768,20 @@ pub fn append_session_rename(path: &Path, title: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn append_omp_session_rename(path: &Path, title: &str) -> Result<()> {
+/// Write the OMP session at `path` with a title slot and a `title_change`
+/// record naming `title`, both stamped `renamed_at`.
+pub fn append_omp_session_rename(
+    path: &Path,
+    title: &str,
+    renamed_at: DateTime<Utc>,
+) -> Result<()> {
     const TITLE_SLOT_BYTES: usize = 256;
 
     let projection = OMP_LOG.parse_transcript(path)?.ok_or_else(|| {
         AppError::ConfigError(format!("{} is not a valid OMP session", path.display()))
     })?;
     let title = title.replace(['\r', '\n'], " ").trim().to_owned();
-    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let timestamp = renamed_at.to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut ids = HashSet::new();
     let contents = std::fs::read_to_string(path)?;
     for line in contents.lines() {
@@ -794,18 +791,7 @@ pub fn append_omp_session_rename(path: &Path, title: &str) -> Result<()> {
             ids.insert(id.to_owned());
         }
     }
-    let id = (0u64..)
-        .map(|counter| {
-            let seed = format!(
-                "{}:{}:{}",
-                projection.header.id,
-                Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                counter
-            );
-            blake3::hash(seed.as_bytes()).to_hex()[..8].to_owned()
-        })
-        .find(|id| !ids.contains(id))
-        .expect("unbounded ID sequence has a free value");
+    let id = unused_record_id(&projection.header.id, renamed_at, &ids);
     let entry = json!({
         "type": "title_change",
         "id": id,
@@ -848,6 +834,23 @@ pub fn append_omp_session_rename(path: &Path, title: &str) -> Result<()> {
     temp.persist(path)
         .map_err(|error| AppError::Io(error.error))?;
     Ok(())
+}
+
+/// The first eight-hex-digit record id derived from `session_id` and
+/// `written_at` that `taken` does not hold.
+fn unused_record_id(
+    session_id: &str,
+    written_at: DateTime<Utc>,
+    taken: &HashSet<String>,
+) -> String {
+    let nanos = written_at.timestamp_nanos_opt().unwrap_or(0);
+    (0u64..)
+        .map(|counter| {
+            let seed = format!("{session_id}:{nanos}:{counter}");
+            blake3::hash(seed.as_bytes()).to_hex()[..8].to_owned()
+        })
+        .find(|id| !taken.contains(id))
+        .expect("unbounded ID sequence has a free value")
 }
 
 fn omp_title_slot(title: &str, timestamp: &str, bytes: usize) -> Result<String> {
@@ -1007,6 +1010,7 @@ mod tests {
     }
     use super::*;
     use crate::agent::transcript::AgentTranscript;
+    use crate::clock::TestClock;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::{Source, parser::process_conversation_file};
 
@@ -1579,7 +1583,7 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         std::fs::copy(fixture("v3-branched.jsonl"), &path).unwrap();
 
-        append_session_rename(&path, "renamed\nPi").unwrap();
+        append_session_rename(&path, "renamed\nPi", TestClock::start_wall()).unwrap();
         let last = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -1590,6 +1594,7 @@ mod tests {
         assert_eq!(value["type"], "session_info");
         assert_eq!(value["parentId"], "name2");
         assert_eq!(value["name"], "renamed Pi");
+        assert_eq!(value["timestamp"], "2026-07-01T12:00:00.000Z");
         assert_eq!(value["id"].as_str().unwrap().len(), 8);
     }
 
@@ -1623,17 +1628,19 @@ mod tests {
         )
         .unwrap();
 
-        append_omp_session_rename(&path, "renamed\nOMP").unwrap();
+        append_omp_session_rename(&path, "renamed\nOMP", TestClock::start_wall()).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let first_line = contents.split_inclusive('\n').next().unwrap();
         assert_eq!(first_line.len(), 256);
         let slot: Value = serde_json::from_str(first_line).unwrap();
         assert_eq!(slot["type"], "title");
         assert_eq!(slot["title"], "renamed OMP");
+        assert_eq!(slot["updatedAt"], "2026-07-01T12:00:00.000Z");
         let last: Value = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
         assert_eq!(last["type"], "title_change");
         assert_eq!(last["parentId"], "a2");
         assert_eq!(last["title"], "renamed OMP");
+        assert_eq!(last["timestamp"], "2026-07-01T12:00:00.000Z");
         let reparsed = OMP_LOG.parse_transcript(&path).unwrap().unwrap();
         assert_eq!(reparsed.title.as_deref(), Some("renamed OMP"));
     }

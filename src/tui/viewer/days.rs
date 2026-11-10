@@ -116,10 +116,11 @@ pub(super) struct DayLabels {
 }
 
 impl DayLabels {
-    pub(super) fn new(shown: bool) -> Self {
+    /// Labels named relative to `today`, the local date.
+    pub(super) fn new(shown: bool, today: NaiveDate) -> Self {
         Self {
             shown,
-            today: Local::now().date_naive(),
+            today,
             current: None,
             unfollowed: None,
         }

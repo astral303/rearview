@@ -1,6 +1,7 @@
 //! `Ctrl+R` in the viewer: the open session read again from its file.
 
 use super::*;
+use crate::clock::TestClock;
 use crate::history::provider::{ReadError, SessionRead};
 use crate::history::{Source, UpdatedSession};
 
@@ -81,9 +82,22 @@ fn viewer_on(path: &Path) -> App {
     viewer_on_with_subagents(path, Vec::new())
 }
 
+/// [`viewer_on`], on a `clock` the test moves.
+fn viewer_on_clock(path: &Path, clock: Arc<TestClock>) -> App {
+    viewer_on_clock_with_subagents(path, Vec::new(), clock)
+}
+
 /// The list holding the session at `path`, whose row lists the sub-agent
 /// transcripts `subagents`, open in the viewer.
 fn viewer_on_with_subagents(path: &Path, subagents: Vec<PathBuf>) -> App {
+    viewer_on_clock_with_subagents(path, subagents, Arc::new(TestClock::default()))
+}
+
+fn viewer_on_clock_with_subagents(
+    path: &Path,
+    subagents: Vec<PathBuf>,
+    clock: Arc<TestClock>,
+) -> App {
     let row = Conversation {
         subagents,
         ..row_from_file(path)
@@ -94,6 +108,7 @@ fn viewer_on_with_subagents(path: &Path, subagents: Vec<PathBuf>) -> App {
         false,
         KeyBindings::default(),
         vec![],
+        clock,
     );
     app.set_session_reader_for_test(read_from_its_file);
     app.selected = Some(0);
@@ -389,28 +404,24 @@ fn failed_read_keeps_view() {
     );
 }
 
-fn count_highlight_remaining(app: &App) -> std::time::Duration {
-    app.count_highlight_remaining()
-        .unwrap_or(std::time::Duration::ZERO)
-}
-
 #[test]
 fn refresh_that_adds_messages_highlights_count_for_three_seconds() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
-    let mut app = viewer_on(&path);
+    let clock = Arc::new(TestClock::default());
+    let mut app = viewer_on_clock(&path, clock.clone());
     scroll_to_message(&mut app, "message 10");
 
     write_messages(&path, &numbered(0..32));
     press_refresh(&mut app);
 
-    let remaining = count_highlight_remaining(&app);
-    assert!(
-        remaining > std::time::Duration::from_millis(2500)
-            && remaining <= std::time::Duration::from_secs(3),
-        "{remaining:?}"
+    assert_eq!(
+        app.count_highlight_remaining(),
+        Some(Duration::from_secs(3))
     );
+    clock.advance(Duration::from_millis(3001));
+    assert_eq!(app.count_highlight_remaining(), None);
 }
 
 #[test]
@@ -425,14 +436,13 @@ fn refresh_that_adds_nothing_doesnt_highlight_count() {
     assert_eq!(app.count_highlight_remaining(), None);
 }
 
-/// Two seconds pass: one second of the current highlight is left.
-fn two_seconds_pass(app: &mut App) {
-    if let AppMode::View(state) = &mut app.app_mode
-        && let Some(highlight) = &mut state.count_highlight
-    {
-        highlight.until -= std::time::Duration::from_secs(2);
-    }
-    assert!(count_highlight_remaining(app) < std::time::Duration::from_millis(1500));
+/// Two seconds pass on `clock`: one second of the current highlight is left.
+fn two_seconds_pass(clock: &TestClock, app: &App) {
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(
+        app.count_highlight_remaining(),
+        Some(Duration::from_secs(1))
+    );
 }
 
 #[test]
@@ -440,17 +450,19 @@ fn second_count_change_restarts_highlight_from_that_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
-    let mut app = viewer_on(&path);
+    let clock = Arc::new(TestClock::default());
+    let mut app = viewer_on_clock(&path, clock.clone());
     scroll_to_message(&mut app, "message 10");
     write_messages(&path, &numbered(0..31));
     press_refresh(&mut app);
 
-    two_seconds_pass(&mut app);
+    two_seconds_pass(&clock, &app);
     write_messages(&path, &numbered(0..32));
     press_refresh(&mut app);
 
-    assert!(
-        count_highlight_remaining(&app) > std::time::Duration::from_millis(2500),
+    assert_eq!(
+        app.count_highlight_remaining(),
+        Some(Duration::from_secs(3)),
         "the second change restarts the three seconds"
     );
 }
@@ -460,18 +472,22 @@ fn second_refresh_at_bottom_shows_its_own_count_of_new_messages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     write_messages(&path, &numbered(0..30));
-    let mut app = viewer_on(&path);
+    let clock = Arc::new(TestClock::default());
+    let mut app = viewer_on_clock(&path, clock.clone());
     app.handle_key(KeyCode::End, KeyModifiers::empty(), VIEWPORT);
     write_messages(&path, &numbered(0..32));
     press_refresh(&mut app);
     assert_eq!(arrived_below(&app), Some(2));
 
-    two_seconds_pass(&mut app);
+    two_seconds_pass(&clock, &app);
     write_messages(&path, &numbered(0..33));
     press_refresh(&mut app);
 
     assert_eq!(arrived_below(&app), Some(1), "not a running total");
-    assert!(count_highlight_remaining(&app) > std::time::Duration::from_millis(2500));
+    assert_eq!(
+        app.count_highlight_remaining(),
+        Some(Duration::from_secs(3))
+    );
 }
 
 #[test]
@@ -537,6 +553,7 @@ fn refresh_reads_directly_opened_file_again() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
     app.check_view_resize(80, VIEWPORT);
 
@@ -567,6 +584,7 @@ fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refre
         false,
         KeyBindings::default(),
         |source, session_id, _| source == Source::Omp && session_id == "omp_session_custom_id",
+        Arc::new(TestClock::default()),
     );
     app.check_view_resize(80, VIEWPORT);
 
@@ -589,12 +607,13 @@ fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
+        Arc::new(TestClock::default()),
     );
     app.check_view_resize(80, VIEWPORT);
-    assert_eq!(app.idle_wait(), std::time::Duration::from_secs(3600));
+    assert_eq!(app.idle_wait(), Duration::from_secs(3600));
 
     write_messages(&path, &numbered(0..5));
     press_refresh(&mut app);
 
-    assert!(app.idle_wait() <= std::time::Duration::from_secs(3));
+    assert_eq!(app.idle_wait(), Duration::from_secs(3));
 }

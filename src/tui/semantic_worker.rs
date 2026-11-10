@@ -1,3 +1,4 @@
+use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::Conversation;
 use crate::search::literal::{build_literal_corpus, exact_fallback};
@@ -63,7 +64,9 @@ pub struct SemanticSearchResponse {
     pub prewarm: bool,
 }
 
-pub fn spawn_semantic_worker() -> (
+pub fn spawn_semantic_worker(
+    clock: Arc<dyn Clock>,
+) -> (
     mpsc::Sender<SemanticWorkerCommand>,
     mpsc::Receiver<SemanticSearchMessage>,
     SemanticCancellationToken,
@@ -75,7 +78,7 @@ pub fn spawn_semantic_worker() -> (
 
     std::thread::Builder::new()
         .name("semantic-search-worker".into())
-        .spawn(move || run_semantic_worker(cmd_rx, res_tx, worker_cancellation))
+        .spawn(move || run_semantic_worker(cmd_rx, res_tx, worker_cancellation, clock))
         .expect("failed to spawn semantic search worker thread");
 
     (cmd_tx, res_rx, cancellation)
@@ -85,9 +88,10 @@ fn run_semantic_worker(
     cmd_rx: mpsc::Receiver<SemanticWorkerCommand>,
     res_tx: mpsc::Sender<SemanticSearchMessage>,
     cancellation_source: SemanticCancellationToken,
+    clock: Arc<dyn Clock>,
 ) {
     let mut worker = SemanticWorkerState::default();
-    let mut state = SemanticIndexState::new();
+    let mut state = SemanticIndexState::new(clock);
     let mut embedder: Option<FastembedEmbedder> = None;
 
     while let Ok(command) = cmd_rx.recv() {
@@ -327,6 +331,7 @@ fn rank_or_prewarm_semantic_request(
     cancellation: &SemanticCancellationToken,
     res_tx: &mpsc::Sender<SemanticSearchMessage>,
 ) -> Result<SemanticSearchResponse> {
+    let clock = state.clock();
     let response = state.refresh_or_prewarm(
         request,
         embedder,
@@ -337,7 +342,7 @@ fn rank_or_prewarm_semantic_request(
                 progress: semantic_progress(progress),
             });
         },
-        write_embedding_cache,
+        |cache| write_embedding_cache(cache, clock.as_ref()),
     )?;
     Ok(semantic_search_response(
         generation,
@@ -640,7 +645,8 @@ mod tests {
 
     #[test]
     fn empty_visible_dialogue_returns_before_embedder_initialization() {
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
         send_worker_setup(&tx, vec![], "alpha", false);
         let response = recv_empty_complete(&rx);
         assert_eq!(response.progress, SemanticProgress::EmptyCorpus);
@@ -648,7 +654,8 @@ mod tests {
 
     #[test]
     fn empty_quoted_search_returns_idle_without_embedding() {
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
         send_worker_setup(&tx, vec!["visible dialogue"], "\"\"", false);
         let response = recv_empty_complete(&rx);
         assert_eq!(response.progress, SemanticProgress::Idle);
@@ -656,7 +663,8 @@ mod tests {
 
     #[test]
     fn empty_prewarm_search_builds_cache_without_idle_short_circuit() {
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
         send_worker_setup(&tx, vec!["visible dialogue"], "\"\"", true);
 
         loop {
@@ -679,7 +687,8 @@ mod tests {
 
     #[test]
     fn quoted_only_search_uses_literal_fallback_without_embedding() {
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
         send_worker_setup(&tx, vec![], "\"title sentinel\"", false);
         let message = rx
             .recv_timeout(WORKER_RESPONSE_TIMEOUT)
@@ -711,7 +720,8 @@ mod tests {
         newest.timestamp = Local::now();
         let mut hidden = conversation("/projects/project-a/session-c.jsonl", vec![]);
         hidden.timestamp = Local::now() + ChronoDuration::days(1);
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
         tx.send(SemanticWorkerCommand::UpdateCorpus {
             corpus_version: 1,
             conversations: corpus(vec![old, newest, hidden]),

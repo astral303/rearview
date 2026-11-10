@@ -1,3 +1,4 @@
+use crate::clock::Clock;
 use crate::history::{Conversation, ParseError};
 use chrono::Local;
 use std::fs::{self, OpenOptions};
@@ -33,11 +34,12 @@ fn open_debug_log_file() -> std::io::Result<Option<fs::File>> {
         .map(Some)
 }
 
-/// Log parse errors for a conversation to the debug log file.
+/// Log parse errors for a conversation to the debug log file, stamped with
+/// `clock`'s local time.
 ///
 /// Only writes to the log if there are parse errors. The log is appended to,
 /// so errors accumulate over time for debugging.
-pub fn log_parse_errors(conversation: &Conversation) -> std::io::Result<()> {
+pub fn log_parse_errors(conversation: &Conversation, clock: &dyn Clock) -> std::io::Result<()> {
     if conversation.parse_errors.is_empty() {
         return Ok(());
     }
@@ -47,7 +49,7 @@ pub fn log_parse_errors(conversation: &Conversation) -> std::io::Result<()> {
         None => return Ok(()),
     };
 
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let timestamp = log_timestamp(clock);
 
     writeln!(file, "=== Parse Errors: {} ===", timestamp)?;
     writeln!(file, "File: {}", conversation.path.display())?;
@@ -117,24 +119,17 @@ fn with_debug_log(f: impl FnOnce(&mut fs::File) -> std::io::Result<()>) -> std::
     f(&mut file)
 }
 
-/// Write a timestamped message `[timestamp] message` to the debug log file.
-fn write_timestamped(file: &mut fs::File, message: &str) -> std::io::Result<()> {
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-    writeln!(file, "[{}] {}", timestamp, message)
+/// `clock`'s current local time as the debug log writes it.
+fn log_timestamp(clock: &dyn Clock) -> impl std::fmt::Display {
+    clock
+        .wall()
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S")
 }
 
-/// Log a debug message to the debug log file.
-pub fn log_debug(message: &str) -> std::io::Result<()> {
-    with_debug_log(|file| write_timestamped(file, message))
-}
-
-/// Log the selected conversation path to the debug log file.
-#[allow(dead_code)]
-pub fn log_selected_path(path: &std::path::Path) -> std::io::Result<()> {
-    with_debug_log(|file| {
-        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-        writeln!(file, "[{}] Selected: {}", timestamp, path.display())
-    })
+/// Log a debug message to the debug log file as `[timestamp] message`.
+pub fn log_debug(message: &str, clock: &dyn Clock) -> std::io::Result<()> {
+    with_debug_log(|file| writeln!(file, "[{}] {}", log_timestamp(clock), message))
 }
 
 /// Log a display-time parse error to the debug log file.
@@ -143,9 +138,10 @@ pub fn log_display_error(
     line_number: usize,
     error: &str,
     line_content: &str,
+    clock: &dyn Clock,
 ) -> std::io::Result<()> {
     with_debug_log(|file| {
-        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let timestamp = log_timestamp(clock);
         writeln!(file, "=== Display Parse Error: {} ===", timestamp)?;
         writeln!(file, "File: {}", file_path.display())?;
         writeln!(file, "Line {}: {}", line_number, error)?;

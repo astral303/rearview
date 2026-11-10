@@ -3,6 +3,7 @@
 //! renamed into place, read only when their header matches, and swept of the
 //! temp files an interrupted write left behind.
 
+use crate::clock::Clock;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -73,14 +74,15 @@ fn add_disk_usage(path: &Path, counted: &mut HashSet<PathBuf>) -> std::io::Resul
 
 /// Write `data` to `path` through a temp file renamed into place, so a reader
 /// never sees half a file. On failure the previous file, if any, stays.
-pub(crate) fn write_atomically(path: &Path, data: &[u8]) {
+/// Sweeps the file's directory of temp files stale at `clock`'s time first.
+pub(crate) fn write_atomically(path: &Path, data: &[u8], clock: &dyn Clock) {
     let Some(parent) = path.parent() else {
         return;
     };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    sweep_stale_temp_files(parent);
+    sweep_stale_temp_files(parent, clock);
     let Ok(mut temp) = tempfile::Builder::new()
         .prefix(TEMP_FILE_PREFIX)
         .tempfile_in(parent)
@@ -95,10 +97,14 @@ pub(crate) fn write_atomically(path: &Path, data: &[u8]) {
 
 /// The whole file at `path` when it opens with `header`; `None` when it is
 /// absent, unreadable, or opens with anything else. Sweeps the file's
-/// directory of stale temp files first.
-pub(crate) fn read_if_header_matches(path: &Path, header: &[u8]) -> Option<Vec<u8>> {
+/// directory of temp files stale at `clock`'s time first.
+pub(crate) fn read_if_header_matches(
+    path: &Path,
+    header: &[u8],
+    clock: &dyn Clock,
+) -> Option<Vec<u8>> {
     if let Some(parent) = path.parent() {
-        sweep_stale_temp_files(parent);
+        sweep_stale_temp_files(parent, clock);
     }
     read_matching(std::fs::File::open(path).ok()?, header)
 }
@@ -119,14 +125,14 @@ fn read_matching(mut reader: impl Read, header: &[u8]) -> Option<Vec<u8>> {
 /// Remove `directory`'s stale temp files the first time this process reads
 /// or writes a cache file in it, so a directory of many cache files is
 /// listed once, not once per file.
-fn sweep_stale_temp_files(directory: &Path) {
+fn sweep_stale_temp_files(directory: &Path, clock: &dyn Clock) {
     static SWEPT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     let first_visit = SWEPT
         .get_or_init(Mutex::default)
         .lock()
         .is_ok_and(|mut swept| swept.insert(directory.to_path_buf()));
     if first_visit {
-        remove_stale_temp_files(directory, SystemTime::now());
+        remove_stale_temp_files(directory, SystemTime::from(clock.wall()));
     }
 }
 
@@ -165,6 +171,7 @@ fn remove_stale_temp_files(directory: &Path, now: SystemTime) {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use crate::clock::TestClock;
 
     pub(crate) struct TempFileFixture {
         pub(crate) leftover: PathBuf,
@@ -173,21 +180,21 @@ pub(crate) mod test_support {
     }
 
     impl TempFileFixture {
-        pub(crate) fn in_directory(directory: &Path) -> Self {
+        /// The files in `directory`, modified relative to `clock`'s wall time.
+        pub(crate) fn in_directory(directory: &Path, clock: &TestClock) -> Self {
             std::fs::create_dir_all(directory).unwrap();
-            let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
-            let file_aged = |name: &str, modified: Option<SystemTime>| {
+            let now = SystemTime::from(clock.wall());
+            let two_hours_ago = now - Duration::from_secs(2 * 60 * 60);
+            let file_modified_at = |name: &str, modified: SystemTime| {
                 let path = directory.join(name);
                 let file = std::fs::File::create(&path).unwrap();
-                if let Some(modified) = modified {
-                    file.set_modified(modified).unwrap();
-                }
+                file.set_modified(modified).unwrap();
                 path
             };
             Self {
-                leftover: file_aged(".tmpLEFTOVER", Some(two_hours_ago)),
-                in_progress: file_aged(".tmpWRITING", None),
-                unrelated: file_aged("notes.bin", Some(two_hours_ago)),
+                leftover: file_modified_at(".tmpLEFTOVER", two_hours_ago),
+                in_progress: file_modified_at(".tmpWRITING", now),
+                unrelated: file_modified_at("notes.bin", two_hours_ago),
             }
         }
 
@@ -211,6 +218,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::TempFileFixture;
     use super::*;
+    use crate::clock::TestClock;
 
     /// A reader that fails the test when read: a body read past a mismatched
     /// header is the full read the header check exists to skip.
@@ -266,9 +274,10 @@ mod tests {
     #[test]
     fn write_sweeps_its_directory_of_leftover_temp_files() {
         let directory = tempfile::tempdir().unwrap();
-        let fixture = TempFileFixture::in_directory(directory.path());
+        let clock = TestClock::default();
+        let fixture = TempFileFixture::in_directory(directory.path(), &clock);
 
-        write_atomically(&directory.path().join("cache.bin"), b"entries");
+        write_atomically(&directory.path().join("cache.bin"), b"entries", &clock);
 
         fixture.assert_swept();
     }
@@ -276,9 +285,10 @@ mod tests {
     #[test]
     fn read_sweeps_its_directory_of_leftover_temp_files() {
         let directory = tempfile::tempdir().unwrap();
-        let fixture = TempFileFixture::in_directory(directory.path());
+        let clock = TestClock::default();
+        let fixture = TempFileFixture::in_directory(directory.path(), &clock);
 
-        read_if_header_matches(&directory.path().join("cache.bin"), b"HEADER");
+        read_if_header_matches(&directory.path().join("cache.bin"), b"HEADER", &clock);
 
         fixture.assert_swept();
     }
@@ -364,6 +374,21 @@ mod tests {
         assert!(
             error.to_string().contains(&locked.display().to_string()),
             "the disk usage error does not name the unreadable folder: {error}"
+        );
+    }
+
+    #[test]
+    fn a_write_stalled_past_the_stale_age_loses_its_temp_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let clock = TestClock::default();
+        let fixture = TempFileFixture::in_directory(directory.path(), &clock);
+        clock.advance(STALE_TEMP_FILE_AGE + Duration::from_secs(1));
+
+        read_if_header_matches(&directory.path().join("cache.bin"), b"HEADER", &clock);
+
+        assert!(
+            !fixture.in_progress.exists(),
+            "a stalled write keeps its file"
         );
     }
 }

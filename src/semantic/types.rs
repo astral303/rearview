@@ -1,11 +1,12 @@
 use crate::agent::refs::MessageRange;
+use crate::clock::{Clock, Moment};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const DEFAULT_CHUNK_TARGET_CHARS: usize = 2_400;
 pub const DEFAULT_CHUNK_OVERLAP_CHARS: usize = 300;
@@ -71,9 +72,42 @@ impl EmbeddingBudget {
         self.passages.map_or(missing, |limit| missing.min(limit))
     }
 
+    /// True once `elapsed`, the time since the first batch started, reaches
+    /// the time limit.
+    pub fn time_is_up(&self, elapsed: Duration) -> bool {
+        self.time.is_some_and(|limit| elapsed >= limit)
+    }
+
+    /// This budget, its time limit measured on `clock`.
+    pub fn timed_on(self, clock: &dyn Clock) -> TimedBudget<'_> {
+        TimedBudget {
+            budget: self,
+            clock,
+        }
+    }
+}
+
+/// An [`EmbeddingBudget`] and the clock its time limit is measured on.
+#[derive(Clone, Copy)]
+pub struct TimedBudget<'a> {
+    budget: EmbeddingBudget,
+    clock: &'a dyn Clock,
+}
+
+impl TimedBudget<'_> {
+    /// `missing`, capped at the passage limit.
+    pub fn passages_within(&self, missing: usize) -> usize {
+        self.budget.passages_within(missing)
+    }
+
+    /// The current moment on the budget's clock, for [`Self::time_is_up`].
+    pub fn start(&self) -> Moment {
+        self.clock.now()
+    }
+
     /// True once the time limit has passed since `started`.
-    pub fn time_is_up(&self, started: Instant) -> bool {
-        self.time.is_some_and(|limit| started.elapsed() >= limit)
+    pub fn time_is_up(&self, started: Moment) -> bool {
+        self.budget.time_is_up(self.clock.elapsed_since(started))
     }
 }
 

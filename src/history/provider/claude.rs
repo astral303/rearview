@@ -15,6 +15,7 @@ use super::{
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::history::format::claude::{
@@ -22,6 +23,7 @@ use crate::history::format::claude::{
 };
 use crate::history::format::{self, SessionFormat};
 use crate::history::{Conversation, Source, Workspace};
+use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -155,7 +157,7 @@ impl SessionProvider for ClaudeProvider {
 }
 
 impl SessionRenamer for ClaudeProvider {
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+    fn rename_session(&self, path: &Path, title: &str, _renamed_at: DateTime<Utc>) -> Result<()> {
         rename::append_session_rename(path, title)
     }
 }
@@ -234,8 +236,10 @@ impl SessionStorage for ClaudeStorage {
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
-        let Some(mut conversation) = session_row(stub, debug_level, on_transcript_read)? else {
+        let Some(mut conversation) = session_row(stub, debug_level, on_transcript_read, clock)?
+        else {
             return Ok(None);
         };
         let project_path = conversation.cwd.clone().unwrap_or_else(|| {
@@ -1118,7 +1122,11 @@ pub(crate) mod tests {
 
     fn parsed_alone(transcript: &Path) -> Conversation {
         CLAUDE_TRANSCRIPT
-            .parse_conversation(transcript, None, None)
+            .parse_conversation(
+                transcript,
+                crate::history::parser::RowDating::new(None, &crate::clock::TestClock::default()),
+                None,
+            )
             .unwrap()
             .expect("the transcript holds a conversation")
     }

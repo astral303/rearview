@@ -3,6 +3,7 @@
 use super::storage::{DiscoveredSessions, ResolvedSession, SessionStub};
 use super::{SessionRoot, SessionStorage, SessionTitle};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::cache::{
@@ -225,18 +226,21 @@ impl SkippedSessions {
 /// held no conversation is skipped without being read again. `progress` hears
 /// `(done, total)` in transcripts, a session's own and each sub-agent's: once
 /// every root is discovered, then as each transcript is read or its session
-/// completes without reading it.
+/// completes without reading it. A row without any time is dated `clock`'s
+/// current time.
 pub fn load_sessions(
     storage: &dyn SessionStorage,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     progress: &mut dyn FnMut(usize, usize),
+    clock: &dyn Clock,
 ) -> Result<LoadedSessions> {
     SessionLoader {
         storage,
         cache: &SessionCacheStore::in_user_cache(storage.cache()),
         show_last,
         debug_level,
+        clock,
     }
     .load(progress)
 }
@@ -249,12 +253,14 @@ pub fn rediscover_sessions(
     show_last: bool,
     debug_level: Option<DebugLevel>,
     needs_reading: &dyn Fn(&SessionStub) -> bool,
+    clock: &dyn Clock,
 ) -> Result<RediscoveredSessions> {
     SessionLoader {
         storage,
         cache: &SessionCacheStore::in_user_cache(storage.cache()),
         show_last,
         debug_level,
+        clock,
     }
     .rediscover(needs_reading)
 }
@@ -266,7 +272,11 @@ pub fn rediscover_sessions(
 ///
 /// `None` when no provider stores the session, or it holds no conversation,
 /// or cannot be read.
-pub fn load_session_by_id(session_id: &str, show_last: bool) -> Option<(Source, Conversation)> {
+pub fn load_session_by_id(
+    session_id: &str,
+    show_last: bool,
+    clock: &dyn Clock,
+) -> Option<(Source, Conversation)> {
     let (source, ResolvedSession { root, stub }) = super::resolve_session_id(session_id)?;
     let storage = source.provider().storage();
     let conversation = SessionLoader {
@@ -274,6 +284,7 @@ pub fn load_session_by_id(session_id: &str, show_last: bool) -> Option<(Source, 
         cache: &SessionCacheStore::in_user_cache(storage.cache()),
         show_last,
         debug_level: None,
+        clock,
     }
     .load_one(&root, &stub)?;
     Some((source, conversation))
@@ -293,6 +304,7 @@ pub fn reread_sessions(
     source: Source,
     locators: &[&Path],
     show_last: bool,
+    clock: &dyn Clock,
 ) -> Vec<Option<SessionRead>> {
     let storage = source.provider().storage();
     SessionLoader {
@@ -300,12 +312,13 @@ pub fn reread_sessions(
         cache: &SessionCacheStore::in_user_cache(storage.cache()),
         show_last,
         debug_level: None,
+        clock,
     }
     .reread(locators)
 }
 
 /// [`reread_sessions`] for one session, against a caller-chosen storage and
-/// cache.
+/// cache, on test time.
 #[cfg(test)]
 pub(crate) fn reread_session_with_cache(
     storage: &dyn SessionStorage,
@@ -318,13 +331,15 @@ pub(crate) fn reread_session_with_cache(
         cache,
         show_last,
         debug_level: None,
+        clock: &crate::clock::TestClock::default(),
     }
     .reread(&[locator])
     .pop()
     .flatten()
 }
 
-/// [`load_sessions`] against a caller-chosen cache, reporting nothing.
+/// [`load_sessions`] against a caller-chosen cache, on test time, reporting
+/// nothing.
 #[cfg(test)]
 pub(crate) fn load_with_cache(
     storage: &dyn SessionStorage,
@@ -337,6 +352,7 @@ pub(crate) fn load_with_cache(
         cache,
         show_last,
         debug_level,
+        clock: &crate::clock::TestClock::default(),
     }
     .load(&mut |_, _| {})
 }
@@ -352,7 +368,7 @@ pub(crate) fn load_sessions_with_cache(
     load_with_cache(storage, cache, show_last, debug_level).map(|loaded| loaded.conversations)
 }
 
-/// [`rediscover_sessions`] against a caller-chosen cache.
+/// [`rediscover_sessions`] against a caller-chosen cache, on test time.
 #[cfg(test)]
 pub(crate) fn rediscover_sessions_with_cache(
     storage: &dyn SessionStorage,
@@ -365,6 +381,7 @@ pub(crate) fn rediscover_sessions_with_cache(
         cache,
         show_last,
         debug_level: None,
+        clock: &crate::clock::TestClock::default(),
     }
     .rediscover(needs_reading)
 }
@@ -382,6 +399,7 @@ struct SessionLoader<'a> {
     cache: &'a SessionCacheStore,
     show_last: bool,
     debug_level: Option<DebugLevel>,
+    clock: &'a dyn Clock,
 }
 
 impl SessionLoader<'_> {
@@ -538,7 +556,7 @@ impl SessionLoader<'_> {
         stubs: Vec<SessionStub>,
         read: &mpsc::Sender<usize>,
     ) -> LoadedRoot {
-        let mut entries = CacheEntries::read_from(self.cache.read(&root.path));
+        let mut entries = CacheEntries::read_from(self.cache.read(&root.path, self.clock));
         let hits: Vec<bool> = stubs
             .iter()
             .map(|stub| cached_entry(&entries.read, stub).is_some())
@@ -614,7 +632,8 @@ impl SessionLoader<'_> {
         );
 
         for index in changed_shards {
-            self.cache.write_shard(&root.path, index, &entries.current);
+            self.cache
+                .write_shard(&root.path, index, &entries.current, self.clock);
         }
         LoadedRoot {
             conversations,
@@ -713,7 +732,8 @@ impl SessionLoader<'_> {
         }
         let mut read = Vec::new();
         for (shard, stubs) in by_shard {
-            let mut entries = CacheEntries::read_from(self.cache.read_shard(&root.path, shard));
+            let mut entries =
+                CacheEntries::read_from(self.cache.read_shard(&root.path, shard, self.clock));
             let outcomes: Vec<SessionOutcome> = stubs
                 .par_iter()
                 .map(|stub| {
@@ -730,7 +750,7 @@ impl SessionLoader<'_> {
             }
             if missed {
                 self.cache
-                    .merge_into_shard(&root.path, shard, entries.current);
+                    .merge_into_shard(&root.path, shard, entries.current, self.clock);
             }
         }
         read
@@ -813,6 +833,7 @@ impl SessionLoader<'_> {
                 root,
                 self.debug_level,
                 on_transcript_read,
+                self.clock,
             ),
         }
     }
@@ -831,6 +852,7 @@ impl SessionLoader<'_> {
             stub.locator.clone(),
             self.show_last,
             external_titles,
+            self.clock,
         ))
     }
 }
@@ -998,6 +1020,7 @@ fn restore_from_cache(
     locator: PathBuf,
     show_last: bool,
     external_titles: &HashMap<String, SessionTitle>,
+    clock: &dyn Clock,
 ) -> Conversation {
     let ListedSessionEntry {
         conversation: cached,
@@ -1006,7 +1029,8 @@ fn restore_from_cache(
         project_path,
         ..
     } = entry;
-    let mut conversation = conversation_from_cached(storage.source(), cached, locator, show_last);
+    let mut conversation =
+        conversation_from_cached(storage.source(), cached, locator, show_last, clock);
     conversation.session_id = session_id;
     conversation.subagents = subagents;
     conversation.project_name = Some(format_short_name_from_path(&project_path));
@@ -1044,8 +1068,9 @@ fn parse_session(
     root: &SessionRoot,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
+    clock: &dyn Clock,
 ) -> SessionOutcome {
-    match storage.parse_session(stub, root, debug_level, on_transcript_read) {
+    match storage.parse_session(stub, root, debug_level, on_transcript_read, clock) {
         Ok(Some(conversation)) if conversation.source == storage.source() => {
             SessionOutcome::Parsed(conversation)
         }
@@ -1306,6 +1331,7 @@ mod tests {
             _root: &SessionRoot,
             _debug_level: Option<DebugLevel>,
             on_transcript_read: &(dyn Fn() + Sync),
+            _clock: &dyn Clock,
         ) -> Result<Option<Conversation>> {
             self.parsed
                 .lock()
@@ -1361,6 +1387,7 @@ mod tests {
             cache::CachedConversation::default(),
             PathBuf::new(),
             false,
+            &crate::clock::TestClock::default(),
         );
         conversation.session_id = id.to_owned();
         conversation.agent_search_text = agent_text.to_owned();
@@ -1387,7 +1414,10 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(storage.parsed_ids(), vec!["ses_other", "ses_parent"]);
         let mut keys = cache
-            .read(std::path::Path::new("container.db"))
+            .read(
+                std::path::Path::new("container.db"),
+                &crate::clock::TestClock::default(),
+            )
             .into_keys()
             .collect::<Vec<_>>();
         keys.sort();
@@ -1423,6 +1453,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         };
         let root = SessionRoot::new("container.db");
         loader.load_root(
@@ -1437,7 +1468,10 @@ mod tests {
 
         assert!(by_id.path.ends_with("ses_by_id.jsonl"));
         assert_eq!(storage.parsed_ids(), vec!["ses_by_id", "ses_listed"]);
-        let mut keys = cache.read(&root.path).into_keys().collect::<Vec<_>>();
+        let mut keys = cache
+            .read(&root.path, loader.clock)
+            .into_keys()
+            .collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, vec!["ses_by_id", "ses_listed"]);
 
@@ -1469,6 +1503,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         }
         .load(&mut |done, total| reports.push((done, total)))
         .unwrap();
@@ -1493,6 +1528,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         }
         .load(&mut |_, _| {})
         .unwrap();
@@ -1516,6 +1552,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         };
 
         loader.load(&mut |_, _| {}).unwrap();
@@ -1656,7 +1693,10 @@ mod tests {
 
     fn sorted_cache_keys(cache: &SessionCacheStore) -> Vec<String> {
         let mut keys = cache
-            .read(std::path::Path::new("container.db"))
+            .read(
+                std::path::Path::new("container.db"),
+                &crate::clock::TestClock::default(),
+            )
             .into_keys()
             .collect::<Vec<_>>();
         keys.sort();
@@ -1700,7 +1740,10 @@ mod tests {
         );
         assert_eq!(
             cache
-                .read(std::path::Path::new("container.db"))
+                .read(
+                    std::path::Path::new("container.db"),
+                    &crate::clock::TestClock::default(),
+                )
                 .get(&stubs[1].cache_key)
                 .map(|entry| entry.fingerprint().file_size),
             Some(250)
@@ -1954,6 +1997,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         };
         let root = SessionRoot::new("container.db");
         loader.load_root(&root, vec![listed.clone()], &mpsc::channel().0);
@@ -1982,12 +2026,13 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         };
         let root = SessionRoot::new("container.db");
         loader.load_root(&root, stubs.clone(), &mpsc::channel().0);
         let parsed_by_the_load = storage.parsed_ids().len();
 
-        let shard = cache.read_shard(&root.path, shard_index(&by_id.cache_key));
+        let shard = cache.read_shard(&root.path, shard_index(&by_id.cache_key), loader.clock);
         loader.load_one(&root, by_id).unwrap();
 
         assert_eq!(shard.keys().collect::<Vec<_>>(), [&by_id.cache_key]);
@@ -2016,6 +2061,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         };
 
         let loaded = loader.load(&mut |_, _| {}).unwrap();
@@ -2084,7 +2130,10 @@ mod tests {
         );
         assert_eq!(
             cache
-                .read(std::path::Path::new("container.db"))
+                .read(
+                    std::path::Path::new("container.db"),
+                    &crate::clock::TestClock::default(),
+                )
                 .get(&grown.cache_key)
                 .map(|entry| entry.fingerprint().file_size),
             Some(250)
@@ -2123,6 +2172,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         }
         .reread(&[&second.locator, &first.locator]);
 
@@ -2260,6 +2310,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         };
 
         let rediscovered = loader.rediscover(&|_| true).unwrap();
@@ -2296,7 +2347,14 @@ mod tests {
             "the sub-agent's tokens are missing"
         );
         assert!(listed[0].has_transient_read_error);
-        assert!(cache.read(Path::new("container.db")).is_empty());
+        assert!(
+            cache
+                .read(
+                    Path::new("container.db"),
+                    &crate::clock::TestClock::default()
+                )
+                .is_empty()
+        );
         assert_eq!(busy.parse_count(), 2, "the next load parses it again");
     }
 
@@ -2421,6 +2479,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         };
 
         let reports = progress_of_load(&loader);
@@ -2445,6 +2504,7 @@ mod tests {
             cache: &cache,
             show_last: false,
             debug_level: None,
+            clock: &crate::clock::TestClock::default(),
         };
         progress_of_load(&loader);
 

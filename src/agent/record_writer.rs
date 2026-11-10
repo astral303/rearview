@@ -12,7 +12,7 @@ use crate::agent::refs::ResolvedConversation;
 use crate::agent::subagents::{Handle, SubagentTag};
 use crate::agent::time_span::{DayRecords, RecordTime, TimeSpan, output_offset};
 use crate::agent::visibility::ContentVisibility;
-use chrono::FixedOffset;
+use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::Value;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -151,11 +151,11 @@ impl<'e> RecordWriter<'e> {
     }
 
     /// The offset the header's `tz=` names: the output's first `day`
-    /// record's, or the current one without a `day` record.
-    pub fn header_offset(&self) -> FixedOffset {
+    /// record's, or the local offset at `written_at` without a `day` record.
+    pub fn header_offset(&self, written_at: DateTime<Utc>) -> FixedOffset {
         self.days
             .header_offset()
-            .unwrap_or_else(|| output_offset(None))
+            .unwrap_or_else(|| output_offset(None, written_at))
     }
 
     pub fn into_output(self) -> String {

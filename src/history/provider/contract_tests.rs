@@ -25,6 +25,7 @@ use super::{
     SessionRenamer, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored, SubagentFinder,
 };
 use crate::cli::DebugLevel;
+use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
 use crate::history::cache::SessionCacheStore;
 use crate::history::{Conversation, Source};
@@ -305,7 +306,7 @@ pub(crate) fn list_row(source: Source, locator: &Path, subagents: &[PathBuf]) ->
     source
         .provider()
         .storage()
-        .parse_session(&stub, &root, None, &|| {})
+        .parse_session(&stub, &root, None, &|| {}, &TestClock::default())
         .unwrap()
         .expect("the session is listed")
 }
@@ -610,10 +611,11 @@ impl SessionStorage for FixtureStorage<'_> {
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
     ) -> Result<Option<Conversation>> {
         self.fixture
             .storage()
-            .parse_session(stub, root, debug_level, on_transcript_read)
+            .parse_session(stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -779,18 +781,20 @@ fn rename_reaches_next_load_through_warm_cache() {
     run_contract(Contract::WarmCacheRename, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
+        let clock = TestClock::default();
         let session = fixture.write_session(home.path(), fixture.ids().session);
         fixture
             .renamer()
-            .rename_session(&session, "old name")
+            .rename_session(&session, "old name", clock.wall())
             .unwrap();
 
         let first = load_under(fixture, home.path(), cache.path());
         assert_eq!(first[0].custom_title.as_deref(), Some("old name"));
 
+        clock.advance(std::time::Duration::from_secs(1));
         fixture
             .renamer()
-            .rename_session(&session, "fresh name")
+            .rename_session(&session, "fresh name", clock.wall())
             .unwrap();
 
         let second = load_under(fixture, home.path(), cache.path());
@@ -977,6 +981,7 @@ fn actions_menu_offers_fork(fixture: &dyn ProviderFixture) -> bool {
         false,
         crate::config::KeyBindings::default(),
         Vec::new(),
+        std::sync::Arc::new(TestClock::default()),
     );
     menu.is_action_available(crate::tui::SessionAction::Fork)
 }

@@ -57,7 +57,11 @@ pub fn assert_row_numbers_messages_as_agent_read(
     let row = source
         .provider()
         .format()
-        .parse_conversation(path, None, None)
+        .parse_conversation(
+            path,
+            crate::history::parser::RowDating::new(None, &crate::clock::TestClock::default()),
+            None,
+        )
         .unwrap()
         .expect("the session is listed");
     let transcript = AgentTranscript::load_owned(source, path, &[]).unwrap();
