@@ -10,6 +10,7 @@ pub(crate) mod output_coverage;
 mod runtime;
 pub mod search;
 mod semantic_worker;
+mod supervisor;
 pub mod theme;
 mod ui;
 pub mod viewer;
@@ -18,6 +19,8 @@ pub mod viewer;
 pub(crate) use actions_menu::SessionAction;
 #[cfg(test)]
 pub(crate) use app::App;
+#[cfg(test)]
+pub(crate) use app::claude_home;
 pub use app::{Action, ListScope, ListSearchMode, TuiSearchOptions};
 pub(crate) use command_tags::{parse_command_name, parse_command_name_and_args};
 pub(crate) use export::{ExportOptions, plain_text};

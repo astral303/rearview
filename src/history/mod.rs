@@ -48,7 +48,7 @@ pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub(crate) use loader::SeenPaths;
 pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
-    load_all_conversations_streaming, load_history, missing_earlier_turns_terms,
+    load_history, missing_earlier_turns_terms, stream_all_conversations,
 };
 pub use message_texts::{MESSAGE_SEPARATOR, MessageTextStarts};
 pub use message_times::{MessageTimes, MessagesInWindow};
@@ -56,13 +56,14 @@ pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
 pub use provider::{FoundSession, SkippedSessions};
 pub use refresh::{
-    KnownSessions, RefreshOptions, RefreshOutcome, SessionChanges, UpdatedSession,
-    refresh_in_background, refresh_sessions,
+    KnownSessions, RefreshOptions, RefreshOutcome, SessionChanges, UpdatedSession, refresh_sessions,
 };
 #[cfg(test)]
 pub use sqlite_cache::ProcessIdentity;
-pub use sqlite_cache::refresh::RefreshOwner;
-pub use sqlite_cache::{CacheBase, DrawingThread, InteractiveCache, InteractiveRead, NextStep};
+pub use sqlite_cache::{
+    AwaitedRefresh, CacheBase, DrawingThread, InteractiveCache, InteractiveRead, NextStep,
+    OperationScope, OtherRearview, Patience, WaitStatus,
+};
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
 };
@@ -347,6 +348,13 @@ pub enum LoaderMessage {
     Ignored(FilterTerm),
     /// Sessions the load read without listing them, and the unreadable ones
     SkippedSessions(SkippedSessions),
+    /// The batches so far came from the cache as it was while another
+    /// rearview refreshed it; these are the changes the load read under its
+    /// own refresh ownership since, applied as a list refresh applies them
+    Changes(SessionChanges),
+    /// A failed write batch stopped the load's cache writes part way: the
+    /// rows it parsed rather than restored may be missing from the cache
+    CacheWritesStopped,
     /// Loading completed
     Done,
 }

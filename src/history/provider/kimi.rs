@@ -93,7 +93,7 @@ impl SessionProvider for KimiProvider {
     }
 
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
+        resolved_session_paths(self, &KimiStorage, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -183,16 +183,17 @@ impl SessionIdResolver for KimiProvider {
     /// A Kimi session id names the directory holding its wires. A sub-agent
     /// thread is named `<session>#<agent>` and is read through its parent, so
     /// it resolves to no wire of its own.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
-        if !self.is_session_id_shape(session_id) {
-            return Ok(None);
-        }
-        for root in KimiStorage.roots()? {
-            if let Some(stub) = session_stub_of(&root, session_id)? {
-                return Ok(Some(ResolvedSession { root, stub }));
-            }
-        }
-        Ok(None)
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>> {
+        Ok(
+            session_stub_of(root, session_id)?.map(|stub| ResolvedSession {
+                root: root.clone(),
+                stub,
+            }),
+        )
     }
 }
 
@@ -1596,12 +1597,9 @@ pub(super) mod tests {
     /// An id joined to a workspace directory would otherwise be a path.
     #[test]
     fn id_that_is_not_session_directory_name_resolves_to_nothing() {
-        assert_eq!(
-            KimiProvider
-                .resolve_session_id("session_../escape")
-                .unwrap(),
-            None
-        );
-        assert_eq!(KimiProvider.resolve_session_id("wire.jsonl").unwrap(), None);
+        let resolve =
+            |query| super::super::resolve_in_storage(&KimiProvider, &KimiStorage, query).unwrap();
+        assert_eq!(resolve("session_../escape"), None);
+        assert_eq!(resolve("wire.jsonl"), None);
     }
 }

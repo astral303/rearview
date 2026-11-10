@@ -2,8 +2,8 @@
 //! --perf-stats` reports the first, the agent progress record the second.
 
 use super::Source;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use super::sqlite_cache::{OtherRearview, WaitStatus};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 /// A step of one agent's load. Each root goes through discovery, then its
@@ -91,35 +91,26 @@ pub struct RefreshTotals {
 pub struct LoadMeter {
     agents: Mutex<Vec<AgentLoad>>,
     progress: Mutex<StepProgress>,
-    /// The count of this load's threads waiting for another rearview's
-    /// refresh of the session cache.
-    refresh_waiters: AtomicUsize,
-}
-
-/// One thread's wait for another rearview's refresh, counted in its
-/// [`LoadMeter`] until dropped.
-pub(crate) struct RefreshWait<'a>(Option<&'a AtomicUsize>);
-
-impl Drop for RefreshWait<'_> {
-    fn drop(&mut self) {
-        if let Some(waiters) = self.0 {
-            waiters.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
+    /// The load's wait for another rearview's hold on the session cache.
+    wait: Arc<WaitStatus>,
 }
 
 impl LoadMeter {
-    /// True while one of this load's threads waits for another rearview's
-    /// refresh to release the session cache.
-    pub(crate) fn is_waiting_for_refresh(&self) -> bool {
-        self.refresh_waiters.load(Ordering::Relaxed) != 0
+    /// The other rearview the load waits for now; `None` while it does not
+    /// wait.
+    pub(crate) fn waiting_for(&self) -> Option<OtherRearview> {
+        self.wait.current()
     }
 
-    /// Count a wait for another rearview's refresh until the returned guard
-    /// drops.
-    pub(crate) fn start_refresh_wait(&self) -> RefreshWait<'_> {
-        self.refresh_waiters.fetch_add(1, Ordering::Relaxed);
-        RefreshWait(Some(&self.refresh_waiters))
+    /// True while the load waits for another rearview's hold on the session
+    /// cache.
+    pub(crate) fn is_waiting_for_refresh(&self) -> bool {
+        self.waiting_for().is_some()
+    }
+
+    /// The status the load's operation publishes its wait on.
+    pub(crate) fn wait_status(&self) -> &Arc<WaitStatus> {
+        &self.wait
     }
 
     /// The meter for `source`'s load.
@@ -173,13 +164,6 @@ pub struct AgentMeter<'a>(Option<(&'a LoadMeter, Source)>);
 
 impl<'a> AgentMeter<'a> {
     pub const UNMETERED: Self = Self(None);
-
-    /// Count a wait for another rearview's refresh in the meter until the
-    /// returned guard drops; an unmetered load counts nothing.
-    pub(crate) fn start_refresh_wait(self) -> RefreshWait<'a> {
-        self.0
-            .map_or(RefreshWait(None), |(meter, _)| meter.start_refresh_wait())
-    }
 
     /// `source`'s meter in `meter`, or [`Self::UNMETERED`] without one.
     pub fn of(meter: Option<&'a LoadMeter>, source: Source) -> Self {

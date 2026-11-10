@@ -7,6 +7,7 @@ use super::provider::{
     self, FoundSession, ReadError, RediscoveredSessions, SessionOutcome, SessionRead, SessionStub,
     SessionTitle, SkippedSessions,
 };
+use super::sqlite_cache::OperationScope;
 use super::{Conversation, Environment, FilterTerm, NextStep, Source};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -14,8 +15,6 @@ use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 
 /// Every session the last load or refresh found, by locator, for a refresh to
 /// compare discovery against.
@@ -55,8 +54,8 @@ impl KnownSessions {
     }
 }
 
-/// The options the list was loaded with, so a refresh reads sessions as the
-/// load read them.
+/// The options the list loads with, so a refresh reads sessions as the
+/// launch read them.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RefreshOptions {
     pub show_last: bool,
@@ -97,7 +96,8 @@ pub struct KeptSession {
     pub next: NextStep,
 }
 
-/// The one outcome of the TUI's background refresh thread.
+/// The one outcome of a list or session refresh on the TUI's background
+/// worker.
 pub enum RefreshOutcome {
     /// `Ctrl+R` in the list: the changes on disk since the list loaded.
     Changes(SessionChanges),
@@ -106,27 +106,18 @@ pub enum RefreshOutcome {
     Cached(Vec<SessionOutcome>),
 }
 
-/// Run `refresh` on the TUI's background refresh thread; the receiver gets
-/// its one outcome.
-pub fn refresh_in_background(
-    refresh: impl FnOnce() -> Result<RefreshOutcome> + Send + 'static,
-) -> Receiver<Result<RefreshOutcome>> {
-    let (outcome, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = outcome.send(refresh());
-    });
-    receiver
-}
-
 /// The changes on disk since `known`: every agent's sessions discovered
-/// again, and only new and changed ones read.
+/// again, and only new and changed ones read, under `operation`'s refresh
+/// ownership.
 ///
 /// An agent whose discovery fails keeps what the list holds of it. The
-/// refresh fails when every agent's discovery does.
+/// refresh fails when every agent's discovery does, and when a write finds
+/// the cache's drive short of space.
 pub fn refresh_sessions(
     environment: &Environment,
     known: &KnownSessions,
     options: RefreshOptions,
+    operation: &OperationScope,
 ) -> Result<SessionChanges> {
     let sources = environment
         .storages()
@@ -143,6 +134,7 @@ pub fn refresh_sessions(
             options.show_last,
             options.debug_level,
             needs_reading,
+            operation,
         )
     })
 }
@@ -178,6 +170,7 @@ fn refresh_sources(
             Ok(rediscovered) => {
                 changes.absorb(source, rediscovered, known, &mut claimed, options.time);
             }
+            Err(error @ AppError::SessionCacheOutOfSpace { .. }) => return Err(error),
             Err(error) => {
                 changes
                     .ignored
@@ -273,6 +266,16 @@ impl SessionChanges {
                     if error == ReadError::Permanent {
                         self.skipped.unreadable.insert(locator.clone(), found);
                     }
+                    if is_listed {
+                        self.kept.push(KeptSession {
+                            path: locator,
+                            next,
+                        });
+                    }
+                }
+                // A refresh read the cache as it is: a listed row keeps the
+                // copy the list already shows.
+                SessionRead::NotCached => {
                     if is_listed {
                         self.kept.push(KeptSession {
                             path: locator,

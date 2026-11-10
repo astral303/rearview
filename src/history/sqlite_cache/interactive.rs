@@ -1,22 +1,25 @@
 //! The session cache as the TUI's drawing thread reads it.
 //!
 //! The drawing thread reads the cache only through [`InteractiveCache`]: it
-//! does not acquire refresh ownership or write any cache, and waits at most
+//! does not acquire refresh ownership, write any cache or parse a
+//! transcript, and waits at most
 //! [`INTERACTIVE_BUSY_TIMEOUT`](super::INTERACTIVE_BUSY_TIMEOUT) for another
-//! connection's lock. A session the database does not hold as it is now is
-//! read outside the database, from its transcripts, and its
-//! [`NextStep::after_drawing_thread_read`] names what caches it: the refresh
-//! running now, or the TUI's background refresh thread.
+//! connection's lock. For a session the database does not hold as its
+//! transcripts are now, a read returns the older copy or no copy, and its
+//! [`NextStep::after_drawing_thread_read`] names what refreshes it: the
+//! refresh running now, or a session refresh on the TUI's background worker.
+//! Without a cache base, a read parses the transcripts: there is no cache to
+//! read.
 //!
 //! In debug builds, the waiting reader ([`SqliteCache::open_waiting`]),
-//! refresh ownership and cache writers panic on a thread a
-//! [`DrawingThread`] marks. The TUI's `App` marks its thread for as long as
+//! refresh ownership, cache writers and a transcript parse beside a session
+//! cache panic on a thread a [`DrawingThread`] marks. The TUI's `App` marks its thread for as long as
 //! it lives, so a test that drives a TUI path into any of them fails. A path
 //! no test drives, and a release build, are not checked.
 
-use super::next_step::{Fallback, NextStep};
-use super::refresh::{self, RefreshOwner};
-use super::{CacheBase, ReaderWait, SqliteCache, is_busy_error};
+use super::next_step::NextStep;
+use super::observer::{self, AwaitedRefresh};
+use super::{CacheBase, ReaderWait, SqliteCache};
 use crate::error::Result;
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -28,11 +31,19 @@ pub struct InteractiveCache {
     base: Option<CacheBase>,
 }
 
-/// The value a drawing-thread read returned without waiting for the session
-/// cache, and the TUI's next step for the session.
+/// A drawing-thread read of a session, and the TUI's next step for it.
 pub struct InteractiveRead<T> {
-    pub value: T,
+    /// The session as read; `None` when it is missing from the cache, or the
+    /// cache could not be read within the drawing thread's wait.
+    pub value: Option<T>,
     pub next: NextStep,
+}
+
+/// A session's copy in the cache, as one read found it.
+pub(crate) struct CachedCopy<T> {
+    pub(crate) value: T,
+    /// True when the copy matches the session's transcripts as they are now.
+    pub(crate) is_current: bool,
 }
 
 impl InteractiveCache {
@@ -60,37 +71,41 @@ impl InteractiveCache {
         }
     }
 
-    /// `from_cache`'s read of the cache when it serves one, settled;
-    /// otherwise `from_transcripts`', with its
-    /// [`NextStep::after_drawing_thread_read`].
+    /// `from_cache`'s copy of a session: settled when current, otherwise
+    /// with its [`NextStep::after_drawing_thread_read`], as is a session
+    /// missing from the cache. Without a cache base, `from_transcripts`'
+    /// read, settled.
     pub(crate) fn read<T>(
         &self,
-        from_cache: impl FnOnce(&SqliteCache) -> Result<Option<T>>,
+        from_cache: impl FnOnce(&SqliteCache) -> Result<Option<CachedCopy<T>>>,
         from_transcripts: impl FnOnce() -> Result<T>,
     ) -> Result<InteractiveRead<T>> {
-        let cached = self
+        let Some(base) = self.base() else {
+            return Ok(InteractiveRead {
+                value: Some(from_transcripts()?),
+                next: NextStep::Settled,
+            });
+        };
+        let copy = self
             .open()
-            .and_then(|cache| cache.map_or(Ok(None), |cache| from_cache(&cache)));
-        let fallback = match cached {
-            Ok(Some(read)) => {
-                return Ok(InteractiveRead {
-                    value: read,
-                    next: NextStep::Settled,
-                });
-            }
-            Err(error) if is_busy_error(&error) => Fallback::DatabaseBusy,
-            Ok(None) | Err(_) => Fallback::NotServed,
+            .and_then(|cache| cache.map_or(Ok(None), |cache| from_cache(&cache)))
+            .ok()
+            .flatten();
+        let next = match &copy {
+            Some(copy) if copy.is_current => NextStep::Settled,
+            Some(_) | None => NextStep::after_drawing_thread_read(Some(base)),
         };
         Ok(InteractiveRead {
-            value: from_transcripts()?,
-            next: NextStep::after_drawing_thread_read(self.base(), fallback),
+            value: copy.map(|copy| copy.value),
+            next,
         })
     }
 
-    /// The process whose refresh owns this cache now; `None` while no
-    /// refresh owns it, or when the cache cannot be read. Never waits.
-    pub(crate) fn running_refresh(&self) -> Option<RefreshOwner> {
-        refresh::running_refresh(self.base()?).ok().flatten()
+    /// The refresh a reader of this cache waits for now; `None` while no
+    /// refresh owns it, or when the cache's refresh state cannot be read.
+    /// Never waits and never takes SQLite's writer lock.
+    pub(crate) fn awaited_refresh(&self) -> Option<AwaitedRefresh> {
+        observer::observe(self.base()?).ok()?.awaited()
     }
 }
 
@@ -122,7 +137,7 @@ impl Drop for DrawingThread {
 
 /// Panic in debug builds on a thread a [`DrawingThread`] marks, naming the
 /// refused `operation`.
-pub(super) fn refuse_the_drawing_thread(operation: &str) {
+pub(crate) fn refuse_the_drawing_thread(operation: &str) {
     debug_assert!(
         DRAWING_THREAD_MARKS.with(Cell::get) == 0,
         "the TUI's drawing thread tried to {operation}; read through InteractiveCache"

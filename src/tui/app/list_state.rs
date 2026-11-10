@@ -136,8 +136,7 @@ impl App {
             return;
         };
 
-        let removed = self.conversations.remove(conv_idx);
-        self.note_changed_during_refresh(&removed.path);
+        self.conversations.remove(conv_idx);
 
         self.searchable.retain_mut(|s| {
             if s.index == conv_idx {

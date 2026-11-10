@@ -19,7 +19,10 @@ fn read_as_viewer(
         file_path,
         subagents,
     )
-    .map(|read| read.value)
+    .map(|read| {
+        read.value
+            .expect("a read without a session cache parses the transcripts")
+    })
 }
 
 /// Entries rendered with an empty roster keep their ID labels.

@@ -19,6 +19,9 @@ pub enum SessionRead {
     Missing,
     /// Could not be read.
     Failed(ReadError),
+    /// Missing from the session cache, and nothing parsed the transcript: a
+    /// read of the cache alone, as the TUI's drawing thread reads it.
+    NotCached,
 }
 
 /// One session's read, by the provider the caller asked, and what the TUI
@@ -54,6 +57,14 @@ impl SessionOutcome {
     /// being read: it may still be there, unchanged.
     pub(super) fn failed_transiently(locator: &Path) -> Self {
         Self::unread(locator, SessionRead::Failed(ReadError::Transient))
+    }
+
+    /// The session at `stub`, missing from the session cache.
+    pub(super) fn not_cached(stub: &SessionStub) -> Self {
+        Self {
+            revision: stub.fingerprint.stamp(),
+            ..Self::unread(&stub.locator, SessionRead::NotCached)
+        }
     }
 
     fn unread(locator: &Path, read: SessionRead) -> Self {
@@ -92,7 +103,6 @@ impl SessionOutcome {
         self.revision
     }
 
-    #[cfg(test)]
     pub fn read(&self) -> &SessionRead {
         &self.read
     }

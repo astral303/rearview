@@ -1,12 +1,88 @@
 use super::{App, AppMode, CountHighlight, DialogMode, Focus, ViewSearchMode, ViewState};
-use crate::history::Conversation;
+use crate::history::provider::SessionRead;
+use crate::history::{Conversation, RefreshOutcome};
 use crate::tui::ui;
 use crate::tui::viewer::{
-    CallArea, CallRange, EntryRelocation, MessageRange, RenderOptions, ToolOutputId, find_matches,
+    CallArea, CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderOptions,
+    ToolOutputId, find_matches,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// The open session's row as its finished refresh read it, for the viewer's
+/// read of the session from the cache.
+pub(super) struct ReloadedSession {
+    subagents: Vec<PathBuf>,
+    session_id: String,
+}
+
+/// A copy or export asked for while the open session's refresh was pending.
+pub(super) enum DeferredCopy {
+    /// The export menu's `option`, to the clipboard or to a file.
+    Export { option: usize, to_clipboard: bool },
+    /// The focused message or call, in a viewport `viewport_height` rows high.
+    Focused { viewport_height: usize },
+}
+
+/// A finished refresh's read of the open session.
+enum OpenSessionRead {
+    Listed(ReloadedSession),
+    /// Gone or empty, with the status that names which.
+    Gone(&'static str),
+    /// The read or the whole refresh failed, with the status to show.
+    Failed(String),
+}
+
+impl OpenSessionRead {
+    /// `outcome`'s read of the session at `path`; `None` when it read none.
+    fn in_outcome(outcome: &crate::error::Result<RefreshOutcome>, path: &Path) -> Option<Self> {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Self::Failed(format!("Refresh failed: {error}"))),
+        };
+        match outcome {
+            RefreshOutcome::Cached(outcomes) => {
+                let outcome = outcomes.iter().find(|outcome| outcome.locator() == path)?;
+                Some(match outcome.read() {
+                    SessionRead::Listed(row) => Self::listed(row),
+                    SessionRead::Missing => Self::Gone("Session not found"),
+                    SessionRead::Empty => Self::Gone("Session is empty"),
+                    SessionRead::Failed(_) | SessionRead::NotCached => Self::read_failed(),
+                })
+            }
+            RefreshOutcome::Changes(changes) => {
+                if let Some(updated) = changes
+                    .updated
+                    .iter()
+                    .find(|updated| updated.row.path == path)
+                {
+                    return Some(Self::listed(&updated.row));
+                }
+                if changes.removed.iter().any(|removed| removed == path) {
+                    return Some(Self::Gone("Session not found"));
+                }
+                changes
+                    .kept
+                    .iter()
+                    .any(|kept| kept.path == path)
+                    .then(Self::read_failed)
+            }
+        }
+    }
+
+    fn listed(row: &Conversation) -> Self {
+        Self::Listed(ReloadedSession {
+            subagents: row.subagents.clone(),
+            session_id: row.session_id.clone(),
+        })
+    }
+
+    fn read_failed() -> Self {
+        Self::Failed("Refresh failed: the session could not be read".to_owned())
+    }
+}
 
 impl App {
     /// Open the selected session at once; the event loop defers through
@@ -40,7 +116,8 @@ impl App {
         ) {
             Ok(read) => {
                 self.act_on_next_step(&path, read.next);
-                let conversation = Arc::new(read.value);
+                let is_copy_missing = read.value.is_none();
+                let conversation = Arc::new(read.value.unwrap_or_else(ParsedConversation::empty));
                 let options = RenderOptions {
                     tool_display: self.tool_display,
                     show_thinking: self.show_thinking,
@@ -80,6 +157,7 @@ impl App {
                     expanded_tool_outputs: BTreeSet::new(),
                     hovered_tool_output: None,
                     count_highlight: None,
+                    is_copy_missing,
                 });
             }
             Err(e) => {
@@ -88,9 +166,131 @@ impl App {
         }
     }
 
+    /// Ask for the open session to be read again (`Ctrl+R`): through a
+    /// session refresh beside a session cache, or from its file on the next
+    /// frame for a file opened directly or without a cache.
+    pub(super) fn request_open_session_refresh(&mut self) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        if self.single_file_mode || self.environment.cache_base().is_none() {
+            self.pending_view_refresh = true;
+            return;
+        }
+        let path = state.conversation_path.clone();
+        self.store.request_session_refresh(&path);
+    }
+
+    /// True while the open session's refresh waits, runs or awaits another
+    /// refresh, beside a session cache.
+    pub fn is_open_session_updating(&self) -> bool {
+        match &self.app_mode {
+            AppMode::View(state) => self.store.is_refresh_pending(&state.conversation_path),
+            AppMode::List => false,
+        }
+    }
+
+    /// When the newest finished refresh read the open session: read it
+    /// again from the cache on the next frame, leave the viewer for a
+    /// session that is gone or empty, or report the failed read. The list
+    /// applies the refresh itself once the viewer closes.
+    pub(super) fn follow_open_session(&mut self) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        if self.single_file_mode {
+            return;
+        }
+        let read = self
+            .store
+            .newest_finished()
+            .and_then(|outcome| OpenSessionRead::in_outcome(outcome, &state.conversation_path));
+        match read {
+            Some(OpenSessionRead::Listed(reloaded)) => self.pending_view_reload = Some(reloaded),
+            Some(OpenSessionRead::Gone(status)) => {
+                self.deferred_copy = None;
+                self.exit_view_mode();
+                self.set_status(status.to_owned());
+            }
+            Some(OpenSessionRead::Failed(status)) => {
+                self.set_status(status);
+                self.run_deferred_copy();
+            }
+            None => {}
+        }
+    }
+
+    /// Read the open session again from the cache after its refresh finished,
+    /// as `reloaded` lists it, keeping the reader's place. A copy asked for
+    /// meanwhile runs once nothing more is pending.
+    pub(super) fn reload_open_session(
+        &mut self,
+        viewport_height: usize,
+        reloaded: ReloadedSession,
+    ) {
+        use crate::tui::viewer::parse_conversation_file_interactively;
+
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        let path = state.conversation_path.clone();
+        let read = parse_conversation_file_interactively(
+            &self.interactive_cache(),
+            state.conversation_source,
+            &path,
+            &reloaded.subagents,
+        );
+        match read {
+            Ok(read) => {
+                if let Some(conversation) = read.value {
+                    self.show_reread_conversation(
+                        viewport_height,
+                        Arc::new(conversation),
+                        reloaded.subagents,
+                        Some(reloaded.session_id),
+                    );
+                    if let AppMode::View(state) = &mut self.app_mode {
+                        state.is_copy_missing = false;
+                    }
+                }
+            }
+            Err(error) => self.set_status(format!("Refresh failed: {error}")),
+        }
+        if !self.store.is_refresh_pending(&path) {
+            self.run_deferred_copy();
+        }
+    }
+
+    /// True when a copy or export of the open session waits for its
+    /// refresh, which is pending beside a session cache.
+    pub(super) fn defers_copy(&self) -> bool {
+        !self.single_file_mode && self.is_open_session_updating()
+    }
+
+    /// Run the copy or export asked for while the open session's refresh
+    /// was pending.
+    fn run_deferred_copy(&mut self) {
+        match self.deferred_copy.take() {
+            Some(DeferredCopy::Export {
+                option,
+                to_clipboard,
+            }) => self.export_now(
+                option,
+                to_clipboard,
+                super::dialog_state::CopyMissing::Report,
+            ),
+            Some(DeferredCopy::Focused { viewport_height }) => {
+                self.copy_focused_now(viewport_height);
+            }
+            None => {}
+        }
+    }
+
     pub fn exit_view_mode(&mut self) {
         self.app_mode = AppMode::List;
         self.pending_view_refresh = false;
+        self.pending_view_reload = None;
+        self.deferred_copy = None;
     }
 
     pub(super) fn start_view_search(&mut self) {
@@ -242,14 +442,14 @@ impl App {
         self.render_view(viewport_height, None, false);
     }
 
-    /// Read the open session again (`Ctrl+R`): new messages appear, its row
-    /// in the list updates, and the view keeps the reader's place. A changed
+    /// Read the open session again from its file (`Ctrl+R` for a file opened
+    /// directly or without a session cache): new messages appear, its row in
+    /// the list updates, and the view keeps the reader's place. A changed
     /// message count is marked in the view; a refresh reports nothing else
     /// unless it failed. A session no longer found, or now empty, returns to
     /// the list. False when no session is open, so nothing was read.
     pub(super) fn refresh_open_session(&mut self, viewport_height: usize) -> bool {
         use crate::history::format::same_file;
-        use crate::history::provider::SessionRead;
         use crate::tui::viewer::parse_conversation_file_interactively;
 
         let AppMode::View(state) = &self.app_mode else {
@@ -257,7 +457,6 @@ impl App {
         };
         let path = state.conversation_path.clone();
         let source = state.conversation_source;
-        self.note_changed_during_refresh(&path);
         let row_index = self
             .conversations
             .iter()
@@ -274,18 +473,26 @@ impl App {
                     Ok(read) => {
                         self.act_on_next_step(&path, read.next);
                         let session_id = Some(row.session_id.clone());
-                        self.store_open_session_row(row_index, Some(*row));
-                        self.show_reread_conversation(
-                            viewport_height,
-                            Arc::new(read.value),
-                            subagents,
-                            session_id,
-                        );
+                        if self.store.is_refreshing() {
+                            // That refresh read the row before this read: a
+                            // session refresh after it lands this row last.
+                            self.store.request_session_refresh(&path);
+                        } else {
+                            self.store_open_session_row(row_index, Some(*row));
+                        }
+                        if let Some(conversation) = read.value {
+                            self.show_reread_conversation(
+                                viewport_height,
+                                Arc::new(conversation),
+                                subagents,
+                                session_id,
+                            );
+                        }
                     }
                     Err(error) => self.set_status(format!("Refresh failed: {error}")),
                 }
             }
-            SessionRead::Failed(_) => {
+            SessionRead::Failed(_) | SessionRead::NotCached => {
                 self.set_status("Refresh failed: the session could not be read".to_owned());
             }
             SessionRead::Missing => {
@@ -317,8 +524,8 @@ impl App {
         path: &std::path::Path,
         source: crate::history::Source,
         row_index: Option<usize>,
-    ) -> crate::history::provider::SessionRead {
-        use crate::history::provider::{ReadError, SessionRead};
+    ) -> SessionRead {
+        use crate::history::provider::ReadError;
 
         if self.single_file_mode {
             if !path.exists() {
@@ -457,7 +664,9 @@ impl App {
                 ) {
                     Ok(read) => {
                         displayed_read = Some((state.conversation_path.clone(), read.next));
-                        let conversation = Arc::new(read.value);
+                        state.is_copy_missing = read.value.is_none();
+                        let conversation =
+                            Arc::new(read.value.unwrap_or_else(ParsedConversation::empty));
                         state.parsed_conversation = Some(conversation.clone());
                         conversation
                     }
@@ -1087,7 +1296,17 @@ impl App {
         }
     }
 
+    /// Copy the focused call or message; while the open session's refresh is
+    /// pending, once it finishes, so the copy holds the newest messages.
     pub(super) fn copy_focused(&mut self, viewport_height: usize) {
+        if self.defers_copy() {
+            self.deferred_copy = Some(DeferredCopy::Focused { viewport_height });
+            return;
+        }
+        self.copy_focused_now(viewport_height);
+    }
+
+    fn copy_focused_now(&mut self, viewport_height: usize) {
         if self.focused_call_is_active() {
             self.copy_focused_call();
         } else {

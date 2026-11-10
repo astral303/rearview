@@ -3,7 +3,7 @@
 //! `agent_progress` shape unconverted, since they index and print it.
 
 use super::format::RecordLine;
-use super::sqlite_cache::{CacheBase, InteractiveCache, InteractiveRead};
+use super::sqlite_cache::{CacheBase, CachedCopy, InteractiveCache, InteractiveRead};
 use super::{MalformedLine, Source, TranscriptEntries, normalized_session, sniffed_session};
 use crate::error::Result;
 use crate::log_entry::{
@@ -107,8 +107,9 @@ pub fn display_log_entries_waiting(
     Ok(normalized_session(source, path, subagents)?.into())
 }
 
-/// The session's [`normalized_session`] as the viewer, exports and the
-/// clipboard copy read it, through `cache`'s interactive read.
+/// The session's entries as the viewer, exports and the clipboard copy read
+/// them, through `cache`'s interactive read: the copy the cache holds,
+/// current or not, or [`normalized_session`] without a cache base.
 pub fn display_log_entries_interactively(
     cache: &InteractiveCache,
     source: Source,
@@ -120,7 +121,14 @@ pub fn display_log_entries_interactively(
             let Some(session) = reader.find_session(source, path, subagents)? else {
                 return Ok(None);
             };
-            Ok(session.entries()?.map(DisplayEntries::from))
+            let is_current = session.matches_source()?;
+            Ok(session
+                .ignoring_source_changes()
+                .entries()?
+                .map(|entries| CachedCopy {
+                    value: DisplayEntries::from(entries),
+                    is_current,
+                }))
         },
         || Ok(normalized_session(source, path, subagents)?.into()),
     )

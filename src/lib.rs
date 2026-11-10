@@ -73,6 +73,7 @@ fn error_report(error: AppError) -> String {
     match error {
         AppError::AgentProtocol(output) => output,
         AppError::Agent(error) => agent::diagnostic::format_error(&error),
+        error @ AppError::SessionCacheOutOfSpace { .. } => format!("{APP_NAME}: {error}\n"),
         error => format!("Error: {error}\n"),
     }
 }
@@ -556,15 +557,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
         exclude_projects,
     };
 
-    // Always use streaming global loader for all conversations
     let load_meter = std::sync::Arc::new(history::load_meter::LoadMeter::default());
-    let rx = history::load_all_conversations_streaming(
-        environment.clone(),
-        show_last,
-        args.debug,
-        time_filter,
-        std::sync::Arc::clone(&load_meter),
-    );
 
     // An empty result is far more often the time filter than an empty history,
     // so say which when a filter is in play.
@@ -576,7 +569,6 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     };
 
     let (conversations, selected_path) = match tui::run_with_loader(
-        rx,
         load_meter,
         history::RefreshOptions {
             show_last,

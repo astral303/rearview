@@ -1,5 +1,6 @@
 use super::app::{Action, App, AppMode, ListScope, TuiSearchOptions};
 use super::backend::ShowAfterMove;
+use super::supervisor::TaskSupervisor;
 use super::ui;
 use crate::clock::Clock;
 use crate::config::KeyBindings;
@@ -7,8 +8,7 @@ use crate::debug_log;
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
 use crate::history::{
-    Conversation, Environment, LoaderMessage, RefreshOptions, RefreshOutcome,
-    refresh_in_background, refresh_sessions,
+    Conversation, Environment, LoaderMessage, RefreshOptions, RefreshOutcome, refresh_sessions,
 };
 use crate::tui::viewer::ToolDisplayMode;
 use crossterm::event::{
@@ -19,7 +19,6 @@ use ratatui::prelude::*;
 use std::io::{self, BufWriter, Stderr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 /// Frames are assembled in a buffer and reach the terminal in one write.
@@ -216,40 +215,35 @@ pub(crate) enum Tick {
     Exit(Action),
 }
 
-/// The TUI's event loop body: the load's and the refresh's messages, the
-/// timed checks, one frame, the pending open or viewer refresh, then the
-/// terminal events of one poll. [`run_with_loader`] and [`run_single_file`]
-/// run it against the terminal; a test runs it against a test backend with
-/// events of its own.
+/// The TUI's event loop body: the background jobs' messages, the timed
+/// checks, the next job, one frame, the pending open or viewer refresh, then
+/// the terminal events of one poll. [`run_with_loader`] and
+/// [`run_single_file`] run it against the terminal; a test runs it against a
+/// test backend with events of its own.
 pub(crate) struct Runtime {
     app: App,
     environment: Environment,
-    /// The streaming load's messages; `None` for a file opened directly.
-    loader: Option<Receiver<LoaderMessage>>,
-    load_meter: Arc<LoadMeter>,
+    supervisor: TaskSupervisor,
     refresh_options: RefreshOptions,
-    /// The background refresh thread's outcome, while one runs.
-    refresh: Option<Receiver<Result<RefreshOutcome>>>,
 }
 
 impl Runtime {
-    /// The list, filled from `loader`, the streaming load whose reads
-    /// `load_meter` records, in `environment`. `Ctrl+R` refreshes it with
-    /// `refresh_options`.
+    /// The list, filled by the launch, which reads sessions with
+    /// `refresh_options` and records its reads in `load_meter`, in
+    /// `environment`. `Ctrl+R` refreshes it with the same options.
     pub(crate) fn listing(
         app: App,
         environment: Environment,
-        loader: Receiver<LoaderMessage>,
         load_meter: Arc<LoadMeter>,
         refresh_options: RefreshOptions,
     ) -> Self {
+        let mut supervisor = TaskSupervisor::start(environment.clone(), load_meter);
+        supervisor.launch(refresh_options);
         Self {
             app,
             environment,
-            loader: Some(loader),
-            load_meter,
+            supervisor,
             refresh_options,
-            refresh: None,
         }
     }
 
@@ -257,11 +251,9 @@ impl Runtime {
     pub(crate) fn single_file(app: App, environment: Environment) -> Self {
         Self {
             app,
+            supervisor: TaskSupervisor::start(environment.clone(), Arc::default()),
             environment,
-            loader: None,
-            load_meter: Arc::default(),
             refresh_options: RefreshOptions::default(),
-            refresh: None,
         }
     }
 
@@ -270,25 +262,38 @@ impl Runtime {
         &self.app
     }
 
+    #[cfg(test)]
+    pub(crate) fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+
     /// One pass of the event loop, drawing on `terminal`. `poll` returns the
-    /// terminal events that arrive within the time it is given.
+    /// terminal events that arrive within the time it is given. The pass
+    /// that leaves the TUI, with an action or an error, shuts the background
+    /// worker down first.
     pub(crate) fn tick<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
         poll: &mut dyn FnMut(Duration) -> Result<Vec<Event>>,
     ) -> Result<Tick> {
-        self.receive_load()?;
-        self.receive_refresh();
-        self.app.apply_finished_refresh();
-        self.app.set_load_waiting_for_another_rearview(
-            self.app.is_loading() && self.load_meter.is_waiting_for_refresh(),
-        );
-        self.app.check_awaited_refresh();
-        if self.refresh.is_none()
-            && let Some(rows) = self.app.begin_caching_refresh()
-        {
-            self.refresh = Some(refresh_in_background(move || Ok(rows.cache())));
+        let tick = self.run_one_pass(terminal, poll);
+        if !matches!(tick, Ok(Tick::Continue)) {
+            self.supervisor.shutdown();
         }
+        tick
+    }
+
+    fn run_one_pass<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        poll: &mut dyn FnMut(Duration) -> Result<Vec<Event>>,
+    ) -> Result<Tick> {
+        self.receive_load()?;
+        self.receive_refresh()?;
+        self.app.apply_finished_refresh();
+        self.app.set_cache_wait(self.supervisor.waiting_for());
+        self.app.check_awaited_refresh();
+        self.start_next_job();
 
         let frame_state = prepare_frame(&mut self.app, terminal);
         self.app.receive_search_results();
@@ -316,55 +321,67 @@ impl Runtime {
         self.app.into_conversations()
     }
 
-    /// Apply every message the load has sent. Fails with the load's fatal
-    /// error, or when the finished load found no session.
+    /// Apply every message the launch has sent. Fails with the launch's
+    /// fatal error, or when the finished launch found no session.
     fn receive_load(&mut self) -> Result<()> {
-        let Some(loader) = &self.loader else {
-            return Ok(());
-        };
-        loop {
-            match loader.try_recv() {
-                Ok(LoaderMessage::Fatal(error)) => return Err(error),
-                Ok(LoaderMessage::ProviderError) => {}
-                Ok(LoaderMessage::Batch(conversations)) => {
+        while let Some(message) = self.supervisor.next_launch_message() {
+            match message {
+                LoaderMessage::Fatal(error) => return Err(error),
+                LoaderMessage::ProviderError => {}
+                LoaderMessage::Batch(conversations) => {
                     self.app.append_conversations(conversations);
                 }
-                Ok(LoaderMessage::Progress(progress)) => self.app.report_load_progress(progress),
-                Ok(LoaderMessage::Ignored(term)) => self.app.add_active_filter(term),
-                Ok(LoaderMessage::SkippedSessions(sessions)) => {
+                LoaderMessage::Progress(progress) => self.app.report_load_progress(progress),
+                LoaderMessage::Ignored(term) => self.app.add_active_filter(term),
+                LoaderMessage::SkippedSessions(sessions) => {
                     self.app.add_skipped_sessions(sessions);
                 }
-                Ok(LoaderMessage::Done) => finish_loading(&mut self.app)?,
-                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if self.app.is_loading() {
-                        finish_loading(&mut self.app)?;
-                    }
-                    return Ok(());
-                }
+                LoaderMessage::Changes(changes) => self.app.add_launch_changes(changes),
+                LoaderMessage::CacheWritesStopped => self.app.refresh_rows_the_launch_parsed(),
+                LoaderMessage::Done => finish_loading(&mut self.app)?,
             }
         }
+        Ok(())
     }
 
-    /// Hand a finished refresh to the app. A refresh thread that stopped
-    /// without an outcome reports as a failed refresh.
-    fn receive_refresh(&mut self) {
-        let Some(outcome) = self.refresh.as_ref() else {
-            return;
+    /// Hand a finished refresh to the app. Fails when the refresh found the
+    /// cache's drive short of space: rearview stops.
+    fn receive_refresh(&mut self) -> Result<()> {
+        let Some(outcome) = self.supervisor.finished_refresh() else {
+            return Ok(());
         };
-        let outcome = match outcome.try_recv() {
-            Ok(outcome) => outcome,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(AppError::RefreshStopped),
-        };
-        self.refresh = None;
+        if let Err(error @ AppError::SessionCacheOutOfSpace { .. }) = outcome {
+            return Err(error);
+        }
         self.app.finish_refresh(outcome);
+        Ok(())
+    }
+
+    /// Hand the worker its next job once it runs none: a requested list
+    /// refresh first, then the sessions waiting for a refresh. A job starts
+    /// only once the last one's outcome is applied, because the list holds
+    /// one outcome at a time.
+    fn start_next_job(&mut self) {
+        if !self.supervisor.can_take_job() {
+            return;
+        }
+        if let Some(known) = self.app.begin_requested_refresh() {
+            let options = self.refresh_options;
+            self.supervisor.refresh(move |environment, operation| {
+                refresh_sessions(environment, &known, options, operation)
+                    .map(RefreshOutcome::Changes)
+            });
+        } else if let Some(sessions) = self.app.begin_session_refresh() {
+            self.supervisor
+                .refresh(move |_, operation| sessions.refresh(operation));
+        }
     }
 
     /// The longest the next poll waits for input: briefly while work runs in
     /// the background, until the next timed redraw otherwise.
     fn poll_timeout(&self) -> Duration {
-        if self.app.is_loading() || self.refresh.is_some() || self.app.is_reading_fork() {
+        if self.app.is_loading() || self.supervisor.is_running_a_job() || self.app.is_reading_fork()
+        {
             Duration::from_millis(50)
         } else if self.app.has_search_work_in_flight() {
             Duration::from_millis(8)
@@ -390,9 +407,7 @@ impl Runtime {
                 },
             );
         }
-        let environment = &self.environment;
-        let refresh_options = self.refresh_options;
-        let refresh = &mut self.refresh;
+        let clock = Arc::clone(self.environment.clock());
         handle_events(
             &mut self.app,
             frame_state,
@@ -400,17 +415,11 @@ impl Runtime {
             true,
             |app, action| match action {
                 Action::Refresh => {
-                    if let Some(known) = app.begin_refresh() {
-                        let environment = environment.clone();
-                        *refresh = Some(refresh_in_background(move || {
-                            refresh_sessions(&environment, &known, refresh_options)
-                                .map(RefreshOutcome::Changes)
-                        }));
-                    }
+                    app.request_list_refresh();
                     EventLoopResult::Continue
                 }
                 Action::Delete(ref path) => {
-                    delete_selected_session(app, path, environment.clock().as_ref());
+                    delete_selected_session(app, path, clock.as_ref());
                     EventLoopResult::Continue
                 }
                 _ => EventLoopResult::Return(Some(action)),
@@ -455,7 +464,6 @@ fn delete_selected_session(app: &mut App, path: &std::path::Path, clock: &dyn Cl
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_loader(
-    rx: Receiver<LoaderMessage>,
     load_meter: Arc<LoadMeter>,
     refresh_options: RefreshOptions,
     tool_display: ToolDisplayMode,
@@ -477,7 +485,7 @@ pub fn run_with_loader(
     );
     app.set_active_filters(active_filters);
     app.set_show_last(refresh_options.show_last);
-    let mut runtime = Runtime::listing(app, environment, rx, load_meter, refresh_options);
+    let mut runtime = Runtime::listing(app, environment, load_meter, refresh_options);
     loop {
         if let Tick::Exit(action) = runtime.tick(&mut guard.terminal, &mut drain_events)? {
             return Ok((action, runtime.into_conversations()));

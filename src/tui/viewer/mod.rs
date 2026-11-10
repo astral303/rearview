@@ -251,6 +251,17 @@ pub struct ParsedConversation {
 }
 
 impl ParsedConversation {
+    /// A conversation without entries: what the viewer shows of a session
+    /// missing from the cache until its refresh finishes.
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            origins: Vec::new(),
+            roster: SubagentRoster::from_identities(Vec::new()),
+            activity_span: None,
+        }
+    }
+
     /// The earliest and latest user or assistant message times; `None` when
     /// no message carries one.
     pub fn activity_span(&self) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
@@ -298,7 +309,7 @@ pub fn parse_conversation_file_interactively(
         crate::history::display_log_entries_interactively(cache, source, file_path, subagents)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(crate::history::InteractiveRead {
-        value: parsed_conversation(displayed.value),
+        value: displayed.value.map(parsed_conversation),
         next: displayed.next,
     })
 }

@@ -98,7 +98,7 @@ impl SessionProvider for OpenCodeProvider {
     }
 
     fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
+        resolved_session_paths(self, &OpenCodeStorage, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -226,16 +226,17 @@ impl SessionIdResolver for OpenCodeProvider {
     }
 
     /// A session is a row keyed by its id, archived or not.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
-        if !self.is_session_id_shape(session_id) {
-            return Ok(None);
-        }
-        for root in OpenCodeStorage.roots()? {
-            if let Some(stub) = stored_session_in(&root.path, session_id)? {
-                return Ok(Some(ResolvedSession { root, stub }));
-            }
-        }
-        Ok(None)
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>> {
+        Ok(
+            stored_session_in(&root.path, session_id)?.map(|stub| ResolvedSession {
+                root: root.clone(),
+                stub,
+            }),
+        )
     }
 }
 

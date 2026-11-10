@@ -51,16 +51,16 @@ pub(crate) fn tui_outputs(queries: &[&str], environment: history::Environment) -
     let time = TimeFilter::default();
     app.set_active_filters(history::active_load_filters(&[&time]));
     app.set_show_last(true);
-    load(
-        &mut app,
-        history::load_all_conversations_streaming(
-            environment,
-            true,
-            None,
-            time,
-            Default::default(),
-        ),
-    );
+    let (messages, received) = std::sync::mpsc::channel();
+    let options = history::RefreshOptions {
+        show_last: true,
+        debug_level: None,
+        time,
+    };
+    std::thread::spawn(move || {
+        history::stream_all_conversations(&messages, &environment, options, &Default::default());
+    });
+    load(&mut app, received);
 
     let list = frame_text(&app);
     let search = queries
@@ -97,6 +97,8 @@ fn load(app: &mut App, messages: std::sync::mpsc::Receiver<LoaderMessage>) {
             LoaderMessage::Progress(progress) => app.report_load_progress(progress),
             LoaderMessage::Ignored(term) => app.add_active_filter(term),
             LoaderMessage::SkippedSessions(sessions) => app.add_skipped_sessions(sessions),
+            LoaderMessage::Changes(changes) => app.add_launch_changes(changes),
+            LoaderMessage::CacheWritesStopped => app.refresh_rows_the_launch_parsed(),
             LoaderMessage::Done => break,
         }
     }

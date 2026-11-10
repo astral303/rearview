@@ -5,6 +5,34 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
 use std::sync::mpsc;
 
+/// This rearview's work on the list that rename and delete wait for.
+#[derive(Clone, Copy)]
+enum ListWork {
+    Loading,
+    Refreshing,
+    RefreshingSession,
+}
+
+impl ListWork {
+    /// The reason the actions menu shows beside Delete and Rename.
+    fn menu_reason(self) -> &'static str {
+        match self {
+            Self::Loading => "list loading",
+            Self::Refreshing => "list refreshing",
+            Self::RefreshingSession => "refreshing",
+        }
+    }
+
+    /// The status the rename key shows.
+    fn rename_status(self) -> &'static str {
+        match self {
+            Self::Loading => "Rename is unavailable while the list loads",
+            Self::Refreshing => "Rename is unavailable while the list refreshes",
+            Self::RefreshingSession => "Rename waits for this session's refresh",
+        }
+    }
+}
+
 impl App {
     /// True when `action` is available on the selected or open session.
     pub fn is_action_available(&self, action: SessionAction) -> bool {
@@ -24,7 +52,14 @@ impl App {
     /// waiting for a `fork` declaration that has yet to be read. A file opened
     /// directly offers Rename alone, and only when its agent stores it:
     /// renaming writes to the file, and a copy elsewhere must stay unchanged.
+    /// Rename and delete wait for this rearview's work on the list (see
+    /// [`Self::rename_and_delete_wait`]).
     fn read_availability(&self, action: SessionAction) -> ActionAvailability {
+        if matches!(action, SessionAction::Delete | SessionAction::Rename)
+            && let Some(work) = self.rename_and_delete_wait()
+        {
+            return ActionAvailability::Waiting(work.menu_reason());
+        }
         let Some(source) = self.get_selected_source() else {
             return ActionAvailability::Unavailable;
         };
@@ -47,6 +82,23 @@ impl App {
         } else {
             ActionAvailability::Unavailable
         }
+    }
+
+    /// This rearview's work on the list that rename and delete of the
+    /// selected or open session wait for: the launch, a list refresh, or a
+    /// refresh of that session whose outcome the list has yet to apply.
+    /// Another rearview's refresh is none of these.
+    fn rename_and_delete_wait(&self) -> Option<ListWork> {
+        if self.is_loading() {
+            return Some(ListWork::Loading);
+        }
+        if self.store.is_list_refresh_running() {
+            return Some(ListWork::Refreshing);
+        }
+        let path = self.get_selected_path()?;
+        self.store
+            .is_session_refreshing(&path)
+            .then_some(ListWork::RefreshingSession)
     }
 
     /// True while the actions menu waits for a `fork` declaration read on a
@@ -110,6 +162,8 @@ impl App {
         if self.keys.rename.matches(code, modifiers) {
             if self.is_action_available(SessionAction::Rename) {
                 self.start_rename();
+            } else if let Some(work) = self.rename_and_delete_wait() {
+                self.set_status(work.rename_status().to_owned());
             }
             return Some(None);
         }

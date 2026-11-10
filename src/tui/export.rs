@@ -882,7 +882,10 @@ mod tests {
             path,
             subagents,
         )
-        .map(|read| read.value)
+        .map(|read| {
+            read.value
+                .expect("a read without a session cache parses the transcripts")
+        })
         .map_err(|error| std::io::Error::other(error.to_string()))
     }
 

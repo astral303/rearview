@@ -95,6 +95,16 @@ impl Environment {
     pub fn lister(&self) -> &dyn DirectoryLister {
         self.lister.as_ref()
     }
+
+    /// This environment with its session cache on a drive with `free_bytes`
+    /// free, whatever its writes add.
+    #[cfg(test)]
+    pub(crate) fn with_free_space(self, free_bytes: u64) -> Self {
+        Self {
+            cache_base: self.cache_base.map(|base| base.with_free_space(free_bytes)),
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]
@@ -146,26 +156,32 @@ pub(crate) mod test_support {
         )
     }
 
+    /// One operation on `environment`'s session cache that waits for refresh
+    /// ownership as long as another rearview keeps it, publishing its wait
+    /// nowhere a test reads.
+    pub(crate) fn waiting_operation(environment: &Environment) -> crate::history::OperationScope {
+        crate::history::OperationScope::new(
+            environment.cache_base(),
+            crate::history::Patience::UntilAcquired,
+            Arc::default(),
+        )
+    }
+
     /// Every session `storage` holds, newest first, loaded on test time
-    /// through the session cache database under `cache_base`, admitted as a
-    /// first build admits it.
+    /// through the session cache database under `cache_base`.
     pub(crate) fn load_rows(
         storage: &dyn SessionStorage,
         cache_base: &Path,
     ) -> Vec<crate::history::Conversation> {
-        crate::history::sqlite_cache::SqliteCache::open(
-            &crate::history::sqlite_cache::tests::rearview_at(cache_base),
-        )
-        .unwrap()
-        .mark_admitted()
-        .unwrap();
+        let environment = test_environment(Vec::new(), Some(cache_base));
         crate::history::provider::load_sessions(
-            &test_environment(Vec::new(), Some(cache_base)),
+            &environment,
             storage,
             false,
             None,
             crate::history::load_meter::AgentMeter::UNMETERED,
             crate::history::provider::LeftOutRows::NONE,
+            &waiting_operation(&environment),
             &mut |_, _| {},
         )
         .unwrap()

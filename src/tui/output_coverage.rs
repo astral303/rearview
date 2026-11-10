@@ -32,6 +32,7 @@ fn entries_of(row: &Conversation) -> DisplayEntries {
     )
     .unwrap()
     .value
+    .expect("a read without a session cache parses the transcripts")
 }
 
 fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
@@ -42,7 +43,8 @@ fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
         &row.subagents,
     )
     .unwrap()
-    .value;
+    .value
+    .expect("a read without a session cache parses the transcripts");
     let options = RenderOptions {
         tool_display,
         show_thinking: true,

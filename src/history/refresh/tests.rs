@@ -394,6 +394,8 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
     };
     std::thread::scope(|scope| {
         let running = scope.spawn(|| {
+            let operation =
+                crate::history::environment::test_support::waiting_operation(&environment);
             refresh_sources(
                 &known,
                 &[Source::Pi],
@@ -405,6 +407,7 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
                         false,
                         None,
                         needs_reading,
+                        &operation,
                     )
                 },
             )

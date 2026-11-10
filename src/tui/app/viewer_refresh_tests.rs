@@ -1,7 +1,7 @@
 //! `Ctrl+R` in the viewer: the open session read again from its file.
 
 use super::claude_home::{ClaudeHome, app_reading};
-use super::refresh_tests::refresh_found;
+use super::refresh_tests::{refresh_found, serve_session_refresh};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
@@ -481,6 +481,7 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
         }],
         ..Default::default()
     }));
+    serve_session_refresh(&mut app);
 
     assert_eq!(
         app.conversations()[0].message_count,
