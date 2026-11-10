@@ -242,6 +242,7 @@ fn rows_awaiting_this_processs_refresh_wait_for_the_process_that_took_it_over() 
     let environment = reading_home(home.path(), base.path());
     let held = RefreshOwnership::acquire(environment.cache_base().unwrap(), || ()).unwrap();
     let mut app = app_reading(vec![rows.remove(0)], environment);
+    grow(&path);
     app.begin_refresh().unwrap();
     app.note_changed_during_refresh(&path);
     app.finish_refresh(refresh_found(SessionChanges::default()));

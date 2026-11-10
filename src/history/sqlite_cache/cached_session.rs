@@ -92,10 +92,10 @@ impl CachedSession {
 
     fn validate_source(&self, connection: &Connection, session: i64) -> Result<()> {
         files::validate(connection, session)?;
-        let logical: Option<(String, crate::history::cache::CachedFingerprint)> = connection.query_row(
+        let logical: Option<(String, crate::history::fingerprint::CachedFingerprint)> = connection.query_row(
             "SELECT s.locator, s.file_size, s.mtime_secs, s.mtime_nsecs FROM sessions s \
              JOIN session_files f ON f.session = s.id WHERE s.id = ?1 AND f.kind = 'locator' AND f.file_size IS NULL",
-            [session], |row| Ok((row.get(0)?, crate::history::cache::CachedFingerprint { file_size: row.get::<_, i64>(1)? as u64, mtime_secs: row.get::<_, i64>(2)? as u64, mtime_nsecs: row.get(3)? })),
+            [session], |row| Ok((row.get(0)?, crate::history::fingerprint::CachedFingerprint { file_size: row.get::<_, i64>(1)? as u64, mtime_secs: row.get::<_, i64>(2)? as u64, mtime_nsecs: row.get(3)? })),
         ).optional()?;
         if let Some((locator, expected)) = logical {
             let current = self.source.provider().storage().current_fingerprint(

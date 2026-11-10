@@ -1,7 +1,6 @@
 //! The session cache database, `history.sqlite3` in the cache base: every
 //! session's catalogue row and the entries `session_entries` returns for
-//! it. Catalogue, viewer and agent readers share it; the refresh pipeline
-//! continues writing legacy shards until their removal in the final phase.
+//! it. Catalogue, viewer and agent readers share it.
 //!
 //! Each session's rows are written in short transactions outside the parse:
 //! its catalogue row first, marked [`catalogue::WRITING`], then its entries
@@ -27,7 +26,7 @@ pub(crate) use admission::admit_first_build;
 pub use base::{CacheBase, ProcessIdentity};
 pub use cached_session::CachedSession;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
-pub(crate) use catalogue::{SessionRecord, SessionStatus};
+pub(crate) use catalogue::{SessionRecord, SessionStatus, subagents_as_listed};
 pub(crate) use entries::StoredEntries;
 pub(crate) use interactive::Fallback;
 pub use interactive::{CacheFollowUp, DrawingThread, InteractiveCache, InteractiveRead};
@@ -39,7 +38,7 @@ use crate::debug;
 use crate::error::{AppError, Result};
 #[cfg(test)]
 use crate::history::TranscriptEntries;
-use crate::history::cache::CachedFingerprint;
+use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::SessionCache;
 use connection::Access;
 use entries::path_text;
@@ -482,8 +481,8 @@ impl CacheWriter {
     }
 
     /// Deletes `storage`'s sessions when they were written under another
-    /// version of its shard cache's schema, so the load writes them again,
-    /// and records the version they are written under now.
+    /// `SessionCache::schema_version` of the storage, so the load writes
+    /// them again, and records the version they are written under now.
     pub(crate) fn admit_storage(&self, storage: SessionCache) -> Result<()> {
         if self.storage_is_current(storage)? {
             return Ok(());
@@ -784,8 +783,8 @@ fn storage_schema_key(storage: SessionCache) -> String {
     format!("storage_schema:{}", storage.directory)
 }
 
-/// True when `storage`'s sessions were written under the version of its
-/// shard cache's schema this release uses.
+/// True when `storage`'s sessions were written under the
+/// `SessionCache::schema_version` this release gives the storage.
 fn is_storage_current(connection: &Connection, storage: SessionCache) -> Result<bool> {
     Ok(
         read_meta(connection, &storage_schema_key(storage))?.as_deref()

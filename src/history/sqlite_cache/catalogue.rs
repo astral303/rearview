@@ -2,7 +2,7 @@
 //! record a load hands the database writer.
 
 use super::entries::path_text;
-use crate::history::cache::CachedFingerprint;
+use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::{RecordedSession, SessionCache, SessionRoot, SessionStub};
 use crate::history::{Conversation, ParseError, Source, TranscriptEntries};
 use std::collections::BTreeSet;
@@ -95,6 +95,9 @@ impl SessionRecord {
     }
 }
 
+/// The search parts and source transcripts of each sub-agent transcript at
+/// `subagents` that reads. An unreadable sub-agent transcript is left out,
+/// as the session's entries leave it out.
 fn read_subagent_search_parts(
     source: Source,
     subagents: &[std::path::PathBuf],
@@ -102,7 +105,7 @@ fn read_subagent_search_parts(
     let mut parts = Vec::new();
     let mut sources = BTreeSet::new();
     for (index, path) in subagents.iter().enumerate() {
-        if let Some(projection) = source.provider().format().parse_transcript(path)? {
+        if let Ok(Some(projection)) = source.provider().format().parse_transcript(path) {
             sources.extend(
                 projection
                     .entries
@@ -297,7 +300,37 @@ impl CatalogueRow {
         self.assistant_messages = Some(conversation.assistant_messages as i64);
         self.is_missing_earlier_turns = Some(conversation.is_missing_earlier_turns);
         self.parse_errors.clone_from(&conversation.parse_errors);
+        // The row's sub-agents, not the stub's: a row leaves out the
+        // sub-agents of discarded turns. The stub's fingerprint still spans
+        // every sub-agent transcript.
+        self.files.retain(|file| file.kind != "subagent");
+        self.files
+            .extend(conversation.subagents.iter().map(|file| SessionFile {
+                kind: "subagent",
+                path: path_text(&super::files::key(file)),
+                fingerprint: file_fingerprint(file),
+            }));
     }
+}
+
+/// `restored`, the sub-agent transcripts of a row the database restored for
+/// the session at `stub`, spelled as `stub` lists them: the database keys
+/// each by its canonical path. A transcript `stub` does not list keeps the
+/// database's spelling.
+pub(crate) fn subagents_as_listed(
+    stub: &SessionStub,
+    restored: Vec<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    restored
+        .into_iter()
+        .map(|key| {
+            stub.subagents
+                .iter()
+                .find(|listed| super::files::key(listed) == key)
+                .cloned()
+                .unwrap_or(key)
+        })
+        .collect()
 }
 
 fn transcript_paths(entries: &TranscriptEntries) -> BTreeSet<&Path> {

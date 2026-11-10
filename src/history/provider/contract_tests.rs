@@ -609,12 +609,19 @@ mod runner {
 }
 
 /// Every conversation under `home`, through the shared load loop with its
-/// session cache under `cache_base`.
+/// session cache database under `cache_base`, admitted as a first build
+/// admits it.
 pub(crate) fn load_under(
     fixture: &'static dyn ProviderFixture,
     home: &Path,
     cache_base: &Path,
 ) -> Vec<Conversation> {
+    crate::history::sqlite_cache::SqliteCache::open(
+        &crate::history::sqlite_cache::tests::rearview_at(cache_base),
+    )
+    .unwrap()
+    .mark_admitted()
+    .unwrap();
     let environment = fixture_environment(fixture, home, cache_base);
     let storage = environment.storages()[0];
     super::load_sessions(

@@ -624,32 +624,31 @@ mod tests {
         }
     }
 
-    /// `directory` and `magic` must never change: a new value orphans the file
-    /// a user already has instead of replacing it. `schema_version` changes
-    /// when the meaning of an entry changes, and every bump discards that
-    /// provider's cache and costs one cold load.
+    /// `directory` must never change: a new value orphans the sessions a user
+    /// already has cached instead of replacing them. `schema_version` changes
+    /// when the meaning of a recorded session changes, and every bump costs
+    /// one cold load of that provider.
     #[test]
     fn session_cache_identities_are_pinned() {
         let pinned = [
-            (Source::Claude, "claude", *b"CLHIST02", 19),
-            (Source::Pi, "pi", *b"PIHIST01", 17),
-            (Source::Omp, "omp", *b"OMHIST01", 19),
-            (Source::Codex, "codex", *b"CXHIST01", 26),
-            (Source::Kimi, "kimi", *b"KIHIST01", 18),
-            (Source::Grok, "grok", *b"GKHIST01", 10),
-            (Source::OpenCode, "opencode", *b"OCHIST01", 16),
+            (Source::Claude, "claude", 19),
+            (Source::Pi, "pi", 17),
+            (Source::Omp, "omp", 19),
+            (Source::Codex, "codex", 26),
+            (Source::Kimi, "kimi", 18),
+            (Source::Grok, "grok", 10),
+            (Source::OpenCode, "opencode", 16),
         ];
         assert_eq!(
             pinned.len(),
             providers().len(),
             "a provider is missing from the pinned list"
         );
-        for (source, directory, magic, schema_version) in pinned {
+        for (source, directory, schema_version) in pinned {
             assert_eq!(
                 source.provider().storage().cache(),
                 SessionCache {
                     directory,
-                    magic,
                     schema_version,
                 },
                 "{source:?} cache identity"
@@ -675,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn session_caches_do_not_share_directory_or_magic() {
+    fn session_caches_do_not_share_a_directory() {
         let caches = providers()
             .iter()
             .map(|provider| (provider.labels().name, provider.storage().cache()))
@@ -685,10 +684,6 @@ mod tests {
                 assert_ne!(
                     cache.directory, other.directory,
                     "providers {name} and {other_name} must have different cache directories"
-                );
-                assert_ne!(
-                    cache.magic, other.magic,
-                    "providers {name} and {other_name} must have different magic bytes"
                 );
             }
         }

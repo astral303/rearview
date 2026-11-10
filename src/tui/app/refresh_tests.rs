@@ -3,8 +3,8 @@ use super::refresh_state::AppliedChanges;
 use super::*;
 use crate::clock::TestClock;
 use crate::error::AppError;
-use crate::history::cache::CachedFingerprint;
 use crate::history::environment::test_support::test_environment;
+use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::{SessionTitle, reread_sessions};
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
 use crate::history::{

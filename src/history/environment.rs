@@ -146,12 +146,19 @@ pub(crate) mod test_support {
         )
     }
 
-    /// Every session `storage` holds, newest first, loaded through the
-    /// session cache under `cache_base` on test time.
+    /// Every session `storage` holds, newest first, loaded on test time
+    /// through the session cache database under `cache_base`, admitted as a
+    /// first build admits it.
     pub(crate) fn load_rows(
         storage: &dyn SessionStorage,
         cache_base: &Path,
     ) -> Vec<crate::history::Conversation> {
+        crate::history::sqlite_cache::SqliteCache::open(
+            &crate::history::sqlite_cache::tests::rearview_at(cache_base),
+        )
+        .unwrap()
+        .mark_admitted()
+        .unwrap();
         crate::history::provider::load_sessions(
             &test_environment(Vec::new(), Some(cache_base)),
             storage,

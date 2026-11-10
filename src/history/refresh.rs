@@ -1,7 +1,7 @@
 //! Refreshing a loaded list: reading only the sessions new or changed since
 //! it was loaded.
 
-use super::cache::CachedFingerprint;
+use super::fingerprint::CachedFingerprint;
 use super::loader::{SeenPaths, sessions_not_loaded_term};
 use super::provider::{
     self, FoundSession, ReadError, RediscoveredSessions, SessionRead, SessionStub, SessionTitle,

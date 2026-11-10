@@ -677,7 +677,8 @@ fn writing_a_session_again_replaces_its_rows() {
     assert_eq!(read.entries.len(), expected.entries.len());
 }
 
-/// A shard schema bump also invalidates that provider's database rows.
+/// A `SessionCache::schema_version` bump invalidates that provider's
+/// database rows.
 #[test]
 fn a_storage_written_under_another_schema_version_loses_its_sessions() {
     let base = tempfile::tempdir().unwrap();

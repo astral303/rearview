@@ -459,7 +459,6 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            magic: *b"CXHIST01",
             schema_version: 26,
         }
     }
@@ -1949,14 +1948,20 @@ pub(super) mod tests {
         .unwrap()
         .unwrap();
 
-        for load in ["parsed", "restored from the cache"] {
-            let rows = load_rows(&storage, cache_base.path());
-            let [row] = rows.as_slice() else {
-                panic!("{} sessions when {load}", rows.len());
-            };
-            assert_eq!(row.subagents, vec![thread.kept.clone()], "{load}");
-            assert_eq!(row.agent_search_text, kept_only.agent_search_text, "{load}");
-            assert_eq!(row.message_count, kept_only.message_count, "{load}");
+        let parsed = load_rows(&storage, cache_base.path());
+        let restored = load_rows(&storage, cache_base.path());
+
+        let [parsed] = parsed.as_slice() else {
+            panic!("{} sessions when parsed", parsed.len());
+        };
+        assert_eq!(parsed.agent_search_text, kept_only.agent_search_text);
+        let [restored] = restored.as_slice() else {
+            panic!("{} sessions when restored", restored.len());
+        };
+        assert!(restored.cached_session.is_some(), "restored from the cache");
+        for row in [parsed, restored] {
+            assert_eq!(row.subagents, vec![thread.kept.clone()]);
+            assert_eq!(row.message_count, kept_only.message_count);
         }
     }
 

@@ -204,7 +204,6 @@ impl SessionStorage for ClaudeStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "claude",
-            magic: *b"CLHIST02",
             schema_version: 19,
         }
     }
@@ -1256,33 +1255,14 @@ pub(crate) mod tests {
         }
         assert!(session.full_text.contains("PARENT_ANSWER_SENTINEL"));
 
-        // The second load restores the row from the cache. The hit is proved
-        // by rewriting a sub-agent transcript under its original size and
-        // mtime: a re-parse would show the rewritten text.
-        let nested = subagents_dir.join(FIXTURE_SUBAGENTS[2]);
-        let modified = std::fs::metadata(&nested).unwrap().modified().unwrap();
-        let rewritten = std::fs::read_to_string(&nested)
-            .unwrap()
-            .replace("NESTED_SUBAGENT_SENTINEL", "NESTED_SUBAGENT_REWRITE_");
-        std::fs::write(&nested, rewritten).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&nested)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
         let restored = load_the_one_session(root.path(), cache.path());
         assert!(
-            restored
-                .agent_search_text
-                .contains("NESTED_SUBAGENT_SENTINEL"),
-            "the second load is a cache hit"
+            restored.cached_session.is_some(),
+            "the second load restores the row from the session cache database"
         );
         assert_eq!(restored.subagents, session.subagents);
         assert_eq!(restored.message_count, session.message_count);
         assert_eq!(restored.total_tokens, session.total_tokens);
-        assert_eq!(restored.agent_search_text, session.agent_search_text);
-        assert_eq!(restored.semantic_route_text, session.semantic_route_text);
     }
 
     /// Semantic and hybrid `agent search` route to a session by its
@@ -1673,19 +1653,19 @@ pub(crate) mod tests {
 
     /// Releases up to v0.3.1 cached Claude per project directory, under a
     /// directory named for the `CLAUDE_CONFIG_DIR` when one was set. The
-    /// shard cache beside it stays.
+    /// other directories in the cache base stay.
     #[test]
     fn per_project_cache_of_earlier_releases_is_removed() {
         let base = tempfile::tempdir().unwrap();
-        let shards = base.path().join("claude").join("root-0000000000000000");
-        std::fs::create_dir_all(&shards).unwrap();
+        let other = base.path().join("claude").join("root-0000000000000000");
+        std::fs::create_dir_all(&other).unwrap();
         let unconfigured = base.path().join("projects");
         write_project_cache_file(&unconfigured.join("-tmp-project.bin"));
 
         remove_project_cache(base.path(), None);
 
         assert!(!unconfigured.exists());
-        assert!(shards.exists());
+        assert!(other.exists());
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&"/elsewhere/.claude".to_owned(), &mut hasher);
@@ -1698,7 +1678,7 @@ pub(crate) mod tests {
         remove_project_cache(base.path(), Some("/elsewhere/.claude"));
 
         assert!(!configured.exists());
-        assert!(shards.exists());
+        assert!(other.exists());
     }
 
     /// `REARVIEW_CACHE_DIR` can name a directory whose `projects/` is the

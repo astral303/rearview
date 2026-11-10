@@ -3,8 +3,8 @@
 use super::{CachedSession, SqliteCache, path_text};
 use crate::agent::time_span::TimeSpan;
 use crate::error::Result;
-use crate::history::cache::CachedFingerprint;
-use crate::history::provider::SessionCache;
+use crate::history::fingerprint::CachedFingerprint;
+use crate::history::provider::{RecordedSession, SessionCache};
 use crate::history::{Conversation, MessageTimes, ParseError, Source};
 use chrono::{Local, TimeZone};
 use rusqlite::{Connection, Row};
@@ -27,6 +27,39 @@ impl SqliteCache {
         show_last: bool,
     ) -> Result<HashMap<String, CatalogueSession>> {
         self.read_catalogue(storage, source, root, show_last, None)
+    }
+
+    /// What each session under `root` recorded of itself, by cache key: its
+    /// id and working directory when it is listed, `None` when it holds no
+    /// conversation or could not be read. Read without the rows' text.
+    pub(crate) fn recorded_sessions(
+        &self,
+        storage: SessionCache,
+        root: &Path,
+    ) -> Result<HashMap<String, Option<RecordedSession>>> {
+        self.with_read_snapshot(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT cache_key, status, session_id, cwd FROM sessions \
+                 WHERE storage = ?1 AND root = ?2 AND status != 'writing' \
+                 AND entries_error IS NULL",
+            )?;
+            let mut rows =
+                statement.query(rusqlite::params![storage.directory, path_text(root)])?;
+            let mut sessions = HashMap::new();
+            while let Some(row) = rows.next()? {
+                let status: String = row.get(1)?;
+                let recorded = match status.as_str() {
+                    "listed" => Some(RecordedSession {
+                        session_id: row.get(2)?,
+                        project_dir: row.get::<_, Option<String>>(3)?.map(PathBuf::from),
+                    }),
+                    "empty" | "unreadable" => None,
+                    _ => continue,
+                };
+                sessions.insert(row.get(0)?, recorded);
+            }
+            Ok(sessions)
+        })
     }
 
     pub(crate) fn catalogue_session(

@@ -298,27 +298,27 @@ fn old_ownership_doesnt_return_after_release_and_reacquisition() {
 }
 
 #[test]
-fn shard_publication_holds_the_writer_lock_until_replacement_finishes() {
+fn a_write_batch_holds_the_writer_lock_and_a_replaced_owner_writes_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire(&base, || ()).unwrap();
-    let shard = base.path().join("shard.bin");
+    let written = base.path().join("written.txt");
     owner.token.write_batch(||{
         let mut contender = connect(base.path(), Duration::ZERO).unwrap();
         assert!(matches!(
             contender.transaction_with_behavior(TransactionBehavior::Immediate),
             Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy
         ));
-        std::fs::write(&shard, "current owner").unwrap();
+        std::fs::write(&written, "current owner").unwrap();
     }).unwrap();
     let replacement = replace_owner(&base);
     assert!(matches!(
         owner
             .token
-            .write_batch(|| std::fs::write(&shard, "old owner").unwrap()),
+            .write_batch(|| std::fs::write(&written, "old owner").unwrap()),
         Err(AppError::SessionCacheRefreshLost)
     ));
-    assert_eq!(std::fs::read_to_string(shard).unwrap(), "current owner");
+    assert_eq!(std::fs::read_to_string(written).unwrap(), "current owner");
     replacement.write_batch(|| ()).unwrap();
 }
 

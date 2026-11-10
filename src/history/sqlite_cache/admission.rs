@@ -21,8 +21,8 @@ const LARGEST_PER_PROVIDER: usize = 2;
 /// sessions by size.
 const SPREAD_PER_PROVIDER: usize = 8;
 const SAMPLE_WRITE_HEADROOM: u64 = super::JOURNAL_SIZE_LIMIT;
-// The transitional shard holds searchable text and its lowercase copy;
-// SQLite adds a third projection. This allowance is an estimate, not a quota.
+// Room for the sample's writes: searchable text, its lowercase copy and the
+// database's own projection. This allowance is an estimate, not a quota.
 const SAMPLE_TRANSCRIPT_COPIES: u64 = 3;
 // Large sessions can retain a different share of their transcript bytes
 // than the rest of the corpus. Reserve an extra quarter beyond the sample.
