@@ -247,48 +247,127 @@ struct LogLine {
     number: usize,
     /// Past the line's line ending; `None` for a last line without one.
     end: Option<LineCursor>,
-    /// The line as written, kept for the records that can hold the header.
+    /// The line as written: the header's identity hashes it.
     text: String,
     record: Option<Value>,
 }
 
-/// The lines of `reader`, standing at `from`, to its end, and the cursor
-/// past the last line with a line ending. The text is kept for the first
-/// `texts_kept` records.
-fn read_log_lines(
+/// Hands `visit` each line of `reader`, standing at `from`, to its end, in
+/// file order; returns the cursor past the last line with a line ending.
+fn visit_log_lines(
     reader: impl BufRead,
     from: LineCursor,
-    texts_kept: usize,
-) -> std::io::Result<(Vec<LogLine>, LineCursor)> {
+    mut visit: impl FnMut(LogLine),
+) -> std::io::Result<LineCursor> {
     let parse = |line: &str| serde_json::from_str::<Value>(line).ok();
-    let mut lines = Vec::new();
-    let mut kept = 0;
-    let mut push = |number, end, text: String, record: Option<Value>| {
-        let text = if record.is_some() && kept < texts_kept {
-            kept += 1;
-            text
-        } else {
-            String::new()
-        };
-        lines.push(LogLine {
-            number,
-            end,
-            text,
-            record,
-        });
-    };
     let read = visit_line_spans_from(
         reader,
         from,
         ParallelThreshold::DEFAULT,
         parse,
-        |span, text, record| push(span.start.line, Some(span.end), text, record),
+        |span, text, record| {
+            visit(LogLine {
+                number: span.start.line,
+                end: Some(span.end),
+                text,
+                record,
+            })
+        },
     )?;
     if let Some((number, text)) = read.unterminated {
         let record = parse(&text);
-        push(number, None, text, record);
+        visit(LogLine {
+            number,
+            end: None,
+            text,
+            record,
+        });
     }
-    Ok((lines, read.cursor))
+    Ok(read.cursor)
+}
+
+/// A whole read of a Pi-family log, line by line: its first records until
+/// they settle the header, then the entries after it.
+enum WholeLog {
+    /// Before the header settles: the records so far, at most
+    /// [`HEAD_RECORDS`], and the lines that hold none.
+    Head {
+        records: Vec<LogLine>,
+        malformed_lines: Vec<usize>,
+    },
+    /// The header the reader accepts, and the entries after it.
+    Entries { header: LogHeader, raw: RawEntries },
+    /// The first records hold no header the reader accepts.
+    Rejected,
+}
+
+impl WholeLog {
+    fn new() -> Self {
+        Self::Head {
+            records: Vec::with_capacity(HEAD_RECORDS),
+            malformed_lines: Vec::new(),
+        }
+    }
+
+    /// Take the log's next line, attributing a log without a title slot to
+    /// `default_source`.
+    fn read(&mut self, line: LogLine, default_source: Source) {
+        match self {
+            Self::Head {
+                records,
+                malformed_lines,
+            } => {
+                if line.record.is_none() {
+                    malformed_lines.push(line.number);
+                    return;
+                }
+                records.push(line);
+                if records.len() == HEAD_RECORDS {
+                    *self = Self::settled(
+                        std::mem::take(records),
+                        std::mem::take(malformed_lines),
+                        default_source,
+                    );
+                }
+            }
+            Self::Entries { raw, .. } => raw.push_line(line),
+            Self::Rejected => {}
+        }
+    }
+
+    /// The log once `records`, its first records, settle its header: the
+    /// records past the header are its first entries, after
+    /// `malformed_lines`, the lines among them that hold no record.
+    fn settled(records: Vec<LogLine>, malformed_lines: Vec<usize>, default_source: Source) -> Self {
+        let Some(header) = records
+            .first()
+            .and_then(|first| LogHeader::of(first, records.get(1), default_source))
+        else {
+            return Self::Rejected;
+        };
+        let mut raw = RawEntries::after(header.version, None);
+        raw.malformed_lines = malformed_lines;
+        for line in records.into_iter().skip(header.record_count) {
+            raw.push_line(line);
+        }
+        Self::Entries { header, raw }
+    }
+
+    /// The header and the entries after it; `None` for a log without a
+    /// header the reader accepts.
+    fn finish(self, default_source: Source) -> Option<(LogHeader, RawEntries)> {
+        let settled = match self {
+            Self::Head {
+                records,
+                malformed_lines,
+            } => Self::settled(records, malformed_lines, default_source),
+            settled => settled,
+        };
+        match settled {
+            Self::Entries { header, raw } => Some((header, raw)),
+            Self::Head { .. } | Self::Rejected => None,
+        }
+    }
 }
 
 /// The lines of `reader` up to its first [`HEAD_RECORDS`] records, which
@@ -351,6 +430,14 @@ impl RawEntries {
             previous_id,
             entries: Vec::new(),
             malformed_lines: Vec::new(),
+        }
+    }
+
+    /// Add `line`'s record; a line that holds none is malformed.
+    fn push_line(&mut self, line: LogLine) {
+        match line.record {
+            Some(record) => self.push(line.number, line.end, record),
+            None => self.malformed_lines.push(line.number),
         }
     }
 
@@ -607,37 +694,17 @@ fn parse_reader(
     default_source: Source,
     mut dropped: DroppedRecords,
 ) -> Result<Option<SessionProjection>> {
-    let (lines, cursor) = read_log_lines(&mut reader, LineCursor::START, HEAD_RECORDS)?;
-    let mut records = lines.iter().filter(|line| line.record.is_some());
-    let Some(header) = records
-        .next()
-        .and_then(|first| LogHeader::of(first, records.next(), default_source))
-    else {
+    let mut log = WholeLog::new();
+    let cursor = visit_log_lines(&mut reader, LineCursor::START, |line| {
+        log.read(line, default_source)
+    })?;
+    let Some((header, raw)) = log.finish(default_source) else {
         return Ok(None);
     };
     let version = header.version;
     // The header records the session file's format, not the release that
     // wrote it.
     dropped.record_version(|| Some(format!("session format {version}")));
-
-    let mut raw = RawEntries::after(version, None);
-    let mut records_seen = 0;
-    for LogLine {
-        number,
-        end,
-        record,
-        ..
-    } in lines
-    {
-        let Some(record) = record else {
-            raw.malformed_lines.push(number);
-            continue;
-        };
-        records_seen += 1;
-        if records_seen > header.record_count {
-            raw.push(number, end, record);
-        }
-    }
 
     let branch = ShownBranch::of(&raw.entries);
     let mut entries: Vec<(usize, LogEntry)> = header.title_entry().into_iter().collect();
@@ -729,14 +796,8 @@ impl TranscriptReader for PiLogFormat {
         };
         let mut reader = BufReader::new(File::open(source)?);
         reader.seek(SeekFrom::Start(stable_cursor.offset))?;
-        let (lines, cursor) = read_log_lines(&mut reader, stable_cursor, 0)?;
         let mut raw = RawEntries::after(state.version, state.leaf.clone());
-        for line in lines {
-            match line.record {
-                Some(record) => raw.push(line.number, line.end, record),
-                None => raw.malformed_lines.push(line.number),
-            }
-        }
+        let cursor = visit_log_lines(&mut reader, stable_cursor, |line| raw.push_line(line))?;
         let branch = ShownBranch::of(&raw.entries);
         let Some(end) = LogReadEnd::of(&raw.entries, &branch, stable_cursor, cursor, &state) else {
             return Ok(Resumption::ChangesEarlierEntry);
