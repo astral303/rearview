@@ -6,7 +6,10 @@ use super::files::FileKey;
 use super::positional::PositionalRow;
 use crate::history::fingerprint::{CachedFingerprint, FileStamp};
 use crate::history::parser::{SessionTranscripts, SubagentSearchPart};
-use crate::history::provider::{RecordedSession, SessionCache, SessionRoot, SessionStub};
+use crate::history::provider::{
+    RecordedSession, SessionCache, SessionRoot, SessionStub, TranscriptRead,
+};
+use crate::history::resumed::SessionCheckpoint;
 use crate::history::{Conversation, ParseError, Source, TranscriptEntries};
 use rusqlite::types::Value;
 use std::collections::HashMap;
@@ -52,6 +55,13 @@ pub(crate) struct SessionRecord {
     /// writes it; `None` for a listed one.
     pub(super) unlisted_reason: Option<String>,
     pub(super) search_parts: Vec<SubagentSearchPart>,
+    /// Where a resumed read of the session starts, with the agent's ledger
+    /// of its threads' links; `None` for a session whose next change is read
+    /// whole.
+    pub(super) checkpoint: Option<(SessionCheckpoint, Vec<u8>)>,
+    /// For a record of a resumed read: what changed, written over the
+    /// stored session in place of its whole entries.
+    pub(super) update: Option<Box<super::window::WindowUpdate>>,
 }
 
 /// A session's transcript files as its stub names them, the locator first,
@@ -70,6 +80,14 @@ impl StubStamps {
                 .collect(),
         )
     }
+
+    /// The stamp of the stub's file at `path`.
+    pub(crate) fn fingerprint_of(&self, path: &Path) -> Option<CachedFingerprint> {
+        self.0
+            .iter()
+            .find(|stamp| stamp.path == path)
+            .and_then(|stamp| stamp.fingerprint)
+    }
 }
 
 impl SessionRecord {
@@ -84,12 +102,18 @@ impl SessionRecord {
         stub: &SessionStub,
         stamps: StubStamps,
         conversation: &Conversation,
-        transcripts: SessionTranscripts,
+        mut transcripts: SessionTranscripts,
     ) -> Option<Self> {
         let mut catalogue =
             CatalogueRow::of_stub(storage, source, root, stub, stamps, SessionStatus::Listed)?;
         catalogue.describe(stub, conversation);
-        let (entries, search_parts) = match catalogue.add_transcripts_read(&transcripts) {
+        let added = catalogue.add_transcripts_read(&transcripts);
+        catalogue.add_reads(&transcripts);
+        let checkpoint = transcripts
+            .checkpoint
+            .take()
+            .map(|checkpoint| (checkpoint, std::mem::take(&mut transcripts.ledger)));
+        let (entries, search_parts) = match added {
             Ok(()) => {
                 let (entries, search_parts) = transcripts.into_entries_and_search_parts();
                 (Ok(entries), search_parts)
@@ -101,6 +125,50 @@ impl SessionRecord {
             entries: Some(entries),
             unlisted_reason: None,
             search_parts,
+            checkpoint,
+            update: None,
+        })
+    }
+
+    /// The record of `conversation`, a resumed read of `storage`'s session
+    /// at `stub` under `root`, whose files were stamped as `stamps` before
+    /// the read. `reads` gives each file read again what its read leaves
+    /// for the next and its share of the row, `stored` each other file's.
+    /// `None` when a file changed after its stamp was taken, or the stub
+    /// has no fingerprint.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resumed(
+        storage: SessionCache,
+        source: Source,
+        root: &SessionRoot,
+        stub: &SessionStub,
+        stamps: StubStamps,
+        conversation: &Conversation,
+        reads: HashMap<PathBuf, (TranscriptRead, Vec<u8>)>,
+        entries: TranscriptEntries,
+        search_parts: Vec<SubagentSearchPart>,
+        checkpoint: Option<(SessionCheckpoint, Vec<u8>)>,
+        update: super::window::WindowUpdate,
+    ) -> Option<Self> {
+        let mut catalogue =
+            CatalogueRow::of_stub(storage, source, root, stub, stamps, SessionStatus::Listed)?;
+        catalogue.describe(stub, conversation);
+        for file in &mut catalogue.files {
+            if CachedFingerprint::of_file(&file.path).ok()? != file.fingerprint {
+                return None;
+            }
+            if let Some((read, fold)) = reads.get(&file.path) {
+                file.read = read.clone();
+                file.fold = fold.clone();
+            }
+        }
+        Some(Self {
+            catalogue,
+            entries: Some(Ok(entries)),
+            unlisted_reason: None,
+            search_parts,
+            checkpoint,
+            update: Some(Box::new(update)),
         })
     }
 
@@ -123,6 +191,8 @@ impl SessionRecord {
             entries: None,
             unlisted_reason: Some(reason),
             search_parts: Vec::new(),
+            checkpoint: None,
+            update: None,
         })
     }
 }
@@ -165,6 +235,28 @@ pub(super) struct SessionFile {
     /// As discovery, or the transcript that names the file, spells it.
     pub(super) path: PathBuf,
     pub(super) fingerprint: Option<CachedFingerprint>,
+    /// What the parse's read of the file leaves for the next read: the full
+    /// read's values for a file read through the default, or not read.
+    pub(super) read: TranscriptRead,
+    /// A sub-agent transcript's encoded [`crate::history::resumed::ThreadFold`];
+    /// empty for any other file.
+    pub(super) fold: Vec<u8>,
+}
+
+impl SessionFile {
+    pub(super) fn new(
+        kind: &'static str,
+        path: PathBuf,
+        fingerprint: Option<CachedFingerprint>,
+    ) -> Self {
+        Self {
+            kind,
+            path,
+            fingerprint,
+            read: TranscriptRead::full_read(),
+            fold: Vec::new(),
+        }
+    }
 }
 
 /// The [`FileKey`] of a row's locator and of each of its files, in order.
@@ -398,10 +490,9 @@ impl CatalogueRow {
                 .0
                 .into_iter()
                 .enumerate()
-                .map(|(index, stamp)| SessionFile {
-                    kind: if index == 0 { "locator" } else { "subagent" },
-                    path: stamp.path,
-                    fingerprint: stamp.fingerprint,
+                .map(|(index, stamp)| {
+                    let kind = if index == 0 { "locator" } else { "subagent" };
+                    SessionFile::new(kind, stamp.path, stamp.fingerprint)
                 })
                 .collect(),
             parse_errors: Vec::new(),
@@ -423,11 +514,11 @@ impl CatalogueRow {
                     .stamp_before_read(path)
                     .and_then(|stamp| stamp.fingerprint)
                     .ok_or_else(|| AppError::SessionCacheSourceChanged(path.to_path_buf()))?;
-                self.files.push(SessionFile {
-                    kind: "continuation",
-                    path: path.to_path_buf(),
-                    fingerprint: Some(fingerprint),
-                });
+                self.files.push(SessionFile::new(
+                    "continuation",
+                    path.to_path_buf(),
+                    Some(fingerprint),
+                ));
             }
         }
         for file in &self.files {
@@ -486,15 +577,57 @@ impl CatalogueRow {
             false
         });
         self.files.extend(conversation.subagents.iter().map(|file| {
-            SessionFile {
-                kind: "subagent",
-                path: file.clone(),
-                fingerprint: stamped
-                    .get(file)
-                    .copied()
-                    .unwrap_or_else(|| file_fingerprint(file)),
-            }
+            let fingerprint = stamped
+                .get(file)
+                .copied()
+                .unwrap_or_else(|| file_fingerprint(file));
+            SessionFile::new("subagent", file.clone(), fingerprint)
         }));
+    }
+
+    /// Give each of the row's files what `transcripts`' read of it leaves
+    /// for the next read. A continuation file is read whole.
+    fn add_reads(&mut self, transcripts: &SessionTranscripts) {
+        for file in &mut self.files {
+            let read = match file.kind {
+                "locator" => Some(transcripts.own_read()),
+                "subagent" => transcripts.subagent_read(&file.path),
+                _ => None,
+            };
+            if let Some(read) = read {
+                file.read = read.clone();
+            }
+            if file.kind == "subagent"
+                && let Some(fold) = transcripts.subagent_fold(&file.path)
+            {
+                file.fold = fold.to_vec();
+            }
+        }
+    }
+
+    /// The row's `transcript_reads` rows, one per file at its position,
+    /// keyed by the file's path.
+    pub(super) fn read_rows(&self) -> Vec<PositionalRow<String>> {
+        self.files
+            .iter()
+            .map(|file| {
+                let path = path_text(&file.path);
+                let read = &file.read;
+                PositionalRow {
+                    key: path.clone(),
+                    values: vec![
+                        path.into(),
+                        read.cursor.clone().into(),
+                        read.stable_cursor.clone().into(),
+                        read.identity.clone().into(),
+                        read.rewrite_check.clone().into(),
+                        read.parser_state.clone().into(),
+                        read.stable_line.map(|line| line as i64).into(),
+                        file.fold.clone().into(),
+                    ],
+                }
+            })
+            .collect()
     }
 }
 

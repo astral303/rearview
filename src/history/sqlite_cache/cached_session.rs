@@ -36,6 +36,16 @@ pub(crate) struct CopyKey {
 }
 
 impl CachedSession {
+    /// The generation of the copy this session reads.
+    pub(crate) fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    /// This session, reading the copy of `generation`.
+    pub(crate) fn of_generation(self, generation: i64) -> Self {
+        Self { generation, ..self }
+    }
+
     pub(crate) fn copy_key(&self) -> CopyKey {
         CopyKey {
             root: self.root.clone(),

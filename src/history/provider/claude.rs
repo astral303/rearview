@@ -10,7 +10,8 @@ use super::{
     Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch, SessionProvider,
     SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
-    SourceLabels, Stored, SubagentFinder, resolved_session_paths, walk,
+    SourceLabels, Stored, SubagentFinder, ThreadLinker, TranscriptReader, resolved_session_paths,
+    walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -281,6 +282,14 @@ impl SessionStorage for ClaudeStorage {
                 .var(CONFIG_DIR_VARIABLE)
                 .as_deref(),
         );
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &CLAUDE_TRANSCRIPT
+    }
+
+    fn thread_linker(&self) -> &dyn ThreadLinker {
+        &CLAUDE_TRANSCRIPT
     }
 }
 
@@ -1354,7 +1363,14 @@ pub(crate) mod tests {
 
         assert_eq!(before.subagents.len(), 3);
         assert_eq!(after.subagents.len(), 4);
-        assert!(after.agent_search_text.contains("LATE_SUBAGENT_SENTINEL"));
+        // A resumed row's texts load lazily, as an unchanged row's do.
+        assert!(
+            after
+                .load_content()
+                .unwrap()
+                .agent_search_text
+                .contains("LATE_SUBAGENT_SENTINEL")
+        );
         assert_eq!(
             after.message_count,
             before.message_count + parsed_alone(&late).message_count

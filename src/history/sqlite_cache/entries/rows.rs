@@ -9,10 +9,11 @@ use super::messages::{MessageRow, Messages};
 use super::search::{self, EntrySearch};
 use super::threads::{Numbering, ThreadRow};
 use super::{EntryColumns, parts};
+use crate::agent::message_numbering::NumberingCheckpoint;
 use crate::history::TranscriptEntries;
 use crate::history::format::RecordLine;
 use crate::log_entry::{LogEntry, TokenUsage};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -20,8 +21,13 @@ pub(in super::super) struct SessionRows<'a> {
     pub(super) transcripts: Vec<Arc<Path>>,
     pub(super) threads: Vec<ThreadRow>,
     pub(super) messages: Vec<MessageRow<'a>>,
-    /// In the session's entry order: an entry's index is its `sequence`.
+    /// In the session's entry order: an entry's index after
+    /// `first_sequence` is its `sequence`.
     pub(super) entries: Vec<EntryRow<'a>>,
+    pub(super) first_sequence: usize,
+    /// The sequences of the stored entries before `first_sequence` that
+    /// held the title or the summary search reads, and no longer do.
+    pub(in super::super) superseded_leading: Vec<usize>,
 }
 
 pub(super) struct EntryRow<'a> {
@@ -37,6 +43,11 @@ pub(super) struct EntryRow<'a> {
     pub(super) transcript: Option<usize>,
     /// True for the title or the summary search reads.
     pub(super) is_leading: bool,
+    /// The timestamp text the splice orders the entry by.
+    pub(super) splice_key: Option<&'a str>,
+    /// The index in [`SessionRows::transcripts`] of the sub-agent
+    /// transcript a spliced turn came from.
+    pub(super) child: Option<usize>,
     pub(super) digest: i64,
 }
 
@@ -64,6 +75,7 @@ impl EntryRow<'_> {
             columns.uuid,
             columns.level,
             columns.parent_uuid,
+            self.splice_key,
         ] {
             digest.text(text);
         }
@@ -81,24 +93,56 @@ impl EntryRow<'_> {
     }
 }
 
+/// Where a session's rows start: the numbering of the entries before them,
+/// and the sequence of their first entry.
+#[derive(Default)]
+pub(in super::super) struct RowsStart {
+    pub(in super::super) numbering: NumberingCheckpoint,
+    /// The next position in each thread, by thread number.
+    pub(in super::super) positions: HashMap<i64, i64>,
+    pub(in super::super) sequence: usize,
+    /// The stored entries before them holding the title and the summary
+    /// search reads.
+    pub(in super::super) leading: LeadingTexts,
+}
+
 impl<'a> SessionRows<'a> {
     /// The rows of `entries`, the entries of a session whose sub-agent
     /// transcripts are `subagents`.
     pub(in super::super) fn of(entries: &'a TranscriptEntries, subagents: &HashSet<&Path>) -> Self {
-        let mut numbering = Numbering::default();
-        let mut messages = Messages::default();
-        let mut leading = LeadingTexts::default();
-        let mut rows = Vec::with_capacity(entries.entries.len());
-        for (index, (record, entry)) in entries.entries.iter().enumerate() {
+        Self::from(&entries.entries, subagents, &RowsStart::default())
+    }
+
+    /// The rows of `entries`, a session's entries from `start` on.
+    pub(in super::super) fn from(
+        entries: &'a [(RecordLine, LogEntry)],
+        subagents: &HashSet<&Path>,
+        start: &RowsStart,
+    ) -> Self {
+        let mut numbering = Numbering::resumed(&start.numbering, &start.positions);
+        let mut messages = Messages::resumed(&start.numbering);
+        let mut leading = start.leading;
+        let mut rows = Vec::with_capacity(entries.len());
+        for (index, (record, entry)) in entries.iter().enumerate() {
             let placement = numbering.place(record, entry);
             let columns = EntryColumns::of(entry);
             let membership = messages.add(index, &placement, entry, &columns);
-            leading.read(index, entry);
-            let spliced = record
+            leading.read(start.sequence + index, entry);
+            let child = record
                 .transcript
                 .as_deref()
-                .is_some_and(|path| subagents.contains(path));
-            let search = search::entry_search(entry, columns.parts.blocks(), spliced);
+                .filter(|path| subagents.contains(path))
+                .and(placement.record_transcript);
+            let splice_key = match (child, entry) {
+                (Some(_), LogEntry::Progress { extra, .. }) => Some(
+                    extra
+                        .get("timestamp")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                ),
+                _ => entry.timestamp(),
+            };
+            let search = search::entry_search(entry, columns.parts.blocks(), child.is_some());
             let mut row = EntryRow {
                 record,
                 columns,
@@ -108,19 +152,47 @@ impl<'a> SessionRows<'a> {
                 position: placement.position,
                 transcript: placement.transcript,
                 is_leading: false,
+                splice_key,
+                child,
                 digest: 0,
             };
             row.digest = row.digest();
             rows.push(row);
         }
-        for index in [leading.title, leading.summary].into_iter().flatten() {
-            rows[index].is_leading = true;
+        let is_leading =
+            |sequence: &usize| [leading.title, leading.summary].contains(&Some(*sequence));
+        for sequence in [leading.title, leading.summary].into_iter().flatten() {
+            if let Some(index) = sequence.checked_sub(start.sequence) {
+                rows[index].is_leading = true;
+            }
         }
+        let superseded_leading = [start.leading.title, start.leading.summary]
+            .into_iter()
+            .flatten()
+            .filter(|sequence| !is_leading(sequence))
+            .collect();
         Self {
             transcripts: numbering.transcripts,
             threads: numbering.threads,
             messages: messages.rows,
             entries: rows,
+            first_sequence: start.sequence,
+            superseded_leading,
+        }
+    }
+
+    /// The sequence of the entry at `index`.
+    pub(super) fn sequence_of(&self, index: usize) -> usize {
+        self.first_sequence + index
+    }
+
+    /// Leave the title search reads to an entry after these rows, the rows
+    /// of a session's leading entries, which names its own.
+    pub(in super::super) fn yield_title(&mut self) {
+        for row in &mut self.entries {
+            if row.columns.kind == "custom-title" {
+                row.is_leading = false;
+            }
         }
     }
 
@@ -134,23 +206,23 @@ impl<'a> SessionRows<'a> {
 }
 
 /// The entries holding the session's title and summary, which search reads
-/// with its text: the last custom title, unless it is blank; the last AI
-/// title that is not blank, else the first summary.
-#[derive(Default)]
-struct LeadingTexts {
-    title: Option<usize>,
-    summary: Option<usize>,
+/// with its text, by sequence: the last custom title, unless it is blank;
+/// the last AI title that is not blank, else the first summary.
+#[derive(Clone, Copy, Default)]
+pub(in super::super) struct LeadingTexts {
+    pub(in super::super) title: Option<usize>,
+    pub(in super::super) summary: Option<usize>,
 }
 
 impl LeadingTexts {
-    fn read(&mut self, index: usize, entry: &LogEntry) {
+    fn read(&mut self, sequence: usize, entry: &LogEntry) {
         match entry {
-            LogEntry::Summary { .. } if self.summary.is_none() => self.summary = Some(index),
+            LogEntry::Summary { .. } if self.summary.is_none() => self.summary = Some(sequence),
             LogEntry::AiTitle { ai_title } if !ai_title.trim().is_empty() => {
-                self.summary = Some(index);
+                self.summary = Some(sequence);
             }
             LogEntry::CustomTitle { custom_title } => {
-                self.title = (!custom_title.trim().is_empty()).then_some(index);
+                self.title = (!custom_title.trim().is_empty()).then_some(sequence);
             }
             _ => {}
         }

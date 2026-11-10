@@ -3,11 +3,16 @@
 //! answering it, a sub-agent's opening message repeating the call's prompt,
 //! and the receipt a background launch returns as the call's result.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::SubagentSidecar;
+use crate::history::format::RecordLine;
+use crate::history::format::splice::SubagentThread;
+use crate::history::provider::{LinkWindow, LinkedThread};
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 
 /// The opening sentence of a background launch's receipt. Instructions to the
@@ -46,61 +51,250 @@ fn opening_text(content: &Value) -> Option<&str> {
     }
 }
 
-/// The prompt of every `Agent` call among `entries`, by call id.
-pub(crate) fn agent_call_prompts<'a>(
-    entries: impl IntoIterator<Item = &'a LogEntry>,
-) -> HashMap<String, String> {
+/// The id and prompt of every `Agent` call among `entries`.
+fn agent_call_prompts<'a>(
+    entries: impl IntoIterator<Item = &'a (RecordLine, LogEntry)>,
+) -> impl Iterator<Item = (&'a RecordLine, &'a str, &'a str)> {
     entries
         .into_iter()
-        .filter_map(|entry| match entry {
-            LogEntry::Assistant { message, .. } => Some(&message.content),
+        .filter_map(|(record, entry)| match entry {
+            LogEntry::Assistant { message, .. } => Some((record, &message.content)),
             _ => None,
         })
-        .flatten()
-        .filter_map(|block| match block {
+        .flat_map(|(record, blocks)| blocks.iter().map(move |block| (record, block)))
+        .filter_map(|(record, block)| match block {
             ContentBlock::ToolUse {
                 id,
                 tool: Tool::Agent,
                 input,
                 ..
-            } => Some((id.clone(), input.get("prompt")?.as_str()?.to_owned())),
+            } => Some((record, id.as_str(), input.get("prompt")?.as_str()?)),
             _ => None,
         })
-        .collect()
 }
 
-/// A sub-agent's `entries` without the records repeating the `Agent` call
-/// its sidecar names. A fork's transcript opens with a copy of that call and
-/// a result holding the fork instructions and the call's prompt; both are
-/// dropped. A non-fork sub-agent's opening message is dropped when its text
-/// is exactly that prompt.
-pub(crate) fn without_launch_repeats<Record>(
+/// A fork's `entries` without its copy of the `Agent` call its sidecar
+/// names and the result answering that copy, which holds the fork
+/// instructions and the call's prompt. Any other sub-agent's entries stay.
+pub(crate) fn without_fork_copies<Record>(
     mut entries: Vec<(Record, LogEntry)>,
     sidecar: &SubagentSidecar,
-    prompts: &HashMap<String, String>,
 ) -> Vec<(Record, LogEntry)> {
-    let Some(call_id) = sidecar.tool_use_id.as_deref() else {
-        return entries;
-    };
-    if sidecar.is_fork {
+    if let (true, Some(call_id)) = (sidecar.is_fork, sidecar.tool_use_id.as_deref()) {
         entries.retain(|(_, entry)| !is_copy_of_call(entry, call_id));
-        return entries;
-    }
-    let Some(prompt) = prompts.get(call_id) else {
-        return entries;
-    };
-    let opening = entries
-        .iter()
-        .position(|(_, entry)| matches!(entry, LogEntry::User { .. } | LogEntry::Assistant { .. }));
-    if let Some(opening) = opening
-        && matches!(
-            &entries[opening].1,
-            LogEntry::User { message, .. } if message.content.whole_text() == Some(prompt.as_str())
-        )
-    {
-        entries.remove(opening);
     }
     entries
+}
+
+/// The index of the thread's first message among `entries`.
+fn opening_index(entries: &[(RecordLine, LogEntry)]) -> Option<usize> {
+    entries
+        .iter()
+        .position(|(_, entry)| matches!(entry, LogEntry::User { .. } | LogEntry::Assistant { .. }))
+}
+
+/// A hash of an `Agent` call's prompt: the ledger keeps it instead of the
+/// prompt, to tell whether a sub-agent's opening message repeats it.
+fn prompt_hash(prompt: &str) -> String {
+    blake3::hash(prompt.as_bytes()).to_hex().to_string()
+}
+
+/// Where a ledger item was read: its transcript, `None` for the session's
+/// own, and its line.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LedgerPlace {
+    transcript: Option<PathBuf>,
+    line: usize,
+}
+
+/// How a sub-agent thread was launched, as its sidecar records it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ThreadLaunch {
+    transcript: PathBuf,
+    /// The parent's `Agent` call that launched the thread.
+    call: Option<String>,
+    is_fork: bool,
+    /// The line of the thread's first message; `None` before one is read.
+    opening: Option<usize>,
+}
+
+impl ThreadLaunch {
+    /// The launch the sidecar beside the transcript at `transcript` records.
+    fn read(transcript: &Path) -> Self {
+        let sidecar = SubagentSidecar::read(transcript);
+        Self {
+            transcript: transcript.to_path_buf(),
+            call: sidecar.tool_use_id,
+            is_fork: sidecar.is_fork,
+            opening: None,
+        }
+    }
+}
+
+/// What links a Claude session's sub-agent threads to the session: each
+/// `Agent` call's prompt, by a hash, and each thread's launch. A
+/// non-fork sub-agent's opening message repeating its launching call's
+/// prompt, which may stand in another transcript, is dropped.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub(crate) struct LaunchLedger {
+    /// Each `Agent` call: its place, its id and its prompt's hash.
+    prompts: Vec<(LedgerPlace, String, String)>,
+    launches: Vec<ThreadLaunch>,
+}
+
+impl LaunchLedger {
+    pub(crate) fn decode(bytes: &[u8]) -> Self {
+        serde_json::from_slice(bytes).unwrap_or_default()
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a launch ledger serializes")
+    }
+
+    /// The ledger of `session`, the session's own entries, and `threads`,
+    /// each read whole; drops each thread's opening message that repeats
+    /// its launching call's prompt, and gives it that call.
+    pub(crate) fn link(session: &[(RecordLine, LogEntry)], threads: &mut [SubagentThread]) -> Self {
+        let mut ledger = Self::default();
+        ledger.add_prompts(None, session);
+        for thread in threads.iter() {
+            ledger.add_prompts(Some(&thread.transcript), &thread.entries);
+        }
+        for thread in threads.iter_mut() {
+            let mut launch = ThreadLaunch::read(&thread.transcript);
+            launch.opening =
+                opening_index(&thread.entries).map(|index| thread.entries[index].0.line);
+            thread.launch_call = launch.call.clone();
+            ledger.drop_repeated_prompt(&mut thread.entries, &launch);
+            ledger.launches.push(launch);
+        }
+        ledger
+    }
+
+    /// The ledger once `windows` replace what it holds of their transcripts,
+    /// for a session whose threads are `threads`: each thread's launching
+    /// call, in `threads` order, and the threads whose opening message the
+    /// windows hold or whose launching call they add, which are read whole
+    /// and given to [`Self::fold`].
+    pub(crate) fn update(
+        mut self,
+        windows: &[LinkWindow<'_>],
+        threads: &[LinkedThread<'_>],
+    ) -> (Self, Vec<Option<String>>, Vec<PathBuf>) {
+        let known: HashSet<String> = self.prompts.iter().map(|(_, id, _)| id.clone()).collect();
+        for window in windows {
+            self.prompts.retain(|(place, ..)| {
+                place.transcript.as_deref() != window.transcript || place.line < window.start_line
+            });
+        }
+        for window in windows {
+            self.add_prompts(window.transcript, window.entries);
+        }
+        let added: HashSet<&str> = self
+            .prompts
+            .iter()
+            .map(|(_, id, _)| id.as_str())
+            .filter(|id| !known.contains(*id))
+            .collect();
+        let mut rereads = Vec::new();
+        let mut launches = Vec::with_capacity(threads.len());
+        for thread in threads {
+            let mut launch = self
+                .launches
+                .iter()
+                .find(|launch| launch.transcript == thread.transcript)
+                .cloned()
+                .unwrap_or_else(|| ThreadLaunch::read(thread.transcript));
+            let window = windows
+                .iter()
+                .find(|window| window.transcript == Some(thread.transcript));
+            let opening_of = |entries: &[(RecordLine, LogEntry)]| {
+                opening_index(entries).map(|index| entries[index].0.line)
+            };
+            let mut reread = launch
+                .call
+                .as_deref()
+                .is_some_and(|call| added.contains(call))
+                && launch.opening.is_some();
+            match window {
+                // A whole read: the thread is folded as read.
+                Some(window) if window.start_line == 0 => {
+                    launch.opening = opening_of(window.entries);
+                    reread = false;
+                }
+                Some(window) if launch.opening.is_none_or(|line| line >= window.start_line) => {
+                    launch.opening = opening_of(window.entries);
+                    let mut entries = window.entries.to_vec();
+                    let before = entries.len();
+                    self.drop_repeated_prompt(&mut entries, &launch);
+                    reread |= entries.len() != before;
+                }
+                _ => {}
+            }
+            if reread {
+                rereads.push(thread.transcript.to_path_buf());
+            }
+            launches.push(launch);
+        }
+        self.launches = launches;
+        let launch_calls = self
+            .launches
+            .iter()
+            .map(|launch| launch.call.clone())
+            .collect();
+        (self, launch_calls, rereads)
+    }
+
+    /// Drop `thread`'s opening message, read whole, when it repeats its
+    /// launching call's prompt.
+    pub(crate) fn fold(&self, thread: &mut SubagentThread) {
+        let launch = self
+            .launches
+            .iter()
+            .find(|launch| *launch.transcript == *thread.transcript)
+            .cloned()
+            .unwrap_or_else(|| ThreadLaunch::read(&thread.transcript));
+        self.drop_repeated_prompt(&mut thread.entries, &launch);
+    }
+
+    /// Add the `Agent` calls among `entries`, read from `transcript`.
+    fn add_prompts(&mut self, transcript: Option<&Path>, entries: &[(RecordLine, LogEntry)]) {
+        for (record, id, prompt) in agent_call_prompts(entries) {
+            let place = LedgerPlace {
+                transcript: transcript.map(Path::to_path_buf),
+                line: record.line,
+            };
+            self.prompts
+                .push((place, id.to_owned(), prompt_hash(prompt)));
+        }
+    }
+
+    /// Drop the opening message of `entries`, a non-fork thread launched as
+    /// `launch`, when its text is exactly its launching call's prompt.
+    fn drop_repeated_prompt(
+        &self,
+        entries: &mut Vec<(RecordLine, LogEntry)>,
+        launch: &ThreadLaunch,
+    ) {
+        if launch.is_fork {
+            return;
+        }
+        let Some(call) = launch.call.as_deref() else {
+            return;
+        };
+        let Some((_, _, prompt)) = self.prompts.iter().find(|(_, id, _)| id == call) else {
+            return;
+        };
+        if let Some(opening) = opening_index(entries)
+            && matches!(
+                &entries[opening].1,
+                LogEntry::User { message, .. }
+                    if message.content.whole_text().map(prompt_hash).as_ref() == Some(prompt)
+            )
+        {
+            entries.remove(opening);
+        }
+    }
 }
 
 /// True for a fork's copy of the call `call_id` and for the result answering

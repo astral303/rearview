@@ -9,7 +9,7 @@ use super::{
     ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
     SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
     SessionStorage, SessionStub, SessionsDirLookup, SourceLabels, Stored, SubagentFinder,
-    resolved_session_paths,
+    TranscriptReader, resolved_session_paths,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -311,47 +311,68 @@ struct SessionRows {
 /// OpenCode 1 its parts, plus its title's length, and the newest
 /// `time_updated` across the session and its rows. One statement per table
 /// for discovery and session-id lookup, so the two cannot fingerprint
-/// different columns; the lookup filters the union by id.
-const OPENCODE_1_SESSION_ROWS_SQL: &str = "SELECT s.id AS id,
+/// different columns; `rows_filter` narrows the rows aggregated, and the
+/// lookup filters the union by id too.
+///
+/// `octet_length` takes a payload's size from its record header without
+/// reading the payload, and one pass per table aggregates both columns.
+fn opencode_1_session_rows_sql(rows_filter: &str) -> String {
+    format!(
+        "SELECT s.id AS id,
         s.parent_id AS parent_id,
-        LENGTH(s.title)
-          + COALESCE((SELECT SUM(LENGTH(m.data)) FROM message m
-                      WHERE m.session_id = s.id), 0)
-          + COALESCE((SELECT SUM(LENGTH(p.data)) FROM part p
-                      WHERE p.session_id = s.id), 0) AS size,
-        MAX(s.time_updated,
-            COALESCE((SELECT MAX(m.time_updated) FROM message m
-                      WHERE m.session_id = s.id), 0),
-            COALESCE((SELECT MAX(p.time_updated) FROM part p
-                      WHERE p.session_id = s.id), 0)) AS modified
- FROM session s";
+        LENGTH(s.title) + COALESCE(m.bytes, 0) + COALESCE(p.bytes, 0) AS size,
+        MAX(s.time_updated, COALESCE(m.latest, 0), COALESCE(p.latest, 0)) AS modified
+ FROM session s
+ LEFT JOIN ({}) m ON m.session_id = s.id
+ LEFT JOIN ({}) p ON p.session_id = s.id",
+        rows_by_session("message", rows_filter),
+        rows_by_session("part", rows_filter),
+    )
+}
 
-/// [`OPENCODE_1_SESSION_ROWS_SQL`] for `session_v2`, whose title may be null.
-const OPENCODE_2_SESSION_ROWS_SQL: &str = "SELECT s.id AS id,
+/// [`opencode_1_session_rows_sql`] for `session_v2`, whose title may be null.
+fn opencode_2_session_rows_sql(rows_filter: &str) -> String {
+    format!(
+        "SELECT s.id AS id,
         s.parent_id AS parent_id,
-        COALESCE(LENGTH(s.title), 0)
-          + COALESCE((SELECT SUM(LENGTH(m.data)) FROM session_message m
-                      WHERE m.session_id = s.id), 0) AS size,
-        MAX(s.time_updated,
-            COALESCE((SELECT MAX(m.time_updated) FROM session_message m
-                      WHERE m.session_id = s.id), 0)) AS modified
- FROM session_v2 s";
+        COALESCE(LENGTH(s.title), 0) + COALESCE(m.bytes, 0) AS size,
+        MAX(s.time_updated, COALESCE(m.latest, 0)) AS modified
+ FROM session_v2 s
+ LEFT JOIN ({}) m ON m.session_id = s.id",
+        rows_by_session("session_message", rows_filter),
+    )
+}
+
+/// Each session's payload bytes and newest `time_updated` in `table`.
+fn rows_by_session(table: &str, rows_filter: &str) -> String {
+    format!(
+        "SELECT session_id, SUM(octet_length(data)) AS bytes, MAX(time_updated) AS latest
+         FROM {table} {rows_filter} GROUP BY session_id"
+    )
+}
 
 impl SessionRows {
     /// Every row, or the rows `only` names, fingerprinted in one query. The
     /// failure is SQLite's own, so the caller can word it for the list.
     fn read(connection: &Connection, only: Option<&[String]>) -> rusqlite::Result<Self> {
-        let every_row = SessionTables::of(connection)?
-            .select_sessions(OPENCODE_1_SESSION_ROWS_SQL, OPENCODE_2_SESSION_ROWS_SQL);
+        let tables = SessionTables::of(connection)?;
         let sql = match only {
-            None => every_row,
+            None => tables.select_sessions(
+                &opencode_1_session_rows_sql(""),
+                &opencode_2_session_rows_sql(""),
+            ),
             Some(ids) => {
                 let placeholders = (1..=ids.len())
                     .map(|position| format!("?{position}"))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let rows_filter = format!("WHERE session_id IN ({placeholders})");
+                let sessions = tables.select_sessions(
+                    &opencode_1_session_rows_sql(&rows_filter),
+                    &opencode_2_session_rows_sql(&rows_filter),
+                );
                 format!(
-                    "SELECT id, parent_id, size, modified FROM ({every_row})
+                    "SELECT id, parent_id, size, modified FROM ({sessions})
                      WHERE id IN ({placeholders})"
                 )
             }
@@ -509,6 +530,10 @@ impl SessionStorage for OpenCodeStorage {
             on_transcript_read,
             clock,
         )
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &OPENCODE_DB
     }
 }
 

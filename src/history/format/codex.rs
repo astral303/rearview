@@ -15,7 +15,7 @@
 mod tools;
 
 use super::dropped::DroppedRecords;
-use super::lines::visit_parsed_lines;
+use super::lines::{self, LineCursor, visit_lines_from, visit_parsed_lines};
 use super::splice::SubagentThread;
 use super::{
     EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code,
@@ -25,9 +25,12 @@ use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
 use crate::history::fingerprint::FileStamp;
-use crate::history::provider::ReadError;
 use crate::history::provider::subagents::SubagentForest;
 use crate::history::provider::walk::{DirectoryLister, SystemLister};
+use crate::history::provider::{
+    LinkUpdate, LinkWindow, LinkedThread, ReadError, ResumedWindow, Resumption, ThreadLinker,
+    TranscriptRead, TranscriptReader,
+};
 use crate::history::task_notification::ReportSender;
 use crate::history::{Admitted, ParsePermit, Source, TaskReport, TranscriptEntries};
 use crate::log_entry::{
@@ -36,12 +39,13 @@ use crate::log_entry::{
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, FixedOffset};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -86,32 +90,384 @@ impl SessionFormat for CodexRolloutFormat {
     }
 }
 
-/// Each sub-agent thread linked to the `spawn_agent` call that started it,
-/// and with its copy of each report it handed back folded into a delivered
-/// `final_answer` call: the report shows where the agent that launched it
-/// received it. `session` holds the session's own entries; a nested
-/// sub-agent's launch and reports are in its parent thread's.
+/// Resumes the read of a thread's newest rollout. The identity is the
+/// header's `session_meta` line. A thread that continues earlier rollouts
+/// cannot resume, nor can a rollout whose header has no line ending yet.
+impl TranscriptReader for CodexRolloutFormat {
+    fn identity(&self, source: &Path) -> Result<Vec<u8>> {
+        let mut reader = BufReader::new(File::open(source)?);
+        Ok(read_opening(&mut reader)?
+            .map(|opening| opening.identity())
+            .unwrap_or_default())
+    }
+
+    fn is_rewritten(&self, source: &Path, read: &TranscriptRead) -> Result<bool> {
+        lines::is_rewritten(source, read)
+    }
+
+    fn read_from(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+        read: &TranscriptRead,
+    ) -> Result<Resumption> {
+        permit.admit();
+        let (Some(stable_cursor), Ok(state)) = (
+            LineCursor::decode(&read.stable_cursor),
+            serde_json::from_slice::<RecordState>(&read.parser_state),
+        ) else {
+            return Ok(Resumption::FullRead);
+        };
+        let mut reader = BufReader::new(File::open(source)?);
+        let Some(opening) = read_opening(&mut reader)?.filter(RolloutOpening::can_resume) else {
+            return Ok(Resumption::FullRead);
+        };
+        reader.seek(SeekFrom::Start(stable_cursor.offset))?;
+        let mut thread = ThreadProjection::with_state(state, DroppedRecords::default());
+        let newest = thread.read_newest(
+            &opening,
+            &mut reader,
+            stable_cursor,
+            ParallelThreshold::DEFAULT,
+        )?;
+        let bytes_read = reader
+            .get_ref()
+            .metadata()?
+            .len()
+            .saturating_sub(stable_cursor.offset);
+        Ok(Resumption::Window(ResumedWindow {
+            start_line: stable_cursor.line,
+            read: newest.transcript_read(&opening, reader.get_mut())?,
+            entries: thread.entries,
+            malformed_lines: thread
+                .malformed_lines
+                .into_iter()
+                .map(|line_number| crate::history::MalformedLine {
+                    line_number,
+                    detail: None,
+                })
+                .collect(),
+            bytes_read,
+        }))
+    }
+
+    fn read_whole(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+    ) -> Result<Option<SessionProjection>> {
+        Ok(
+            read_thread(permit.admit(), source, DroppedRecords::default())?
+                .map(|thread| thread.projection),
+        )
+    }
+
+    /// The thread's title in the session index.
+    fn leading_entries(
+        &self,
+        source: &Path,
+        _read: &TranscriptRead,
+    ) -> Result<Vec<(RecordLine, LogEntry)>> {
+        let Some(header) = header_of(source)? else {
+            return Ok(Vec::new());
+        };
+        Ok(thread_title(source, &header.id)
+            .map(|custom_title| (RecordLine::from(0), LogEntry::CustomTitle { custom_title }))
+            .into_iter()
+            .collect())
+    }
+}
+
+/// [`ThreadLinker::link`] of the Codex reader: links `threads` given the
+/// session's own entries, and returns the ledger.
 pub(crate) fn link_subagent_threads(
     session: &[(RecordLine, LogEntry)],
     threads: &mut [SubagentThread],
-) {
-    let entries = || {
-        session
+) -> Vec<u8> {
+    CODEX_ROLLOUT.link(session, threads)
+}
+
+/// Links each sub-agent thread to the `spawn_agent` call that started it,
+/// and folds its copy of each report it handed back into a delivered
+/// `final_answer` call: the report shows where the agent that launched it
+/// received it. A nested sub-agent's launch and reports are in its parent
+/// thread's entries. The ledger holds each call, spawn result and report
+/// with the line it came from.
+impl ThreadLinker for CodexRolloutFormat {
+    fn link(&self, session: &[(RecordLine, LogEntry)], threads: &mut [SubagentThread]) -> Vec<u8> {
+        let mut ledger = LinkLedger::default();
+        ledger.add(None, session);
+        for thread in threads.iter() {
+            ledger.add(Some(&thread.transcript), &thread.entries);
+        }
+        let names = threads
             .iter()
-            .chain(threads.iter().flat_map(|thread| &thread.entries))
-            .map(|(_, entry)| entry)
-    };
-    let spawns = SpawnedAgents::of(entries());
-    let reports = HandedBackReports::of(entries());
-    let reports_by_thread = reports.by_thread(threads);
-    for (thread, reports) in threads.iter_mut().zip(reports_by_thread) {
-        thread.launch_call = spawns.launch_call(
-            &thread.label,
-            thread.identity.agent_path.as_deref(),
-            instant_of(&thread.started),
-        );
-        fold_delivered_final_answers(&mut thread.entries, &reports);
+            .map(|thread| LinkedThread {
+                transcript: &thread.transcript,
+                label: &thread.label,
+                identity: &thread.identity,
+                started: &thread.started,
+            })
+            .collect::<Vec<_>>();
+        let spawns = ledger.spawns(&names);
+        let reports = ledger.reports(&names, None);
+        let launch_calls = names
+            .iter()
+            .map(|name| spawns.launch_call_of(name))
+            .collect::<Vec<_>>();
+        let reports_by_thread = reports.by_thread(&names);
+        drop(names);
+        for ((thread, reports), launch_call) in
+            threads.iter_mut().zip(reports_by_thread).zip(launch_calls)
+        {
+            thread.launch_call = launch_call;
+            fold_delivered_final_answers(&mut thread.entries, &reports);
+        }
+        ledger.encode()
     }
+
+    fn update(
+        &self,
+        ledger: &[u8],
+        windows: &[LinkWindow<'_>],
+        threads: &[LinkedThread<'_>],
+    ) -> LinkUpdate {
+        let mut ledger = LinkLedger::decode(ledger);
+        let known_reports = ledger.report_keys();
+        for window in windows {
+            ledger.remove_from(window.transcript, window.start_line);
+        }
+        for window in windows {
+            ledger.add(window.transcript, window.entries);
+        }
+        let dropped_report = known_reports
+            .difference(&ledger.report_keys())
+            .next()
+            .is_some();
+        let spawns = ledger.spawns(threads);
+        let reports = ledger.reports(threads, Some(&known_reports));
+        let reports_by_thread = reports.by_thread(threads);
+        let mut rereads = Vec::new();
+        for (thread, reports) in threads.iter().zip(&reports_by_thread) {
+            let has_new_report = reports.iter().any(|report| report.is_new);
+            let window_delivers = windows
+                .iter()
+                .filter(|window| window.transcript == Some(thread.transcript))
+                .flat_map(|window| window.entries)
+                .any(|(_, entry)| reports.iter().any(|report| report.is_delivered_by(entry)));
+            if has_new_report || window_delivers {
+                rereads.push(thread.transcript.to_path_buf());
+            }
+        }
+        // A report the windows dropped without adding back unfolds a reply:
+        // read every thread it may have answered again.
+        if dropped_report {
+            rereads = threads
+                .iter()
+                .map(|thread| thread.transcript.to_path_buf())
+                .collect();
+        }
+        LinkUpdate {
+            launch_calls: threads
+                .iter()
+                .map(|thread| spawns.launch_call_of(thread))
+                .collect(),
+            rereads,
+            ledger: ledger.encode(),
+        }
+    }
+
+    fn fold(&self, ledger: &[u8], thread: &mut SubagentThread, threads: &[LinkedThread<'_>]) {
+        let ledger = LinkLedger::decode(ledger);
+        let reports = ledger.reports(threads, None);
+        let index = threads
+            .iter()
+            .position(|name| name.transcript == &*thread.transcript);
+        if let Some(index) = index {
+            let reports_by_thread = reports.by_thread(threads);
+            fold_delivered_final_answers(&mut thread.entries, &reports_by_thread[index]);
+        }
+    }
+}
+
+/// Where a ledger item came from: its transcript, `None` for the session's
+/// own, and its line.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LedgerPlace {
+    transcript: Option<PathBuf>,
+    line: usize,
+}
+
+impl LedgerPlace {
+    /// The place's rank in the order the session's entries are linked in:
+    /// the session's own first, then each thread's in `threads` order.
+    fn rank(&self, threads: &[LinkedThread<'_>]) -> (usize, usize) {
+        let transcript = match &self.transcript {
+            None => 0,
+            Some(path) => threads
+                .iter()
+                .position(|thread| thread.transcript == path)
+                .map_or(usize::MAX, |index| index + 1),
+        };
+        (transcript, self.line)
+    }
+}
+
+/// A session's `spawn_agent` calls, their results and the reports its
+/// sub-agents handed back, each with its place.
+#[derive(Default, Deserialize, Serialize)]
+struct LinkLedger {
+    /// Each call's place, id and the time it was made, as written.
+    calls: Vec<(LedgerPlace, String, Option<String>)>,
+    /// Each result naming a thread: its place, its call's id, and the keys
+    /// it names the thread by, `task_name` then `agent_id`.
+    results: Vec<(LedgerPlace, String, Vec<String>)>,
+    /// Each report: its place, its sender, its body and the time it was
+    /// received, as written.
+    reports: Vec<(LedgerPlace, String, String, Option<String>)>,
+}
+
+impl LinkLedger {
+    fn decode(bytes: &[u8]) -> Self {
+        serde_json::from_slice(bytes).unwrap_or_default()
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a link ledger serializes")
+    }
+
+    /// Add the calls, results and reports of `entries`, read from
+    /// `transcript`.
+    fn add(&mut self, transcript: Option<&Path>, entries: &[(RecordLine, LogEntry)]) {
+        for (record, entry) in entries {
+            let place = || LedgerPlace {
+                transcript: transcript.map(Path::to_path_buf),
+                line: record.line,
+            };
+            match entry {
+                LogEntry::Assistant {
+                    message, timestamp, ..
+                } => {
+                    for block in &message.content {
+                        if let ContentBlock::ToolUse { id, name, .. } = block
+                            && name == SPAWN_AGENT
+                        {
+                            self.calls.push((place(), id.clone(), timestamp.clone()));
+                        }
+                    }
+                }
+                LogEntry::User {
+                    message, timestamp, ..
+                } => {
+                    if let UserContent::Blocks(blocks) = &message.content {
+                        for block in blocks {
+                            if let Some((call, keys)) = spawn_result(block) {
+                                self.results.push((place(), call, keys));
+                            }
+                        }
+                    }
+                    if let Some(report) = crate::history::user_task_report(&message.content)
+                        && let (Some(sender), Some(body)) = (report.sender.task_id, report.body)
+                    {
+                        self.reports
+                            .push((place(), sender, body, timestamp.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Drop what the ledger holds of `transcript` from `start_line` on.
+    fn remove_from(&mut self, transcript: Option<&Path>, start_line: usize) {
+        let kept = |place: &LedgerPlace| {
+            place.transcript.as_deref() != transcript || place.line < start_line
+        };
+        self.calls.retain(|(place, ..)| kept(place));
+        self.results.retain(|(place, ..)| kept(place));
+        self.reports.retain(|(place, ..)| kept(place));
+    }
+
+    /// The ledger's spawns, in the order the session's entries are linked
+    /// in among `threads`.
+    fn spawns(&self, threads: &[LinkedThread<'_>]) -> SpawnedAgents {
+        let made: HashMap<&str, Option<DateTime<FixedOffset>>> = self
+            .calls
+            .iter()
+            .map(|(_, id, made)| (id.as_str(), made.as_deref().and_then(instant_of)))
+            .collect();
+        let mut results = self.results.iter().collect::<Vec<_>>();
+        results.sort_by_key(|(place, ..)| place.rank(threads));
+        let mut spawned = SpawnedAgents::default();
+        for (_, call, keys) in results {
+            let Some(made) = made.get(call.as_str()) else {
+                continue;
+            };
+            for key in keys {
+                spawned
+                    .by_key
+                    .entry(key.clone())
+                    .or_default()
+                    .push(SpawnCall {
+                        id: call.clone(),
+                        made: *made,
+                    });
+            }
+        }
+        spawned
+    }
+
+    /// Each report's sender, body and time received, as written.
+    fn report_keys(&self) -> HashSet<(String, String, Option<String>)> {
+        self.reports
+            .iter()
+            .map(|(_, sender, body, received)| (sender.clone(), body.clone(), received.clone()))
+            .collect()
+    }
+
+    /// The ledger's reports, in the order the session's entries are linked
+    /// in among `threads`. A report `known` does not hold is new.
+    fn reports(
+        &self,
+        threads: &[LinkedThread<'_>],
+        known: Option<&HashSet<(String, String, Option<String>)>>,
+    ) -> HandedBackReports {
+        let mut reports = self.reports.iter().collect::<Vec<_>>();
+        reports.sort_by_key(|(place, ..)| place.rank(threads));
+        HandedBackReports(
+            reports
+                .into_iter()
+                .map(|(_, sender, body, received)| HandedBackReport {
+                    is_new: known.is_some_and(|known| {
+                        !known.contains(&(sender.clone(), body.clone(), received.clone()))
+                    }),
+                    sender: sender.clone(),
+                    body: body.clone(),
+                    received: received.as_deref().and_then(instant_of),
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The call a `spawn_agent` result answers and the keys it names the
+/// thread by: its agent path in `task_name`, or its thread id in
+/// `agent_id`. `None` for any other block.
+fn spawn_result(block: &ContentBlock) -> Option<(String, Vec<String>)> {
+    let ContentBlock::ToolResult {
+        tool_use_id,
+        content: Some(Value::String(output)),
+        ..
+    } = block
+    else {
+        return None;
+    };
+    let result = serde_json::from_str::<Value>(output).ok()?;
+    let keys = ["task_name", "agent_id"]
+        .into_iter()
+        .filter_map(|key| result.get(key).and_then(Value::as_str).map(str::to_owned))
+        .collect::<Vec<_>>();
+    (!keys.is_empty()).then(|| (tool_use_id.clone(), keys))
 }
 
 /// The `spawn_agent` calls of a session and its threads, by the thread each
@@ -130,65 +486,13 @@ struct SpawnCall {
 }
 
 impl SpawnedAgents {
-    fn of<'a>(entries: impl Iterator<Item = &'a LogEntry> + Clone) -> Self {
-        let mut spawn_calls: HashMap<&str, Option<DateTime<FixedOffset>>> = HashMap::new();
-        for entry in entries.clone() {
-            if let LogEntry::Assistant {
-                message, timestamp, ..
-            } = entry
-            {
-                for block in &message.content {
-                    if let ContentBlock::ToolUse { id, name, .. } = block
-                        && name == SPAWN_AGENT
-                    {
-                        spawn_calls.insert(id, timestamp.as_deref().and_then(instant_of));
-                    }
-                }
-            }
-        }
-        let mut spawned = Self::default();
-        for entry in entries {
-            let LogEntry::User {
-                message:
-                    UserMessage {
-                        content: UserContent::Blocks(blocks),
-                        ..
-                    },
-                ..
-            } = entry
-            else {
-                continue;
-            };
-            for block in blocks {
-                let ContentBlock::ToolResult {
-                    tool_use_id,
-                    content: Some(Value::String(output)),
-                    ..
-                } = block
-                else {
-                    continue;
-                };
-                let Some(made) = spawn_calls.get(tool_use_id.as_str()) else {
-                    continue;
-                };
-                let Ok(result) = serde_json::from_str::<Value>(output) else {
-                    continue;
-                };
-                for key in ["task_name", "agent_id"] {
-                    if let Some(named) = result.get(key).and_then(Value::as_str) {
-                        spawned
-                            .by_key
-                            .entry(named.to_owned())
-                            .or_default()
-                            .push(SpawnCall {
-                                id: tool_use_id.clone(),
-                                made: *made,
-                            });
-                    }
-                }
-            }
-        }
-        spawned
+    /// The call that started `thread`, by its label and agent path.
+    fn launch_call_of(&self, thread: &LinkedThread<'_>) -> Option<String> {
+        self.launch_call(
+            thread.label,
+            thread.identity.agent_path.as_deref(),
+            instant_of(thread.started),
+        )
     }
 
     /// The call that started the thread `thread_id` at `agent_path`: of the
@@ -226,34 +530,13 @@ struct HandedBackReport {
     sender: String,
     body: String,
     received: Option<DateTime<FixedOffset>>,
+    /// True for a report the ledger did not hold before its update.
+    is_new: bool,
 }
 
 impl HandedBackReports {
-    fn of<'a>(entries: impl Iterator<Item = &'a LogEntry>) -> Self {
-        let mut reports = Vec::new();
-        for entry in entries {
-            let LogEntry::User {
-                message, timestamp, ..
-            } = entry
-            else {
-                continue;
-            };
-            let Some(report) = crate::history::user_task_report(&message.content) else {
-                continue;
-            };
-            if let (Some(sender), Some(body)) = (report.sender.task_id, report.body) {
-                reports.push(HandedBackReport {
-                    sender,
-                    body,
-                    received: timestamp.as_deref().and_then(instant_of),
-                });
-            }
-        }
-        Self(reports)
-    }
-
     /// The reports each of `threads` handed back, in the order of `threads`.
-    fn by_thread(&self, threads: &[SubagentThread]) -> Vec<Vec<&HandedBackReport>> {
+    fn by_thread(&self, threads: &[LinkedThread<'_>]) -> Vec<Vec<&HandedBackReport>> {
         let mut reports = vec![Vec::new(); threads.len()];
         for report in &self.0 {
             if let Some(thread) = report.sending_thread(threads) {
@@ -270,16 +553,16 @@ impl HandedBackReport {
     /// received. A reused agent path names several. Without an RFC 3339
     /// time, the report answers its sender only when the sender names one
     /// thread.
-    fn sending_thread(&self, threads: &[SubagentThread]) -> Option<usize> {
+    fn sending_thread(&self, threads: &[LinkedThread<'_>]) -> Option<usize> {
         let named = threads.iter().enumerate().filter(|(_, thread)| {
-            let identity = &thread.identity;
+            let identity = thread.identity;
             [&identity.agent_path, &identity.agent_id]
                 .into_iter()
                 .any(|name| name.as_deref() == Some(self.sender.as_str()))
         });
         match self.received {
             Some(received) => named
-                .filter_map(|(index, thread)| Some((index, instant_of(&thread.started)?)))
+                .filter_map(|(index, thread)| Some((index, instant_of(thread.started)?)))
                 .filter(|&(_, started)| started <= received)
                 .max_by_key(|&(_, started)| started)
                 .map(|(index, _)| index),
@@ -532,28 +815,70 @@ pub(crate) fn thread_kind_of(path: &Path) -> Option<ThreadKind> {
 /// line is not a rollout header.
 fn header_of(path: &Path) -> Result<Option<RolloutHeader>> {
     let mut reader = BufReader::new(File::open(path)?);
-    Ok(read_header(&mut reader)?.map(|(header, _)| header))
+    Ok(read_opening(&mut reader)?.map(|opening| opening.header))
 }
 
-/// The header `reader` opens with, and the number of the line after it.
-/// `None` when the first line holding more than whitespace is not a rollout
-/// header.
-fn read_header(reader: &mut impl BufRead) -> Result<Option<(RolloutHeader, usize)>> {
+/// A rollout's header and where the records after it start.
+struct RolloutOpening {
+    header: RolloutHeader,
+    /// The header's line as written, without its line ending.
+    header_line: String,
+    /// Past the header's line.
+    records_start: LineCursor,
+    /// False while the header's line has no line ending: Codex is still
+    /// writing it, and the rollout holds no record yet.
+    is_header_terminated: bool,
+}
+
+impl RolloutOpening {
+    /// The rollout's identity: a hash of its header's line, which Codex
+    /// never rewrites.
+    fn identity(&self) -> Vec<u8> {
+        blake3::hash(self.header_line.as_bytes())
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// False for a thread that continues earlier rollouts, which the reader
+    /// reads first, and for a header without a line ending: its read is a
+    /// full read.
+    fn can_resume(&self) -> bool {
+        self.is_header_terminated && self.header.history_base.is_none()
+    }
+}
+
+/// The header `reader` opens with. `None` when the first line holding more
+/// than whitespace is not a rollout header.
+fn read_opening(reader: &mut impl BufRead) -> Result<Option<RolloutOpening>> {
     let mut line = String::new();
-    let mut line_number = 0;
+    let mut records_start = LineCursor::START;
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let length = reader.read_line(&mut line)?;
+        if length == 0 {
             return Ok(None);
         }
-        line_number += 1;
+        records_start = LineCursor {
+            offset: records_start.offset + length as u64,
+            line: records_start.line + 1,
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let header = serde_json::from_str::<Value>(&line)
+        let Some(header) = serde_json::from_str::<Value>(&line)
             .ok()
-            .and_then(|value| rollout_header(&value));
-        return Ok(header.map(|header| (header, line_number + 1)));
+            .and_then(|value| rollout_header(&value))
+        else {
+            return Ok(None);
+        };
+        let is_header_terminated = line.ends_with('\n');
+        let header_line = line.trim_end_matches(['\n', '\r']).to_owned();
+        return Ok(Some(RolloutOpening {
+            header,
+            header_line,
+            records_start,
+            is_header_terminated,
+        }));
     }
 }
 
@@ -566,13 +891,80 @@ fn parse_thread(
     dropped: DroppedRecords,
 ) -> Result<Option<ThreadRead>> {
     let mut reader = BufReader::new(File::open(path)?);
-    let Some((header, first_record_line)) = read_header(&mut reader)? else {
+    let Some(opening) = read_opening(&mut reader)? else {
         return Ok(None);
     };
-    let mut thread = ThreadProjection::new(&header, dropped);
-    thread.read_earlier_rollouts(earlier_rollouts(path, &header), parallel);
-    thread.read_records(&header, None, reader, first_record_line, parallel)?;
-    Ok(Some(thread.finish(header)))
+    let mut thread = ThreadProjection::new(&opening.header, dropped);
+    thread.read_earlier_rollouts(earlier_rollouts(path, &opening.header), parallel);
+    let newest = thread.read_newest(&opening, &mut reader, opening.records_start, parallel)?;
+    let transcript_read = if opening.can_resume() {
+        newest.transcript_read(&opening, reader.get_mut())?
+    } else {
+        TranscriptRead::full_read()
+    };
+    Ok(Some(thread.finish(opening.header, transcript_read)))
+}
+
+/// What a read of a rollout's records carries from one record to the next.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RecordState {
+    last_shown: LastShown,
+    own_history: OwnHistory,
+}
+
+impl RecordState {
+    /// The state before the first record of the rollout `header` opens.
+    fn at_start(header: &RolloutHeader) -> Self {
+        Self {
+            last_shown: LastShown::default(),
+            own_history: match header.own_history_start {
+                Some(boundary) => OwnHistory::Pending { boundary },
+                None => OwnHistory::Started,
+            },
+        }
+    }
+}
+
+/// Where a read of a thread's newest rollout stopped, and where the next
+/// read restarts with which state.
+struct NewestRead {
+    cursor: LineCursor,
+    stable_cursor: LineCursor,
+    stable_state: RecordState,
+}
+
+impl NewestRead {
+    /// The read that stopped at `cursor` with `state`. A sub-agent whose own
+    /// records have not started restarts at its first record, since its
+    /// first own record clears the entries read before it.
+    fn stopped_at(cursor: LineCursor, state: RecordState, opening: &RolloutOpening) -> Self {
+        match state.own_history {
+            OwnHistory::Pending { .. } => Self {
+                cursor,
+                stable_cursor: opening.records_start,
+                stable_state: RecordState::at_start(&opening.header),
+            },
+            OwnHistory::Started => Self {
+                cursor,
+                stable_cursor: cursor,
+                stable_state: state,
+            },
+        }
+    }
+
+    /// What this read leaves for the next, with `file` holding the rollout
+    /// `opening` opens.
+    fn transcript_read(&self, opening: &RolloutOpening, file: &mut File) -> Result<TranscriptRead> {
+        Ok(TranscriptRead {
+            cursor: self.cursor.encode(),
+            stable_cursor: self.stable_cursor.encode(),
+            identity: opening.identity(),
+            rewrite_check: lines::rewrite_check(file, self.cursor)?,
+            parser_state: serde_json::to_vec(&self.stable_state)
+                .expect("a record state serializes"),
+            stable_line: Some(self.stable_cursor.line),
+        })
+    }
 }
 
 struct ThreadProjection {
@@ -580,8 +972,7 @@ struct ThreadProjection {
     /// The newest rollout's malformed lines, the ones `agent read` reports
     /// against the session's file.
     malformed_lines: Vec<usize>,
-    last_shown: LastShown,
-    own_history: OwnHistory,
+    state: RecordState,
     dropped: DroppedRecords,
     /// The oldest earlier rollout's start, when one was read.
     started: Option<String>,
@@ -595,14 +986,15 @@ impl ThreadProjection {
         // Record the newest rollout's version first: the dropped-records
         // report counts its malformed lines under the first version.
         dropped.record_version(|| newest.cli_version.clone());
+        Self::with_state(RecordState::at_start(newest), dropped)
+    }
+
+    /// A projection that reads on with `state`, holding no entry yet.
+    fn with_state(state: RecordState, dropped: DroppedRecords) -> Self {
         Self {
             entries: Vec::new(),
             malformed_lines: Vec::new(),
-            last_shown: LastShown::default(),
-            own_history: match newest.own_history_start {
-                Some(boundary) => OwnHistory::Pending { boundary },
-                None => OwnHistory::Started,
-            },
+            state,
             dropped,
             started: None,
             earlier_turns: EarlierTurns::Read,
@@ -618,7 +1010,7 @@ impl ThreadProjection {
         for rollout in earlier.rollouts {
             if let Err(unread) = self.read_earlier(&rollout, parallel) {
                 self.entries.clear();
-                self.last_shown = LastShown::default();
+                self.state.last_shown = LastShown::default();
                 self.started = None;
                 self.earlier_turns = unread;
                 continue;
@@ -653,7 +1045,7 @@ impl ThreadProjection {
             .map_err(|error| unread(AppError::from(error)))?
             .take(rollout.end_byte_offset);
         let mut reader = BufReader::new(file);
-        let Some((_, first_record_line)) = read_header(&mut reader).map_err(unread)? else {
+        let Some(opening) = read_opening(&mut reader).map_err(unread)? else {
             // `end_byte_offset` cuts the header.
             return Err(EarlierTurns::Missing);
         };
@@ -662,7 +1054,7 @@ impl ThreadProjection {
             &rollout.header,
             Some(transcript),
             &mut reader,
-            first_record_line,
+            opening.records_start.line,
             parallel,
         )
         .map_err(unread)?;
@@ -686,53 +1078,77 @@ impl ThreadProjection {
         parallel: ParallelThreshold,
     ) -> Result<()> {
         self.dropped.record_version(|| header.cli_version.clone());
-        let Self {
-            entries,
-            malformed_lines,
-            last_shown,
-            own_history,
-            dropped,
-            ..
-        } = self;
         visit_parsed_lines(
             reader,
             first_line_number,
             parallel,
-            |line| serde_json::from_str::<Value>(line).ok(),
-            |line, _, parsed| {
-                let Some(object) = parsed.as_ref().and_then(Value::as_object) else {
-                    // `malformed_lines` holds the newest rollout's lines;
-                    // count an earlier rollout's under its version.
-                    match transcript {
-                        None => malformed_lines.push(line),
-                        Some(_) => dropped.failed("line"),
-                    }
-                    return;
-                };
-                if let OwnHistory::Pending { boundary } = *own_history
-                    && !ordinal_below(object, boundary)
-                {
-                    // The first own record: what was read so far is the
-                    // parent's history, its last model and goal included.
-                    entries.clear();
-                    *last_shown = LastShown::default();
-                    *own_history = OwnHistory::Started;
-                }
-                if let Some(entry) = normalize_line(object, last_shown, dropped) {
-                    let record = RecordLine {
-                        transcript: transcript.clone(),
-                        line,
-                    };
-                    entries.push((record, entry));
-                }
-            },
+            parse_record,
+            |line, _, parsed| self.add_record(&transcript, line, parsed),
         )?;
         Ok(())
     }
 
-    /// The projection, with the facts of the thread's newest rollout and the
-    /// time the thread started.
-    fn finish(self, newest: RolloutHeader) -> ThreadRead {
+    /// Read the thread's newest rollout, which `opening` opens, from `from`,
+    /// where `reader` stands, to its end. A last record without a line
+    /// ending is read, and the read stops before it.
+    fn read_newest(
+        &mut self,
+        opening: &RolloutOpening,
+        reader: impl BufRead,
+        from: LineCursor,
+        parallel: ParallelThreshold,
+    ) -> Result<NewestRead> {
+        self.dropped
+            .record_version(|| opening.header.cli_version.clone());
+        let read = visit_lines_from(reader, from, parallel, parse_record, |line, _, parsed| {
+            self.add_record(&None, line, parsed)
+        })?;
+        let state_at_cursor = self.state.clone();
+        if let Some((line, text)) = read.unterminated {
+            self.add_record(&None, line, parse_record(&text));
+        }
+        Ok(NewestRead::stopped_at(
+            read.cursor,
+            state_at_cursor,
+            opening,
+        ))
+    }
+
+    /// Add the record at `line` of `transcript`, `None` for the newest
+    /// rollout, as `parse_record` parsed it.
+    fn add_record(&mut self, transcript: &Option<Arc<Path>>, line: usize, parsed: Option<Value>) {
+        let Some(object) = parsed.as_ref().and_then(Value::as_object) else {
+            // `malformed_lines` holds the newest rollout's lines; count an
+            // earlier rollout's under its version.
+            match transcript {
+                None => self.malformed_lines.push(line),
+                Some(_) => self.dropped.failed("line"),
+            }
+            return;
+        };
+        if let OwnHistory::Pending { boundary } = self.state.own_history
+            && !ordinal_below(object, boundary)
+        {
+            // The first own record: what was read so far is the parent's
+            // history, its last model and goal included.
+            self.entries.clear();
+            self.state = RecordState {
+                last_shown: LastShown::default(),
+                own_history: OwnHistory::Started,
+            };
+        }
+        if let Some(entry) = normalize_line(object, &mut self.state.last_shown, &mut self.dropped) {
+            let record = RecordLine {
+                transcript: transcript.clone(),
+                line,
+            };
+            self.entries.push((record, entry));
+        }
+    }
+
+    /// The projection, with the facts of the thread's newest rollout, the
+    /// time the thread started, and what its read leaves for the next.
+    fn finish(self, newest: RolloutHeader, transcript_read: TranscriptRead) -> ThreadRead {
         let projection = SessionProjection {
             source: Source::Codex,
             header: SessionHeader {
@@ -750,6 +1166,7 @@ impl ThreadProjection {
             dropped: self.dropped,
             earlier_turns: self.earlier_turns,
             earlier_transcripts: self.earlier_transcripts,
+            transcript_read,
         };
         ThreadRead {
             projection,
@@ -1252,7 +1669,7 @@ pub(crate) fn forks_continuing(
 /// shape and shows its copied context as its own.
 /// Without a boundary, retain all recorded turns: timestamps, repeated text
 /// and reply ids cannot distinguish inherited context from genuine work.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 enum OwnHistory {
     /// Every line so far sits below the boundary. Its entries are kept until
     /// a record at or past the boundary shows them to be the parent's.
@@ -1269,10 +1686,15 @@ fn ordinal_below(object: &Map<String, Value>, boundary: u64) -> bool {
 }
 
 /// The last model and goal shown. A line that repeats them shows no row.
-#[derive(Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct LastShown {
     model: Option<String>,
     goal: Option<ShownGoal>,
+}
+
+/// A rollout line as JSON, or `None` for a malformed line.
+fn parse_record(line: &str) -> Option<Value> {
+    serde_json::from_str(line).ok()
 }
 
 fn normalize_line(
@@ -1766,6 +2188,7 @@ fn turn_aborted(
 }
 
 /// A goal as its `Goal` row showed it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ShownGoal {
     created_at: Option<i64>,
     objective: String,
@@ -2317,12 +2740,22 @@ mod tests {
         parallel: ParallelThreshold,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
-        let Some((header, first_record_line)) = read_header(&mut reader)? else {
+        let Some(opening) = read_opening(&mut reader)? else {
             return Ok(None);
         };
-        let mut thread = ThreadProjection::new(&header, dropped);
-        thread.read_records(&header, None, reader, first_record_line, parallel)?;
-        Ok(Some(thread.finish(header).projection))
+        let mut thread = ThreadProjection::new(&opening.header, dropped);
+        thread.read_records(
+            &opening.header,
+            None,
+            reader,
+            opening.records_start.line,
+            parallel,
+        )?;
+        Ok(Some(
+            thread
+                .finish(opening.header, TranscriptRead::full_read())
+                .projection,
+        ))
     }
 
     #[test]
@@ -3713,7 +4146,7 @@ mod tests {
 
         thread_projection.read_earlier_rollouts(earlier, ParallelThreshold::DEFAULT);
         let projection = thread_projection
-            .finish(header(&thread.second_edit))
+            .finish(header(&thread.second_edit), TranscriptRead::full_read())
             .projection;
 
         assert_eq!(dialogue(&projection), turns(&["delta", "echo"]));
@@ -4443,6 +4876,326 @@ mod tests {
             "plain question",
         ] {
             assert!(!is_injected_context(typed_by_a_user), "{typed_by_a_user}");
+        }
+    }
+
+    mod resumed_reads {
+        use super::*;
+        use crate::history::format::lines::record_splits;
+        use crate::history::provider::contract_tests::every_record_sessions;
+        use crate::history::provider::transcript_reads::resume;
+
+        fn reader() -> &'static dyn TranscriptReader {
+            Source::Codex.provider().storage().transcript_reader()
+        }
+
+        /// The thread ending in the rollout at `path`, read whole.
+        fn read_whole(path: &Path) -> SessionProjection {
+            parse_thread(path, ParallelThreshold::DEFAULT, DroppedRecords::default())
+                .unwrap()
+                .expect("a rollout")
+                .projection
+        }
+
+        /// The rollout at `path`, changed since `stored`, read on from it.
+        fn resumed(path: &Path, stored: &TranscriptRead) -> Resumption {
+            resume(reader(), crate::history::FOR_FIXTURES, path, stored).unwrap()
+        }
+
+        fn window(resumption: Resumption) -> ResumedWindow {
+            match resumption {
+                Resumption::Window(window) => window,
+                Resumption::FullRead | Resumption::ChangesEarlierEntry => {
+                    panic!("the rollout resumes")
+                }
+            }
+        }
+
+        /// `entries` as text a test compares.
+        fn listed(entries: &[(RecordLine, LogEntry)]) -> Vec<String> {
+            entries
+                .iter()
+                .map(|(record, entry)| format!("{} {entry:?}", record.line))
+                .collect()
+        }
+
+        /// Asserts that `prefix`, a read of a rollout's beginning, up to the
+        /// window's first line, and then `window`, the read resumed from it
+        /// over the whole rollout, hold what `full`, one read of the whole
+        /// rollout, holds, and leave what it leaves for the next read.
+        fn assert_window_completes(
+            name: &str,
+            prefix: &SessionProjection,
+            window: &ResumedWindow,
+            full: &SessionProjection,
+        ) {
+            let kept = prefix
+                .entries
+                .iter()
+                .filter(|(record, _)| record.line < window.start_line)
+                .cloned()
+                .chain(window.entries.iter().cloned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed(&kept),
+                listed(&full.entries),
+                "{name}: the prefix and the window hold the full read's entries"
+            );
+            let malformed = prefix
+                .malformed_lines
+                .iter()
+                .filter(|line| **line < window.start_line)
+                .copied()
+                .chain(window.malformed_lines.iter().map(|line| line.line_number))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                malformed, full.malformed_lines,
+                "{name}: the prefix and the window hold the full read's malformed lines"
+            );
+            assert_eq!(
+                window.read, full.transcript_read,
+                "{name}: the window leaves what the full read leaves"
+            );
+        }
+
+        /// A rollout written at `path` as `bytes`, read whole.
+        fn written_and_read(path: &Path, bytes: &[u8]) -> SessionProjection {
+            std::fs::write(path, bytes).unwrap();
+            read_whole(path)
+        }
+
+        #[test]
+        fn prefix_and_resumed_read_equal_full_read_at_every_split_of_every_codex_fixture() {
+            let every_record = every_record_sessions()
+                .into_iter()
+                .find(|session| session.row.source == Source::Codex)
+                .unwrap();
+            let fixtures = [
+                "rollout.jsonl",
+                "subagent.jsonl",
+                "subagent-migrated.jsonl",
+                "subagent-without-user-text.jsonl",
+                "guardian.jsonl",
+            ]
+            .map(fixture)
+            .into_iter()
+            .chain(std::iter::once(every_record.row.path.clone()))
+            .chain(every_record.row.subagents.iter().cloned());
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rollout.jsonl");
+            for fixture in fixtures {
+                let bytes = std::fs::read(&fixture).unwrap();
+                let full = written_and_read(&path, &bytes);
+                for split in record_splits(&bytes) {
+                    let name = format!("{} at {split}", fixture.display());
+                    std::fs::write(&path, &bytes[..split]).unwrap();
+                    let Some(prefix) =
+                        parse_thread(&path, ParallelThreshold::DEFAULT, DroppedRecords::default())
+                            .unwrap()
+                    else {
+                        continue;
+                    };
+                    let prefix = prefix.projection;
+                    std::fs::write(&path, &bytes).unwrap();
+
+                    match resumed(&path, &prefix.transcript_read) {
+                        Resumption::Window(window) => {
+                            assert_window_completes(&name, &prefix, &window, &full)
+                        }
+                        Resumption::FullRead | Resumption::ChangesEarlierEntry => assert_eq!(
+                            prefix.transcript_read,
+                            TranscriptRead::full_read(),
+                            "{name}: only a rollout whose header has no line ending yet reads whole"
+                        ),
+                    }
+                }
+            }
+        }
+
+        fn rollout_bytes() -> Vec<u8> {
+            std::fs::read(fixture("rollout.jsonl")).unwrap()
+        }
+
+        /// The read of `before`, written at `path`, and the rollout then
+        /// rewritten as `after`.
+        fn read_then_rewritten(path: &Path, before: &[u8], after: &[u8]) -> TranscriptRead {
+            let read = written_and_read(path, before).transcript_read;
+            std::fs::write(path, after).unwrap();
+            read
+        }
+
+        #[test]
+        fn rollout_with_another_header_reads_whole() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rollout.jsonl");
+            let before = rollout_bytes();
+            let header_end = before.iter().position(|byte| *byte == b'\n').unwrap();
+            let mut after = String::from_utf8(before[..header_end].to_vec())
+                .unwrap()
+                .replacen("\"cwd\":\"", "\"cwd\":\"/elsewhere", 1)
+                .into_bytes();
+            after.extend_from_slice(&before[header_end..]);
+            let read = read_then_rewritten(&path, &before, &after);
+
+            assert_ne!(reader().identity(&path).unwrap(), read.identity);
+            assert!(matches!(resumed(&path, &read), Resumption::FullRead));
+        }
+
+        /// The read of the rollout fixture, written at `path`, and the
+        /// offset of its cursor.
+        fn rollout_read(path: &Path) -> (TranscriptRead, usize) {
+            let read = written_and_read(path, &rollout_bytes()).transcript_read;
+            let cursor = LineCursor::decode(&read.cursor).unwrap().offset as usize;
+            (read, cursor)
+        }
+
+        #[test]
+        fn rewrite_before_cursor_reads_whole() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rollout.jsonl");
+            let (read, cursor) = rollout_read(&path);
+            let mut after = rollout_bytes();
+            let changed = cursor - 10;
+            after[changed] = if after[changed] == b'a' { b'b' } else { b'a' };
+            after.extend_from_slice(turn("appended", "2026-08-01T11:00:00.000Z").as_bytes());
+            std::fs::write(&path, &after).unwrap();
+
+            assert!(matches!(resumed(&path, &read), Resumption::FullRead));
+        }
+
+        #[test]
+        fn shrunk_rollout_reads_whole() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rollout.jsonl");
+            let (read, cursor) = rollout_read(&path);
+            std::fs::write(&path, &rollout_bytes()[..cursor - 1]).unwrap();
+
+            assert!(matches!(resumed(&path, &read), Resumption::FullRead));
+        }
+
+        #[test]
+        fn appended_records_resume() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rollout.jsonl");
+            let (read, cursor) = rollout_read(&path);
+            let mut after = rollout_bytes();
+            after.extend_from_slice(turn("appended", "2026-08-01T11:00:00.000Z").as_bytes());
+            std::fs::write(&path, &after).unwrap();
+
+            let window = window(resumed(&path, &read));
+
+            assert!(
+                listed(&window.entries)
+                    .concat()
+                    .contains("answer to appended")
+            );
+            assert!(
+                LineCursor::decode(&window.read.cursor).unwrap().offset as usize > cursor,
+                "the cursor moves past the appended records"
+            );
+        }
+
+        #[test]
+        fn unterminated_last_record_is_read_and_read_again_once_complete() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rollout.jsonl");
+            let complete = header_line(PARENT_THREAD, "2026-10-12T10:00:00.000Z", "0.160.0", None)
+                + &turn("alpha", "2026-10-12T10:00:01.000Z");
+            let unterminated = complete.trim_end_matches('\n');
+            let last_line_start = unterminated.rfind('\n').unwrap() + 1;
+
+            let prefix = written_and_read(&path, unterminated.as_bytes());
+
+            assert!(
+                entry_json(&prefix).contains("answer to alpha"),
+                "the record without a line ending is read"
+            );
+            assert_eq!(
+                LineCursor::decode(&prefix.transcript_read.cursor),
+                Some(LineCursor {
+                    offset: last_line_start as u64,
+                    line: 3
+                }),
+                "the cursor stays before the record without a line ending"
+            );
+
+            std::fs::write(&path, &complete).unwrap();
+            let window = window(resumed(&path, &prefix.transcript_read));
+
+            assert_eq!(window.start_line, 3);
+            assert_eq!(
+                listed(&window.entries),
+                listed(&read_whole(&path).entries[1..]),
+                "the window reads the completed record again"
+            );
+        }
+
+        #[test]
+        fn subagent_before_its_own_records_resumes_from_its_first_record() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("rollout.jsonl");
+            let bytes = std::fs::read(fixture("subagent.jsonl")).unwrap();
+            let inherited_end = bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'\n')
+                .nth(4)
+                .unwrap()
+                .0
+                + 1;
+
+            let prefix = written_and_read(&path, &bytes[..inherited_end]);
+            assert!(
+                entry_json(&prefix).contains("INHERITED_PARENT_SENTINEL"),
+                "before its own records, the sub-agent shows the history it copied"
+            );
+            assert_eq!(
+                LineCursor::decode(&prefix.transcript_read.stable_cursor).map(|cursor| cursor.line),
+                Some(2),
+                "the next read restarts at the first record"
+            );
+
+            std::fs::write(&path, &bytes).unwrap();
+            let window = window(resumed(&path, &prefix.transcript_read));
+
+            assert_eq!(window.start_line, 2);
+            assert_window_completes("sub-agent", &prefix, &window, &read_whole(&path));
+            assert!(
+                !listed(&window.entries)
+                    .concat()
+                    .contains("INHERITED_PARENT_SENTINEL")
+            );
+        }
+
+        #[test]
+        fn thread_continuing_earlier_rollouts_reads_whole() {
+            let home = tempfile::tempdir().unwrap();
+            let thread = edited_thread(home.path());
+
+            let read = read_whole(&thread.second_edit).transcript_read;
+
+            assert_eq!(read, TranscriptRead::full_read());
+            assert!(matches!(
+                resumed(&thread.second_edit, &read),
+                Resumption::FullRead
+            ));
+            let directory = tempfile::tempdir().unwrap();
+            let resumable =
+                written_and_read(&directory.path().join("rollout.jsonl"), &rollout_bytes())
+                    .transcript_read;
+            assert!(
+                matches!(
+                    reader()
+                        .read_from(
+                            crate::history::FOR_FIXTURES,
+                            &thread.second_edit,
+                            &resumable
+                        )
+                        .unwrap(),
+                    Resumption::FullRead
+                ),
+                "a read that could resume does not resume a thread continuing earlier rollouts"
+            );
         }
     }
 }

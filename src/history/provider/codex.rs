@@ -9,7 +9,7 @@ use super::{
     ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
     SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
     SessionStorage, SessionStub, SessionTitle, SessionsDirLookup, SourceLabels, Stored,
-    SubagentFinder, resolved_session_paths, walk,
+    SubagentFinder, ThreadLinker, TranscriptReader, resolved_session_paths, walk,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -554,6 +554,14 @@ impl SessionStorage for CodexStorage {
             listed.row.has_transient_read_error |= discarded.has_transient_error;
             listed
         }))
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &codex::CODEX_ROLLOUT
+    }
+
+    fn thread_linker(&self) -> &dyn ThreadLinker {
+        &codex::CODEX_ROLLOUT
     }
 
     /// Thread names live in `session_index.jsonl`, so a rename never touches
@@ -2164,9 +2172,11 @@ pub(super) mod tests {
         let second = load_rows(&storage, cache_base.path());
         assert!(
             second[0]
+                .load_content()
+                .unwrap()
                 .agent_search_text
                 .contains("later sub-agent answer"),
-            "the fingerprint spans the sub-agent, so its growth reparses the session"
+            "the fingerprint spans the sub-agent, so its growth reads the session again"
         );
     }
 

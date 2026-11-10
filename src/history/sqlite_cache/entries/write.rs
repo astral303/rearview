@@ -34,6 +34,7 @@ const ENTRY_PLACE_COLUMNS: &[&str] = &[
     "sequence",
     "record_transcript",
     "search_field",
+    "child",
 ];
 
 /// The columns [`EntryRow::digest`] hashes, the digest last.
@@ -54,6 +55,7 @@ const ENTRY_CONTENT_COLUMNS: &[&str] = &[
     "duration_ms",
     "parent_uuid",
     "flag",
+    "splice_key",
     "digest",
 ];
 
@@ -113,20 +115,22 @@ pub(super) struct EntryPlace {
     pub(super) sequence: i64,
     pub(super) message: Option<i64>,
     pub(super) transcript: Option<i64>,
+    pub(super) child: Option<i64>,
 }
 
 impl EntryPlace {
     /// `row`'s place at `sequence`, with the ids `ids` gives its message and
-    /// transcript, which are written already.
+    /// transcripts, which are written already.
     pub(super) fn of(row: &EntryRow, sequence: usize, ids: &RowIds) -> Self {
+        let transcript =
+            |index: usize| ids.transcripts[index].expect("an entry's transcript is written first");
         Self {
             sequence: sequence as i64,
             message: row
                 .message
                 .map(|message| ids.messages[message].expect("an entry's message is written first")),
-            transcript: row.transcript.map(|transcript| {
-                ids.transcripts[transcript].expect("an entry's transcript is written first")
-            }),
+            transcript: row.transcript.map(transcript),
+            child: row.child.map(transcript),
         }
     }
 }
@@ -270,23 +274,23 @@ impl<'connection> RowWriter<'connection> {
         Ok(())
     }
 
-    /// Inserts the entry at `sequence` with its parts and search texts,
-    /// first inserting its message, thread and transcript when `ids` has
-    /// none for them.
+    /// Inserts the entry at `index` with its parts and search texts, first
+    /// inserting its message, thread and transcripts when `ids` has none for
+    /// them.
     pub(super) fn insert_entry(
         &mut self,
         rows: &SessionRows,
         ids: &mut RowIds,
-        sequence: usize,
+        index: usize,
     ) -> rusqlite::Result<i64> {
-        let row = &rows.entries[sequence];
+        let row = &rows.entries[index];
         if let Some(message) = row.message {
             self.message(rows, ids, message)?;
         }
-        if let Some(transcript) = row.transcript {
+        for transcript in [row.transcript, row.child].into_iter().flatten() {
             self.transcript(rows, ids, transcript)?;
         }
-        let place = EntryPlace::of(row, sequence, ids);
+        let place = EntryPlace::of(row, rows.sequence_of(index), ids);
         bind_entry(&mut self.insert_entry, self.session, row, &place)?;
         self.insert_entry.raw_execute()?;
         let id = self.connection.last_insert_rowid();
@@ -315,6 +319,49 @@ impl<'connection> RowWriter<'connection> {
             .prepare_cached("DELETE FROM search_texts WHERE entry = ?1")?
             .execute([id])?;
         self.insert_children(row, id)
+    }
+
+    /// Sets the columns of the stored entry `id` that [`EntryRow::digest`]
+    /// hashes to `row`'s, and replaces its parts and search texts. The row
+    /// keeps its place and its message.
+    pub(super) fn rewrite_content(&mut self, row: &EntryRow, id: i64) -> rusqlite::Result<()> {
+        let mut statement = self
+            .connection
+            .prepare_cached(&update_sql("entries", &[ENTRY_CONTENT_COLUMNS]))?;
+        statement.raw_bind_parameter(1, self.session)?;
+        bind_content(&mut statement, row, 2)?;
+        statement.raw_bind_parameter(ENTRY_CONTENT_COLUMNS.len() + 2, id)?;
+        statement.raw_execute()?;
+        drop(statement);
+        self.connection
+            .prepare_cached("DELETE FROM parts WHERE entry = ?1")?
+            .execute([id])?;
+        self.connection
+            .prepare_cached("DELETE FROM search_texts WHERE entry = ?1")?
+            .execute([id])?;
+        self.insert_children(row, id)
+    }
+
+    /// Sets every column of the stored message `id` but its thread and its
+    /// ordinal to the message at `index`'s.
+    pub(super) fn rewrite_message(
+        &self,
+        rows: &SessionRows,
+        index: usize,
+        id: i64,
+    ) -> rusqlite::Result<()> {
+        let columns = &MESSAGE_COLUMNS[2..];
+        let mut statement = self
+            .connection
+            .prepare_cached(&update_sql("messages", &[columns]))?;
+        statement.raw_bind_parameter(1, self.session)?;
+        let values = rows.messages[index].values();
+        for (offset, value) in values[1..].iter().enumerate() {
+            statement.raw_bind_parameter(offset + 2, value)?;
+        }
+        statement.raw_bind_parameter(columns.len() + 2, id)?;
+        statement.raw_execute()?;
+        Ok(())
     }
 
     /// Moves the stored entry `id` to `place`, and sets whether search reads
@@ -361,7 +408,7 @@ fn bind_place(
     place: &EntryPlace,
 ) -> rusqlite::Result<()> {
     let search_field = row.is_leading.then(|| SearchField::Leading.code());
-    let values: [&dyn ToSql; 7] = [
+    let values: [&dyn ToSql; 8] = [
         &session,
         &place.message,
         &row.contributes,
@@ -369,6 +416,7 @@ fn bind_place(
         &place.sequence,
         &place.transcript,
         &search_field,
+        &place.child,
     ];
     for (offset, value) in values.into_iter().enumerate() {
         statement.raw_bind_parameter(offset + 1, value)?;
@@ -384,12 +432,21 @@ fn bind_entry(
     place: &EntryPlace,
 ) -> rusqlite::Result<()> {
     bind_place(statement, session, row, place)?;
+    bind_content(statement, row, ENTRY_PLACE_COLUMNS.len() + 2)
+}
+
+/// Binds `row`'s [`ENTRY_CONTENT_COLUMNS`] from parameter `first` on.
+fn bind_content(
+    statement: &mut CachedStatement,
+    row: &EntryRow,
+    first: usize,
+) -> rusqlite::Result<()> {
     let columns = &row.columns;
     let text = columns.text.map(split_terminal_codes);
     let usage = row.metadata_usage();
     let count =
         |count: fn(&crate::log_entry::TokenUsage) -> u64| usage.map(|usage| count(usage) as i64);
-    let values: [&dyn ToSql; 17] = [
+    let values: [&dyn ToSql; 18] = [
         &(row.record.line as i64),
         &columns.kind,
         &columns.timestamp_ms,
@@ -406,10 +463,11 @@ fn bind_entry(
         &columns.duration_ms.map(|duration| duration as i64),
         &columns.parent_uuid,
         &columns.flag,
+        &row.splice_key,
         &row.digest,
     ];
     for (offset, value) in values.into_iter().enumerate() {
-        statement.raw_bind_parameter(ENTRY_PLACE_COLUMNS.len() + 2 + offset, value)?;
+        statement.raw_bind_parameter(first + offset, value)?;
     }
     Ok(())
 }

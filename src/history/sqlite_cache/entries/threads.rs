@@ -1,4 +1,4 @@
-use crate::agent::message_numbering::{ThreadIdentity, ThreadNumbers};
+use crate::agent::message_numbering::{NumberingCheckpoint, ThreadIdentity, ThreadNumbers};
 use crate::history::format::RecordLine;
 use crate::log_entry::{LogEntry, SubagentIdentity};
 use rusqlite::Connection;
@@ -48,9 +48,21 @@ pub(super) struct Placement {
     pub(super) position: i64,
     /// The entry's transcript when its thread's origin names another one.
     pub(super) transcript: Option<usize>,
+    /// The entry's transcript; `None` for the session's own.
+    pub(super) record_transcript: Option<usize>,
 }
 
 impl Numbering {
+    /// The numbering after the entries `numbering` and `positions` were
+    /// checkpointed past, holding no transcript or thread row yet.
+    pub(super) fn resumed(numbering: &NumberingCheckpoint, positions: &HashMap<i64, i64>) -> Self {
+        Self {
+            positions: positions.clone(),
+            logical_threads: ThreadNumbers::resumed(&numbering.threads),
+            ..Self::default()
+        }
+    }
+
     fn transcript(&mut self, path: &Arc<Path>) -> usize {
         match self.transcript_indexes.entry(path.clone()) {
             Entry::Occupied(entry) => *entry.get(),
@@ -121,6 +133,7 @@ impl Numbering {
             logical_thread: number,
             position,
             transcript: record_transcript,
+            record_transcript: transcript,
         }
     }
 }

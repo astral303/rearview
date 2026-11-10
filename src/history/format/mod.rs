@@ -18,7 +18,7 @@ pub(crate) mod splice;
 use super::fingerprint::FileStamp;
 #[cfg(test)]
 use super::parser::RowDating;
-use super::provider::Capability;
+use super::provider::{Capability, TranscriptRead};
 use super::{Admitted, ParsePermit};
 #[cfg(test)]
 use super::{Conversation, parser};
@@ -109,6 +109,10 @@ pub struct SessionProjection {
     /// Each earlier transcript the read opened, stamped just before it was
     /// opened; empty for a format whose transcripts continue none.
     pub earlier_transcripts: Vec<FileStamp>,
+    /// What the read leaves for the agent's transcript reader to resume
+    /// from; [`TranscriptRead::full_read`] for a format whose reads do not
+    /// resume yet.
+    pub transcript_read: TranscriptRead,
 }
 
 /// The outcome of reading the earlier transcripts a transcript continues.

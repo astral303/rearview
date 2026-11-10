@@ -53,7 +53,7 @@ impl ThreadIdentity {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ThreadNumbers(HashMap<ThreadIdentity, i64>);
 
 impl ThreadNumbers {
@@ -64,6 +64,63 @@ impl ThreadNumbers {
         let next = self.0.len() as i64 + 1;
         *self.0.entry(identity).or_insert(next)
     }
+
+    /// Each sub-agent thread's identity and number, as a checkpoint stores
+    /// them.
+    pub(crate) fn checkpoint(&self) -> Vec<(ThreadKey, i64)> {
+        let mut threads: Vec<(ThreadKey, i64)> = self
+            .0
+            .iter()
+            .filter_map(|(identity, number)| match identity {
+                ThreadIdentity::Session => None,
+                ThreadIdentity::Progress { transcript, label } => Some((
+                    ThreadKey {
+                        transcript: transcript.as_deref().map(Path::to_path_buf),
+                        label: label.clone(),
+                    },
+                    *number,
+                )),
+            })
+            .collect();
+        threads.sort_by_key(|(_, number)| *number);
+        threads
+    }
+
+    /// The numbers [`Self::checkpoint`] stored.
+    pub(crate) fn resumed(threads: &[(ThreadKey, i64)]) -> Self {
+        Self(
+            threads
+                .iter()
+                .map(|(key, number)| (key.identity(), *number))
+                .collect(),
+        )
+    }
+}
+
+/// A sub-agent thread's [`ThreadIdentity`] as a checkpoint stores it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ThreadKey {
+    pub(crate) transcript: Option<std::path::PathBuf>,
+    pub(crate) label: String,
+}
+
+impl ThreadKey {
+    pub(crate) fn identity(&self) -> ThreadIdentity {
+        ThreadIdentity::Progress {
+            transcript: self.transcript.as_deref().map(Arc::from),
+            label: self.label.clone(),
+        }
+    }
+}
+
+/// What a [`MessageNumbering`] carries past one entry to the next, without
+/// the reply ids it numbered: a numbering resumed from it numbers no record
+/// as continuing a reply started before the checkpoint.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct NumberingCheckpoint {
+    pub(crate) count: usize,
+    pub(crate) has_user_message: bool,
+    pub(crate) threads: Vec<(ThreadKey, i64)>,
 }
 
 /// A message's place in the numbering.
@@ -86,6 +143,26 @@ pub(crate) struct MessageNumbering {
 }
 
 impl MessageNumbering {
+    /// The numbering as a checkpoint stores it.
+    pub(crate) fn checkpoint(&self) -> NumberingCheckpoint {
+        NumberingCheckpoint {
+            count: self.count,
+            has_user_message: self.has_user_message,
+            threads: self.threads.checkpoint(),
+        }
+    }
+
+    /// The numbering [`Self::checkpoint`] stored.
+    pub(crate) fn resumed(checkpoint: &NumberingCheckpoint) -> Self {
+        Self {
+            count: checkpoint.count,
+            has_user_message: checkpoint.has_user_message,
+            own_replies: ReplyOrdinals::default(),
+            subagent_replies: ReplyOrdinals::default(),
+            threads: ThreadNumbers::resumed(&checkpoint.threads),
+        }
+    }
+
     pub(crate) fn thread(&mut self, identity: ThreadIdentity) -> i64 {
         self.threads.number(identity)
     }

@@ -11,27 +11,35 @@
 //! because the transcript does not name its agent. A session closed before
 //! its first prompt has a summary and no transcript; it reads as a session
 //! with no entries.
+//!
+//! Grok appends to the transcript and rewrites `summary.json`, so a read of
+//! a changed transcript resumes from its stable cursor and reads
+//! `summary.json` again.
 
 use super::dropped::DroppedRecords;
-use super::lines::visit_parsed_lines;
+use super::lines::{self, LineCursor, visit_line_spans_from};
 use super::{
-    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, append_exit_code, at_own_lines,
+    EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code,
+    at_own_lines,
 };
 use super::{rename_key, rfc3339_from_millis};
 use crate::error::Result;
-use crate::history::Source;
-use crate::history::provider::SessionTitle;
+use crate::history::provider::{
+    ResumedWindow, Resumption, SessionTitle, TranscriptRead, TranscriptReader,
+};
+use crate::history::{MalformedLine, ParsePermit, Source};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, RECAP_LABEL, TokenUsage, Tool, UserContent,
     UserMessage, replacement_diff,
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader, ErrorKind};
+use std::io::{self, BufRead, BufReader, ErrorKind, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// The transcript's file name in a session directory, and the locator's last
@@ -60,16 +68,159 @@ impl SessionFormat for GrokUpdatesFormat {
         let Some(summary) = session_summary(path.parent().unwrap_or_else(|| Path::new(""))) else {
             return Ok(None);
         };
-        let updates = match File::open(path) {
-            Ok(file) => parse_updates(BufReader::new(file), ParallelThreshold::DEFAULT, dropped)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => ParsedUpdates {
-                dropped,
-                ..ParsedUpdates::default()
-            },
+        let (updates, transcript_read) = match File::open(path) {
+            Ok(file) => {
+                let mut reader = BufReader::new(file);
+                let mut projector =
+                    Projector::new(LineCursor::START, StreamState::default(), dropped);
+                let cursor =
+                    projector.read(&mut reader, LineCursor::START, ParallelThreshold::DEFAULT)?;
+                let transcript_read = match projector.first_line {
+                    Some(first_line) => projector
+                        .end(cursor)
+                        .transcript_read(stream_identity(first_line, &summary), reader.get_mut())?,
+                    None => TranscriptRead::full_read(),
+                };
+                (projector.finish(), transcript_read)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => (
+                ParsedUpdates {
+                    dropped,
+                    ..ParsedUpdates::default()
+                },
+                TranscriptRead::full_read(),
+            ),
             Err(error) => return Err(error.into()),
         };
-        Ok(Some(projection(summary, updates)))
+        Ok(Some(projection(summary, updates, transcript_read)))
     }
+}
+
+/// Resumes a read of a Grok transcript from its stable cursor: the last
+/// record boundary where no message is still streaming and no call the
+/// current turn opened waits for its result, since a later update completes
+/// a call's input. The identity is the transcript's first line with what the
+/// read takes from `summary.json` besides the title and the model; every
+/// read takes those again.
+impl TranscriptReader for GrokUpdatesFormat {
+    fn identity(&self, source: &Path) -> Result<Vec<u8>> {
+        if source.file_name() != Some(OsStr::new(UPDATES_FILE)) {
+            return Ok(Vec::new());
+        }
+        let Some(summary) = session_summary(source.parent().unwrap_or_else(|| Path::new("")))
+        else {
+            return Ok(Vec::new());
+        };
+        let mut reader = BufReader::new(File::open(source)?);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') {
+                return Ok(Vec::new());
+            }
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            if !line.trim().is_empty() {
+                return Ok(stream_identity(blake3::hash(line.as_bytes()), &summary));
+            }
+        }
+    }
+
+    fn is_rewritten(&self, source: &Path, read: &TranscriptRead) -> Result<bool> {
+        lines::is_rewritten(source, read)
+    }
+
+    fn read_from(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+        read: &TranscriptRead,
+    ) -> Result<Resumption> {
+        permit.admit();
+        let (Some(stable_cursor), Ok(state)) = (
+            LineCursor::decode(&read.stable_cursor),
+            serde_json::from_slice::<StreamRead>(&read.parser_state),
+        ) else {
+            return Ok(Resumption::FullRead);
+        };
+        let mut reader = BufReader::new(File::open(source)?);
+        reader.seek(SeekFrom::Start(stable_cursor.offset))?;
+        let mut projector =
+            Projector::new(stable_cursor, state.at_stable, DroppedRecords::default());
+        let cursor = projector.read(&mut reader, stable_cursor, ParallelThreshold::DEFAULT)?;
+        if projector.changes_earlier_entry {
+            return Ok(Resumption::ChangesEarlierEntry);
+        }
+        let bytes_read = reader
+            .get_ref()
+            .metadata()?
+            .len()
+            .saturating_sub(stable_cursor.offset);
+        let next_read = projector
+            .end(cursor)
+            .transcript_read(read.identity.clone(), reader.get_mut())?;
+        let updates = projector.finish();
+        Ok(Resumption::Window(ResumedWindow {
+            start_line: stable_cursor.line,
+            entries: at_own_lines(updates.entries),
+            malformed_lines: updates
+                .malformed_lines
+                .into_iter()
+                .map(|line_number| MalformedLine {
+                    line_number,
+                    detail: None,
+                })
+                .collect(),
+            read: next_read,
+            bytes_read,
+        }))
+    }
+
+    fn read_whole(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+    ) -> Result<Option<SessionProjection>> {
+        self.parse_transcript(permit, source)
+    }
+
+    /// The entries `summary.json` adds: the session's title, and the
+    /// summary's model while the transcript, as `read` read it, names none.
+    fn leading_entries(
+        &self,
+        source: &Path,
+        read: &TranscriptRead,
+    ) -> Result<Vec<(RecordLine, LogEntry)>> {
+        let Some(summary) = session_summary(source.parent().unwrap_or_else(|| Path::new("")))
+        else {
+            return Ok(Vec::new());
+        };
+        let names_a_model = serde_json::from_slice::<StreamRead>(&read.parser_state)
+            .is_ok_and(|stream| stream.names_a_model);
+        let (entries, _) = summary_entries(&summary, names_a_model);
+        Ok(entries
+            .into_iter()
+            .map(|entry| (RecordLine::from(0), entry))
+            .collect())
+    }
+}
+
+/// The transcript's identity: a hash of its first line, given as
+/// `first_line`'s hash, and of what a read takes from `summary` besides the
+/// title and the model.
+fn stream_identity(first_line: blake3::Hash, summary: &SessionSummary) -> Vec<u8> {
+    let facts = serde_json::to_vec(&(
+        first_line.to_hex().as_str(),
+        &summary.id,
+        summary.cwd.as_deref().map(Path::to_string_lossy),
+        &summary.created_at,
+        &summary.session_kind,
+        &summary.agent_name,
+    ))
+    .expect("a transcript's identity facts serialize");
+    blake3::hash(&facts).as_bytes().to_vec()
 }
 
 /// The `summary.json` fields this reader uses. Only `info.id` is required:
@@ -144,14 +295,15 @@ pub(crate) fn session_summary(session_dir: &Path) -> Option<SessionSummary> {
     })
 }
 
-fn projection(summary: SessionSummary, updates: ParsedUpdates) -> SessionProjection {
-    let mut entries = updates.entries;
-    // Use the summary's model when no completed turn named one.
-    if !updates.named_a_model
-        && let Some(model) = summary.current_model_id.clone()
-    {
-        entries.insert(0, (0, model_entry(model, None)));
-    }
+/// The entries `summary` adds before the transcript's, at line 0, and the
+/// title's text: the session's title, then the summary's model when the
+/// transcript names none, as no completed turn did when `named_a_model` is
+/// false.
+fn summary_entries(
+    summary: &SessionSummary,
+    named_a_model: bool,
+) -> (Vec<LogEntry>, Option<String>) {
+    let mut entries = Vec::new();
     let mut title = None;
     if !summary.is_subagent()
         && let Some(name) = summary.title()
@@ -170,10 +322,28 @@ fn projection(summary: SessionSummary, updates: ParsedUpdates) -> SessionProject
                 text,
             ),
         };
-        // Line 0: the title lives in summary.json, not the transcript.
-        entries.insert(0, (0, entry));
+        entries.push(entry);
         title = Some(text);
     }
+    if !named_a_model && let Some(model) = summary.current_model_id.clone() {
+        entries.push(model_entry(model, None));
+    }
+    (entries, title)
+}
+
+fn projection(
+    summary: SessionSummary,
+    updates: ParsedUpdates,
+    transcript_read: TranscriptRead,
+) -> SessionProjection {
+    // Line 0: the title and the model live in summary.json, not the
+    // transcript.
+    let (leading, title) = summary_entries(&summary, updates.named_a_model);
+    let entries = leading
+        .into_iter()
+        .map(|entry| (0, entry))
+        .chain(updates.entries)
+        .collect();
     let thread_label = summary
         .is_subagent()
         .then(|| summary.agent_name.clone())
@@ -199,6 +369,7 @@ fn projection(summary: SessionSummary, updates: ParsedUpdates) -> SessionProject
         dropped: updates.dropped,
         earlier_turns: EarlierTurns::Read,
         earlier_transcripts: Vec::new(),
+        transcript_read,
     }
 }
 
@@ -222,26 +393,70 @@ struct ParsedUpdates {
     dropped: DroppedRecords,
 }
 
+#[cfg(test)]
 fn parse_updates(
     reader: impl BufRead,
     parallel: ParallelThreshold,
     dropped: DroppedRecords,
 ) -> Result<ParsedUpdates> {
-    let mut projector = Projector {
-        dropped,
-        ..Projector::default()
-    };
-    visit_parsed_lines(
-        reader,
-        1,
-        parallel,
-        |line| serde_json::from_str::<Value>(line).ok(),
-        |line_number, _, record| match record {
-            Some(Value::Object(record)) => projector.record(line_number, &record),
-            _ => projector.malformed_lines.push(line_number),
-        },
-    )?;
+    let mut projector = Projector::new(LineCursor::START, StreamState::default(), dropped);
+    projector.read(reader, LineCursor::START, parallel)?;
     Ok(projector.finish())
+}
+
+/// What a read of the update stream carries from one record to the next, as
+/// the next read restarts with it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct StreamState {
+    last_model: Option<String>,
+    named_a_model: bool,
+    /// Each sub-agent's type by its session id, from its spawn record.
+    subagent_types: BTreeMap<String, String>,
+    /// The id of each call opened before the place the state stands at. An
+    /// update completing one's input changes an entry before that place.
+    earlier_calls: BTreeSet<String>,
+}
+
+/// What a read of the update stream leaves for the next, as its
+/// [`TranscriptRead::parser_state`].
+#[derive(Debug, Deserialize, Serialize)]
+struct StreamRead {
+    /// The state at the stable cursor.
+    at_stable: StreamState,
+    /// True when a completed turn named a model by the stream's end: the
+    /// summary's model then adds no entry.
+    names_a_model: bool,
+}
+
+/// Where a read of the update stream stopped, and what it leaves for the
+/// next.
+struct StreamReadEnd {
+    cursor: LineCursor,
+    stable_cursor: LineCursor,
+    read: StreamRead,
+}
+
+impl StreamReadEnd {
+    /// What this read leaves for the next, for the transcript `file` holds,
+    /// whose identity is `identity`.
+    fn transcript_read(&self, identity: Vec<u8>, file: &mut File) -> Result<TranscriptRead> {
+        Ok(TranscriptRead {
+            cursor: self.cursor.encode(),
+            stable_cursor: self.stable_cursor.encode(),
+            identity,
+            rewrite_check: lines::rewrite_check(file, self.cursor)?,
+            parser_state: serde_json::to_vec(&self.read).expect("a stream read serializes"),
+            stable_line: Some(self.stable_cursor.line),
+        })
+    }
+}
+
+/// A record boundary a read can restart from: the state there, but for the
+/// earlier calls, and how many calls the read had opened.
+struct StablePlace {
+    cursor: LineCursor,
+    state: StreamState,
+    opened: usize,
 }
 
 /// The update kinds the reader drops on purpose: plans, task lifecycle,
@@ -264,19 +479,31 @@ const DROPPED_UPDATE_KINDS: &[&str] = &[
 ];
 
 /// The update stream folded into entries, one record at a time.
-#[derive(Default)]
 struct Projector {
     entries: Vec<(usize, LogEntry)>,
     malformed_lines: Vec<usize>,
     /// The run of chunk records not yet emitted.
     run: Option<ChunkRun>,
-    /// Each tool call's index in `entries`, by call id, so a later update can
-    /// complete its input.
+    /// Each tool call this read opened, by call id, with its index in
+    /// `entries`, so a later update can complete its input.
     calls: HashMap<String, usize>,
-    /// Each sub-agent's type by its session id, from its spawn record.
-    subagent_types: HashMap<String, String>,
-    last_model: Option<String>,
-    named_a_model: bool,
+    /// The state the read started with, its earlier calls those opened
+    /// before the read, moved on record by record.
+    state: StreamState,
+    /// The id of each call this read opened, in order.
+    opened: Vec<String>,
+    /// The calls the current turn opened that wait for their result. A
+    /// prompt or a completed turn ends the turn.
+    open_turn_calls: HashSet<String>,
+    /// True once an update would complete the input of a call opened before
+    /// the read.
+    changes_earlier_entry: bool,
+    /// The last record boundary where no message streamed and no call of
+    /// the current turn waited.
+    stable: StablePlace,
+    /// The hash of the first line holding more than whitespace that ends in
+    /// a line ending.
+    first_line: Option<blake3::Hash>,
     dropped: DroppedRecords,
 }
 
@@ -304,6 +531,96 @@ struct ChunkRun {
 }
 
 impl Projector {
+    /// A projector reading on from `from` with `state`.
+    fn new(from: LineCursor, state: StreamState, dropped: DroppedRecords) -> Self {
+        let mut projector = Self {
+            entries: Vec::new(),
+            malformed_lines: Vec::new(),
+            run: None,
+            calls: HashMap::new(),
+            state,
+            opened: Vec::new(),
+            open_turn_calls: HashSet::new(),
+            changes_earlier_entry: false,
+            stable: StablePlace {
+                cursor: from,
+                state: StreamState::default(),
+                opened: 0,
+            },
+            first_line: None,
+            dropped,
+        };
+        projector.stable = projector.place(from);
+        projector
+    }
+
+    /// Read `reader`, standing at `from`, to its end, and return the cursor
+    /// past the last line with a line ending. A last line without one is
+    /// read too, after the stable place is kept.
+    fn read(
+        &mut self,
+        reader: impl BufRead,
+        from: LineCursor,
+        parallel: ParallelThreshold,
+    ) -> io::Result<LineCursor> {
+        let parse = |line: &str| serde_json::from_str::<Value>(line).ok();
+        let read = visit_line_spans_from(reader, from, parallel, parse, |span, line, record| {
+            if self.first_line.is_none() {
+                self.first_line = Some(blake3::hash(line.as_bytes()));
+            }
+            self.add(span.start.line, record);
+            if self.run.is_none() && self.open_turn_calls.is_empty() {
+                self.stable = self.place(span.end);
+            }
+        })?;
+        if let Some((line_number, line)) = read.unterminated {
+            self.add(line_number, parse(&line));
+        }
+        Ok(read.cursor)
+    }
+
+    fn add(&mut self, line: usize, record: Option<Value>) {
+        match record {
+            Some(Value::Object(record)) => self.record(line, &record),
+            _ => self.malformed_lines.push(line),
+        }
+    }
+
+    /// `cursor` as a place the next read can restart from, with the state
+    /// now.
+    fn place(&self, cursor: LineCursor) -> StablePlace {
+        StablePlace {
+            cursor,
+            state: StreamState {
+                last_model: self.state.last_model.clone(),
+                named_a_model: self.state.named_a_model,
+                subagent_types: self.state.subagent_types.clone(),
+                earlier_calls: BTreeSet::new(),
+            },
+            opened: self.opened.len(),
+        }
+    }
+
+    /// The read's end, stopped at `cursor`.
+    fn end(&self, cursor: LineCursor) -> StreamReadEnd {
+        let mut at_stable = self.stable.state.clone();
+        at_stable.earlier_calls = self
+            .state
+            .earlier_calls
+            .iter()
+            .chain(&self.opened[..self.stable.opened])
+            .cloned()
+            .collect();
+        StreamReadEnd {
+            cursor,
+            stable_cursor: self.stable.cursor,
+            read: StreamRead {
+                at_stable,
+                names_a_model: self.state.named_a_model,
+            },
+        }
+    }
+
     fn record(&mut self, line: usize, record: &Map<String, Value>) {
         let params = record.get("params").and_then(Value::as_object);
         let meta = params
@@ -375,6 +692,9 @@ impl Projector {
                 .and_then(|meta| meta.get("promptIndex"))
                 .and_then(Value::as_i64),
         };
+        if kind == ChunkKind::User {
+            self.open_turn_calls.clear();
+        }
         if let Some(run) = &mut self.run
             && run.kind == kind
             && run.key == key
@@ -432,13 +752,17 @@ impl Projector {
             tool,
             input: call_input(update, tool),
         };
-        self.calls.insert(id, self.entries.len());
+        self.calls.insert(id.clone(), self.entries.len());
+        self.opened.push(id.clone());
+        self.open_turn_calls.insert(id);
         self.entries
             .push((line, assistant_entry(vec![block], timestamp)));
     }
 
     /// An update carries the call's full input, its result, or both. If the
-    /// call's opening record is missing, the update opens the call.
+    /// call's opening record is missing, the update opens the call. An update
+    /// completing the input of a call opened before the read changes an entry
+    /// before it.
     fn update_call(
         &mut self,
         line: usize,
@@ -447,9 +771,13 @@ impl Projector {
         timestamp: Option<String>,
     ) {
         let id = call_id(update);
-        if !self.calls.contains_key(&id) {
+        let is_earlier = !self.calls.contains_key(&id) && self.state.earlier_calls.contains(&id);
+        if !self.calls.contains_key(&id) && !is_earlier {
             self.open_call(line, update, meta, timestamp.clone());
         } else if update.get("rawInput").is_some_and(Value::is_object) {
+            if is_earlier {
+                self.changes_earlier_entry = true;
+            }
             let (name, tool) = tool_identity(update, meta);
             if let Some(ContentBlock::ToolUse {
                 name: call_name,
@@ -473,13 +801,17 @@ impl Projector {
         if !matches!(status, Some("completed" | "failed")) {
             return;
         }
-        if let Some(query) = backend_search_query(update)
-            && let Some(ContentBlock::ToolUse { input, .. }) = self.call_block(&id)
-            && let Some(arguments) = input.as_object_mut()
-        {
-            arguments
-                .entry("query")
-                .or_insert_with(|| Value::String(query));
+        self.open_turn_calls.remove(&id);
+        if let Some(query) = backend_search_query(update) {
+            if is_earlier {
+                self.changes_earlier_entry = true;
+            } else if let Some(ContentBlock::ToolUse { input, .. }) = self.call_block(&id)
+                && let Some(arguments) = input.as_object_mut()
+            {
+                arguments
+                    .entry("query")
+                    .or_insert_with(|| Value::String(query));
+            }
         }
         let text = result_text(update, status == Some("failed"));
         self.entries.push((
@@ -511,14 +843,15 @@ impl Projector {
         update: &Map<String, Value>,
         timestamp: Option<String>,
     ) {
+        self.open_turn_calls.clear();
         let Some(usage) = update.get("usage").and_then(Value::as_object) else {
             return;
         };
         if let Some(models) = usage.get("modelUsage").and_then(Value::as_object) {
             for model in models.keys() {
-                if self.last_model.as_deref() != Some(model) {
-                    self.last_model = Some(model.clone());
-                    self.named_a_model = true;
+                if self.state.last_model.as_deref() != Some(model) {
+                    self.state.last_model = Some(model.clone());
+                    self.state.named_a_model = true;
                     self.entries
                         .push((line, model_entry(model.clone(), timestamp.clone())));
                 }
@@ -554,7 +887,7 @@ impl Projector {
             string(update, "child_session_id"),
             string(update, "subagent_type"),
         ) {
-            self.subagent_types.insert(child, subagent_type);
+            self.state.subagent_types.insert(child, subagent_type);
         }
     }
 
@@ -571,7 +904,7 @@ impl Projector {
             return;
         };
         let subagent_type = string(update, "child_session_id")
-            .and_then(|child| self.subagent_types.get(&child).cloned());
+            .and_then(|child| self.state.subagent_types.get(&child).cloned());
         let mut text = match subagent_type {
             Some(subagent_type) => format!("{subagent_type} {status}"),
             None => status.clone(),
@@ -600,7 +933,7 @@ impl Projector {
         ParsedUpdates {
             entries: self.entries,
             malformed_lines: self.malformed_lines,
-            named_a_model: self.named_a_model,
+            named_a_model: self.state.named_a_model,
             dropped: self.dropped,
         }
     }
@@ -1998,5 +2331,389 @@ mod tests {
             parsed(ParallelThreshold::ALWAYS),
             parsed(ParallelThreshold::NEVER)
         );
+    }
+
+    mod resumed_reads {
+        use super::*;
+        use crate::history::format::lines::record_splits;
+        use crate::history::provider::contract_tests::every_record_sessions;
+        use crate::history::provider::transcript_reads::resume;
+
+        fn reader() -> &'static dyn TranscriptReader {
+            Source::Grok.provider().storage().transcript_reader()
+        }
+
+        fn read_whole(path: &Path) -> SessionProjection {
+            GROK_UPDATES
+                .parse_transcript(crate::history::FOR_FIXTURES, path)
+                .unwrap()
+                .expect("a Grok transcript")
+        }
+
+        /// `entries` as text a test compares.
+        fn listed(entries: &[(RecordLine, LogEntry)]) -> Vec<String> {
+            entries
+                .iter()
+                .map(|(record, entry)| format!("{} {entry:?}", record.line))
+                .collect()
+        }
+
+        /// Asserts that `prefix`, a read of a transcript's beginning, up to
+        /// the window's first line, and then `window`, the read resumed from
+        /// it over the whole transcript, hold what `full`, one read of the
+        /// whole transcript, holds, and leave what it leaves. The entries at
+        /// line 0 come from `summary.json`, which every read takes again.
+        fn assert_window_completes(
+            name: &str,
+            path: &Path,
+            prefix: &SessionProjection,
+            window: &ResumedWindow,
+            full: &SessionProjection,
+        ) {
+            let kept = prefix
+                .entries
+                .iter()
+                .filter(|(record, _)| record.line > 0 && record.line < window.start_line)
+                .chain(&window.entries)
+                .cloned()
+                .collect::<Vec<_>>();
+            let full_entries = full
+                .entries
+                .iter()
+                .filter(|(record, _)| record.line > 0)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed(&kept),
+                listed(&full_entries),
+                "{name}: the prefix and the window hold the full read's entries"
+            );
+            let malformed = prefix
+                .malformed_lines
+                .iter()
+                .filter(|line| **line < window.start_line)
+                .copied()
+                .chain(window.malformed_lines.iter().map(|line| line.line_number))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                malformed, full.malformed_lines,
+                "{name}: the prefix and the window hold the full read's malformed lines"
+            );
+            assert_eq!(
+                window.read, full.transcript_read,
+                "{name}: the window leaves what the full read leaves"
+            );
+            let leading = reader().leading_entries(path, &window.read).unwrap();
+            assert_eq!(
+                listed(&leading),
+                listed(
+                    &full
+                        .entries
+                        .iter()
+                        .filter(|(record, _)| record.line == 0)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                ),
+                "{name}: the leading entries after the window are the full read's"
+            );
+        }
+
+        /// The three records of a call `id` opened at `millis`: opened, its
+        /// input, and its result.
+        fn call_records(millis: i64, id: &str) -> [Value; 3] {
+            call(
+                millis,
+                id,
+                "read_file",
+                "read",
+                json!({"target_file": format!("/tmp/{id}.rs")}),
+                "completed",
+                json!({"type": "ReadFile", "FileContent": {"content": format!("body of {id}")}}),
+            )
+            .try_into()
+            .unwrap()
+        }
+
+        /// Three turns: streamed thoughts and replies, two calls completing
+        /// in the other order, a call still open when the next prompt
+        /// arrives, a sub-agent that fails, and two models.
+        fn interleaved_turns() -> Vec<Value> {
+            let [open_a, input_a, done_a] = call_records(1_300, "a");
+            let [open_b, input_b, done_b] = call_records(1_310, "b");
+            let [open_c, input_c, done_c] = call_records(1_500, "c");
+            vec![
+                user(1_000, "first question", 0),
+                agent_chunk(1_100, "agent_thought_chunk", "think ", "p1", 1_100),
+                agent_chunk(1_101, "agent_thought_chunk", "more", "p1", 1_100),
+                reply(1_200, "first answer", "p1"),
+                turn_completed(1_250, "grok-4.6", 10, 5),
+                user(1_260, "second question", 1),
+                reply(1_270, "second answer", "p2"),
+                open_a,
+                input_a,
+                open_b,
+                input_b,
+                done_b,
+                done_a,
+                envelope(
+                    1_350,
+                    json!({"sessionUpdate": "subagent_spawned", "child_session_id": "child-1",
+                           "subagent_type": "explore"}),
+                    json!({}),
+                ),
+                open_c,
+                input_c,
+                user(2_000, "third question", 2),
+                done_c,
+                reply(2_100, "third answer", "p3"),
+                envelope(
+                    2_150,
+                    json!({"sessionUpdate": "subagent_finished", "child_session_id": "child-1",
+                           "status": "failed", "error": "model unavailable"}),
+                    json!({}),
+                ),
+                turn_completed(2_200, "grok-4.7", 20, 6),
+            ]
+        }
+
+        /// `records` as lines, with a malformed line after the second.
+        fn with_malformed_line(records: &[Value]) -> String {
+            let mut lines = records.iter().map(Value::to_string).collect::<Vec<_>>();
+            lines.insert(2, "{not json".to_owned());
+            lines.join("\n") + "\n"
+        }
+
+        /// Copies the session directory holding `locator` into `into`, and
+        /// returns the copy's locator.
+        fn copied_session(locator: &Path, into: &Path) -> PathBuf {
+            let directory = into.join(locator.parent().unwrap().file_name().unwrap());
+            std::fs::create_dir_all(&directory).unwrap();
+            for file in [UPDATES_FILE, SUMMARY_FILE] {
+                std::fs::copy(locator.with_file_name(file), directory.join(file)).unwrap();
+            }
+            directory.join(UPDATES_FILE)
+        }
+
+        #[test]
+        fn prefix_and_resumed_read_equal_full_read_at_every_split_of_every_grok_transcript() {
+            let home = tempfile::tempdir().unwrap();
+            let every_record = every_record_sessions()
+                .into_iter()
+                .find(|session| session.row.source == Source::Grok)
+                .unwrap();
+            let mut transcripts = std::iter::once(&every_record.row.path)
+                .chain(&every_record.row.subagents)
+                .map(|locator| copied_session(locator, home.path()))
+                .collect::<Vec<_>>();
+            let generated = write_session(
+                home.path(),
+                "cwd",
+                SESSION,
+                &summary(
+                    SESSION,
+                    "/tmp/grok-project",
+                    json!({"generated_title": "Generated"}),
+                ),
+                &[],
+            );
+            std::fs::write(&generated, with_malformed_line(&interleaved_turns())).unwrap();
+            transcripts.push(generated);
+            for path in transcripts {
+                let bytes = std::fs::read(&path).unwrap();
+                let full = read_whole(&path);
+                for split in record_splits(&bytes) {
+                    let name = format!("{} at {split}", path.display());
+                    std::fs::write(&path, &bytes[..split]).unwrap();
+                    let prefix = read_whole(&path);
+                    std::fs::write(&path, &bytes).unwrap();
+
+                    match resume(
+                        reader(),
+                        crate::history::FOR_FIXTURES,
+                        &path,
+                        &prefix.transcript_read,
+                    )
+                    .unwrap()
+                    {
+                        Resumption::Window(window) => {
+                            assert_window_completes(&name, &path, &prefix, &window, &full)
+                        }
+                        other => assert!(
+                            matches!(other, Resumption::FullRead)
+                                && prefix.transcript_read == TranscriptRead::full_read(),
+                            "{name}: only a transcript without a first line ending reads whole: {other:?}"
+                        ),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn streaming_message_or_waiting_call_of_current_turn_holds_stable_cursor_before_it() {
+            let records = interleaved_turns();
+            let lines_through = |count: usize| {
+                records[..count]
+                    .iter()
+                    .map(|record| format!("{record}\n"))
+                    .collect::<String>()
+            };
+            let home = tempfile::tempdir().unwrap();
+            let path = write_session(
+                home.path(),
+                "cwd",
+                SESSION,
+                &summary(SESSION, "/tmp", json!({})),
+                &[],
+            );
+            let stable_line = |count: usize| {
+                std::fs::write(&path, lines_through(count)).unwrap();
+                read_whole(&path).transcript_read.stable_line
+            };
+
+            for (records_read, expected, reason) in [
+                (5, 6, "a completed turn is a place to restart"),
+                (
+                    9,
+                    6,
+                    "the streamed reply, then the call it opened, await what follows",
+                ),
+                (
+                    12,
+                    6,
+                    "the first call awaits its result after the second completes",
+                ),
+                (13, 14, "every call of the turn has its result"),
+                (16, 15, "an open call restarts at its opening record"),
+                (17, 15, "a streaming prompt follows the open call"),
+                (18, 19, "the prompt ended the turn of the call still open"),
+                (19, 19, "a streaming reply restarts at its first chunk"),
+            ] {
+                assert_eq!(
+                    stable_line(records_read),
+                    Some(expected),
+                    "after {records_read} records: {reason}"
+                );
+            }
+        }
+
+        #[test]
+        fn input_completed_for_call_before_stable_cursor_changes_earlier_entry() {
+            let [open, _, _] = call_records(1_000, "late");
+            let records = [
+                user(900, "question", 0),
+                open,
+                turn_completed(2_100, "grok-4.6", 1, 1),
+            ];
+            let home = tempfile::tempdir().unwrap();
+            let path = write_session(
+                home.path(),
+                "cwd",
+                SESSION,
+                &summary(SESSION, "/tmp", json!({})),
+                &records,
+            );
+            let read = read_whole(&path).transcript_read;
+            assert_eq!(
+                read.stable_line,
+                Some(4),
+                "the completed turn ended the turn of the open call"
+            );
+            let late_input = envelope(
+                2_200,
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "late",
+                       "rawInput": {"target_file": "/tmp/late-input.rs"}}),
+                json!({}),
+            );
+            let mut bytes = std::fs::read_to_string(&path).unwrap();
+            bytes.push_str(&format!("{late_input}\n"));
+            std::fs::write(&path, &bytes).unwrap();
+
+            assert!(matches!(
+                resume(reader(), crate::history::FOR_FIXTURES, &path, &read).unwrap(),
+                Resumption::ChangesEarlierEntry
+            ));
+        }
+
+        #[test]
+        fn summarys_model_leads_until_a_turn_names_one() {
+            let home = tempfile::tempdir().unwrap();
+            let path = write_session(
+                home.path(),
+                "cwd",
+                SESSION,
+                &summary(SESSION, "/tmp", json!({})),
+                &[user(1_000, "question", 0)],
+            );
+            let unnamed = read_whole(&path).transcript_read;
+            let model_rows = |read: &TranscriptRead| {
+                listed(&reader().leading_entries(&path, read).unwrap())
+                    .concat()
+                    .matches("Model")
+                    .count()
+            };
+            assert_eq!(model_rows(&unnamed), 1, "the summary's model leads");
+
+            let mut bytes = std::fs::read_to_string(&path).unwrap();
+            bytes.push_str(&format!("{}\n", turn_completed(2_000, "grok-4.7", 1, 1)));
+            std::fs::write(&path, &bytes).unwrap();
+            let Resumption::Window(window) =
+                resume(reader(), crate::history::FOR_FIXTURES, &path, &unnamed).unwrap()
+            else {
+                panic!("the transcript resumes");
+            };
+
+            assert_eq!(
+                model_rows(&window.read),
+                0,
+                "a named model replaces the summary's"
+            );
+        }
+
+        #[test]
+        fn transcript_with_another_first_line_or_working_directory_reads_whole() {
+            let home = tempfile::tempdir().unwrap();
+            let path = write_session(
+                home.path(),
+                "cwd",
+                SESSION,
+                &summary(
+                    SESSION,
+                    "/tmp/grok-project",
+                    json!({"generated_title": "First"}),
+                ),
+                &[user(1_000, "question", 0), reply(1_100, "answer", "p1")],
+            );
+            let read = read_whole(&path).transcript_read;
+            let summary_path = path.with_file_name(SUMMARY_FILE);
+            let original = std::fs::read_to_string(&summary_path).unwrap();
+            assert_eq!(reader().identity(&path).unwrap(), read.identity);
+
+            std::fs::write(&summary_path, original.replace("\"First\"", "\"Renamed\"")).unwrap();
+            assert_eq!(
+                reader().identity(&path).unwrap(),
+                read.identity,
+                "the title is not part of the identity: every read takes it again"
+            );
+
+            std::fs::write(
+                &summary_path,
+                original.replace("/tmp/grok-project", "/tmp/elsewhere"),
+            )
+            .unwrap();
+            assert_ne!(reader().identity(&path).unwrap(), read.identity);
+            assert!(matches!(
+                resume(reader(), crate::history::FOR_FIXTURES, &path, &read).unwrap(),
+                Resumption::FullRead
+            ));
+
+            std::fs::write(&summary_path, &original).unwrap();
+            let bytes = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, bytes.replacen("question", "QUESTION", 1)).unwrap();
+            assert_ne!(
+                reader().identity(&path).unwrap(),
+                read.identity,
+                "the first line is the identity"
+            );
+        }
     }
 }

@@ -13,6 +13,7 @@ use crate::history::fingerprint::CachedFingerprint;
 use crate::history::format::same_file;
 use crate::history::load_meter::AgentMeter;
 use crate::history::parser::{ParsedSession, SessionTranscripts, UnlistedReason};
+use crate::history::resumed::{ResumeContext, ResumedSession, WholeRead, read_resumed};
 use crate::history::shard_files;
 use crate::history::sqlite_cache::refresh::RefreshToken;
 use crate::history::sqlite_cache::{
@@ -1163,26 +1164,50 @@ impl SessionLoader<'_> {
                     self.meter.transcript_read();
                     let _ = read.send(TranscriptProgress::Completed(1));
                 };
-                let stamps = database.map(|_| StubStamps::current(stub));
-                let (raw, transcripts) = self.parse(permit, root, stub, &on_transcript_read);
-                let record = stamps.and_then(|stamps| {
-                    cache_record(self.storage, root, stub, stamps, &raw, transcripts)
-                });
+                let resumed = database
+                    .and_then(|database| database.listed_row(stub))
+                    .and_then(|stored| {
+                        self.read_resumed(permit, root, stub, stored, &on_transcript_read)
+                    });
+                let parsed = match resumed {
+                    Some(resumed) => SessionParse::Resumed(resumed),
+                    None => {
+                        let stamps = database.map(|_| StubStamps::current(stub));
+                        let (raw, transcripts) =
+                            self.parse(permit, root, stub, &on_transcript_read);
+                        let record = stamps.and_then(|stamps| {
+                            cache_record(self.storage, root, stub, stamps, &raw, transcripts)
+                        });
+                        SessionParse::Whole(raw, record)
+                    }
+                };
                 let unannounced =
                     transcript_count(stub).saturating_sub(announced.load(Ordering::Relaxed));
                 if unannounced > 0 {
                     let _ = read.send(TranscriptProgress::Completed(unannounced));
                 }
-                (raw, record)
+                parsed
             },
             |group, parsed| {
-                for (&index, (outcome, record)) in group.iter().zip(parsed) {
-                    if caches.access.owner().is_some()
-                        && let (Some(database), Some(record)) = (database, record)
-                    {
-                        database.write(record);
-                    }
-                    outcomes[index] = Some(RootRead::Read(outcome));
+                for (&index, parsed) in group.iter().zip(parsed) {
+                    outcomes[index] = Some(match parsed {
+                        SessionParse::Whole(outcome, record) => {
+                            if caches.access.owner().is_some()
+                                && let (Some(database), Some(record)) = (database, record)
+                            {
+                                database.write(record);
+                            }
+                            RootRead::Read(outcome)
+                        }
+                        // A failed write leaves the stored copy, which then
+                        // restores as it is.
+                        SessionParse::Resumed(resumed) => {
+                            match database.and_then(|database| database.write_resumed(resumed)) {
+                                Some(row) => RootRead::Read(RawRead::Parsed(row)),
+                                None => copy_as_it_is(&stubs[index], database, &external_titles),
+                            }
+                        }
+                    });
                 }
             },
         );
@@ -1341,6 +1366,65 @@ impl SessionLoader<'_> {
         );
         RawRead::of_parse(self.storage.source(), &stub.locator, outcome)
     }
+
+    /// The session at `stub` read on from `stored`, its listed row in the
+    /// cache, with `permit`, the read recorded in the meter; `None` when the
+    /// session is read whole, with the reason under `--debug`. Each
+    /// transcript read reaches `on_transcript_read` only once the read
+    /// succeeds, since a whole read reports its own.
+    fn read_resumed(
+        &self,
+        permit: ParsePermit<'_>,
+        root: &SessionRoot,
+        stub: &SessionStub,
+        stored: &Conversation,
+        on_transcript_read: &(dyn Fn() + Sync),
+    ) -> Option<ResumedSession> {
+        let reading = self.clock().now();
+        let opened = AtomicUsize::new(0);
+        let count_read = || {
+            opened.fetch_add(1, Ordering::Relaxed);
+        };
+        let read = SqliteCache::open_waiting(self.cache_base()).and_then(|cache| match cache {
+            Some(cache) => read_resumed(
+                &ResumeContext {
+                    storage: self.storage,
+                    cache: &cache,
+                    root,
+                    stub,
+                    stored,
+                    on_transcript_read: &count_read,
+                    clock: self.clock(),
+                    debug_level: self.debug_level,
+                },
+                permit,
+            ),
+            None => Ok(Err(WholeRead::NoCheckpoint)),
+        });
+        let reason = match read {
+            Ok(Ok(resumed)) => {
+                let transcripts = opened.into_inner();
+                (0..transcripts).for_each(|_| on_transcript_read());
+                self.meter.session_parsed(
+                    transcripts,
+                    resumed.bytes_read,
+                    self.clock().elapsed_since(reading),
+                );
+                return Some(resumed);
+            }
+            Ok(Err(whole)) => whole.reason().to_owned(),
+            Err(error) => format!("the resumed read failed: {error}"),
+        };
+        debug::debug(
+            self.debug_level,
+            &format!(
+                "Reading {} session {} whole: {reason}",
+                self.storage.source().list_label(),
+                stub.locator.display()
+            ),
+        );
+        None
+    }
 }
 
 /// The source of a session's row in a root load.
@@ -1496,6 +1580,39 @@ impl<'a> DatabaseWrites<'a> {
     fn write(&self, record: SessionRecord) {
         let _ = self.writes.send(CacheWrite::Session(Box::new(record)));
     }
+
+    /// The listed row the database held for `stub`'s session when the load
+    /// began, whether or not its transcripts changed since.
+    fn listed_row(&self, stub: &SessionStub) -> Option<&'a Conversation> {
+        match self.catalogue.get(&stub.cache_key) {
+            Some(CatalogueSession::Listed(row)) => Some(row),
+            _ => None,
+        }
+    }
+
+    /// Writes `resumed`'s record and waits for the write; returns its row,
+    /// reading the copy the write left. `None` when the write failed.
+    fn write_resumed(&self, resumed: ResumedSession) -> Option<Conversation> {
+        let (reply, replied) = mpsc::channel();
+        let record = Box::new(resumed.record);
+        self.writes
+            .send(CacheWrite::Resumed { record, reply })
+            .ok()?;
+        let generation = replied.recv().ok()?.ok()?;
+        let mut row = resumed.row;
+        row.cached_session = row
+            .cached_session
+            .map(|cached| cached.of_generation(generation));
+        Some(row)
+    }
+}
+
+/// A session's read in a root load's parse.
+enum SessionParse {
+    /// Read whole, with the record of the read for the database.
+    Whole(RawRead, Option<SessionRecord>),
+    /// Read on from the database's copy.
+    Resumed(ResumedSession),
 }
 
 /// True when `current`, the database's fingerprints by cache key, holds
@@ -3467,7 +3584,7 @@ mod tests {
                 .unwrap()
         };
         for transcript in &transcripts {
-            home.append(transcript, 1, "a later question");
+            home.rewrite(transcript, 1, &["a question", "a later question"]);
         }
         let fresh = transcripts
             .iter()
@@ -4081,7 +4198,7 @@ mod tests {
             rusqlite::Connection::open(base.path().join(sqlite_cache::DATABASE_FILE_NAME)).unwrap();
         connection.execute_batch("CREATE TABLE refresh_commits (count INTEGER); INSERT INTO refresh_commits VALUES (0);
             CREATE TRIGGER count_commits AFTER UPDATE OF last_commit_ms ON refresh_state WHEN NEW.owner = OLD.owner BEGIN UPDATE refresh_commits SET count = count + 1; END;").unwrap();
-        home.append(&transcripts[0], 1, "a later question");
+        home.rewrite(&transcripts[0], 1, &["a question", "a later question"]);
         home.watch().mark();
 
         load_sessions_with_cache(home.storage(), base.path(), false, None).unwrap();
@@ -4487,7 +4604,7 @@ mod tests {
         let unchanged = home.write("unchanged", 0, &["a question"]);
         let changed = home.write("changed", 1, &["a question"]);
         load_sessions_with_cache(home.storage(), cache_base.path(), false, None).unwrap();
-        home.append(&changed, 2, "a later question");
+        home.rewrite(&changed, 2, &["a question", "a later question"]);
         let added = home.write("added", 3, &["a question"]);
         home.watch().mark();
 

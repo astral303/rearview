@@ -2,7 +2,7 @@
 //! Its first line is `Base directory for this skill: <dir>`, and the skill's
 //! file follows.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use crate::tui::parse_command_name;
@@ -11,18 +11,13 @@ const SKILL_TEXT_PREFIX: &str = "Base directory for this skill:";
 
 /// One transcript's entries without its repeated skill text: the `Skill`
 /// call or slash command before that text already shows the load.
-pub(crate) fn without_repeated_skill_text<Record>(
+#[cfg(test)]
+fn without_repeated_skill_text<Record>(
     entries: Vec<(Record, LogEntry)>,
 ) -> Vec<(Record, LogEntry)> {
-    let mut repeated_skill_text = RepeatedSkillText::default();
-    entries
-        .into_iter()
-        .filter(|(_, entry)| {
-            let is_repeated = repeated_skill_text.is_repeated(entry);
-            repeated_skill_text.record(entry);
-            !is_repeated
-        })
-        .collect()
+    RepeatedSkillText::default()
+        .without_repeated(entries, |_| false)
+        .0
 }
 
 /// The directory skill text names, or `None` for any other text.
@@ -70,15 +65,54 @@ fn command_loads_skill(command: &str, skill: &str) -> bool {
 
 /// Recognizes repeated skill text: text answering a `Skill` call
 /// (`sourceToolUseID`), or text after the thread's slash command for the
-/// same skill.
-#[derive(Default)]
-struct RepeatedSkillText {
+/// same skill. A transcript read resumed from a place carries it from
+/// there.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RepeatedSkillText {
     /// The slash command of each thread's latest user message, by the
     /// thread's `parent_tool_use_id`; `None` for a message that ran none.
-    latest_command: HashMap<Option<String>, Option<String>>,
+    latest_command: BTreeMap<Option<String>, Option<String>>,
 }
 
 impl RepeatedSkillText {
+    /// The state [`Self::commands`] listed.
+    pub(crate) fn of_commands(commands: Vec<(Option<String>, Option<String>)>) -> Self {
+        Self {
+            latest_command: commands.into_iter().collect(),
+        }
+    }
+
+    /// Each thread's latest slash command, in the threads' order.
+    pub(crate) fn commands(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.latest_command
+            .iter()
+            .map(|(thread, command)| (thread.clone(), command.clone()))
+            .collect()
+    }
+
+    /// `entries`, read on from this state, without their repeated skill
+    /// text, and the state before the first entry `is_past` accepts, or
+    /// after the last.
+    pub(crate) fn without_repeated<Record>(
+        mut self,
+        entries: Vec<(Record, LogEntry)>,
+        is_past: impl Fn(&Record) -> bool,
+    ) -> (Vec<(Record, LogEntry)>, Self) {
+        let mut before_past = None;
+        let kept = entries
+            .into_iter()
+            .filter(|(record, entry)| {
+                if before_past.is_none() && is_past(record) {
+                    before_past = Some(self.clone());
+                }
+                let is_repeated = self.is_repeated(entry);
+                self.record(entry);
+                !is_repeated
+            })
+            .collect();
+        (kept, before_past.unwrap_or(self))
+    }
+
     /// True when `entry` is skill text answering a `Skill` call, or
     /// following the thread's slash command for the same skill.
     fn is_repeated(&self, entry: &LogEntry) -> bool {

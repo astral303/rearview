@@ -6,7 +6,7 @@ use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     RootOrigin, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
     SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
-    SourceLabels, SubagentFinder, walk,
+    SourceLabels, SubagentFinder, TranscriptReader, walk,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -298,6 +298,12 @@ impl SessionStorage for OmpStorage {
             on_transcript_read,
             clock,
         )
+    }
+
+    /// A resumed read keeps the agent the session's whole read attributed
+    /// it to, in a redirected root too.
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &pi_log::OMP_LOG
     }
 }
 

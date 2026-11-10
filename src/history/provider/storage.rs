@@ -1,7 +1,7 @@
 //! Providers that keep whole session transcripts under one or more roots.
 
 use super::walk::{DirectoryLister, SystemLister};
-use super::{RootEnvironment, SessionRoot};
+use super::{FullRead, NoLinks, RootEnvironment, SessionRoot, ThreadLinker, TranscriptReader};
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::Result;
@@ -281,6 +281,19 @@ pub trait SessionStorage: Sync {
     /// warm loads included, so it must cost little once the old cache is
     /// gone. The default is for providers whose cache never moved.
     fn remove_superseded_cache(&self, _cache_base: &Path) {}
+
+    /// The reader that resumes a read of one of this provider's transcripts.
+    /// The default reads every changed transcript whole; a provider
+    /// overrides it once its format can resume.
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &FullRead
+    }
+
+    /// The linker of this provider's sub-agent threads, which a resumed
+    /// read relinks them through. The default links nothing.
+    fn thread_linker(&self) -> &dyn ThreadLinker {
+        &NoLinks
+    }
 }
 
 /// A storage that answers as `inner` but pins its roots.
@@ -346,6 +359,14 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
 
     fn remove_superseded_cache(&self, cache_base: &Path) {
         self.inner.remove_superseded_cache(cache_base)
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        self.inner.transcript_reader()
+    }
+
+    fn thread_linker(&self) -> &dyn ThreadLinker {
+        self.inner.thread_linker()
     }
 }
 
@@ -414,6 +435,14 @@ impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
     fn remove_superseded_cache(&self, cache_base: &Path) {
         self.inner.remove_superseded_cache(cache_base)
     }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        self.inner.transcript_reader()
+    }
+
+    fn thread_linker(&self) -> &dyn ThreadLinker {
+        self.inner.thread_linker()
+    }
 }
 
 /// A storage that answers as `inner` from the roots it pins, with its parses
@@ -481,6 +510,14 @@ impl SessionStorage for WatchedStorage {
 
     fn remove_superseded_cache(&self, cache_base: &Path) {
         self.inner.remove_superseded_cache(cache_base)
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        self.inner.transcript_reader()
+    }
+
+    fn thread_linker(&self) -> &dyn ThreadLinker {
+        self.inner.thread_linker()
     }
 }
 
@@ -659,6 +696,14 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
 
     fn remove_superseded_cache(&self, cache_base: &Path) {
         (**self).remove_superseded_cache(cache_base)
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        (**self).transcript_reader()
+    }
+
+    fn thread_linker(&self) -> &dyn ThreadLinker {
+        (**self).thread_linker()
     }
 }
 

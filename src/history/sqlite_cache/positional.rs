@@ -34,6 +34,20 @@ pub(super) const SESSION_FILES: PositionalTable = PositionalTable {
     ],
 };
 
+pub(super) const TRANSCRIPT_READS: PositionalTable = PositionalTable {
+    name: "transcript_reads",
+    columns: &[
+        "path",
+        "cursor",
+        "stable_cursor",
+        "identity",
+        "rewrite_check",
+        "parser_state",
+        "stable_line",
+        "fold_state",
+    ],
+};
+
 pub(super) const PARSE_ERRORS: PositionalTable = PositionalTable {
     name: "parse_errors",
     columns: &[

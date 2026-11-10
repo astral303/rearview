@@ -1,23 +1,31 @@
 //! The JSONL transcript format Pi and OMP share.
+//!
+//! Pi and OMP append to a log; OMP also rewrites the title slot at its head
+//! in place. A read of a changed log resumes from its stable cursor while
+//! the new entries continue the branch the log shows.
 
 mod tools;
 
 use super::dropped::{DroppedRecords, SkippedKinds};
+use super::lines::{self, LineCursor, visit_line_spans_from};
 use super::{
-    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, append_exit_code,
+    EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code,
     append_output_note, at_own_lines, rfc3339_from_millis, trim_blank_lines,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::{AppError, Result};
-use crate::history::Source;
+use crate::history::provider::{ResumedWindow, Resumption, TranscriptRead, TranscriptReader};
+use crate::history::{MalformedLine, ParsePermit, Source};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
+use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_SUPPORTED_VERSION: u64 = 3;
@@ -162,12 +170,390 @@ impl<'a> AcceptedHeader<'a> {
     }
 }
 
+/// A log's header as a read takes it, from the first records.
+struct LogHeader {
+    id: String,
+    timestamp: String,
+    cwd: String,
+    version: u64,
+    source: Source,
+    title: Option<String>,
+    /// How many records the header and its title slot take up.
+    record_count: usize,
+    /// The end of the title slot, which the agent rewrites in place; 0
+    /// without one.
+    slot_end: u64,
+    /// The log's identity and where its records start past the header;
+    /// `None` while the header has no line ending.
+    terminated: Option<(Vec<u8>, LineCursor)>,
+}
+
+impl LogHeader {
+    /// The header among a log's first two records, on `first` and
+    /// `second`; `None` when the reader does not accept it.
+    fn of(first: &LogLine, second: Option<&LogLine>, default_source: Source) -> Option<Self> {
+        let accepted = AcceptedHeader::of(
+            first.record.as_ref()?,
+            second.and_then(|line| line.record.as_ref()),
+        )?;
+        let has_slot = accepted.title_slot.is_some();
+        let header_line = if has_slot { second? } else { first };
+        let slot_end = if has_slot { first.end?.offset } else { 0 };
+        let identity = || {
+            let facts = serde_json::to_vec(&(header_line.text.as_str(), has_slot))
+                .expect("a log's identity facts serialize");
+            blake3::hash(&facts).as_bytes().to_vec()
+        };
+        Some(Self {
+            id: accepted.id.to_owned(),
+            timestamp: accepted.timestamp.to_owned(),
+            cwd: accepted.cwd.to_owned(),
+            version: accepted.version,
+            source: accepted.source(default_source),
+            title: accepted.title(),
+            record_count: accepted.record_count(),
+            slot_end,
+            terminated: header_line.end.map(|end| (identity(), end)),
+        })
+    }
+
+    /// The header of the log at `path`, read from its first records alone.
+    fn read(path: &Path, default_source: Source) -> Result<Option<Self>> {
+        let head = head_lines(BufReader::new(File::open(path)?))?;
+        Ok(head
+            .first()
+            .and_then(|first| Self::of(first, head.get(1), default_source)))
+    }
+
+    /// The title as the session's leading entry.
+    fn title_entry(&self) -> Option<(usize, LogEntry)> {
+        self.title.as_ref().map(|title| {
+            (
+                0,
+                LogEntry::CustomTitle {
+                    custom_title: title.clone(),
+                },
+            )
+        })
+    }
+}
+
+/// The records a log's header can take up: an OMP title slot, then the
+/// header.
+const HEAD_RECORDS: usize = 2;
+
+/// One line of a Pi-family log as a read takes it.
+struct LogLine {
+    number: usize,
+    /// Past the line's line ending; `None` for a last line without one.
+    end: Option<LineCursor>,
+    /// The line as written, kept for the records that can hold the header.
+    text: String,
+    record: Option<Value>,
+}
+
+/// The lines of `reader`, standing at `from`, to its end, and the cursor
+/// past the last line with a line ending. The text is kept for the first
+/// `texts_kept` records.
+fn read_log_lines(
+    reader: impl BufRead,
+    from: LineCursor,
+    texts_kept: usize,
+) -> std::io::Result<(Vec<LogLine>, LineCursor)> {
+    let parse = |line: &str| serde_json::from_str::<Value>(line).ok();
+    let mut lines = Vec::new();
+    let mut kept = 0;
+    let mut push = |number, end, text: String, record: Option<Value>| {
+        let text = if record.is_some() && kept < texts_kept {
+            kept += 1;
+            text
+        } else {
+            String::new()
+        };
+        lines.push(LogLine {
+            number,
+            end,
+            text,
+            record,
+        });
+    };
+    let read = visit_line_spans_from(
+        reader,
+        from,
+        ParallelThreshold::DEFAULT,
+        parse,
+        |span, text, record| push(span.start.line, Some(span.end), text, record),
+    )?;
+    if let Some((number, text)) = read.unterminated {
+        let record = parse(&text);
+        push(number, None, text, record);
+    }
+    Ok((lines, read.cursor))
+}
+
+/// The lines of `reader` up to its first [`HEAD_RECORDS`] records, which
+/// hold its header; lines that hold no record are left out.
+fn head_lines(mut reader: impl BufRead) -> std::io::Result<Vec<LogLine>> {
+    let mut head = Vec::new();
+    let mut cursor = LineCursor::START;
+    while head.len() < HEAD_RECORDS {
+        let mut text = String::new();
+        let length = reader.read_line(&mut text)?;
+        if length == 0 {
+            break;
+        }
+        let number = cursor.line;
+        cursor = LineCursor {
+            offset: cursor.offset + length as u64,
+            line: number + 1,
+        };
+        let end = text.ends_with('\n').then_some(cursor);
+        let text = text.trim_end_matches(['\n', '\r']).to_owned();
+        if let Ok(record) = serde_json::from_str::<Value>(&text) {
+            head.push(LogLine {
+                number,
+                end,
+                text,
+                record: Some(record),
+            });
+        }
+    }
+    Ok(head)
+}
+
 #[derive(Debug)]
 struct RawEntry {
     line: usize,
+    /// Past the record's line ending; `None` for a last line without one.
+    end: Option<LineCursor>,
     id: String,
     parent_id: Option<String>,
     value: Value,
+}
+
+/// A log's entries after its header, each with its id and the id of its
+/// parent.
+struct RawEntries {
+    version: u64,
+    /// The id of the entry before the next one: a format 1 entry's parent.
+    previous_id: Option<String>,
+    entries: Vec<RawEntry>,
+    /// The lines that hold no record, or a record the format rejects.
+    malformed_lines: Vec<usize>,
+}
+
+impl RawEntries {
+    /// The entries of a log in format `version` that follow the entry with
+    /// id `previous_id`.
+    fn after(version: u64, previous_id: Option<String>) -> Self {
+        Self {
+            version,
+            previous_id,
+            entries: Vec::new(),
+            malformed_lines: Vec::new(),
+        }
+    }
+
+    /// Add the record on line `number`, ending at `end`.
+    fn push(&mut self, number: usize, end: Option<LineCursor>, record: Value) {
+        let Some(object) = record.as_object() else {
+            self.malformed_lines.push(number);
+            return;
+        };
+        let id = if self.version == 1 {
+            format!("v1-{number}")
+        } else if let Some(id) = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            id.to_owned()
+        } else {
+            self.malformed_lines.push(number);
+            return;
+        };
+        let parent_id = if self.version == 1 {
+            self.previous_id.clone()
+        } else {
+            object
+                .get("parentId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        self.previous_id = Some(id.clone());
+        self.entries.push(RawEntry {
+            line: number,
+            end,
+            id,
+            parent_id,
+            value: record,
+        });
+    }
+
+    /// The entries the log shows, in file order, each normalized for
+    /// `source` at its line.
+    fn shown(
+        &self,
+        branch: &ShownBranch,
+        source: Source,
+        dropped: &mut DroppedRecords,
+    ) -> Vec<(usize, LogEntry)> {
+        branch
+            .indices
+            .iter()
+            .rev()
+            .filter_map(|&index| {
+                let raw = &self.entries[index];
+                normalize_entry(&raw.value, &raw.id, source, dropped).map(|entry| (raw.line, entry))
+            })
+            .collect()
+    }
+}
+
+/// The branch a log shows: from its last entry back through each parent.
+struct ShownBranch {
+    /// Indices into the entries, from the last entry back.
+    indices: Vec<usize>,
+    end: BranchEnd,
+}
+
+/// Where the walk back along a branch stopped.
+#[derive(Debug, Eq, PartialEq)]
+enum BranchEnd {
+    /// An entry without a parent, or no entry at all.
+    Root,
+    /// A parent the entries do not hold.
+    Outside(String),
+    /// An entry the walk met before.
+    Cycle,
+}
+
+impl ShownBranch {
+    /// The branch `entries` show. Of two entries with one id, the later is
+    /// the parent.
+    fn of(entries: &[RawEntry]) -> Self {
+        let by_id = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let mut indices = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = entries.len().checked_sub(1);
+        let end = loop {
+            let Some(index) = current else {
+                break BranchEnd::Root;
+            };
+            let entry = &entries[index];
+            if !visited.insert(entry.id.as_str()) {
+                break BranchEnd::Cycle;
+            }
+            indices.push(index);
+            let Some(parent) = entry.parent_id.as_deref() else {
+                break BranchEnd::Root;
+            };
+            match by_id.get(parent) {
+                Some(&parent_index) => current = Some(parent_index),
+                None => break BranchEnd::Outside(parent.to_owned()),
+            }
+        };
+        Self { indices, end }
+    }
+
+    /// True when each entry's parent comes before it in the file: the
+    /// branch's entries before any line are then the branch of the last
+    /// entry before it.
+    fn is_in_file_order(&self) -> bool {
+        self.indices.windows(2).all(|pair| pair[0] > pair[1])
+    }
+
+    /// The index of the branch's last entry with a line ending.
+    fn last_terminated(&self, entries: &[RawEntry]) -> Option<usize> {
+        self.indices
+            .iter()
+            .copied()
+            .find(|&index| entries[index].end.is_some())
+    }
+}
+
+/// What a read of a Pi-family log carries to the next, at the stable
+/// cursor.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LogState {
+    version: u64,
+    /// True for a log read as OMP's.
+    is_omp: bool,
+    /// [`LogHeader::slot_end`].
+    slot_end: u64,
+    /// The id of the shown branch's last entry before the stable cursor.
+    leaf: Option<String>,
+}
+
+impl LogState {
+    fn source(&self) -> Source {
+        if self.is_omp { Source::Omp } else { Source::Pi }
+    }
+}
+
+/// Where a read of a Pi-family log stopped, and where the next restarts
+/// with which state.
+struct LogReadEnd {
+    cursor: LineCursor,
+    stable_cursor: LineCursor,
+    state: LogState,
+}
+
+impl LogReadEnd {
+    /// The read's end over `entries`, the log's entries from `from` on, read
+    /// to `cursor`: the stable cursor stands past the shown branch's last
+    /// entry with a line ending, else stays at `from`. `None` when the
+    /// branch does not continue `state`'s leaf or is not in file order.
+    fn of(
+        entries: &[RawEntry],
+        branch: &ShownBranch,
+        from: LineCursor,
+        cursor: LineCursor,
+        state: &LogState,
+    ) -> Option<Self> {
+        let continues = match &branch.end {
+            _ if entries.is_empty() => true,
+            BranchEnd::Root => state.leaf.is_none(),
+            BranchEnd::Outside(parent) => state.leaf.as_ref().is_none_or(|leaf| leaf == parent),
+            BranchEnd::Cycle => false,
+        };
+        if !continues || !branch.is_in_file_order() {
+            return None;
+        }
+        let (stable_cursor, leaf) = match branch.last_terminated(entries) {
+            Some(index) => (entries[index].end?, Some(entries[index].id.clone())),
+            None => (from, state.leaf.clone()),
+        };
+        Some(Self {
+            cursor,
+            stable_cursor,
+            state: LogState {
+                leaf,
+                ..state.clone()
+            },
+        })
+    }
+
+    /// What this read leaves for the next, for the log `file` holds, whose
+    /// identity is `identity`.
+    fn transcript_read(
+        &self,
+        identity: Vec<u8>,
+        file: &mut (impl std::io::Read + Seek),
+    ) -> Result<TranscriptRead> {
+        Ok(TranscriptRead {
+            cursor: self.cursor.encode(),
+            stable_cursor: self.stable_cursor.encode(),
+            identity,
+            rewrite_check: lines::rewrite_check_after(file, self.state.slot_end, self.cursor)?,
+            parser_state: serde_json::to_vec(&self.state).expect("a log state serializes"),
+            stable_line: Some(self.stable_cursor.line),
+        })
+    }
 }
 
 /// One reader of the Pi-family log, bound to the source it speaks for.
@@ -214,131 +600,188 @@ impl SessionFormat for PiLogFormat {
     }
 }
 
+/// The log `reader` holds, read whole. Its title, which OMP rewrites in
+/// place and every read takes again, is its leading entry.
 fn parse_reader(
-    reader: impl BufRead,
+    mut reader: impl BufRead + Seek,
     default_source: Source,
     mut dropped: DroppedRecords,
 ) -> Result<Option<SessionProjection>> {
-    let mut parsed = Vec::new();
-    let mut malformed_lines = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(&line) {
-            Ok(value) => parsed.push((index + 1, value)),
-            Err(_) => malformed_lines.push(index + 1),
-        }
-    }
-
-    let Some(header) = parsed
-        .first()
-        .and_then(|(_, first)| AcceptedHeader::of(first, parsed.get(1).map(|(_, second)| second)))
+    let (lines, cursor) = read_log_lines(&mut reader, LineCursor::START, HEAD_RECORDS)?;
+    let mut records = lines.iter().filter(|line| line.record.is_some());
+    let Some(header) = records
+        .next()
+        .and_then(|first| LogHeader::of(first, records.next(), default_source))
     else {
         return Ok(None);
     };
-    let source = header.source(default_source);
-    let title = header.title();
-    let id = header.id.to_owned();
-    let timestamp = header.timestamp.to_owned();
-    let cwd = header.cwd.to_owned();
     let version = header.version;
-    let header_records = header.record_count();
     // The header records the session file's format, not the release that
     // wrote it.
     dropped.record_version(|| Some(format!("session format {version}")));
 
-    let mut raw_entries = Vec::new();
-    let mut previous_id: Option<String> = None;
-    for (line, value) in parsed.into_iter().skip(header_records) {
-        let Some(object) = value.as_object() else {
-            malformed_lines.push(line);
+    let mut raw = RawEntries::after(version, None);
+    let mut records_seen = 0;
+    for LogLine {
+        number,
+        end,
+        record,
+        ..
+    } in lines
+    {
+        let Some(record) = record else {
+            raw.malformed_lines.push(number);
             continue;
         };
-        let entry_id = if version == 1 {
-            format!("v1-{line}")
-        } else if let Some(id) = object
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            id.to_owned()
-        } else {
-            malformed_lines.push(line);
-            continue;
-        };
-        let parent_id = if version == 1 {
-            previous_id.clone()
-        } else {
-            object
-                .get("parentId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-        previous_id = Some(entry_id.clone());
-        raw_entries.push(RawEntry {
-            line,
-            id: entry_id,
-            parent_id,
-            value,
-        });
-    }
-
-    let leaf_id = raw_entries.last().map(|entry| entry.id.clone());
-    let by_id = raw_entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (entry.id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let mut active_indices = Vec::new();
-    let mut current = raw_entries.len().checked_sub(1);
-    let mut visited = HashSet::new();
-    while let Some(index) = current {
-        let entry = &raw_entries[index];
-        if !visited.insert(entry.id.clone()) {
-            break;
+        records_seen += 1;
+        if records_seen > header.record_count {
+            raw.push(number, end, record);
         }
-        active_indices.push(index);
-        current = entry
-            .parent_id
-            .as_deref()
-            .and_then(|parent| by_id.get(parent).copied());
     }
-    active_indices.reverse();
 
-    let mut entries = Vec::new();
-    if let Some(title) = title.as_ref() {
-        entries.push((
-            1,
-            LogEntry::CustomTitle {
-                custom_title: title.clone(),
-            },
-        ));
-    }
-    entries.extend(active_indices.into_iter().filter_map(|index| {
-        let raw = &raw_entries[index];
-        normalize_entry(&raw.value, &raw.id, source, &mut dropped).map(|entry| (raw.line, entry))
-    }));
+    let branch = ShownBranch::of(&raw.entries);
+    let mut entries: Vec<(usize, LogEntry)> = header.title_entry().into_iter().collect();
+    entries.extend(raw.shown(&branch, header.source, &mut dropped));
+    let transcript_read = match &header.terminated {
+        Some((identity, records_start)) => {
+            let state = LogState {
+                version,
+                is_omp: header.source == Source::Omp,
+                slot_end: header.slot_end,
+                leaf: None,
+            };
+            match LogReadEnd::of(&raw.entries, &branch, *records_start, cursor, &state) {
+                Some(end) => end.transcript_read(identity.clone(), &mut reader)?,
+                None => TranscriptRead::full_read(),
+            }
+        }
+        None => TranscriptRead::full_read(),
+    };
 
     Ok(Some(SessionProjection {
-        source,
+        source: header.source,
         header: SessionHeader {
             version,
-            id,
-            timestamp,
-            cwd: PathBuf::from(cwd),
+            id: header.id,
+            timestamp: header.timestamp,
+            cwd: PathBuf::from(header.cwd),
             thread_label: None,
             subagent_identity: Default::default(),
         },
-        title,
+        title: header.title,
         entries: at_own_lines(entries),
-        leaf_id,
-        malformed_lines,
+        leaf_id: raw.entries.last().map(|entry| entry.id.clone()),
+        malformed_lines: raw.malformed_lines,
         dropped,
         earlier_turns: EarlierTurns::Read,
         earlier_transcripts: Vec::new(),
+        transcript_read,
     }))
+}
+
+/// Resumes a read of a Pi-family log from its stable cursor: past the last
+/// entry with a line ending on the branch the log shows. A read whose new
+/// entries do not continue that branch changes which earlier entries show,
+/// and reads the log whole. The identity is the header record, and whether
+/// a title slot leads; every read takes the title again, and the rewrite
+/// check leaves out the title slot, which OMP rewrites in place.
+///
+/// Two entries with one id are not detected: Pi and OMP give each a fresh
+/// one.
+impl TranscriptReader for PiLogFormat {
+    fn identity(&self, source: &Path) -> Result<Vec<u8>> {
+        Ok(LogHeader::read(source, self.default_source)?
+            .and_then(|header| header.terminated)
+            .map(|(identity, _)| identity)
+            .unwrap_or_default())
+    }
+
+    fn is_rewritten(&self, source: &Path, read: &TranscriptRead) -> Result<bool> {
+        let (Some(cursor), Ok(state)) = (
+            LineCursor::decode(&read.cursor),
+            serde_json::from_slice::<LogState>(&read.parser_state),
+        ) else {
+            return Ok(true);
+        };
+        let mut file = File::open(source)?;
+        if file.metadata()?.len() < cursor.offset {
+            return Ok(true);
+        }
+        let slot_end = LogHeader::read(source, self.default_source)?.map(|header| header.slot_end);
+        if slot_end != Some(state.slot_end) {
+            return Ok(true);
+        }
+        Ok(lines::rewrite_check_after(&mut file, state.slot_end, cursor)? != read.rewrite_check)
+    }
+
+    fn read_from(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+        read: &TranscriptRead,
+    ) -> Result<Resumption> {
+        permit.admit();
+        let (Some(stable_cursor), Ok(state)) = (
+            LineCursor::decode(&read.stable_cursor),
+            serde_json::from_slice::<LogState>(&read.parser_state),
+        ) else {
+            return Ok(Resumption::FullRead);
+        };
+        let mut reader = BufReader::new(File::open(source)?);
+        reader.seek(SeekFrom::Start(stable_cursor.offset))?;
+        let (lines, cursor) = read_log_lines(&mut reader, stable_cursor, 0)?;
+        let mut raw = RawEntries::after(state.version, state.leaf.clone());
+        for line in lines {
+            match line.record {
+                Some(record) => raw.push(line.number, line.end, record),
+                None => raw.malformed_lines.push(line.number),
+            }
+        }
+        let branch = ShownBranch::of(&raw.entries);
+        let Some(end) = LogReadEnd::of(&raw.entries, &branch, stable_cursor, cursor, &state) else {
+            return Ok(Resumption::ChangesEarlierEntry);
+        };
+        let entries = raw.shown(&branch, state.source(), &mut DroppedRecords::default());
+        let bytes_read = reader
+            .get_ref()
+            .metadata()?
+            .len()
+            .saturating_sub(stable_cursor.offset);
+        Ok(Resumption::Window(ResumedWindow {
+            start_line: stable_cursor.line,
+            entries: at_own_lines(entries),
+            malformed_lines: raw
+                .malformed_lines
+                .into_iter()
+                .map(|line_number| MalformedLine {
+                    line_number,
+                    detail: None,
+                })
+                .collect(),
+            read: end.transcript_read(read.identity.clone(), reader.get_mut())?,
+            bytes_read,
+        }))
+    }
+
+    fn read_whole(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+    ) -> Result<Option<SessionProjection>> {
+        self.parse_transcript(permit, source)
+    }
+
+    fn leading_entries(
+        &self,
+        source: &Path,
+        _read: &TranscriptRead,
+    ) -> Result<Vec<(RecordLine, LogEntry)>> {
+        Ok(LogHeader::read(source, self.default_source)?
+            .and_then(|header| header.title_entry())
+            .map(|(line, entry)| (RecordLine::from(line), entry))
+            .into_iter()
+            .collect())
+    }
 }
 
 fn normalize_entry(
@@ -1791,6 +2234,286 @@ mod tests {
 
             assert_eq!(projection.header.thread_label(), label);
             assert_eq!(projection.header.id, "omp_subagent_id");
+        }
+    }
+
+    mod resumed_reads {
+        use super::*;
+        use crate::history::format::lines::record_splits;
+        use crate::history::provider::contract_tests::every_record_sessions;
+        use crate::history::provider::transcript_reads::resume;
+
+        fn read_whole(format: &PiLogFormat, path: &Path) -> Option<SessionProjection> {
+            format
+                .parse_transcript(crate::history::FOR_FIXTURES, path)
+                .unwrap()
+        }
+
+        /// `entries` as text a test compares.
+        fn listed(entries: &[(RecordLine, LogEntry)]) -> Vec<String> {
+            entries
+                .iter()
+                .map(|(record, entry)| format!("{} {entry:?}", record.line))
+                .collect()
+        }
+
+        /// Asserts that `prefix`, a read of a log's beginning, up to the
+        /// window's first line, and then `window`, the read resumed from it
+        /// over the whole log, hold what `full`, one read of the whole log,
+        /// holds, and leave what it leaves for the next read.
+        fn assert_window_completes(
+            name: &str,
+            prefix: &SessionProjection,
+            window: &ResumedWindow,
+            full: &SessionProjection,
+        ) {
+            let kept = prefix
+                .entries
+                .iter()
+                .filter(|(record, _)| record.line < window.start_line)
+                .chain(&window.entries)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed(&kept),
+                listed(&full.entries),
+                "{name}: the prefix and the window hold the full read's entries"
+            );
+            let malformed = prefix
+                .malformed_lines
+                .iter()
+                .filter(|line| **line < window.start_line)
+                .copied()
+                .chain(window.malformed_lines.iter().map(|line| line.line_number))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                malformed, full.malformed_lines,
+                "{name}: the prefix and the window hold the full read's malformed lines"
+            );
+            assert_eq!(
+                window.read, full.transcript_read,
+                "{name}: the window leaves what the full read leaves"
+            );
+        }
+
+        /// A Pi log whose second branch leaves the first, with a malformed
+        /// line and an entry without an id inside the shown branch.
+        fn branch_with_malformed_lines() -> String {
+            [
+                r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+                r#"{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"first question"}}"#,
+                r#"{"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[{"type":"text","text":"first answer"}]}}"#,
+                "{not json",
+                r#"{"type":"message","parentId":"a1","message":{"role":"user","content":"no id"}}"#,
+                r#"{"type":"message","id":"u2","parentId":"u1","message":{"role":"user","content":"second branch"}}"#,
+                r#"{"type":"message","id":"a2","parentId":"u2","message":{"role":"assistant","content":[{"type":"text","text":"second answer"}]}}"#,
+            ]
+            .join("\n")
+                + "\n"
+        }
+
+        /// Every Pi and OMP fixture, the every-record sessions' logs and a
+        /// branching log with malformed lines, each copied under `directory`
+        /// with the reader that reads it.
+        fn logs(directory: &Path) -> Vec<(&'static PiLogFormat, PathBuf)> {
+            let mut logs: Vec<(&'static PiLogFormat, PathBuf)> = Vec::new();
+            let mut copy = |format, path: &Path| {
+                let copy = directory.join(format!("copy-{}.jsonl", logs.len()));
+                std::fs::copy(path, &copy).unwrap();
+                logs.push((format, copy));
+            };
+            // Each every-record session keeps its logs while it lives.
+            for session in every_record_sessions() {
+                let format = match session.row.source {
+                    Source::Pi => &PI_LOG,
+                    Source::Omp => &OMP_LOG,
+                    _ => continue,
+                };
+                for path in std::iter::once(&session.row.path).chain(&session.row.subagents) {
+                    copy(format, path);
+                }
+            }
+            for name in ["v1.jsonl", "v2.jsonl", "v3-branched.jsonl"] {
+                copy(&PI_LOG, &fixture(name));
+            }
+            copy(&OMP_LOG, &omp_fixture());
+            copy(&OMP_LOG, &omp_fixture().with_file_name("subagent.jsonl"));
+            let branching = directory.join("branching.jsonl");
+            std::fs::write(&branching, branch_with_malformed_lines()).unwrap();
+            logs.push((&PI_LOG, branching));
+            logs
+        }
+
+        #[test]
+        fn prefix_and_resumed_read_equal_full_read_at_every_split_of_every_log() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut branch_switches = 0;
+            for (format, path) in logs(directory.path()) {
+                let bytes = std::fs::read(&path).unwrap();
+                let full = read_whole(format, &path).unwrap();
+                for split in record_splits(&bytes) {
+                    let name = format!("{} at {split}", path.display());
+                    std::fs::write(&path, &bytes[..split]).unwrap();
+                    let prefix = read_whole(format, &path);
+                    std::fs::write(&path, &bytes).unwrap();
+                    let Some(prefix) = prefix else {
+                        continue;
+                    };
+
+                    match resume(
+                        format,
+                        crate::history::FOR_FIXTURES,
+                        &path,
+                        &prefix.transcript_read,
+                    )
+                    .unwrap()
+                    {
+                        Resumption::Window(window) => assert_window_completes(
+                            &format!("{name} from line {}", window.start_line),
+                            &prefix,
+                            &window,
+                            &full,
+                        ),
+                        Resumption::ChangesEarlierEntry => {
+                            let shown = listed(&full.entries);
+                            assert!(
+                                listed(&prefix.entries)
+                                    .iter()
+                                    .any(|entry| !shown.contains(entry)),
+                                "{name}: only a log whose new entries hide an entry the \
+                                 prefix shows reads whole"
+                            );
+                            branch_switches += 1;
+                        }
+                        Resumption::FullRead => assert_eq!(
+                            prefix.transcript_read,
+                            TranscriptRead::full_read(),
+                            "{name}: only a log whose header has no line ending yet reads whole"
+                        ),
+                    }
+                }
+            }
+            assert!(
+                branch_switches > 0,
+                "a split before a branch switch reads whole"
+            );
+        }
+
+        #[test]
+        fn branch_switch_reads_whole() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            let bytes = std::fs::read_to_string(fixture("v3-branched.jsonl")).unwrap();
+            let through_abandoned_answer = bytes.split_inclusive('\n').take(5).collect::<String>();
+            std::fs::write(&path, &through_abandoned_answer).unwrap();
+            let prefix = read_whole(&PI_LOG, &path).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+
+            let resumed = resume(
+                &PI_LOG,
+                crate::history::FOR_FIXTURES,
+                &path,
+                &prefix.transcript_read,
+            )
+            .unwrap();
+
+            assert!(
+                matches!(resumed, Resumption::ChangesEarlierEntry),
+                "the branch summary returns to the root answer: {resumed:?}"
+            );
+        }
+
+        /// An OMP log whose title slot OMP's own rename wrote: 256 bytes.
+        fn renamed_omp_log(directory: &Path) -> PathBuf {
+            let path = directory.join("session.jsonl");
+            std::fs::copy(omp_fixture(), &path).unwrap();
+            append_omp_session_rename(
+                crate::history::FOR_FIXTURES,
+                &path,
+                "First name",
+                TestClock::start_wall(),
+            )
+            .unwrap();
+            path
+        }
+
+        #[test]
+        fn title_slot_rewritten_in_place_resumes_with_new_title() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = renamed_omp_log(directory.path());
+            let before = read_whole(&OMP_LOG, &path).unwrap();
+
+            append_omp_session_rename(
+                crate::history::FOR_FIXTURES,
+                &path,
+                "Second name",
+                TestClock::start_wall(),
+            )
+            .unwrap();
+            let full = read_whole(&OMP_LOG, &path).unwrap();
+            let resumed = resume(
+                &OMP_LOG,
+                crate::history::FOR_FIXTURES,
+                &path,
+                &before.transcript_read,
+            )
+            .unwrap();
+
+            let Resumption::Window(window) = resumed else {
+                panic!("a title slot rewritten in place resumes: {resumed:?}");
+            };
+            assert_eq!(
+                listed(&OMP_LOG.leading_entries(&path, &window.read).unwrap()),
+                listed(&full.entries[..1]),
+                "the leading entry is the slot's new title"
+            );
+            let mut resumed_entries = before.entries;
+            resumed_entries.retain(|(record, _)| record.line < window.start_line);
+            resumed_entries[0] = full.entries[0].clone();
+            resumed_entries.extend(window.entries);
+            assert_eq!(listed(&resumed_entries), listed(&full.entries));
+        }
+
+        #[test]
+        fn title_slot_of_another_length_or_another_header_reads_whole() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("session.jsonl");
+            std::fs::copy(omp_fixture(), &path).unwrap();
+            let read = read_whole(&OMP_LOG, &path).unwrap().transcript_read;
+
+            append_omp_session_rename(
+                crate::history::FOR_FIXTURES,
+                &path,
+                "A name in a 256-byte slot",
+                TestClock::start_wall(),
+            )
+            .unwrap();
+            assert_eq!(
+                OMP_LOG.identity(&path).unwrap(),
+                read.identity,
+                "the title slot is not part of the identity"
+            );
+            assert!(
+                matches!(
+                    resume(&OMP_LOG, crate::history::FOR_FIXTURES, &path, &read).unwrap(),
+                    Resumption::FullRead
+                ),
+                "a slot of another length moves every record"
+            );
+
+            let path = renamed_omp_log(directory.path());
+            let read = read_whole(&OMP_LOG, &path).unwrap().transcript_read;
+            let bytes = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                bytes.replace("/tmp/omp-project", "/tmp/omp-elsewhere"),
+            )
+            .unwrap();
+            assert_ne!(
+                OMP_LOG.identity(&path).unwrap(),
+                read.identity,
+                "the header record is the identity"
+            );
         }
     }
 }

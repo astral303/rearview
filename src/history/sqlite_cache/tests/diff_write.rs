@@ -3,8 +3,12 @@
 //! earlier version of a parse, then the parse, and compares the stored
 //! session with a fresh write of the parse in another database.
 
+mod resumed;
+
 use super::*;
 use crate::history::provider::contract_tests::AgentSession;
+use crate::history::provider::transcript_reads::resume;
+use crate::history::provider::{Resumption, TranscriptRead};
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
@@ -59,24 +63,25 @@ fn writes_of(writes: &BTreeMap<(String, String), i64>, table: &str, operation: &
 }
 
 struct Fixture {
-    session: AgentSession,
+    source: Source,
     root: SessionRoot,
     stub: SessionStub,
+    /// Keeps a fixture session built on disk alive.
+    _session: Option<AgentSession>,
 }
 
 impl Fixture {
     fn of(session: AgentSession) -> Self {
-        let root = root_of(&session);
-        let stub = stub_of(&session, 1);
         Self {
-            session,
-            root,
-            stub,
+            source: session.row.source,
+            root: root_of(&session),
+            stub: stub_of(&session, 1),
+            _session: Some(session),
         }
     }
 
     fn source(&self) -> Source {
-        self.session.row.source
+        self.source
     }
 
     fn label(&self) -> &'static str {
@@ -170,6 +175,12 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
             "session_files",
             "SELECT position, kind, path, key, file_size, mtime_secs, mtime_nsecs \
              FROM session_files WHERE session = ?1 ORDER BY position"
+                .to_owned(),
+        ),
+        (
+            "transcript_reads",
+            "SELECT position, path, cursor, stable_cursor, identity, rewrite_check, parser_state \
+             FROM transcript_reads WHERE session = ?1 ORDER BY position"
                 .to_owned(),
         ),
         (
@@ -409,6 +420,84 @@ fn without_last_own_entries(record: &mut SessionRecord, count: usize) -> usize {
         removed += 1;
     }
     removed
+}
+
+/// The `transcript_reads` rows of `session`, in position order, each with
+/// its path.
+fn stored_reads(cache: &CacheWriter, session: i64) -> Vec<(PathBuf, TranscriptRead)> {
+    cache
+        .connection
+        .prepare(
+            "SELECT path, cursor, stable_cursor, identity, rewrite_check, parser_state, \
+             stable_line FROM transcript_reads WHERE session = ?1 ORDER BY position",
+        )
+        .unwrap()
+        .query_map([session], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                TranscriptRead {
+                    cursor: row.get(1)?,
+                    stable_cursor: row.get(2)?,
+                    identity: row.get(3)?,
+                    rewrite_check: row.get(4)?,
+                    parser_state: row.get(5)?,
+                    stable_line: row.get::<_, Option<i64>>(6)?.map(|line| line as usize),
+                },
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn stored_file_paths(cache: &CacheWriter, session: i64) -> Vec<PathBuf> {
+    cache
+        .connection
+        .prepare("SELECT path FROM session_files WHERE session = ?1 ORDER BY position")
+        .unwrap()
+        .query_map([session], |row| Ok(PathBuf::from(row.get::<_, String>(0)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn write_stores_read_of_every_session_file_that_resumes_through_its_agents_reader() {
+    for session in every_record_sessions() {
+        let fixture = Fixture::of(session);
+        let mut before = fixture.record();
+        for file in &mut before.catalogue.files {
+            file.read = TranscriptRead::full_read();
+        }
+        let base = tempfile::tempdir().unwrap();
+        let mut cache = cache_holding(base.path(), &fixture, &before);
+
+        let record = fixture.record();
+        cache.write(&record).unwrap();
+
+        let session = fixture.session_id(&cache);
+        let reads = stored_reads(&cache, session);
+        assert_eq!(
+            reads
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            stored_file_paths(&cache, session),
+            "{}: each session file has its read, at its position",
+            fixture.label()
+        );
+        let reader = fixture.source().provider().storage().transcript_reader();
+        for (path, read) in &reads {
+            let resumption = resume(reader, crate::history::FOR_FIXTURES, path, read).unwrap();
+            assert!(
+                matches!(resumption, Resumption::Window(_)),
+                "{}: {} resumes through its agent's reader: {resumption:?}",
+                fixture.label(),
+                path.display()
+            );
+        }
+        assert_matches_fresh_write(&cache, &fixture, &record);
+    }
 }
 
 #[test]

@@ -10,58 +10,365 @@
 //! | any other                                      | nothing          |
 
 use super::{
-    EntrySink, UNKNOWN, assistant_entry, compaction_summary, injected_read_input_from_text,
-    nonempty_text, tool_result_entry, tool_use_block, usage_entry, user_entry,
+    EntrySink, RowsRead, RowsSeen, RowsStart, UNKNOWN, assistant_entry, compaction_summary,
+    injected_read_input_from_text, nonempty_text, tool_result_entry, tool_use_block, usage_entry,
+    user_entry,
 };
 use crate::history::format::dropped::DroppedRecords;
 use crate::history::format::rfc3339_from_millis;
 use crate::log_entry::{ContentBlock, LogEntry};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-/// An OpenCode 1 session's entries, each numbered by the part it came from,
-/// and the records dropped on the way, counted in `dropped`.
-pub(super) fn entries(
-    connection: &Connection,
-    session_id: &str,
-    mut dropped: DroppedRecords,
-) -> rusqlite::Result<EntrySink> {
-    let mut parts_by_message = parts_by_message(connection, session_id, &mut dropped)?;
-    let messages = messages(connection, session_id, &mut dropped)?;
-    let mut sink = EntrySink {
-        dropped,
-        ..EntrySink::default()
-    };
-    for (message_id, data) in messages {
-        let parts = parts_by_message.remove(&message_id).unwrap_or_default();
-        message_entries(&data, &parts, &mut sink);
-    }
-    Ok(sink)
+/// The order OpenCode 1 reads a session's messages and parts in: creation
+/// time, then id.
+type RowKey = (i64, String);
+
+/// Where a read of an OpenCode 1 session's rows starts: the first message it
+/// reads, and the last part before that message's. The default starts at the
+/// session's first row.
+///
+/// Parts are numbered across the session, so a read from a cursor reads
+/// only once every part of an earlier message comes before every part of a
+/// later one.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Cursor {
+    message: Option<RowKey>,
+    last_part: Option<RowKey>,
 }
 
-/// The session's messages in conversation order: `(message id, decoded data)`.
-/// A row whose JSON does not parse is skipped rather than failing the session,
-/// and counted in `dropped`.
-fn messages(
+/// The index of the `message` and `part` table in [`RowsStart::before`].
+const MESSAGES: usize = 0;
+const PARTS: usize = 1;
+
+/// An OpenCode 1 session's entries from `from` on, each numbered by the part
+/// it came from, `start` being the state the rows before `from` left; the
+/// records dropped on the way are counted in `dropped`.
+///
+/// The next read starts before the session's last message, which OpenCode
+/// still writes while a reply streams, unless a part comes before a part of
+/// an earlier message. A part from `from` on of a message before it leaves no
+/// next read.
+pub(super) fn read(
     connection: &Connection,
     session_id: &str,
-    dropped: &mut DroppedRecords,
-) -> rusqlite::Result<Vec<(String, Value)>> {
-    let mut statement = connection
-        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")?;
-    let rows = statement.query_map([session_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut messages = Vec::new();
-    for row in rows {
-        let (id, data) = row?;
-        match serde_json::from_str::<Value>(&data) {
-            Ok(data) => messages.push((id, data)),
-            Err(_) => dropped.failed("message.data"),
+    from: &Cursor,
+    start: &RowsStart,
+    dropped: DroppedRecords,
+) -> rusqlite::Result<RowsRead<Cursor>> {
+    let messages = message_rows(connection, session_id, from)?;
+    let parts = part_rows(connection, session_id, from, start.seen(PARTS).count)?;
+    let index_of: HashMap<&str, usize> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.id.as_str(), index))
+        .collect();
+    let owners: Vec<Option<usize>> = parts
+        .rows
+        .iter()
+        .map(|part| index_of.get(part.message_id.as_str()).copied())
+        .collect();
+    let has_every_message = from.message.is_none();
+    let is_complete =
+        parts.is_complete && (has_every_message || owners.iter().all(Option::is_some));
+    let split = is_complete
+        .then(|| split_point(messages.len(), &owners))
+        .flatten();
+
+    let mut all = vec![start.seen(MESSAGES), start.seen(PARTS)];
+    let mut before = all.clone();
+    let mut bytes_read = 0;
+    for (index, message) in messages.iter().enumerate() {
+        all[MESSAGES].add(message.time_updated);
+        if split.is_some_and(|split| index < split) {
+            before[MESSAGES].add(message.time_updated);
+        }
+        bytes_read += message.data_bytes;
+    }
+    let parts_before = split.map_or(0, |split| {
+        owners
+            .iter()
+            .take_while(|owner| owner.is_none_or(|index| index < split))
+            .count()
+    });
+    for (position, part) in parts.rows.iter().enumerate() {
+        all[PARTS].add(part.time_updated);
+        if position < parts_before {
+            before[PARTS].add(part.time_updated);
+        }
+        bytes_read += part.data_bytes;
+    }
+    let next_cursor = split.map(|split| Cursor {
+        message: messages
+            .get(split)
+            .map(|message| message.key.clone())
+            .or_else(|| from.message.clone()),
+        last_part: parts_before
+            .checked_sub(1)
+            .map(|last| parts.rows[last].key.clone())
+            .or_else(|| from.last_part.clone()),
+    });
+
+    let mut sink = EntrySink {
+        dropped,
+        last_model: start.last_model.clone(),
+        ..EntrySink::default()
+    };
+    let mut parts_by_message: Vec<Vec<Part>> = messages.iter().map(|_| Vec::new()).collect();
+    for (position, (part, owner)) in parts.rows.into_iter().zip(&owners).enumerate() {
+        match (part.data, owner) {
+            (Some(data), Some(owner)) => parts_by_message[*owner].push(Part {
+                position: start.lines_before + position + 1,
+                data,
+            }),
+            (None, _) => sink.dropped.failed("part.data"),
+            (Some(_), None) => {}
         }
     }
-    Ok(messages)
+    let mut model_at_split = None;
+    for (index, (message, parts)) in messages.iter().zip(&parts_by_message).enumerate() {
+        if split == Some(index) {
+            model_at_split = Some(sink.last_model.clone());
+        }
+        match &message.data {
+            Some(data) => message_entries(data, parts, &mut sink),
+            None => sink.dropped.failed("message.data"),
+        }
+    }
+    let model_at_split = model_at_split.unwrap_or_else(|| sink.last_model.clone());
+    Ok(RowsRead {
+        next: next_cursor.map(|cursor| {
+            (
+                cursor,
+                RowsStart {
+                    lines_before: start.lines_before + parts_before,
+                    last_model: model_at_split,
+                    before,
+                },
+            )
+        }),
+        sink,
+        every_row: all,
+        bytes_read,
+    })
+}
+
+/// The latest place before a message, short of the last, where every part
+/// of a message before it comes before every part of a message from it on;
+/// `owners` gives each part's message, `None` for one of no message, which
+/// comes first. `None` when no place is.
+fn split_point(messages: usize, owners: &[Option<usize>]) -> Option<usize> {
+    let last_message = messages.saturating_sub(1);
+    // The last part of each message and of the ones before it, and the first
+    // part of each message and of the ones after it.
+    let mut last_part_through = vec![None::<usize>; messages + 1];
+    let mut first_part_from = vec![usize::MAX; messages + 1];
+    let mut orphans_end = None;
+    for (position, owner) in owners.iter().enumerate() {
+        match owner {
+            Some(index) => {
+                last_part_through[*index] = Some(position);
+                first_part_from[*index] = first_part_from[*index].min(position);
+            }
+            None => orphans_end = Some(position),
+        }
+    }
+    for index in 1..=messages {
+        last_part_through[index] = last_part_through[index].max(last_part_through[index - 1]);
+    }
+    for index in (0..messages).rev() {
+        first_part_from[index] = first_part_from[index].min(first_part_from[index + 1]);
+    }
+    (0..=last_message).rev().find(|&split| {
+        let last_before = match split {
+            0 => orphans_end,
+            _ => last_part_through[split - 1].max(orphans_end),
+        };
+        last_before.is_none_or(|last| last < first_part_from[split])
+    })
+}
+
+/// One row of the session's `message` table.
+struct MessageRow {
+    id: String,
+    key: RowKey,
+    time_updated: i64,
+    data_bytes: u64,
+    /// `None` for JSON that does not parse.
+    data: Option<Value>,
+}
+
+/// The session's messages from `from` on, in conversation order.
+fn message_rows(
+    connection: &Connection,
+    session_id: &str,
+    from: &Cursor,
+) -> rusqlite::Result<Vec<MessageRow>> {
+    const COLUMNS: &str = "SELECT id, time_created, time_updated, data FROM message";
+    let map = |row: &rusqlite::Row<'_>| {
+        let data = row.get::<_, String>(3)?;
+        Ok(MessageRow {
+            id: row.get(0)?,
+            key: (row.get(1)?, row.get(0)?),
+            time_updated: row.get(2)?,
+            data_bytes: data.len() as u64,
+            data: serde_json::from_str(&data).ok(),
+        })
+    };
+    match &from.message {
+        None => connection
+            .prepare(&format!(
+                "{COLUMNS} WHERE session_id = ?1 ORDER BY time_created, id"
+            ))?
+            .query_map([session_id], map)?
+            .collect(),
+        Some((time_created, id)) => connection
+            .prepare(&format!(
+                "{COLUMNS} WHERE session_id = ?1 AND (time_created, id) >= (?2, ?3) \
+                 ORDER BY time_created, id"
+            ))?
+            .query_map(params![session_id, time_created, id], map)?
+            .collect(),
+    }
+}
+
+/// One row of the session's `part` table.
+struct PartRow {
+    message_id: String,
+    key: RowKey,
+    time_updated: i64,
+    data_bytes: u64,
+    /// `None` for JSON that does not parse.
+    data: Option<Value>,
+}
+
+/// The session's parts from `from` on, in part order.
+struct PartRows {
+    rows: Vec<PartRow>,
+    /// False when the session holds a part after `from`'s last part that
+    /// `rows` leave out: one of a message before `from`'s.
+    is_complete: bool,
+}
+
+/// The parts after `from`'s last part: every one of the session's, while
+/// `from` starts at its first message; else the parts of the messages from
+/// `from` on, through their index, counted against the session's parts with
+/// `parts_before`, the parts through `from`'s last part.
+fn part_rows(
+    connection: &Connection,
+    session_id: &str,
+    from: &Cursor,
+    parts_before: u64,
+) -> rusqlite::Result<PartRows> {
+    const COLUMNS: &str =
+        "SELECT p.message_id, p.time_created, p.id, p.time_updated, p.data FROM part p";
+    let map = |row: &rusqlite::Row<'_>| {
+        let data = row.get::<_, String>(4)?;
+        Ok(PartRow {
+            message_id: row.get(0)?,
+            key: (row.get(1)?, row.get(2)?),
+            time_updated: row.get(3)?,
+            data_bytes: data.len() as u64,
+            data: serde_json::from_str(&data).ok(),
+        })
+    };
+    let after_last_part = |rows: Vec<PartRow>| -> Vec<PartRow> {
+        rows.into_iter()
+            .filter(|part| from.last_part.as_ref().is_none_or(|last| part.key > *last))
+            .collect()
+    };
+    let Some((time_created, id)) = &from.message else {
+        let rows = connection
+            .prepare(&format!(
+                "{COLUMNS} WHERE p.session_id = ?1 ORDER BY p.time_created, p.id"
+            ))?
+            .query_map([session_id], map)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(PartRows {
+            rows: after_last_part(rows),
+            is_complete: true,
+        });
+    };
+    let rows = connection
+        .prepare(&format!(
+            "{COLUMNS} JOIN message m ON m.id = p.message_id \
+             WHERE m.session_id = ?1 AND (m.time_created, m.id) >= (?2, ?3) \
+             ORDER BY p.time_created, p.id"
+        ))?
+        .query_map(params![session_id, time_created, id], map)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let fetched = rows.len();
+    let rows = after_last_part(rows);
+    let parts: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM part WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    Ok(PartRows {
+        is_complete: rows.len() == fetched && parts_before + rows.len() as u64 == parts as u64,
+        rows,
+    })
+}
+
+/// The session's rows before `from`, by table: the messages before its
+/// first message, and the parts through its last part.
+pub(super) fn rows_before(
+    connection: &Connection,
+    session_id: &str,
+    from: &Cursor,
+) -> rusqlite::Result<Vec<RowsSeen>> {
+    let messages = match &from.message {
+        None => RowsSeen::default(),
+        Some((time_created, id)) => connection.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(time_updated), 0) FROM message \
+             WHERE session_id = ?1 AND (time_created, id) < (?2, ?3)",
+            params![session_id, time_created, id],
+            RowsSeen::of_row,
+        )?,
+    };
+    Ok(vec![
+        messages,
+        rows_through(connection, session_id, from.last_part.as_ref())?,
+    ])
+}
+
+/// The session's parts through `last`; none for `None`.
+fn rows_through(
+    connection: &Connection,
+    session_id: &str,
+    last: Option<&RowKey>,
+) -> rusqlite::Result<RowsSeen> {
+    let Some((time_created, id)) = last else {
+        return Ok(RowsSeen::default());
+    };
+    connection.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(time_updated), 0) FROM part \
+         WHERE session_id = ?1 AND (time_created, id) <= (?2, ?3)",
+        params![session_id, time_created, id],
+        RowsSeen::of_row,
+    )
+}
+
+/// Every row of the session, by table.
+pub(super) fn every_row(
+    connection: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<RowsSeen>> {
+    ["message", "part"]
+        .into_iter()
+        .map(|table| {
+            connection.query_row(
+                &format!(
+                    "SELECT COUNT(*), COALESCE(MAX(time_updated), 0) FROM {table} \
+                     WHERE session_id = ?1"
+                ),
+                [session_id],
+                RowsSeen::of_row,
+            )
+        })
+        .collect()
 }
 
 /// One row of the session's `part` table: its decoded data, and its
@@ -69,33 +376,6 @@ fn messages(
 struct Part {
     position: usize,
     data: Value,
-}
-
-/// Every part of the session, grouped by message, in part order. A row whose
-/// JSON does not parse is counted in `dropped`.
-fn parts_by_message(
-    connection: &Connection,
-    session_id: &str,
-    dropped: &mut DroppedRecords,
-) -> rusqlite::Result<HashMap<String, Vec<Part>>> {
-    let mut statement = connection.prepare(
-        "SELECT message_id, data FROM part WHERE session_id = ?1 ORDER BY time_created, id",
-    )?;
-    let rows = statement.query_map([session_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut parts: HashMap<String, Vec<Part>> = HashMap::new();
-    for (index, row) in rows.enumerate() {
-        let (message_id, data) = row?;
-        match serde_json::from_str::<Value>(&data) {
-            Ok(data) => parts.entry(message_id).or_default().push(Part {
-                position: index + 1,
-                data,
-            }),
-            Err(_) => dropped.failed("part.data"),
-        }
-    }
-    Ok(parts)
 }
 
 /// Project one message's parts into `sink`.

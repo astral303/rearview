@@ -642,37 +642,96 @@ impl SessionLoader<'_> {
             return reads;
         }
         let writes_database = matches!(database, Some(CacheDatabase::Writer(_)));
+        let to_parse: Vec<(&SessionStub, Option<Conversation>)> = to_parse
+            .into_iter()
+            .map(|stub| {
+                let stored = match &database {
+                    Some(database @ CacheDatabase::Writer(_)) => {
+                        self.stored_listed_row(database, root, stub)
+                    }
+                    _ => None,
+                };
+                (stub, stored)
+            })
+            .collect();
         let unparsed = self.parse_in_groups(
             access,
             &to_parse,
-            |permit, stub| {
+            |permit, (stub, stored)| {
+                let resumed = stored
+                    .as_ref()
+                    .and_then(|stored| self.read_resumed(permit, root, stub, stored, &|| {}));
+                if let Some(resumed) = resumed {
+                    return SessionParse::Resumed(resumed);
+                }
                 let stamps = writes_database.then(|| StubStamps::current(stub));
                 let (raw, transcripts) = self.parse(permit, root, stub, &|| {});
                 let record = stamps.and_then(|stamps| {
                     cache_record(self.storage, root, stub, stamps, &raw, transcripts)
                 });
-                (raw, record)
+                SessionParse::Whole(raw, record)
             },
             |group, parsed| {
-                for (&stub, (raw, record)) in group.iter().zip(parsed) {
-                    let is_written = access.owner().is_some()
-                        && match (&mut database, record) {
-                            (Some(CacheDatabase::Writer(writer)), Some(record)) => writer
-                                .write(&record)
-                                .inspect_err(|error| {
-                                    debug::warn(
-                                        self.debug_level,
-                                        &format!(
-                                            "Failed to write the session cache database: {error}"
+                for (&(stub, _), parsed) in group.iter().zip(parsed) {
+                    let write = |database: &mut Option<CacheDatabase>, record: &SessionRecord| {
+                        match database {
+                            Some(CacheDatabase::Writer(writer)) if access.owner().is_some() => {
+                                writer
+                                    .write(record)
+                                    .inspect_err(|error| {
+                                        debug::warn(
+                                            self.debug_level,
+                                            &format!(
+                                                "Failed to write the session cache database: \
+                                                 {error}"
+                                            ),
+                                        );
+                                    })
+                                    .ok()
+                            }
+                            _ => None,
+                        }
+                    };
+                    reads.push(match parsed {
+                        SessionParse::Whole(raw, record) => {
+                            let is_written = record
+                                .is_some_and(|record| write(&mut database, &record).is_some());
+                            AttemptRead {
+                                outcome: SessionOutcome::settled(
+                                    stub,
+                                    self.session_read(stub, raw),
+                                ),
+                                is_current: is_written,
+                            }
+                        }
+                        // A failed write leaves the stored copy, which then
+                        // restores as it is.
+                        SessionParse::Resumed(resumed) => {
+                            match write(&mut database, &resumed.record) {
+                                Some(generation) => {
+                                    let mut row = resumed.row;
+                                    row.cached_session = row
+                                        .cached_session
+                                        .map(|cached| cached.of_generation(generation));
+                                    AttemptRead {
+                                        outcome: SessionOutcome::settled(
+                                            stub,
+                                            self.session_read(stub, RawRead::Parsed(row)),
                                         ),
-                                    );
-                                })
-                                .is_ok(),
-                            _ => false,
-                        };
-                    reads.push(AttemptRead {
-                        outcome: SessionOutcome::settled(stub, self.session_read(stub, raw)),
-                        is_current: is_written,
+                                        is_current: true,
+                                    }
+                                }
+                                None => AttemptRead {
+                                    outcome: self.cached_copy(
+                                        database.as_ref(),
+                                        root,
+                                        external_titles,
+                                        stub,
+                                    ),
+                                    is_current: false,
+                                },
+                            }
+                        }
                     });
                 }
             },
@@ -685,11 +744,37 @@ impl SessionLoader<'_> {
                 &format!("Failed to checkpoint the session cache database: {error}"),
             );
         }
-        reads.extend(unparsed.iter().map(|stub| AttemptRead {
+        reads.extend(unparsed.iter().map(|(stub, _)| AttemptRead {
             outcome: self.cached_copy(database.as_ref(), root, external_titles, stub),
             is_current: false,
         }));
         reads
+    }
+
+    /// The listed row `database` holds for `stub`'s session, whether or not
+    /// its transcripts changed since; `None` when it holds none, or the
+    /// catalogue cannot be read, which reads the session whole.
+    fn stored_listed_row(
+        &self,
+        database: &CacheDatabase,
+        root: &SessionRoot,
+        stub: &SessionStub,
+    ) -> Option<Conversation> {
+        let cached = database
+            .reader()
+            .catalogue_session(
+                self.storage.cache(),
+                self.storage.source(),
+                &root.path,
+                &stub.cache_key,
+                self.show_last,
+            )
+            .ok()
+            .flatten();
+        match cached {
+            Some(CatalogueSession::Listed(row)) => Some(*row),
+            _ => None,
+        }
     }
 }
 

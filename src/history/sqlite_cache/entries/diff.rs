@@ -9,7 +9,7 @@
 //! matches the stored thread of the same origin; a transcript the stored
 //! transcript of the same path.
 
-use super::rows::SessionRows;
+use super::rows::{LeadingTexts, SessionRows};
 use super::threads::ThreadOrigin;
 use super::write::{EntryPlace, RowIds, RowWriter};
 use crate::error::Result;
@@ -26,6 +26,166 @@ pub(in super::super) fn update(
     session: i64,
     rows: &SessionRows,
 ) -> Result<()> {
+    update_scope(connection, session, rows, Scope::Session)
+}
+
+/// Makes the stored entries of `session` from `rows`' first sequence on the
+/// rows of `rows`, inside the caller's transaction. Every entry before it
+/// keeps its row, its message, its thread and its transcript, but for the
+/// title or the summary search reads moving into `rows`.
+pub(in super::super) fn update_tail(
+    connection: &Connection,
+    session: i64,
+    rows: &SessionRows,
+) -> Result<()> {
+    update_scope(connection, session, rows, Scope::Tail)?;
+    for sequence in &rows.superseded_leading {
+        connection
+            .prepare_cached(
+                "UPDATE entries SET search_field = NULL WHERE session = ?1 AND sequence = ?2",
+            )?
+            .execute(params![session, *sequence as i64])?;
+    }
+    Ok(())
+}
+
+/// The stored entries of `session` before `sequence` holding the title and
+/// the summary search reads.
+pub(in super::super) fn stored_leading(
+    connection: &Connection,
+    session: i64,
+    sequence: usize,
+) -> Result<LeadingTexts> {
+    let mut leading = LeadingTexts::default();
+    let mut statement = connection.prepare_cached(
+        "SELECT sequence, kind FROM entries WHERE session = ?1 AND search_field = ?2 \
+         AND sequence < ?3",
+    )?;
+    let mut found = statement.query(params![
+        session,
+        SearchField::Leading.code(),
+        sequence as i64
+    ])?;
+    while let Some(row) = found.next()? {
+        let sequence = row.get::<_, i64>(0)? as usize;
+        if row.get::<_, String>(1)? == "custom-title" {
+            leading.title = Some(sequence);
+        } else {
+            leading.summary = Some(sequence);
+        }
+    }
+    Ok(leading)
+}
+
+/// Makes `rows`, the rows of the session's leading entries, the stored
+/// rows at sequence 0 on, where `stored_count` rows held them: every later
+/// entry moves by the change in their number, and every later entry of the
+/// session's own thread moves its position by as much. An unchanged leading
+/// row is kept, a changed one updated in place.
+pub(in super::super) fn replace_leading(
+    connection: &Connection,
+    session: i64,
+    rows: &SessionRows,
+    stored_count: usize,
+) -> Result<()> {
+    let stored: Vec<(i64, i64)> = connection
+        .prepare_cached(
+            "SELECT id, digest FROM entries WHERE session = ?1 AND sequence < ?2 ORDER BY sequence",
+        )?
+        .query_map(params![session, stored_count as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, _) in stored.iter().skip(rows.entries.len()) {
+        connection
+            .prepare_cached("DELETE FROM search_texts WHERE entry = ?1")?
+            .execute([id])?;
+        connection
+            .prepare_cached("DELETE FROM entries WHERE id = ?1")?
+            .execute([id])?;
+    }
+    let delta = rows.entries.len() as i64 - stored_count as i64;
+    if delta != 0 {
+        // Through negative sequences, so no two entries hold one at once.
+        connection
+            .prepare_cached(
+                "UPDATE entries SET sequence = -sequence - 1 WHERE session = ?1 AND sequence >= ?2",
+            )?
+            .execute(params![session, stored_count as i64])?;
+        connection
+            .prepare_cached(
+                "UPDATE entries SET sequence = -sequence - 1 + ?2 WHERE session = ?1 AND sequence < 0",
+            )?
+            .execute(params![session, delta])?;
+        connection
+            .prepare_cached(
+                "UPDATE entries SET position = position + ?3 WHERE session = ?1 \
+                 AND sequence >= ?2 AND child IS NULL AND (message IS NULL OR message IN \
+                 (SELECT m.id FROM messages m JOIN threads t ON t.id = m.thread \
+                 WHERE m.session = ?1 AND t.number = 0))",
+            )?
+            .execute(params![session, stored_count as i64 + delta, delta])?;
+    }
+    let mut ids = RowIds::new(rows);
+    let mut writer = RowWriter::new(connection, session)?;
+    for index in 0..rows.entries.len() {
+        let row = &rows.entries[index];
+        match stored.get(index) {
+            Some(&(_, digest)) if digest == row.digest => {}
+            Some(&(id, _)) => {
+                let place = EntryPlace::of(row, rows.sequence_of(index), &ids);
+                writer.update_entry(row, &place, id)?;
+            }
+            None => {
+                writer.insert_entry(rows, &mut ids, index)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rewrites stored entries in place: each of `rows`' entries over the
+/// stored entry `stored` gives at its index, its id, its message and its
+/// digest. Each row keeps its place, and its message its thread and its
+/// ordinal.
+pub(in super::super) fn rewrite_in_place(
+    connection: &Connection,
+    session: i64,
+    rows: &SessionRows,
+    stored: &[(i64, Option<i64>, i64)],
+) -> Result<()> {
+    let mut writer = RowWriter::new(connection, session)?;
+    for (index, (row, &(id, message, digest))) in rows.entries.iter().zip(stored).enumerate() {
+        if row.digest == digest {
+            continue;
+        }
+        writer.rewrite_content(row, id)?;
+        if let (Some(new), Some(message)) = (row.message, message)
+            && rows.messages[new].first_entry == index
+        {
+            writer.rewrite_message(rows, new, message)?;
+        }
+    }
+    Ok(())
+}
+
+/// The stored rows a write compares with its rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Every row of the session: a stored row the write does not hold is
+    /// deleted.
+    Session,
+    /// The entries from the rows' first sequence on, and their messages.
+    /// Threads and transcripts are matched, never deleted.
+    Tail,
+}
+
+fn update_scope(
+    connection: &Connection,
+    session: i64,
+    rows: &SessionRows,
+    scope: Scope,
+) -> Result<()> {
     let mut ids = RowIds::new(rows);
     let mut writer = RowWriter::new(connection, session)?;
     let stored_transcripts = match_transcripts(connection, session, rows, &mut ids)?;
@@ -37,7 +197,8 @@ pub(in super::super) fn update(
         writer.thread(rows, &mut ids, index)?;
     }
     let stored = StoredEntries::read(connection, session, rows, &stored_transcripts.matches)?;
-    let gone_messages = update_messages(connection, session, rows, &stored, &writer, &mut ids)?;
+    let gone_messages =
+        update_messages(connection, session, rows, &stored, &writer, &mut ids, scope)?;
     for index in 0..rows.messages.len() {
         writer.message(rows, &mut ids, index)?;
     }
@@ -46,6 +207,9 @@ pub(in super::super) fn update(
         connection
             .prepare_cached("DELETE FROM messages WHERE id = ?1")?
             .execute([id])?;
+    }
+    if scope == Scope::Tail {
+        return Ok(());
     }
     for id in gone_threads {
         connection
@@ -198,6 +362,7 @@ struct StoredEntry {
     record_transcript: Option<i64>,
     search_field: Option<i64>,
     digest: i64,
+    child: Option<i64>,
     /// The index of the new entry at its place.
     matched: Option<usize>,
 }
@@ -242,11 +407,13 @@ impl StoredEntries {
         // as a read gives it.
         let mut statement = connection.prepare_cached(
             "SELECT e.id, e.sequence, e.message, e.contributes, e.position, e.record_transcript, \
-             e.search_field, e.digest, e.record_line, COALESCE(e.record_transcript, t.transcript) \
+             e.search_field, e.digest, e.record_line, \
+             COALESCE(e.child, e.record_transcript, t.transcript), e.child \
              FROM entries e LEFT JOIN messages m ON m.id = e.message \
-             LEFT JOIN threads t ON t.id = m.thread WHERE e.session = ?1 ORDER BY e.sequence",
+             LEFT JOIN threads t ON t.id = m.thread WHERE e.session = ?1 AND e.sequence >= ?2 \
+             ORDER BY e.sequence",
         )?;
-        let mut found = statement.query([session])?;
+        let mut found = statement.query(params![session, rows.first_sequence as i64])?;
         while let Some(row) = found.next()? {
             let line: i64 = row.get(8)?;
             let place = match row.get::<_, Option<i64>>(9)? {
@@ -268,6 +435,7 @@ impl StoredEntries {
                 record_transcript: row.get(5)?,
                 search_field: row.get(6)?,
                 digest: row.get(7)?,
+                child: row.get(10)?,
                 matched: index,
             });
         }
@@ -286,6 +454,7 @@ fn update_messages(
     stored: &StoredEntries,
     writer: &RowWriter,
     ids: &mut RowIds,
+    scope: Scope,
 ) -> Result<Vec<i64>> {
     let mut first_entries: HashMap<i64, Option<usize>> = HashMap::new();
     for entry in &stored.entries {
@@ -295,14 +464,26 @@ fn update_messages(
     }
     let mut gone = Vec::new();
     let mut changed = Vec::new();
-    let mut statement = connection
-        .prepare_cached("SELECT id, thread, ordinal, digest FROM messages WHERE session = ?1")?;
-    let mut found = statement.query([session])?;
-    while let Some(row) = found.next()? {
-        let id: i64 = row.get(0)?;
-        let thread: i64 = row.get(1)?;
-        let ordinal: Option<i64> = row.get(2)?;
-        let digest: i64 = row.get(3)?;
+    let stored_messages: Vec<(i64, i64, Option<i64>, i64)> = match scope {
+        Scope::Session => connection
+            .prepare_cached("SELECT id, thread, ordinal, digest FROM messages WHERE session = ?1")?
+            .query_map([session], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?,
+        Scope::Tail => {
+            let mut statement = connection
+                .prepare_cached("SELECT id, thread, ordinal, digest FROM messages WHERE id = ?1")?;
+            let mut messages = Vec::with_capacity(first_entries.len());
+            for &id in first_entries.keys() {
+                messages.push(statement.query_row([id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?);
+            }
+            messages
+        }
+    };
+    for (id, thread, ordinal, digest) in stored_messages {
         let new = first_entries.get(&id).copied().flatten().and_then(|entry| {
             rows.entries[entry]
                 .message
@@ -321,7 +502,6 @@ fn update_messages(
             changed.push((id, index, ordinal, message.ordinal));
         }
     }
-    drop(found);
     // No two messages may hold one ordinal at once. Clear the ordinals of
     // gone messages and of messages losing theirs first, and give messages
     // gaining one theirs last, once every other message holds its own.
@@ -406,10 +586,16 @@ fn update_entries(
         .iter()
         .filter_map(|entry| entry.matched.map(|index| (entry, index)));
     let (kept, moved): (Vec<_>, Vec<_>) =
-        matched.partition(|(entry, index)| entry.sequence == *index as i64);
+        matched.partition(|(entry, index)| entry.sequence == rows.sequence_of(*index) as i64);
     let moved = moved
         .into_iter()
-        .map(|(entry, index)| (entry.sequence, index as i64, (entry, index)))
+        .map(|(entry, index)| {
+            (
+                entry.sequence,
+                rows.sequence_of(index) as i64,
+                (entry, index),
+            )
+        })
         .collect();
     let moved = match collision_free_order(moved) {
         Ok(order) => order,
@@ -428,12 +614,13 @@ fn update_entries(
     let leading = SearchField::Leading.code();
     for (entry, index) in kept.into_iter().chain(moved) {
         let row = &rows.entries[index];
-        let place = EntryPlace::of(row, index, ids);
+        let place = EntryPlace::of(row, rows.sequence_of(index), ids);
         if entry.digest != row.digest {
             writer.update_entry(row, &place, entry.id)?;
         } else if entry.sequence != place.sequence
             || entry.message != place.message
             || entry.record_transcript != place.transcript
+            || entry.child != place.child
             || entry.contributes != row.contributes
             || entry.position != row.position
             || entry.search_field != row.is_leading.then_some(leading)

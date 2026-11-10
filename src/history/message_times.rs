@@ -167,6 +167,20 @@ impl MessageTimesBuilder {
         self.spans.resize(message_count, None);
         MessageTimes::new(&self.spans)
     }
+
+    /// [`Self::finish`] for a builder that numbered no message among the
+    /// first ones, whose spans are `before`, in order.
+    pub(crate) fn finish_after(
+        mut self,
+        message_count: usize,
+        before: impl Iterator<Item = Option<TimeSpan>>,
+    ) -> MessageTimes {
+        self.spans.resize(message_count, None);
+        for (span, earlier) in self.spans.iter_mut().zip(before) {
+            *span = earlier;
+        }
+        MessageTimes::new(&self.spans)
+    }
 }
 
 #[cfg(test)]

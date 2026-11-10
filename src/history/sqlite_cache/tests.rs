@@ -625,14 +625,14 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
     let mut record = parsed_record(Source::Claude, &root, &stub_of(&session, 1));
     record.catalogue.locator = source.to_string_lossy().into_owned();
     let metadata = std::fs::metadata(&source).unwrap();
-    record.catalogue.files = vec![catalogue::SessionFile {
-        kind: "locator",
-        path: source.clone(),
-        fingerprint: Some(CachedFingerprint::of(
+    record.catalogue.files = vec![catalogue::SessionFile::new(
+        "locator",
+        source.clone(),
+        Some(CachedFingerprint::of(
             metadata.len(),
             metadata.modified().unwrap(),
         )),
-    }];
+    )];
     record.entries = Some(Ok(normalized_session(
         crate::history::FOR_FIXTURES,
         Source::Claude,

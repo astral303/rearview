@@ -7,8 +7,8 @@ use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
     SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder, resolved_session_paths,
-    retain_index_records, walk, write_atomically,
+    SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder, TranscriptReader,
+    resolved_session_paths, retain_index_records, walk, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -432,6 +432,10 @@ impl SessionStorage for KimiStorage {
             }
         }
         titles
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &kimi::KIMI_WIRE
     }
 }
 

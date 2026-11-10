@@ -11,8 +11,8 @@ use super::{
     Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
     SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder, resolved_session_paths,
-    write_atomically,
+    SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder, TranscriptReader,
+    resolved_session_paths, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -585,6 +585,10 @@ impl SessionStorage for GrokStorage {
                 Some((summary.id, title))
             })
             .collect()
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &grok::GROK_UPDATES
     }
 }
 

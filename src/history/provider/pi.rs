@@ -5,7 +5,7 @@ use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
     SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
-    SourceLabels, SubagentFinder, walk,
+    SourceLabels, SubagentFinder, TranscriptReader, walk,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -199,6 +199,10 @@ impl SessionStorage for PiStorage {
             on_transcript_read,
             clock,
         )
+    }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &pi_log::PI_LOG
     }
 }
 

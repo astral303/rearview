@@ -31,6 +31,7 @@ mod sessions_dir;
 pub(crate) mod sqlite;
 mod storage;
 pub(crate) mod subagents;
+pub(crate) mod transcript_reads;
 #[cfg(test)]
 mod upstream_releases;
 pub(crate) mod walk;
@@ -56,6 +57,10 @@ pub use storage::{
 };
 #[cfg(test)]
 pub(crate) use storage::{ParseWatch, RootedStorage, StorageUnderHome, WatchedStorage};
+pub use transcript_reads::{
+    FullRead, LinkUpdate, LinkWindow, LinkedThread, NoLinks, ResumedWindow, Resumption,
+    ThreadLinker, TranscriptRead, TranscriptReader,
+};
 
 use launcher::PathResumeLauncher;
 

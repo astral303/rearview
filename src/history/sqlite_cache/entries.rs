@@ -25,8 +25,8 @@ use serde_json::Value;
 use std::ops::RangeInclusive;
 use std::path::Path;
 
-pub(super) use diff::update;
-pub(super) use rows::SessionRows;
+pub(super) use diff::{replace_leading, rewrite_in_place, stored_leading, update, update_tail};
+pub(super) use rows::{RowsStart, SessionRows};
 
 /// Entries a first write of a session writes per transaction, so a session
 /// of hundreds of thousands of entries does not hold the database's write
@@ -292,6 +292,11 @@ pub(super) struct Selection {
 }
 
 impl Selection {
+    /// The entries `ids`, a query of entry ids, selects with `parameters`.
+    pub(super) fn of(ids: &'static str, parameters: Vec<rusqlite::types::Value>) -> Self {
+        Self { ids, parameters }
+    }
+
     fn new(session: i64, messages: Option<RangeInclusive<u64>>) -> Self {
         let mut parameters = vec![session.into()];
         let ids = if let Some(messages) = messages {
@@ -423,7 +428,7 @@ pub(super) fn read_search_batch(
     read_selected(connection, session, &selected, ReadPurpose::Search)
 }
 
-fn read_selected(
+pub(super) fn read_selected(
     connection: &Connection,
     session: i64,
     selected: &Selection,
@@ -475,28 +480,7 @@ fn read_selected(
         entries.push((record, entry_of(row, thread, entry_text, blocks)?));
     }
     let malformed_lines = if matches!(purpose, ReadPurpose::Display) {
-        connection
-            .prepare(
-                "SELECT line_number, line_content, error_message, context_before, context_after \
-             FROM malformed_lines WHERE session = ?1 ORDER BY position",
-            )?
-            .query_map([session], |row| {
-                let line_content: Option<String> = row.get(1)?;
-                let detail = match line_content {
-                    Some(line_content) => Some(MalformedLineDetail {
-                        line_content,
-                        error_message: row.get(2)?,
-                        context_before: lines_of(&row.get::<_, String>(3)?),
-                        context_after: lines_of(&row.get::<_, String>(4)?),
-                    }),
-                    None => None,
-                };
-                Ok(MalformedLine {
-                    line_number: row.get::<_, i64>(0)? as usize,
-                    detail,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?
+        read_malformed_lines(connection, session)?
     } else {
         Vec::new()
     };
@@ -508,6 +492,35 @@ fn read_selected(
         numbers,
         last_sequence,
     })
+}
+
+/// The lines of `session`'s transcript that did not parse, in order.
+pub(super) fn read_malformed_lines(
+    connection: &Connection,
+    session: i64,
+) -> Result<Vec<MalformedLine>> {
+    Ok(connection
+        .prepare_cached(
+            "SELECT line_number, line_content, error_message, context_before, context_after \
+             FROM malformed_lines WHERE session = ?1 ORDER BY position",
+        )?
+        .query_map([session], |row| {
+            let line_content: Option<String> = row.get(1)?;
+            let detail = match line_content {
+                Some(line_content) => Some(MalformedLineDetail {
+                    line_content,
+                    error_message: row.get(2)?,
+                    context_before: lines_of(&row.get::<_, String>(3)?),
+                    context_after: lines_of(&row.get::<_, String>(4)?),
+                }),
+                None => None,
+            };
+            Ok(MalformedLine {
+                line_number: row.get::<_, i64>(0)? as usize,
+                detail,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// The entry `row` holds, with `entry_text`, its own text as the read gives

@@ -110,6 +110,14 @@ impl ClaudeHome {
         path
     }
 
+    /// Rewrite the transcript at `path` from its first line: one user
+    /// message per text, sent `minute` past noon a second apart. A load
+    /// reads a rewritten transcript whole, where it reads an appended one on
+    /// from its stored copy.
+    pub(crate) fn rewrite(&self, path: &Path, minute: u32, texts: &[&str]) {
+        std::fs::write(path, transcript_lines(minute, texts)).unwrap();
+    }
+
     /// Add a user message with `text`, sent `minute` past noon, to the
     /// transcript at `path`.
     pub(crate) fn append(&self, path: &Path, minute: u32, text: &str) {

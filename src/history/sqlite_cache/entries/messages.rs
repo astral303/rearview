@@ -1,6 +1,6 @@
 use super::digest::Digest;
 use super::{EntryColumns, threads::Placement};
-use crate::agent::message_numbering::MessageNumbering;
+use crate::agent::message_numbering::{MessageNumbering, NumberingCheckpoint};
 use crate::agent::transcript::{AgentMessageRole, MessageReport};
 use crate::log_entry::{LogEntry, TokenUsage};
 use std::collections::HashMap;
@@ -100,6 +100,15 @@ pub(super) struct Membership {
 }
 
 impl<'a> Messages<'a> {
+    /// The grouping after the entries `numbering` was checkpointed past,
+    /// holding no message yet.
+    pub(super) fn resumed(numbering: &NumberingCheckpoint) -> Self {
+        Self {
+            numbering: MessageNumbering::resumed(numbering),
+            ..Self::default()
+        }
+    }
+
     /// Adds `entry`, the entry at `index` whose columns are `columns`, to its
     /// message; `None` for an entry outside every message.
     pub(super) fn add(

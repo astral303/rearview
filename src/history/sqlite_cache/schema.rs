@@ -3,7 +3,7 @@
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 13;
+pub(super) const SCHEMA_VERSION: u32 = 16;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Every table, dropped in this order when the schema changes.
@@ -18,6 +18,8 @@ pub(super) const TABLES: &[&str] = &[
     "threads",
     "transcripts",
     "parse_errors",
+    "session_checkpoints",
+    "transcript_reads",
     "session_files",
     "sessions",
     "meta",
@@ -107,6 +109,41 @@ CREATE TABLE IF NOT EXISTS session_files (
     mtime_nsecs INTEGER,
     PRIMARY KEY (session, position)
 ) WITHOUT ROWID;
+
+-- What the last read of each `session_files` file left for the next read,
+-- at the file's position: the agent's transcript reader resumes from these
+-- values, which nothing else interprets. A file read whole holds the full
+-- read's empty values.
+CREATE TABLE IF NOT EXISTS transcript_reads (
+    session INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    cursor BLOB NOT NULL,
+    stable_cursor BLOB NOT NULL,
+    identity BLOB NOT NULL,
+    rewrite_check BLOB NOT NULL,
+    parser_state BLOB NOT NULL,
+    -- The line the stable cursor stands at: the file's rows from this line
+    -- on are derived again by the next read. Null for a file read whole.
+    stable_line INTEGER,
+    -- The file's share of the session row at the stable cursor, as the
+    -- session row's fold keeps it; empty for the session's own transcript,
+    -- whose share `session_checkpoints` holds.
+    fold_state BLOB NOT NULL,
+    PRIMARY KEY (session, position)
+) WITHOUT ROWID;
+
+-- Where a resumed read of the session starts its session row and numbering
+-- from: the fold of the entries before `sequence`, every one of which a
+-- resumed read leaves as stored, and the agent's ledger of what links the
+-- session's threads, such as the calls that started them. Missing for a
+-- session written without one: its next change is read whole.
+CREATE TABLE IF NOT EXISTS session_checkpoints (
+    session INTEGER PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    checkpoint BLOB NOT NULL,
+    ledger BLOB NOT NULL
+);
 
 -- Searchable child metadata omitted by the dialogue splice, one text part
 -- per row. It has no message number and is excluded by active time windows.
@@ -207,6 +244,8 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE (session, ordinal)
 );
 CREATE INDEX IF NOT EXISTS messages_by_thread ON messages (thread, ordinal);
+CREATE INDEX IF NOT EXISTS messages_by_reply_id ON messages (session, reply_id)
+    WHERE reply_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS messages_by_time ON messages (last_ms, first_ms)
     WHERE ordinal IS NOT NULL;
 
@@ -250,6 +289,13 @@ CREATE TABLE IF NOT EXISTS entries (
     parent_uuid TEXT,
     -- A metadata row's `searchable`.
     flag INTEGER,
+    -- The timestamp text the splice orders the entry by, as the transcript
+    -- wrote it: a parent entry's own, null without one; a sub-agent turn's,
+    -- inherited from an earlier turn when it has none.
+    splice_key TEXT,
+    -- The sub-agent transcript a spliced turn came from; null for the
+    -- session's own entries.
+    child INTEGER REFERENCES transcripts (id),
     -- A hash of what the row stores besides its place in the session and
     -- its message (`message`, `contributes`, `position`, `sequence`,
     -- `record_transcript`, `search_field`), with its parts, result items and
@@ -261,8 +307,14 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS entries_by_message ON entries (message, sequence);
 CREATE INDEX IF NOT EXISTS entries_by_record_transcript ON entries (record_transcript)
     WHERE record_transcript IS NOT NULL;
+CREATE INDEX IF NOT EXISTS entries_by_child ON entries (child, record_line)
+    WHERE child IS NOT NULL;
 CREATE INDEX IF NOT EXISTS entries_by_time ON entries (timestamp_ms)
     WHERE timestamp_ms IS NOT NULL;
+-- A resumed write finds the title and the summary search reads before its
+-- checkpoint here, when an entry after it takes their place.
+CREATE INDEX IF NOT EXISTS entries_by_search_field ON entries (session, sequence)
+    WHERE search_field IS NOT NULL;
 
 -- Each content part retains its original position, including reference-only
 -- images and unknown blocks.

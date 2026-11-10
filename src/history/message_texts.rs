@@ -191,10 +191,6 @@ impl MessageTextBuilder {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.outside_messages.is_empty() && self.messages.iter().all(Vec::is_empty)
-    }
-
     /// `leading` and the parts outside every message, then the parts of each
     /// of `message_count` messages. Each part is normalised on its own and
     /// written after a separator, so quoted text matches within one part and

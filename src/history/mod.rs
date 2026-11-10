@@ -27,6 +27,8 @@ pub mod path;
 pub mod pi_loader;
 pub mod provider;
 mod refresh;
+pub(crate) mod resumed;
+pub(crate) mod row_fold;
 mod shard_files;
 pub(crate) mod skill_text;
 pub(crate) mod sqlite_cache;
@@ -156,7 +158,7 @@ impl TranscriptEntries {
 }
 
 /// A transcript line that did not parse as an entry.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MalformedLine {
     pub(crate) line_number: usize,
     /// `None` for a format that records only the line's number.
@@ -165,7 +167,7 @@ pub(crate) struct MalformedLine {
 
 /// A malformed line as written, why it did not parse, and the lines around
 /// it.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MalformedLineDetail {
     pub(crate) line_content: String,
     pub(crate) error_message: String,

@@ -124,6 +124,11 @@ impl SubagentTurn {
         self.record.transcript.as_deref()
     }
 
+    /// The turn's line in its transcript.
+    pub(crate) fn record(&self) -> &RecordLine {
+        &self.record
+    }
+
     pub(crate) fn thread_identity(&self) -> crate::agent::message_numbering::ThreadIdentity {
         crate::agent::message_numbering::ThreadIdentity::Progress {
             transcript: self.record.transcript.clone(),
@@ -138,7 +143,7 @@ impl SubagentTurn {
     /// `parentToolUseID` at the top level, as a Claude record carries its
     /// own, and the thread's identity beside `agentId` when the provider
     /// records one.
-    fn into_progress_entry(self) -> (RecordLine, LogEntry) {
+    pub(crate) fn into_progress_entry(self) -> (RecordLine, LogEntry) {
         let role = self.role.progress_type();
         let mut data = json!({
             "type": "agent_progress",

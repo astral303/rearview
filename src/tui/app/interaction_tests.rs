@@ -1522,8 +1522,8 @@ fn submit_rename_reparses_and_updates_search_index() {
     serve_session_refresh(&mut app);
 
     assert_eq!(app.conversations[0].custom_title, Some("new".to_string()));
-    assert!(search::search(&app.conversations, &app.searchable, "new", Local::now()).contains(&0));
-    assert!(search::search(&app.conversations, &app.searchable, "old", Local::now()).is_empty());
+    assert!(found_rows(&app, "new").contains(&0));
+    assert!(found_rows(&app, "old").is_empty());
 }
 
 #[test]
@@ -1564,7 +1564,20 @@ fn submit_empty_rename_clears_searchable_title() {
     serve_session_refresh(&mut app);
 
     assert_eq!(app.conversations[0].custom_title, None);
-    assert!(search::search(&app.conversations, &app.searchable, "old", Local::now()).is_empty());
+    assert!(found_rows(&app, "old").is_empty());
+}
+
+/// The rows `query` finds among `app`'s, searched off the drawing thread, as
+/// the search worker searches: a row read on from its stored copy reads its
+/// search texts from the session cache.
+fn found_rows(app: &App, query: &str) -> Vec<usize> {
+    let (conversations, searchable) = (&app.conversations, &app.searchable);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| search::search(conversations, searchable, query, Local::now()))
+            .join()
+            .unwrap()
+    })
 }
 
 fn app_with_codex_conversation(dir: &tempfile::TempDir) -> App {

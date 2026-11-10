@@ -7,10 +7,11 @@ use super::format::splice::{
 };
 use super::format::{RecordLine, SessionFormat, SessionProjection};
 use super::message_texts::{MessageTextBuilder, MessageTextStarts, push_separated};
-use super::message_times::MessageTimesBuilder;
-use super::provider::{ReadError, SessionStub};
+use super::provider::{ReadError, SessionStub, TranscriptRead};
+use super::resumed::{SessionCheckpoint, ThreadFold, checkpoint_place, leading_digest, walk_steps};
+use super::row_fold::{FoldCheckpoint, FoldedRow, RowFold, Unlisted};
 use super::{Conversation, ParseError, ParsePermit, Source, TranscriptEntries, parse_task_report};
-use crate::agent::message_numbering::{MessageNumbering, ThreadIdentity, has_visible_block};
+use crate::agent::message_numbering::{ThreadIdentity, has_visible_block};
 use crate::agent::refs::MessageRange;
 use crate::agent::sanitize::{sanitize_agent_text, without_terminal_codes};
 use crate::agent::transcript::{
@@ -21,7 +22,7 @@ use crate::clock::Clock;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::log_entry::{
-    AgentContent, ContentBlock, LogEntry, TokenUsage, UserContent, extract_text_from_assistant,
+    AgentContent, ContentBlock, LogEntry, UserContent, extract_text_from_assistant,
     extract_text_from_blocks, extract_text_from_user, labeled_metadata_text, parse_agent_progress,
     progress_timestamp, search_texts_of_blocks, search_texts_of_user,
 };
@@ -70,20 +71,48 @@ pub(crate) struct SessionTranscripts {
     /// Each earlier transcript the session's own continues, stamped before
     /// it was read.
     own_earlier_transcripts: Vec<FileStamp>,
+    /// What the read of the session's own transcript leaves for the next.
+    own_read: TranscriptRead,
     subagents: SubagentTranscripts,
+    /// Where a resumed read of the session starts; `None` when its own
+    /// transcript does not resume.
+    pub(crate) checkpoint: Option<SessionCheckpoint>,
+    /// The agent's ledger of what links the session's threads.
+    pub(crate) ledger: Vec<u8>,
 }
 
 impl SessionTranscripts {
     pub(crate) fn new(
         own: TranscriptEntries,
         own_earlier_transcripts: Vec<FileStamp>,
+        own_read: TranscriptRead,
         subagents: SubagentTranscripts,
     ) -> Self {
         Self {
             own,
             own_earlier_transcripts,
+            own_read,
             subagents,
+            checkpoint: None,
+            ledger: Vec::new(),
         }
+    }
+
+    /// The sub-agent transcript at `path`'s share of the row at its stable
+    /// cursor, encoded; `None` when the parse did not read it.
+    pub(crate) fn subagent_fold(&self, path: &Path) -> Option<&[u8]> {
+        self.subagents.folds.get(path).map(Vec::as_slice)
+    }
+
+    /// What the read of the session's own transcript leaves for the next.
+    pub(crate) fn own_read(&self) -> &TranscriptRead {
+        &self.own_read
+    }
+
+    /// What the read of the sub-agent transcript at `path` leaves for the
+    /// next; `None` when the parse did not read it.
+    pub(crate) fn subagent_read(&self, path: &Path) -> Option<&TranscriptRead> {
+        self.subagents.reads.get(path)
     }
 
     /// Every transcript the session's entries and its sub-agents' records
@@ -124,6 +153,133 @@ impl SessionTranscripts {
         };
         (entries, self.subagents.search_parts)
     }
+}
+
+/// A sub-agent transcript read whole, as a resumed read takes it in.
+pub(crate) struct SubagentShare {
+    pub(crate) fold: ThreadFold,
+    pub(crate) search_parts: Vec<String>,
+    pub(crate) thread: SubagentThread,
+    pub(crate) read: TranscriptRead,
+}
+
+/// `projection`, the sub-agent transcript at `path` read whole, as a
+/// resumed read takes it in.
+pub(crate) fn subagent_share(path: &Path, mut projection: SessionProjection) -> SubagentShare {
+    let (_, fold) = SubagentContribution::of_projection(&projection);
+    let search_parts =
+        SubagentContribution::search_parts(projection.entries.iter().map(|(_, entry)| entry));
+    let read = std::mem::replace(&mut projection.transcript_read, TranscriptRead::full_read());
+    SubagentShare {
+        fold,
+        search_parts,
+        thread: SubagentThread::of_projection(path, projection),
+        read,
+    }
+}
+
+/// `fold`, a sub-agent transcript's share of its row at its stable cursor,
+/// once `entries`, read from that cursor on, follow it; the new share stands
+/// at `stable_line`.
+pub(crate) fn resumed_thread_fold(
+    fold: &ThreadFold,
+    entries: &[(RecordLine, LogEntry)],
+    stable_line: Option<usize>,
+) -> ThreadFold {
+    let stable_index = stable_line.map(|line| {
+        entries
+            .iter()
+            .position(|(record, _)| record.line >= line)
+            .unwrap_or(entries.len())
+    });
+    let mut builder = ConversationBuilder {
+        keeps_only_text_outside_turns: true,
+        fold: RowFold::resumed(&fold.fold),
+        checkpoint_at: stable_index,
+        ..ConversationBuilder::default()
+    };
+    builder.push_spliced(entries.iter().map(|(_, entry)| entry), &[]);
+    let checkpoint = builder.checkpoint.take();
+    let before_stable = &entries[..stable_index.unwrap_or(0)];
+    ThreadFold {
+        last_timestamp: before_stable
+            .iter()
+            .rev()
+            .find_map(|(_, entry)| entry.timestamp())
+            .map_or_else(|| fold.last_timestamp.clone(), str::to_owned),
+        fold: checkpoint.unwrap_or_default(),
+        has_parts_after_stable: stable_index.is_some_and(|index| {
+            !SubagentContribution::search_parts(entries[index..].iter().map(|(_, entry)| entry))
+                .is_empty()
+        }),
+        total_tokens: builder.fold.total_tokens(),
+        ..fold.clone()
+    }
+}
+
+/// True when `entries` add to their sub-agent transcript's search parts.
+pub(crate) fn adds_search_parts(entries: &[(RecordLine, LogEntry)]) -> bool {
+    !SubagentContribution::search_parts(entries.iter().map(|(_, entry)| entry)).is_empty()
+}
+
+/// The session row's fold resumed from `checkpoint`, its leading entries
+/// naming `leading_title`, over `tail`, the session's entries from the
+/// checkpoint on in the view's order, where a spliced turn comes from one of
+/// `subagents`; with the fold as it stood before the entry at
+/// `checkpoint_at` of `tail`.
+pub(crate) fn fold_tail(
+    checkpoint: &FoldCheckpoint,
+    leading_title: Option<&str>,
+    tail: &[(RecordLine, LogEntry)],
+    subagents: &std::collections::HashSet<&Path>,
+    checkpoint_at: Option<usize>,
+) -> (RowFold, Option<FoldCheckpoint>) {
+    let mut fold = RowFold::resumed(checkpoint);
+    fold.replace_leading_title(leading_title);
+    let mut builder = ConversationBuilder {
+        fold,
+        checkpoint_at,
+        ..ConversationBuilder::default()
+    };
+    for (record, entry) in tail {
+        builder.keep_checkpoint();
+        match spliced_mark(record, entry, subagents) {
+            Some(mark) => builder.push_mark(&mark),
+            None => builder.push_record(Some(record), entry),
+        }
+        builder.steps += 1;
+    }
+    builder.keep_checkpoint();
+    let checkpoint = builder.checkpoint.take();
+    (builder.fold, checkpoint)
+}
+
+/// `entry`, read at `record`, as the mark of the spliced turn it is, when
+/// it came from one of `subagents`. The mark carries no texts.
+fn spliced_mark(
+    record: &RecordLine,
+    entry: &LogEntry,
+    subagents: &std::collections::HashSet<&Path>,
+) -> Option<SubagentMark> {
+    let transcript = record.transcript.as_deref()?;
+    if !subagents.contains(transcript) {
+        return None;
+    }
+    let LogEntry::Progress { data, extra } = entry else {
+        return None;
+    };
+    let progress = parse_agent_progress(data)?;
+    let role = AgentMessageRole::of_progress(&progress.message.message_type)?;
+    let AgentContent::Blocks(blocks) = progress.message.message.content;
+    Some(SubagentMark {
+        thread: ThreadIdentity::of(entry, Some(transcript)),
+        record: record.clone(),
+        timestamp: progress_timestamp(extra).unwrap_or_default(),
+        is_message: has_visible_block(role, &blocks),
+        reply_id: progress.message.message.id,
+        agent_search_parts: Vec::new(),
+        thinking_and_tool_call_parts: Vec::new(),
+    })
 }
 
 /// One search part of a sub-agent transcript: text outside its spliced
@@ -202,6 +358,7 @@ pub fn process_projected_session(
         stub,
         session,
         subagents,
+        Vec::new(),
         debug_level,
         clock,
     ))
@@ -209,15 +366,16 @@ pub fn process_projected_session(
 
 /// [`process_projected_session`] for a format whose sub-agent threads
 /// depend on each other and on the session: `link` rewrites the threads,
-/// given the session's entries, before their turns are numbered. Every
-/// sub-agent transcript is read and held at once.
+/// given the session's entries, before their turns are numbered, and
+/// returns its ledger of what links them. Every sub-agent transcript is read
+/// and held at once.
 #[allow(clippy::too_many_arguments)]
 pub fn process_linked_session(
     permit: ParsePermit<'_>,
     stub: &SessionStub,
     session: Option<SessionProjection>,
     subagent_format: &dyn SessionFormat,
-    link: impl FnOnce(&[(RecordLine, LogEntry)], &mut [SubagentThread]),
+    link: impl FnOnce(&[(RecordLine, LogEntry)], &mut [SubagentThread]) -> Vec<u8>,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
     clock: &dyn Clock,
@@ -226,7 +384,7 @@ pub fn process_linked_session(
     let Some(session) = session else {
         return Ok(Err(UnlistedReason::ForeignTranscript));
     };
-    let subagents = SubagentReads::of_linked_projections(
+    let (subagents, ledger) = SubagentReads::of_linked_projections(
         permit,
         stub,
         subagent_format,
@@ -237,6 +395,7 @@ pub fn process_linked_session(
         stub,
         session,
         subagents,
+        ledger,
         debug_level,
         clock,
     ))
@@ -246,26 +405,124 @@ fn row_with_subagents(
     stub: &SessionStub,
     mut session: SessionProjection,
     subagents: SubagentReads,
+    ledger: Vec<u8>,
     debug_level: Option<DebugLevel>,
     clock: &dyn Clock,
 ) -> ParsedSession {
-    let mut row = spliced_conversation_from_projection(
+    let steps = walk_steps(&session.entries, &subagents.marks, |mark| {
+        (
+            &mark.record,
+            mark.timestamp.as_str(),
+            mark.reply_id.as_deref(),
+        )
+    });
+    let place = checkpoint_place(&steps, session.transcript_read.stable_line);
+    drop(steps);
+    let (mut row, fold) = spliced_conversation_with_checkpoint(
         stub.locator.clone(),
         &session,
         &subagents.marks,
+        place.as_ref().map(|(sequence, _)| *sequence),
         RowDating::new(stub.fingerprint.modified, clock),
         debug_level,
     )?;
+    let checkpoint = place
+        .zip(fold)
+        .map(|((sequence, splice), fold)| SessionCheckpoint {
+            sequence,
+            fold,
+            splice,
+            header_time: session.header.timestamp.clone(),
+            is_headerless: false,
+            leading_digest: leading_digest(&session.entries),
+        });
     let subagents = subagents.merge_into(&mut row, &stub.subagents, debug_level);
     let own_earlier_transcripts = std::mem::take(&mut session.earlier_transcripts);
-    Ok(ListedSession {
-        row,
-        transcripts: SessionTranscripts::new(
-            TranscriptEntries::of_projection(session),
-            own_earlier_transcripts,
-            subagents,
-        ),
-    })
+    let own_read = std::mem::replace(&mut session.transcript_read, TranscriptRead::full_read());
+    let mut transcripts = SessionTranscripts::new(
+        TranscriptEntries::of_projection(session),
+        own_earlier_transcripts,
+        own_read,
+        subagents,
+    );
+    transcripts.checkpoint = checkpoint;
+    transcripts.ledger = ledger;
+    Ok(ListedSession { row, transcripts })
+}
+
+/// The parse of a session whose format states no header, as
+/// [`headerless_session`] builds it.
+pub(crate) struct HeaderlessSession<'a> {
+    pub(crate) source: Source,
+    pub(crate) stub: &'a SessionStub,
+    /// The id the format's own rule names the session by.
+    pub(crate) session_id: String,
+    pub(crate) own: TranscriptEntries,
+    /// What the read of the session's own transcript leaves for the next.
+    pub(crate) own_read: TranscriptRead,
+    pub(crate) subagents: SubagentReads,
+    /// The format's ledger of what links the session's threads.
+    pub(crate) ledger: Vec<u8>,
+    pub(crate) parse_errors: Vec<ParseError>,
+    pub(crate) dating: RowDating<'a>,
+    pub(crate) debug_level: Option<DebugLevel>,
+}
+
+/// The listed session `session` reads as: its row dated by its last
+/// timestamped message, else by `session.dating`, since Claude Code appends
+/// untimestamped bookkeeping records when it reopens a session; with the
+/// checkpoint a resumed read starts from.
+pub(crate) fn headerless_session(session: HeaderlessSession<'_>) -> ParsedSession {
+    let HeaderlessSession {
+        source,
+        stub,
+        session_id,
+        own,
+        own_read,
+        subagents,
+        ledger,
+        parse_errors,
+        dating,
+        debug_level,
+    } = session;
+    let steps = walk_steps(&own.entries, &subagents.marks, |mark| {
+        (
+            &mark.record,
+            mark.timestamp.as_str(),
+            mark.reply_id.as_deref(),
+        )
+    });
+    let place = checkpoint_place(&steps, own_read.stable_line);
+    drop(steps);
+    let mut builder = ConversationBuilder {
+        parse_errors,
+        checkpoint_at: place.as_ref().map(|(sequence, _)| *sequence),
+        ..ConversationBuilder::default()
+    };
+    builder.push_spliced_records(&own.entries, &subagents.marks);
+    let fold = builder.checkpoint.take();
+    let timestamp = builder
+        .fold
+        .last_activity()
+        .map(|last| last.with_timezone(&Local))
+        .unwrap_or_else(|| dating.fallback_time());
+    let mut row = builder.finish(source, stub.locator.clone(), timestamp, debug_level)?;
+    row.session_id = session_id;
+    let checkpoint = place
+        .zip(fold)
+        .map(|((sequence, splice), fold)| SessionCheckpoint {
+            sequence,
+            fold,
+            splice,
+            header_time: String::new(),
+            is_headerless: true,
+            leading_digest: leading_digest(&own.entries),
+        });
+    let subagents = subagents.merge_into(&mut row, &stub.subagents, debug_level);
+    let mut transcripts = SessionTranscripts::new(own, Vec::new(), own_read, subagents);
+    transcripts.checkpoint = checkpoint;
+    transcripts.ledger = ledger;
+    Ok(ListedSession { row, transcripts })
 }
 
 /// Read each of `stub`'s sub-agent transcripts with `read`, announcing each
@@ -294,6 +551,7 @@ fn read_subagent_transcripts<T: Send>(
 /// `thinking_and_tool_call_text`.
 pub(crate) struct SubagentMark {
     thread: ThreadIdentity,
+    record: RecordLine,
     timestamp: String,
     is_message: bool,
     reply_id: Option<String>,
@@ -312,6 +570,7 @@ fn subagent_marks(turns: &[SubagentTurn]) -> Vec<SubagentMark> {
             };
             SubagentMark {
                 thread: turn.thread_identity(),
+                record: turn.record().clone(),
                 is_message: has_visible_block(turn.role, &turn.blocks),
                 timestamp: turn.timestamp.clone(),
                 reply_id: turn.reply_id.clone(),
@@ -348,12 +607,17 @@ pub(crate) struct SubagentTranscripts {
     search_parts: Vec<SubagentSearchPart>,
     sources: BTreeSet<PathBuf>,
     earlier_transcripts: Vec<FileStamp>,
+    /// What the read of each sub-agent transcript leaves for the next, by
+    /// its path.
+    reads: HashMap<PathBuf, TranscriptRead>,
+    /// Each sub-agent transcript's encoded [`ThreadFold`], by its path.
+    folds: HashMap<PathBuf, Vec<u8>>,
 }
 
 impl SubagentTranscripts {
-    /// Add `read`, the sub-agent transcript at `file_position` among the
-    /// row's sub-agents, counted from 1.
-    pub(crate) fn add(&mut self, file_position: usize, read: SubagentRecordParts) {
+    /// Add `read`, the sub-agent transcript at `path`, at `file_position`
+    /// among the row's sub-agents, counted from 1.
+    pub(crate) fn add(&mut self, file_position: usize, path: &Path, read: SubagentRecordParts) {
         self.search_parts.extend(
             read.search_parts
                 .into_iter()
@@ -364,6 +628,8 @@ impl SubagentTranscripts {
         );
         self.sources.extend(read.sources);
         self.earlier_transcripts.extend(read.earlier_transcripts);
+        self.reads.insert(path.to_path_buf(), read.transcript_read);
+        self.folds.insert(path.to_path_buf(), read.thread_fold);
     }
 }
 
@@ -374,11 +640,15 @@ pub(crate) struct SubagentRecordParts {
     /// The transcripts the records came from, beside the sub-agent's own.
     sources: BTreeSet<PathBuf>,
     earlier_transcripts: Vec<FileStamp>,
+    transcript_read: TranscriptRead,
+    /// The transcript's [`ThreadFold`], encoded; empty when not folded.
+    thread_fold: Vec<u8>,
 }
 
 impl SubagentRecordParts {
     /// The parts of the sub-agent transcript holding `entries`, its earlier
-    /// transcripts stamped as `earlier_transcripts`.
+    /// transcripts stamped as `earlier_transcripts`, read through the full
+    /// read.
     pub(crate) fn of_entries(
         entries: &[(RecordLine, LogEntry)],
         earlier_transcripts: Vec<FileStamp>,
@@ -392,13 +662,31 @@ impl SubagentRecordParts {
                 .filter_map(|(record, _)| record.transcript.as_deref().map(Path::to_path_buf))
                 .collect(),
             earlier_transcripts,
+            transcript_read: TranscriptRead::full_read(),
+            thread_fold: Vec::new(),
         }
     }
 
-    /// [`Self::of_entries`] for `projection`; takes its earlier transcripts.
-    fn of_projection(projection: &mut SessionProjection) -> Self {
+    /// [`Self::of_projection`] for `projection`, a sub-agent transcript read
+    /// whole, with its share of the row at its stable cursor.
+    pub(crate) fn of_read(projection: &mut SessionProjection) -> Self {
+        let (_, fold) = SubagentContribution::of_projection(projection);
+        Self::of_projection(projection, fold)
+    }
+
+    /// [`Self::of_entries`] for `projection`, whose share of the row at its
+    /// stable cursor is `fold`; takes its earlier transcripts and what its
+    /// read leaves for the next.
+    fn of_projection(projection: &mut SessionProjection, fold: ThreadFold) -> Self {
         let earlier_transcripts = std::mem::take(&mut projection.earlier_transcripts);
-        Self::of_entries(&projection.entries, earlier_transcripts)
+        Self {
+            transcript_read: std::mem::replace(
+                &mut projection.transcript_read,
+                TranscriptRead::full_read(),
+            ),
+            thread_fold: fold.encode(),
+            ..Self::of_entries(&projection.entries, earlier_transcripts)
+        }
     }
 }
 
@@ -437,8 +725,8 @@ impl SubagentReads {
         let transcripts = read_subagent_transcripts(stub, on_transcript_read, |subagent| {
             let projection = format.parse_transcript(permit, subagent)?;
             Ok::<_, AppError>(projection.map(|mut projection| {
-                let contribution = SubagentContribution::of_projection(&projection);
-                let record = SubagentRecordParts::of_projection(&mut projection);
+                let (contribution, fold) = SubagentContribution::of_projection(&projection);
+                let record = SubagentRecordParts::of_projection(&mut projection, fold);
                 let thread = SubagentThread::of_projection(subagent, projection);
                 (contribution, record, subagent_turns(vec![thread]))
             }))
@@ -448,7 +736,7 @@ impl SubagentReads {
             match transcript {
                 Ok(Some((contribution, record, turns))) => {
                     reads.contributions.push(contribution);
-                    reads.transcripts.add(index + 1, record);
+                    reads.transcripts.add(index + 1, subagent, record);
                     reads.transcripts.turns.extend(turns);
                 }
                 Ok(None) => {}
@@ -474,13 +762,13 @@ impl SubagentReads {
         stub: &SessionStub,
         format: &dyn SessionFormat,
         on_transcript_read: &(dyn Fn() + Sync),
-        link: impl FnOnce(&mut [SubagentThread]),
-    ) -> Self {
+        link: impl FnOnce(&mut [SubagentThread]) -> Vec<u8>,
+    ) -> (Self, Vec<u8>) {
         let transcripts = read_subagent_transcripts(stub, on_transcript_read, |subagent| {
             let projection = format.parse_transcript(permit, subagent)?;
             Ok::<_, AppError>(projection.map(|mut projection| {
-                let contribution = SubagentContribution::of_projection(&projection);
-                let record = SubagentRecordParts::of_projection(&mut projection);
+                let (contribution, fold) = SubagentContribution::of_projection(&projection);
+                let record = SubagentRecordParts::of_projection(&mut projection, fold);
                 (
                     contribution,
                     record,
@@ -496,25 +784,22 @@ impl SubagentReads {
             match transcript {
                 Ok(Some((contribution, record, thread))) => {
                     contributions.push(contribution);
-                    records.add(index + 1, record);
+                    records.add(index + 1, subagent, record);
                     threads.push(thread);
                 }
                 Ok(None) => {}
                 Err(error) => unreadable.push((subagent.clone(), error)),
             }
         }
-        link(&mut threads);
+        let ledger = link(&mut threads);
         records.turns = subagent_turns(threads);
-        Self {
+        let reads = Self {
             contributions,
             marks: subagent_marks(&records.turns),
             transcripts: records,
             unreadable,
-        }
-    }
-
-    pub(crate) fn marks(&self) -> &[SubagentMark] {
-        &self.marks
+        };
+        (reads, ledger)
     }
 
     /// Add each contribution to `session`, and report each unreadable
@@ -577,10 +862,11 @@ impl SubagentContribution {
             ..Default::default()
         };
         builder.push_spliced(entries, &[]);
-        let leading =
-            title_and_summary(&builder.extracted_custom_title, &builder.extracted_summary)
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
+        let leading = [builder.fold.custom_title(), builder.fold.summary()]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
         leading
             .into_iter()
             .chain(builder.full_text.into_parts())
@@ -590,20 +876,64 @@ impl SubagentContribution {
 
     /// Build the contribution from a transcript's `entries`, in file order.
     fn of_entries<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Self {
+        Self::of_entries_with_checkpoint(entries, None).0
+    }
+
+    /// [`Self::of_entries`], with the fold as it stood before the entry at
+    /// `checkpoint_at`.
+    fn of_entries_with_checkpoint<'a>(
+        entries: impl IntoIterator<Item = &'a LogEntry>,
+        checkpoint_at: Option<usize>,
+    ) -> (Self, Option<FoldCheckpoint>) {
         let mut builder = ConversationBuilder {
             keeps_only_text_outside_turns: true,
+            checkpoint_at,
             ..ConversationBuilder::default()
         };
         builder.push_spliced(entries, &[]);
-        builder.subagent_contribution()
+        let checkpoint = builder.checkpoint.take();
+        (builder.subagent_contribution(), checkpoint)
     }
 
-    fn of_projection(projection: &SessionProjection) -> Self {
-        Self {
-            has_transient_read_error: projection.earlier_turns.is_transient_error(),
+    /// The contribution of `projection`, a sub-agent transcript, and its
+    /// share of the row at its stable cursor.
+    fn of_projection(projection: &SessionProjection) -> (Self, ThreadFold) {
+        let entries = &projection.entries;
+        let stable_index = projection.transcript_read.stable_line.map(|line| {
+            entries
+                .iter()
+                .position(|(record, _)| record.line >= line)
+                .unwrap_or(entries.len())
+        });
+        let (contribution, checkpoint) =
+            Self::of_entries_with_checkpoint(entries.iter().map(|(_, entry)| entry), stable_index);
+        let before_stable = &entries[..stable_index.unwrap_or(0)];
+        let header = &projection.header;
+        let fold = ThreadFold {
+            label: header.thread_label().to_owned(),
+            identity: header.subagent_identity.clone(),
+            started: header.timestamp.clone(),
+            last_timestamp: before_stable
+                .iter()
+                .rev()
+                .find_map(|(_, entry)| entry.timestamp())
+                .unwrap_or(&header.timestamp)
+                .to_owned(),
+            fold: checkpoint.unwrap_or_default(),
+            has_parts_after_stable: stable_index.is_some_and(|index| {
+                !Self::search_parts(entries[index..].iter().map(|(_, entry)| entry)).is_empty()
+            }),
+            title: projection.title.clone(),
+            total_tokens: contribution.total_tokens,
             is_missing_earlier_turns: projection.earlier_turns.is_missing(),
-            ..Self::of_entries(projection.entries.iter().map(|(_, entry)| entry))
-        }
+            has_transient_read_error: projection.earlier_turns.is_transient_error(),
+        };
+        let contribution = Self {
+            has_transient_read_error: fold.has_transient_read_error,
+            is_missing_earlier_turns: fold.is_missing_earlier_turns,
+            ..contribution
+        };
+        (contribution, fold)
     }
 
     /// Add the text to the end of `session`'s `agent_search_text`, outside
@@ -662,29 +992,32 @@ fn spliced_conversation_from_projection(
     dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> ParsedRow {
-    let timestamp = latest_activity_timestamp(&projection.entries)
-        .or_else(|| {
-            DateTime::parse_from_rfc3339(&projection.header.timestamp)
-                .ok()
-                .map(|timestamp| timestamp.with_timezone(&Local))
-        })
-        .unwrap_or_else(|| dating.fallback_time());
+    spliced_conversation_with_checkpoint(path, projection, marks, None, dating, debug_level)
+        .map(|(conversation, _)| conversation)
+}
 
+/// [`spliced_conversation_from_projection`], with the row's fold as it
+/// stood before the entry at `checkpoint_at` in the view's order.
+fn spliced_conversation_with_checkpoint(
+    path: PathBuf,
+    projection: &SessionProjection,
+    marks: &[SubagentMark],
+    checkpoint_at: Option<usize>,
+    dating: RowDating<'_>,
+    debug_level: Option<DebugLevel>,
+) -> std::result::Result<(Conversation, Option<FoldCheckpoint>), UnlistedReason> {
     let mut builder = ConversationBuilder {
-        parse_errors: projection
-            .malformed_lines
-            .iter()
-            .map(|line_number| ParseError {
-                line_number: *line_number,
-                line_content: String::new(),
-                error_message: format!("malformed {} JSONL record", projection.source.label()),
-                context_before: Vec::new(),
-                context_after: Vec::new(),
-            })
-            .collect(),
+        parse_errors: parse_errors_of(projection.source, &projection.malformed_lines),
+        checkpoint_at,
         ..ConversationBuilder::default()
     };
-    builder.push_spliced(projection.entries.iter().map(|(_, entry)| entry), marks);
+    builder.push_spliced_records(&projection.entries, marks);
+    let checkpoint = builder.checkpoint.take();
+    let timestamp = session_time(
+        builder.fold.latest_activity(),
+        &projection.header.timestamp,
+        dating,
+    );
 
     let mut conversation = builder.finish(projection.source, path, timestamp, debug_level)?;
     conversation.is_missing_earlier_turns = projection.earlier_turns.is_missing();
@@ -693,16 +1026,59 @@ fn spliced_conversation_from_projection(
     conversation.cwd = Some(projection.header.cwd.clone());
     conversation.project_path = Some(projection.header.cwd.clone());
     conversation.project_name = Some(super::format_short_name_from_path(&projection.header.cwd));
-    Ok(conversation)
+    Ok((conversation, checkpoint))
 }
 
-fn latest_activity_timestamp(entries: &[(RecordLine, LogEntry)]) -> Option<DateTime<Local>> {
-    entries
+/// The parse errors of a `source` transcript's `malformed_lines`.
+pub(crate) fn parse_errors_of(source: Source, malformed_lines: &[usize]) -> Vec<ParseError> {
+    malformed_lines
         .iter()
-        .filter_map(|(_, entry)| entry.activity_timestamp())
-        .filter_map(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|line_number| ParseError {
+            line_number: *line_number,
+            line_content: String::new(),
+            error_message: format!("malformed {} JSONL record", source.label()),
+            context_before: Vec::new(),
+            context_after: Vec::new(),
+        })
+        .collect()
+}
+
+/// The parse errors of a `source` transcript's `malformed_lines`: each line
+/// recorded with its text keeps it, its error and its context.
+pub(crate) fn parse_errors_of_lines(
+    source: Source,
+    malformed_lines: &[super::MalformedLine],
+) -> Vec<ParseError> {
+    malformed_lines
+        .iter()
+        .map(|line| match &line.detail {
+            Some(detail) => ParseError {
+                line_number: line.line_number,
+                line_content: detail.line_content.clone(),
+                error_message: detail.error_message.clone(),
+                context_before: detail.context_before.clone(),
+                context_after: detail.context_after.clone(),
+            },
+            None => parse_errors_of(source, &[line.line_number]).remove(0),
+        })
+        .collect()
+}
+
+/// The time a session with a header is dated: its latest activity, else its
+/// header's time, else `dating`'s.
+pub(crate) fn session_time(
+    latest_activity: Option<DateTime<chrono::FixedOffset>>,
+    header_time: &str,
+    dating: RowDating<'_>,
+) -> DateTime<Local> {
+    latest_activity
         .map(|timestamp| timestamp.with_timezone(&Local))
-        .max()
+        .or_else(|| {
+            DateTime::parse_from_rfc3339(header_time)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Local))
+        })
+        .unwrap_or_else(|| dating.fallback_time())
 }
 
 /// Accumulates one conversation as its log entries stream past in file order.
@@ -716,33 +1092,20 @@ struct ConversationBuilder {
     /// Set for a sub-agent transcript: the parent session reads each turn's
     /// text from the turn's [`SubagentMark`].
     keeps_only_text_outside_turns: bool,
+    /// The row's facts besides its texts.
+    fold: RowFold,
     full_text: MessageTextBuilder,
     agent_search_text: MessageTextBuilder,
     thinking_and_tool_call_text: MessageTextBuilder,
     semantic_turns: Vec<String>,
     semantic_turn_ranges: Vec<MessageRange>,
-    preview_parts: Vec<String>,
-    user_messages: Vec<String>,
-    /// True once a user message has entered the preview. Replies before it
-    /// stay out of the preview, so the preview opens with the user's text.
-    has_user_preview: bool,
-    extracted_cwd: Option<PathBuf>,
-    numbering: MessageNumbering,
-    message_times: MessageTimesBuilder,
-    assistant_messages: usize,
     parse_errors: Vec<ParseError>,
-    extracted_summary: Option<String>,
-    extracted_custom_title: Option<String>,
-    extracted_model: Option<String>,
-    /// Token usage per message id, so the several streaming entries that can
-    /// describe one message are counted once. Entries carrying no id accumulate
-    /// into `anonymous_token_count` instead.
-    token_usage_by_msg: HashMap<(i64, String), TokenUsage>,
     assistant_id_semantic_indices: HashMap<usize, usize>,
-    assistant_id_preview_indices: HashMap<usize, usize>,
-    anonymous_token_count: u64,
-    first_timestamp: Option<chrono::DateTime<chrono::FixedOffset>>,
-    last_timestamp: Option<chrono::DateTime<chrono::FixedOffset>>,
+    /// The step of the view's walk before which the fold is kept as
+    /// `checkpoint`.
+    checkpoint_at: Option<usize>,
+    checkpoint: Option<FoldCheckpoint>,
+    steps: usize,
 }
 
 /// The text one user turn contributes to the list preview, the search index
@@ -867,39 +1230,75 @@ impl ConversationBuilder {
         entries: impl IntoIterator<Item = &'a LogEntry>,
         marks: &[SubagentMark],
     ) {
-        walk_spliced(
-            entries,
-            |entry| entry.timestamp(),
+        self.push_steps(entries.into_iter().map(|entry| (None, entry)), marks);
+    }
+
+    /// [`Self::push_spliced`] for entries with their records: the session's
+    /// own entries at line 0 are its leading entries, and each entry's
+    /// thread is its record's.
+    fn push_spliced_records<'a>(
+        &mut self,
+        entries: impl IntoIterator<Item = &'a (RecordLine, LogEntry)>,
+        marks: &[SubagentMark],
+    ) {
+        self.push_steps(
+            entries
+                .into_iter()
+                .map(|(record, entry)| (Some(record), entry)),
             marks,
-            |mark| &mark.timestamp,
-            |step| match step {
-                Spliced::Parent(entry) => self.push(entry),
-                Spliced::Child(mark) => {
-                    let ordinal = mark.is_message.then(|| {
-                        let thread = self.numbering.thread(mark.thread.clone());
-                        let numbered = self
-                            .numbering
-                            .number_subagent_message(mark.reply_id.as_deref(), thread);
-                        self.message_times
-                            .add(numbered.ordinal, Some(mark.timestamp.as_str()));
-                        numbered.ordinal
-                    });
-                    self.agent_search_text
-                        .push_parts(ordinal, mark.agent_search_parts.clone());
-                    self.thinking_and_tool_call_text
-                        .push_parts(ordinal, mark.thinking_and_tool_call_parts.clone());
-                }
-            },
         );
     }
 
-    fn push(&mut self, entry: &LogEntry) {
-        self.record_activity_timestamp(entry);
-        let thread = self.numbering.thread(ThreadIdentity::of(entry, None));
-        let numbered = self.numbering.number_in_thread(entry, thread);
-        if let Some(numbered) = numbered {
-            self.message_times.add(numbered.ordinal, entry.timestamp());
+    fn push_steps<'a>(
+        &mut self,
+        entries: impl IntoIterator<Item = (Option<&'a RecordLine>, &'a LogEntry)>,
+        marks: &[SubagentMark],
+    ) {
+        walk_spliced(
+            entries,
+            |(_, entry)| entry.timestamp(),
+            marks,
+            |mark| &mark.timestamp,
+            |step| {
+                self.keep_checkpoint();
+                match step {
+                    Spliced::Parent((record, entry)) => self.push_record(record, entry),
+                    Spliced::Child(mark) => self.push_mark(mark),
+                }
+                self.steps += 1;
+            },
+        );
+        self.keep_checkpoint();
+    }
+
+    fn keep_checkpoint(&mut self) {
+        if self.checkpoint_at == Some(self.steps) && self.checkpoint.is_none() {
+            self.checkpoint = Some(self.fold.checkpoint());
         }
+    }
+
+    fn push_mark(&mut self, mark: &SubagentMark) {
+        let ordinal = self.fold.place_child(
+            mark.thread.clone(),
+            mark.is_message,
+            mark.reply_id.as_deref(),
+            &mark.timestamp,
+        );
+        self.agent_search_text
+            .push_parts(ordinal, mark.agent_search_parts.clone());
+        self.thinking_and_tool_call_text
+            .push_parts(ordinal, mark.thinking_and_tool_call_parts.clone());
+    }
+
+    /// Push `entry`, read at `record` when the caller knows it.
+    fn push_record(&mut self, record: Option<&RecordLine>, entry: &LogEntry) {
+        let transcript = record.and_then(|record| record.transcript.as_deref());
+        let is_leading = record.is_some_and(|record| record.line == 0 && transcript.is_none());
+        let folded = self
+            .fold
+            .place_parent(entry, ThreadIdentity::of(entry, transcript));
+        let thread = folded.thread;
+        let numbered = folded.numbered;
         let ordinal = numbered.map(|numbered| numbered.ordinal);
         match entry {
             LogEntry::User {
@@ -909,17 +1308,10 @@ impl ConversationBuilder {
                 ..
             } => {
                 if let Some(usage) = usage {
-                    self.anonymous_token_count += usage.input_tokens
-                        + usage.output_tokens
-                        + usage.cache_creation_input_tokens
-                        + usage.cache_read_input_tokens;
+                    self.fold.add_anonymous_usage(usage);
                 }
-
-                // Extract cwd from the first user message that has it
-                if self.extracted_cwd.is_none()
-                    && let Some(cwd_str) = cwd
-                {
-                    self.extracted_cwd = Some(PathBuf::from(cwd_str));
+                if let Some(cwd) = cwd {
+                    self.fold.add_cwd(cwd);
                 }
 
                 if let UserContent::Blocks(blocks) = &message.content {
@@ -938,7 +1330,7 @@ impl ConversationBuilder {
                 }
 
                 if !preview_text.is_empty() {
-                    self.user_messages.push(preview_text.clone());
+                    self.fold.add_user_message(&preview_text);
                 }
 
                 self.push_turn_search_parts(ordinal, search_parts);
@@ -961,31 +1353,17 @@ impl ConversationBuilder {
                     self.semantic_turn_ranges
                         .push(MessageRange::single(numbered.ordinal));
                 }
-                self.preview_parts.push(effective_preview);
-                self.has_user_preview = true;
+                self.fold.add_user_preview(effective_preview);
             }
             LogEntry::Assistant { message, .. } => {
-                // Extract model name from first assistant message that has it
-                if self.extracted_model.is_none()
-                    && let Some(model) = &message.model
-                {
-                    self.extracted_model = Some(model.clone());
+                if let Some(model) = &message.model {
+                    self.fold.add_first_model(model);
                 }
-
-                // Track token usage by message ID to avoid double-counting
-                // Multiple JSONL entries can exist for the same message (streaming)
+                // Streaming can write one reply as several records: the last
+                // usage of a reply id counts once.
                 if let Some(usage) = &message.usage {
-                    if let Some(msg_id) = &message.id {
-                        // Store/update usage for this message ID (last one wins)
-                        self.token_usage_by_msg
-                            .insert((thread, msg_id.clone()), usage.clone());
-                    } else {
-                        // No message ID - accumulate directly (legacy format)
-                        self.anonymous_token_count += usage.input_tokens
-                            + usage.output_tokens
-                            + usage.cache_creation_input_tokens
-                            + usage.cache_read_input_tokens;
-                    }
+                    self.fold
+                        .add_reply_usage(thread, message.id.as_deref(), usage);
                 }
 
                 let preview_text = extract_text_from_assistant(message);
@@ -996,7 +1374,7 @@ impl ConversationBuilder {
                     return;
                 };
                 if numbered.starts_message {
-                    self.assistant_messages += 1;
+                    self.fold.add_assistant_message();
                 }
                 if preview_text.is_empty() {
                     return;
@@ -1009,9 +1387,8 @@ impl ConversationBuilder {
                             &preview_text,
                             message_range,
                         );
-                        if self.has_user_preview {
-                            self.append_reply_preview(numbered.ordinal, preview_text);
-                        }
+                        self.fold
+                            .add_reply_preview(numbered.ordinal, preview_text, true);
                     }
                     None => {
                         if let Some(turn) = filter_turn(SemanticTurnRole::Assistant, &preview_text)
@@ -1019,31 +1396,14 @@ impl ConversationBuilder {
                             self.semantic_turns.push(turn);
                             self.semantic_turn_ranges.push(message_range);
                         }
-                        if self.has_user_preview {
-                            self.preview_parts.push(preview_text);
-                        }
+                        self.fold
+                            .add_reply_preview(numbered.ordinal, preview_text, false);
                     }
                 }
             }
-            LogEntry::Summary { summary } => {
-                if self.extracted_summary.is_none() {
-                    self.extracted_summary = Some(summary.clone());
-                }
-            }
-            LogEntry::AiTitle { ai_title } => {
-                let trimmed = ai_title.trim();
-                if !trimmed.is_empty() {
-                    self.extracted_summary = Some(trimmed.to_owned());
-                }
-            }
-            LogEntry::CustomTitle { custom_title } => {
-                let trimmed = custom_title.trim();
-                self.extracted_custom_title = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_owned())
-                };
-            }
+            LogEntry::Summary { summary } => self.fold.add_summary(summary),
+            LogEntry::AiTitle { ai_title } => self.fold.set_summary(ai_title),
+            LogEntry::CustomTitle { custom_title } => self.fold.set_title(custom_title, is_leading),
             LogEntry::PiMetadata {
                 label,
                 text,
@@ -1052,17 +1412,15 @@ impl ConversationBuilder {
                 ..
             } => {
                 if let Some(usage) = usage {
-                    self.anonymous_token_count += usage.input_tokens
-                        + usage.output_tokens
-                        + usage.cache_creation_input_tokens
-                        + usage.cache_read_input_tokens;
+                    self.fold.add_anonymous_usage(usage);
                 }
                 if label == "Model" && !text.is_empty() {
-                    self.extracted_model = Some(text.clone());
+                    self.fold.set_model(text);
                 }
                 if *searchable {
-                    self.full_text
-                        .push(ordinal, labeled_metadata_text(label, text));
+                    let text = labeled_metadata_text(label, text);
+                    self.fold.note_search_text(std::slice::from_ref(&text));
+                    self.full_text.push(ordinal, text);
                 }
                 if let Some(numbered) = numbered
                     && let Some(turn) = filter_turn(SemanticTurnRole::User, text)
@@ -1079,21 +1437,13 @@ impl ConversationBuilder {
                 {
                     let message = progress.message.message;
                     let AgentContent::Blocks(blocks) = message.content;
-                    let numbered = self.numbering.number_progress_in_thread(
+                    let numbered = self.fold.number_progress(
                         role,
                         &blocks,
                         message.id.as_deref(),
                         thread,
+                        progress_timestamp(extra).as_deref(),
                     );
-                    if let Some(numbered) = numbered {
-                        self.message_times
-                            .add(numbered.ordinal, progress_timestamp(extra).as_deref());
-                    }
-                    if numbered.is_some_and(|numbered| numbered.starts_message)
-                        && role == AgentMessageRole::Assistant
-                    {
-                        self.assistant_messages += 1;
-                    }
                     self.agent_search_text.push_parts(
                         numbered.map(|numbered| numbered.ordinal),
                         agent_search_parts_from_blocks(role, &blocks),
@@ -1110,6 +1460,7 @@ impl ConversationBuilder {
     /// parts from its [`SubagentMark`].
     fn push_turn_search_parts(&mut self, ordinal: Option<usize>, parts: Vec<String>) {
         if !self.keeps_only_text_outside_turns {
+            self.fold.note_search_text(&parts);
             self.full_text.push_parts(ordinal, parts);
         }
     }
@@ -1124,24 +1475,6 @@ impl ConversationBuilder {
         if !self.keeps_only_text_outside_turns {
             self.thinking_and_tool_call_text
                 .push_parts(ordinal, thinking_and_tool_call_parts(blocks));
-        }
-    }
-
-    /// Append one record's `text` to the preview of its numbered reply. An agent
-    /// can write one reply as several records under its ID, one content block
-    /// each.
-    fn append_reply_preview(&mut self, ordinal: usize, text: String) {
-        match self.assistant_id_preview_indices.get(&ordinal).copied() {
-            Some(index) => {
-                let reply = &mut self.preview_parts[index];
-                reply.push(' ');
-                reply.push_str(&text);
-            }
-            None => {
-                self.assistant_id_preview_indices
-                    .insert(ordinal, self.preview_parts.len());
-                self.preview_parts.push(text);
-            }
         }
     }
 
@@ -1166,21 +1499,6 @@ impl ConversationBuilder {
         }
     }
 
-    /// Widens the span `duration_minutes` is computed from to include the
-    /// entry, when it carries an activity timestamp that parses.
-    fn record_activity_timestamp(&mut self, entry: &LogEntry) {
-        let Some(ts) = entry
-            .activity_timestamp()
-            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-        else {
-            return;
-        };
-        if self.first_timestamp.is_none() {
-            self.first_timestamp = Some(ts);
-        }
-        self.last_timestamp = Some(ts);
-    }
-
     /// The accumulated conversation, or the reason it holds nothing worth
     /// listing: a `/clear`-only session, or one with no previewable text.
     fn finish(
@@ -1190,61 +1508,12 @@ impl ConversationBuilder {
         timestamp: DateTime<Local>,
         debug_level: Option<DebugLevel>,
     ) -> ParsedRow {
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown");
-        let unlisted = if self.numbering.count() == 0 {
-            UnlistedReason::NoVisibleMessages
-        } else {
-            UnlistedReason::NoConversationMetadata
-        };
-
-        if is_clear_only_conversation(&self.user_messages) {
-            debug::debug(
-                debug_level,
-                &format!("Filtered {}: clear-only conversation", filename),
-            );
-            return Err(unlisted);
-        }
-
-        if self.full_text.is_empty() || self.preview_parts.is_empty() {
-            debug::debug(
-                debug_level,
-                &format!(
-                    "Filtered {}: empty conversation (has_search_text={}, preview_parts={})",
-                    filename,
-                    !self.full_text.is_empty(),
-                    self.preview_parts.len()
-                ),
-            );
-            return Err(unlisted);
-        }
-
-        // Both previews come from preview_parts rather than the search text, so
-        // leading assistant messages don't displace the user's opening message.
-        let preview_first = self
-            .preview_parts
-            .iter()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ... ");
-        let preview_last = self
-            .preview_parts
-            .iter()
-            .rev()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ... ");
-
-        let preview_first = normalize_whitespace(&preview_first);
-        let preview_last = normalize_whitespace(&preview_last);
-        let total_tokens = self.total_tokens();
-        let message_count = self.numbering.count();
+        let folded = folded_row(&self.fold, &path, debug_level)?;
+        let message_count = folded.message_count;
+        let custom_title = folded.custom_title.clone();
+        let summary = folded.summary.clone();
         let (full_text, full_text_starts) = self.full_text.finish(
-            title_and_summary(&self.extracted_custom_title, &self.extracted_summary),
+            title_and_summary(&custom_title, &summary),
             message_count,
             normalize_full_text,
         );
@@ -1265,14 +1534,7 @@ impl ConversationBuilder {
             .filter(|(turn, _)| !turn.is_empty())
             .unzip();
 
-        let duration_minutes = match (self.first_timestamp, self.last_timestamp) {
-            (Some(first), Some(last)) => {
-                let minutes = last.signed_duration_since(first).num_minutes();
-                (minutes > 0).then_some(minutes as u64)
-            }
-            _ => None,
-        };
-        let message_times = self.message_times.finish(message_count);
+        let message_times = self.fold.message_times(None);
 
         Ok(Conversation {
             cached_session: None,
@@ -1284,9 +1546,9 @@ impl ConversationBuilder {
             path,
             index: 0,
             timestamp,
-            preview: preview_first.clone(),
-            preview_first,
-            preview_last,
+            preview: folded.preview_first.clone(),
+            preview_first: folded.preview_first,
+            preview_last: folded.preview_last,
             full_text,
             agent_search_text,
             thinking_and_tool_call_text,
@@ -1295,7 +1557,7 @@ impl ConversationBuilder {
             search_text_lower,
             project_name: None,
             project_path: None,
-            cwd: self.extracted_cwd,
+            cwd: folded.cwd,
             message_count,
             message_times,
             message_text_starts: MessageTextStarts {
@@ -1303,38 +1565,28 @@ impl ConversationBuilder {
                 agent_search_text: agent_search_text_starts,
                 thinking_and_tool_call_text: thinking_and_tool_call_text_starts,
             },
-            assistant_messages: self.assistant_messages,
+            assistant_messages: folded.assistant_messages,
             parse_errors: self.parse_errors,
-            summary: self.extracted_summary,
-            custom_title: self.extracted_custom_title,
-            model: self.extracted_model,
-            total_tokens,
-            duration_minutes,
+            summary,
+            custom_title,
+            model: folded.model,
+            total_tokens: folded.total_tokens,
+            duration_minutes: folded.duration_minutes,
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
         })
     }
 
-    fn total_tokens(&self) -> u64 {
-        self.token_usage_by_msg
-            .values()
-            .map(|usage| {
-                usage.input_tokens
-                    + usage.output_tokens
-                    + usage.cache_creation_input_tokens
-                    + usage.cache_read_input_tokens
-            })
-            .sum::<u64>()
-            + self.anonymous_token_count
-    }
-
     /// The accumulated sub-agent transcript as a [`SubagentContribution`],
     /// with or without a preview.
     fn subagent_contribution(self) -> SubagentContribution {
-        let total_tokens = self.total_tokens();
+        let total_tokens = self.fold.total_tokens();
         let mut text_outside_turns = self.full_text.into_text(
-            title_and_summary(&self.extracted_custom_title, &self.extracted_summary),
+            title_and_summary(
+                &self.fold.custom_title().cloned(),
+                &self.fold.summary().cloned(),
+            ),
             normalize_full_text,
         );
         push_separated(
@@ -1347,6 +1599,38 @@ impl ConversationBuilder {
             ..SubagentContribution::default()
         }
     }
+}
+
+/// The row facts of `fold`, the fold of the session at `path`, or the
+/// reason it holds nothing worth listing: a `/clear`-only session, or one
+/// without previewable text.
+pub(crate) fn folded_row(
+    fold: &RowFold,
+    path: &Path,
+    debug_level: Option<DebugLevel>,
+) -> std::result::Result<FoldedRow, UnlistedReason> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    let unlisted = if fold.has_no_messages() {
+        UnlistedReason::NoVisibleMessages
+    } else {
+        UnlistedReason::NoConversationMetadata
+    };
+    fold.finish().map_err(|reason| {
+        let message = match reason {
+            Unlisted::ClearOnly => format!("Filtered {filename}: clear-only conversation"),
+            Unlisted::Empty {
+                has_search_text,
+                previews,
+            } => format!(
+                "Filtered {filename}: empty conversation (has_search_text={has_search_text}, preview_parts={previews})"
+            ),
+        };
+        debug::debug(debug_level, &message);
+        unlisted
+    })
 }
 
 /// The text `full_text` opens with, outside every message.
@@ -1367,6 +1651,7 @@ fn title_and_summary<'a>(
 /// Date the row by its last timestamped message, else by `dating`. Claude
 /// Code appends untimestamped bookkeeping records when it reopens a session;
 /// they move the file's modification time past the last message.
+#[cfg(test)]
 pub(crate) fn conversation_from_entries<'a>(
     source: Source,
     path: PathBuf,
@@ -1382,7 +1667,8 @@ pub(crate) fn conversation_from_entries<'a>(
     };
     builder.push_spliced(entries, marks);
     let timestamp = builder
-        .last_timestamp
+        .fold
+        .last_activity()
         .map(|last| last.with_timezone(&Local))
         .unwrap_or_else(|| dating.fallback_time());
     builder.finish(source, path, timestamp, debug_level)
@@ -1449,44 +1735,11 @@ pub(crate) fn extract_skill_preview(message: &str) -> Option<String> {
     Some(command_name.to_string())
 }
 
+/// True when `user_messages` hold only a `/clear` command's caveat, command
+/// and output, as the row's fold reads them.
+#[cfg(test)]
 pub(crate) fn is_clear_only_conversation(user_messages: &[String]) -> bool {
-    if user_messages.is_empty() {
-        return false;
-    }
-
-    let mut saw_caveat = false;
-    let mut saw_command = false;
-    let mut saw_stdout = false;
-
-    for msg in user_messages {
-        let trimmed = msg.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let is_caveat = trimmed.starts_with(
-            "Caveat: The messages below were generated by the user while running local commands.",
-        );
-        let has_command_tag = trimmed.contains("<command-name>/clear</command-name>");
-        let has_stdout_tag = trimmed.contains("<local-command-stdout>");
-
-        if is_caveat {
-            saw_caveat = true;
-        }
-        if has_command_tag {
-            saw_command = true;
-        }
-        if has_stdout_tag {
-            saw_stdout = true;
-        }
-
-        // Any substantive user message immediately disqualifies this from being clear-only
-        if !(is_caveat || has_command_tag || has_stdout_tag) {
-            return false;
-        }
-    }
-
-    saw_caveat && saw_command && saw_stdout
+    super::row_fold::is_clear_only(user_messages)
 }
 
 /// Normalize whitespace in a string
