@@ -180,10 +180,19 @@ impl SessionLoader<'_> {
         self.open_database_reader(DatabaseReader::WithoutWaiting)
     }
 
-    /// Parse `items` with `parse` in parallel, in groups of at most
-    /// [`READ_BATCH_LENGTH`], and hand each group's results to `after_group`
-    /// once the group's batch ends, with `in_flight` to queue the group's
-    /// writes in. Returns the items left unparsed.
+    /// Parse `items` with `parse` in parallel, in groups, and hand each
+    /// group's results to `after_group` once the group's batch ends, with
+    /// `in_flight` to queue the group's writes in. Returns the items left
+    /// unparsed.
+    ///
+    /// A session is in flight from its admission to a group until its write
+    /// lands. A group admits the next sessions, at most
+    /// [`READ_BATCH_LENGTH`], while the transcript bytes in flight stay
+    /// within the loader's limit, and waits for writes to land until the
+    /// next session fits. A session over the limit is admitted alone, once
+    /// no write is in flight. `stub_of` names each item's session. Writes
+    /// that land while a group waits reach `after_group` without results
+    /// before the group parses, so the caller can settle them.
     ///
     /// Each group asks `access`'s owner for a permit as it starts, and
     /// parses inside one writer-locked batch. Once the owner is no longer
@@ -194,10 +203,11 @@ impl SessionLoader<'_> {
     /// `after_group` runs outside the writer lock: a record sent to the
     /// bounded database queue under the lock could fill it and block the
     /// consumer, which needs that lock to drain it.
-    pub(super) fn parse_in_groups<'i, T: Sync, Parsed: Send>(
+    pub(super) fn parse_in_groups<'i, 's, T: Sync, Parsed: Send>(
         &self,
         access: CacheAccess<'_>,
         items: &'i [T],
+        stub_of: impl Fn(&T) -> &'s SessionStub,
         in_flight: &mut WritesInFlight,
         parse: impl Fn(ParsePermit<'_>, &T) -> Parsed + Sync,
         mut after_group: impl FnMut(&[T], Vec<Parsed>, &mut WritesInFlight),
@@ -216,7 +226,10 @@ impl SessionLoader<'_> {
         }
         let mut rest = items;
         while !rest.is_empty() {
-            let (group, remaining) = rest.split_at(READ_BATCH_LENGTH.min(rest.len()));
+            let (group, remaining) = rest.split_at(self.admitted_length(rest, &stub_of, in_flight));
+            if in_flight.has_landed() {
+                after_group(&[], Vec::new(), in_flight);
+            }
             let batch = owner.parse_batch(|permit| {
                 group
                     .par_iter()
@@ -238,7 +251,45 @@ impl SessionLoader<'_> {
         }
         rest
     }
+
+    /// The length of the next group from the front of `rest`, as
+    /// [`Self::parse_in_groups`] admits it, after waiting for the writes in
+    /// flight it must wait for.
+    fn admitted_length<'s, T>(
+        &self,
+        rest: &[T],
+        stub_of: &impl Fn(&T) -> &'s SessionStub,
+        in_flight: &mut WritesInFlight,
+    ) -> usize {
+        loop {
+            let mut bytes = in_flight.transcript_bytes();
+            let fitting = rest
+                .iter()
+                .take(READ_BATCH_LENGTH)
+                .take_while(|item| {
+                    bytes = bytes.saturating_add(transcript_bytes(stub_of(item)));
+                    bytes <= self.transcript_bytes_in_flight_limit
+                })
+                .count();
+            if fitting > 0 {
+                return fitting;
+            }
+            if !in_flight.is_writing() {
+                return 1;
+            }
+            in_flight.wait_for_a_landing();
+        }
+    }
 }
 
 /// The most sessions a writer-locked batch parses.
 pub(crate) const READ_BATCH_LENGTH: usize = 4;
+
+/// The most transcript bytes a load holds in flight: the sessions admitted
+/// to a parse group whose writes have not landed. A session over the limit
+/// is admitted alone, once no other session is in flight.
+///
+/// A session's parse and write hold up to about 6 times its transcript
+/// bytes, so the sessions in flight under the limit hold about 0.4 GB at
+/// most. A full group of sessions up to 16 MiB each stays a group.
+pub(super) const TRANSCRIPT_BYTES_IN_FLIGHT_LIMIT: u64 = 64 << 20;

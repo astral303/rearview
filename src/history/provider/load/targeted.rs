@@ -710,6 +710,7 @@ impl SessionLoader<'_> {
         let unparsed = self.parse_in_groups(
             access,
             &to_parse,
+            |&(stub, _)| stub,
             &mut WritesInFlight::default(),
             |permit, (stub, stored)| {
                 let resumed = stored

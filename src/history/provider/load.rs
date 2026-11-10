@@ -612,6 +612,10 @@ struct SessionLoader<'a> {
     /// The directories the load's sessions recorded, each canonicalised once
     /// for the references the cache records.
     project_directories: std::sync::Arc<CanonicalDirectories>,
+    /// [`cache_access::TRANSCRIPT_BYTES_IN_FLIGHT_LIMIT`]. A field, so a
+    /// test can load sessions over the limit without writing transcripts
+    /// that large.
+    transcript_bytes_in_flight_limit: u64,
 }
 
 impl<'a> SessionLoader<'a> {
@@ -629,6 +633,7 @@ impl<'a> SessionLoader<'a> {
             debug_level,
             meter,
             project_directories: environment.canonical_directories(),
+            transcript_bytes_in_flight_limit: cache_access::TRANSCRIPT_BYTES_IN_FLIGHT_LIMIT,
         }
     }
 
@@ -1305,6 +1310,7 @@ impl SessionLoader<'_> {
         let unparsed = self.parse_in_groups(
             caches.access,
             &to_parse,
+            |&index| &stubs[index],
             &mut in_flight,
             |permit, &index| {
                 let stub = &stubs[index];
@@ -1351,11 +1357,11 @@ impl SessionLoader<'_> {
                                 && let (Some(database), Some(record)) =
                                     (database, record.into_record())
                             {
-                                let writes_its_entries = record.writes_its_entries();
-                                let written = database.write(record);
-                                if writes_its_entries {
-                                    in_flight.push(index, written);
-                                }
+                                in_flight.push(
+                                    index,
+                                    transcript_bytes(&stubs[index]),
+                                    database.write(record),
+                                );
                             }
                             RootRead::Read(*outcome)
                         }
@@ -1710,6 +1716,11 @@ fn transcript_count(stub: &SessionStub) -> usize {
     1 + stub.subagents.len()
 }
 
+/// The bytes of the transcripts `stub` names, as discovery stamped them.
+fn transcript_bytes(stub: &SessionStub) -> u64 {
+    stub.fingerprint.size
+}
+
 /// Replace `found`, the discovery `stubs` came from, with `rediscovered`,
 /// the root's discovery repeated after acquiring refresh ownership, and
 /// return its stubs. The progress total follows the change.
@@ -1772,12 +1783,15 @@ impl<'a> DatabaseWrites<'a> {
             .flatten()
     }
 
-    /// Queues the write of `record`; returns the receiver its outcome
-    /// arrives on, which disconnects when the write is dropped unwritten.
-    fn write(&self, record: SessionRecord) -> mpsc::Receiver<WriteOutcome> {
+    /// Queues the write of `record`.
+    fn write(&self, record: SessionRecord) -> QueuedWrite {
+        let holds_entries = record.writes_its_entries();
         let (write, outcome) = CacheWrite::session(record);
         let _ = self.writes.send(write);
-        outcome
+        QueuedWrite {
+            outcome,
+            holds_entries,
+        }
     }
 
     /// The listed row the database held for `stub`'s session when the load
@@ -1792,7 +1806,7 @@ impl<'a> DatabaseWrites<'a> {
     /// Writes `resumed`'s record and waits for the write; returns its row,
     /// reading the copy the write left. `None` when the write failed.
     fn write_resumed(&self, resumed: ResumedSession) -> Option<Conversation> {
-        let generation = self.write(resumed.record).recv().ok()?.ok()??;
+        let generation = self.write(resumed.record).outcome.recv().ok()?.ok()??;
         Some(published_at(resumed.row, generation))
     }
 }
@@ -1807,14 +1821,65 @@ fn published_at(mut row: Conversation, generation: i64) -> Conversation {
     row
 }
 
-/// The whole parses of a root load whose writes are queued with their
-/// entries, by the index of each parse's outcome, in queue order.
+/// A session write in the database queue.
+struct QueuedWrite {
+    /// Disconnects when the write is dropped unwritten.
+    outcome: mpsc::Receiver<WriteOutcome>,
+    /// True when the copy the write makes holds the session's entries.
+    holds_entries: bool,
+}
+
+/// The writes a root load queued for its whole parses and has not settled,
+/// in queue order, by the index of each parse's outcome. Until it lands,
+/// each counts its session's transcript bytes as in flight.
 #[derive(Default)]
-struct WritesInFlight(std::collections::VecDeque<(usize, mpsc::Receiver<WriteOutcome>)>);
+struct WritesInFlight(std::collections::VecDeque<WriteInFlight>);
+
+struct WriteInFlight {
+    index: usize,
+    transcript_bytes: u64,
+    write: QueuedWrite,
+    /// The generation the write gave the copy, once its outcome arrived:
+    /// `None` when it failed, kept the earlier copy, or was dropped
+    /// unwritten.
+    landed: Option<Option<i64>>,
+}
 
 impl WritesInFlight {
-    fn push(&mut self, index: usize, outcome: mpsc::Receiver<WriteOutcome>) {
-        self.0.push_back((index, outcome));
+    fn push(&mut self, index: usize, transcript_bytes: u64, write: QueuedWrite) {
+        self.0.push_back(WriteInFlight {
+            index,
+            transcript_bytes,
+            write,
+            landed: None,
+        });
+    }
+
+    /// The transcript bytes of the sessions whose writes have not landed.
+    fn transcript_bytes(&self) -> u64 {
+        self.not_landed().map(|write| write.transcript_bytes).sum()
+    }
+
+    /// True while a write has not landed.
+    fn is_writing(&self) -> bool {
+        self.not_landed().next().is_some()
+    }
+
+    /// True when a write [`Self::wait_for_a_landing`] waited for has not
+    /// been settled.
+    fn has_landed(&self) -> bool {
+        self.0.iter().any(|write| write.landed.is_some())
+    }
+
+    /// Waits for the oldest write that has not landed, if any, to land.
+    fn wait_for_a_landing(&mut self) {
+        if let Some(write) = self.0.iter_mut().find(|write| write.landed.is_none()) {
+            write.landed = Some(landed_generation(write.write.outcome.recv()));
+        }
+    }
+
+    fn not_landed(&self) -> impl Iterator<Item = &WriteInFlight> {
+        self.0.iter().filter(|write| write.landed.is_none())
     }
 
     /// [`Self::settle_all`] for the writes the writer has settled so far,
@@ -1831,38 +1896,38 @@ impl WritesInFlight {
     }
 
     /// Waits for every write, in queue order, and hands `settle` each index
-    /// with the generation its write gave the copy: `None` when the write
-    /// failed, kept the earlier copy, or was dropped unwritten. A writer
-    /// that stops drops the writes it leaves queued, so the wait ends.
+    /// with the generation its write gave a copy holding the session's
+    /// entries: `None` when the write failed, kept the earlier copy, was
+    /// dropped unwritten, or made a copy without entries. A writer that
+    /// stops drops the writes it leaves queued, so the wait ends.
     fn settle_all(&mut self, settle: impl FnMut(usize, Option<i64>)) {
-        self.settle_while(
-            |outcome| {
-                Some(
-                    outcome
-                        .recv()
-                        .ok()
-                        .and_then(|outcome| outcome.ok().flatten()),
-                )
-            },
-            settle,
-        );
+        self.settle_while(|outcome| Some(landed_generation(outcome.recv())), settle);
     }
 
-    /// Settles the writes in queue order while `generation_of` finds the
-    /// outcome of the first.
+    /// Settles the writes in queue order while the first has landed or
+    /// `generation_of` finds its outcome.
     fn settle_while(
         &mut self,
         generation_of: impl Fn(&mpsc::Receiver<WriteOutcome>) -> Option<Option<i64>>,
         mut settle: impl FnMut(usize, Option<i64>),
     ) {
-        while let Some((index, outcome)) = self.0.front() {
-            let Some(generation) = generation_of(outcome) else {
+        while let Some(write) = self.0.front() {
+            let Some(generation) = write.landed.or_else(|| generation_of(&write.write.outcome))
+            else {
                 return;
             };
-            settle(*index, generation);
+            settle(
+                write.index,
+                generation.filter(|_| write.write.holds_entries),
+            );
             self.0.pop_front();
         }
     }
+}
+
+/// The generation a write gave the copy, from its outcome as received.
+fn landed_generation(received: std::result::Result<WriteOutcome, mpsc::RecvError>) -> Option<i64> {
+    received.ok().and_then(|outcome| outcome.ok().flatten())
 }
 
 /// `read`, a read of `stub`'s session from a copy as it is, whose row
@@ -4139,9 +4204,17 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+            let holds_entries = record.writes_its_entries();
             let (write, outcome) = CacheWrite::session(record);
             writes.send(write).unwrap();
-            in_flight.push(index, outcome);
+            in_flight.push(
+                index,
+                transcript_bytes(&stub),
+                QueuedWrite {
+                    outcome,
+                    holds_entries,
+                },
+            );
         }
         ownership.token().revoke();
         let writing =
@@ -4323,6 +4396,111 @@ mod tests {
             );
             assert_eq!(load.sessions, (READ_BATCH_LENGTH + 1) as i64);
             assert_eq!(load.unchanged_sessions, load.sessions);
+        }
+    }
+
+    /// Two sessions over the transcript bytes in-flight limit, then three
+    /// that fit within it together, read over an empty cache by a full load
+    /// or by targeted reads: the parse groups in order, each as the sessions
+    /// the database held as each of its parses began.
+    fn parse_groups_over_and_under_in_flight_limit(targeted: bool) -> Vec<Vec<i64>> {
+        let base = admitted_cache_base();
+        drop(RefreshOwnership::acquire_for_test(&rearview(base.path())).unwrap());
+        let database_path = base.path().join(sqlite_cache::DATABASE_FILE_NAME);
+        // A group's parses begin inside one writer-locked batch, which
+        // commits once they end: its parses see one count of commits.
+        rusqlite::Connection::open(&database_path).unwrap().execute_batch("CREATE TABLE refresh_commits (count INTEGER); INSERT INTO refresh_commits VALUES (0);
+            CREATE TRIGGER count_commits AFTER UPDATE OF last_commit_ms ON refresh_state WHEN NEW.owner = OLD.owner BEGIN UPDATE refresh_commits SET count = count + 1; END;").unwrap();
+        let home = ClaudeHome::new();
+        let long_question = "a long question ".repeat(100);
+        let over: Vec<_> = ["0-over", "1-over"]
+            .into_iter()
+            .map(|name| home.write(name, 0, &[&long_question]))
+            .collect();
+        let under: Vec<_> = ["2-under", "3-under", "4-under"]
+            .into_iter()
+            .map(|name| home.write(name, 0, &["a question"]))
+            .collect();
+        // A load reads the newest first: the two over the limit.
+        for (age, transcript) in over.iter().chain(&under).enumerate() {
+            std::fs::File::options()
+                .write(true)
+                .open(transcript)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000 - age as u64))
+                .unwrap();
+        }
+        let size = |transcript: &PathBuf| std::fs::metadata(transcript).unwrap().len();
+        let limit = size(&over[0]) - 1;
+        assert!(
+            under.iter().map(size).sum::<u64>() <= limit,
+            "the sessions under the limit fit within it together"
+        );
+        let begins = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&begins);
+        home.watch().run_as_each_parse_begins(move || {
+            let connection = rusqlite::Connection::open(&database_path).unwrap();
+            connection.busy_timeout(Duration::ZERO).unwrap();
+            let count = |sql: &str| {
+                connection
+                    .query_row(sql, [], |row| row.get::<_, i64>(0))
+                    .unwrap()
+            };
+            let begin = (
+                count("SELECT count FROM refresh_commits"),
+                count("SELECT COUNT(*) FROM sessions"),
+            );
+            recorded.lock().unwrap().push(begin);
+        });
+        let environment = environment_of(base.path());
+        let mut loader = SessionLoader::new(
+            &environment,
+            home.storage(),
+            false,
+            None,
+            AgentMeter::UNMETERED,
+        );
+        loader.transcript_bytes_in_flight_limit = limit;
+        if targeted {
+            let stubs = over
+                .iter()
+                .chain(&under)
+                .map(|transcript| discovered_stub(&home, transcript))
+                .collect();
+            let operation = waiting_operation(&environment);
+            let reads = loader.read_stubs(
+                &home.root(),
+                &HashMap::new(),
+                stubs,
+                StubsAfterRediscovery::SameFiles,
+                &operation,
+            );
+            operation.finish().and(reads).unwrap();
+        } else {
+            loader.load_waiting().unwrap();
+        }
+        let mut begins = std::mem::take(&mut *begins.lock().unwrap());
+        begins.sort();
+        begins
+            .chunk_by(|first, second| first.0 == second.0)
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|&(_, sessions_held)| sessions_held)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sessions_over_in_flight_limit_parse_and_write_one_at_a_time() {
+        for targeted in [false, true] {
+            assert_eq!(
+                parse_groups_over_and_under_in_flight_limit(targeted),
+                [vec![0], vec![1], vec![2, 2, 2]],
+                "targeted {targeted}: each session over the limit parses alone once the \
+                 write before it landed, and the three under it share a group"
+            );
         }
     }
 
