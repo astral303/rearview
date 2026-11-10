@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::time_span::TimeSpan;
+use crate::clock::Zone;
 use crate::error::SessionDatabaseFailure;
 use crate::history::MessageTimes;
 use crate::history::provider::Fingerprint;
@@ -304,14 +305,14 @@ fn listed_session_gone_from_disk_is_removed() {
 }
 
 #[test]
-fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() {
+fn session_deleted_during_cache_wait_is_removed_by_refresh_consumer() {
     use crate::history::environment::test_support::real_time_environment;
     use crate::history::provider::DiscoveredSessions;
     use crate::history::provider::walk::DirectoryLister;
     use crate::history::provider::{
         RootEnvironment, RootedStorage, SessionCache, SessionRoot, SessionStorage,
     };
-    use crate::history::sqlite_cache::refresh::tests::OtherProcessOwner;
+    use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct ObservedStorage {
@@ -352,14 +353,15 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
         }
         fn parse_session(
             &self,
+            permit: crate::history::ParsePermit<'_>,
             stub: &SessionStub,
             root: &SessionRoot,
             debug_level: Option<DebugLevel>,
             on_read: &(dyn Fn() + Sync),
             clock: &dyn crate::clock::Clock,
-        ) -> Result<Option<Conversation>> {
+        ) -> Result<crate::history::parser::ParsedSession> {
             self.inner
-                .parse_session(stub, root, debug_level, on_read, clock)
+                .parse_session(permit, stub, root, debug_level, on_read, clock)
         }
     }
 
@@ -380,7 +382,7 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
         calls: AtomicUsize::new(0),
     };
     let environment = real_time_environment(Vec::new(), Some(base.path()));
-    let owner = OtherProcessOwner::hold(base.path());
+    let owner = AnotherRearviewsOwner::hold(base.path());
     let known = KnownSessions {
         listed: HashMap::from([(
             path.clone(),
@@ -422,7 +424,7 @@ fn a_session_deleted_during_the_cache_wait_is_removed_by_the_refresh_consumer() 
 }
 
 #[test]
-fn an_incomplete_directory_doesnt_remove_its_known_sessions() {
+fn incomplete_directory_doesnt_remove_its_known_sessions() {
     let known = known(
         &[
             ("blocked/kept", found(Source::Claude, 1)),
@@ -496,7 +498,7 @@ fn new_session_outside_time_filter_is_unlisted_and_listed_one_stays_listed() {
         );
     let known = known(&[("listed", found(Source::Claude, 1))], &[]);
     let since_october_3 = TimeFilter {
-        after: Some(Local.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
+        after: Some(Zone::System.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
         before: None,
     };
 
@@ -522,8 +524,12 @@ fn new_session_is_listed_when_one_of_its_messages_falls_inside_time_filter() {
             Content::ConversationOnDays(&[1, 9]),
         );
     let october_3_to_7 = TimeFilter {
-        after: Some(Local.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
-        before: Some(Local.with_ymd_and_hms(2026, 10, 7, 23, 59, 59).unwrap()),
+        after: Some(Zone::System.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap()),
+        before: Some(
+            Zone::System
+                .with_ymd_and_hms(2026, 10, 7, 23, 59, 59)
+                .unwrap(),
+        ),
     };
 
     let changes = disk

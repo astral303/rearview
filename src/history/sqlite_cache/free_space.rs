@@ -73,7 +73,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_temporary_directorys_drive_has_free_space() {
+    fn temporary_directorys_drive_has_free_space() {
         let directory = tempfile::tempdir().unwrap();
 
         assert!(

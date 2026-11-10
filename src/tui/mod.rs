@@ -5,6 +5,7 @@ mod command_tags;
 #[cfg(test)]
 pub(crate) mod contract_outputs;
 mod export;
+mod list_change;
 #[cfg(test)]
 pub(crate) mod output_coverage;
 mod runtime;
@@ -17,8 +18,6 @@ pub mod viewer;
 
 #[cfg(test)]
 pub(crate) use actions_menu::SessionAction;
-#[cfg(test)]
-pub(crate) use app::App;
 #[cfg(test)]
 pub(crate) use app::claude_home;
 pub use app::{Action, ListScope, ListSearchMode, TuiSearchOptions};

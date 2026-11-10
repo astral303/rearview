@@ -106,10 +106,30 @@ impl AgentWarningKind {
             Self::StaleCache => "stale-cache",
         }
     }
+
+    /// The kind `atom` names, as [`Self::as_str`] writes it.
+    fn of_atom(atom: &str) -> Option<Self> {
+        [
+            Self::Skipped,
+            Self::MalformedTranscript,
+            Self::Io,
+            Self::SemanticUnavailable,
+            Self::Ignored,
+            Self::PartialIndex,
+            Self::StaleCache,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == atom)
+    }
 }
 
-/// The sentence a stale-cache record ends with.
+/// The sentence a stale-cache record ends with while another rearview
+/// refreshes the cache.
 const STALE_CACHE_SENTENCE: &str = "another rearview is refreshing these sessions; repeat the command after it finishes to include their newest messages";
+
+/// The sentence a stale-cache record ends with once the command's own cache
+/// writes stopped.
+const WRITES_STOPPED_SENTENCE: &str = "rearview could not update these sessions in the session cache; repeat the command to include their newest messages";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentWarning {
@@ -146,6 +166,23 @@ impl AgentWarning {
         }
     }
 
+    /// The warning as the session cache records it: its kind's atom, a
+    /// space, then its detail. The reference is left out.
+    pub(crate) fn to_recorded(&self) -> String {
+        format!("{} {}", self.kind.as_str(), self.detail)
+    }
+
+    /// The warning `recorded` holds, as [`Self::to_recorded`] writes it,
+    /// without a reference; `None` when it does not start with a kind.
+    pub(crate) fn from_recorded(recorded: &str) -> Option<Self> {
+        let (atom, detail) = recorded.split_once(' ')?;
+        Some(Self {
+            kind: AgentWarningKind::of_atom(atom)?,
+            reference: None,
+            detail: detail.to_owned(),
+        })
+    }
+
     pub fn skipped(reference: Option<&str>, detail: impl Into<String>) -> Self {
         Self {
             kind: AgentWarningKind::Skipped,
@@ -170,12 +207,13 @@ impl AgentWarning {
         }
     }
 
-    /// The sessions at `refs`, read from the cache as it was while another
-    /// rearview refreshed it. `cached_until` is the earliest end of their
-    /// cached messages; `None` when the cache held none of them.
+    /// The sessions at `refs`, read from the cache as it was for `cause`.
+    /// `cached_until` is the earliest end of their cached messages; `None`
+    /// when the cache held none of them.
     pub fn stale_cache(
         refs: &[String],
-        cached_until: Option<chrono::DateTime<chrono::Local>>,
+        cached_until: Option<chrono::DateTime<crate::clock::Zone>>,
+        cause: crate::history::StaleCause,
     ) -> Self {
         let mut detail = format!("refs={}", refs.join(","));
         if let Some(cached_until) = cached_until {
@@ -183,7 +221,10 @@ impl AgentWarning {
             detail.push_str(&cached_until.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
         }
         detail.push_str(" : ");
-        detail.push_str(STALE_CACHE_SENTENCE);
+        detail.push_str(match cause {
+            crate::history::StaleCause::AnotherRearview => STALE_CACHE_SENTENCE,
+            crate::history::StaleCause::WritesStopped => WRITES_STOPPED_SENTENCE,
+        });
         Self {
             kind: AgentWarningKind::StaleCache,
             reference: None,

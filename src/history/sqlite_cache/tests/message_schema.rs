@@ -16,7 +16,7 @@ pub(super) fn transcript(records: Vec<Value>) -> TranscriptEntries {
 }
 
 #[test]
-fn a_message_links_its_records_and_keeps_its_millisecond_span() {
+fn message_links_its_records_and_keeps_its_millisecond_span() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&super::rearview_at(base.path())).unwrap();
     let records = transcript(vec![
@@ -125,7 +125,7 @@ fn a_message_links_its_records_and_keeps_its_millisecond_span() {
 }
 
 #[test]
-fn empty_stream_records_update_usage_without_widening_the_visible_message() {
+fn empty_stream_records_update_usage_without_widening_visible_message() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&super::rearview_at(base.path())).unwrap();
     write_test_entries(
@@ -165,7 +165,7 @@ fn empty_stream_records_update_usage_without_widening_the_visible_message() {
 }
 
 #[test]
-fn copying_a_reply_id_between_threads_doesnt_join_their_time_spans() {
+fn copying_reply_id_between_threads_doesnt_join_their_time_spans() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&super::rearview_at(base.path())).unwrap();
     let progress = |timestamp: &str| {
@@ -212,7 +212,7 @@ fn copying_a_reply_id_between_threads_doesnt_join_their_time_spans() {
 }
 
 #[test]
-fn an_absent_or_unparseable_entry_time_doesnt_become_epoch_zero() {
+fn absent_or_unparseable_entry_time_doesnt_become_epoch_zero() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&super::rearview_at(base.path())).unwrap();
     let (storage, root) = write_test_entries(

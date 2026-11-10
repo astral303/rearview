@@ -14,8 +14,20 @@ pub struct RootEnvironment<'a> {
 }
 
 impl RootEnvironment<'static> {
+    /// The process's environment. In a test build, an environment without
+    /// the developer's agent stores: no variable is set, and the home is an
+    /// empty directory of the running test's own. A test that needs sessions
+    /// passes fixture storages or its own environment.
     #[allow(clippy::disallowed_methods)]
     pub fn of_process() -> Self {
+        #[cfg(test)]
+        return Self {
+            variable: &no_variable,
+            home: Some(test_home::directory()),
+            current_dir: std::env::current_dir().ok(),
+            temp_dir: Some(std::env::temp_dir()),
+        };
+        #[cfg(not(test))]
         Self {
             variable: &process_variable,
             home: home::home_dir(),
@@ -25,9 +37,31 @@ impl RootEnvironment<'static> {
     }
 }
 
+#[cfg(not(test))]
 #[allow(clippy::disallowed_methods)]
 fn process_variable(name: &str) -> Option<OsString> {
     std::env::var_os(name)
+}
+
+#[cfg(test)]
+fn no_variable(_name: &str) -> Option<OsString> {
+    None
+}
+
+#[cfg(test)]
+mod test_home {
+    use std::path::PathBuf;
+
+    thread_local! {
+        /// libtest runs each test on a thread of its own, so the directory
+        /// is the test's, and it is removed when the test ends.
+        static HOME: tempfile::TempDir = tempfile::tempdir().expect("a temporary home directory");
+    }
+
+    /// The running test's own empty home directory.
+    pub(super) fn directory() -> PathBuf {
+        HOME.with(|home| home.path().to_path_buf())
+    }
 }
 
 impl<'a> RootEnvironment<'a> {

@@ -17,9 +17,10 @@ pub fn october(day: u32, hour: u32) -> DateTime<Local> {
 
 /// 10 October 2026 from 00:00 to 23:00.
 pub fn window_on_october_10() -> TimeFilter {
+    let at = |hour| october(10, hour).with_timezone(&crate::clock::Zone::System);
     TimeFilter {
-        after: Some(october(10, 0)),
-        before: Some(october(10, 23)),
+        after: Some(at(0)),
+        before: Some(at(23)),
     }
 }
 

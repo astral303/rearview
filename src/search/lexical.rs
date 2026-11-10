@@ -1314,7 +1314,7 @@ mod tests {
     fn session_active_after_window_ranks_by_its_last_message_inside_it() {
         let before_october_1_at_23 = TimeFilter {
             after: None,
-            before: Some(october(1, 23)),
+            before: Some(october(1, 23).with_timezone(&crate::clock::Zone::System)),
         };
         let convs = [
             timed_messages_conversation(

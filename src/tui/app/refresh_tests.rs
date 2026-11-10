@@ -7,12 +7,14 @@ use crate::history::environment::test_support::test_environment;
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::SessionTitle;
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
+use crate::history::sqlite_cache::refresh::tests::{allow_owner_commits, fail_owner_commits};
 use crate::history::{
     AwaitedRefresh, FoundSession, NextStep, OtherRearview, ProcessIdentity, RefreshOutcome,
     SessionChanges, Source, UpdatedSession,
 };
 use crate::search::test_fixtures::one_message_conversation;
 use chrono::TimeZone;
+use std::path::Path;
 
 fn fingerprint(size: u64) -> CachedFingerprint {
     CachedFingerprint {
@@ -79,7 +81,7 @@ fn status_text(app: &App) -> Option<&str> {
 
 /// The outcome of a `Ctrl+R` refresh that found `changes`.
 pub(super) fn refresh_found(changes: SessionChanges) -> crate::error::Result<RefreshOutcome> {
-    Ok(RefreshOutcome::Changes(changes))
+    Ok(RefreshOutcome::Changes(Box::new(changes)))
 }
 
 #[test]
@@ -208,7 +210,7 @@ fn search_finds_changed_session_by_its_new_text() {
 }
 
 #[test]
-fn a_second_refresh_doesnt_begin_while_one_runs() {
+fn second_refresh_doesnt_begin_while_one_runs() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
 
     assert!(app.begin_refresh().is_some());
@@ -221,7 +223,7 @@ fn a_second_refresh_doesnt_begin_while_one_runs() {
 /// Rule 5: a list `Ctrl+R` pressed while another job runs waits, one at
 /// most, and begins once that job's outcome is applied.
 #[test]
-fn ctrl_r_pressed_twice_while_a_refresh_runs_requests_one_list_refresh() {
+fn ctrl_r_pressed_twice_while_refresh_runs_requests_one_list_refresh() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
 
@@ -239,7 +241,7 @@ fn ctrl_r_pressed_twice_while_a_refresh_runs_requests_one_list_refresh() {
 }
 
 #[test]
-fn a_refresh_doesnt_begin_while_the_list_loads() {
+fn refresh_doesnt_begin_while_list_loads() {
     let mut app = App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
@@ -276,13 +278,21 @@ fn known_sessions_are_listed_rows_and_skipped_sessions() {
     assert_eq!(known.skipped, skipped);
 }
 
+/// Hand `app` the outcome of a delete of the session at `path`.
+fn finish_deleting(app: &mut App, path: &Path) {
+    app.finish_list_change(crate::tui::list_change::ListChangeOutcome::Deleted {
+        path: path.to_path_buf(),
+        result: Ok(crate::history::provider::Deleted::just_the_session()),
+    });
+}
+
 #[test]
 fn session_deleted_during_refresh_stays_deleted() {
     let doomed = session("a", "a", 5, 1);
     let mut app = app_listing(vec![session("b", "b", 10, 1), doomed.clone()]);
     app.begin_refresh().unwrap();
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
-    app.remove_selected_from_list();
+    finish_deleting(&mut app, &doomed.path);
 
     app.finish_refresh(refresh_found(SessionChanges {
         updated: vec![changed_session(session("a", "grew", 15, 2))],
@@ -302,6 +312,7 @@ fn renamed_session_keeps_lists_last_message_preview() {
     app.set_show_last(true);
 
     app.show_renamed_session(0, "Renamed");
+    serve_session_refresh(&mut app);
 
     assert_shows_the_last_message_preview(&app.conversations()[0]);
 }
@@ -354,6 +365,7 @@ fn rename_reads_unreadable_session() {
     app.set_show_last(true);
 
     app.show_renamed_session(0, "Renamed");
+    serve_session_refresh(&mut app);
 
     assert_shows_the_last_message_preview(&app.conversations()[0]);
 }
@@ -391,13 +403,103 @@ fn rename_whose_session_is_gone_reports_it_and_keeps_dialog() {
     std::fs::remove_file(path).unwrap();
     renaming(&mut app);
 
-    app.show_renamed_session(0, "Renamed");
+    app.submit_rename();
+    serve_list_change(&mut app);
 
     assert!(matches!(app.dialog_mode, DialogMode::Rename { .. }));
-    assert_eq!(
-        status_text(&app),
-        Some("Failed to rename: conversation became empty")
+    let status = status_text(&app);
+    assert!(
+        status.is_some_and(|status| status.starts_with("Failed to rename: ")),
+        "the rename of a gone session reports its failure: {status:?}"
     );
+}
+
+#[test]
+fn rename_runs_on_background_worker_and_shows_new_title() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["a"]);
+    let mut app = home.app();
+    renaming(&mut app);
+
+    app.submit_rename();
+    assert!(
+        matches!(app.dialog_mode, DialogMode::Rename { .. }),
+        "the rename waits for the background worker"
+    );
+    serve_list_change(&mut app);
+
+    assert_eq!(app.dialog_mode, DialogMode::None);
+    assert_eq!(
+        app.conversations()[0].custom_title.as_deref(),
+        Some("Renamed")
+    );
+    assert_eq!(status_text(&app), Some("Session renamed"));
+}
+
+/// An app listing sessions `b` and `a` under the confirmation `dialog` for
+/// `a`, after a list refresh that removed `a` finished behind the dialog.
+fn confirming_for_a_session_a_refresh_removed(dialog: DialogMode) -> App {
+    let gone = session("a", "a", 5, 1);
+    let mut app = app_listing(vec![session("b", "b", 10, 1), gone.clone()]);
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
+    app.begin_refresh().unwrap();
+    app.dialog_mode = dialog;
+    app.finish_refresh(refresh_found(SessionChanges {
+        removed: vec![gone.path],
+        ..Default::default()
+    }));
+    app
+}
+
+#[test]
+fn delete_confirmed_after_refresh_removed_its_session_reports_it_not_found() {
+    let mut app = confirming_for_a_session_a_refresh_removed(DialogMode::ConfirmDelete);
+
+    let action = app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE, 10);
+
+    assert!(
+        action.is_none(),
+        "the confirmation doesn't delete a session the refresh removed"
+    );
+    assert_eq!(status_text(&app), Some("Session not found"));
+}
+
+#[test]
+fn rename_confirmed_after_refresh_removed_its_session_reports_it_not_found() {
+    let mut app = confirming_for_a_session_a_refresh_removed(DialogMode::Rename {
+        input: "Renamed".to_owned(),
+        cursor: 7,
+    });
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, 10);
+
+    assert!(
+        app.begin_list_change().is_none(),
+        "the confirmation doesn't rename a session the refresh removed"
+    );
+    assert_eq!(status_text(&app), Some("Session not found"));
+}
+
+/// Run the rename or delete `app` hands the background worker, as the
+/// worker runs it, on a thread of its own, and hand `app` its outcome.
+pub(super) fn serve_list_change(app: &mut App) {
+    let change = app
+        .begin_list_change()
+        .expect("a rename or delete waits for the worker");
+    let environment = app.environment.clone();
+    let outcome = std::thread::spawn(move || {
+        let operation = crate::history::OperationScope::new(
+            environment.cache_base(),
+            crate::history::Patience::UntilAcquired,
+            Arc::default(),
+        );
+        let outcome = change.make(&operation);
+        operation.finish().unwrap();
+        outcome
+    })
+    .join()
+    .unwrap();
+    app.finish_list_change(outcome);
 }
 
 /// Run the session refresh `app` begins as the background worker runs it,
@@ -422,13 +524,13 @@ pub(super) fn serve_session_refresh(app: &mut App) {
 }
 
 #[test]
-fn a_session_refresh_discovers_its_sessions_once() {
+fn session_refresh_discovers_its_sessions_once() {
     let home = ClaudeHome::new();
     let b = home.write("b", 10, &["b"]);
     let a = home.write("a", 5, &["a"]);
     let mut app = home.app();
-    app.act_on_next_step(&a, NextStep::CacheInBackground);
-    app.act_on_next_step(&b, NextStep::CacheInBackground);
+    app.record_next_step(&a, NextStep::CacheInBackground);
+    app.record_next_step(&b, NextStep::CacheInBackground);
     let listings_before = home.times_project_listed();
 
     serve_session_refresh(&mut app);
@@ -449,7 +551,7 @@ fn row_named<'a>(app: &'a App, name: &str) -> &'a Conversation {
 }
 
 #[test]
-fn a_row_waiting_for_another_refresh_is_refreshed_once_it_completes() {
+fn row_waiting_for_another_refresh_is_refreshed_once_it_completes() {
     let home = ClaudeHome::new();
     let cache = admitted_cache();
     let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
@@ -460,9 +562,9 @@ fn a_row_waiting_for_another_refresh_is_refreshed_once_it_completes() {
         RefreshOwnership::acquire_for_test(&another_rearview(cache.path(), clock.clone())).unwrap();
     let environment = home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
     let mut app = app_reading(rows, environment);
-    app.await_refresh(
-        [a.clone()],
-        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    app.record_next_step(
+        &a,
+        NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
     );
     home.append(&a, 6, "written during the other refresh");
 
@@ -484,8 +586,128 @@ fn a_row_waiting_for_another_refresh_is_refreshed_once_it_completes() {
     assert_eq!(listed_names(&app), ["b", "a"]);
 }
 
+/// A list `Ctrl+R` of `app` under `window`, run as the background worker
+/// runs it.
+pub(super) fn serve_list_refresh(app: &mut App, window: TimeFilter) {
+    let known = app.begin_refresh().expect("a list refresh begins");
+    let environment = app.environment.clone();
+    let outcome = std::thread::spawn(move || {
+        let operation = crate::history::OperationScope::new(
+            environment.cache_base(),
+            crate::history::Patience::UntilAcquired,
+            Arc::default(),
+        );
+        let options = crate::history::RefreshOptions {
+            time: window,
+            ..Default::default()
+        };
+        let outcome = crate::history::refresh_sessions(&environment, &known, options, &operation)
+            .map(|changes| RefreshOutcome::Changes(Box::new(changes)));
+        operation.finish().and(outcome)
+    })
+    .join()
+    .unwrap();
+    app.finish_refresh(outcome);
+}
+
+/// Messages from 12:30 on the day [`ClaudeHome::write`] writes them.
+pub(super) fn window_from_half_past_noon() -> TimeFilter {
+    TimeFilter {
+        after: Some(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 10, 1, 12, 30, 0)
+                .unwrap()
+                .with_timezone(&crate::clock::Zone::System),
+        ),
+        before: None,
+    }
+}
+
+/// An app after [`refresh_a_new_session_with_an_old_copy`], with its
+/// sessions and their cache.
+pub(super) struct RefreshedNewSession {
+    pub(super) app: App,
+    home: ClaudeHome,
+    pub(super) new: PathBuf,
+    _cache: tempfile::TempDir,
+}
+
+/// A list `Ctrl+R` under a window from 12:30 whose writes fail, while the
+/// cache holds a copy from before the window of `new`, a session the list
+/// does not show, and `new`'s transcript gained a message at `minute`.
+/// Then commits succeed again and the session refresh `new` waits for is
+/// served.
+pub(super) fn refresh_a_new_session_with_an_old_copy(minute: u32) -> RefreshedNewSession {
+    let home = ClaudeHome::new();
+    let cache = admitted_cache();
+    let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
+    let environment = home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
+    home.write("listed", 40, &["inside the window"]);
+    let rows = home.rows(&environment);
+    let new = home.write("new", 10, &["before the window"]);
+    home.rows(&environment);
+    home.append(&new, minute, "added since the copy");
+    let mut app = app_reading(rows, environment);
+    let window = window_from_half_past_noon();
+    app.set_list_window(window);
+
+    fail_owner_commits(cache.path());
+    serve_list_refresh(&mut app, window);
+    assert_eq!(listed_names(&app), ["listed"]);
+    assert!(
+        app.store.is_refresh_pending(&new),
+        "a new session read from its old copy outside the window keeps its pending refresh"
+    );
+
+    allow_owner_commits(cache.path());
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+    serve_session_refresh(&mut app);
+    RefreshedNewSession {
+        app,
+        home,
+        new,
+        _cache: cache,
+    }
+}
+
 #[test]
-fn a_session_refresh_removes_rows_now_gone_or_empty_and_keeps_failed_reads() {
+fn new_session_with_old_copy_outside_window_is_listed_once_refreshed_with_message_inside_it() {
+    let refreshed = refresh_a_new_session_with_an_old_copy(50);
+
+    assert_eq!(listed_names(&refreshed.app), ["new", "listed"]);
+}
+
+#[test]
+fn new_session_still_outside_window_once_refreshed_is_skipped_until_it_changes() {
+    let RefreshedNewSession {
+        mut app,
+        home,
+        new,
+        _cache,
+    } = refresh_a_new_session_with_an_old_copy(20);
+    assert_eq!(listed_names(&app), ["listed"]);
+    let known = app.begin_refresh().expect("a list refresh begins");
+    drop(app);
+
+    let refreshed = home.rows(&home.environment());
+    let current = refreshed
+        .iter()
+        .find(|row| row.path == new)
+        .and_then(|row| row.fingerprint);
+    assert_eq!(
+        known
+            .skipped
+            .unlisted
+            .get(&new)
+            .and_then(|found| found.fingerprint),
+        current,
+        "the session is recorded as unlisted at the revision its refresh read"
+    );
+}
+
+#[test]
+fn session_refresh_removes_rows_now_gone_or_empty_and_keeps_failed_reads() {
     let home = ClaudeHome::new();
     let cache = admitted_cache();
     let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
@@ -497,7 +719,7 @@ fn a_session_refresh_removes_rows_now_gone_or_empty_and_keeps_failed_reads() {
     let environment = home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
     let mut app = app_reading(rows, environment);
     for path in [&gone, &empty, &failed, &listed] {
-        app.act_on_next_step(path, NextStep::CacheInBackground);
+        app.record_next_step(path, NextStep::CacheInBackground);
     }
 
     std::fs::remove_file(&gone).unwrap();
@@ -508,8 +730,48 @@ fn a_session_refresh_removes_rows_now_gone_or_empty_and_keeps_failed_reads() {
     assert_eq!(listed_names(&app), ["failed", "listed"]);
 }
 
+/// Replace the session cache database in `cache` with a text file, and
+/// delete its write-ahead log and shared-memory files.
+fn replace_database_with_text(cache: &Path) {
+    let database = cache.join(crate::history::sqlite_cache::DATABASE_FILE_NAME);
+    for suffix in ["-wal", "-shm"] {
+        let mut companion = database.clone().into_os_string();
+        companion.push(suffix);
+        match std::fs::remove_file(&companion) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            removed => removed.unwrap(),
+        }
+    }
+    std::fs::write(&database, "not a database").unwrap();
+}
+
 #[test]
-fn only_sessions_opened_out_of_date_wait_for_the_refresh() {
+fn unreadable_cache_database_requests_session_refresh_that_reports_error() {
+    let home = ClaudeHome::new();
+    let cache = admitted_cache();
+    let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
+    let session = home.write("a", 5, &["a"]);
+    let environment = home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
+    let rows = home.rows(&environment);
+    let mut app = app_reading(rows, environment);
+    replace_database_with_text(cache.path());
+
+    app.enter_view_mode(80);
+
+    assert!(
+        app.store.is_refresh_pending(&session),
+        "the read of an unreadable cache requests the session's refresh"
+    );
+    serve_session_refresh(&mut app);
+    assert_eq!(
+        status_text(&app),
+        Some("Refresh failed: Session cache database error: file is not a database"),
+        "the session refresh over an unreadable cache reports the database error"
+    );
+}
+
+#[test]
+fn only_sessions_opened_out_of_date_wait_for_refresh() {
     let home = ClaudeHome::new();
     let cache = admitted_cache();
     let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
@@ -538,15 +800,15 @@ fn only_sessions_opened_out_of_date_wait_for_the_refresh() {
 }
 
 #[test]
-fn an_open_requested_before_a_completion_check_opens_the_requested_session() {
+fn open_requested_before_completion_check_opens_requested_session() {
     let home = ClaudeHome::new();
     home.write("newer", 20, &["newer"]);
     let requested = home.write("older", 10, &["older"]);
     let mut app = home.app();
     home.append(&requested, 30, "written last");
-    app.await_refresh(
-        [requested.clone()],
-        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    app.record_next_step(
+        &requested,
+        NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
     );
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
     assert!(app.request_open());
@@ -562,13 +824,13 @@ fn an_open_requested_before_a_completion_check_opens_the_requested_session() {
 }
 
 #[test]
-fn a_session_refresh_waits_while_a_delete_confirmation_is_open() {
+fn session_refresh_waits_while_delete_confirmation_is_open() {
     let home = ClaudeHome::new();
     home.write("b", 10, &["b"]);
     let a = home.write("a", 5, &["a"]);
     let mut app = home.app();
     std::fs::remove_file(&a).unwrap();
-    app.act_on_next_step(&a, NextStep::CacheInBackground);
+    app.record_next_step(&a, NextStep::CacheInBackground);
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
     app.dialog_mode = DialogMode::ConfirmDelete;
 
@@ -597,10 +859,9 @@ fn rows_waiting_for_this_processs_own_refresh_dont_report_another_rearview() {
         ProcessIdentity::default(),
         Arc::new(TestClock::default()),
     );
-    let own_refresh =
-        RefreshOwnership::acquire_for_test(environment.cache_base().unwrap()).unwrap();
+    let own_refresh = RefreshOwnership::acquire_for_test(environment.cache_base()).unwrap();
     let mut app = app_reading(rows, environment);
-    app.await_refresh([a], AwaitedRefresh::ThisProcess);
+    app.record_next_step(&a, NextStep::AwaitRefresh(AwaitedRefresh::ThisProcess));
 
     assert!(app.is_awaiting_refresh());
     assert!(!app.is_waiting_for_another_rearview());
@@ -620,7 +881,7 @@ fn session_that_cannot_be_read_again_keeps_its_row() {
     let a = home.write("a", 5, &["a"]);
     let mut app = home.app();
     home.refuse_project();
-    app.act_on_next_step(&a, NextStep::CacheInBackground);
+    app.record_next_step(&a, NextStep::CacheInBackground);
 
     serve_session_refresh(&mut app);
 
@@ -635,7 +896,7 @@ fn session_its_agent_no_longer_finds_is_removed_when_read_again() {
     let a = home.write("a", 5, &["a"]);
     let mut app = home.app();
     std::fs::remove_file(&a).unwrap();
-    app.act_on_next_step(&a, NextStep::CacheInBackground);
+    app.record_next_step(&a, NextStep::CacheInBackground);
 
     serve_session_refresh(&mut app);
 
@@ -676,7 +937,7 @@ fn refresh_that_finishes_in_viewer_applies_back_in_list() {
     app.begin_refresh().unwrap();
     app.app_mode = AppMode::View(ViewState::initial(
         PathBuf::from("/sessions/a.jsonl"),
-        Source::Claude,
+        Some(Source::Claude),
         Some("a".to_owned()),
         Vec::new(),
         ToolDisplayMode::Hidden,
@@ -720,6 +981,7 @@ fn refresh_replaces_ignored_terms_and_keeps_launch_filters() {
 fn ctrl_l_counts_loaded_sessions_missing_earlier_turns_as_rows_change() {
     let mut deleted = session("d", "d", 6, 4);
     deleted.is_missing_earlier_turns = true;
+    let deleted_path = deleted.path.clone();
     let mut app = app_listing(vec![deleted, session("a", "a", 5, 1)]);
     assert_eq!(
         app.active_filters().collect::<Vec<_>>(),
@@ -729,7 +991,7 @@ fn ctrl_l_counts_loaded_sessions_missing_earlier_turns_as_rows_change() {
         )]
     );
 
-    app.remove_selected_from_list();
+    finish_deleting(&mut app, &deleted_path);
     assert!(!app.has_active_filters(), "a list delete recounts");
 
     let mut missing = session("b", "b", 5, 2);

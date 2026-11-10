@@ -6,19 +6,16 @@
 //!
 //! One test per surface compares one file and names the first line that
 //! differs. The outputs come from one child process: the test binary runs
-//! [`child_process_writes_the_outputs`] alone, with the home holding the
-//! sessions, the cache, the time zone and the clock fixed, so the outputs
-//! are the same on every machine and every day:
+//! [`child_process_writes_outputs`] alone, with the home holding the
+//! sessions, the cache and the clock fixed, so the outputs are the same on
+//! every machine and every day:
 //! - The home holds each provider's every-record session at the provider's
 //!   first default root, with fixed modification times, and no
 //!   configuration file. Every provider's storage variables and session
 //!   variables are unset.
 //! - The cache starts empty, and no command searches semantically.
 //! - Every command and the TUI run on a test clock standing at
-//!   [`FIXED_NOW`].
-//! - Times print in America/New_York. On Unix the child process's `TZ` sets
-//!   it. Windows reads the system time zone whatever `TZ` holds, so there the
-//!   tests require US Eastern Time.
+//!   [`FIXED_NOW`] in US Eastern Time, whatever zone the machine is set to.
 //!
 //! When an output changes on purpose, write the files again and review
 //! their diff before committing it:
@@ -28,22 +25,21 @@
 //! ```
 
 use crate::agent::test_support::atom;
-use crate::clock::TestClock;
+use crate::clock::{TestClock, Zone};
 use crate::history::provider::contract_tests::{AgentSession, registered_fixtures};
-use crate::history::provider::{RootEnvironment, SessionStorage};
-use chrono::{DateTime, TimeZone, Utc};
+use crate::history::provider::{RootEnvironment, SessionStorage, StorageUnderHome};
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 /// The test the child process runs, by its path in the test binary.
-const CHILD_TEST: &str = "output_contract::child_process_writes_the_outputs";
+const CHILD_TEST: &str = "output_contract::child_process_writes_outputs";
 /// Names the directory the child process writes the outputs to. Unset, the
 /// child test does nothing.
 const OUTPUT_DIR_VARIABLE: &str = "REARVIEW_OUTPUT_CONTRACT_OUTPUT";
 /// Set to write the expected files from the outputs instead of comparing.
 const WRITE_VARIABLE: &str = "REARVIEW_WRITE_OUTPUT_CONTRACT";
-const TIME_ZONE: &str = "America/New_York";
 /// After every fixture's last message.
 const FIXED_NOW: &str = "2026-10-01T16:00:00Z";
 /// The modification time of the first provider's transcripts; each later
@@ -101,12 +97,42 @@ fn fixed_time(rfc_3339: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-/// The clock the outputs read: [`FIXED_NOW`]. Nothing in the child process
-/// sleeps on it, so it stays there.
+/// The clock the outputs read: [`FIXED_NOW`] in US Eastern Time. Nothing in
+/// the child process sleeps on it, so it stays there.
 fn fixed_clock() -> Arc<TestClock> {
-    let clock = TestClock::default();
+    let clock = TestClock::in_zone(Zone::UsEastern);
     clock.set_wall(fixed_time(FIXED_NOW));
     Arc::new(clock)
+}
+
+/// Names the home holding every provider's every-record session, for the
+/// child process.
+const HOME_VARIABLE: &str = "REARVIEW_OUTPUT_CONTRACT_HOME";
+
+/// The environment the child process runs every case in: every provider's
+/// storage with its roots under the home [`HOME_VARIABLE`] names, the
+/// test's own session cache directory, and [`fixed_clock`].
+fn contract_environment() -> crate::history::Environment {
+    let home = PathBuf::from(
+        std::env::var_os(HOME_VARIABLE).expect("the parent test names the fixture home"),
+    );
+    let storages = crate::history::provider::providers()
+        .iter()
+        .map(|provider| {
+            let storage: &'static dyn SessionStorage = Box::leak(Box::new(StorageUnderHome {
+                inner: provider.storage(),
+                home: home.clone(),
+            }));
+            storage
+        })
+        .collect();
+    crate::history::Environment::new(
+        storages,
+        crate::cache_file::user_cache_base().expect("a test build has a cache directory"),
+        crate::history::ProcessIdentity::default(),
+        fixed_clock(),
+        Arc::new(crate::history::provider::walk::SystemLister),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -114,42 +140,42 @@ fn fixed_clock() -> Arc<TestClock> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn agent_sessions_output_matches_the_contract() {
+fn agent_sessions_output_matches_contract() {
     assert_matches_contract(Surface::AgentSessions);
 }
 
 #[test]
-fn agent_search_output_matches_the_contract() {
+fn agent_search_output_matches_contract() {
     assert_matches_contract(Surface::AgentSearch);
 }
 
 #[test]
-fn agent_within_output_matches_the_contract() {
+fn agent_within_output_matches_contract() {
     assert_matches_contract(Surface::AgentWithin);
 }
 
 #[test]
-fn agent_read_output_matches_the_contract() {
+fn agent_read_output_matches_contract() {
     assert_matches_contract(Surface::AgentRead);
 }
 
 #[test]
-fn agent_outline_output_matches_the_contract() {
+fn agent_outline_output_matches_contract() {
     assert_matches_contract(Surface::AgentOutline);
 }
 
 #[test]
-fn tui_list_matches_the_contract() {
+fn tui_list_matches_contract() {
     assert_matches_contract(Surface::TuiList);
 }
 
 #[test]
-fn tui_search_results_match_the_contract() {
+fn tui_search_results_match_contract() {
     assert_matches_contract(Surface::TuiSearch);
 }
 
 #[test]
-fn tui_viewer_matches_the_contract() {
+fn tui_viewer_matches_contract() {
     assert_matches_contract(Surface::TuiViewer);
 }
 
@@ -205,7 +231,7 @@ fn first_difference(expected: &str, actual: &str) -> Option<String> {
 }
 
 #[test]
-fn a_difference_names_its_first_line_and_both_texts_there() {
+fn difference_names_its_first_line_and_both_texts_there() {
     assert_eq!(first_difference("a\nb\n", "a\nb\n"), None);
     assert_eq!(
         first_difference("a\nb\nc\n", "a\nB\nc\n"),
@@ -225,7 +251,6 @@ fn contract_outputs() -> &'static Result<Vec<String>, String> {
 }
 
 fn run_child_process() -> Result<Vec<String>, String> {
-    require_the_time_zone()?;
     let run = tempfile::tempdir().map_err(|error| error.to_string())?;
     let home = run.path().join("home");
     let output = run.path().join("output");
@@ -238,10 +263,7 @@ fn run_child_process() -> Result<Vec<String>, String> {
         .args([CHILD_TEST, "--exact", "--ignored", "--test-threads=1"])
         .current_dir(&home)
         .env(OUTPUT_DIR_VARIABLE, &output)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("REARVIEW_CACHE_DIR", run.path().join("cache"))
-        .env("TZ", TIME_ZONE);
+        .env(HOME_VARIABLE, &home);
     for variable in crate::test_support::storage_env_vars()
         .into_iter()
         .chain(crate::test_support::current_session_variables())
@@ -268,32 +290,6 @@ fn run_child_process() -> Result<Vec<String>, String> {
             })
         })
         .collect()
-}
-
-/// On Windows, an error unless the system time zone is US Eastern Time:
-/// chrono reads it there and ignores `TZ`.
-fn require_the_time_zone() -> Result<(), String> {
-    if cfg!(unix) {
-        return Ok(());
-    }
-    let offset_hours = |rfc_3339| {
-        chrono::Local
-            .from_utc_datetime(&fixed_time(rfc_3339).naive_utc())
-            .offset()
-            .local_minus_utc()
-            / 3600
-    };
-    if (
-        offset_hours("2026-01-15T12:00:00Z"),
-        offset_hours("2026-07-15T12:00:00Z"),
-    ) == (-5, -4)
-    {
-        return Ok(());
-    }
-    Err(format!(
-        "the output contract prints times in {TIME_ZONE}; this system's time zone is \
-         another, and Windows ignores TZ"
-    ))
 }
 
 /// Writes every provider's every-record session at the provider's first
@@ -356,16 +352,13 @@ fn set_modified_under(directory: &Path, modified: std::time::SystemTime) {
 /// fixed; without the variable it does nothing.
 #[test]
 #[ignore = "the output contract tests run it in a child process"]
-fn child_process_writes_the_outputs() {
+fn child_process_writes_outputs() {
     let Some(output) = std::env::var_os(OUTPUT_DIR_VARIABLE) else {
         return;
     };
     let output = PathBuf::from(output);
     let agent = AgentOutputs::run();
-    let tui = crate::tui::contract_outputs::tui_outputs(
-        TUI_QUERIES,
-        crate::history::Environment::of_user(fixed_clock()),
-    );
+    let tui = crate::tui::contract_outputs::tui_outputs(TUI_QUERIES, contract_environment());
     for (surface, text) in [
         (Surface::AgentSessions, agent.sessions),
         (Surface::AgentSearch, agent.search),
@@ -766,10 +759,7 @@ fn agent_command(args: &[&str]) -> AgentCommandRun {
             let Some(crate::cli::Commands::Agent { command }) = parsed.command else {
                 panic!("{args:?} is an agent command");
             };
-            match crate::agent::service::execute(
-                *command,
-                crate::history::Environment::of_user(fixed_clock()),
-            ) {
+            match crate::agent::service::execute(*command, contract_environment()) {
                 Ok(output) => {
                     record.push_str("--- stdout\n");
                     record.push_str(&output);

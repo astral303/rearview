@@ -228,7 +228,11 @@ mod tests {
         let read = || {
             parsed_conversation(DisplayEntries::from(
                 OPENCODE_DB
-                    .session_entries(&session_ref(&database, "ses_live"), &[])
+                    .session_entries(
+                        crate::history::FOR_FIXTURES,
+                        &session_ref(&database, "ses_live"),
+                        &[],
+                    )
                     .unwrap()
                     .unwrap(),
             ))

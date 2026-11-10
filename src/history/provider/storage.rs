@@ -6,7 +6,8 @@ use crate::cli::DebugLevel;
 use crate::clock::Clock;
 use crate::error::Result;
 use crate::history::fingerprint::CachedFingerprint;
-use crate::history::{Conversation, FilterTerm, Source};
+use crate::history::parser::ParsedSession;
+use crate::history::{FilterTerm, ParsePermit, Source};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -134,6 +135,13 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
+    /// The fingerprint of a session whose transcripts discovery did not
+    /// list, such as a cached session under a directory it could not list.
+    pub const UNKNOWN: Self = Self {
+        size: 0,
+        modified: None,
+    };
+
     /// What a cache entry for this session would be stamped with, or `None`
     /// when discovery reported no `modified` and there is nothing to validate
     /// a later entry against.
@@ -195,7 +203,9 @@ pub trait SessionStorage: Sync {
     ///
     /// There is deliberately no default: how sessions are arranged inside a
     /// root is the provider's own knowledge. File-backed providers compose the
-    /// helpers in [`walk`](super::walk).
+    /// helpers in [`walk`](super::walk), listing the directories that hold
+    /// sessions through a [`DiscoveryLister`](super::walk::DiscoveryLister)
+    /// over `lister`.
     fn discover(
         &self,
         root: &SessionRoot,
@@ -231,8 +241,8 @@ pub trait SessionStorage: Sync {
     }
 
     /// Parse one session into a conversation, its sub-agent transcripts
-    /// merged in, or `None` if the locator holds nothing this provider
-    /// recognizes.
+    /// merged in, or the reason the list shows no row for it, such as a
+    /// locator holding nothing this provider recognises.
     ///
     /// `root` is supplied because the user can redirect a provider's session
     /// directory outside the agent's own tree, where transcripts may be written
@@ -242,15 +252,17 @@ pub trait SessionStorage: Sync {
     /// session's own and each sub-agent's, so a load can report progress
     /// inside a session with many sub-agents.
     ///
-    /// A row without any time is dated `clock`'s current time.
+    /// A row without any time is dated `clock`'s current time. `permit`
+    /// admits the parses.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>>;
+    ) -> Result<ParsedSession>;
 
     /// Titles stored beside the transcripts rather than in them, by session id.
     ///
@@ -317,14 +329,15 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<ParsedSession> {
         self.inner
-            .parse_session(stub, root, debug_level, on_transcript_read, clock)
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -333,6 +346,195 @@ impl<S: SessionStorage> SessionStorage for RootedStorage<S> {
 
     fn remove_superseded_cache(&self, cache_base: &Path) {
         self.inner.remove_superseded_cache(cache_base)
+    }
+}
+
+/// `inner` with its roots resolved under `home`, as the user's environment
+/// resolves them under the user's home, without any variable set.
+#[cfg(test)]
+pub(crate) struct StorageUnderHome<S: SessionStorage> {
+    pub(crate) inner: S,
+    pub(crate) home: PathBuf,
+}
+
+#[cfg(test)]
+impl<S: SessionStorage> SessionStorage for StorageUnderHome<S> {
+    fn source(&self) -> Source {
+        self.inner.source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        self.inner.cache()
+    }
+
+    fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        let no_variables = |_: &str| None;
+        self.inner.roots_in(&RootEnvironment::new(
+            &no_variables,
+            Some(self.home.clone()),
+            Some(self.home.clone()),
+        ))
+    }
+
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.inner.discover(root, lister)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        self.inner
+            .rediscover_unlisted_session(root, locator, lister)
+    }
+
+    fn parse_session(
+        &self,
+        permit: ParsePermit<'_>,
+        stub: &SessionStub,
+        root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
+    ) -> Result<ParsedSession> {
+        self.inner
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        self.inner.external_titles(root)
+    }
+
+    fn remove_superseded_cache(&self, cache_base: &Path) {
+        self.inner.remove_superseded_cache(cache_base)
+    }
+}
+
+/// A storage that answers as `inner` from the roots it pins, with its parses
+/// watched by a test through `watch`.
+#[cfg(test)]
+pub(crate) struct WatchedStorage {
+    pub(crate) inner: &'static dyn SessionStorage,
+    pub(crate) roots: Vec<SessionRoot>,
+    pub(crate) watch: ParseWatch,
+}
+
+#[cfg(test)]
+impl SessionStorage for WatchedStorage {
+    fn source(&self) -> Source {
+        self.inner.source()
+    }
+
+    fn cache(&self) -> SessionCache {
+        self.inner.cache()
+    }
+
+    fn roots_in(&self, _environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
+        Ok(self.roots.clone())
+    }
+
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.inner.discover(root, lister)
+    }
+
+    fn rediscover_unlisted_session(
+        &self,
+        root: &SessionRoot,
+        locator: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        self.inner
+            .rediscover_unlisted_session(root, locator, lister)
+    }
+
+    fn parse_session(
+        &self,
+        permit: ParsePermit<'_>,
+        stub: &SessionStub,
+        root: &SessionRoot,
+        debug_level: Option<DebugLevel>,
+        on_transcript_read: &(dyn Fn() + Sync),
+        clock: &dyn Clock,
+    ) -> Result<ParsedSession> {
+        self.watch.begin_parse();
+        self.inner
+            .parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
+    }
+
+    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
+        self.inner.external_titles(root)
+    }
+}
+
+/// The parses of [`WatchedStorage`]s, as a test watches them: how many
+/// began after a moment the test marks, and a hold that keeps each parse
+/// from running until the test releases it.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ParseWatch(std::sync::Arc<ParseWatchState>);
+
+#[cfg(test)]
+#[derive(Default)]
+struct ParseWatchState {
+    begun: std::sync::atomic::AtomicUsize,
+    is_marked: std::sync::atomic::AtomicBool,
+    begun_after_mark: std::sync::atomic::AtomicUsize,
+    is_held: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ParseWatch {
+    /// Count every parse that begins from now on.
+    pub(crate) fn mark(&self) {
+        self.0
+            .is_marked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The parses that began after [`Self::mark`].
+    pub(crate) fn parses_after_mark(&self) -> usize {
+        self.0
+            .begun_after_mark
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The parses that began.
+    pub(crate) fn parses_begun(&self) -> usize {
+        self.0.begun.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Keep every later parse from running until [`Self::release`].
+    pub(crate) fn hold(&self) {
+        *self.0.is_held.lock().unwrap() = true;
+    }
+
+    /// Let every held and later parse run.
+    pub(crate) fn release(&self) {
+        *self.0.is_held.lock().unwrap() = false;
+        self.0.released.notify_all();
+    }
+
+    fn begin_parse(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0.begun.fetch_add(1, SeqCst);
+        if self.0.is_marked.load(SeqCst) {
+            self.0.begun_after_mark.fetch_add(1, SeqCst);
+        }
+        let mut is_held = self.0.is_held.lock().unwrap();
+        while *is_held {
+            is_held = self.0.released.wait(is_held).unwrap();
+        }
     }
 }
 
@@ -371,13 +573,14 @@ impl<S: SessionStorage + ?Sized> SessionStorage for &S {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
-        (**self).parse_session(stub, root, debug_level, on_transcript_read, clock)
+    ) -> Result<ParsedSession> {
+        (**self).parse_session(permit, stub, root, debug_level, on_transcript_read, clock)
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {

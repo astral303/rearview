@@ -73,7 +73,9 @@ fn error_report(error: AppError) -> String {
     match error {
         AppError::AgentProtocol(output) => output,
         AppError::Agent(error) => agent::diagnostic::format_error(&error),
-        error @ AppError::SessionCacheOutOfSpace { .. } => format!("{APP_NAME}: {error}\n"),
+        error @ (AppError::SessionCacheOutOfSpace { .. } | AppError::NoSessionCacheDirectory) => {
+            format!("{APP_NAME}: {error}\n")
+        }
         error => format!("Error: {error}\n"),
     }
 }
@@ -192,19 +194,30 @@ fn delete_empty_summary_line(delete: bool, candidates: &[history::EmptySession])
     )
 }
 
-/// Delete the session `session_id` names, whichever agent recorded it.
+/// Delete the session `session_id` names, whichever of `environment`'s agents
+/// recorded it.
 ///
 /// Each provider removes what the session owns beyond the transcript: Claude
 /// every copy a cross-project fork left, Codex the thread's earlier rollouts
 /// and its sub-agent threads, Kimi the whole session directory.
-fn delete_session_by_id(session_id: &str) -> Result<()> {
-    let found = history::provider::find_sessions_by_id(session_id);
+///
+/// Finds and deletes the session as the refresh owner of the session cache:
+/// the providers read the transcripts they check before they delete them.
+fn delete_session_by_id(environment: &history::Environment, session_id: &str) -> Result<()> {
+    let operation = history::OperationScope::new(
+        environment.cache_base(),
+        history::Patience::UntilAcquired,
+        std::sync::Arc::default(),
+    );
+    let permit = operation.acquired_parse_permit()?;
+    let found = history::provider::find_sessions_by_id(environment, session_id);
     let (source, path) = match found.as_slice() {
         [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
         [only] => only.clone(),
         several => return Err(ambiguous_session_id(session_id, several)),
     };
-    let deleted = history::provider::delete_session(source, &path)?;
+    let deleted = history::provider::delete_session(permit, source, &path)?;
+    operation.finish()?;
     eprintln!("{}", deletion_report(source, session_id, deleted));
     Ok(())
 }
@@ -258,22 +271,41 @@ fn truncate_delete_empty_preview(preview: &str) -> String {
 }
 
 fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
-    let args = Args::parse();
+    run_with(
+        Args::parse(),
+        clock,
+        cache_file::user_cache_base(),
+        update::run,
+    )
+}
+
+/// Run `args` on `clock`, with the session cache under `cache_base`, updating
+/// rearview through `update`. A test passes its own `update`: the real one
+/// downloads a release and replaces the running executable.
+fn run_with(
+    args: Args,
+    clock: Arc<dyn Clock>,
+    cache_base: Option<PathBuf>,
+    update: fn() -> Result<()>,
+) -> Result<()> {
     config::migrate_pre_rename_config()?;
-    let environment = history::Environment::of_user(Arc::clone(&clock));
+    // Only the commands that read sessions through the session cache build
+    // it, so the others run without a cache directory.
+    let user_environment = || history::Environment::of_user(cache_base.clone(), Arc::clone(&clock));
 
     // Handle subcommands
     if let Some(command) = args.command {
         return match command {
             Commands::Agent { command } => {
+                let environment = user_environment().map_err(agent::service::protocol_error)?;
                 agent::service::execute(*command, environment).map(|output| {
                     print!("{output}");
                 })
             }
             Commands::DeleteEmpty { yes, local, all } => {
-                run_delete_empty_command(DeleteEmptyArgs { yes, local, all }, &environment)
+                run_delete_empty_command(DeleteEmptyArgs { yes, local, all }, &user_environment()?)
             }
-            Commands::Update => update::run(),
+            Commands::Update => update(),
         };
     }
 
@@ -344,27 +376,27 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
 
     // Handle --delete flag: delete a session by its ID and exit
     if let Some(ref session_id) = args.delete {
-        return delete_session_by_id(session_id);
+        return delete_session_by_id(&user_environment()?, session_id);
     }
 
     // Resolved before the search paths below so every one of them honours the
     // window rather than silently ignoring it.
     let time_filter = args.time.resolve(clock.as_ref())?;
-    let load_all_conversations =
-        || history::load_all_conversations(&environment, show_last, args.debug);
+    let load_all_conversations = |environment: &history::Environment| {
+        history::load_all_conversations(environment, show_last, args.debug)
+    };
+    let local_workspace = |environment: &history::Environment| {
+        args.local.then(|| environment.workspace()).transpose()
+    };
 
     // Handle --debug-search flag: debug search result scoring
     if let Some(ref query) = args.debug_search {
-        let mut conversations = load_all_conversations()?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
 
-        let workspace = if args.local {
-            Some(history::Workspace::current()?)
-        } else {
-            None
-        };
+        let workspace = local_workspace(&environment)?;
 
         let perf = agent::perf::DebugSearchPerf::new(Arc::clone(&clock));
         let searchable = perf.time("search-data", || {
@@ -441,11 +473,16 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     }
 
     if let Some(ref query) = args.debug_semantic_search {
-        let mut conversations = load_all_conversations()?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::debug_search(query, &conversations, args.local, clock.as_ref());
+        return semantic_cli::debug_search(
+            query,
+            &conversations,
+            local_workspace(&environment)?.as_ref(),
+            clock.as_ref(),
+        );
     }
 
     if args.generate_semantic_cache {
@@ -456,9 +493,14 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
                 "--generate-semantic-cache cannot be combined with a time filter".to_string(),
             ));
         }
-        let mut conversations = load_all_conversations()?;
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::generate_cache(&conversations, args.local, clock);
+        return semantic_cli::generate_cache(
+            &conversations,
+            local_workspace(&environment)?.as_ref(),
+            clock,
+        );
     }
 
     if args.clear_semantic_cache {
@@ -466,20 +508,42 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
     }
 
     if args.report_dropped_records {
-        let mut conversations = load_all_conversations()?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
-        dropped_records_cli::print_report(&conversations);
+        // The report parses every listed transcript again: it loads and
+        // counts as one refresh owner of the session cache.
+        let environment = user_environment()?;
+        let operation = history::OperationScope::new(
+            environment.cache_base(),
+            history::Patience::UntilAcquired,
+            std::sync::Arc::default(),
+        );
+        let mut conversations = history::load_history(
+            &environment,
+            show_last,
+            args.debug,
+            None,
+            history::provider::LeftOutRows::NONE,
+            &operation,
+        )?
+        .conversations;
+        history::listing::retain_listed(&mut conversations, &time_filter);
+        dropped_records_cli::print_report(operation.acquired_parse_permit()?, &conversations);
+        operation.finish()?;
         return Ok(());
     }
 
     // Handle --semantic-search flag
     if let Some(ref query) = args.semantic_search {
-        let mut conversations = load_all_conversations()?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::run(query, &conversations, args.semantic_top, args.local, clock);
+        return semantic_cli::run(
+            query,
+            &conversations,
+            args.semantic_top,
+            local_workspace(&environment)?.as_ref(),
+            clock,
+        );
     }
 
     // Handle --render flag: render a JSONL file in ledger format and exit
@@ -508,16 +572,12 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
                 format!("Not a file: {}", input_file.display()),
             )));
         }
-        let source = history::format::parse_transcript(input_file)?
-            .map(|projection| projection.source)
-            .ok_or_else(|| AppError::UnrecognizedTranscript(input_file.display().to_string()))?;
         tui::run_single_file(
             input_file.clone(),
-            source,
             tool_display,
             show_thinking,
             keys,
-            environment,
+            user_environment()?,
         )?;
         return Ok(());
     }
@@ -557,6 +617,7 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
         exclude_projects,
     };
 
+    let environment = user_environment()?;
     let load_meter = std::sync::Arc::new(history::load_meter::LoadMeter::default());
 
     // An empty result is far more often the time filter than an empty history,
@@ -684,8 +745,9 @@ fn try_run(clock: Arc<dyn Clock>) -> Result<()> {
         no_color: args.no_color,
     };
 
+    let selected = listed_conversation(&conversations, &selected_path)?;
     let session =
-        display::read_session_to_print(environment.cache_base(), &conversations, &selected_path)?;
+        history::printed_log_entries(&environment, selected.source, &selected.path, show_last)?;
     if plain_mode {
         display::display_conversation_plain(
             &selected_path,
@@ -924,6 +986,84 @@ mod agent_command_tests {
     }
 
     #[test]
+    fn run_without_session_cache_directory_prints_how_to_name_one() {
+        assert_eq!(
+            error_report(AppError::NoSessionCacheDirectory),
+            "rearview: no directory for the session cache. Set REARVIEW_CACHE_DIR to a writable \
+             directory and run rearview again.\n"
+        );
+    }
+
+    #[test]
+    fn agent_command_without_session_cache_directory_prints_agent_error_record() {
+        assert_eq!(
+            error_report(agent::service::protocol_error(
+                AppError::NoSessionCacheDirectory
+            )),
+            "protocol agent-error kind=io detail=rearview:%20no%20directory%20for%20the%20session\
+             %20cache.%20Set%20REARVIEW_CACHE_DIR%20to%20a%20writable%20directory%20and%20run\
+             %20rearview%20again.\n"
+        );
+    }
+
+    /// `update` runs a stand-in: the real one downloads a release and
+    /// replaces the running executable.
+    #[test]
+    fn render_show_dir_clear_semantic_cache_and_update_run_without_cache_directory() {
+        let run_without_cache_directory = |arguments: &[&str]| {
+            let args = Args::try_parse_from(std::iter::once("rearview").chain(arguments.to_vec()))
+                .unwrap();
+            run_with(args, Arc::new(clock::TestClock::default()), None, || Ok(()))
+        };
+        let transcripts = tempfile::tempdir().unwrap();
+        let transcript = write_jsonl(
+            &transcripts,
+            "session.jsonl",
+            &[
+                agent::test_support::user_jsonl_line("a question"),
+                agent::test_support::assistant_jsonl_line("an answer"),
+            ],
+        );
+        let semantic_cache = cache_file::test_support::test_cache_directory().join("semantic");
+        std::fs::create_dir_all(&semantic_cache).unwrap();
+        std::fs::write(semantic_cache.join("embeddings-v1.bin"), "").unwrap();
+        let claude_folder = history::provider::RootEnvironment::of_process()
+            .home()
+            .unwrap()
+            .join(".claude")
+            .join("projects")
+            .join(history::provider::claude::convert_path_to_project_dir_name(
+                &std::env::current_dir().unwrap(),
+            ));
+        std::fs::create_dir_all(&claude_folder).unwrap();
+        std::fs::copy(&transcript, claude_folder.join("session.jsonl")).unwrap();
+
+        let refused = run_without_cache_directory(&["agent", "sessions"]);
+        assert!(
+            matches!(&refused, Err(AppError::AgentProtocol(record))
+                if record.contains("no%20directory%20for%20the%20session%20cache")),
+            "an agent command refuses without a cache directory: {refused:?}"
+        );
+        for arguments in [
+            vec!["--render", transcript.to_str().unwrap(), "--no-pager"],
+            vec!["--show-dir", "claude"],
+            vec!["--clear-semantic-cache"],
+            vec!["update"],
+        ] {
+            let outcome = run_without_cache_directory(&arguments);
+            assert!(
+                outcome.is_ok(),
+                "`rearview {}` succeeds without a cache directory: {outcome:?}",
+                arguments.join(" ")
+            );
+        }
+        assert!(
+            !semantic_cache.join("embeddings-v1.bin").exists(),
+            "--clear-semantic-cache deletes the embedding cache"
+        );
+    }
+
+    #[test]
     fn read_validation_rejects_focus_outside_range() {
         let keys = vec![key(
             "project-a",
@@ -1127,7 +1267,7 @@ mod agent_command_tests {
             "protocol agent-search mode=lexical cut=none chars=none policy=per-hit hits=1{}\n",
             agent::time_span::tz_atom(agent::time_span::output_offset(
                 None,
-                clock::TestClock::start_wall()
+                agent::test_support::written_at()
             ))
         )));
         assert!(rendered.contains(

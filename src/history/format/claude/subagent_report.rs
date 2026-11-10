@@ -315,7 +315,7 @@ mod tests {
     fn session_entries(project: &std::path::Path, with_sidecar: bool) -> Vec<LogEntry> {
         let (transcript, subagents) = write_handback_session(project, with_sidecar);
         CLAUDE_TRANSCRIPT
-            .session_entries(&transcript, &subagents)
+            .session_entries(crate::history::FOR_FIXTURES, &transcript, &subagents)
             .unwrap()
             .expect("a Claude transcript")
             .entries
@@ -454,7 +454,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-a4444444444444444.jsonl");
         std::fs::write(&path, records.join("\n")).unwrap();
-        let entries = fold_delivered_handbacks(transcript_entries(&path).unwrap().entries);
+        let entries = fold_delivered_handbacks(
+            transcript_entries(crate::history::FOR_FIXTURES.admit(), &path)
+                .unwrap()
+                .entries,
+        );
         let blocks: Vec<&ContentBlock> = entries
             .iter()
             .flat_map(|(_, entry)| match entry {

@@ -27,11 +27,6 @@ pub struct CachedSession {
 }
 
 impl CachedSession {
-    /// The clock of the rearview that found this session.
-    pub(crate) fn clock(&self) -> &dyn crate::clock::Clock {
-        self.base.clock().as_ref()
-    }
-
     /// Other message bodies contain only the context needed to render this
     /// range's links, handles and header. Do not render outside `range`.
     pub(crate) fn agent_range(
@@ -58,11 +53,35 @@ impl CachedSession {
         }
     }
 
+    /// This session, whose reads wait for another connection's lock as the
+    /// waiting reader does. A session a probe found reads without waiting,
+    /// and would fail at once while a writer commits.
+    pub(crate) fn waiting(self) -> Self {
+        Self {
+            wait: ReaderWait::Waiting(super::WAITING_BUSY_TIMEOUT),
+            ..self
+        }
+    }
+
     /// True when the copy matches its transcripts as they are now; false when
     /// they changed since it was written, or the cache no longer holds it.
     pub(crate) fn matches_source(&self) -> Result<bool> {
         match self.read(|_, _| Ok(())) {
             Ok(found) => Ok(found.is_some()),
+            Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`Self::matches_source`], and false as well when the copy's sub-agent
+    /// transcripts are not `subagents`, the session's sub-agents now: a
+    /// session that started a sub-agent since its copy was written.
+    pub(crate) fn matches_transcripts(&self, subagents: &[PathBuf]) -> Result<bool> {
+        let lists_subagents = self.read(|connection, session| {
+            Ok(stored_subagents(connection, session)? == subagent_keys(subagents))
+        });
+        match lists_subagents {
+            Ok(found) => Ok(found == Some(true)),
             Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(false),
             Err(error) => Err(error),
         }
@@ -139,31 +158,45 @@ impl CachedSession {
 }
 
 /// The listed session at `path` with `subagents` in the cache under `base`,
-/// through [`SqliteCache::open_waiting`]; `None` without a base.
+/// through [`SqliteCache::open_waiting`]; `None` when the cache does not
+/// hold it.
 pub(crate) fn find_waiting(
-    base: Option<&CacheBase>,
+    base: &CacheBase,
     source: crate::history::Source,
     path: &Path,
     subagents: &[PathBuf],
 ) -> Result<Option<CachedSession>> {
-    let Some(base) = base else {
-        return Ok(None);
-    };
     let Some(cache) = SqliteCache::open_waiting(base)? else {
         return Ok(None);
     };
     cache.find_session(source, path, subagents)
 }
 
-/// [`find_waiting`], whose reads return the copy as the cache holds it,
-/// whether or not its transcripts changed since it was written.
-pub(crate) fn find_as_is(
-    base: Option<&CacheBase>,
+/// The copy of the listed session `source` stores at `path` in the cache
+/// under `base`, whatever sub-agents it lists; `None` when the cache does
+/// not hold it. The lookup and the copy's reads fail at once with a busy
+/// error while another connection holds an exclusive lock, as a rebuild
+/// does: callers wait through it with [`super::read_when_unlocked`].
+pub(crate) fn find_copy_without_waiting(
+    base: &CacheBase,
     source: crate::history::Source,
     path: &Path,
-    subagents: &[PathBuf],
 ) -> Result<Option<CachedSession>> {
-    Ok(find_waiting(base, source, path, subagents)?.map(CachedSession::ignoring_source_changes))
+    let Some(cache) = SqliteCache::open_waiting_at_most(base, std::time::Duration::ZERO)? else {
+        return Ok(None);
+    };
+    cache.find_copy(source, path)
+}
+
+/// [`find_copy_without_waiting`], whose reads return the copy as the cache
+/// holds it, whether or not its transcripts changed since it was written.
+/// The reads return the sub-agents the copy lists.
+pub(crate) fn find_as_is_without_waiting(
+    base: &CacheBase,
+    source: crate::history::Source,
+    path: &Path,
+) -> Result<Option<CachedSession>> {
+    Ok(find_copy_without_waiting(base, source, path)?.map(CachedSession::ignoring_source_changes))
 }
 
 impl SqliteCache {
@@ -176,16 +209,85 @@ impl SqliteCache {
         subagents: &[PathBuf],
     ) -> Result<Option<CachedSession>> {
         self.with_read_snapshot(|connection| {
-            let stored: Option<(i64, String, String)> = connection.query_row(
-                "SELECT id, root, cache_key FROM sessions WHERE storage = ?1 AND canonical_path = ?2 AND status = 'listed' ORDER BY id LIMIT 1",
-                params![source.provider().storage().cache().directory, path_text(&files::key(path))],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).optional()?;
-            let Some((generation, root, cache_key)) = stored else { return Ok(None) };
-            let stored = connection.prepare("SELECT path FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position")?
-                .query_map([generation], |row| row.get::<_, String>(0).map(PathBuf::from))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            if stored != subagents.iter().map(|path| files::key(path)).collect::<Vec<_>>() { return Ok(None); }
-            Ok(Some(CachedSession { base: self.base().clone(), storage: source.provider().storage().cache(), root: root.into(), cache_key, generation, source, wait: self.wait, checks_source: true }))
+            let Some(copy) = self.listed_copy(connection, source, path)? else {
+                return Ok(None);
+            };
+            let lists_subagents =
+                stored_subagents(connection, copy.generation)? == subagent_keys(subagents);
+            Ok(lists_subagents.then_some(copy))
         })
     }
+
+    /// The listed session `source` stores at `path`, whatever sub-agents it
+    /// lists; `None` when the database holds none.
+    pub(crate) fn find_copy(
+        &self,
+        source: crate::history::Source,
+        path: &Path,
+    ) -> Result<Option<CachedSession>> {
+        self.with_read_snapshot(|connection| self.listed_copy(connection, source, path))
+    }
+
+    /// The cache key of the listed session `source` stores under `root` at
+    /// `path`, when its copy matches the transcripts as they are now; `None`
+    /// when the database holds no listed session there, or an older copy.
+    pub(crate) fn current_cache_key(
+        &self,
+        source: crate::history::Source,
+        root: &Path,
+        path: &Path,
+    ) -> Result<Option<String>> {
+        self.with_read_snapshot(|connection| {
+            let Some(copy) = self
+                .listed_copy(connection, source, path)?
+                .filter(|copy| copy.root == root)
+            else {
+                return Ok(None);
+            };
+            match copy.validate_source(connection, copy.generation) {
+                Ok(()) => Ok(Some(copy.cache_key)),
+                Err(crate::error::AppError::SessionCacheSourceChanged(_)) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn listed_copy(
+        &self,
+        connection: &Connection,
+        source: crate::history::Source,
+        path: &Path,
+    ) -> Result<Option<CachedSession>> {
+        let storage = source.provider().storage().cache();
+        let stored: Option<(i64, String, String)> = connection.query_row(
+            "SELECT id, root, cache_key FROM sessions WHERE storage = ?1 AND canonical_path = ?2 AND status = 'listed' ORDER BY id LIMIT 1",
+            params![storage.directory, path_text(&files::key(path))],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        Ok(stored.map(|(generation, root, cache_key)| CachedSession {
+            base: self.base().clone(),
+            storage,
+            root: root.into(),
+            cache_key,
+            generation,
+            source,
+            wait: self.wait,
+            checks_source: true,
+        }))
+    }
+}
+
+/// The sub-agent transcripts the copy `session` lists, in order, by
+/// [`files::key`].
+fn stored_subagents(connection: &Connection, session: i64) -> Result<Vec<PathBuf>> {
+    Ok(connection
+        .prepare(
+            "SELECT path FROM session_files WHERE session = ?1 AND kind = 'subagent' ORDER BY position",
+        )?
+        .query_map([session], |row| row.get::<_, String>(0).map(PathBuf::from))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn subagent_keys(subagents: &[PathBuf]) -> Vec<PathBuf> {
+    subagents.iter().map(|path| files::key(path)).collect()
 }

@@ -6,7 +6,6 @@ use crate::history::sqlite_cache::observer::{Observation, observe};
 use crate::history::sqlite_cache::{
     CacheWrite, CacheWriter, ProcessIdentity, SessionRecord, SessionStatus, SqliteCache,
 };
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -40,6 +39,9 @@ pub(crate) enum OwnerActivity {
     /// Starts a rebuild and commits dropping `meta`, holding SQLite's
     /// exclusive lock.
     InsideRebuild,
+    /// Holds ownership after a write batch whose commit failed revoked its
+    /// write permission.
+    Revoked,
 }
 
 impl OwnerActivity {
@@ -50,21 +52,95 @@ impl OwnerActivity {
             Self::Idle => "idle",
             Self::InsideBatch => "batch",
             Self::InsideRebuild => "rebuild",
+            Self::Revoked => "revoked",
         }
     }
 
+    /// The activity the parent test set for this helper process. Read from
+    /// the process's own variables: a test build's `RootEnvironment` sets none.
+    #[allow(clippy::disallowed_methods)]
     fn of_process() -> Self {
-        match crate::history::provider::RootEnvironment::of_process()
-            .var(Self::VARIABLE)
-            .as_deref()
-        {
+        match std::env::var(Self::VARIABLE).ok().as_deref() {
             Some("batch") => Self::InsideBatch,
             Some("rebuild") => Self::InsideRebuild,
+            Some("revoked") => Self::Revoked,
             _ => Self::Idle,
         }
     }
 }
 
+/// Another rearview's refresh ownership of the cache in a base, held in this
+/// process on a thread of its own in one [`OwnerActivity`]. Dropping it ends
+/// the activity cleanly and releases the ownership; a test of an owner that
+/// dies uses [`OtherProcessOwner`] instead.
+pub(crate) struct AnotherRearviewsOwner {
+    base: PathBuf,
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AnotherRearviewsOwner {
+    pub(crate) fn hold(base: &Path) -> Self {
+        Self::start(base, OwnerActivity::Idle)
+    }
+
+    pub(crate) fn start(base: &Path, activity: OwnerActivity) -> Self {
+        let (ready, is_ready) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let directory = base.to_path_buf();
+        let thread = thread::spawn(move || {
+            run_owner(&directory, activity, || {
+                let _ = ready.send(());
+                let _ = released.recv();
+            });
+        });
+        is_ready
+            .recv_timeout(Duration::from_secs(10))
+            .expect("another rearview acquires ownership");
+        Self {
+            base: base.to_path_buf(),
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    pub(crate) fn token(&self) -> RefreshToken {
+        stored_owner_token(&self.base)
+    }
+
+    /// End the activity and release the ownership, failing on the owner's
+    /// panic.
+    pub(crate) fn release(mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+impl Drop for AnotherRearviewsOwner {
+    fn drop(&mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The stored owner's token as a rearview of its own reaches `base`.
+fn stored_owner_token(base: &Path) -> RefreshToken {
+    let identity = connect(base, POLL_EVERY)
+        .unwrap()
+        .query_row(
+            "SELECT owner FROM refresh_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    RefreshToken::new(&rearview(base), identity)
+}
+
+/// A refresh owner in another process, which a test can kill.
 pub(crate) struct OtherProcessOwner {
     child: Child,
     base: PathBuf,
@@ -109,28 +185,11 @@ impl OtherProcessOwner {
     }
 
     pub(crate) fn token(&self) -> RefreshToken {
-        let identity = connect(&self.base, POLL_EVERY)
-            .unwrap()
-            .query_row(
-                "SELECT owner FROM refresh_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        RefreshToken::new(&rearview(&self.base), identity)
-    }
-
-    pub(crate) fn release(mut self) {
-        self.child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(b"release\n")
-            .unwrap();
-        assert!(self.child.wait().unwrap().success());
+        stored_owner_token(&self.base)
     }
 }
 
+/// Kills the owner, as a crash or a closed terminal does.
 impl Drop for OtherProcessOwner {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -140,18 +199,23 @@ impl Drop for OtherProcessOwner {
 
 #[test]
 #[ignore = "subprocess helper for refresh ownership tests"]
+#[allow(clippy::disallowed_methods)]
 fn owner_process() {
     let base = PathBuf::from(
-        crate::history::provider::RootEnvironment::of_process()
-            .var_os("REARVIEW_REFRESH_TEST_BASE")
+        std::env::var_os("REARVIEW_REFRESH_TEST_BASE")
             .expect("the parent test supplies the cache directory"),
     );
-    let owner = RefreshOwnership::acquire_for_test(&rearview(&base)).unwrap();
-    let wait_for_release = || {
+    run_owner(&base, OwnerActivity::of_process(), || {
         std::fs::write(base.join("owner.ready"), "ready").unwrap();
         std::io::stdin().read_line(&mut String::new()).unwrap();
-    };
-    match OwnerActivity::of_process() {
+    });
+}
+
+/// Acquire refresh ownership of the cache in `base` as a rearview of its
+/// own, enter `activity`, and hold it until `wait_for_release` returns.
+fn run_owner(base: &Path, activity: OwnerActivity, wait_for_release: impl FnOnce()) {
+    let owner = RefreshOwnership::acquire_for_test(&rearview(base)).unwrap();
+    match activity {
         OwnerActivity::Idle => wait_for_release(),
         OwnerActivity::InsideBatch => {
             let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
@@ -171,7 +235,35 @@ fn owner_process() {
             commit(batch, owner.token()).unwrap();
             wait_for_release();
         }
+        OwnerActivity::Revoked => {
+            fail_owner_commits(base);
+            assert!(owner.token().write_batch(|| ()).is_err());
+            allow_owner_commits(base);
+            wait_for_release();
+        }
     }
+}
+
+/// Fail every later commit of the refresh owner of the cache in `base`, as a
+/// database that cannot record a commit fails it, until
+/// [`allow_owner_commits`].
+pub(crate) fn fail_owner_commits(base: &Path) {
+    connect(base, POLL_EVERY)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_owner_commit BEFORE UPDATE OF last_commit_ms ON refresh_state \
+             WHEN NEW.owner = OLD.owner \
+             BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END;",
+        )
+        .unwrap();
+}
+
+/// Undo [`fail_owner_commits`].
+pub(crate) fn allow_owner_commits(base: &Path) {
+    connect(base, POLL_EVERY)
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_owner_commit")
+        .unwrap();
 }
 
 /// A connection holding SQLite's exclusive lock on the session cache
@@ -205,7 +297,7 @@ pub(crate) fn expire_last_commit(base: &Path) {
 }
 
 #[test]
-fn a_crashed_process_is_replaced_after_its_last_commit_expires() {
+fn crashed_process_is_replaced_after_its_last_commit_expires() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let child = OtherProcessOwner::hold(base.path());
@@ -218,7 +310,7 @@ fn a_crashed_process_is_replaced_after_its_last_commit_expires() {
 }
 
 #[test]
-fn a_crash_releases_the_writer_lock_and_keeps_completed_batches() {
+fn crash_releases_writer_lock_and_keeps_completed_batches() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let child = OtherProcessOwner::start(base.path(), OwnerActivity::InsideBatch);
@@ -270,6 +362,7 @@ fn record() -> SessionRecord {
         &root,
         &stub,
         SessionStatus::Empty,
+        "skipped transcript has no visible messages".to_owned(),
     )
     .unwrap()
 }
@@ -300,7 +393,7 @@ fn old_ownership_doesnt_return_after_release_and_reacquisition() {
 }
 
 #[test]
-fn a_write_batch_holds_the_writer_lock_and_a_replaced_owner_writes_nothing() {
+fn write_batch_holds_writer_lock_and_replaced_owner_writes_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -361,7 +454,7 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
 }
 
 #[test]
-fn takeover_between_batches_prevents_more_entries_and_the_final_status() {
+fn takeover_between_batches_prevents_more_entries_and_final_status() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -382,7 +475,7 @@ fn takeover_between_batches_prevents_more_entries_and_the_final_status() {
 }
 
 #[test]
-fn schema_and_page_rebuilds_preserve_the_active_ownership() {
+fn schema_and_page_rebuilds_preserve_active_ownership() {
     for page_size in [1024, 4096] {
         let directory = tempfile::tempdir().unwrap();
         let base = rearview(directory.path());
@@ -408,7 +501,7 @@ fn schema_and_page_rebuilds_preserve_the_active_ownership() {
 }
 
 #[test]
-fn an_admitted_database_with_the_wrong_page_size_requires_refresh() {
+fn admitted_database_with_wrong_page_size_requires_refresh() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let cache = SqliteCache::open(&base).unwrap();
@@ -440,7 +533,7 @@ fn an_admitted_database_with_the_wrong_page_size_requires_refresh() {
 }
 
 #[test]
-fn a_committed_batch_restarts_the_takeover_window() {
+fn committed_batch_restarts_takeover_window() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -453,7 +546,7 @@ fn a_committed_batch_restarts_the_takeover_window() {
 }
 
 #[test]
-fn a_long_batch_blocks_takeover_and_timestamps_its_end() {
+fn long_batch_blocks_takeover_and_timestamps_its_end() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -548,7 +641,7 @@ fn rebuild_exclusion_survives_commits_and_waiting_connections() {
 }
 
 #[test]
-fn a_rebuild_blocked_at_begin_exclusive_preserves_the_existing_tables() {
+fn rebuild_blocked_at_begin_exclusive_preserves_existing_tables() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -574,7 +667,7 @@ fn a_rebuild_blocked_at_begin_exclusive_preserves_the_existing_tables() {
 }
 
 #[test]
-fn a_previous_owner_cannot_start_rebuild_maintenance() {
+fn previous_owner_cannot_start_rebuild_maintenance() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -591,7 +684,7 @@ fn a_previous_owner_cannot_start_rebuild_maintenance() {
 }
 
 #[test]
-fn a_crashed_rebuild_without_meta_still_corrects_the_page_size() {
+fn crashed_rebuild_without_meta_still_corrects_page_size() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let connection = Connection::open(super::super::database_path(base.path())).unwrap();
@@ -633,7 +726,7 @@ fn a_crashed_rebuild_without_meta_still_corrects_the_page_size() {
 }
 
 #[test]
-fn ownership_doesnt_advance_without_a_batch_commit() {
+fn ownership_doesnt_advance_without_batch_commit() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -654,6 +747,7 @@ fn ownership_doesnt_advance_without_a_batch_commit() {
         Observation::Running {
             owner: RefreshOwner::ThisProcess,
             last_commit_ms: before,
+            commit_age: crate::history::sqlite_cache::observer::CommitAge::Recent,
         }
     );
     assert!(matches!(
@@ -697,7 +791,7 @@ fn sqlite_content_batches_also_record_their_commit_time() {
 }
 
 #[test]
-fn a_failed_read_revokes_queued_writes_even_after_the_failure_clears() {
+fn failed_read_revokes_queued_writes_even_after_failure_clears() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -752,7 +846,7 @@ fn a_failed_read_revokes_queued_writes_even_after_the_failure_clears() {
 }
 
 #[test]
-fn a_rebuild_waits_at_begin_exclusive_for_an_open_reader_while_a_waiter_polls() {
+fn rebuild_waits_at_begin_exclusive_for_open_reader_while_waiter_polls() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -827,7 +921,7 @@ fn clock_rollback_doesnt_extend_unchanged_ownership_indefinitely() {
 }
 
 #[test]
-fn a_new_commit_restarts_monotonic_observation_after_clock_rollback() {
+fn new_commit_restarts_monotonic_observation_after_clock_rollback() {
     let directory = tempfile::tempdir().unwrap();
     let clock = Arc::new(TestClock::default());
     let base = rearview_on(directory.path(), Arc::clone(&clock));
@@ -849,7 +943,7 @@ fn a_new_commit_restarts_monotonic_observation_after_clock_rollback() {
 }
 
 #[test]
-fn a_blocked_commit_revokes_writes_and_rolls_back_its_batch() {
+fn blocked_commit_revokes_writes_and_rolls_back_its_batch() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -881,7 +975,7 @@ fn a_blocked_commit_revokes_writes_and_rolls_back_its_batch() {
 }
 
 #[test]
-fn failure_to_begin_a_write_batch_revokes_publication() {
+fn failure_to_begin_write_batch_revokes_publication() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -899,7 +993,7 @@ fn failure_to_begin_a_write_batch_revokes_publication() {
 }
 
 #[test]
-fn a_wait_within_a_limit_behind_a_held_writer_lock_ends_without_ownership() {
+fn wait_within_limit_behind_held_writer_lock_ends_without_ownership() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -908,8 +1002,13 @@ fn a_wait_within_a_limit_behind_a_held_writer_lock_ends_without_ownership() {
     let waiter = rearview_on(directory.path(), Arc::new(TestClock::default()));
     let status = WaitStatus::default();
 
-    let waited =
-        RefreshOwnership::acquire_within(&waiter, Duration::from_secs(1), &status).unwrap();
+    let waited = RefreshOwnership::acquire_within(
+        &waiter,
+        Duration::from_secs(1),
+        &status,
+        &Cancellation::default(),
+    )
+    .unwrap();
 
     assert!(waited.is_none(), "a held refresh stays with its owner");
     assert_eq!(status.current(), Some(OtherRearview::Refreshing));
@@ -918,7 +1017,7 @@ fn a_wait_within_a_limit_behind_a_held_writer_lock_ends_without_ownership() {
 }
 
 #[test]
-fn an_owners_write_waits_for_its_own_batch_past_the_limit_without_revoking_it() {
+fn owners_write_waits_for_its_own_batch_past_limit_without_revoking_it() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
@@ -943,11 +1042,11 @@ fn an_owners_write_waits_for_its_own_batch_past_the_limit_without_revoking_it() 
 }
 
 #[test]
-fn an_uncontended_acquisition_publishes_no_wait() {
+fn uncontended_acquisition_publishes_no_wait() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let status = WaitStatus::default();
-    let owner = RefreshOwnership::acquire(&base, &status).unwrap();
+    let owner = RefreshOwnership::acquire(&base, &status, &Cancellation::default()).unwrap();
     assert_eq!(status.current(), None);
     drop(owner);
 }
@@ -965,13 +1064,14 @@ fn wait_for_a_published_wait(status: &WaitStatus) -> OtherRearview {
 }
 
 #[test]
-fn a_wait_for_another_processs_refresh_publishes_it() {
+fn wait_for_another_processs_refresh_publishes_it() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
-    let other = OtherProcessOwner::hold(base.path());
+    let other = AnotherRearviewsOwner::hold(base.path());
     let status = WaitStatus::default();
     thread::scope(|scope| {
-        let waiter = scope.spawn(|| RefreshOwnership::acquire(&base, &status));
+        let waiter =
+            scope.spawn(|| RefreshOwnership::acquire(&base, &status, &Cancellation::default()));
         assert_eq!(
             wait_for_a_published_wait(&status),
             OtherRearview::Refreshing
@@ -982,13 +1082,14 @@ fn a_wait_for_another_processs_refresh_publishes_it() {
 }
 
 #[test]
-fn a_wait_for_this_processs_own_refresh_publishes_no_wait() {
+fn wait_for_this_processs_own_refresh_publishes_no_wait() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let held = RefreshOwnership::acquire_for_test(&base).unwrap();
     let status = WaitStatus::default();
     thread::scope(|scope| {
-        let waiter = scope.spawn(|| RefreshOwnership::acquire(&base, &status));
+        let waiter =
+            scope.spawn(|| RefreshOwnership::acquire(&base, &status, &Cancellation::default()));
         let deadline = Instant::now() + POLL_EVERY * 3;
         while Instant::now() < deadline {
             assert_eq!(status.current(), None);
@@ -999,8 +1100,103 @@ fn a_wait_for_this_processs_own_refresh_publishes_no_wait() {
     });
 }
 
+/// A rebuild's exclusive lock on the session cache database in `base`,
+/// released `after` the first connection rearview opens to it starts
+/// opening.
+fn exclusive_lock_released_after_first_open(
+    base: &Path,
+    after: Duration,
+) -> super::super::connection::test_hooks::Installed {
+    let lock = Mutex::new(Some(exclusive_lock(base)));
+    super::super::connection::test_hooks::on_every_connection(base, move |_| {
+        if let Some(held) = lock.lock().unwrap().take() {
+            thread::spawn(move || {
+                thread::sleep(after);
+                drop(held);
+            });
+        }
+    })
+}
+
 #[test]
-fn an_observation_names_the_refreshs_process_without_waiting() {
+fn exclusive_lock_released_within_open_wait_doesnt_publish_rebuild() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
+    let _released =
+        exclusive_lock_released_after_first_open(base.path(), REBUILD_LOCK_THRESHOLD / 4);
+    let status = WaitStatus::default();
+
+    let owner = RefreshOwnership::acquire(&base, &status, &Cancellation::default()).unwrap();
+
+    assert_eq!(
+        status.current(),
+        None,
+        "a lock released within the waiter's open wait doesn't publish a wait"
+    );
+    drop(owner);
+}
+
+#[test]
+fn exclusive_lock_held_past_open_wait_publishes_rebuild_after_waiting() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
+    let rebuild = exclusive_lock(base.path());
+    let status = WaitStatus::default();
+    thread::scope(|scope| {
+        let started = Instant::now();
+        let waiter =
+            scope.spawn(|| RefreshOwnership::acquire(&base, &status, &Cancellation::default()));
+
+        assert_eq!(
+            wait_for_a_published_wait(&status),
+            OtherRearview::Rebuilding
+        );
+        assert!(
+            started.elapsed() >= REBUILD_LOCK_THRESHOLD / 2,
+            "the waiter waits for the lock before publishing the rebuild"
+        );
+        drop(rebuild);
+        waiter.join().unwrap().unwrap();
+    });
+}
+
+#[test]
+fn observation_doesnt_report_rebuild_for_lock_released_within_open_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
+    let _released =
+        exclusive_lock_released_after_first_open(base.path(), REBUILD_LOCK_THRESHOLD / 4);
+
+    assert_eq!(
+        observe(&base).unwrap(),
+        Observation::Idle,
+        "a lock released within the observation's open wait is observed as idle"
+    );
+}
+
+#[test]
+fn observation_reports_rebuild_for_lock_held_past_open_wait_after_waiting() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
+    let rebuild = exclusive_lock(base.path());
+    let started = Instant::now();
+
+    let observation = observe(&base).unwrap();
+
+    assert_eq!(observation, Observation::Unknown);
+    assert!(
+        started.elapsed() >= REBUILD_LOCK_THRESHOLD / 2,
+        "the observation waits for the lock before reporting"
+    );
+    drop(rebuild);
+}
+
+#[test]
+fn observation_names_refreshs_process_without_waiting() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     assert_eq!(observe(&base).unwrap(), Observation::Idle);
@@ -1019,7 +1215,7 @@ fn an_observation_names_the_refreshs_process_without_waiting() {
     drop(owner);
     assert_eq!(observe(&base).unwrap(), Observation::Idle);
 
-    let other = OtherProcessOwner::hold(base.path());
+    let other = AnotherRearviewsOwner::hold(base.path());
     assert!(matches!(
         observe(&base).unwrap(),
         Observation::Running {
@@ -1040,10 +1236,10 @@ fn an_observation_names_the_refreshs_process_without_waiting() {
 }
 
 #[test]
-fn another_processs_batch_holding_the_writer_lock_is_observed_as_its_refresh() {
+fn another_processs_batch_holding_writer_lock_is_observed_as_its_refresh() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
-    let other = OtherProcessOwner::start(base.path(), OwnerActivity::InsideBatch);
+    let other = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideBatch);
     assert!(matches!(
         observe(&base).unwrap(),
         Observation::Running {
@@ -1055,12 +1251,12 @@ fn another_processs_batch_holding_the_writer_lock_is_observed_as_its_refresh() {
 }
 
 #[test]
-fn a_takeover_from_this_process_is_another_processs_refresh_until_it_completes() {
+fn takeover_from_this_process_is_another_processs_refresh_until_it_completes() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let held = RefreshOwnership::acquire_for_test(&base).unwrap();
     expire_last_commit(base.path());
-    let other = OtherProcessOwner::hold(base.path());
+    let other = AnotherRearviewsOwner::hold(base.path());
 
     assert!(matches!(
         observe(&base).unwrap(),
@@ -1097,7 +1293,8 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
         .unwrap();
     let status = WaitStatus::default();
     thread::scope(|scope| {
-        let load = scope.spawn(|| RefreshOwnership::acquire(&base, &status));
+        let load =
+            scope.spawn(|| RefreshOwnership::acquire(&base, &status, &Cancellation::default()));
         wait_for_a_published_wait(&status);
 
         connection
@@ -1125,7 +1322,7 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
-    let other = OtherProcessOwner::start(base.path(), OwnerActivity::InsideRebuild);
+    let other = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideRebuild);
     let started = Instant::now();
 
     let lookup = super::super::InteractiveCache::at(base.clone())
@@ -1143,4 +1340,130 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
         "the reads don't wait for the rebuild"
     );
     drop(other);
+}
+
+/// How the ownership lifecycle sweep ends a refresh ownership whose write
+/// permission a failed batch revoked.
+#[derive(Clone, Copy, Debug)]
+enum RevokedOwnershipEnd {
+    /// Its operation finishes, dropping the ownership.
+    Finish,
+    /// This rearview shuts the cache down, as the TUI does at exit.
+    Shutdown,
+    /// Another rearview takes over once the last commit is older than the
+    /// takeover window, and then the operation finishes.
+    Takeover,
+}
+
+/// The refresh owning the cache, as `base` observes it; `None` while none
+/// does.
+fn observed_owner(base: &CacheBase) -> Option<RefreshOwner> {
+    match observe(base).unwrap() {
+        Observation::Running { owner, .. } => Some(owner),
+        Observation::Idle | Observation::Unknown | Observation::RebuildingHere => None,
+    }
+}
+
+/// A refresh ownership revoked at each batch lasts until its operation
+/// ends: this rearview keeps seeing its own refresh, another sees it
+/// running, and each end leaves the cache to another rearview at once,
+/// without clearing a replacement owner.
+#[test]
+fn revoked_ownership_lasts_until_its_operation_ends_and_no_longer() {
+    use crate::history::sqlite_cache::{AwaitedRefresh, Coordinator, NextStep};
+    for committed in 0..3 {
+        for end in [
+            RevokedOwnershipEnd::Finish,
+            RevokedOwnershipEnd::Shutdown,
+            RevokedOwnershipEnd::Takeover,
+        ] {
+            let case = format!("revoked after {committed} committed batches, ended by {end:?}");
+            let directory = tempfile::tempdir().unwrap();
+            let this = rearview(directory.path());
+            let other = rearview(directory.path());
+            let ownership = RefreshOwnership::acquire_for_test(&this).unwrap();
+            for _ in 0..committed {
+                ownership.token().write_batch(|| ()).unwrap();
+            }
+            fail_owner_commits(directory.path());
+            assert!(
+                ownership.token().write_batch(|| ()).is_err(),
+                "{case}: the batch whose commit fails doesn't commit"
+            );
+            allow_owner_commits(directory.path());
+
+            assert_eq!(
+                observed_owner(&this),
+                Some(RefreshOwner::ThisProcess),
+                "{case}: this rearview sees its revoked refresh as its own"
+            );
+            assert_eq!(
+                observed_owner(&other),
+                Some(RefreshOwner::AnotherProcess),
+                "{case}: another rearview finds the revoked refresh running"
+            );
+            assert_eq!(
+                NextStep::after_read_without_writing(&this),
+                NextStep::AwaitRefresh(AwaitedRefresh::ThisProcess),
+                "{case}: a read without writing waits for this rearview's refresh"
+            );
+
+            match end {
+                RevokedOwnershipEnd::Finish => drop(ownership),
+                RevokedOwnershipEnd::Shutdown => Coordinator::of(&this).shutdown(),
+                RevokedOwnershipEnd::Takeover => {
+                    expire_last_commit(directory.path());
+                    let replacement = RefreshOwnership::acquire_for_test(&other).unwrap();
+                    assert_eq!(
+                        observed_owner(&this),
+                        Some(RefreshOwner::AnotherProcess),
+                        "{case}: this rearview sees the replacement as another rearview's"
+                    );
+                    drop(ownership);
+                    assert_eq!(
+                        observed_owner(&other),
+                        Some(RefreshOwner::ThisProcess),
+                        "{case}: the revoked ownership's end keeps its replacement"
+                    );
+                    drop(replacement);
+                    continue;
+                }
+            }
+            assert!(
+                matches!(
+                    RefreshOwnership::try_acquire_now(&other).unwrap(),
+                    Acquisition::Acquired(_)
+                ),
+                "{case}: another rearview acquires ownership at once"
+            );
+        }
+    }
+}
+
+/// A rearview killed while its revoked ownership lasted keeps readers
+/// waiting only until its last commit is older than the takeover window.
+#[test]
+fn killed_revoked_owner_stops_holding_readers_once_its_last_commit_expires() {
+    let directory = tempfile::tempdir().unwrap();
+    let this = rearview(directory.path());
+    let killed = OtherProcessOwner::start(directory.path(), OwnerActivity::Revoked);
+    assert_eq!(
+        observe(&this).unwrap().awaited(),
+        Some(super::super::AwaitedRefresh::AnotherRearview(
+            OtherRearview::Refreshing
+        ))
+    );
+
+    drop(killed);
+    expire_last_commit(directory.path());
+
+    assert_eq!(
+        observe(&this).unwrap().awaited(),
+        None,
+        "a reader waits for an owner whose last commit is past the takeover window"
+    );
+    assert!(matches!(
+        RefreshOwnership::try_acquire_now(&this).unwrap(),
+        Acquisition::Acquired(_)
+    ));
 }

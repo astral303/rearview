@@ -24,19 +24,15 @@ const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(60 * 60);
 /// `~/.cache/rearview`, or `None` without a home directory.
 ///
 /// The override exists so tests that spawn the binary keep cache writes out of
-/// the user's real cache; it also lets a user relocate the cache outright.
+/// the user's real cache; it also lets a user relocate the cache outright. A
+/// unit test build reads a temporary directory of the running test's own,
+/// never the developer's cache, which another rearview may be refreshing
+/// while the tests run.
 pub(crate) fn user_cache_base() -> Option<PathBuf> {
-    cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), home::home_dir())
-}
-
-/// Root of the session caches: [`user_cache_base`]. A unit test build reads
-/// only a session cache `$REARVIEW_CACHE_DIR` names, never the developer's,
-/// which another rearview may be refreshing while the tests run.
-pub(crate) fn session_cache_base() -> Option<PathBuf> {
     #[cfg(test)]
-    return cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), None);
+    return Some(test_support::test_cache_directory());
     #[cfg(not(test))]
-    user_cache_base()
+    cache_base_from(std::env::var_os("REARVIEW_CACHE_DIR"), home::home_dir())
 }
 
 fn cache_base_from(
@@ -188,6 +184,20 @@ fn remove_stale_temp_files(directory: &Path, now: SystemTime) {
 pub(crate) mod test_support {
     use super::*;
     use crate::clock::TestClock;
+
+    thread_local! {
+        /// libtest runs each test on a thread of its own, so the directory
+        /// is the test's, and it is removed when the test ends.
+        static TEST_CACHE_DIRECTORY: tempfile::TempDir =
+            tempfile::tempdir().expect("a temporary session cache directory");
+    }
+
+    /// The running test's own session cache directory, created on its first
+    /// use. A thread the test starts gets a directory of its own: hand it
+    /// this path instead.
+    pub(crate) fn test_cache_directory() -> PathBuf {
+        TEST_CACHE_DIRECTORY.with(|directory| directory.path().to_path_buf())
+    }
 
     pub(crate) struct TempFileFixture {
         pub(crate) leftover: PathBuf,
@@ -394,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_stalled_past_the_stale_age_loses_its_temp_file() {
+    fn write_stalled_past_stale_age_loses_its_temp_file() {
         let directory = tempfile::tempdir().unwrap();
         let clock = TestClock::default();
         let fixture = TempFileFixture::in_directory(directory.path(), &clock);

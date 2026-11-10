@@ -126,6 +126,14 @@ pub enum AppError {
         .floor_bytes / 1_000_000_000
     )]
     SessionCacheOutOfSpace { free_bytes: u64, floor_bytes: u64 },
+
+    /// Neither `REARVIEW_CACHE_DIR` nor a home directory names where the
+    /// session cache goes: nothing runs.
+    #[error(
+        "no directory for the session cache. Set REARVIEW_CACHE_DIR to a writable directory \
+         and run rearview again."
+    )]
+    NoSessionCacheDirectory,
 }
 
 /// `bytes` in gigabytes, rounded down to one decimal place, so a drive

@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn database_backed_sessions_validate_the_current_logical_fingerprint() {
+fn database_backed_sessions_validate_current_logical_fingerprint() {
     let session = every_record_sessions()
         .into_iter()
         .find(|session| session.row.source == Source::OpenCode)
@@ -15,7 +15,15 @@ fn database_backed_sessions_validate_the_current_logical_fingerprint() {
     cache.admit_storage(storage).unwrap();
     cache
         .write(
-            &SessionRecord::listed(storage, Source::OpenCode, &root, &stub, &session.row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                Source::OpenCode,
+                &root,
+                &stub,
+                &session.row,
+            )
+            .unwrap(),
         )
         .unwrap();
     let super::super::CatalogueSession::Listed(cached) = cache
@@ -34,16 +42,17 @@ fn database_backed_sessions_validate_the_current_logical_fingerprint() {
         Err(AppError::SessionCacheSourceChanged(_))
     ));
     assert!(
-        cached
+        !cached
             .load_content()
             .unwrap()
             .full_text
-            .contains("fresh database text")
+            .contains("fresh database text"),
+        "a changed session database's copy is read without parsing the database"
     );
 }
 
 #[test]
-fn a_resumed_childs_earlier_files_are_dependencies_before_splicing() {
+fn resumed_childs_earlier_files_are_dependencies_before_splicing() {
     let home = tempfile::tempdir().unwrap();
     let child = crate::history::format::codex::test_support::write_edited_thread_with_subagents(
         home.path(),
@@ -61,6 +70,7 @@ fn a_resumed_childs_earlier_files_are_dependencies_before_splicing() {
         .provider()
         .storage()
         .parse_session(
+            crate::history::FOR_FIXTURES,
             &stub,
             &root,
             None,
@@ -69,7 +79,15 @@ fn a_resumed_childs_earlier_files_are_dependencies_before_splicing() {
         )
         .unwrap()
         .unwrap();
-    let record = SessionRecord::listed(storage_of(source), source, &root, &stub, &row).unwrap();
+    let record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
+        storage_of(source),
+        source,
+        &root,
+        &stub,
+        &row,
+    )
+    .unwrap();
     assert!(
         record
             .catalogue
@@ -92,7 +110,7 @@ fn a_resumed_childs_earlier_files_are_dependencies_before_splicing() {
 }
 
 #[test]
-fn changing_or_removing_an_earlier_codex_rollout_invalidates_ordinary_text() {
+fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
     let home = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
     let thread = crate::history::format::codex::test_support::write_edited_thread_with_subagents(
@@ -148,7 +166,13 @@ fn changing_or_removing_an_earlier_codex_rollout_invalidates_ordinary_text() {
         .entries(storage, &root.path, CACHE_KEY)
         .unwrap()
         .unwrap();
-    let fresh = normalized_session(Source::Codex, &thread.newest, &[]).unwrap();
+    let fresh = normalized_session(
+        crate::history::FOR_FIXTURES,
+        Source::Codex,
+        &thread.newest,
+        &[],
+    )
+    .unwrap();
     assert_eq!(
         format!("{:?}", read.entries),
         format!("{:?}", fresh.entries)
@@ -168,7 +192,13 @@ fn changing_or_removing_an_earlier_codex_rollout_invalidates_ordinary_text() {
         Err(AppError::SessionCacheSourceChanged(_))
     ));
     let (missing, _) = source_record(Source::Codex, &thread.newest);
-    let fresh = normalized_session(Source::Codex, &thread.newest, &[]).unwrap();
+    let fresh = normalized_session(
+        crate::history::FOR_FIXTURES,
+        Source::Codex,
+        &thread.newest,
+        &[],
+    )
+    .unwrap();
     assert_eq!(
         format!(
             "{:?}",
@@ -200,7 +230,7 @@ fn changing_or_removing_an_earlier_codex_rollout_invalidates_ordinary_text() {
 }
 
 #[test]
-fn a_bounded_read_doesnt_restore_an_unrelated_result() {
+fn bounded_read_doesnt_restore_unrelated_result() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     let lines = [
@@ -265,14 +295,18 @@ fn a_bounded_read_doesnt_restore_an_unrelated_result() {
     assert_eq!(bounded.messages.len(), 2);
     assert_eq!(bounded.malformed_lines, [3]);
     assert!(format!("{:?}", bounded.messages[0]).contains("requested text"));
-    assert!(matches!(
-        cache.entries(storage, &root.path, CACHE_KEY),
-        Err(AppError::SessionCacheSourceChanged(_))
-    ));
+    let full = cache
+        .entries(storage, &root.path, CACHE_KEY)
+        .unwrap()
+        .unwrap();
+    assert!(
+        format!("{:?}", full.entries).contains("\"original\""),
+        "a full read holds the stored result"
+    );
 }
 
 #[test]
-fn text_only_result_arrays_reconstruct_without_fetching_the_source() {
+fn text_only_result_arrays_reconstruct_without_fetching_source() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     let result = json!(["bare", {"type":"text","text":"content"}, {}, {"type":"text"}]);
@@ -301,7 +335,7 @@ fn text_only_result_arrays_reconstruct_without_fetching_the_source() {
 }
 
 #[test]
-fn omitted_results_require_a_cached_source_generation_even_when_the_file_exists() {
+fn object_result_reads_from_cache_without_its_source() {
     let base = tempfile::tempdir().unwrap();
     let source = base.path().join("source.jsonl");
     std::fs::write(
@@ -315,17 +349,26 @@ fn omitted_results_require_a_cached_source_generation_even_when_the_file_exists(
     .unwrap();
     let (mut record, root) = source_record(Source::Claude, &source);
     record.catalogue.files.clear();
+    let expected =
+        serde_json::to_value(&record.entries.as_ref().unwrap().as_ref().unwrap().entries[0].1)
+            .unwrap();
     let mut cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
-    assert!(matches!(
-        cache.entries(storage_of(Source::Claude), &root.path, CACHE_KEY),
-        Err(AppError::SessionCacheSourceChanged(_))
-    ));
+    std::fs::remove_file(&source).unwrap();
+    let read = cache
+        .entries(storage_of(Source::Claude), &root.path, CACHE_KEY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&read.entries[0].1).unwrap(),
+        expected,
+        "the object result passes through the cache unchanged"
+    );
 }
 
 #[cfg(windows)]
 #[test]
-fn alternate_windows_path_spelling_matches_the_cached_generation() {
+fn alternate_windows_path_spelling_matches_cached_generation() {
     use crate::history::format::RecordLine;
     use std::sync::Arc;
     let base = tempfile::tempdir().unwrap();

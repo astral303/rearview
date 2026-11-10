@@ -2,7 +2,7 @@ use super::Selection;
 use crate::log_entry::{ContentBlock, Tool};
 use rusqlite::{Connection, Row, Statement, params};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub(super) struct Writer<'connection> {
     part: Statement<'connection>,
@@ -46,6 +46,7 @@ impl<'connection> Writer<'connection> {
                 content: Some(Value::Array(items)),
                 ..
             } = block
+                && columns.result_shape == Some(LOSSLESS_ARRAY)
             {
                 let part = connection.last_insert_rowid();
                 for (position, value) in items.iter().enumerate() {
@@ -109,26 +110,20 @@ impl<'a> Columns<'a> {
                 content,
                 standalone_tool_name,
             } => {
-                let (text, result_shape) = match content {
-                    Some(Value::String(text)) => (Some(text.as_str()), None),
+                let (text, json, result_shape) = match content {
+                    Some(Value::String(text)) => (Some(text.as_str()), None, None),
                     Some(Value::Array(items)) if items.iter().all(is_lossless_item) => {
-                        (None, Some("array"))
+                        (None, None, Some(LOSSLESS_ARRAY))
                     }
-                    Some(Value::Array(items))
-                        if items
-                            .iter()
-                            .any(|item| item.get("text").and_then(Value::as_str).is_some()) =>
-                    {
-                        (None, Some("array-source"))
-                    }
-                    Some(_) => (None, Some("external")),
-                    None => (None, None),
+                    Some(other) => (None, Some(other.to_string()), Some(VERBATIM_JSON)),
+                    None => (None, None, None),
                 };
                 Self {
                     kind: "result",
                     text,
                     call_id: Some(tool_use_id),
                     name: standalone_tool_name.as_deref(),
+                    json,
                     result_shape,
                     ..Self::default()
                 }
@@ -144,6 +139,12 @@ impl<'a> Columns<'a> {
         }
     }
 }
+
+/// A result array whose every item is a string or a text item:
+/// `result_items` holds it.
+const LOSSLESS_ARRAY: &str = "array";
+/// Any other result content: `parts.json` holds it as recorded.
+const VERBATIM_JSON: &str = "json";
 
 fn is_lossless_item(item: &Value) -> bool {
     match item {
@@ -208,22 +209,6 @@ pub(super) fn read(connection: &Connection, selected: &Selection) -> rusqlite::R
     Ok(blocks)
 }
 
-pub(super) fn external_results(
-    connection: &Connection,
-    selected: &Selection,
-) -> rusqlite::Result<HashSet<(i64, usize)>> {
-    connection
-        .prepare(&format!(
-            "SELECT p.entry, p.part FROM parts p WHERE p.entry IN ({}) \
-             AND p.result_shape IN ('external', 'array-source')",
-            selected.ids,
-        ))?
-        .query_map(rusqlite::params_from_iter(&selected.parameters), |row| {
-            Ok((row.get(0)?, row.get::<_, i64>(1)? as usize))
-        })?
-        .collect()
-}
-
 fn block_of(row: &Row, array: Option<Vec<Value>>) -> rusqlite::Result<ContentBlock> {
     let kind: String = row.get(2)?;
     let text: Option<String> = row.get(3)?;
@@ -251,7 +236,10 @@ fn block_of(row: &Row, array: Option<Vec<Value>>) -> rusqlite::Result<ContentBlo
             content: match text {
                 Some(text) => Some(Value::String(text)),
                 None => match row.get::<_, Option<String>>(8)?.as_deref() {
-                    Some("array" | "array-source") => Some(Value::Array(array.unwrap_or_default())),
+                    Some(LOSSLESS_ARRAY) => Some(Value::Array(array.unwrap_or_default())),
+                    Some(VERBATIM_JSON) => {
+                        super::json_value(row.get::<_, Option<String>>(7)?.as_deref())?
+                    }
                     _ => None,
                 },
             },

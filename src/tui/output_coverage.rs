@@ -1,9 +1,9 @@
 //! Every display output over each registered agent's every-record session,
-//! read through the session row's agent. The tests fail on a record kind an
-//! output drops, on a hidden record kind an output shows, on a call whose run
-//! shows another summary-mode row than its fixture names, and on a call an
-//! output shows as raw JSON. Each agent's session and markers are in its
-//! provider's `ProviderFixture`.
+//! read through the session row's agent from the session cache a load wrote.
+//! The tests fail on a record kind an output drops, on a hidden record kind an
+//! output shows, on a call whose run shows another summary-mode row than its
+//! fixture names, and on a call an output shows as raw JSON. Each agent's
+//! session and markers are in its provider's `ProviderFixture`.
 
 use super::export::{ExportFormat, ExportOptions, export_content, format_entry_for_clipboard};
 use super::viewer::{
@@ -11,7 +11,10 @@ use super::viewer::{
     render_parsed_conversation,
 };
 use crate::clock::{Clock, TestClock};
-use crate::display::{DisplayFormat, DisplayOptions, printout, read_session_to_print};
+use crate::display::{DisplayFormat, DisplayOptions, printout};
+use crate::history::environment::test_support::{
+    cache_session, current_copy, environment_reading, test_cache_base,
+};
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use crate::history::{Conversation, DisplayEntries, InteractiveCache};
 use std::collections::BTreeSet;
@@ -21,30 +24,30 @@ const WITH_TOOLS_AND_THINKING: ExportOptions = ExportOptions {
     show_thinking: true,
 };
 
-/// `row`'s entries as the TUI's exports and clipboard copy read them, without
-/// a session cache.
+/// Cache `session` in the test's session cache, where the outputs read it.
+fn cache_every_record_session(session: &AgentSession) {
+    let row = &session.row;
+    cache_session(row.source, &row.path, &row.subagents);
+}
+
+/// `row`'s entries as the TUI's exports and clipboard copy read them from the
+/// test's session cache.
 fn entries_of(row: &Conversation) -> DisplayEntries {
-    crate::history::display_log_entries_interactively(
-        &InteractiveCache::default(),
+    current_copy(crate::history::display_log_entries_interactively(
+        &InteractiveCache::at(test_cache_base()),
         row.source,
         &row.path,
         &row.subagents,
-    )
-    .unwrap()
-    .value
-    .expect("a read without a session cache parses the transcripts")
+    ))
 }
 
 fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
-    let conversation = parse_conversation_file_interactively(
-        &InteractiveCache::default(),
+    let conversation = current_copy(parse_conversation_file_interactively(
+        &InteractiveCache::at(test_cache_base()),
         row.source,
         &row.path,
         &row.subagents,
-    )
-    .unwrap()
-    .value
-    .expect("a read without a session cache parses the transcripts");
+    ));
     let options = RenderOptions {
         tool_display,
         show_thinking: true,
@@ -53,6 +56,7 @@ fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
         expanded_tool_outputs: BTreeSet::new(),
         can_expand: false,
         today: TestClock::default().today(),
+        zone: TestClock::default().zone(),
     };
     render_parsed_conversation(&conversation, &options)
         .lines
@@ -85,7 +89,13 @@ fn outputs(row: &Conversation) -> Vec<(&'static str, String)> {
         ..DisplayOptions::default()
     };
     let printed = |format| {
-        let session = read_session_to_print(None, std::slice::from_ref(row), &row.path).unwrap();
+        let session = crate::history::printed_log_entries(
+            &environment_reading(std::slice::from_ref(row)),
+            row.source,
+            &row.path,
+            false,
+        )
+        .unwrap();
         printout(session, &printout_options, format)
     };
     let export = |format| {
@@ -114,6 +124,7 @@ fn outputs(row: &Conversation) -> Vec<(&'static str, String)> {
 /// Each output's dropped record kinds and shown hidden record kinds.
 fn display_gaps(session: &AgentSession) -> Vec<String> {
     let agent = session.row.source;
+    cache_every_record_session(session);
     let mut gaps = Vec::new();
     for (output, text) in outputs(&session.row) {
         for marker in &session.markers {
@@ -148,6 +159,7 @@ fn every_display_output_shows_each_agents_record_kinds_and_no_hidden_one() {
 /// key.
 fn call_gaps(session: &AgentSession) -> Vec<String> {
     let agent = session.row.source;
+    cache_every_record_session(session);
     let calls: Vec<_> = session
         .markers
         .iter()

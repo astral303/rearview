@@ -1,12 +1,16 @@
 //! Loading every provider's conversations, at once or streamed to the TUI.
 
+use super::listing::{self, SessionOrigin, SessionTimes};
 use super::load_meter::{AgentMeter, LoadMeter};
-use super::provider::{Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions};
-use super::sqlite_cache::refresh::RefreshOwner;
-use super::sqlite_cache::{Observation, OperationScope, OtherRearview, Patience};
+use super::provider::{
+    Deleted, DiscoveredSession, FoundSession, LeftOutRows, SkippedSessions, UnreadableDirectory,
+};
+use super::sqlite_cache::{
+    AwaitedRefresh, Cancellation, Observation, OperationScope, OtherRearview, Patience,
+};
 use super::{
     Conversation, Environment, FilterTerm, KnownSessions, LoadProgress, LoaderMessage,
-    RefreshOptions, Source, Workspace,
+    RefreshOptions, Source, StaleSession,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Moment;
@@ -84,6 +88,7 @@ struct ProviderHistory {
     /// Each provider that loaded, in registration order, with the sessions
     /// its discovery found.
     discovered: Vec<(Source, Vec<DiscoveredSession>)>,
+    unreadable_directories: Vec<(Source, UnreadableDirectory)>,
 }
 
 impl ProviderHistory {
@@ -112,6 +117,7 @@ impl ProviderHistory {
             failures: Vec::new(),
             usable: false,
             discovered: Vec::new(),
+            unreadable_directories: Vec::new(),
         };
         for &storage in environment.storages() {
             let root_on_disk = storage
@@ -149,6 +155,12 @@ impl ProviderHistory {
                         report(LoaderMessage::Batch(loaded.conversations));
                     }
                     history.discovered.push((source, loaded.discovered));
+                    history.unreadable_directories.extend(
+                        loaded
+                            .unreadable_directories
+                            .into_iter()
+                            .map(|directory| (source, directory)),
+                    );
                 }
                 Err(error) => {
                     if let Some(term) = sessions_not_loaded_term(source, &error) {
@@ -225,6 +237,9 @@ pub struct LoadedHistory {
     pub discovered: Vec<(Source, Vec<DiscoveredSession>)>,
     /// Each agent whose sessions could not be listed, and why.
     pub failures: Vec<(Source, AppError)>,
+    /// Each directory an agent's discovery could not list, in registration
+    /// order.
+    pub unreadable_directories: Vec<(Source, UnreadableDirectory)>,
 }
 
 /// The conversations of [`load_history`], waiting for refresh ownership as
@@ -235,49 +250,53 @@ pub fn load_all_conversations(
     show_last: bool,
     debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
-    Ok(load_history(
+    let operation = OperationScope::new(
+        environment.cache_base(),
+        Patience::UntilAcquired,
+        Arc::default(),
+    );
+    let history = load_history(
         environment,
         show_last,
         debug_level,
         None,
         LeftOutRows::NONE,
-        Patience::UntilAcquired,
-    )?
-    .conversations)
+        &operation,
+    )?;
+    operation.finish()?;
+    Ok(history.conversations)
 }
 
 /// Every agent's conversations from every project, and what the load found
-/// but ignores. A root holding a changed session waits for refresh
-/// ownership as `patience` allows, then reads the cache as it is. `meter`
-/// records what each agent's load read, and its wait. A changed session
-/// whose cached row `left_out` holds keeps that row unread. A row without any
-/// time is dated `environment`'s current time.
+/// but ignores, read under `operation`: a root holding a changed session
+/// waits for refresh ownership as its patience allows, then reads the cache
+/// as it is. The caller finishes the operation. `meter` records what each
+/// agent's load read. A changed session whose cached row `left_out` holds
+/// keeps that row unread. A row without any time is dated `environment`'s
+/// current time.
 pub fn load_history(
     environment: &Environment,
     show_last: bool,
     debug_level: Option<DebugLevel>,
     meter: Option<&LoadMeter>,
     left_out: LeftOutRows,
-    patience: Patience,
+    operation: &OperationScope,
 ) -> Result<LoadedHistory> {
     let mut conversations = Vec::new();
     let mut ignored = Vec::new();
-    let status = meter.map_or_else(Arc::default, |meter| Arc::clone(meter.wait_status()));
-    let operation = OperationScope::new(environment.cache_base(), patience, status);
     let history = ProviderHistory::load(
         environment,
         show_last,
         debug_level,
         meter,
         left_out,
-        &operation,
+        operation,
         &mut |message| match message {
             LoaderMessage::Batch(batch) => conversations.extend(batch),
             LoaderMessage::Ignored(term) => ignored.push(term),
             _ => {}
         },
     )?;
-    operation.finish()?;
     if !history.usable {
         return Err(history.into_fatal_error());
     }
@@ -294,6 +313,7 @@ pub fn load_history(
         ignored,
         discovered: history.discovered,
         failures: history.failures,
+        unreadable_directories: history.unreadable_directories,
     })
 }
 
@@ -370,22 +390,29 @@ impl ProgressThrottle {
 /// Every provider's conversations read with `options`, streamed to `tx` as
 /// the list shows them, ending with [`LoaderMessage::Done`] or
 /// [`LoaderMessage::Fatal`]. `meter` records what the load read and what
-/// it waits for.
+/// it waits for. Once `cancellation` is set, the load parses nothing more.
 pub fn stream_all_conversations(
     tx: &Sender<LoaderMessage>,
     environment: &Environment,
     options: RefreshOptions,
     meter: &LoadMeter,
+    cancellation: &Cancellation,
 ) {
     let operation = OperationScope::new(
         environment.cache_base(),
         Patience::UntilAcquired,
         Arc::clone(meter.wait_status()),
-    );
-    let loaded = if is_behind_another_refresh(environment) {
-        stream_cache_then_refresh(tx, environment, options, meter, &operation)
+    )
+    .cancelled_by(cancellation);
+    let (loaded, stale) = if is_behind_another_refresh(environment) {
+        // The refresh after the cached list carries each row's next step.
+        let loaded = stream_cache_then_refresh(tx, environment, options, meter, &operation);
+        (loaded, Vec::new())
     } else {
-        stream_history(tx, environment, options, meter, &operation).map(|(history, _)| history)
+        let loaded =
+            stream_history(tx, environment, options, meter, &operation).map(|(history, _)| history);
+        let stale = loaded.as_ref().map_or_else(|_| Vec::new(), stale_sessions);
+        (loaded, stale)
     };
     let have_writes_stopped = operation.has_lost_write_permission();
     let history = match loaded.and_then(|history| operation.finish().map(|()| history)) {
@@ -404,22 +431,40 @@ pub fn stream_all_conversations(
         let _ = tx.send(LoaderMessage::ProviderError);
     }
     if have_writes_stopped {
-        let _ = tx.send(LoaderMessage::CacheWritesStopped);
+        let _ = tx.send(LoaderMessage::CacheWritesStopped(stale));
     }
     let _ = tx.send(LoaderMessage::Done);
 }
 
-/// True when another rearview's refresh owns `environment`'s cache now.
+/// Every session `history` read from a copy older than its transcripts, or
+/// left unlisted because the cache holds no copy of it.
+fn stale_sessions(history: &ProviderHistory) -> Vec<StaleSession> {
+    history
+        .discovered
+        .iter()
+        .flat_map(|(source, sessions)| {
+            sessions
+                .iter()
+                .filter(|session| session.stale.is_some())
+                .map(move |session| StaleSession {
+                    source: *source,
+                    path: session.stub.locator.clone(),
+                })
+        })
+        .collect()
+}
+
+/// True when another rearview's refresh owns `environment`'s cache now and
+/// committed within the takeover window.
 fn is_behind_another_refresh(environment: &Environment) -> bool {
-    environment.cache_base().is_some_and(|base| {
-        matches!(
-            super::sqlite_cache::Coordinator::of(base).observe(),
-            Ok(Observation::Running {
-                owner: RefreshOwner::AnotherProcess,
-                ..
-            })
-        )
-    })
+    matches!(
+        super::sqlite_cache::Coordinator::of(environment.cache_base())
+            .observe()
+            .map(Observation::awaited),
+        Ok(Some(AwaitedRefresh::AnotherRearview(
+            OtherRearview::Refreshing
+        )))
+    )
 }
 
 /// Behind another rearview's ordinary refresh: stream the cache as it is,
@@ -467,7 +512,11 @@ fn stream_history(
                     let (unseen, mut unlisted) = seen.partition_unseen(conversations);
                     let (listed, outside_time): (Vec<_>, Vec<_>) =
                         unseen.into_iter().partition(|conversation| {
-                            conversation.message_times.has_message_within(&options.time)
+                            listing::is_listed(
+                                SessionOrigin::Discovered,
+                                SessionTimes::Messages(&conversation.message_times),
+                                &options.time,
+                            )
                         });
                     unlisted.extend(outside_time);
                     if !unlisted.is_empty() {
@@ -509,20 +558,23 @@ fn stream_history(
     Ok((history, known))
 }
 
-/// Every session that was started and never answered, newest first.
+/// Every session that was started and never answered, newest first, loaded
+/// under `operation`.
 ///
 /// Loads the whole corpus. Emptiness is a property of the parsed session, and
 /// one rule read there covers every agent.
-pub fn find_empty_sessions(
+fn find_empty_sessions(
     environment: &Environment,
     scope: DeleteEmptyScope,
+    operation: &OperationScope,
 ) -> Result<Vec<EmptySession>> {
     let workspace = match scope {
         DeleteEmptyScope::All => None,
-        DeleteEmptyScope::Local => Some(Workspace::current()?),
+        DeleteEmptyScope::Local => Some(environment.workspace()?),
     };
 
-    let mut empty = load_all_conversations(environment, false, None)?
+    let mut empty = load_history(environment, false, None, None, LeftOutRows::NONE, operation)?
+        .conversations
         .into_iter()
         .filter(|conversation| conversation.assistant_messages == 0)
         .filter(|conversation| {
@@ -542,21 +594,32 @@ pub fn find_empty_sessions(
 ///
 /// Each goes through the agent that recorded it, which also deletes what the
 /// agent stores beside the session, such as a Codex thread's earlier rollouts.
+/// The load and the deletes run as one refresh owner of the session cache:
+/// the providers read the transcripts they check before they delete them.
 pub fn delete_empty_sessions(
     environment: &Environment,
     scope: DeleteEmptyScope,
     delete: bool,
 ) -> Result<DeleteEmptySummary> {
-    let candidates = find_empty_sessions(environment, scope)?;
-    if !delete {
-        return Ok(DeleteEmptySummary {
+    let operation = OperationScope::new(
+        environment.cache_base(),
+        Patience::UntilAcquired,
+        Arc::default(),
+    );
+    let candidates = find_empty_sessions(environment, scope, &operation)?;
+    let summary = if delete {
+        let permit = operation.acquired_parse_permit()?;
+        delete_each(candidates, |session| {
+            super::provider::delete_session(permit, session.source, &session.path)
+        })?
+    } else {
+        DeleteEmptySummary {
             candidates,
             ..DeleteEmptySummary::default()
-        });
-    }
-    delete_each(candidates, |session| {
-        super::provider::delete_session(session.source, &session.path)
-    })
+        }
+    };
+    operation.finish()?;
+    Ok(summary)
 }
 
 /// Record a refused delete with its reason and carry on; stop at any other
@@ -736,7 +799,7 @@ mod tests {
     /// Rule 8: a cache write that finds less than 1 GB free on the cache's
     /// drive stops the command, which prints the free space.
     #[test]
-    fn a_load_whose_cache_write_finds_less_than_a_gigabyte_free_deletes_the_cache_and_fails() {
+    fn load_whose_cache_write_finds_less_than_gigabyte_free_deletes_cache_and_fails() {
         use crate::tui::claude_home::ClaudeHome;
         let home = ClaudeHome::new();
         home.write("first", 5, &["hello"]);
@@ -749,14 +812,7 @@ mod tests {
             )
             .with_free_space(950_000_000);
 
-        let Err(error) = load_history(
-            &environment,
-            false,
-            None,
-            None,
-            LeftOutRows::NONE,
-            Patience::UntilAcquired,
-        ) else {
+        let Err(error) = load_all_conversations(&environment, false, None) else {
             panic!("the load fails");
         };
 
@@ -770,6 +826,58 @@ mod tests {
             "history.sqlite3-shm",
         ] {
             assert!(!cache.path().join(file).exists(), "{file} is deleted");
+        }
+    }
+
+    /// The TUI's launch over `environment`: its last message.
+    fn launch_ending(environment: &Environment) -> LoaderMessage {
+        let (messages, received) = std::sync::mpsc::channel();
+        stream_all_conversations(
+            &messages,
+            environment,
+            RefreshOptions::default(),
+            &LoadMeter::default(),
+            &Cancellation::default(),
+        );
+        received.try_iter().last().expect("the launch reports")
+    }
+
+    /// A cache write that finds the drive short of space, at the first, the
+    /// middle or the last write, stops the TUI's launch before its next
+    /// parse.
+    #[test]
+    fn launch_whose_cache_write_finds_drive_short_parses_nothing_after_it() {
+        use crate::history::sqlite_cache::DriveRunningOut;
+        use crate::tui::claude_home::ChangedSessionsTemplate;
+        let template = ChangedSessionsTemplate::new();
+        let checks = {
+            let sessions = template.case();
+            let drive = Arc::new(DriveRunningOut::after(usize::MAX, || {}));
+            let ending = launch_ending(&sessions.environment().with_disk_space(drive.clone()));
+            assert!(matches!(ending, LoaderMessage::Done), "the launch succeeds");
+            drive.answers()
+        };
+        assert!(checks > 0, "the launch checks free space");
+
+        for roomy_checks in DriveRunningOut::check_points(checks) {
+            let sessions = template.case();
+            let watch = sessions.watch.clone();
+            let drive = DriveRunningOut::after(roomy_checks, move || watch.mark());
+
+            let ending = launch_ending(&sessions.environment().with_disk_space(Arc::new(drive)));
+
+            assert!(
+                matches!(
+                    ending,
+                    LoaderMessage::Fatal(AppError::SessionCacheOutOfSpace { .. })
+                ),
+                "running out after {roomy_checks} checks stops the launch"
+            );
+            assert_eq!(
+                sessions.watch.parses_after_mark(),
+                0,
+                "running out after {roomy_checks} checks stops parsing"
+            );
         }
     }
 }

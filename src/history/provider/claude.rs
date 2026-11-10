@@ -5,8 +5,7 @@ mod project_folder;
 pub(crate) use project_folder::convert_path_to_project_dir_name;
 use project_folder::{decode_project_dir_name_to_path, is_project_folder_of};
 
-use super::storage::UnreadableDirectory;
-use super::walk::{DirectoryLister, SessionFiles, SystemLister};
+use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
     SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch, SessionProvider,
@@ -22,7 +21,8 @@ use crate::history::format::claude::{
     CLAUDE_TRANSCRIPT, SUBAGENT_FILE_PREFIX, SUBAGENTS_DIR, rename, session_id_of, session_row,
 };
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, Source, Workspace};
+use crate::history::parser::ParsedSession;
+use crate::history::{ParsePermit, Source, Workspace};
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -157,7 +157,13 @@ impl SessionProvider for ClaudeProvider {
 }
 
 impl SessionRenamer for ClaudeProvider {
-    fn rename_session(&self, path: &Path, title: &str, _renamed_at: DateTime<Utc>) -> Result<()> {
+    fn rename_session(
+        &self,
+        _permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        _renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
         rename::append_session_rename(path, title)
     }
 }
@@ -166,8 +172,8 @@ impl SessionDeleter for ClaudeProvider {
     /// Claude deletes by session id rather than by path: the same transcript can
     /// exist under several project directories, and all of its copies go, each
     /// with the session directory holding its sub-agent transcripts.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        delete_session_under(&projects_root()?.path, path)
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        delete_session_under(permit, &projects_root()?.path, path)
     }
 }
 
@@ -226,11 +232,12 @@ impl SessionStorage for ClaudeStorage {
         root: &SessionRoot,
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        Ok(discover_projects(
-            lister,
-            root,
-            project_directories_newest_first(lister, &root.path)?,
-        ))
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
+        let found = discover_projects(&discovery, lister, root)?;
+        Ok(DiscoveredSessions {
+            unreadable_directories: discovery.into_unreadable_directories(),
+            ..found
+        })
     }
 
     /// Discovery lists every session a Claude session ID resolves to.
@@ -247,21 +254,26 @@ impl SessionStorage for ClaudeStorage {
     /// without it, the path decoded from the project folder's name.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
-        let Some(mut conversation) = session_row(stub, debug_level, on_transcript_read, clock)?
-        else {
-            return Ok(None);
-        };
-        let project_path = conversation.cwd.clone().unwrap_or_else(|| {
-            decode_project_dir_name_to_path(project_folder_name(&stub.locator).unwrap_or_default())
-        });
-        conversation.project_path = Some(project_path);
-        Ok(Some(conversation))
+    ) -> Result<ParsedSession> {
+        Ok(
+            session_row(permit, stub, debug_level, on_transcript_read, clock)?.map(
+                |mut conversation| {
+                    let project_path = conversation.cwd.clone().unwrap_or_else(|| {
+                        decode_project_dir_name_to_path(
+                            project_folder_name(&stub.locator).unwrap_or_default(),
+                        )
+                    });
+                    conversation.project_path = Some(project_path);
+                    conversation
+                },
+            ),
+        )
     }
 
     fn remove_superseded_cache(&self, cache_base: &Path) {
@@ -370,29 +382,18 @@ fn project_folder_name(path: &Path) -> Option<&str> {
     path.parent()?.file_name()?.to_str()
 }
 
-/// The sessions in each of `projects`, in that order, listed through
-/// `lister`. A project folder that cannot be listed is reported, and the
-/// others still list: on Windows, a folder Claude Code is deleting refuses
-/// to be listed until the delete completes.
+/// The sessions in each project folder under `root`, the most recently
+/// modified folder first: each folder listed through `discovery`, and each
+/// session's sub-agent transcripts through `lister`.
 fn discover_projects(
+    discovery: &DiscoveryLister,
     lister: &dyn DirectoryLister,
     root: &SessionRoot,
-    projects: Vec<PathBuf>,
-) -> DiscoveredSessions {
+) -> Result<DiscoveredSessions> {
     let mut discovered = DiscoveredSessions::complete(Vec::new());
-    for project in projects {
-        let transcripts = match walk::jsonl_files_at_depth(lister, &project, 0) {
-            Ok(transcripts) => transcripts,
-            Err(error) => {
-                discovered.unreadable_directories.push(UnreadableDirectory {
-                    path: project,
-                    error: error.to_string(),
-                });
-                continue;
-            }
-        };
+    for project in project_directories_newest_first(discovery, &root.path)? {
         let mut sessions = Vec::new();
-        for transcript in transcripts {
+        for transcript in walk::jsonl_files_at_depth(discovery, &project, 0)? {
             if is_subagent_transcript(&transcript) {
                 discovered.skipped += 1;
                 continue;
@@ -407,7 +408,7 @@ fn discover_projects(
         project_stubs.sort_by_key(|stub| std::cmp::Reverse(stub.fingerprint.modified));
         discovered.stubs.extend(project_stubs);
     }
-    discovered
+    Ok(discovered)
 }
 
 /// The project folders under `root`, listed through `lister`, most recently
@@ -479,7 +480,7 @@ fn stored_copies(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
 /// session directory (`tool-results/`, `subagents/`), and only copies
 /// Claude's format reads as its own. A sub-agent transcript copied with the
 /// session across projects counts once.
-fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
+fn delete_session_under(permit: ParsePermit<'_>, root: &Path, path: &Path) -> Result<Deleted> {
     let session_id = session_id_of(path).unwrap_or_default();
     // Validate format to prevent path traversal
     if session_id.is_empty()
@@ -489,11 +490,11 @@ fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
     {
         return Err(AppError::SessionNotFound(session_id.to_owned()));
     }
-    format::require_owned_transcript(Source::Claude, path)?;
+    format::require_owned_transcript(permit, Source::Claude, path)?;
 
     let mut copies = Vec::new();
     for copy in stored_copies(root, session_id)? {
-        if format::parse_owned_transcript(Source::Claude, &copy)?.is_some() {
+        if format::parse_owned_transcript(permit, Source::Claude, &copy)?.is_some() {
             copies.push(copy);
         }
     }
@@ -745,13 +746,16 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 pub(crate) mod tests {
     use super::*;
     use crate::agent::transcript::AgentTranscript;
-    use crate::history::environment::test_support::{load_rows, test_environment};
+    use crate::history::Conversation;
+    use crate::history::environment::test_support::{
+        load_rows, test_environment, waiting_operation,
+    };
     use crate::history::provider::contract_tests::{
         AgentSession, CONFIGURED_ARGUMENT, ExpectedCommand, FixtureIds, IdCase, Marker,
         ProviderFixture, copy_tree, list_row,
     };
     use crate::history::provider::storage::RootedStorage;
-    use crate::history::provider::{SessionRead, reread_sessions};
+    use crate::history::provider::{SessionRead, cache_sessions};
     use serde_json::{Value, json};
     use std::ffi::OsString;
 
@@ -794,6 +798,16 @@ pub(crate) mod tests {
     /// The projects root of the configuration directory `home`.
     fn projects_under(home: &Path) -> PathBuf {
         home.join("projects")
+    }
+
+    /// One listable session in the project folder `project_dir` under
+    /// `home`; returns its transcript.
+    fn write_contract_session(home: &Path, project_dir: &str, session: &str) -> PathBuf {
+        let transcript = projects_under(home)
+            .join(project_dir)
+            .join(format!("{session}.jsonl"));
+        write_transcript(&transcript);
+        transcript
     }
 
     /// A Claude Code configuration directory in a temporary directory, for
@@ -862,11 +876,11 @@ pub(crate) mod tests {
         }
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
-            let transcript = projects_under(home)
-                .join(PROJECT_DIR)
-                .join(format!("{session}.jsonl"));
-            write_transcript(&transcript);
-            transcript
+            write_contract_session(home, PROJECT_DIR, session)
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_contract_session(home, "-tmp-claude-other-project", session)
         }
 
         fn every_record_session(&self) -> AgentSession {
@@ -985,7 +999,7 @@ pub(crate) mod tests {
         }
 
         fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted> {
-            delete_session_under(&projects_under(home), locator)
+            delete_session_under(crate::history::FOR_FIXTURES, &projects_under(home), locator)
         }
 
         fn session_working_dir(&self) -> PathBuf {
@@ -1211,8 +1225,13 @@ pub(crate) mod tests {
         let subagents = [subagent];
 
         let row = list_row(Source::Claude, &transcript, &subagents);
-        let opened =
-            AgentTranscript::load_owned(None, Source::Claude, &transcript, &subagents).unwrap();
+        let opened = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
+            Source::Claude,
+            &transcript,
+            &subagents,
+        )
+        .unwrap();
 
         assert_eq!(row.message_count, 4);
         assert_eq!(opened.messages.len(), 4);
@@ -1241,8 +1260,13 @@ pub(crate) mod tests {
             .iter()
             .map(|path| parsed_alone(path).total_tokens)
             .sum();
-        let opened =
-            AgentTranscript::load_owned(None, Source::Claude, &transcript, &subagents).unwrap();
+        let opened = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
+            Source::Claude,
+            &transcript,
+            &subagents,
+        )
+        .unwrap();
         assert!(session.message_count > alone.message_count);
         assert_eq!(session.message_count, opened.messages.len());
         assert_eq!(session.total_tokens, alone.total_tokens + thread_tokens);
@@ -1380,7 +1404,8 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(session_dir.join("subagents")).unwrap();
         std::fs::write(session_dir.join("subagents"), "not a directory").unwrap();
 
-        let deleted = delete_session_under(root.path(), &transcript).unwrap();
+        let deleted =
+            delete_session_under(crate::history::FOR_FIXTURES, root.path(), &transcript).unwrap();
 
         assert_eq!(deleted, Deleted::just_the_session());
         assert!(!transcript.exists());
@@ -1397,6 +1422,7 @@ pub(crate) mod tests {
         copy_dir_recursive(&original, &fork).unwrap();
 
         let deleted = delete_session_under(
+            crate::history::FOR_FIXTURES,
             root.path(),
             &original.join(format!("{FIXTURE_SESSION}.jsonl")),
         )
@@ -1430,12 +1456,20 @@ pub(crate) mod tests {
 
         for project in [&original, &fork] {
             let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
-            let SessionRead::Listed(read) =
-                reread_sessions(&environment, Source::Claude, &[&transcript], false)
-                    .pop()
-                    .unwrap()
-                    .into_read()
-            else {
+            let operation = waiting_operation(&environment);
+            let outcome = cache_sessions(
+                &environment,
+                Source::Claude,
+                &[&transcript],
+                false,
+                &operation,
+                crate::history::load_meter::AgentMeter::UNMETERED,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+            operation.finish().unwrap();
+            let (SessionRead::Listed(read), _) = outcome.into_parts() else {
                 panic!("{} was not read as a listed session", transcript.display());
             };
             let subagents_dir = project.join(FIXTURE_SESSION).join("subagents");
@@ -1468,7 +1502,8 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let deleted = delete_session_under(root.path(), &transcript).unwrap();
+        let deleted =
+            delete_session_under(crate::history::FOR_FIXTURES, root.path(), &transcript).unwrap();
 
         assert_eq!(deleted.stored, Stored::SessionFiles(1));
         assert!(!transcript.exists());
@@ -1584,31 +1619,6 @@ pub(crate) mod tests {
                 "{load}"
             );
         }
-    }
-
-    /// A file where a project folder should be cannot be listed, as a folder
-    /// mid-delete cannot on Windows.
-    #[test]
-    fn project_folder_that_cannot_be_listed_leaves_others_listed() {
-        let root = fixture_root();
-        let unreadable = root.path().join("-tmp-unreadable");
-        std::fs::write(&unreadable, "not a directory").unwrap();
-
-        let discovered = discover_projects(
-            &SystemLister,
-            &SessionRoot::new(root.path()),
-            vec![unreadable.clone(), root.path().join(FIXTURE_PROJECT)],
-        );
-
-        assert_eq!(discovered.stubs.len(), 1);
-        assert_eq!(
-            discovered
-                .unreadable_directories
-                .iter()
-                .map(|directory| &directory.path)
-                .collect::<Vec<_>>(),
-            [&unreadable]
-        );
     }
 
     /// A Claude session's `ch_` reference and project id are digests of its

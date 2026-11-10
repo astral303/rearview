@@ -1,6 +1,5 @@
 use crate::clock::Clock;
 use crate::history::{Conversation, ParseError};
-use chrono::Local;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -121,10 +120,7 @@ fn with_debug_log(f: impl FnOnce(&mut fs::File) -> std::io::Result<()>) -> std::
 
 /// `clock`'s current local time as the debug log writes it.
 fn log_timestamp(clock: &dyn Clock) -> impl std::fmt::Display {
-    clock
-        .wall()
-        .with_timezone(&Local)
-        .format("%Y-%m-%d %H:%M:%S")
+    clock.local_wall().format("%Y-%m-%d %H:%M:%S")
 }
 
 /// Log a debug message to the debug log file as `[timestamp] message`.

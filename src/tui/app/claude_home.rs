@@ -1,7 +1,7 @@
 //! Claude Code sessions written to a temporary configuration directory, for
 //! app tests that read sessions again through the production entry points:
 //! Claude's storage pinned to that directory, a lister the test can make
-//! refuse a directory, and a session cache when the test gives one.
+//! refuse a directory, and the test's own session cache unless it gives one.
 
 use super::{App, ToolDisplayMode, TuiSearchOptions};
 use crate::clock::{Clock, TestClock};
@@ -10,7 +10,8 @@ use crate::history::environment::test_support::waiting_operation;
 use crate::history::load_meter::AgentMeter;
 use crate::history::provider::walk::test_support::ScriptedLister;
 use crate::history::provider::{
-    LeftOutRows, RootedStorage, SessionRoot, SessionStorage, load_sessions,
+    LeftOutRows, ParseWatch, RootedStorage, SessionRoot, SessionStorage, WatchedStorage,
+    load_sessions,
 };
 use crate::history::sqlite_cache::SqliteCache;
 use crate::history::{CacheBase, Conversation, Environment, ProcessIdentity, Source};
@@ -104,7 +105,7 @@ impl ClaudeHome {
     }
 
     /// Claude's storage pinned here, listed through this home's lister, on
-    /// test time, without a session cache.
+    /// test time, with this test's own session cache.
     pub(crate) fn environment(&self) -> Environment {
         self.environment_on(Arc::new(TestClock::default()))
     }
@@ -113,7 +114,7 @@ impl ClaudeHome {
     pub(crate) fn environment_on(&self, clock: Arc<dyn Clock>) -> Environment {
         Environment::new(
             vec![self.storage],
-            None,
+            crate::cache_file::test_support::test_cache_directory(),
             ProcessIdentity::default(),
             clock,
             self.lister.clone(),
@@ -130,7 +131,7 @@ impl ClaudeHome {
     ) -> Environment {
         Environment::new(
             vec![self.storage],
-            Some(cache_base.to_path_buf()),
+            cache_base.to_path_buf(),
             process,
             clock,
             self.lister.clone(),
@@ -157,11 +158,131 @@ impl ClaudeHome {
         rows
     }
 
-    /// An app listing every session here, reading them without a session
-    /// cache on test time.
+    /// An app listing every session here, loaded through this test's own
+    /// session cache on test time.
     pub(crate) fn app(&self) -> App {
         let environment = self.environment();
         app_reading(self.rows(&environment), environment)
+    }
+}
+
+/// Claude Code sessions in two homes, five in the first and two in the
+/// second, cached by a load and each changed since. Set up once for a
+/// sweep: each case reads the same transcripts over a copy of that cache.
+pub(crate) struct ChangedSessionsTemplate {
+    homes: Arc<[ClaudeHome; 2]>,
+    transcripts: Vec<PathBuf>,
+    cache: TemplateCache,
+}
+
+impl ChangedSessionsTemplate {
+    pub(crate) fn new() -> Self {
+        let homes = Arc::new([ClaudeHome::new(), ClaudeHome::new()]);
+        let mut transcripts = Vec::new();
+        for (root, (home, sessions)) in homes.iter().zip([5, 2]).enumerate() {
+            for index in 0..sessions {
+                let id = format!("0f000000-0000-4000-8000-0000000000{root}{index}");
+                let minute = (root * 10 + index) as u32;
+                transcripts.push((root, home.write(&id, minute, &["a question"])));
+            }
+        }
+        let paths: Vec<PathBuf> = transcripts.iter().map(|(_, path)| path.clone()).collect();
+        let sessions = ChangedSessionsInTwoRoots::over(Arc::clone(&homes), paths, admitted_cache());
+        let environment = sessions.environment();
+        let operation = waiting_operation(&environment);
+        sessions.load(&environment, &operation);
+        operation.finish().unwrap();
+        for (root, transcript) in transcripts {
+            homes[root].append(&transcript, 30, "the newest question");
+        }
+        Self {
+            homes,
+            transcripts: sessions.transcripts,
+            cache: TemplateCache::new(sessions.cache),
+        }
+    }
+
+    /// The sessions over a copy of the cache, read through a storage whose
+    /// parses a new `watch` sees.
+    pub(crate) fn case(&self) -> ChangedSessionsInTwoRoots {
+        ChangedSessionsInTwoRoots::over(
+            Arc::clone(&self.homes),
+            self.transcripts.clone(),
+            self.cache.copy(),
+        )
+    }
+}
+
+/// The sessions of a [`ChangedSessionsTemplate`] over a session cache of
+/// their own, read as two roots of one storage whose parses `watch` sees.
+pub(crate) struct ChangedSessionsInTwoRoots {
+    _homes: Arc<[ClaudeHome; 2]>,
+    pub(crate) transcripts: Vec<PathBuf>,
+    pub(crate) cache: tempfile::TempDir,
+    pub(crate) watch: ParseWatch,
+    storage: &'static dyn SessionStorage,
+}
+
+impl ChangedSessionsInTwoRoots {
+    /// The sessions of a template set up for this test alone.
+    pub(crate) fn new() -> Self {
+        ChangedSessionsTemplate::new().case()
+    }
+
+    fn over(
+        homes: Arc<[ClaudeHome; 2]>,
+        transcripts: Vec<PathBuf>,
+        cache: tempfile::TempDir,
+    ) -> Self {
+        let watch = ParseWatch::default();
+        let storage: &'static dyn SessionStorage = Box::leak(Box::new(WatchedStorage {
+            inner: Source::Claude.provider().storage(),
+            roots: homes
+                .iter()
+                .map(|home| SessionRoot::new(home.project().parent().unwrap()))
+                .collect(),
+            watch: watch.clone(),
+        }));
+        Self {
+            _homes: homes,
+            transcripts,
+            cache,
+            watch,
+            storage,
+        }
+    }
+
+    /// Every session here, newest first, as a full load under `operation`
+    /// through `environment` lists them.
+    pub(crate) fn load(
+        &self,
+        environment: &Environment,
+        operation: &crate::history::OperationScope,
+    ) -> Vec<Conversation> {
+        load_sessions(
+            environment,
+            self.storage,
+            false,
+            None,
+            AgentMeter::UNMETERED,
+            LeftOutRows::NONE,
+            operation,
+            &mut |_, _| {},
+        )
+        .unwrap()
+        .conversations
+    }
+
+    /// The storage reading both roots, on test time, with the session cache
+    /// these sessions were cached in.
+    pub(crate) fn environment(&self) -> Environment {
+        Environment::new(
+            vec![self.storage],
+            self.cache.path().to_path_buf(),
+            ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+            Arc::new(crate::history::provider::walk::SystemLister),
+        )
     }
 }
 
@@ -196,6 +317,38 @@ pub(crate) fn admitted_cache() -> tempfile::TempDir {
     .mark_admitted()
     .unwrap();
     directory
+}
+
+/// A session cache directory a sweep sets up once. Each case starts from a
+/// copy, so the setup runs once per sweep, not once per case.
+pub(crate) struct TemplateCache(tempfile::TempDir);
+
+impl TemplateCache {
+    /// `cache` as a template. Drop every connection to it first, so no
+    /// write or checkpoint changes its files while a case copies them.
+    pub(crate) fn new(cache: tempfile::TempDir) -> Self {
+        Self(cache)
+    }
+
+    /// A new session cache directory holding a copy of every file here.
+    pub(crate) fn copy(&self) -> tempfile::TempDir {
+        let copy = tempfile::tempdir().unwrap();
+        copy_directory(self.0.path(), copy.path());
+        copy
+    }
+}
+
+fn copy_directory(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir(&target).unwrap();
+            copy_directory(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
 }
 
 fn user_line(minute: u32, second: usize, text: &str) -> String {

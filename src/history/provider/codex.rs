@@ -3,7 +3,7 @@
 
 use super::sqlite::{self, SchemaPin};
 use super::subagents::SubagentForest;
-use super::walk::{DirectoryLister, SessionFiles, SystemLister, Transcripts};
+use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister, Transcripts};
 use super::{
     Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
     ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
@@ -17,7 +17,7 @@ use crate::error::{AppError, Result, SessionDatabaseFailure};
 use crate::history::format::codex::{ForksContinuing, RolloutFileName, ThreadKind};
 use crate::history::format::dropped::DroppedRecords;
 use crate::history::format::{self, SessionFormat, codex};
-use crate::history::{Conversation, Source, parser};
+use crate::history::{ParsePermit, Source, parser};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -109,8 +109,14 @@ impl SessionProvider for CodexProvider {
 impl SessionRenamer for CodexProvider {
     /// A Codex title lives in the session index, not the transcript, so a
     /// rename appends an index record and leaves the rollout untouched.
-    fn rename_session(&self, path: &Path, title: &str, renamed_at: DateTime<Utc>) -> Result<()> {
-        format::require_owned_transcript(Source::Codex, path)?;
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        format::require_owned_transcript(permit, Source::Codex, path)?;
         append_index_record(path, &thread_id_of(path)?, title, renamed_at)
     }
 }
@@ -126,8 +132,8 @@ impl SessionDeleter for CodexProvider {
     ///
     /// Remove nothing while a fork continues one of those rollouts: Codex
     /// reads the fork's earlier turns from them.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Codex, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Codex, path)?;
         let Some(thread_id) =
             RolloutFileName::parse_path(path).map(|name| name.thread_id.to_owned())
         else {
@@ -480,7 +486,12 @@ impl SessionStorage for CodexStorage {
         root: &SessionRoot,
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        Ok(CodexThreadIndex::under(root, lister)?.discovered(root))
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
+        let index = CodexThreadIndex::under(root, &discovery)?;
+        Ok(DiscoveredSessions {
+            unreadable_directories: discovery.into_unreadable_directories(),
+            ..index.discovered(root)
+        })
     }
 
     fn rediscover_unlisted_session(
@@ -501,16 +512,17 @@ impl SessionStorage for CodexStorage {
     /// leaves the row uncached.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<parser::ParsedSession> {
         if let Some(database) = state_database_beside_sessions_tree(&root.path) {
             SCHEMA_PIN.warn_when_schema_outruns_reader(&database, debug_level);
         }
-        let thread = codex::read_thread(&stub.locator, DroppedRecords::default())?;
+        let thread = codex::read_thread(permit.admit(), &stub.locator, DroppedRecords::default())?;
         let discarded = thread
             .as_ref()
             .map(|thread| {
@@ -529,6 +541,7 @@ impl SessionStorage for CodexStorage {
             ..stub.clone()
         };
         let row = parser::process_linked_session(
+            permit,
             &shown,
             thread.map(|thread| thread.projection),
             &codex::CODEX_ROLLOUT,
@@ -940,6 +953,11 @@ pub(super) mod tests {
             write_rollout(home, "2026-08-18T09-00-00", session)
         }
 
+        /// The day after [`Self::write_session`]'s, in that day's directory.
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_rollout(home, "2026-08-19T09-00-00", session)
+        }
+
         fn every_record_session(&self) -> AgentSession {
             let line = |second: u32, kind: &str, payload: Value| {
                 json!({
@@ -1208,7 +1226,14 @@ pub(super) mod tests {
             panic!("one thread: {:?}", discovered.stubs);
         };
         let conversation = CodexStorage
-            .parse_session(stub, &root, None, &|| {}, &TestClock::default())
+            .parse_session(
+                crate::history::FOR_FIXTURES,
+                stub,
+                &root,
+                None,
+                &|| {},
+                &TestClock::default(),
+            )
             .unwrap()
             .expect("the thread lists with the conversation it inherits");
 
@@ -1326,7 +1351,12 @@ pub(super) mod tests {
         let transcript = write_rollout(home.path(), "2026-08-19T10-00-00", THREAD);
 
         CodexProvider
-            .rename_session(&transcript, "renamed\nCodex", TestClock::start_wall())
+            .rename_session(
+                crate::history::FOR_FIXTURES,
+                &transcript,
+                "renamed\nCodex",
+                TestClock::start_wall(),
+            )
             .unwrap();
 
         let index = std::fs::read_to_string(home.path().join("session_index.jsonl")).unwrap();
@@ -1335,7 +1365,7 @@ pub(super) mod tests {
         assert_eq!(record["thread_name"], "renamed Codex");
         assert_eq!(record["updated_at"], "2026-07-01T12:00:00.000Z");
         let reparsed = codex::CODEX_ROLLOUT
-            .parse_transcript(&transcript)
+            .parse_transcript(crate::history::FOR_FIXTURES, &transcript)
             .unwrap()
             .unwrap();
         assert_eq!(reparsed.title.as_deref(), Some("renamed Codex"));
@@ -1364,7 +1394,9 @@ pub(super) mod tests {
         )
         .unwrap();
 
-        let deleted = CodexProvider.delete_session(&newest).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &newest)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1408,7 +1440,9 @@ pub(super) mod tests {
             ],
         );
 
-        CodexProvider.delete_session(&parent).unwrap();
+        CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &parent)
+            .unwrap();
 
         assert_eq!(
             codex::index_titles(&home.path().join("session_index.jsonl")),
@@ -1436,7 +1470,9 @@ pub(super) mod tests {
             THREAD,
         );
 
-        let deleted = CodexProvider.delete_session(&reverted).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &reverted)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1463,7 +1499,9 @@ pub(super) mod tests {
             SUBAGENT_THREAD,
         );
 
-        let deleted = CodexProvider.delete_session(&subagent).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &subagent)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1497,7 +1535,9 @@ pub(super) mod tests {
             SUBAGENT_THREAD,
         );
 
-        let deleted = CodexProvider.delete_session(&parent).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &parent)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1554,7 +1594,9 @@ pub(super) mod tests {
         let fork = rollout_path(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
         write_continuing_rollout(&fork, OTHER_THREAD, EDITED_ROLLOUT_ID, 100);
 
-        let refusal = CodexProvider.delete_session(&edited).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &edited)
+            .unwrap_err();
 
         assert!(matches!(refusal, AppError::DeleteRefused(_)), "{refusal:?}");
         assert_eq!(
@@ -1578,7 +1620,9 @@ pub(super) mod tests {
             .join(format!("rollout-2026-08-20T11-00-00-{OTHER_THREAD}.jsonl"));
         write_continuing_rollout(&fork, OTHER_THREAD, THREAD, 100);
 
-        let refusal = CodexProvider.delete_session(&first).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &first)
+            .unwrap_err();
 
         assert!(refusal.to_string().contains(OTHER_THREAD), "{refusal}");
         assert!(first.exists());
@@ -1609,7 +1653,9 @@ pub(super) mod tests {
         let unrelated = archived_rollout_path(home.path(), "2026-08-17T07-00-00", OTHER_THREAD);
         std::fs::copy(fixture("rollout.jsonl"), &unrelated).unwrap();
 
-        let deleted = CodexProvider.delete_session(&current).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &current)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1638,7 +1684,9 @@ pub(super) mod tests {
             SUBAGENT_THREAD,
         );
 
-        let deleted = CodexProvider.delete_session(&parent).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &parent)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1658,7 +1706,9 @@ pub(super) mod tests {
         let session = write_rollout(home.path(), "2026-08-18T09-00-00", THREAD);
         std::fs::write(home.path().join("archived_sessions"), "not a directory").unwrap();
 
-        let error = CodexProvider.delete_session(&session).unwrap_err();
+        let error = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap_err();
 
         assert!(matches!(error, AppError::Io(_)), "{error:?}");
         assert!(session.exists());
@@ -1681,13 +1731,17 @@ pub(super) mod tests {
             .open(&other)
             .unwrap();
 
-        let refusal = CodexProvider.delete_session(&session).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap_err();
 
         assert_eq!(refusal.to_string(), UNREAD_FILE_REFUSAL);
         assert!(session.exists());
         assert!(archived.exists());
         drop(lock);
-        CodexProvider.delete_session(&session).unwrap();
+        CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap();
         assert!(!session.exists());
         assert!(!archived.exists());
     }
@@ -1705,7 +1759,9 @@ pub(super) mod tests {
         let fork = rollout_path(home.path(), "2026-08-20T11-00-00", OTHER_THREAD);
         write_continuing_rollout(&fork, OTHER_THREAD, THREAD, 100);
 
-        let refusal = CodexProvider.delete_session(&current).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &current)
+            .unwrap_err();
 
         assert!(refusal.to_string().contains(OTHER_THREAD), "{refusal}");
         for file in [archived, current, fork] {
@@ -1725,7 +1781,9 @@ pub(super) mod tests {
             100,
         );
 
-        let deleted = CodexProvider.delete_session(&edited).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &edited)
+            .unwrap();
 
         assert_eq!(
             deleted,
@@ -1753,7 +1811,9 @@ pub(super) mod tests {
             .open(&other)
             .unwrap();
 
-        let refusal = CodexProvider.delete_session(&edited).unwrap_err();
+        let refusal = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &edited)
+            .unwrap_err();
 
         assert_eq!(
             refusal.to_string(),
@@ -1762,7 +1822,9 @@ pub(super) mod tests {
         assert!(first.exists());
         assert!(edited.exists());
         drop(lock);
-        CodexProvider.delete_session(&edited).unwrap();
+        CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &edited)
+            .unwrap();
         assert!(!edited.exists());
     }
 
@@ -1868,6 +1930,7 @@ pub(super) mod tests {
         let mut parent_alone = discovered.stubs[0].clone();
         parent_alone.subagents.clear();
         let parent_alone = parser::process_session_file(
+            crate::history::FOR_FIXTURES,
             &parent_alone,
             &codex::CODEX_ROLLOUT,
             None,
@@ -1906,6 +1969,7 @@ pub(super) mod tests {
         let announced = std::sync::atomic::AtomicUsize::new(0);
 
         parser::process_session_file(
+            crate::history::FOR_FIXTURES,
             &discovered.stubs[0],
             &codex::CODEX_ROLLOUT,
             None,
@@ -1938,6 +2002,7 @@ pub(super) mod tests {
             .clone();
         kept_only.subagents = vec![thread.kept.clone()];
         let kept_only = parser::process_session_file(
+            crate::history::FOR_FIXTURES,
             &kept_only,
             &codex::CODEX_ROLLOUT,
             None,
@@ -1975,7 +2040,9 @@ pub(super) mod tests {
         let nested = resolved_stub(home.path(), codex::test_support::NESTED_SUBAGENT).unwrap();
         assert_eq!(nested.locator, thread.nested);
 
-        let deleted = CodexProvider.delete_session(&thread.newest).unwrap();
+        let deleted = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &thread.newest)
+            .unwrap();
 
         assert_eq!(deleted.subagent_sessions, 5);
         let session_files = [&thread.root, &thread.first_edit, &thread.newest];
@@ -2000,7 +2067,14 @@ pub(super) mod tests {
             .unwrap();
 
         let row = CodexStorage
-            .parse_session(&stub, &root, None, &|| {}, &TestClock::default())
+            .parse_session(
+                crate::history::FOR_FIXTURES,
+                &stub,
+                &root,
+                None,
+                &|| {},
+                &TestClock::default(),
+            )
             .unwrap()
             .unwrap();
 
@@ -2633,7 +2707,9 @@ pub(super) mod tests {
         .unwrap();
         let before = surviving_rollouts(home.path());
 
-        let failure = CodexProvider.delete_session(&family.thread).unwrap_err();
+        let failure = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &family.thread)
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2671,8 +2747,12 @@ pub(super) mod tests {
         state_database::insert_edge(&connection, SUBAGENT_THREAD, NESTED_SUBAGENT_THREAD);
         drop(connection);
 
-        let deleted_through_database = CodexProvider.delete_session(&indexed.thread).unwrap();
-        let deleted_through_headers = CodexProvider.delete_session(&walked.thread).unwrap();
+        let deleted_through_database = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &indexed.thread)
+            .unwrap();
+        let deleted_through_headers = CodexProvider
+            .delete_session(crate::history::FOR_FIXTURES, &walked.thread)
+            .unwrap();
 
         assert_eq!(deleted_through_database, deleted_through_headers);
         assert_eq!(

@@ -2,6 +2,7 @@
 //! it was loaded.
 
 use super::fingerprint::CachedFingerprint;
+use super::listing::{self, SessionOrigin, SessionTimes};
 use super::loader::{SeenPaths, sessions_not_loaded_term};
 use super::provider::{
     self, FoundSession, ReadError, RediscoveredSessions, SessionOutcome, SessionRead, SessionStub,
@@ -72,6 +73,10 @@ pub struct SessionChanges {
     pub kept: Vec<KeptSession>,
     /// Listed sessions that are gone, or now hold no conversation, by path.
     pub removed: Vec<PathBuf>,
+    /// New sessions read from an out-of-date copy without a message inside
+    /// the list's window. Their next step decides whether the list shows
+    /// them.
+    pub pending: Vec<PendingSession>,
     /// The titles each agent stores beside its transcripts, by session id.
     pub external_titles: Vec<(Source, HashMap<String, SessionTitle>)>,
     /// The sessions the next refresh skips until their fingerprint changes.
@@ -96,11 +101,18 @@ pub struct KeptSession {
     pub next: NextStep,
 }
 
+/// A new session the list does not show until its next step reads it again.
+pub struct PendingSession {
+    pub source: Source,
+    pub path: PathBuf,
+    pub next: NextStep,
+}
+
 /// The one outcome of a list or session refresh on the TUI's background
 /// worker.
 pub enum RefreshOutcome {
     /// `Ctrl+R` in the list: the changes on disk since the list loaded.
-    Changes(SessionChanges),
+    Changes(Box<SessionChanges>),
     /// A session refresh: each requested session read again under refresh
     /// ownership, one outcome per session, each answering for its row's path.
     Cached(Vec<SessionOutcome>),
@@ -234,21 +246,33 @@ impl SessionChanges {
                 fingerprint: outcome.revision(),
                 has_transient_read_error: false,
             };
-            let next = outcome.next();
-            match outcome.into_read() {
+            let origin = if is_listed {
+                SessionOrigin::AlreadyListed
+            } else {
+                SessionOrigin::Discovered
+            };
+            let (read, next) = outcome.into_parts();
+            match read {
                 SessionRead::Listed(row) => {
-                    // A listed session stays listed as it changes; the time
-                    // filter decides only whether a new one joins.
-                    if is_listed || row.message_times.has_message_within(&time) {
+                    if listing::is_listed(origin, SessionTimes::Messages(&row.message_times), &time)
+                    {
                         self.updated.push(UpdatedSession {
                             row: *row,
                             replaces_listed_row: is_listed,
                             next,
                         });
-                    } else {
+                    } else if next == NextStep::Settled {
                         self.skipped
                             .unlisted
                             .insert(locator, FoundSession::of(&row));
+                    } else {
+                        // The newer messages the copy lacks may fall inside
+                        // the window.
+                        self.pending.push(PendingSession {
+                            source,
+                            path: locator,
+                            next,
+                        });
                     }
                 }
                 SessionRead::Empty => {

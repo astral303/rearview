@@ -6,7 +6,7 @@
 //! reads the parent's `subagents/<id>/meta.json` to attach each sub-agent to
 //! its parent.
 
-use super::walk::{self, DirectoryLister, SessionFiles, SystemLister};
+use super::walk::{self, DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
     RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
@@ -19,7 +19,7 @@ use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::format::grok::{self, SUMMARY_FILE, UPDATES_FILE};
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, Source, parser};
+use crate::history::{ParsePermit, Source, parser};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -124,8 +124,14 @@ impl SessionProvider for GrokProvider {
 
 impl SessionRenamer for GrokProvider {
     /// Set the manual title in `summary.json` and freeze Grok's auto title.
-    fn rename_session(&self, path: &Path, title: &str, _renamed_at: DateTime<Utc>) -> Result<()> {
-        format::require_owned_transcript(Source::Grok, path)?;
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        _renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        format::require_owned_transcript(permit, Source::Grok, path)?;
         let session_dir = session_dir_of(path)?;
         rewrite_summary_title(&session_dir.join(SUMMARY_FILE), title)?;
         write_atomically(
@@ -140,8 +146,8 @@ impl SessionDeleter for GrokProvider {
     /// Grok's search index. A sub-agent left behind lists as a session of its
     /// own, because the parent's `subagents/` is the only record that it is a
     /// thread. `grok sessions delete` removes only the session.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Grok, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Grok, path)?;
         let session_dir = session_dir_of(path)?;
         let sessions_root = sessions_root_of(&session_dir);
         let subagent_dirs = match sessions_root {
@@ -509,7 +515,8 @@ impl SessionStorage for GrokStorage {
         root: &SessionRoot,
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        let directories = SessionDirectories::walk(lister, &root.path)?;
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
+        let directories = SessionDirectories::walk(&discovery, &root.path)?;
         let walked = directories.walked.as_deref().unwrap_or_default();
         let children: HashSet<String> = walked
             .iter()
@@ -524,7 +531,7 @@ impl SessionStorage for GrokStorage {
                 session_stub(lister, root, directory, &|id| directories.locate(id))
             })
             .collect();
-        Ok(DiscoveredSessions::complete(stubs))
+        Ok(discovery.discovered(stubs))
     }
 
     /// A sub-agent opened by its ID: discovery lists its transcript under the
@@ -542,13 +549,15 @@ impl SessionStorage for GrokStorage {
 
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
+    ) -> Result<parser::ParsedSession> {
         parser::process_session_file(
+            permit,
             stub,
             &grok::GROK_UPDATES,
             debug_level,
@@ -559,9 +568,11 @@ impl SessionStorage for GrokStorage {
 
     /// Read each session's title from its `summary.json`. A rename in Grok or
     /// in rearview changes that file, not the transcript the cache validates
-    /// against.
+    /// against. Walked as discovery walks the root, so a directory that
+    /// cannot be listed keeps only its own sessions' titles out.
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
-        let Ok(directories) = SessionDirectories::walk(&SystemLister, &root.path) else {
+        let discovery = DiscoveryLister::beneath(&SystemLister, &root.path);
+        let Ok(directories) = SessionDirectories::walk(&discovery, &root.path) else {
             return HashMap::new();
         };
         directories
@@ -728,11 +739,17 @@ pub(super) mod tests {
 
     /// A listable session with a reply, returning its locator.
     fn write_session(home: &Path, id: &str) -> PathBuf {
+        write_session_recorded_in(home, PROJECT_DIR, PROJECT, id)
+    }
+
+    /// [`write_session`], recorded in the working directory `project`, whose
+    /// cwd directory is `cwd_dir`.
+    fn write_session_recorded_in(home: &Path, cwd_dir: &str, project: &str, id: &str) -> PathBuf {
         write_grok_session(
             &sessions_under(home),
-            PROJECT_DIR,
+            cwd_dir,
             id,
-            &summary(id, PROJECT, json!({"generated_title": "grok title"})),
+            &summary(id, project, json!({"generated_title": "grok title"})),
             &[
                 user(1_000, "grok question", 0),
                 reply(2_000, "grok answer", "p1"),
@@ -801,6 +818,24 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(home, session)
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_session_recorded_in(
+                home,
+                "%2Ftmp%2Fgrok-other-project",
+                "/tmp/grok-other-project",
+                session,
+            )
+        }
+
+        /// The cwd directory: discovery finds each session directory by
+        /// listing it.
+        fn listed_directory_of(&self, locator: &Path) -> Option<PathBuf> {
+            session_dir_of(locator)
+                .ok()?
+                .parent()
+                .map(Path::to_path_buf)
         }
 
         fn session_working_dir(&self) -> PathBuf {
@@ -1162,7 +1197,7 @@ pub(super) mod tests {
         let child = write_subagent(home.path(), SESSION, CHILD, PROJECT_DIR);
 
         let entries = grok::GROK_UPDATES
-            .session_entries(&session, &[child])
+            .session_entries(crate::history::FOR_FIXTURES, &session, &[child])
             .unwrap()
             .unwrap()
             .entries;
@@ -1210,6 +1245,7 @@ pub(super) mod tests {
 
         GrokProvider
             .rename_session(
+                crate::history::FOR_FIXTURES,
                 &locator,
                 "renamed\nGrok",
                 crate::clock::TestClock::start_wall(),
@@ -1275,7 +1311,9 @@ pub(super) mod tests {
         write_session(home.path(), OTHER_SESSION);
         let index = write_search_index(home.path(), &[SESSION, CHILD, OTHER_SESSION]);
 
-        GrokProvider.delete_session(&doomed).unwrap();
+        GrokProvider
+            .delete_session(crate::history::FOR_FIXTURES, &doomed)
+            .unwrap();
 
         assert_eq!(indexed_ids(&index), vec![OTHER_SESSION.to_owned()]);
     }
@@ -1302,7 +1340,9 @@ pub(super) mod tests {
         let holder = rusqlite::Connection::open(&index).unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
 
-        GrokProvider.delete_session(&doomed).unwrap();
+        GrokProvider
+            .delete_session(crate::history::FOR_FIXTURES, &doomed)
+            .unwrap();
 
         assert!(!session_dir_under(home.path(), SESSION).exists());
         holder.execute_batch("ROLLBACK;").unwrap();

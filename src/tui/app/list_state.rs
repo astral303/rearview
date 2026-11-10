@@ -1,8 +1,10 @@
-use super::App;
+use super::{App, AppMode};
 use crate::error::AppError;
+use crate::history::provider::Deleted;
 use crate::history::{Conversation, ExcludedProjects, Workspace};
+use crate::tui::list_change::{ListChange, ListChangeOutcome};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 impl App {
     pub(super) fn filter_indices<I>(&self, indices: I) -> Vec<usize>
@@ -124,15 +126,68 @@ impl App {
             .copied()
     }
 
+    /// Ask the background worker to delete the listed session at `path`.
+    pub(crate) fn request_delete(&mut self, path: &Path) {
+        let Some(row) = self.conversations.iter().find(|row| row.path == path) else {
+            let _ = crate::debug_log::log_debug(
+                &format!("No listed session to delete at {}", path.display()),
+                self.clock(),
+            );
+            return;
+        };
+        self.list_change = Some(ListChange::Delete {
+            source: row.source,
+            path: path.to_path_buf(),
+        });
+    }
+
+    /// Hand the background worker the confirmed rename or delete; `None`
+    /// while none waits.
+    pub(crate) fn begin_list_change(&mut self) -> Option<ListChange> {
+        self.list_change.take()
+    }
+
+    /// Show what a rename or delete did.
+    pub(crate) fn finish_list_change(&mut self, outcome: ListChangeOutcome) {
+        match outcome {
+            ListChangeOutcome::Renamed {
+                path,
+                title,
+                result,
+            } => self.finish_rename(&path, &title, result),
+            ListChangeOutcome::Deleted { path, result } => self.finish_delete(&path, result),
+        }
+    }
+
+    /// Remove the deleted session at `path` from the list and leave its
+    /// viewer, or report why it could not be deleted.
+    fn finish_delete(&mut self, path: &Path, result: crate::error::Result<Deleted>) {
+        match result {
+            Ok(_) => {
+                self.remove_from_list(path);
+                if matches!(&self.app_mode, AppMode::View(state) if state.conversation_path == path)
+                {
+                    self.exit_view_mode();
+                }
+            }
+            Err(error) => {
+                let _ = crate::debug_log::log_debug(
+                    &format!("Failed to delete session {}: {}", path.display(), error),
+                    self.clock(),
+                );
+                self.report_delete_failure(&error);
+            }
+        }
+    }
+
     pub(crate) fn report_delete_failure(&mut self, error: &AppError) {
         self.set_status(format!("Failed to delete: {error}"));
     }
 
-    pub(crate) fn remove_selected_from_list(&mut self) {
-        let Some(selected) = self.selected else {
-            return;
-        };
-        let Some(&conv_idx) = self.filtered.get(selected) else {
+    /// Remove the row of the session at `path`. The selection keeps its
+    /// position, or moves to the last row.
+    fn remove_from_list(&mut self, path: &Path) {
+        let Some(conv_idx) = self.conversations.iter().position(|row| row.path == path) else {
             return;
         };
 
@@ -158,7 +213,10 @@ impl App {
 
         if self.filtered.is_empty() {
             self.selected = None;
-        } else if selected >= self.filtered.len() {
+        } else if self
+            .selected
+            .is_some_and(|selected| selected >= self.filtered.len())
+        {
             self.selected = Some(self.filtered.len() - 1);
         }
 

@@ -1,15 +1,18 @@
-//! The TUI's one background worker: the launch, list `Ctrl+R` and session
-//! refreshes run on it one at a time, and their messages come back to the
-//! runtime through the supervisor.
+//! The TUI's one background worker: the launch, list `Ctrl+R`, session
+//! refreshes, renames and deletes run on it one at a time, and their messages
+//! come back to the runtime through the supervisor.
 
+use super::list_change::{ListChange, ListChangeOutcome};
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
+use crate::history::provider::{DirectFileRead, open_direct_file};
 use crate::history::sqlite_cache::Coordinator;
 use crate::history::{
-    Environment, LoaderMessage, OperationScope, OtherRearview, Patience, RefreshOptions,
-    RefreshOutcome, WaitStatus, stream_all_conversations,
+    Cancellation, Environment, LoaderMessage, OperationScope, OtherRearview, Patience,
+    RefreshOptions, RefreshOutcome, WaitStatus, stream_all_conversations,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
@@ -26,8 +29,15 @@ pub(crate) struct TaskSupervisor {
     load_meter: Arc<LoadMeter>,
     /// The running list or session refresh's outcome.
     refresh: Option<Receiver<Result<RefreshOutcome>>>,
-    /// The wait a list or session refresh publishes.
+    /// The running rename or delete's outcome, and its outcome should the
+    /// job stop without one.
+    change: Option<(Receiver<ListChangeOutcome>, ListChangeOutcome)>,
+    /// The running read of a file opened directly.
+    direct_file: Option<Receiver<Result<DirectFileRead>>>,
+    /// The wait a list or session refresh, a rename or a delete publishes.
     refresh_wait: Arc<WaitStatus>,
+    /// Set at shutdown: the running job parses nothing more.
+    cancellation: Cancellation,
 }
 
 impl TaskSupervisor {
@@ -48,7 +58,22 @@ impl TaskSupervisor {
             launch: None,
             load_meter,
             refresh: None,
+            change: None,
+            direct_file: None,
             refresh_wait: Arc::default(),
+            cancellation: Cancellation::default(),
+        }
+    }
+
+    /// One job's operation on the session cache: it waits for refresh
+    /// ownership as long as another rearview keeps it, publishes its wait,
+    /// and stops at shutdown.
+    fn job_operation(&self) -> impl FnOnce(&Environment) -> OperationScope + Send + 'static {
+        let wait = Arc::clone(&self.refresh_wait);
+        let cancellation = self.cancellation.clone();
+        move |environment| {
+            OperationScope::new(environment.cache_base(), Patience::UntilAcquired, wait)
+                .cancelled_by(&cancellation)
         }
     }
 
@@ -59,7 +84,10 @@ impl TaskSupervisor {
 
     /// True while a job runs.
     pub(crate) fn is_running_a_job(&self) -> bool {
-        self.launch.is_some() || self.refresh.is_some()
+        self.launch.is_some()
+            || self.refresh.is_some()
+            || self.change.is_some()
+            || self.direct_file.is_some()
     }
 
     /// Run the launch, reading sessions with `options`. Its messages come
@@ -68,9 +96,10 @@ impl TaskSupervisor {
         let (messages, received) = mpsc::channel();
         let environment = self.environment.clone();
         let meter = Arc::clone(&self.load_meter);
+        let cancellation = self.cancellation.clone();
         self.launch = Some(received);
         self.run(Box::new(move || {
-            stream_all_conversations(&messages, &environment, options, &meter);
+            stream_all_conversations(&messages, &environment, options, &meter, &cancellation);
         }));
     }
 
@@ -84,13 +113,47 @@ impl TaskSupervisor {
     ) {
         let (outcome, received) = mpsc::channel();
         let environment = self.environment.clone();
-        let wait = Arc::clone(&self.refresh_wait);
+        let operation = self.job_operation();
         self.refresh = Some(received);
         self.run(Box::new(move || {
-            let operation =
-                OperationScope::new(environment.cache_base(), Patience::UntilAcquired, wait);
+            let operation = operation(&environment);
             let refreshed = refresh(&environment, &operation);
             let _ = outcome.send(operation.finish().and(refreshed));
+        }));
+    }
+
+    /// Make `change` as one operation on the session cache that waits for
+    /// refresh ownership as long as another rearview keeps it. Its outcome
+    /// comes through [`Self::finished_change`].
+    pub(crate) fn change(&mut self, change: ListChange) {
+        let (outcome, received) = mpsc::channel();
+        let environment = self.environment.clone();
+        let operation = self.job_operation();
+        self.change = Some((received, change.stopped()));
+        self.run(Box::new(move || {
+            let operation = operation(&environment);
+            let changed = change.make(&operation);
+            // Ignore the finish: only a cache write that found the drive
+            // short of space fails it, and a rename or delete writes none.
+            let _ = operation.finish();
+            let _ = outcome.send(changed);
+        }));
+    }
+
+    /// Read the file at `path`, opened directly, with the preview `show_last`
+    /// selects, as one operation on the session cache that waits for refresh
+    /// ownership as long as another rearview keeps it. Its read comes through
+    /// [`Self::finished_direct_file`], failed as [`OperationScope::finish`]
+    /// fails.
+    pub(crate) fn read_direct_file(&mut self, path: PathBuf, show_last: bool) {
+        let (read, received) = mpsc::channel();
+        let environment = self.environment.clone();
+        let operation = self.job_operation();
+        self.direct_file = Some(received);
+        self.run(Box::new(move || {
+            let operation = operation(&environment);
+            let opened = open_direct_file(&environment, &path, show_last, &operation);
+            let _ = read.send(operation.finish().and(opened));
         }));
     }
 
@@ -130,25 +193,50 @@ impl TaskSupervisor {
         Some(outcome)
     }
 
+    /// The running rename or delete's outcome once it has one: a job that
+    /// stopped without one fails with [`AppError::RefreshStopped`].
+    pub(crate) fn finished_change(&mut self) -> Option<ListChangeOutcome> {
+        let (received, _) = self.change.as_ref()?;
+        let finished = match received.try_recv() {
+            Ok(outcome) => Some(outcome),
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        let (_, stopped) = self.change.take()?;
+        Some(finished.unwrap_or(stopped))
+    }
+
+    /// The running read of a file opened directly once it has one: a read
+    /// that stopped without one fails with [`AppError::RefreshStopped`].
+    pub(crate) fn finished_direct_file(&mut self) -> Option<Result<DirectFileRead>> {
+        let read = match self.direct_file.as_ref()?.try_recv() {
+            Ok(read) => read,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => Err(AppError::RefreshStopped),
+        };
+        self.direct_file = None;
+        Some(read)
+    }
+
     /// The other rearview the running job waits for; `None` while it does
     /// not wait or no job runs.
     pub(crate) fn waiting_for(&self) -> Option<OtherRearview> {
         if self.launch.is_some() {
             self.load_meter.waiting_for()
-        } else if self.refresh.is_some() {
+        } else if self.refresh.is_some() || self.change.is_some() || self.direct_file.is_some() {
             self.refresh_wait.current()
         } else {
             None
         }
     }
 
-    /// Take no more jobs, and give up this rearview's refresh ownership of
-    /// the session cache: the running job writes nothing more, and a job
-    /// waiting for ownership fails instead of acquiring it.
+    /// Take no more jobs, stop the running one before its next parse, and
+    /// give up this rearview's refresh ownership of the session cache: the
+    /// running job writes nothing more, and a job waiting for ownership
+    /// fails instead of acquiring it.
     pub(crate) fn shutdown(&mut self) {
         self.worker = None;
-        if let Some(base) = self.environment.cache_base() {
-            Coordinator::of(base).shutdown();
-        }
+        self.cancellation.cancel();
+        Coordinator::of(self.environment.cache_base()).shutdown();
     }
 }

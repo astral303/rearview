@@ -4,7 +4,7 @@
 use super::entries::path_text;
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::{RecordedSession, SessionCache, SessionRoot, SessionStub};
-use crate::history::{Conversation, ParseError, Source, TranscriptEntries};
+use crate::history::{Conversation, ParseError, ParsePermit, Source, TranscriptEntries};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -31,6 +31,11 @@ impl SessionStatus {
 /// row with it is not a current one.
 pub(super) const WRITING: &str = "writing";
 
+/// The SQL condition on a `sessions` row that holds unless its entries failed
+/// to read: an unlisted row's `entries_error` holds the reason it is not
+/// listed, not a failure.
+pub(super) const ENTRIES_NOT_FAILED: &str = "(status != 'listed' OR entries_error IS NULL)";
+
 /// One session as a load read it, for the database writer: its catalogue
 /// row and, for a listed session, its entries.
 pub(crate) struct SessionRecord {
@@ -38,6 +43,10 @@ pub(crate) struct SessionRecord {
     /// `None` for a session that is not listed; the reason `session_entries`
     /// failed for a listed one.
     pub(super) entries: Option<Result<TranscriptEntries, String>>,
+    /// The warning an agent command prints for a session that is not
+    /// listed, as [`crate::agent::diagnostic::AgentWarning::to_recorded`]
+    /// writes it; `None` for a listed one.
+    pub(super) unlisted_reason: Option<String>,
     pub(super) search_parts: Vec<SubagentSearchPart>,
 }
 
@@ -49,9 +58,11 @@ pub(super) struct SubagentSearchPart {
 
 impl SessionRecord {
     /// The record of `conversation`, `storage`'s session at `stub` under
-    /// `root`, with its entries as `session_entries` reads them. `None` when
-    /// the stub has no fingerprint to validate the record against.
+    /// `root`, with its entries as `session_entries` reads them with
+    /// `permit`. `None` when the stub has no fingerprint to validate the
+    /// record against.
     pub(crate) fn listed(
+        permit: ParsePermit<'_>,
         storage: SessionCache,
         source: Source,
         root: &SessionRoot,
@@ -63,7 +74,7 @@ impl SessionRecord {
         catalogue.describe(stub, conversation);
         let mut search_parts = Vec::new();
         let entries = catalogue
-            .read_entries(source, &stub.locator, &conversation.subagents)
+            .read_entries(permit, source, &stub.locator, &conversation.subagents)
             .map(|(entries, parts)| {
                 search_parts = parts;
                 entries
@@ -72,24 +83,28 @@ impl SessionRecord {
         Some(Self {
             catalogue,
             entries: Some(entries),
+            unlisted_reason: None,
             search_parts,
         })
     }
 
     /// The record of `storage`'s session at `stub` under `root`, read as
-    /// `status`, which is not [`SessionStatus::Listed`].
+    /// `status`, which is not [`SessionStatus::Listed`], with `reason`, the
+    /// warning an agent command prints for it.
     pub(crate) fn unlisted(
         storage: SessionCache,
         source: Source,
         root: &SessionRoot,
         stub: &SessionStub,
         status: SessionStatus,
+        reason: String,
     ) -> Option<Self> {
         let mut catalogue = CatalogueRow::of_stub(storage, source, root, stub, status)?;
         catalogue.handle = handle(source, stub, None);
         Some(Self {
             catalogue,
             entries: None,
+            unlisted_reason: Some(reason),
             search_parts: Vec::new(),
         })
     }
@@ -99,13 +114,14 @@ impl SessionRecord {
 /// `subagents` that reads. An unreadable sub-agent transcript is left out,
 /// as the session's entries leave it out.
 fn read_subagent_search_parts(
+    permit: ParsePermit<'_>,
     source: Source,
     subagents: &[std::path::PathBuf],
 ) -> crate::error::Result<(Vec<SubagentSearchPart>, BTreeSet<std::path::PathBuf>)> {
     let mut parts = Vec::new();
     let mut sources = BTreeSet::new();
     for (index, path) in subagents.iter().enumerate() {
-        if let Ok(Some(projection)) = source.provider().format().parse_transcript(path) {
+        if let Ok(Some(projection)) = source.provider().format().parse_transcript(permit, path) {
             sources.extend(
                 projection
                     .entries
@@ -224,13 +240,15 @@ impl CatalogueRow {
 
     fn read_entries(
         &mut self,
+        permit: ParsePermit<'_>,
         source: Source,
         path: &Path,
         subagents: &[std::path::PathBuf],
     ) -> crate::error::Result<(TranscriptEntries, Vec<SubagentSearchPart>)> {
         use crate::error::AppError;
-        let mut entries = crate::history::normalized_session(source, path, subagents)?;
-        let (mut search_parts, mut child_sources) = read_subagent_search_parts(source, subagents)?;
+        let mut entries = crate::history::normalized_session(permit, source, path, subagents)?;
+        let (mut search_parts, mut child_sources) =
+            read_subagent_search_parts(permit, source, subagents)?;
         let mut added_dependency = false;
         for path in transcript_paths(&entries)
             .into_iter()
@@ -250,8 +268,8 @@ impl CatalogueRow {
         }
         // Discover continuation dependencies before the validated parse.
         if added_dependency {
-            entries = crate::history::normalized_session(source, path, subagents)?;
-            (search_parts, child_sources) = read_subagent_search_parts(source, subagents)?;
+            entries = crate::history::normalized_session(permit, source, path, subagents)?;
+            (search_parts, child_sources) = read_subagent_search_parts(permit, source, subagents)?;
         }
         for path in transcript_paths(&entries)
             .into_iter()

@@ -1,15 +1,11 @@
+use super::session_store::SessionCopy;
+use super::view_state::DeferredCopy;
 use super::{Action, App, AppMode, DialogMode};
-use crate::history::provider::Operation;
+use crate::error::Result;
+use crate::history::DisplayEntries;
+use crate::tui::list_change::ListChange;
 use crossterm::event::{KeyCode, KeyModifiers};
-
-/// An export's course when the session is missing from the cache.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CopyMissing {
-    /// Wait for the session's refresh, then export.
-    WaitForTheRefresh,
-    /// Report the failure: the export already waited for the refresh.
-    Report,
-}
+use std::path::Path;
 
 const EXPORT_OPTIONS: [&str; 4] = [
     "Ledger (formatted)",
@@ -23,7 +19,9 @@ impl App {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.dialog_mode = DialogMode::None;
-                self.get_selected_path().map(Action::Delete)
+                let path = self.get_selected_path()?;
+                self.apply_finished_refreshes_before_editing(&path)?;
+                Some(Action::Delete(path))
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.dialog_mode = DialogMode::None;
@@ -210,18 +208,31 @@ impl App {
             DialogMode::Rename { input, .. } => input.trim().to_string(),
             _ => return,
         };
-        let Some(idx) = self.get_selected_conversation_index() else {
+        let Some(idx) = self
+            .get_selected_path()
+            .and_then(|path| self.apply_finished_refreshes_before_editing(&path))
+        else {
             self.dialog_mode = DialogMode::None;
             return;
         };
         let row = &self.conversations[idx];
-        let provider = row.source.provider();
-        let renamed = provider
-            .rename()
-            .or_refuse(provider.labels().display, Operation::Rename)
-            .and_then(|renamer| renamer.rename_session(&row.path, &title, self.clock().wall()));
-        match renamed {
-            Ok(()) => self.show_renamed_session(idx, &title),
+        self.list_change = Some(ListChange::Rename {
+            source: row.source,
+            path: row.path.clone(),
+            title,
+            renamed_at: self.clock().wall(),
+        });
+    }
+
+    /// Show the session at `path` renamed to `title`, or report why the
+    /// rename failed and keep the name box open.
+    pub(super) fn finish_rename(&mut self, path: &Path, title: &str, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                if let Some(idx) = self.conversations.iter().position(|row| row.path == path) {
+                    self.show_renamed_session(idx, title);
+                }
+            }
             Err(e) => {
                 self.status_message =
                     Some((format!("Failed to rename: {}", e), self.clock().now()));
@@ -229,37 +240,13 @@ impl App {
         }
     }
 
-    /// Show row `idx` renamed to `title`, keeping it selected. Beside a
-    /// session cache, the row shows `title` at once and a session refresh
-    /// reads the session again. Otherwise the session is read again now, and
-    /// a failed read keeps `title` on the row as it is: the rename already
-    /// saved it.
+    /// Show row `idx` renamed to `title`, keeping it selected. The row shows
+    /// `title` at once and a session refresh reads the session again.
     pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str) {
-        use crate::history::provider::SessionRead;
         let path = self.conversations[idx].path.clone();
-        let titled = Some(title.to_owned()).filter(|title| !title.is_empty());
-        if self.environment.cache_base().is_some() && !self.single_file_mode {
-            self.conversations[idx].custom_title = titled;
-            self.store.request_session_refresh(&path);
-        } else {
-            let read = self
-                .read_rows_again(&[idx])
-                .pop()
-                .expect("one read per row");
-            match read {
-                SessionRead::Listed(conv) => self.conversations[idx] = *conv,
-                SessionRead::Failed(_) | SessionRead::NotCached => {
-                    self.conversations[idx].custom_title = titled;
-                }
-                SessionRead::Missing | SessionRead::Empty => {
-                    self.status_message = Some((
-                        "Failed to rename: conversation became empty".to_string(),
-                        self.clock().now(),
-                    ));
-                    return;
-                }
-            }
-        }
+        self.conversations[idx].custom_title =
+            Some(title.to_owned()).filter(|title| !title.is_empty());
+        self.store.request_session_refresh(&path);
         self.dialog_mode = DialogMode::None;
         self.status_message = Some(("Session renamed".to_string(), self.clock().now()));
         self.refresh_search_data();
@@ -275,29 +262,72 @@ impl App {
         }
     }
 
-    /// Export the open session as the export menu's `option`; while its
-    /// refresh is pending, once it lands, so the export holds the newest
+    /// Export the open session as the export menu's `option`. JSONL copies
+    /// the transcript file at once: a refresh does not change the file. The
+    /// other formats render the session's current copy; while its refresh
+    /// is pending, or its copy is out of date or missing, they wait until
+    /// the session's refresh is applied, so the export holds the newest
     /// messages.
     pub(super) fn perform_export(&mut self, option: usize, to_clipboard: bool) {
-        if self.defers_copy() {
-            self.deferred_copy = Some(super::view_state::DeferredCopy::Export {
-                option,
-                to_clipboard,
-            });
+        if crate::tui::export::ExportFormat::from_index(option)
+            .is_some_and(crate::tui::export::ExportFormat::copies_the_transcript)
+        {
+            self.export_now(option, to_clipboard, None);
             return;
         }
-        self.export_now(option, to_clipboard, CopyMissing::WaitForTheRefresh);
+        let entries = if self.defers_copy() {
+            None
+        } else {
+            self.current_export_entries()
+        };
+        match entries {
+            Some(entries) => self.export_now(option, to_clipboard, Some(entries)),
+            None => {
+                self.deferred_copy = Some(DeferredCopy::Export {
+                    option,
+                    to_clipboard,
+                });
+            }
+        }
     }
 
-    /// Export the open session as the export menu's `option` from the cache.
-    /// When the session is missing from the cache, `missing` decides whether
-    /// the export waits for the session's refresh or reports the failure.
-    pub(super) fn export_now(&mut self, option: usize, to_clipboard: bool, missing: CopyMissing) {
-        let (source, path, subagents, options) = match &self.app_mode {
+    /// The entries an export of the open session writes: the file opened
+    /// directly outside every provider's session roots as the background
+    /// worker last parsed it, or the session's copy in the cache when it is
+    /// current. `None` for an out-of-date or missing copy, whose next step
+    /// is recorded.
+    pub(super) fn current_export_entries(&mut self) -> Option<DisplayEntries> {
+        if let Some(entries) = &self.opened_file_entries {
+            return Some(entries.clone());
+        }
+        let AppMode::View(state) = &self.app_mode else {
+            return None;
+        };
+        let path = state.conversation_path.clone();
+        let read = crate::history::display_log_entries_interactively(
+            &self.interactive_cache(),
+            state.conversation_source?,
+            &path,
+            &state.subagents,
+        );
+        match self.take_interactive(&path, read) {
+            SessionCopy::Current(copy) => Some(copy.into_value()),
+            SessionCopy::Older(_) | SessionCopy::Missing => None,
+        }
+    }
+
+    /// Export the open session as the export menu's `option`, rendering
+    /// `entries`, the session's; `None` for JSONL, which copies the
+    /// transcript file.
+    pub(super) fn export_now(
+        &mut self,
+        option: usize,
+        to_clipboard: bool,
+        entries: Option<DisplayEntries>,
+    ) {
+        let (path, options) = match &self.app_mode {
             AppMode::View(state) => (
-                state.conversation_source,
                 state.conversation_path.clone(),
-                state.subagents.clone(),
                 crate::tui::export::ExportOptions {
                     show_tools: state.tool_display.is_visible(),
                     show_thinking: state.show_thinking,
@@ -311,22 +341,8 @@ impl App {
             None => return,
         };
 
-        let mut next = crate::history::NextStep::Settled;
-        let mut is_copy_missing = false;
-        let read_entries = || {
-            let read = crate::history::display_log_entries_interactively(
-                &self.interactive_cache(),
-                source,
-                &path,
-                &subagents,
-            )
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-            next = read.next;
-            read.value.ok_or_else(|| {
-                is_copy_missing = true;
-                std::io::Error::other("the session is not in the session cache yet")
-            })
-        };
+        let read_entries =
+            || entries.ok_or_else(|| std::io::Error::other("the session's entries were not read"));
         let status = if to_clipboard {
             match crate::tui::export::export_content(&path, format, options, read_entries) {
                 Ok(content) => {
@@ -336,7 +352,7 @@ impl App {
                 Err(error) => Some(format!("Failed to read: {error}")),
             }
         } else {
-            let exported_at = self.clock().wall();
+            let exported_at = self.clock().local_wall();
             Some(
                 crate::tui::export::export_to_file(
                     &path,
@@ -348,14 +364,6 @@ impl App {
                 .message,
             )
         };
-        self.act_on_next_step(&path, next);
-        if is_copy_missing && missing == CopyMissing::WaitForTheRefresh {
-            self.deferred_copy = Some(super::view_state::DeferredCopy::Export {
-                option,
-                to_clipboard,
-            });
-            return;
-        }
         if let Some(status) = status {
             self.set_status(status);
         }

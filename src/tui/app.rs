@@ -2,11 +2,12 @@ use crate::clock::{Clock, Moment};
 use crate::config::KeyBindings;
 use crate::history::{
     Conversation, DrawingThread, Environment, ExcludedProjects, FilterTerm, InteractiveCache,
-    LoadProgress, SkippedSessions, Workspace, format_short_name_from_path,
+    LoadProgress, SkippedSessions, Workspace,
 };
 use crate::search::{self, SearchableConversation};
 #[cfg(test)]
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
+use crate::time_filter::TimeFilter;
 use crate::tui::export::{ClipboardDestination, copy_to_system_clipboard};
 #[cfg(test)]
 use crate::tui::semantic_worker::{SemanticSearchMessage, SemanticWorkerCommand};
@@ -21,7 +22,7 @@ use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -42,8 +43,8 @@ use search_state::{
 #[allow(unused_imports)]
 pub use types::{
     Action, AppMode, CountHighlight, DialogMode, Focus, LIST_LINES_PER_ITEM, ListScope,
-    ListSearchMode, LoadingState, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
-    ViewSearchMode, ViewState, list_lines_per_item,
+    ListSearchMode, LoadingState, OpenSessionStatus, SemanticProgress, SemanticResultMetadata,
+    TuiSearchOptions, ViewSearchMode, ViewState, list_lines_per_item,
 };
 
 /// App state
@@ -88,9 +89,12 @@ pub struct App {
     show_timing: bool,
     /// Whether the app is running in single file mode (direct input, no list)
     single_file_mode: bool,
-    /// In single-file mode, true when the opened file is a session its agent
-    /// stores rather than a copy elsewhere
-    is_opened_file_stored: bool,
+    /// In single-file mode, the background worker's read of the opened file
+    /// while it is asked for or runs
+    direct_file_read: Option<DirectFileJob>,
+    /// The entries of the file opened directly outside every provider's
+    /// session roots, as the background worker last parsed them, for exports
+    opened_file_entries: Option<crate::history::DisplayEntries>,
     /// Configurable keybindings
     keys: KeyBindings,
     /// Whether workspace filter is active (only show current project's conversations)
@@ -131,15 +135,15 @@ pub struct App {
     /// The session open (`Enter`) or a row click named, until the load runs
     /// one frame later, so that frame can show the list as opening
     pending_open: Option<PendingOpen>,
-    /// `Ctrl+R` in the viewer without a session cache, until the read runs
-    /// one frame later, so that frame can show the session as refreshing
-    pending_view_refresh: bool,
     /// The open session's refresh finished: the viewer reads it again from
-    /// the cache on the next frame
+    /// the cache, or shows the file opened directly as parsed, on the next
+    /// frame
     pending_view_reload: Option<view_state::ReloadedSession>,
     /// A copy or export asked for while the open session's refresh was
     /// pending, run once the refresh finishes
     deferred_copy: Option<view_state::DeferredCopy>,
+    /// A confirmed rename or delete, until the background worker takes it
+    list_change: Option<super::list_change::ListChange>,
     /// The load filters that narrowed this list, named for the user: the
     /// ones it launched with, then the terms the last load or refresh
     /// reported
@@ -167,6 +171,9 @@ pub struct App {
     /// True when rows preview their last messages (`--last`), as the load
     /// built them; a session read again or opened by ID gets the same preview
     show_last: bool,
+    /// The time window the list loaded under: a session new to the list joins
+    /// it only with a message inside the window
+    list_window: TimeFilter,
     /// The session the selection stays on while search results arrive after
     /// a refresh; any key or click clears it
     selection_anchor: Option<PathBuf>,
@@ -205,9 +212,13 @@ struct PendingOpen {
 
 type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
 
-/// True when the agent `Source` names stores the file at the path under the
-/// session id: [`crate::history::provider::is_stored_session`] outside tests.
-type StoredSessionCheck = fn(crate::history::Source, &str, &Path) -> bool;
+/// The background worker's read of a file opened directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectFileJob {
+    /// Asked for; the worker has not taken it yet.
+    Requested,
+    Running,
+}
 
 const SEARCH_SPINNER_DELAY: Duration = Duration::from_millis(100);
 const SEARCH_SPINNER_FRAME: Duration = Duration::from_millis(80);
@@ -224,7 +235,6 @@ struct AppParts {
     tool_display: ToolDisplayMode,
     show_thinking: bool,
     single_file_mode: bool,
-    is_opened_file_stored: bool,
     keys: KeyBindings,
     workspace_filter: bool,
     workspace: Option<Workspace>,
@@ -260,7 +270,8 @@ impl App {
             show_thinking: parts.show_thinking,
             show_timing: false,
             single_file_mode: parts.single_file_mode,
-            is_opened_file_stored: parts.is_opened_file_stored,
+            direct_file_read: None,
+            opened_file_entries: None,
             keys: parts.keys,
             workspace_filter: parts.workspace_filter,
             workspace: parts.workspace,
@@ -277,18 +288,23 @@ impl App {
             lexical_evidence: HashMap::new(),
             session_id_query: None,
             pending_open: None,
-            pending_view_refresh: false,
             pending_view_reload: None,
             deferred_copy: None,
+            list_change: None,
             active_filters: Vec::new(),
             launch_filter_count: 0,
             missing_earlier_turns,
             skipped_sessions: SkippedSessions::default(),
-            store: session_store::SessionStore::default(),
+            store: if parts.single_file_mode {
+                session_store::SessionStore::for_a_file_opened_directly()
+            } else {
+                session_store::SessionStore::default()
+            },
             cache_wait: None,
             environment: parts.environment,
             _drawing_thread: DrawingThread::mark_this_thread(),
             show_last: false,
+            list_window: TimeFilter::default(),
             selection_anchor: None,
             clipboard_writer: copy_to_system_clipboard,
             fork_if_known: known_fork,
@@ -298,7 +314,7 @@ impl App {
 
     /// The session cache as the drawing thread reads it.
     fn interactive_cache(&self) -> InteractiveCache {
-        InteractiveCache::of(self.environment.cache_base().cloned())
+        InteractiveCache::at(self.environment.cache_base().clone())
     }
 
     /// Copy `text`, reporting the outcome as a status message that names
@@ -342,28 +358,6 @@ impl App {
         }
     }
 
-    /// Create a new app with all conversations pre-loaded, reading every
-    /// provider's storage and no session cache, on `clock`
-    #[allow(dead_code)]
-    pub fn new(
-        conversations: Vec<Conversation>,
-        tool_display: ToolDisplayMode,
-        show_thinking: bool,
-        keys: KeyBindings,
-        exclude_projects: Vec<String>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self::new_with_options(
-            conversations,
-            tool_display,
-            show_thinking,
-            keys,
-            exclude_projects,
-            TuiSearchOptions::default(),
-            Environment::without_session_cache(clock),
-        )
-    }
-
     /// Create a new app with all conversations pre-loaded, reading
     /// `environment`
     #[allow(dead_code)]
@@ -402,7 +396,6 @@ impl App {
             tool_display,
             show_thinking,
             single_file_mode: false,
-            is_opened_file_stored: false,
             keys,
             workspace_filter: false,
             workspace: None,
@@ -441,7 +434,6 @@ impl App {
             tool_display,
             show_thinking,
             single_file_mode: false,
-            is_opened_file_stored: false,
             keys,
             workspace_filter: scope.workspace_filter,
             workspace: scope.workspace,
@@ -454,82 +446,33 @@ impl App {
         })
     }
 
-    /// Create an app for viewing one file, read with `source`'s format,
-    /// reading `environment`.
+    /// Create an app for viewing the file at `path`, reading `environment`.
+    /// It parses nothing: the viewer shows `Loading…` until the background
+    /// worker reads the file (see [`Self::begin_direct_file_read`]).
     pub fn new_single_file(
         path: PathBuf,
-        source: crate::history::Source,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
         keys: KeyBindings,
-        environment: Environment,
-    ) -> Self {
-        Self::new_single_file_with_stored_check(
-            path,
-            source,
-            tool_display,
-            show_thinking,
-            keys,
-            crate::history::provider::is_stored_session,
-            environment,
-        )
-    }
-
-    /// [`Self::new_single_file`], asking `is_stored` whether the file's agent
-    /// stores it.
-    fn new_single_file_with_stored_check(
-        path: PathBuf,
-        source: crate::history::Source,
-        tool_display: ToolDisplayMode,
-        show_thinking: bool,
-        keys: KeyBindings,
-        is_stored: StoredSessionCheck,
         environment: Environment,
     ) -> Self {
         let (search_tx, search_rx) = spawn_search_worker(environment.clock().clone());
-
-        let is_opened_file_stored = header_names_a_stored_session(&path, source, is_stored);
-        let parsed = read_single_file(
-            &path,
-            source,
-            is_opened_file_stored,
-            environment.clock().as_ref(),
-        )
-        .ok()
-        .flatten();
-
-        // A file that parsed into nothing has no session ID to report.
-        let session_id = parsed
-            .as_ref()
-            .map(|conversation| conversation.session_id.clone());
-        let subagents = parsed
-            .as_ref()
-            .map(|conversation| conversation.subagents.clone())
-            .unwrap_or_default();
-
-        let selected = parsed.is_some().then_some(0);
-        let filtered = Vec::from_iter(selected);
-        let conversations = Vec::from_iter(parsed);
-
-        Self::from_parts(AppParts {
+        let mut view =
+            ViewState::initial(path, None, None, Vec::new(), tool_display, show_thinking);
+        view.parsed_conversation = Some(Arc::new(crate::tui::viewer::ParsedConversation::empty()));
+        view.is_copy_missing = true;
+        let conversations = Vec::new();
+        let mut app = Self::from_parts(AppParts {
             conversations_snapshot: Self::conversation_snapshot(&conversations),
             conversations,
             searchable: Vec::new(),
-            filtered,
-            selected,
+            filtered: Vec::new(),
+            selected: None,
             loading_state: LoadingState::Ready,
-            app_mode: AppMode::View(ViewState::initial(
-                path,
-                source,
-                session_id,
-                subagents,
-                tool_display,
-                show_thinking,
-            )),
+            app_mode: AppMode::View(view),
             tool_display,
             show_thinking,
             single_file_mode: true,
-            is_opened_file_stored,
             keys,
             workspace_filter: false,
             workspace: None,
@@ -539,7 +482,58 @@ impl App {
             list_search_mode: ListSearchMode::Lexical,
             semantic_search: Self::semantic_search_state(false),
             environment,
+        });
+        app.direct_file_read = Some(DirectFileJob::Requested);
+        app
+    }
+
+    /// [`Self::new_single_file`] with its read of the file served (see
+    /// [`Self::serve_direct_file_read`]) and shown in a viewport 20 rows
+    /// high.
+    #[cfg(test)]
+    pub(crate) fn new_single_file_read(
+        path: PathBuf,
+        tool_display: ToolDisplayMode,
+        show_thinking: bool,
+        keys: KeyBindings,
+        environment: Environment,
+    ) -> Self {
+        const VIEWPORT: usize = 20;
+        let mut app = Self::new_single_file(path, tool_display, show_thinking, keys, environment);
+        app.serve_direct_file_read();
+        app.complete_pending_view_refresh(VIEWPORT);
+        app
+    }
+
+    /// Run the read of the file opened directly this app asks the
+    /// background worker for, as the worker runs it, on a thread of its own,
+    /// and hand the app its read. Panics when no read is asked for, or when
+    /// the read fails.
+    #[cfg(test)]
+    pub(crate) fn serve_direct_file_read(&mut self) {
+        let path = self
+            .begin_direct_file_read()
+            .expect("a read of the file opened directly waits for the worker");
+        let environment = self.environment.clone();
+        let show_last = self.show_last;
+        let read = std::thread::spawn(move || {
+            let operation = crate::history::OperationScope::new(
+                environment.cache_base(),
+                crate::history::Patience::UntilAcquired,
+                Arc::default(),
+            );
+            let read = crate::history::provider::open_direct_file(
+                &environment,
+                &path,
+                show_last,
+                &operation,
+            );
+            operation.finish().and(read)
         })
+        .join()
+        .unwrap();
+        self.finish_direct_file_read(read)
+            .expect("the file opened directly reads");
     }
 
     pub fn clock(&self) -> &dyn Clock {
@@ -717,6 +711,11 @@ impl App {
         self.show_last = show_last;
     }
 
+    /// Use the time window the load ran under for sessions new to the list.
+    pub fn set_list_window(&mut self, window: TimeFilter) {
+        self.list_window = window;
+    }
+
     /// A term the load reports — sessions a provider ignores — listed after
     /// the filters it started under.
     pub fn add_active_filter(&mut self, filter: FilterTerm) {
@@ -858,7 +857,6 @@ impl App {
             path: row.path.clone(),
             source: row.source,
         });
-        self.pending_view_refresh = false;
         true
     }
 
@@ -884,19 +882,18 @@ impl App {
         true
     }
 
-    /// True between `Ctrl+R` in the viewer without a session cache and the
-    /// read that answers it.
+    /// True while the file opened directly, already shown, is read again:
+    /// after `Ctrl+R`, or while its session refresh runs.
     pub fn is_refreshing_open_session(&self) -> bool {
-        self.pending_view_refresh
+        self.single_file_mode
+            && self.is_open_session_updating()
+            && matches!(&self.app_mode, AppMode::View(state) if !state.is_copy_missing)
     }
 
-    /// Run the read a pending viewer refresh asked for, or read the open
-    /// session again from the cache once its refresh landed. True when one
-    /// ran, so the caller draws the result next.
+    /// Show the open session again once its refresh finished: read from the
+    /// cache, or as the file opened directly parsed. True when one ran, so
+    /// the caller draws the result next.
     pub fn complete_pending_view_refresh(&mut self, viewport_height: usize) -> bool {
-        if std::mem::take(&mut self.pending_view_refresh) {
-            return self.refresh_open_session(viewport_height);
-        }
         match self.pending_view_reload.take() {
             Some(reloaded) => {
                 self.reload_open_session(viewport_height, reloaded);
@@ -955,58 +952,6 @@ impl App {
     }
 }
 
-/// True when the session the header of the file at `path` names, read by
-/// `source`'s format, is one its agent stores at `path`. A file holding only
-/// its header names its session too.
-fn header_names_a_stored_session(
-    path: &Path,
-    source: crate::history::Source,
-    is_stored: StoredSessionCheck,
-) -> bool {
-    source
-        .provider()
-        .format()
-        .parse_transcript(path)
-        .ok()
-        .flatten()
-        .is_some_and(|projection| is_stored(projection.source, &projection.header.id, path))
-}
-
-/// The row for a file opened directly, read by `source`'s format, with the
-/// sub-agent transcripts its agent names when `is_stored`; `None` when the
-/// file holds no conversation.
-fn read_single_file(
-    path: &Path,
-    source: crate::history::Source,
-    is_stored: bool,
-    clock: &dyn Clock,
-) -> crate::error::Result<Option<Conversation>> {
-    let modified = std::fs::metadata(path)
-        .and_then(|file| file.modified())
-        .ok();
-    let Some(mut conversation) = source.provider().format().parse_conversation(
-        path,
-        crate::history::parser::RowDating::new(modified, clock),
-        None,
-    )?
-    else {
-        return Ok(None);
-    };
-    if is_stored {
-        conversation.subagents =
-            crate::history::format::stored_session_subagents(conversation.source, path);
-    }
-
-    // Set project_name the same way as the loader does
-    let project_path = conversation
-        .cwd
-        .clone()
-        .unwrap_or_else(|| path.to_path_buf());
-    conversation.project_name = Some(format_short_name_from_path(&project_path));
-
-    Ok(Some(conversation))
-}
-
 #[cfg(test)]
 mod semantic_test_helpers;
 
@@ -1027,6 +972,9 @@ mod drawing_thread_tests;
 
 #[cfg(test)]
 mod commit_failure_tests;
+
+#[cfg(test)]
+mod listing_tests;
 
 #[cfg(test)]
 mod viewer_refresh_tests;

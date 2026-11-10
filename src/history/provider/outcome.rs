@@ -103,12 +103,14 @@ impl SessionOutcome {
         self.revision
     }
 
-    pub fn read(&self) -> &SessionRead {
-        &self.read
+    /// True when the read found a row the list shows.
+    pub fn is_listed(&self) -> bool {
+        matches!(self.read, SessionRead::Listed(_))
     }
 
-    pub fn next(&self) -> NextStep {
-        self.next
+    /// True when no session is at the file the read was asked for.
+    pub fn is_missing(&self) -> bool {
+        matches!(self.read, SessionRead::Missing)
     }
 
     /// This outcome with a listed row filed where `listed`, the row it reads
@@ -122,8 +124,8 @@ impl SessionOutcome {
         self
     }
 
-    /// The read, once the caller has acted on [`Self::next`].
-    pub fn into_read(self) -> SessionRead {
-        self.read
+    /// The read and the next step, which the caller acts on.
+    pub fn into_parts(self) -> (SessionRead, NextStep) {
+        (self.read, self.next)
     }
 }

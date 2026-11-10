@@ -258,8 +258,15 @@ mod tests {
             };
             cache
                 .write(
-                    &SessionRecord::listed(storage, session.row.source, &root, &stub, &session.row)
-                        .unwrap(),
+                    &SessionRecord::listed(
+                        crate::history::FOR_FIXTURES,
+                        storage,
+                        session.row.source,
+                        &root,
+                        &stub,
+                        &session.row,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             let CatalogueSession::Listed(cached) = cache
@@ -282,7 +289,10 @@ mod tests {
                 .span(1)
                 .map(|span| span.first_second())
                 .unwrap_or(now.timestamp());
-            let second = Local.timestamp_opt(first_second, 0).single().unwrap();
+            let second = crate::clock::Zone::System
+                .timestamp_opt(first_second, 0)
+                .single()
+                .unwrap();
             let windows = [
                 TimeFilter::default(),
                 TimeFilter {

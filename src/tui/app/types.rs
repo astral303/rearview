@@ -1,4 +1,4 @@
-use crate::history::{LoadProgress, Workspace};
+use crate::history::{LoadProgress, OtherRearview, Workspace};
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
@@ -59,6 +59,17 @@ pub enum AppMode {
     View(ViewState),
 }
 
+/// The open session's pending refresh, as the viewer labels it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenSessionStatus {
+    /// The cache holds no copy of the session yet.
+    Loading,
+    /// The viewer shows an out-of-date copy.
+    Updating,
+    /// The refresh waits for another rearview's activity.
+    AnotherRearview(OtherRearview),
+}
+
 /// Where message navigation points. The call lives inside the message, so
 /// replacing the message drops the call with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +89,9 @@ pub struct ViewState {
     pub conversation_path: PathBuf,
     /// Which agent recorded the conversation; re-parses and exports route
     /// through this source's own format rather than sniffing the path.
-    pub conversation_source: crate::history::Source,
+    /// `None` for a file opened directly until the background worker reads
+    /// it.
+    pub conversation_source: Option<crate::history::Source>,
     /// The session ID as this conversation's provider recorded it. `None` when
     /// the transcript did not parse; a file name is not guaranteed to be the
     /// session ID.
@@ -189,7 +202,7 @@ impl ViewState {
     /// The view before its first render: timing off, no frame width yet.
     pub(super) fn initial(
         conversation_path: PathBuf,
-        conversation_source: crate::history::Source,
+        conversation_source: Option<crate::history::Source>,
         session_id: Option<String>,
         subagents: Vec<PathBuf>,
         tool_display: ToolDisplayMode,

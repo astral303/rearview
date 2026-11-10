@@ -19,6 +19,7 @@ mod free_space;
 mod interactive;
 mod next_step;
 mod observer;
+mod permit;
 mod read_catalogue;
 pub(crate) mod refresh;
 mod schema;
@@ -26,20 +27,26 @@ mod scope;
 mod search_parts;
 
 pub use base::{CacheBase, ProcessIdentity};
+#[cfg(test)]
+pub(crate) use base::{DiskSpace, DriveRunningOut};
 pub use cached_session::CachedSession;
-pub(crate) use cached_session::find_as_is as find_cached_session_as_is;
+pub(crate) use cached_session::find_as_is_without_waiting as find_cached_session_as_is_without_waiting;
+pub(crate) use cached_session::find_copy_without_waiting as find_cached_copy_without_waiting;
 pub(crate) use cached_session::find_waiting as find_cached_session_waiting;
 pub(crate) use catalogue::{SessionRecord, SessionStatus, subagents_as_listed};
 pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
 pub(crate) use entries::StoredEntries;
 pub(crate) use interactive::{CachedCopy, refuse_the_drawing_thread};
-pub use interactive::{DrawingThread, InteractiveCache, InteractiveRead};
+pub use interactive::{CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead};
 pub use next_step::NextStep;
 pub use observer::{AwaitedRefresh, Observation, OtherRearview};
+#[cfg(test)]
+pub(crate) use permit::FOR_FIXTURES;
+pub use permit::{Admitted, ParsePermit};
 pub(crate) use read_catalogue::CatalogueSession;
-pub(crate) use scope::OperationAccess;
-pub use scope::{OperationScope, Patience};
+pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
+pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart};
 
 use crate::cli::DebugLevel;
@@ -70,7 +77,7 @@ const WAITING_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The busy timeout of cache reads on the TUI's drawing thread. Past it, the
 /// read returns a miss with its next step: read the session again once the
 /// refresh owning the cache completes, or request a session refresh.
-const INTERACTIVE_BUSY_TIMEOUT: Duration = Duration::from_millis(150);
+pub(crate) const INTERACTIVE_BUSY_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// A reader's busy timeout.
 #[derive(Clone, Copy, Debug)]
@@ -99,8 +106,6 @@ impl ReaderWait {
     }
 }
 
-/// The size the write-ahead log is truncated to after a checkpoint.
-const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 const ADMISSION_COMPLETE: &str = "admission_complete";
 
 fn database_path(base: &Path) -> PathBuf {
@@ -199,8 +204,7 @@ impl SqliteCache {
         if !path.is_file() {
             return Ok(None);
         }
-        let connection = connection::open(&path, Access::ReadOnly)?;
-        connection.busy_timeout(wait.busy_timeout())?;
+        let connection = connection::open(&path, Access::ReadOnly, wait.busy_timeout())?;
         let cache = Self {
             connection,
             base: base.clone(),
@@ -264,11 +268,12 @@ impl SqliteCache {
         storage: SessionCache,
         root: &Path,
     ) -> Result<HashMap<String, CachedFingerprint>> {
-        let mut statement = self.connection.prepare_cached(
+        let mut statement = self.connection.prepare_cached(&format!(
             "SELECT cache_key, file_size, mtime_secs, mtime_nsecs, id FROM sessions \
-             WHERE storage = ?1 AND root = ?2 AND status != ?3 AND entries_error IS NULL \
+             WHERE storage = ?1 AND root = ?2 AND status != ?3 AND {} \
              AND COALESCE(is_missing_earlier_turns, 0) = 0",
-        )?;
+            catalogue::ENTRIES_NOT_FAILED
+        ))?;
         let candidates = statement
             .query_map(
                 params![storage.directory, path_text(root), catalogue::WRITING],
@@ -321,9 +326,12 @@ impl SqliteCache {
         };
         self.with_read_snapshot(|connection| {
             let session: Option<i64> = connection.query_row(
-                "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
-                 AND file_size = ?4 AND mtime_secs = ?5 AND mtime_nsecs = ?6 AND status != 'writing' \
-                 AND entries_error IS NULL AND COALESCE(is_missing_earlier_turns, 0) = 0",
+                &format!(
+                    "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
+                     AND file_size = ?4 AND mtime_secs = ?5 AND mtime_nsecs = ?6 \
+                     AND status != 'writing' AND {} AND COALESCE(is_missing_earlier_turns, 0) = 0",
+                    catalogue::ENTRIES_NOT_FAILED
+                ),
                 params![storage.directory, path_text(root), stub.cache_key, stamp.file_size as i64, stamp.mtime_secs as i64, stamp.mtime_nsecs],
                 |row| row.get(0),
             ).optional()?;
@@ -401,6 +409,8 @@ impl CacheWriter {
     fn open(owner: &refresh::RefreshToken) -> Result<Self> {
         let mut writer = Self::connect(owner.clone())?;
         if writer.stored_layout()? == StoredLayout::Outdated {
+            let base = owner.cache_base();
+            let _rebuilding = base.process().mark_rebuild(base.path());
             writer.rebuild()?;
             // Closing releases the maintenance connection's retained exclusive
             // lock. Reopen normally before returning to WAL and shared readers.
@@ -419,13 +429,15 @@ impl CacheWriter {
         interactive::refuse_the_drawing_thread("open a session cache writer");
         let base = owner.cache_base();
         std::fs::create_dir_all(base.path())?;
-        let connection = connection::open(&database_path(base.path()), Access::Create)?;
-        connection.busy_timeout(WAITING_BUSY_TIMEOUT)?;
+        let connection = connection::open(
+            &database_path(base.path()),
+            Access::Create,
+            WAITING_BUSY_TIMEOUT,
+        )?;
         connection.pragma_update(None, "page_size", PAGE_SIZE)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT as i64)?;
         Ok(Self {
             cache: SqliteCache {
                 connection,
@@ -451,6 +463,9 @@ impl CacheWriter {
             .pragma_update(None, "locking_mode", "EXCLUSIVE")?;
         let batch = refresh::exclusive_transaction(&self.connection, turn)?;
         refresh::commit(batch, &self.owner)?;
+        // Delete the write-ahead log on leaving WAL mode: SQLite opens a
+        // `-wal` file beside a database out of WAL mode as its log again.
+        connection::set_persistent_wal(&self.connection, false)?;
         let mode: String =
             self.connection
                 .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
@@ -613,7 +628,7 @@ impl CacheWriter {
                 None
             }
             Some(Err(error)) => Some(error.as_str()),
-            None => None,
+            None => record.unlisted_reason.as_deref(),
         };
         check_space()?;
         self.set_final_status(session, record.catalogue.status, entries_error)

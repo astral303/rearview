@@ -1,11 +1,14 @@
-//! `Ctrl+R` in the viewer: the open session read again from its file.
+//! `Ctrl+R` in the viewer: the open session's refresh, and the viewer reading
+//! the refreshed copy from the cache.
 
 use super::claude_home::{ClaudeHome, app_reading};
-use super::refresh_tests::{refresh_found, serve_session_refresh};
+use super::commit_failure_tests::launched_app;
+use super::refresh_tests::{refresh_found, serve_list_refresh, serve_session_refresh};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
 use crate::history::{SessionChanges, Source, UpdatedSession};
+use std::path::Path;
 
 const VIEWPORT: usize = 10;
 
@@ -67,10 +70,17 @@ fn tool_run_lines() -> Vec<String> {
     .to_vec()
 }
 
+/// The row of the transcript at `path`, parsed off the drawing thread, as
+/// the background worker parses it.
 fn row_from_file(path: &Path) -> Conversation {
-    crate::history::parser::process_conversation_file(path.to_path_buf(), None, None)
-        .unwrap()
-        .unwrap()
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        crate::history::parser::process_conversation_file(path, None, None)
+            .unwrap()
+            .unwrap()
+    })
+    .join()
+    .unwrap()
 }
 
 /// The list holding `home`'s sessions, the first open in the viewer.
@@ -87,10 +97,18 @@ fn viewer_on_clock(home: &ClaudeHome, clock: Arc<TestClock>) -> App {
     app
 }
 
-/// `Ctrl+R`, then the next frame's read.
+/// `Ctrl+R`, the session refresh it asks for, then the next frame's read of
+/// the refreshed copy.
 fn press_refresh(app: &mut App) {
-    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
+    request_refresh(app);
     assert!(app.complete_pending_view_refresh(VIEWPORT));
+}
+
+/// `Ctrl+R`, and the session refresh it asks for, run as the background
+/// worker runs it.
+fn request_refresh(app: &mut App) {
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
+    serve_session_refresh(app);
 }
 
 fn view(app: &App) -> &ViewState {
@@ -132,8 +150,13 @@ fn refresh_reads_on_next_frame_and_second_press_adds_no_read() {
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
 
-    assert!(app.is_refreshing_open_session());
+    assert!(app.is_open_session_updating());
     assert!(!view_text(&app).contains("message 4"));
+    serve_session_refresh(&mut app);
+    assert!(
+        !app.is_session_refresh_requested(),
+        "the second press doesn't ask for a second refresh"
+    );
     assert!(app.complete_pending_view_refresh(VIEWPORT));
     assert!(view_text(&app).contains("message 4"));
     assert!(!app.complete_pending_view_refresh(VIEWPORT));
@@ -142,22 +165,38 @@ fn refresh_reads_on_next_frame_and_second_press_adds_no_read() {
 #[test]
 fn refresh_asked_for_before_leaving_viewer_doesnt_run_on_next_session() {
     let home = ClaudeHome::new();
-    let path = home.transcript("session");
-    write_messages(&path, &numbered(0..3));
+    let first = home.transcript("first");
+    write_timed_messages(&first, 3);
+    let second = home.transcript("second");
+    write_messages(&second, &numbered(10..12));
     let mut app = viewer_on(&home);
+    let opened_first = view(&app).conversation_path.clone();
 
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.handle_key(KeyCode::Esc, KeyModifiers::empty(), VIEWPORT);
-    assert!(!app.is_refreshing_open_session());
+    app.selected = app
+        .filtered()
+        .iter()
+        .position(|&index| app.conversations()[index].path != opened_first);
     assert!(app.request_open());
     assert!(app.complete_pending_open(80));
+    let next_session = view(&app).conversation_path.clone();
+    serve_session_refresh(&mut app);
 
-    assert!(!app.is_refreshing_open_session());
-    assert!(!app.complete_pending_view_refresh(VIEWPORT));
+    assert_ne!(next_session, opened_first, "the next session opens");
+    assert_eq!(
+        view(&app).conversation_path,
+        next_session,
+        "the earlier session's refresh keeps the open session"
+    );
+    assert!(
+        !app.complete_pending_view_refresh(VIEWPORT),
+        "the earlier session's refresh doesn't reload the next session's view"
+    );
 }
 
 #[test]
-fn leaving_viewer_with_q_drops_pending_refresh() {
+fn leaving_viewer_with_q_drops_its_pending_reload() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
@@ -165,12 +204,12 @@ fn leaving_viewer_with_q_drops_pending_refresh() {
 
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.handle_key(KeyCode::Char('q'), KeyModifiers::empty(), VIEWPORT);
+    serve_session_refresh(&mut app);
 
     assert!(matches!(app.app_mode(), AppMode::List));
-    assert!(!app.is_refreshing_open_session());
     assert!(
         !app.complete_pending_view_refresh(VIEWPORT),
-        "no read ran, so the frame has nothing new to draw"
+        "a closed viewer doesn't draw a reload"
     );
 }
 
@@ -286,6 +325,58 @@ fn message_copy_copies_message_on_screen_after_file_grew() {
     assert!(copied[0].contains("message 10"), "{copied:?}");
 }
 
+/// The export menu's plain-text option.
+const PLAIN_EXPORT_OPTION: usize = 1;
+
+#[test]
+fn deferred_export_still_out_of_date_after_its_refresh_reports_failed_read() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    COPIED.with(|copied| copied.borrow_mut().clear());
+    write_messages(&path, &numbered(0..5));
+    home.refuse_project();
+
+    app.perform_export(PLAIN_EXPORT_OPTION, true);
+    serve_session_refresh(&mut app);
+
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+    assert!(
+        copied.is_empty(),
+        "the export doesn't copy the out-of-date copy: {copied:?}"
+    );
+    assert_eq!(
+        status_text(&app),
+        Some("Refresh failed: the session could not be read")
+    );
+}
+
+/// The export menu's JSONL option.
+const JSONL_EXPORT_OPTION: usize = 3;
+
+#[test]
+fn jsonl_export_of_out_of_date_session_copies_transcript_at_once() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    COPIED.with(|copied| copied.borrow_mut().clear());
+    write_messages(&path, &numbered(0..5));
+    app.record_next_step(&path, crate::history::NextStep::CacheInBackground);
+
+    app.perform_export(JSONL_EXPORT_OPTION, true);
+
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+    assert_eq!(
+        copied,
+        [std::fs::read_to_string(&path).unwrap()],
+        "the JSONL export copies the transcript before the session's refresh"
+    );
+}
+
 #[test]
 fn scrolled_up_refresh_keeps_same_message_at_top() {
     let home = ClaudeHome::new();
@@ -339,6 +430,8 @@ fn refresh_updates_sessions_row_in_list() {
 
     write_messages(&path, &numbered(0..5));
     press_refresh(&mut app);
+    app.handle_key(KeyCode::Esc, KeyModifiers::empty(), VIEWPORT);
+    app.apply_finished_refresh();
 
     assert_eq!(app.conversations()[0].message_count, before + 2);
 }
@@ -351,7 +444,7 @@ fn deleted_session_returns_to_list() {
     let mut app = viewer_on(&home);
 
     std::fs::remove_file(&path).unwrap();
-    press_refresh(&mut app);
+    request_refresh(&mut app);
 
     assert!(matches!(app.app_mode(), AppMode::List));
     assert!(app.conversations().is_empty());
@@ -364,14 +457,108 @@ fn failed_read_keeps_view() {
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
     let mut app = viewer_on(&home);
-    home.refuse_project();
+    home.refuse(home.project().parent().unwrap());
 
-    press_refresh(&mut app);
+    request_refresh(&mut app);
 
     assert!(view_text(&app).contains("message 2"));
     assert_eq!(
         status_text(&app),
         Some("Refresh failed: the session could not be read")
+    );
+}
+
+/// A launch caches the session, then its directory stops listing and its
+/// transcript grows: no refresh can bring the copy up to date.
+#[test]
+fn changed_session_under_unreadable_directory_reports_failed_refresh_once() {
+    let home = ClaudeHome::new();
+    let cache = super::claude_home::admitted_cache();
+    let hidden = home.write_in("-tmp-unreadable", "hidden", 20, &["the hidden question"]);
+    let environment = home.environment_with_cache(
+        cache.path(),
+        crate::history::ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+    );
+    let mut app = launched_app(&environment, crate::history::RefreshOptions::default());
+    home.refuse(hidden.parent().unwrap());
+    home.append(&hidden, 30, "the newest question");
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+
+    let mut refreshes = 0;
+    for _ in 0..4 {
+        if app.is_session_refresh_requested() {
+            serve_session_refresh(&mut app);
+            refreshes += 1;
+        }
+        app.complete_pending_view_refresh(VIEWPORT);
+    }
+
+    assert_eq!(
+        refreshes, 1,
+        "the viewer doesn't request another refresh after one returns the older copy"
+    );
+    assert!(
+        view_text(&app).contains("the hidden question"),
+        "the viewer keeps the cached copy"
+    );
+    assert_eq!(
+        status_text(&app),
+        Some("Refresh failed: the session could not be read")
+    );
+}
+
+/// A launch caches both sessions, then the directory of one stops listing.
+#[test]
+fn cached_session_under_unreadable_directory_stays_listed_and_opens_in_viewer() {
+    let home = ClaudeHome::new();
+    let cache = super::claude_home::admitted_cache();
+    let hidden = home.write_in("-tmp-unreadable", "hidden", 20, &["the hidden question"]);
+    home.write("listed", 10, &["the listed question"]);
+    let environment = home.environment_with_cache(
+        cache.path(),
+        crate::history::ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+    );
+    let options = crate::history::RefreshOptions::default();
+    drop(launched_app(&environment, options));
+    home.refuse(hidden.parent().unwrap());
+    let names = |app: &App| -> Vec<String> {
+        app.filtered()
+            .iter()
+            .map(|&index| app.conversations()[index].session_id.clone())
+            .collect()
+    };
+
+    let mut app = launched_app(&environment, options);
+    assert_eq!(
+        names(&app),
+        ["hidden", "listed"],
+        "the launch lists the cached session under the unreadable directory"
+    );
+    serve_list_refresh(&mut app, TimeFilter::default());
+    assert_eq!(
+        names(&app),
+        ["hidden", "listed"],
+        "a list refresh keeps the cached session under the unreadable directory"
+    );
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    assert!(
+        view_text(&app).contains("the hidden question"),
+        "the viewer shows the cached copy"
+    );
+    request_refresh(&mut app);
+
+    assert!(
+        view_text(&app).contains("the hidden question"),
+        "the viewer's refresh keeps the cached copy"
+    );
+    assert_eq!(
+        status_text(&app),
+        None,
+        "the viewer's refresh reads the cached copy without reporting a failure"
     );
 }
 
@@ -471,7 +658,7 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
     app.begin_refresh().unwrap();
 
     write_messages(&path, &numbered(0..5));
-    press_refresh(&mut app);
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.handle_key(KeyCode::Esc, KeyModifiers::empty(), VIEWPORT);
     app.finish_refresh(refresh_found(SessionChanges {
         updated: vec![UpdatedSession {
@@ -490,48 +677,139 @@ fn list_refresh_applied_later_doesnt_undo_viewer_refresh() {
 }
 
 #[test]
-fn refresh_reads_directly_opened_file_again() {
+fn list_refresh_finishing_in_viewer_requests_open_sessions_refresh_at_once() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = App::new_single_file(
-        path.clone(),
-        Source::Claude,
+    let mut app = viewer_on(&home);
+    let read_from_an_older_copy = app.conversations()[0].clone();
+    app.begin_refresh().unwrap();
+
+    app.finish_refresh(refresh_found(SessionChanges {
+        updated: vec![UpdatedSession {
+            row: read_from_an_older_copy,
+            replaces_listed_row: true,
+            next: crate::history::NextStep::CacheInBackground,
+        }],
+        ..Default::default()
+    }));
+
+    assert!(
+        app.is_open_session_updating(),
+        "the open session's refresh doesn't wait for the viewer to close"
+    );
+}
+
+#[test]
+fn rename_in_viewer_acts_on_row_its_finished_refresh_read() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    write_messages(&path, &numbered(0..5));
+    press_refresh(&mut app);
+
+    app.handle_key(KeyCode::F(2), KeyModifiers::NONE, VIEWPORT);
+    assert!(
+        matches!(app.dialog_mode, DialogMode::Rename { .. }),
+        "the rename key opens the name box behind a finished refresh"
+    );
+    for typed in "Renamed".chars() {
+        app.handle_key(KeyCode::Char(typed), KeyModifiers::NONE, VIEWPORT);
+    }
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE, VIEWPORT);
+    super::refresh_tests::serve_list_change(&mut app);
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE, VIEWPORT);
+    app.apply_finished_refresh();
+
+    assert_eq!(
+        app.conversations()[0].custom_title.as_deref(),
+        Some("Renamed"),
+        "the refresh read before the rename keeps the renamed row"
+    );
+}
+
+#[test]
+fn copy_out_of_date_again_on_next_frame_requests_another_refresh() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = viewer_on(&home);
+    write_messages(&path, &numbered(0..5));
+    request_refresh(&mut app);
+    write_messages(&path, &numbered(0..7));
+
+    assert!(app.complete_pending_view_refresh(VIEWPORT));
+
+    assert!(
+        app.is_open_session_updating(),
+        "the next frame requests a refresh after reading an out-of-date copy"
+    );
+}
+
+/// `Ctrl+R` on a file opened directly outside every provider's session
+/// roots, the background worker's read of it, then the next frame showing
+/// that read.
+fn press_refresh_outside_every_root(app: &mut App) {
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
+    app.serve_direct_file_read();
+    app.complete_pending_view_refresh(VIEWPORT);
+}
+
+/// The file at `path` opened directly in an environment reading no
+/// provider's sessions, so it lies outside every session root.
+fn opened_outside_every_root(path: &Path) -> App {
+    let mut app = App::new_single_file_read(
+        path.to_path_buf(),
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
         test_environment(Vec::new(), None),
     );
     app.check_view_resize(80, VIEWPORT);
+    app
+}
+
+#[test]
+fn refresh_reads_directly_opened_file_again() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = opened_outside_every_root(&path);
 
     write_messages(&path, &numbered(0..5));
-    press_refresh(&mut app);
+    press_refresh_outside_every_root(&mut app);
 
     assert!(view_text(&app).contains("message 4"));
     assert_eq!(app.conversations()[0].message_count, 5);
 }
 
-/// A file holding only its header parses into no row; its header still
-/// names the session the stored check asks about.
+/// A session holding only its header lists no row; a refresh once it holds
+/// its conversation shows its sub-agents.
 #[test]
 fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refresh() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/omp");
     let session = std::fs::read_to_string(fixtures.join("v3.jsonl")).unwrap();
     let title_slot_and_header: Vec<&str> = session.lines().take(2).collect();
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("session.jsonl");
+    let project = directory.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let path = project.join("session.jsonl");
     std::fs::write(&path, title_slot_and_header.join("\n") + "\n").unwrap();
-    let subagent = directory.path().join("session").join("worker.jsonl");
+    let subagent = project.join("session").join("worker.jsonl");
     std::fs::create_dir_all(subagent.parent().unwrap()).unwrap();
     std::fs::copy(fixtures.join("subagent.jsonl"), &subagent).unwrap();
-    let mut app = App::new_single_file_with_stored_check(
+    let omp: &'static dyn crate::history::provider::SessionStorage =
+        Box::leak(Box::new(crate::history::provider::RootedStorage {
+            inner: Source::Omp.provider().storage(),
+            root: crate::history::provider::SessionRoot::new(directory.path()).in_agent_tree(),
+        }));
+    let mut app = App::new_single_file_read(
         path.clone(),
-        Source::Omp,
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
-        |source, session_id, _| source == Source::Omp && session_id == "omp_session_custom_id",
-        test_environment(Vec::new(), None),
+        test_environment(vec![omp], None),
     );
     app.check_view_resize(80, VIEWPORT);
 
@@ -548,19 +826,11 @@ fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..3));
-    let mut app = App::new_single_file(
-        path.clone(),
-        Source::Claude,
-        ToolDisplayMode::Hidden,
-        false,
-        KeyBindings::default(),
-        test_environment(Vec::new(), None),
-    );
-    app.check_view_resize(80, VIEWPORT);
+    let mut app = opened_outside_every_root(&path);
     assert_eq!(app.idle_wait(), Duration::from_secs(3600));
 
     write_messages(&path, &numbered(0..5));
-    press_refresh(&mut app);
+    press_refresh_outside_every_root(&mut app);
 
     assert_eq!(app.idle_wait(), Duration::from_secs(3));
 }

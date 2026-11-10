@@ -3,7 +3,6 @@
 
 use super::Conversation;
 use super::provider::RootEnvironment;
-use crate::error::Result;
 use std::path::{Component, Path, PathBuf};
 
 /// The directories to scope sessions to: every checkout of the repository
@@ -38,10 +37,6 @@ impl Reach {
 }
 
 impl Workspace {
-    pub fn current() -> Result<Self> {
-        Ok(Self::at(std::env::current_dir()?))
-    }
-
     pub fn at(directory: PathBuf) -> Self {
         Self::in_environment(directory, &RootEnvironment::of_process())
     }

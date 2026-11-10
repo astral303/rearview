@@ -31,6 +31,7 @@ fn source_record(source: Source, path: &Path) -> (SessionRecord, SessionRoot) {
     let session = AgentSession::new(source, path.to_path_buf(), Vec::new(), Vec::new());
     let root = root_of(&session);
     let record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage_of(source),
         source,
         &root,
@@ -90,8 +91,15 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
         let row = &session.row;
         let storage = storage_of(row.source);
         let root = root_of(&session);
-        let record =
-            SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap();
+        let record = SessionRecord::listed(
+            crate::history::FOR_FIXTURES,
+            storage,
+            row.source,
+            &root,
+            &stub_of(&session, 1),
+            row,
+        )
+        .unwrap();
         cache.write(&record).unwrap();
         let subagents = cache
             .connection
@@ -115,7 +123,13 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
                 .map(|path| path_text(&files::key(path)))
                 .collect::<Vec<_>>()
         );
-        let expected = normalized_session(row.source, &row.path, &row.subagents).unwrap();
+        let expected = normalized_session(
+            crate::history::FOR_FIXTURES,
+            row.source,
+            &row.path,
+            &row.subagents,
+        )
+        .unwrap();
 
         let read = cache
             .entries(storage, &root.path, CACHE_KEY)
@@ -190,6 +204,7 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
                         expanded_tool_outputs: Default::default(),
                         can_expand: false,
                         today: TestClock::default().today(),
+                        zone: TestClock::default().zone(),
                     };
                     let expected = viewer::render_parsed_conversation(&expected, &options);
                     let read = viewer::render_parsed_conversation(&read, &options);
@@ -241,6 +256,7 @@ pub(super) fn write_test_entries(
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
     let mut record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage,
         session.row.source,
         &root,
@@ -256,7 +272,7 @@ pub(super) fn write_test_entries(
 }
 
 #[test]
-fn opaque_payloads_keep_their_source_positions_without_copying_their_bytes() {
+fn every_tool_result_is_stored_and_other_opaque_payloads_keep_only_their_positions() {
     use crate::history::format::RecordLine;
     use crate::log_entry::{ContentBlock, LogEntry, UserContent, UserMessage};
     use serde_json::{Value, json};
@@ -423,6 +439,7 @@ fn opaque_payloads_keep_their_source_positions_without_copying_their_bytes() {
         expanded_tool_outputs: Default::default(),
         can_expand: false,
         today: TestClock::default().today(),
+        zone: TestClock::default().zone(),
     };
     let expected_view = viewer::render_parsed_conversation(
         &viewer::parsed_conversation(DisplayEntries::from(expected_entries)),
@@ -441,9 +458,10 @@ fn opaque_payloads_keep_their_source_positions_without_copying_their_bytes() {
         format!("{:?}", expected_view.calls)
     );
     cache.checkpoint().unwrap();
+    let size = std::fs::metadata(database_path(base.path())).unwrap().len();
     assert!(
-        std::fs::metadata(database_path(base.path())).unwrap().len() < 512 * 1024,
-        "multi-megabyte opaque values stay outside the database"
+        size < 3 * 1024 * 1024,
+        "the thinking signature, image and snapshot payloads stay out of the database: {size} bytes"
     );
 }
 
@@ -556,7 +574,7 @@ fn subagent_metadata_is_shared_across_transactions_and_preserves_origins() {
 }
 
 #[test]
-fn results_rendered_as_raw_json_are_read_from_their_original_records() {
+fn results_rendered_as_raw_json_are_stored_as_recorded() {
     use crate::log_entry::{ContentBlock, LogEntry, UserContent, UserMessage};
     use serde_json::json;
 
@@ -579,6 +597,7 @@ fn results_rendered_as_raw_json_are_read_from_their_original_records() {
     let storage = storage_of(Source::Claude);
     let root = root_of(&session);
     let mut record = SessionRecord::listed(
+        crate::history::FOR_FIXTURES,
         storage,
         Source::Claude,
         &root,
@@ -596,7 +615,13 @@ fn results_rendered_as_raw_json_are_read_from_their_original_records() {
             metadata.modified().unwrap(),
         )),
     }];
-    record.entries = Some(Ok(normalized_session(Source::Claude, &source, &[]).unwrap()));
+    record.entries = Some(Ok(normalized_session(
+        crate::history::FOR_FIXTURES,
+        Source::Claude,
+        &source,
+        &[],
+    )
+    .unwrap()));
     let mut cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
     let read = cache
@@ -624,12 +649,13 @@ fn results_rendered_as_raw_json_are_read_from_their_original_records() {
         cache
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM parts WHERE json IS NOT NULL",
+                "SELECT COUNT(*) FROM parts WHERE result_shape = 'json'",
                 [],
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        0
+        2,
+        "each of the two results that are neither text nor text items is stored as a JSON part"
     );
 
     std::fs::write(&source, lines.replace("image-result", "replaced-result")).unwrap();
@@ -640,7 +666,7 @@ fn results_rendered_as_raw_json_are_read_from_their_original_records() {
 }
 
 #[test]
-fn writing_a_session_again_replaces_its_rows() {
+fn writing_session_again_replaces_its_rows() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -650,7 +676,17 @@ fn writing_a_session_again_replaces_its_rows() {
     let write = |cache: &mut CacheWriter, modified_secs| {
         let stub = stub_of(&session, modified_secs);
         cache
-            .write(&SessionRecord::listed(storage, row.source, &root, &stub, row).unwrap())
+            .write(
+                &SessionRecord::listed(
+                    crate::history::FOR_FIXTURES,
+                    storage,
+                    row.source,
+                    &root,
+                    &stub,
+                    row,
+                )
+                .unwrap(),
+            )
             .unwrap();
     };
     write(&mut cache, 1);
@@ -669,7 +705,13 @@ fn writing_a_session_again_replaces_its_rows() {
         .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
         .unwrap();
     assert_eq!(sessions, 1);
-    let expected = normalized_session(row.source, &row.path, &row.subagents).unwrap();
+    let expected = normalized_session(
+        crate::history::FOR_FIXTURES,
+        row.source,
+        &row.path,
+        &row.subagents,
+    )
+    .unwrap();
     let read = cache
         .entries(storage, &root.path, CACHE_KEY)
         .unwrap()
@@ -680,7 +722,7 @@ fn writing_a_session_again_replaces_its_rows() {
 /// A `SessionCache::schema_version` bump invalidates that provider's
 /// database rows.
 #[test]
-fn a_storage_written_under_another_schema_version_loses_its_sessions() {
+fn storage_written_under_another_schema_version_loses_its_sessions() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -690,7 +732,15 @@ fn a_storage_written_under_another_schema_version_loses_its_sessions() {
     cache.admit_storage(storage).unwrap();
     cache
         .write(
-            &SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                row.source,
+                &root,
+                &stub_of(&session, 1),
+                row,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -715,7 +765,7 @@ fn a_storage_written_under_another_schema_version_loses_its_sessions() {
 /// A run that stopped between a session's catalogue row and its last entry
 /// leaves the row marked as writing, which is not current.
 #[test]
-fn a_session_still_being_written_is_not_current() {
+fn session_still_being_written_is_not_current() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -724,7 +774,15 @@ fn a_session_still_being_written_is_not_current() {
     let root = root_of(&session);
     cache
         .write(
-            &SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                row.source,
+                &root,
+                &stub_of(&session, 1),
+                row,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -742,7 +800,7 @@ fn a_session_still_being_written_is_not_current() {
 }
 
 #[test]
-fn a_removed_session_leaves_no_rows() {
+fn removed_session_leaves_no_rows() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -751,7 +809,15 @@ fn a_removed_session_leaves_no_rows() {
     let root = root_of(&session);
     cache
         .write(
-            &SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                row.source,
+                &root,
+                &stub_of(&session, 1),
+                row,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -773,7 +839,7 @@ fn a_removed_session_leaves_no_rows() {
 /// A database written under another version of these tables is emptied and
 /// built again.
 #[test]
-fn a_database_of_another_schema_version_is_emptied() {
+fn database_of_another_schema_version_is_emptied() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -782,7 +848,15 @@ fn a_database_of_another_schema_version_is_emptied() {
     let root = root_of(&session);
     cache
         .write(
-            &SessionRecord::listed(storage, row.source, &root, &stub_of(&session, 1), row).unwrap(),
+            &SessionRecord::listed(
+                crate::history::FOR_FIXTURES,
+                storage,
+                row.source,
+                &root,
+                &stub_of(&session, 1),
+                row,
+            )
+            .unwrap(),
         )
         .unwrap();
     cache
@@ -849,7 +923,7 @@ fn a_database_of_another_schema_version_is_emptied() {
 }
 
 #[test]
-fn a_one_kib_cache_is_rebuilt_at_the_selected_size() {
+fn one_kib_cache_is_rebuilt_at_selected_size() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
     write_test_entries(
@@ -885,5 +959,69 @@ fn a_one_kib_cache_is_rebuilt_at_the_selected_size() {
             .pragma_query_value(None, "page_size", |row| row.get::<_, u32>(0))
             .unwrap(),
         PAGE_SIZE
+    );
+}
+
+/// The file SQLite keeps beside the database in `base` under `suffix`.
+fn beside_database(base: &Path, suffix: &str) -> PathBuf {
+    base.join(format!("{DATABASE_FILE_NAME}{suffix}"))
+}
+
+#[test]
+fn last_connection_to_close_empties_write_ahead_log_and_keeps_both_files() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
+    write_test_entries(
+        &mut cache,
+        TranscriptEntries {
+            entries: Vec::new(),
+            malformed_lines: Vec::new(),
+        },
+    );
+    let write_ahead_log = beside_database(base.path(), "-wal");
+    assert!(
+        std::fs::metadata(&write_ahead_log).unwrap().len() > 0,
+        "the write leaves frames in the write-ahead log"
+    );
+
+    drop(cache);
+
+    assert_eq!(
+        std::fs::metadata(&write_ahead_log)
+            .map(|file| file.len())
+            .ok(),
+        Some(0),
+        "the write-ahead log is kept empty once the last connection closes"
+    );
+    assert!(
+        beside_database(base.path(), "-shm").exists(),
+        "the shared-memory file is kept once the last connection closes"
+    );
+}
+
+#[test]
+fn rebuild_leaves_no_write_ahead_log_while_database_is_out_of_wal_mode() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = SqliteCache::open(&rearview_at(base.path())).unwrap();
+    write_test_entries(
+        &mut cache,
+        TranscriptEntries {
+            entries: Vec::new(),
+            malformed_lines: Vec::new(),
+        },
+    );
+
+    cache.rebuild().unwrap();
+
+    assert_eq!(
+        cache
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+    assert!(
+        !beside_database(base.path(), "-wal").exists(),
+        "the database out of WAL mode has no write-ahead log beside it"
     );
 }

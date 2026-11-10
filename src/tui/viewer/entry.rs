@@ -154,7 +154,7 @@ fn joinable_blocks<'a>(
 
 fn entry_timestamp(options: &RenderOptions, raw: Option<&str>) -> Option<String> {
     if options.show_timing {
-        raw.and_then(format_timestamp)
+        raw.and_then(|raw| format_timestamp(raw, options.zone))
     } else {
         None
     }

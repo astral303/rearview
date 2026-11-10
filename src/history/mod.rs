@@ -16,6 +16,7 @@ pub(crate) mod environment;
 mod filter;
 pub mod fingerprint;
 pub mod format;
+pub mod listing;
 pub mod load_meter;
 mod loader;
 pub mod message_texts;
@@ -40,7 +41,7 @@ use std::path::PathBuf;
 
 // Re-export public API
 pub use display_entries::{
-    DisplayEntries, EntryOrigin, display_log_entries_interactively, display_log_entries_waiting,
+    DisplayEntries, EntryOrigin, display_log_entries_interactively, printed_log_entries,
     sniffed_display_log_entries,
 };
 pub use environment::Environment;
@@ -59,10 +60,13 @@ pub use refresh::{
     KnownSessions, RefreshOptions, RefreshOutcome, SessionChanges, UpdatedSession, refresh_sessions,
 };
 #[cfg(test)]
+pub(crate) use sqlite_cache::FOR_FIXTURES;
+#[cfg(test)]
 pub use sqlite_cache::ProcessIdentity;
 pub use sqlite_cache::{
-    AwaitedRefresh, CacheBase, DrawingThread, InteractiveCache, InteractiveRead, NextStep,
-    OperationScope, OtherRearview, Patience, WaitStatus,
+    Admitted, AwaitedRefresh, CacheBase, CachedRead, Cancellation, CurrentCopy, DrawingThread,
+    InteractiveCache, InteractiveRead, NextStep, OperationScope, OtherRearview, ParsePermit,
+    Patience, StaleCause, WaitStatus,
 };
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
@@ -103,6 +107,7 @@ impl Source {
 /// attributed to a provider never meets a foreign format, which is what lets a
 /// provider's locators be something other than openable files.
 pub(crate) fn normalized_session(
+    permit: ParsePermit<'_>,
     source: Source,
     path: &std::path::Path,
     subagents: &[PathBuf],
@@ -110,14 +115,17 @@ pub(crate) fn normalized_session(
     source
         .provider()
         .format()
-        .session_entries(path, subagents)?
+        .session_entries(permit, path, subagents)?
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
 /// [`normalized_session`] for a bare file (`--render`, a direct path), read by
 /// the format of the agent its projection names.
-pub(crate) fn sniffed_session(path: &std::path::Path) -> Result<TranscriptEntries> {
-    format::sniffed_session_entries(path)?
+pub(crate) fn sniffed_session(
+    permit: ParsePermit<'_>,
+    path: &std::path::Path,
+) -> Result<TranscriptEntries> {
+    format::sniffed_session_entries(permit, path)?
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
@@ -147,6 +155,7 @@ impl TranscriptEntries {
 }
 
 /// A transcript line that did not parse as an entry.
+#[derive(Clone)]
 pub(crate) struct MalformedLine {
     pub(crate) line_number: usize,
     /// `None` for a format that records only the line's number.
@@ -155,6 +164,7 @@ pub(crate) struct MalformedLine {
 
 /// A malformed line as written, why it did not parse, and the lines around
 /// it.
+#[derive(Clone)]
 pub(crate) struct MalformedLineDetail {
     pub(crate) line_content: String,
     pub(crate) error_message: String,
@@ -353,10 +363,19 @@ pub enum LoaderMessage {
     /// own refresh ownership since, applied as a list refresh applies them
     Changes(SessionChanges),
     /// A failed write batch stopped the load's cache writes part way: the
-    /// rows it parsed rather than restored may be missing from the cache
-    CacheWritesStopped,
+    /// rows it parsed rather than restored may be missing from the cache,
+    /// and these sessions it read from older copies or left unlisted
+    CacheWritesStopped(Vec<StaleSession>),
     /// Loading completed
     Done,
+}
+
+/// A session a load read from a copy older than its transcripts, or left
+/// unlisted because the cache holds no copy of it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleSession {
+    pub source: Source,
+    pub path: PathBuf,
 }
 
 /// How far the loader is through one source: `done` of `total` transcripts

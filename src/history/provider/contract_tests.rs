@@ -19,6 +19,7 @@
 //! each provider's [`ProviderFixture::every_record_session`] through
 //! [`every_record_sessions`]. It fails for a provider without a fixture.
 
+use super::walk::test_support::ScriptedLister;
 use super::walk::{DirectoryLister, SystemLister};
 use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
@@ -28,9 +29,10 @@ use super::{
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
-use crate::history::environment::test_support::{test_environment, waiting_operation};
+use crate::history::environment::test_support::waiting_operation;
 use crate::history::load_meter::AgentMeter;
-use crate::history::{Conversation, NextStep, Source};
+use crate::history::sqlite_cache::SqliteCache;
+use crate::history::{Conversation, Environment, NextStep, ProcessIdentity, Source};
 use runner::run_contract;
 pub(crate) use runner::{every_record_sessions, registered_fixtures};
 use std::cell::RefCell;
@@ -38,6 +40,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 /// One variant per contract test below, named after it.
 #[derive(Clone, Copy, Debug)]
@@ -62,6 +65,7 @@ enum Contract {
     WorkspaceSessionsDir,
     RootOverride,
     StorageEnvVars,
+    UnreadableDirectory,
     ForeignFileDelete,
 }
 
@@ -94,7 +98,7 @@ impl Contract {
             Self::WorkspaceSessionsDir => provider.workspace_sessions_dir().is_capable(),
             Self::WarmCacheRename => rename,
             Self::ForeignFileDelete => delete,
-            Self::RootOverride | Self::StorageEnvVars => true,
+            Self::RootOverride | Self::StorageEnvVars | Self::UnreadableDirectory => true,
         }
     }
 }
@@ -329,7 +333,14 @@ pub(crate) fn list_row(source: Source, locator: &Path, subagents: &[PathBuf]) ->
     source
         .provider()
         .storage()
-        .parse_session(&stub, &root, None, &|| {}, &TestClock::default())
+        .parse_session(
+            crate::history::FOR_FIXTURES,
+            &stub,
+            &root,
+            None,
+            &|| {},
+            &TestClock::default(),
+        )
         .unwrap()
         .expect("the session is listed")
 }
@@ -384,11 +395,30 @@ pub(crate) trait ProviderFixture: Sync {
 
     /// Discovery under `home`, through the provider's storage.
     fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
-        let storage = self.storage();
-        storage
-            .discover(&self.root_under(home), &SystemLister)
-            .unwrap()
-            .stubs
+        self.discover_listed_by(home, &SystemLister).unwrap().stubs
+    }
+
+    /// Discovery under `home`, through the provider's storage, listing every
+    /// directory through `lister`.
+    fn discover_listed_by(
+        &self,
+        home: &Path,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        self.storage().discover(&self.root_under(home), lister)
+    }
+
+    /// One listable session in another directory than
+    /// [`write_session`](Self::write_session)'s, one discovery lists apart
+    /// from it; returns its locator.
+    fn write_session_in_another_directory(&self, _home: &Path, _session: &str) -> PathBuf {
+        self.cannot_run("write a session in another directory")
+    }
+
+    /// The directory discovery lists to find the session at `locator`;
+    /// `None` for an agent whose discovery lists no directory.
+    fn listed_directory_of(&self, locator: &Path) -> Option<PathBuf> {
+        locator.parent().map(Path::to_path_buf)
     }
 
     /// The session `id` names under `home`, as the provider's
@@ -457,7 +487,9 @@ pub(crate) trait ProviderFixture: Sync {
     /// The provider's delete of the session at `locator` under `home`.
     fn delete_under(&self, _home: &Path, locator: &Path) -> Result<Deleted> {
         match self.provider().delete() {
-            Capability::Capable(deleter) => deleter.delete_session(locator),
+            Capability::Capable(deleter) => {
+                deleter.delete_session(crate::history::FOR_FIXTURES, locator)
+            }
             Capability::NotCapable(_) => self.cannot_run("delete a session"),
         }
     }
@@ -615,12 +647,16 @@ pub(crate) fn load_under(
     home: &Path,
     cache_base: &Path,
 ) -> Vec<Conversation> {
-    let environment = fixture_environment(fixture, home, cache_base);
-    let storage = environment.storages()[0];
-    let operation = waiting_operation(&environment);
+    rows_loaded_through(&fixture_environment(fixture, home, cache_base))
+}
+
+/// Every conversation `environment`'s one storage holds, through the shared
+/// load loop.
+fn rows_loaded_through(environment: &Environment) -> Vec<Conversation> {
+    let operation = waiting_operation(environment);
     let rows = super::load_sessions(
-        &environment,
-        storage,
+        environment,
+        environment.storages()[0],
         false,
         None,
         AgentMeter::UNMETERED,
@@ -640,16 +676,29 @@ pub(crate) fn fixture_environment(
     fixture: &'static dyn ProviderFixture,
     home: &Path,
     cache_base: &Path,
-) -> crate::history::Environment {
-    test_environment(
-        vec![kept_storage_under(fixture, home, None)],
-        Some(cache_base),
+) -> Environment {
+    fixture_environment_listed_by(fixture, home, cache_base, Arc::new(SystemLister))
+}
+
+/// [`fixture_environment`], listing every directory through `lister`.
+fn fixture_environment_listed_by(
+    fixture: &'static dyn ProviderFixture,
+    home: &Path,
+    cache_base: &Path,
+    lister: Arc<dyn DirectoryLister>,
+) -> Environment {
+    Environment::new(
+        vec![kept_storage_under(fixture, home)],
+        cache_base.to_path_buf(),
+        ProcessIdentity::default(),
+        Arc::new(TestClock::default()),
+        lister,
     )
 }
 
 /// The provider's storage pinned to `home`, with discovery answered by the
-/// fixture's `discover_under`: Pi's and OMP's own discovery reads its walk
-/// depth from the environment.
+/// fixture's `discover_listed_by`: Pi's and OMP's own discovery reads its
+/// walk depth from the environment.
 struct FixtureStorage<'a> {
     fixture: &'a dyn ProviderFixture,
     home: &'a Path,
@@ -671,11 +720,9 @@ impl SessionStorage for FixtureStorage<'_> {
     fn discover(
         &self,
         _root: &SessionRoot,
-        _lister: &dyn DirectoryLister,
+        lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
-        Ok(DiscoveredSessions::complete(
-            self.fixture.discover_under(self.home),
-        ))
+        self.fixture.discover_listed_by(self.home, lister)
     }
 
     fn rediscover_unlisted_session(
@@ -691,15 +738,21 @@ impl SessionStorage for FixtureStorage<'_> {
 
     fn parse_session(
         &self,
+        permit: crate::history::ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
         clock: &dyn Clock,
-    ) -> Result<Option<Conversation>> {
-        self.fixture
-            .storage()
-            .parse_session(stub, root, debug_level, on_transcript_read, clock)
+    ) -> Result<crate::history::parser::ParsedSession> {
+        self.fixture.storage().parse_session(
+            permit,
+            stub,
+            root,
+            debug_level,
+            on_transcript_read,
+            clock,
+        )
     }
 
     fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
@@ -708,82 +761,13 @@ impl SessionStorage for FixtureStorage<'_> {
 }
 
 /// `fixture`'s storage pinned to `home`, kept for the rest of the process as
-/// the first build keeps the storages it samples. With
-/// `unreadable_directory`, discovery also reports that directory as one it
-/// could not list.
+/// the first build keeps the storages it samples.
 pub(crate) fn kept_storage_under(
     fixture: &'static dyn ProviderFixture,
     home: &Path,
-    unreadable_directory: Option<PathBuf>,
 ) -> &'static dyn SessionStorage {
     let home: &'static Path = Box::leak(home.to_path_buf().into_boxed_path());
-    Box::leak(Box::new(StorageMissingADirectory {
-        storage: FixtureStorage { fixture, home },
-        unreadable_directory,
-    }))
-}
-
-/// A [`FixtureStorage`] whose discovery could not list one directory.
-struct StorageMissingADirectory {
-    storage: FixtureStorage<'static>,
-    unreadable_directory: Option<PathBuf>,
-}
-
-impl SessionStorage for StorageMissingADirectory {
-    fn source(&self) -> Source {
-        self.storage.source()
-    }
-
-    fn cache(&self) -> SessionCache {
-        self.storage.cache()
-    }
-
-    fn roots_in(&self, environment: &RootEnvironment) -> Result<Vec<SessionRoot>> {
-        self.storage.roots_in(environment)
-    }
-
-    fn discover(
-        &self,
-        root: &SessionRoot,
-        lister: &dyn DirectoryLister,
-    ) -> Result<DiscoveredSessions> {
-        let mut found = self.storage.discover(root, lister)?;
-        found
-            .unreadable_directories
-            .extend(self.unreadable_directory.iter().map(|path| {
-                super::storage::UnreadableDirectory {
-                    path: path.clone(),
-                    error: "access denied".to_owned(),
-                }
-            }));
-        Ok(found)
-    }
-
-    fn rediscover_unlisted_session(
-        &self,
-        root: &SessionRoot,
-        locator: &Path,
-        lister: &dyn DirectoryLister,
-    ) -> Result<Option<SessionStub>> {
-        self.storage
-            .rediscover_unlisted_session(root, locator, lister)
-    }
-
-    fn parse_session(
-        &self,
-        stub: &SessionStub,
-        root: &SessionRoot,
-        debug_level: Option<DebugLevel>,
-        on_transcript_read: &(dyn Fn() + Sync),
-        clock: &dyn crate::clock::Clock,
-    ) -> Result<Option<Conversation>> {
-        self.storage
-            .parse_session(stub, root, debug_level, on_transcript_read, clock)
-    }
-
-    fn external_titles(&self, root: &SessionRoot) -> HashMap<String, SessionTitle> {
-        self.storage.external_titles(root)
-    }
+    Box::leak(Box::new(FixtureStorage { fixture, home }))
 }
 
 fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -948,7 +932,12 @@ fn rename_reaches_next_load_through_warm_cache() {
         let session = fixture.write_session(home.path(), fixture.ids().session);
         fixture
             .renamer()
-            .rename_session(&session, "old name", clock.wall())
+            .rename_session(
+                crate::history::FOR_FIXTURES,
+                &session,
+                "old name",
+                clock.wall(),
+            )
             .unwrap();
 
         let first = load_under(fixture, home.path(), cache.path());
@@ -957,7 +946,12 @@ fn rename_reaches_next_load_through_warm_cache() {
         clock.advance(std::time::Duration::from_secs(1));
         fixture
             .renamer()
-            .rename_session(&session, "fresh name", clock.wall())
+            .rename_session(
+                crate::history::FOR_FIXTURES,
+                &session,
+                "fresh name",
+                clock.wall(),
+            )
             .unwrap();
 
         let second = load_under(fixture, home.path(), cache.path());
@@ -1102,6 +1096,7 @@ fn subagent_lists(fixture: &dyn ProviderFixture, resolved: &ResolvedSession) -> 
     fixture
         .storage()
         .parse_session(
+            crate::history::FOR_FIXTURES,
             &resolved.stub,
             &resolved.root,
             None,
@@ -1109,7 +1104,7 @@ fn subagent_lists(fixture: &dyn ProviderFixture, resolved: &ResolvedSession) -> 
             &crate::clock::TestClock::default(),
         )
         .unwrap()
-        .is_some()
+        .is_ok()
 }
 
 /// True when `read` is the read of a sub-agent whose parse lists it when
@@ -1124,7 +1119,7 @@ fn reads_as_parsed(read: &SessionRead, lists: bool) -> bool {
 /// A pasted sub-agent ID the cache lacks reads as not cached and asks for a
 /// session refresh, which reads it as the sub-agent's parsed session.
 #[test]
-fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_refresh() {
+fn sub_agent_id_cache_lacks_reads_as_its_parsed_session_through_session_refresh() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1140,18 +1135,27 @@ fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_
         let source = fixture.provider().source();
         let locator = resolved.stub.locator.clone();
 
-        let read = super::read_resolved_session(&environment, source, resolved, false);
+        let (read, next) =
+            super::read_resolved_session(&environment, source, resolved, false).into_parts();
 
-        assert!(matches!(read.read(), SessionRead::NotCached));
-        assert_eq!(read.next(), NextStep::CacheInBackground);
+        assert!(matches!(read, SessionRead::NotCached));
+        assert_eq!(next, NextStep::CacheInBackground);
         let operation = waiting_operation(&environment);
-        let refreshed = super::cache_sessions(&environment, source, &[&locator], false, &operation)
-            .unwrap()
-            .pop()
-            .unwrap();
+        let (refreshed, _) = super::cache_sessions(
+            &environment,
+            source,
+            &[&locator],
+            false,
+            &operation,
+            AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+        .into_parts();
         operation.finish().unwrap();
         assert!(
-            reads_as_parsed(refreshed.read(), lists),
+            reads_as_parsed(&refreshed, lists),
             "the sub-agent reads as its parsed session"
         );
     });
@@ -1162,7 +1166,7 @@ fn a_sub_agent_id_the_cache_lacks_reads_as_its_parsed_session_through_a_session_
 /// discovery leaves out, and the cache serves it after. Otherwise the
 /// completed refresh removes the sub-agent's row.
 #[test]
-fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
+fn sub_agent_opened_by_id_during_refresh_is_read_again_once_it_completes() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1177,35 +1181,43 @@ fn a_sub_agent_opened_by_id_during_a_refresh_is_read_again_once_it_completes() {
         let environment = fixture_environment(fixture, home.path(), cache_base.path());
         let source = fixture.provider().source();
         let refresh = crate::history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
-            environment.cache_base().unwrap(),
+            environment.cache_base(),
         )
         .unwrap();
 
-        let opened = super::read_resolved_session(&environment, source, resolved.clone(), false);
+        let (_, opened) =
+            super::read_resolved_session(&environment, source, resolved.clone(), false)
+                .into_parts();
         assert!(
-            matches!(opened.next(), NextStep::AwaitRefresh(_)),
+            matches!(opened, NextStep::AwaitRefresh(_)),
             "the sub-agent's read records the refresh to await"
         );
         drop(refresh);
         let locator = resolved.stub.locator.as_path();
         let operation = waiting_operation(&environment);
-        let cached = super::cache_sessions(&environment, source, &[locator], false, &operation)
-            .unwrap()
-            .pop()
-            .unwrap();
+        let cached = super::cache_sessions(
+            &environment,
+            source,
+            &[locator],
+            false,
+            &operation,
+            AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
         operation.finish().unwrap();
         let reread = super::reread_sessions(&environment, source, &[locator], false)
             .pop()
             .unwrap();
 
-        for read_again in [cached.read(), reread.read()] {
+        for (read_again, next) in [cached.into_parts(), reread.into_parts()] {
             assert!(
-                reads_as_parsed(read_again, lists),
+                reads_as_parsed(&read_again, lists),
                 "the sub-agent is read again after the refresh"
             );
+            assert_eq!(next, NextStep::Settled);
         }
-        assert_eq!(cached.next(), NextStep::Settled);
-        assert_eq!(reread.next(), NextStep::Settled);
     });
 }
 
@@ -1254,13 +1266,9 @@ fn query_without_id_shape_resolves_to_nothing() {
 /// the agent's `fork` declaration has been read.
 fn actions_menu_offers_fork(fixture: &dyn ProviderFixture) -> bool {
     fixture.provider().fork();
-    let menu = crate::tui::App::new(
+    let menu = crate::tui::claude_home::app_reading(
         vec![fixture.every_record_session().row],
-        crate::tui::ToolDisplayMode::Hidden,
-        false,
-        crate::config::KeyBindings::default(),
-        Vec::new(),
-        std::sync::Arc::new(TestClock::default()),
+        crate::history::environment::test_support::test_environment(Vec::new(), None),
     );
     menu.is_action_available(crate::tui::SessionAction::Fork)
 }
@@ -1439,6 +1447,112 @@ fn listed_environment_variables_decide_every_root() {
             "the variables root resolution reads"
         );
     });
+}
+
+/// A directory discovery cannot list hides no session: the other
+/// directories still list, discovery reports the directory, and the cached
+/// sessions under it stay listed from the session cache, by the list and by
+/// agent `sessions`, which names the directory in one `io` warning.
+#[test]
+fn unreadable_directory_keeps_its_cached_sessions_listed() {
+    run_contract(Contract::UnreadableDirectory, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let hidden = fixture.write_session(home.path(), fixture.ids().session);
+        let other = fixture.write_session_in_another_directory(home.path(), fixture.ids().other);
+        let lister = Arc::new(ScriptedLister::default());
+        let environment =
+            fixture_environment_listed_by(fixture, home.path(), cache.path(), lister.clone());
+        let root = fixture.root_under(home.path());
+        let listed_before = listed_paths(&environment);
+        assert_eq!(listed_before, sorted(vec![hidden.clone(), other.clone()]));
+        let cached_before = cached_keys(&environment, &root);
+        assert_eq!(
+            cached_before.len(),
+            2,
+            "the first load cached both sessions"
+        );
+        let refused = fixture.listed_directory_of(&hidden);
+        if let Some(refused) = &refused {
+            lister.refuse(refused);
+        }
+
+        let listed = listed_paths(&environment);
+        let found = environment.storages()[0]
+            .discover(&root, lister.as_ref())
+            .unwrap();
+
+        assert_eq!(
+            listed, listed_before,
+            "the sessions under the unreadable directory stay listed"
+        );
+        assert_eq!(
+            found
+                .unreadable_directories
+                .into_iter()
+                .map(|directory| directory.path)
+                .collect::<Vec<_>>(),
+            Vec::from_iter(refused.clone()),
+            "discovery reports the directory it could not list"
+        );
+        assert_eq!(
+            cached_keys(&environment, &root),
+            cached_before,
+            "the cache keeps the rows of the sessions under the directory"
+        );
+
+        let output = crate::agent::service::execute(
+            crate::agent::test_support::agent_command(&["sessions", "--all"]),
+            fixture_environment_listed_by(fixture, home.path(), cache.path(), lister),
+        )
+        .unwrap_or_else(crate::error_report);
+        let directory_warnings = output
+            .lines()
+            .filter(|line| {
+                line.starts_with("protocol agent-warning kind=io ")
+                    && refused.as_ref().is_some_and(|refused| {
+                        line.contains(&crate::agent::protocol::escape_atom(
+                            &refused.file_name().unwrap().to_string_lossy(),
+                        ))
+                    })
+            })
+            .count();
+        assert_eq!(
+            directory_warnings,
+            usize::from(refused.is_some()),
+            "agent sessions names each unreadable directory in one io warning:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("sessions matched=2 ")),
+            "agent sessions lists the cached sessions under the unreadable directory:\n{output}"
+        );
+    });
+}
+
+/// The path of every session a load through `environment`'s one storage
+/// lists, sorted.
+fn listed_paths(environment: &Environment) -> Vec<PathBuf> {
+    sorted(
+        rows_loaded_through(environment)
+            .into_iter()
+            .map(|row| row.path)
+            .collect(),
+    )
+}
+
+/// The cache keys `environment`'s session cache stores for its one
+/// storage's `root`, sorted.
+fn cached_keys(environment: &Environment, root: &SessionRoot) -> Vec<String> {
+    let storage = environment.storages()[0];
+    let mut keys = SqliteCache::open_waiting(environment.cache_base())
+        .unwrap()
+        .unwrap()
+        .stored_keys(storage.cache(), &root.path)
+        .unwrap();
+    keys.sort();
+    keys
 }
 
 /// A delete aimed at another agent's transcript, named as this agent names

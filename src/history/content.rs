@@ -9,35 +9,27 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 impl Conversation {
+    /// This row with its content: the copy the session cache holds, as it
+    /// holds it, whether or not the transcript changed since. Only the
+    /// refresh owner parses transcripts, so a copy missing from the cache, or
+    /// replaced since the row was read, is a miss.
     pub(crate) fn load_content(&self) -> Result<Cow<'_, Self>> {
         let Some(cached) = &self.cached_session else {
             return Ok(Cow::Borrowed(self));
         };
         let mut parts = ContentBuilder::default();
-        if let Ok(Some(())) = cached.search_parts(self, |part| parts.push(part)) {
-            let mut row = self.clone();
-            parts.finish(&mut row);
-            return Ok(Cow::Owned(row));
+        let copy = cached.clone().ignoring_source_changes().waiting();
+        match copy.search_parts(self, |part| parts.push(part))? {
+            Some(()) => {
+                let mut row = self.clone();
+                parts.finish(&mut row);
+                Ok(Cow::Owned(row))
+            }
+            None => Err(AppError::SessionCacheNotReady {
+                session: self.session_id.clone(),
+                reason: "the session is not in the session cache".to_owned(),
+            }),
         }
-        // A replaced cache or changed source is a miss. Reparse this session
-        // through its provider; propagate a failure rather than return empty text.
-        let stub = super::provider::SessionStub {
-            locator: self.path.clone(),
-            subagents: self.subagents.clone(),
-            cache_key: String::new(),
-            fingerprint: super::provider::Fingerprint {
-                size: 0,
-                modified: None,
-            },
-        };
-        let root = super::provider::SessionRoot::new(self.path.parent().unwrap_or(&self.path));
-        let content = self
-            .source
-            .provider()
-            .storage()
-            .parse_session(&stub, &root, None, &|| {}, cached.clock())?
-            .ok_or_else(|| AppError::UnrecognizedTranscript(self.path.display().to_string()))?;
-        Ok(Cow::Owned(content))
     }
 }
 
