@@ -6,13 +6,13 @@ use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
-    CachedSession, CopyKey, ReadOrder, ScanScope, ScannedRow, SearchedFields, SessionKey,
-    TextVisitor, scan_search_texts,
+    CachedSession, CopyKey, CopyOutcome, ReadOrder, ScanScope, ScannedRow, SearchedFields,
+    SessionKey, TextVisitor, scan_search_texts,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 
@@ -233,23 +233,17 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
             pieces[copy].push(texts);
         }
     }
-    let no_longer_cached = scanned.no_longer_cached.into_iter().collect::<HashSet<_>>();
-    let replaced = scanned
-        .replaced
-        .into_iter()
-        .map(|(copy, _)| copy)
-        .collect::<HashSet<_>>();
     pieces
         .into_par_iter()
+        .zip(scanned.copies)
         .enumerate()
-        .map(|(copy, pieces)| {
+        .map(|(copy, (pieces, outcome))| {
             let cached = &copies[copy];
-            let texts = if replaced.contains(&copy) {
-                read_texts(cached)
-            } else if no_longer_cached.contains(&copy) {
-                Err(ReadFailure::NoLongerCached)
-            } else {
-                Ok(Arc::new(laid_out(pieces)))
+            let texts = match outcome {
+                CopyOutcome::Scanned(_) => Ok(Arc::new(laid_out(pieces))),
+                CopyOutcome::NoLongerCached => Err(ReadFailure::NoLongerCached),
+                CopyOutcome::Replaced(_) => read_texts(cached),
+                CopyOutcome::Failed(error) => Err(ReadFailure::of(&error)),
             };
             (cached.copy_key(), texts)
         })

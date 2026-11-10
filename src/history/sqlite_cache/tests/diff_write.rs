@@ -21,6 +21,7 @@ const ENTRY_TABLES: &[&str] = &[
     "transcripts",
     "parts",
     "result_items",
+    "semantic_turns",
 ];
 
 /// The operation [`watch_row_writes`] counts for an update of a part's
@@ -290,6 +291,12 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
             "SELECT e.sequence, p.part, i.position, i.kind, i.text, i.text_codes, \
              i.item_type FROM result_items i JOIN parts p ON p.id = i.part \
              JOIN entries e ON e.id = p.entry WHERE e.session = ?1 ORDER BY 1, 2, 3"
+                .to_owned(),
+        ),
+        (
+            "semantic_turns",
+            "SELECT sequence, ordinal, text FROM semantic_turns WHERE session = ?1 \
+             ORDER BY sequence"
                 .to_owned(),
         ),
     ] {
@@ -582,12 +589,22 @@ fn later_write_of_session_with_files_under_two_roots_matches_fresh_write() {
     assert_matches_fresh_write(&cache, &fixture, &record);
 }
 
-/// The entries `write` builds part rows for.
+/// The part rows `write` builds, one set per entry each time.
 fn part_row_builds(write: impl FnOnce()) -> usize {
     use crate::history::sqlite_cache::entries::PART_ROW_BUILDS;
     PART_ROW_BUILDS.with(|builds| builds.set(0));
     write();
     PART_ROW_BUILDS.with(std::cell::Cell::get)
+}
+
+/// The entry rows `cache` stores.
+fn stored_entries(cache: &CacheWriter) -> usize {
+    cache
+        .connection
+        .query_row("SELECT COUNT(*) FROM entries", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap() as usize
 }
 
 #[test]
@@ -605,8 +622,9 @@ fn parse_equal_to_stored_session_writes_no_entry_rows_for_every_agent() {
 
         assert_eq!(
             builds,
-            0,
-            "{}: comparing unchanged entries doesn't build any part rows",
+            stored_entries(&cache),
+            "{}: comparing unchanged entries builds each entry's part rows once, for its \
+             digests",
             fixture.label()
         );
         assert_eq!(
@@ -623,6 +641,19 @@ fn parse_equal_to_stored_session_writes_no_entry_rows_for_every_agent() {
         );
         assert_matches_fresh_write(&cache, &fixture, &record);
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a session's rows are built outside a write batch")]
+fn session_rows_built_inside_write_batch_fail_debug_check() {
+    let fixture = Fixture::of(every_record_sessions().remove(0));
+    let base = tempfile::tempdir().unwrap();
+    let mut record = fixture.record();
+    let cache = cache_holding(base.path(), &fixture, &record);
+    let _batch = refresh::transaction(&cache.connection, &cache.owner).unwrap();
+
+    entries::SessionRows::of(entries_of(&mut record), &HashSet::new());
 }
 
 /// A title the agent keeps outside the transcript is a field of the session
@@ -718,6 +749,7 @@ fn title_outside_transcript_renamed_doesnt_write_entry_rows_for_every_agent() {
 
 #[test]
 fn entries_appended_to_own_transcript_are_inserted_for_every_agent() {
+    let mut appended_turns = 0;
     for session in every_record_sessions() {
         let fixture = Fixture::of(session);
         let mut before = fixture.record();
@@ -744,9 +776,21 @@ fn entries_appended_to_own_transcript_are_inserted_for_every_agent() {
         assert_eq!(
             writes_of(&writes, "entries", "DELETE"),
             0,
-            "{}: the write deletes no entry: {writes:?}",
+            "{}: the write does not delete an entry: {writes:?}",
             fixture.label()
         );
+        let inserted_turns = writes_of(&writes, "semantic_turns", "INSERT");
+        assert_eq!(
+            (
+                inserted_turns <= appended as i64,
+                writes_of(&writes, "semantic_turns", "UPDATE")
+                    + writes_of(&writes, "semantic_turns", "DELETE")
+            ),
+            (true, 0),
+            "{}: the write inserts only the appended entries' semantic turns: {writes:?}",
+            fixture.label()
+        );
+        appended_turns += inserted_turns;
         assert!(
             stored.is_subset(&ids(&cache, "entries")),
             "{}: the earlier entries keep their ids",
@@ -754,6 +798,10 @@ fn entries_appended_to_own_transcript_are_inserted_for_every_agent() {
         );
         assert_matches_fresh_write(&cache, &fixture, &record);
     }
+    assert!(
+        appended_turns > 0,
+        "an appended entry holds a semantic turn"
+    );
 }
 
 /// The parts whose session is not their entry's.
@@ -1093,8 +1141,9 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
         );
         assert_eq!(
             builds,
-            1,
-            "{}: the write builds the changed entry's part rows alone",
+            stored_entries(&cache) + 1,
+            "{}: the write builds each entry's part rows for its digests, and the changed \
+             entry's again to write them",
             fixture.label()
         );
         assert!(
@@ -1102,6 +1151,7 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
             "{}: the write updates the changed entry's changed parts: {writes:?}",
             fixture.label()
         );
+        assert_changed_turn_written(&cache, &writes, &fixture, &mut before, changed);
         assert_eq!(
             ids(&cache, "entries"),
             stored,
@@ -1118,6 +1168,57 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
             source.label()
         );
     }
+}
+
+/// Asserts that the write of `fixture`'s record over `before`, whose rows
+/// `writes` counts, wrote the semantic turn of the entry at `changed` once
+/// when the turn changed and not otherwise, and stored its new turn. Returns
+/// whether the turn changed.
+fn assert_changed_turn_written(
+    cache: &CacheWriter,
+    writes: &BTreeMap<(String, String), i64>,
+    fixture: &Fixture,
+    before: &mut SessionRecord,
+    changed: usize,
+) -> bool {
+    let turn_of = |record: &mut SessionRecord| {
+        crate::history::parser::entry_semantic_turn(&entries_of(record).entries[changed].1)
+    };
+    let (turn_before, turn_after) = (turn_of(before), turn_of(&mut fixture.record()));
+    let expected_writes = match (&turn_before, &turn_after) {
+        (before, after) if before == after => [0, 0, 0],
+        (None, Some(_)) => [1, 0, 0],
+        (Some(_), Some(_)) => [0, 1, 0],
+        (Some(_), None) => [0, 0, 1],
+        (None, None) => unreachable!("equal turns are matched above"),
+    };
+    assert_eq!(
+        ["INSERT", "UPDATE", "DELETE"].map(|operation| writes_of(
+            writes,
+            "semantic_turns",
+            operation
+        )),
+        expected_writes,
+        "{}: the write writes the changed entry's semantic turn alone, when it changed: \
+         {writes:?}",
+        fixture.label()
+    );
+    let stored_turn: Option<String> = cache
+        .connection
+        .query_row(
+            "SELECT text FROM semantic_turns WHERE sequence = ?1",
+            [changed as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        stored_turn,
+        turn_after,
+        "{}: the changed entry's stored turn is its new one",
+        fixture.label()
+    );
+    turn_before != turn_after
 }
 
 /// Replaces the first text block of the last entry of `record` holding a
@@ -1161,6 +1262,7 @@ fn parts_of_entry_at(cache: &CacheWriter, sequence: usize) -> Vec<(i64, i64)> {
 #[test]
 fn entry_with_one_changed_part_updates_that_part_alone_for_every_agent() {
     let mut tested = Vec::new();
+    let mut turns_changed = Vec::new();
     for session in every_record_sessions() {
         let fixture = Fixture::of(session);
         let mut before = fixture.record();
@@ -1207,12 +1309,19 @@ fn entry_with_one_changed_part_updates_that_part_alone_for_every_agent() {
             "{}: every part keeps its id, and every unchanged part its row",
             fixture.label()
         );
+        if assert_changed_turn_written(&cache, &writes, &fixture, &mut before, changed) {
+            turns_changed.push(fixture.source());
+        }
         assert_matches_fresh_write(&cache, &fixture, &record);
         tested.push(fixture.source());
     }
     assert!(
         tested.contains(&Source::OpenCode),
         "OpenCode has an entry with a text and another block: {tested:?}"
+    );
+    assert!(
+        !turns_changed.is_empty(),
+        "a fixture's changed text changes its entry's semantic turn: {tested:?}"
     );
 }
 
@@ -1369,6 +1478,27 @@ fn numbered_parts_of_entry_at(cache: &CacheWriter, sequence: usize) -> Vec<(i64,
         .unwrap()
 }
 
+/// The count of result items of each part of the entry at `sequence`, by
+/// the part's number.
+fn result_items_of_entry_at(cache: &CacheWriter, sequence: usize) -> BTreeMap<i64, i64> {
+    cache
+        .connection
+        .prepare(
+            "SELECT p.part, COUNT(i.part) FROM parts p JOIN entries e ON e.id = p.entry \
+             LEFT JOIN result_items i ON i.part = p.id WHERE e.sequence = ?1 GROUP BY p.part",
+        )
+        .unwrap()
+        .query_map([sequence as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The result items `items` counts for the parts numbered `parts`.
+fn items_of(items: &BTreeMap<i64, i64>, parts: &[i64]) -> i64 {
+    parts.iter().filter_map(|part| items.get(part)).sum()
+}
+
 #[test]
 fn block_removed_from_entry_with_call_deletes_its_parts_alone_for_every_agent() {
     let mut tested = Vec::new();
@@ -1440,10 +1570,17 @@ fn blocks_reordered_in_entry_rewrite_the_swapped_blocks_parts_alone_for_every_ag
         let mut record = fixture.record();
         for record in [&mut before, &mut record] {
             with_trailing_text(record, changed);
+            with_trailing_result_items(record, changed);
         }
         let base = tempfile::tempdir().unwrap();
         let mut cache = cache_holding(base.path(), &fixture, &before);
         let parts_before = numbered_parts_of_entry_at(&cache, changed);
+        let items_before = result_items_of_entry_at(&cache, changed);
+        assert!(
+            items_before.values().sum::<i64>() > 0,
+            "{}: the entry holds result items",
+            fixture.label()
+        );
 
         cache.write(&record).unwrap();
 
@@ -1495,6 +1632,18 @@ fn blocks_reordered_in_entry_rewrite_the_swapped_blocks_parts_alone_for_every_ag
             "{}: the write rewrites the changed parts alone: {writes:?}",
             fixture.label()
         );
+        assert_eq!(
+            (
+                writes_of(&writes, "result_items", "DELETE"),
+                writes_of(&writes, "result_items", "INSERT"),
+            ),
+            (
+                items_of(&items_before, &rewritten),
+                items_of(&result_items_of_entry_at(&cache, changed), &rewritten)
+            ),
+            "{}: the write replaces the result items of the changed parts alone: {writes:?}",
+            fixture.label()
+        );
         assert_matches_fresh_write(&cache, &fixture, &record);
         tested.push(fixture.source());
     }
@@ -1511,6 +1660,21 @@ fn with_trailing_text(record: &mut SessionRecord, index: usize) {
         .expect("the changed entry holds blocks");
     blocks.push(ContentBlock::Text {
         text: "A trailing block the change leaves alone.".to_owned(),
+    });
+}
+
+/// Appends a tool result of two text items to the entry at `index` of
+/// `record`, after the blocks a test changes.
+fn with_trailing_result_items(record: &mut SessionRecord, index: usize) {
+    let blocks = blocks_of(&mut entries_of(record).entries[index].1)
+        .expect("the changed entry holds blocks");
+    blocks.push(ContentBlock::ToolResult {
+        tool_use_id: "trailing-result".to_owned(),
+        standalone_tool_name: None,
+        content: Some(serde_json::json!([
+            {"type": "text", "text": "A trailing result's first item."},
+            {"type": "text", "text": "Its second item."},
+        ])),
     });
 }
 

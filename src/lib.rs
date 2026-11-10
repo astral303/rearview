@@ -728,14 +728,13 @@ fn run_with(
             fork_session,
         )
     };
-    let (conversations, selected_path) =
-        match act_on_tui_exit(action, conversations, environment.cache_base(), resume)? {
-            TuiExit::Selected {
-                conversations,
-                path,
-            } => (conversations, path),
-            TuiExit::Resumed => return Ok(()),
-        };
+    let (conversations, selected_path) = match act_on_tui_exit(action, conversations, resume)? {
+        TuiExit::Selected {
+            conversations,
+            path,
+        } => (conversations, path),
+        TuiExit::Resumed => return Ok(()),
+    };
 
     if args.show_path {
         println!("{}", selected_path.display());
@@ -838,20 +837,14 @@ enum TuiExit {
     Resumed,
 }
 
-/// Act on `action`, which the TUI over the session cache `base` exited with
-/// over the listed `conversations`, resuming a session through `resume`
-/// (with true to fork it). Once a write of the TUI found the cache's drive
-/// short of space, fail with the low-space error instead, without acting:
-/// rearview then deletes the cache and stops (see [`finish_command`]).
+/// Act on `action`, which the TUI exited with over the listed
+/// `conversations`, resuming a session through `resume` (with true to fork
+/// it).
 fn act_on_tui_exit(
     action: tui::Action,
     conversations: Vec<history::Conversation>,
-    base: &history::CacheBase,
     resume: impl FnOnce(&history::Conversation, bool) -> Result<()>,
 ) -> Result<TuiExit> {
-    if let Some(error) = base.low_space().error() {
-        return Err(error);
-    }
     let (path, fork_session) = match action {
         tui::Action::Select(path) => {
             return Ok(TuiExit::Selected {

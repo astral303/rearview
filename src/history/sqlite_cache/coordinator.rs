@@ -78,20 +78,21 @@ impl Coordinator {
 
     /// End this rearview's use of the cache: revoke the write permission of
     /// every refresh ownership it holds, revoked ones included, and release
-    /// each, waiting at most [`SHUTDOWN_RELEASE_WAIT`] for a busy writer
-    /// lock. Release an ownership whose write batch is running with one
-    /// attempt, without waiting: that batch holds the writer lock until it
-    /// ends. An ownership whose release fails stays this rearview's until
-    /// its operation ends or another rearview takes it over.
-    pub(crate) fn shutdown(&self) {
+    /// each, waiting at most `busy_lock_wait` for a busy writer lock.
+    /// - An ownership with its turn held by a write batch or a free-space
+    ///   check is released in one attempt, without waiting: a write batch
+    ///   holds the writer lock until it ends.
+    /// - An ownership left by a failed release stays this rearview's until its
+    ///   operation ends or another rearview takes it over.
+    pub(crate) fn shutdown(&self, busy_lock_wait: Duration) {
         let Ok(base) = self.base.canonical() else {
             return;
         };
         for owner in base.process().revoke_every_owner_of(base.path()) {
-            let wait = if owner.is_writing {
+            let wait = if owner.is_turn_held {
                 Duration::ZERO
             } else {
-                SHUTDOWN_RELEASE_WAIT
+                busy_lock_wait
             };
             if refresh::release(&base, &owner.identity, wait) != Release::Failed {
                 base.process().forget(&owner.identity);
@@ -100,5 +101,6 @@ impl Coordinator {
     }
 }
 
-/// The longest [`Coordinator::shutdown`] waits to release one ownership.
-const SHUTDOWN_RELEASE_WAIT: Duration = Duration::from_secs(1);
+/// The longest the TUI's exit waits to release one ownership while another
+/// connection holds SQLite's writer lock.
+pub(crate) const SHUTDOWN_RELEASE_WAIT: Duration = Duration::from_secs(1);

@@ -27,6 +27,19 @@ pub(crate) fn rearview_at(directory: &Path) -> CacheBase {
     )
 }
 
+/// Marks `copy`'s session row `writing`, as a write holds it until its batch
+/// commits.
+pub(crate) fn mark_writing(copy: &super::CachedSession) {
+    SqliteCache::open(&copy.base)
+        .unwrap()
+        .connection
+        .execute(
+            "UPDATE sessions SET status = ?2 WHERE generation = ?1",
+            rusqlite::params![copy.generation, super::catalogue::WRITING],
+        )
+        .unwrap();
+}
+
 /// Gives the session `copy` reads a generation no write gave, as a write of
 /// another copy of it does, and returns that generation.
 pub(crate) fn replace_copy(copy: &super::CachedSession) -> i64 {
@@ -68,9 +81,10 @@ pub(crate) fn remove_sessions_where(base: &Path, column: &str, value: &str) {
     );
 }
 
-/// Stores `bytes`, whether or not they are UTF-8, as the text of each text
-/// part of the sessions under `cache_key` in the session cache in `base`.
-pub(crate) fn store_text_parts_of(base: &Path, cache_key: &str, bytes: &[u8]) {
+/// Stores `bytes`, whether or not they are UTF-8, as the text of each
+/// semantic turn of the sessions under `cache_key` in the session cache in
+/// `base`.
+pub(crate) fn store_semantic_turns_of(base: &Path, cache_key: &str, bytes: &[u8]) {
     let connection = connection::open(
         &database_path(base),
         connection::Access::ReadWrite,
@@ -79,12 +93,15 @@ pub(crate) fn store_text_parts_of(base: &Path, cache_key: &str, bytes: &[u8]) {
     .unwrap();
     let stored = connection
         .execute(
-            "UPDATE parts SET text = CAST(?2 AS TEXT) WHERE kind = 'text' \
-             AND session IN (SELECT id FROM sessions WHERE cache_key = ?1)",
+            "UPDATE semantic_turns SET text = CAST(?2 AS TEXT) \
+             WHERE session IN (SELECT id FROM sessions WHERE cache_key = ?1)",
             params![cache_key, bytes],
         )
         .unwrap();
-    assert!(stored > 0, "the cache holds text parts under {cache_key}");
+    assert!(
+        stored > 0,
+        "the cache holds semantic turns under {cache_key}"
+    );
 }
 
 pub(super) fn admitted_cache(base: &Path) -> super::OwnedCache {
@@ -964,6 +981,51 @@ fn removed_session_leaves_no_rows() {
             .unwrap();
         assert_eq!(rows, 0, "{table}");
     }
+}
+
+/// A database stamped with another `SEMANTIC_TURN_VERSION` is emptied, and
+/// records the current version once built again.
+#[test]
+fn database_of_another_semantic_turn_version_is_emptied() {
+    use crate::semantic::filter::SEMANTIC_TURN_VERSION;
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = admitted_cache(base.path());
+    let session = every_record_sessions().remove(0);
+    let row = &session.row;
+    let root = root_of(&session);
+    cache
+        .write(&parsed_record(row.source, &root, &stub_of(&session, 1)))
+        .unwrap();
+    let count = |connection: &Connection, table: &str| -> i64 {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    assert!(
+        count(&cache.connection, "semantic_turns") > 0,
+        "the fixture stores semantic turns"
+    );
+    cache
+        .set_meta(
+            schema::SEMANTIC_TURN_VERSION_KEY,
+            &(SEMANTIC_TURN_VERSION - 1).to_string(),
+        )
+        .unwrap();
+    drop(cache);
+
+    let reopened = SqliteCache::open(&rearview_at(base.path())).unwrap();
+
+    assert_eq!(
+        (
+            count(&reopened.connection, "sessions"),
+            count(&reopened.connection, "semantic_turns"),
+            reopened.meta(schema::SEMANTIC_TURN_VERSION_KEY).unwrap(),
+        ),
+        (0, 0, Some(SEMANTIC_TURN_VERSION.to_string())),
+        "the database is emptied and records the current semantic turn version"
+    );
 }
 
 /// A database written under another version of these tables is emptied and

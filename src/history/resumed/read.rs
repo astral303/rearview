@@ -420,7 +420,10 @@ fn place(
     let own_read = own_window.map_or(&resume.files[0].read, |window| &window.read);
     let mut leading = reader.leading_entries(&stub.locator, own_read)?;
     let leading_titles = take_leading_titles(&mut leading);
-    if leading_digest(&leading) != checkpoint.leading_digest {
+    // A write rewrites the stored leading rows in place: a resumed read never
+    // moves the entries after them.
+    if leading.len() != resume.leading_rows || leading_digest(&leading) != checkpoint.leading_digest
+    {
         return Ok(Err(WholeRead::LeadingChanged));
     }
 
@@ -762,7 +765,6 @@ fn finish(
     } = *context;
     let checkpoint = &resume.checkpoint;
     let own = &resume.files[0];
-    let moved = placed.leading.len() as i64 - resume.leading_rows as i64;
     let bytes_read = bytes_read(&stamps, own_window.as_ref(), &threads);
     let subagents: HashSet<&Path> = stub.subagents.iter().map(PathBuf::as_path).collect();
 
@@ -820,9 +822,8 @@ fn finish(
     let steps = tail_steps(&placed.tail, &subagents);
     let place = checkpoint_place_after(&steps, own_read.stable_line, checkpoint.splice.clone())
         .filter(|_| own_read.stable_line >= own.read.stable_line);
-    let start = checkpoint.fold.clone().with_leading_entries_moved(moved);
     let (fold, next_fold) = fold_tail(
-        &start,
+        &checkpoint.fold,
         &placed.leading_titles,
         &placed.tail,
         &subagents,
@@ -835,7 +836,7 @@ fn finish(
         return Ok(Err(WholeRead::CwdChanged));
     }
     let next_checkpoint = place.zip(next_fold).map(|((sequence, splice), fold)| {
-        let sequence = (checkpoint.sequence as i64 + moved) as usize + sequence;
+        let sequence = checkpoint.sequence + sequence;
         (
             SessionCheckpoint {
                 sequence,
@@ -899,7 +900,6 @@ fn finish(
     let update = WindowUpdate {
         session: resume.session,
         generation: resume.generation,
-        stored_leading_rows: resume.leading_rows,
         leading: placed.leading,
         checkpoint: resume.checkpoint.clone(),
         in_place: placed.in_place,

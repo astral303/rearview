@@ -194,8 +194,7 @@ impl RefreshOwnership {
         token.base.process().hold(
             token.base.path(),
             &token.identity,
-            Arc::clone(&token.writable),
-            Arc::clone(&token.turn),
+            Arc::clone(&token.access),
         );
         Self { token }
     }
@@ -214,18 +213,30 @@ impl RefreshOwnership {
     pub(super) fn delete_database(&mut self, wait: ExclusiveWait) -> CacheDeletion {
         let turn = self.token.take_turn();
         let database = super::database_path(self.token.base.path());
-        if database.exists()
-            && let Err(error) = self.empty_database(&turn, wait)
-        {
-            return deletion_failure(&database, error);
+        if !database.exists() {
+            return remove_side_files(&database);
         }
-        remove_side_files(&database)
+        let deletion = self
+            .empty_database(&turn, &database, wait)
+            .unwrap_or_else(|error| deletion_failure(&database, error));
+        #[cfg(test)]
+        if let Some(after_lock_ends) = AFTER_DELETION_LOCK_ENDS.take() {
+            after_lock_ends();
+        }
+        deletion
     }
 
-    /// Drop every table of the database but `refresh_state`, shrink its file
-    /// and leave WAL mode, under SQLite's exclusive lock. The connection
-    /// holds the lock until it closes on return.
-    fn empty_database(&self, turn: &Turn<'_>, wait: ExclusiveWait) -> Result<()> {
+    /// Drop every table of `database` but `refresh_state`, shrink its file,
+    /// leave WAL mode and remove the files SQLite keeps beside it, under
+    /// SQLite's exclusive lock. The connection holds the lock until it
+    /// closes on return: once the lock ends, another rearview may own the
+    /// cache and write those files again.
+    fn empty_database(
+        &self,
+        turn: &Turn<'_>,
+        database: &Path,
+        wait: ExclusiveWait,
+    ) -> Result<CacheDeletion> {
         let connection = connect_writable(&self.token.base, wait.total)?;
         take_exclusive_lock(&connection, &self.token, turn, wait, |batch| {
             record_commit(&batch, &self.token)?;
@@ -245,8 +256,22 @@ impl RefreshOwnership {
         let batch = connection.unchecked_transaction()?;
         record_commit(&batch, &self.token)?;
         batch.commit()?;
-        leave_wal(&connection)
+        leave_wal(&connection)?;
+        // Hold the rollback journal in memory before removing the side
+        // files: in exclusive locking mode the connection keeps the journal
+        // file open, and Windows refuses to remove an open file. The mode
+        // lasts only for this connection.
+        connection.query_row("PRAGMA journal_mode = MEMORY", [], |_| Ok(()))?;
+        Ok(remove_side_files(database))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on the deleting thread once a low-space deletion's exclusive
+    /// lock ends, for a test of what another rearview may do then.
+    pub(super) static AFTER_DELETION_LOCK_ENDS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The outcome of a low-space deletion of `database` that failed with
@@ -453,18 +478,49 @@ pub(super) fn release(base: &CacheBase, identity: &str, wait: Duration) -> Relea
     }
 }
 
+/// An owner's write permission and turn, shared by every copy of its token
+/// and by its rearview's record of the ownership.
+#[derive(Debug)]
+pub(crate) struct WriteAccess {
+    writable: AtomicBool,
+    /// Taken before SQLite's writer lock by each write batch for this owner,
+    /// and released after its commit or rollback, so this owner's threads
+    /// wait for each other without a time limit. A free-space check takes it
+    /// too.
+    turn: Mutex<()>,
+}
+
+impl WriteAccess {
+    fn new() -> Self {
+        Self {
+            writable: AtomicBool::new(true),
+            turn: Mutex::new(()),
+        }
+    }
+
+    /// Revoke write permission for every copy of the owner's token.
+    pub(crate) fn revoke(&self) {
+        self.writable.store(false, Ordering::Release);
+    }
+
+    /// True while a write batch or a free-space check holds the owner's
+    /// turn: a write batch may then hold SQLite's writer lock.
+    pub(crate) fn is_turn_held(&self) -> bool {
+        matches!(
+            self.turn.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RefreshToken {
     /// The canonical cache base this owner owns, as its rearview reaches it.
     base: CacheBase,
     identity: String,
-    writable: Arc<AtomicBool>,
+    access: Arc<WriteAccess>,
     /// True once a write found another identity owning the cache.
     replaced: Arc<AtomicBool>,
-    /// Taken before SQLite's writer lock by each write batch for this owner,
-    /// and released after its commit or rollback, so this owner's threads
-    /// wait for each other without a time limit.
-    turn: Arc<Mutex<()>>,
     /// The thread running a parse of [`Self::parse_batch`] inside the turn.
     /// While it is set, debug builds panic on a take of the turn from that
     /// thread or from any rayon thread: a parse spreads over rayon's pool,
@@ -486,9 +542,8 @@ impl RefreshToken {
         Self {
             base: base.clone(),
             identity,
-            writable: Arc::new(AtomicBool::new(true)),
+            access: Arc::new(WriteAccess::new()),
             replaced: Arc::new(AtomicBool::new(false)),
-            turn: Arc::new(Mutex::new(())),
             #[cfg(debug_assertions)]
             parsing: Arc::default(),
             #[cfg(test)]
@@ -510,7 +565,11 @@ impl RefreshToken {
         }
         #[cfg(test)]
         self.waiting_for_turn.fetch_add(1, Ordering::SeqCst);
-        let guard = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = self
+            .access
+            .turn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         #[cfg(test)]
         self.waiting_for_turn.fetch_sub(1, Ordering::SeqCst);
         Turn { _guard: guard }
@@ -532,7 +591,7 @@ impl RefreshToken {
     }
 
     pub(crate) fn can_publish(&self) -> bool {
-        self.writable.load(Ordering::Acquire)
+        self.access.writable.load(Ordering::Acquire)
     }
 
     /// True once a write found another identity owning the cache.
@@ -547,7 +606,9 @@ impl RefreshToken {
     /// reads the latch. A drive whose free space the system does not report
     /// passes.
     /// Fail without checking once the write permission is revoked, as when
-    /// the TUI quits, including while this check waits for the turn. Call
+    /// the TUI quits, including while this check waits for the turn; fail
+    /// without setting the latch once the TUI's exit gave up waiting for the
+    /// check (see [`super::low_space::Latch::wait_for_checks`]). Call
     /// outside this owner's turn: the check takes it, so a parse group of
     /// this owner runs wholly before the check or finds the write permission
     /// revoked.
@@ -556,7 +617,7 @@ impl RefreshToken {
             return Err(AppError::SessionCacheRefreshLost);
         }
         let _turn = self.take_turn();
-        let Some(_check) = self.base.low_space().begin_check(|| self.can_publish()) else {
+        let Some(check) = self.base.low_space().begin_check(|| self.can_publish()) else {
             return Err(AppError::SessionCacheRefreshLost);
         };
         let Some(free_bytes) = self
@@ -567,7 +628,9 @@ impl RefreshToken {
         else {
             return Ok(());
         };
-        self.base.low_space().set(free_bytes);
+        if !check.publish(free_bytes) {
+            return Err(AppError::SessionCacheRefreshLost);
+        }
         self.revoke();
         Err(self
             .base
@@ -586,7 +649,7 @@ impl RefreshToken {
     /// stays this process's until its release or a confirmed replacement:
     /// the stored owner still names it.
     pub(crate) fn revoke(&self) {
-        self.writable.store(false, Ordering::Release);
+        self.access.revoke();
     }
 
     /// Revoke write permission, as a write that found another identity
@@ -914,6 +977,39 @@ pub(super) struct WriteBatch<'a> {
     // batch of the same owner can begin.
     transaction: Transaction<'a>,
     _turn: Option<Turn<'a>>,
+    #[cfg(debug_assertions)]
+    _live: LiveBatch,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// The write batches open on this thread.
+    static LIVE_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One write batch counted in [`LIVE_BATCHES`] until it drops.
+#[cfg(debug_assertions)]
+struct LiveBatch;
+
+#[cfg(debug_assertions)]
+impl LiveBatch {
+    fn count() -> Self {
+        LIVE_BATCHES.with(|live| live.set(live.get() + 1));
+        Self
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for LiveBatch {
+    fn drop(&mut self) {
+        LIVE_BATCHES.with(|live| live.set(live.get() - 1));
+    }
+}
+
+/// True while a write batch is open on this thread.
+#[cfg(debug_assertions)]
+pub(super) fn is_batch_open_on_this_thread() -> bool {
+    LIVE_BATCHES.with(|live| live.get() > 0)
 }
 
 impl<'a> std::ops::Deref for WriteBatch<'a> {
@@ -975,6 +1071,8 @@ fn transaction_during<'a>(
     Ok(WriteBatch {
         transaction,
         _turn: None,
+        #[cfg(debug_assertions)]
+        _live: LiveBatch::count(),
     })
 }
 
@@ -988,6 +1086,8 @@ pub(super) fn exclusive_transaction<'a>(
     Ok(WriteBatch {
         transaction,
         _turn: None,
+        #[cfg(debug_assertions)]
+        _live: LiveBatch::count(),
     })
 }
 

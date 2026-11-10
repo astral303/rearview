@@ -540,12 +540,22 @@ fn search_only_number(group: usize, index: usize) -> i64 {
 /// numbered by their index among that field's.
 const SEARCH_ONLY_GROUPS: usize = 1 + ENTRY_SEARCH_FIELDS.len();
 
+#[cfg(test)]
+thread_local! {
+    /// The calls of [`part_rows`] on this thread: one per entry for its
+    /// digests, and one more per entry a write writes.
+    pub(in super::super) static PART_ROW_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The part rows of an entry whose content is `blocks`, with `search`'s
 /// places of their texts: one for each block, then a
 /// [`SearchOnlyKind::ResultText`] part for each searched result with items
 /// in `result_items`, in block order, then a [`SearchOnlyKind::Derived`]
 /// part for each derived text.
 fn part_rows<'a>(blocks: &'a [ContentBlock], search: &'a EntrySearch) -> Vec<PartRow<'a>> {
+    #[cfg(test)]
+    PART_ROW_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut rows = Vec::with_capacity(blocks.len() + search.derived.len());
     let mut result_texts = Vec::new();
     for (index, (block, &place)) in blocks.iter().zip(&search.blocks).enumerate() {

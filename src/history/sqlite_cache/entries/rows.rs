@@ -13,18 +13,11 @@ use super::threads::{Numbering, ThreadRow};
 use crate::agent::message_numbering::NumberingCheckpoint;
 use crate::history::TranscriptEntries;
 use crate::history::format::RecordLine;
+use crate::history::parser::entry_semantic_turn;
 use crate::log_entry::{LogEntry, TokenUsage};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-
-#[cfg(test)]
-thread_local! {
-    /// The entries [`EntryRow::build_parts`] built part rows for on this
-    /// thread.
-    pub(in super::super) static PART_ROW_BUILDS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
 
 pub(in super::super) struct SessionRows<'a> {
     pub(super) transcripts: Vec<Arc<Path>>,
@@ -40,6 +33,9 @@ pub(super) struct EntryRow<'a> {
     pub(super) record: &'a RecordLine,
     pub(super) columns: EntryColumns<'a>,
     pub(super) search: EntrySearch,
+    /// The entry's semantic turn ([`entry_semantic_turn`]), computed with the
+    /// row so a write's transaction doesn't run [`crate::semantic::filter_turn`].
+    pub(super) semantic_turn: Option<String>,
     /// The index of the entry's message in [`SessionRows::messages`].
     pub(super) message: Option<usize>,
     pub(super) contributes: bool,
@@ -76,8 +72,6 @@ impl EntryRow<'_> {
     /// Builds the row's part rows. A write builds them for an entry it
     /// writes, and drops them once the entry is written.
     pub(super) fn build_parts(&self) -> EntryParts<'_> {
-        #[cfg(test)]
-        PART_ROW_BUILDS.with(|builds| builds.set(builds.get() + 1));
         EntryParts::of(self.columns.parts.blocks(), &self.search, &self.digests)
     }
 
@@ -123,12 +117,19 @@ impl<'a> SessionRows<'a> {
         Self::from(&entries.entries, subagents, &RowsStart::default())
     }
 
-    /// The rows of `entries`, a session's entries from `start` on.
+    /// The rows of `entries`, a session's entries from `start` on. Build
+    /// them before the write's transaction: hashing them inside it keeps
+    /// other rearviews' writes waiting.
     pub(in super::super) fn from(
         entries: &'a [(RecordLine, LogEntry)],
         subagents: &HashSet<&Path>,
         start: &RowsStart,
     ) -> Self {
+        #[cfg(debug_assertions)]
+        assert!(
+            !super::super::refresh::is_batch_open_on_this_thread(),
+            "a session's rows are built outside a write batch"
+        );
         let mut numbering = Numbering::resumed(&start.numbering, &start.positions);
         let mut messages = Messages::resumed(&start.numbering);
         let mut rows = Vec::with_capacity(entries.len());
@@ -151,10 +152,12 @@ impl<'a> SessionRows<'a> {
                 _ => entry.timestamp(),
             };
             let search = search::entry_search(entry, columns.parts.blocks(), child.is_some());
+            let semantic_turn = entry_semantic_turn(entry);
             let mut row = EntryRow {
                 record,
                 columns,
                 search,
+                semantic_turn,
                 message: membership.map(|membership| membership.message),
                 contributes: membership.is_some_and(|membership| membership.contributes),
                 position: placement.position,

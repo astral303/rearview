@@ -6,7 +6,7 @@ use super::raw::{ADJACENCY_CAP, Counts, PREFIX_CAP, RawMatcher, RawQuery};
 use super::*;
 use crate::error::Result;
 use crate::history::sqlite_cache::{
-    CachedSession, HeldCopy, ScannedRow, TextVisitor, scan_search_texts,
+    CachedSession, CopyOutcome, HeldCopy, ScannedRow, TextVisitor, scan_search_texts,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -105,7 +105,8 @@ pub(super) struct StoredCounts {
 /// when any text it holds has more than whitespace. Also each conversation's
 /// messages holding every term `retrieval` requires. A session another write
 /// replaced during the scan is counted again alone, from the copy the cache
-/// then holds.
+/// then holds. Fails with the first failed copy's error, in `indices`'
+/// order.
 fn count_stored<C: Borrow<Conversation>>(
     conversations: &[C],
     indices: &[usize],
@@ -135,11 +136,20 @@ fn count_stored<C: Borrow<Conversation>>(
     })?;
     let counts = &mut stored.counts;
     let hit_messages = &mut stored.hit_messages;
-    for copy in scanned.no_longer_cached {
-        counts.remove(&indices[copy]);
-        stored.no_longer_cached.insert(indices[copy]);
+    let mut replaced = HashMap::new();
+    for (copy, outcome) in scanned.copies.into_iter().enumerate() {
+        match outcome {
+            CopyOutcome::Scanned(_) => {}
+            CopyOutcome::NoLongerCached => {
+                counts.remove(&indices[copy]);
+                stored.no_longer_cached.insert(indices[copy]);
+            }
+            CopyOutcome::Replaced(generation) => {
+                replaced.insert(copy, generation);
+            }
+            CopyOutcome::Failed(error) => return Err(error),
+        }
     }
-    let replaced = scanned.replaced.into_iter().collect::<HashMap<_, _>>();
     let mut message_terms: HashMap<usize, HashMap<usize, MessageTerms>> = HashMap::new();
     for counter in scanned.reads {
         for (copy, found) in counter.bodies {

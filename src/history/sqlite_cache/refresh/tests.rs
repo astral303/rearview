@@ -1413,6 +1413,52 @@ fn low_space_deletion_outlasting_takeover_window_keeps_ownership_until_it_ends()
     );
 }
 
+/// A low-space deletion removes the files SQLite keeps beside the database
+/// before its exclusive lock ends. A competing rearview takes the cache over
+/// once the lock ends, past the takeover window: its write-ahead log stays,
+/// and the deletion doesn't report a failure to remove it (Windows refuses
+/// the removal of an open file; Unix would unlink it).
+#[test]
+fn low_space_deletion_leaves_log_competitor_writes_once_its_lock_ends() {
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let base = rearview_on(directory.path(), Arc::clone(&clock));
+    let mut owner = owner_of_written_cache(&base);
+    let competing = rearview_on(directory.path(), Arc::clone(&clock));
+    let database = super::super::database_path(directory.path());
+    let log = PathBuf::from(format!("{}-wal", database.display()));
+    let competitor = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let held = std::rc::Rc::clone(&competitor);
+    AFTER_DELETION_LOCK_ENDS.set(Some(Box::new(move || {
+        clock.advance(STALE_AFTER);
+        let Acquisition::Acquired(ownership) =
+            RefreshOwnership::try_acquire_now(&competing).unwrap()
+        else {
+            panic!("the competing rearview takes the cache over once the lock ends");
+        };
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer
+            .query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE refresh_state SET last_commit_ms = last_commit_ms",
+                [],
+            )
+            .unwrap();
+        *held.borrow_mut() = Some((ownership, writer));
+    })));
+
+    let deletion = owner.delete_database(ExclusiveWait::of(POLL_EVERY));
+
+    assert_eq!(deletion, CacheDeletion::Deleted);
+    assert!(
+        competitor.borrow().is_some(),
+        "the competing rearview wrote once the lock ended"
+    );
+    assert!(log.exists(), "the competing rearview's log stays");
+}
+
 /// A low-space deletion of one cache doesn't wait for this rearview's
 /// connections to another cache, and doesn't refuse its new ones.
 #[test]
@@ -1490,6 +1536,49 @@ fn low_space_deletion_on_thread_holding_its_connection_fails_debug_check() {
     run_deletion(&base);
 }
 
+/// A connection moved to another thread and used there is held there: the
+/// thread it left passes the low-space deletion's debug check. Moved back
+/// and used, it is held by that thread again, and the check fails there.
+#[cfg(debug_assertions)]
+#[test]
+fn connection_moved_and_used_is_held_by_its_new_thread_in_debug_check() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    drop(owner_of_written_cache(&base));
+    let cache = SqliteCache::open_waiting(&base).unwrap().unwrap();
+
+    let cache = thread::scope(|scope| {
+        let (used, is_used) = mpsc::channel();
+        let (give_back, given_back) = mpsc::channel::<()>();
+        let holder = scope.spawn(move || {
+            cache.is_admitted().unwrap();
+            used.send(()).unwrap();
+            let _ = given_back.recv_timeout(Duration::from_secs(10));
+            cache
+        });
+        is_used
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the other thread uses the connection");
+        let refused = base.refuse_connections(Duration::ZERO);
+        assert!(
+            !refused.all_closed,
+            "the connection the other thread holds stays open"
+        );
+        drop(refused);
+        give_back.send(()).unwrap();
+        holder.join().unwrap()
+    });
+    cache.is_admitted().unwrap();
+
+    let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        base.refuse_connections(Duration::ZERO)
+    }));
+    assert!(
+        refusal.is_err(),
+        "the thread using the connection again fails the debug check"
+    );
+}
+
 /// Sets `base`'s low-space latch as a first write on a drive short of
 /// space does: the write's ownership checks the space, fails, and is
 /// released.
@@ -1529,6 +1618,47 @@ fn space_check_waiting_for_turn_when_quit_revokes_permission_leaves_latch_clear(
     assert!(!base.low_space().is_set(), "the latch stays clear");
 }
 
+/// A free-space check on a drive short of space outlasts the TUI exit's wait
+/// for it and answers once the wait gave up. The check fails and leaves the
+/// low-space latch clear, as rearview read it at exit.
+#[test]
+fn space_check_answering_after_the_exits_wait_leaves_latch_clear() {
+    let directory = tempfile::tempdir().unwrap();
+    let (checking, is_checking) = mpsc::channel::<()>();
+    let (answer, answered) = mpsc::channel::<()>();
+    let answered = Mutex::new(answered);
+    let drive = super::super::DriveRunningOut::after(0, move || {
+        checking.send(()).unwrap();
+        let _ = answered
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10));
+    });
+    let base = rearview(directory.path()).with_disk_space(Arc::new(drive));
+    let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+    let token = owner.token();
+
+    let checked = thread::scope(|scope| {
+        let check = scope.spawn(|| token.check_space());
+        is_checking
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the check reads the drive's free space");
+        token.revoke();
+        base.low_space().wait_for_checks(Duration::from_millis(50));
+        let latch_at_exit = base.low_space().is_set();
+        answer.send(()).unwrap();
+        (latch_at_exit, check.join().unwrap())
+    });
+
+    assert!(!checked.0, "the latch is clear when the wait gives up");
+    assert!(
+        matches!(checked.1, Err(AppError::SessionCacheRefreshLost)),
+        "the check fails as revoked: {:?}",
+        checked.1
+    );
+    assert!(!base.low_space().is_set(), "the latch stays clear");
+}
+
 /// The TUI's shutdown while this rearview's own write batch holds SQLite's
 /// writer lock tries the ownership's release once, without a busy wait: the
 /// batch keeps the lock until it ends.
@@ -1551,7 +1681,8 @@ fn shutdown_during_own_write_batch_releases_without_busy_wait() {
             .recv_timeout(Duration::from_secs(10))
             .expect("the write batch begins");
         let busy_waits = connection::test_hooks::BusyWaits::record_on_this_thread();
-        super::super::coordinator::Coordinator::of(&base).shutdown();
+        super::super::coordinator::Coordinator::of(&base)
+            .shutdown(super::super::SHUTDOWN_RELEASE_WAIT);
         let waits = busy_waits.take();
         end_batch.send(()).unwrap();
         waits
@@ -1559,8 +1690,8 @@ fn shutdown_during_own_write_batch_releases_without_busy_wait() {
 
     assert_eq!(
         waits,
-        Vec::<Duration>::new(),
-        "the release doesn't wait for the writer lock"
+        [Duration::ZERO],
+        "the shutdown tries the release once, without waiting for the writer lock"
     );
 }
 
@@ -1871,6 +2002,34 @@ fn owners_write_waits_for_its_own_batch_past_limit_without_revoking_it() {
     assert!(token.can_publish(), "the owner keeps its own refresh");
 }
 
+/// A write batch of an owner the TUI's quit revoked fails at once while
+/// another connection holds SQLite's writer lock.
+#[test]
+fn revoked_owners_write_batch_fails_without_waiting_for_held_writer_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path());
+    let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+    let holder = connect(base.path(), Duration::ZERO).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    owner.token().revoke();
+    let busy_waits = connection::test_hooks::BusyWaits::record_on_this_thread();
+    let connection = connect(base.path(), POLL_EVERY).unwrap();
+
+    let batch = transaction_within(&connection, owner.token(), POLL_EVERY * 2);
+
+    assert!(
+        matches!(batch, Err(AppError::SessionCacheRefreshLost)),
+        "the batch fails as revoked: {:?}",
+        batch.err()
+    );
+    assert_eq!(
+        busy_waits.take(),
+        Vec::<Duration>::new(),
+        "the batch doesn't wait for the writer lock"
+    );
+    holder.execute_batch("ROLLBACK").unwrap();
+}
+
 #[test]
 fn uncontended_acquisition_doesnt_publish_wait() {
     let directory = tempfile::tempdir().unwrap();
@@ -1930,31 +2089,13 @@ fn wait_for_this_processs_own_refresh_doesnt_publish_wait() {
     });
 }
 
-/// A rebuild's exclusive lock on the session cache database in `base`,
-/// released `after` the first connection rearview opens to it starts
-/// opening.
-fn exclusive_lock_released_after_first_open(
-    base: &Path,
-    after: Duration,
-) -> super::super::connection::test_hooks::Installed {
-    let lock = Mutex::new(Some(exclusive_lock(base)));
-    super::super::connection::test_hooks::on_every_connection(base, move |_| {
-        if let Some(held) = lock.lock().unwrap().take() {
-            thread::spawn(move || {
-                thread::sleep(after);
-                drop(held);
-            });
-        }
-    })
-}
-
 #[test]
 fn exclusive_lock_released_within_open_wait_doesnt_publish_rebuild() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
-    let _released =
-        exclusive_lock_released_after_first_open(base.path(), REBUILD_LOCK_THRESHOLD / 4);
+    let rebuild = exclusive_lock(base.path());
+    super::super::connection::test_hooks::at_the_first_busy_wait(move || drop(rebuild));
     let status = WaitStatus::default();
 
     let owner = RefreshOwnership::acquire(&base, &status, &Cancellation::default()).unwrap();
@@ -1997,8 +2138,8 @@ fn observation_doesnt_report_rebuild_for_lock_released_within_open_wait() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
-    let _released =
-        exclusive_lock_released_after_first_open(base.path(), REBUILD_LOCK_THRESHOLD / 4);
+    let rebuild = exclusive_lock(base.path());
+    super::super::connection::test_hooks::at_the_first_busy_wait(move || drop(rebuild));
 
     assert_eq!(
         observe(&base).unwrap(),
@@ -2244,7 +2385,9 @@ fn revoked_ownership_lasts_until_its_operation_ends_and_no_longer() {
 
             match end {
                 RevokedOwnershipEnd::Finish => drop(ownership),
-                RevokedOwnershipEnd::Shutdown => Coordinator::of(&this).shutdown(),
+                RevokedOwnershipEnd::Shutdown => {
+                    Coordinator::of(&this).shutdown(super::super::SHUTDOWN_RELEASE_WAIT)
+                }
                 RevokedOwnershipEnd::Takeover => {
                     expire_last_commit(directory.path());
                     let replacement = RefreshOwnership::acquire_for_test(&other).unwrap();

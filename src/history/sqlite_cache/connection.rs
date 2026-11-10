@@ -2,7 +2,7 @@
 //! In test builds, [`test_hooks`] installs a test's SQLite hooks on each of
 //! them.
 
-use super::base::CacheBase;
+use super::base::{CacheBase, OpenConnection};
 use rusqlite::{Connection, FileControl, OpenFlags};
 use std::path::Path;
 use std::time::Duration;
@@ -20,10 +20,10 @@ pub(super) enum Access {
 /// The size the write-ahead log is truncated to after a checkpoint.
 const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 
-/// A connection to the database at `path`, with a persistent write-ahead
-/// log: the next connection reuses the `-wal` and `-shm` files instead of
-/// creating them again. Each statement waits at most `busy_timeout` for a
-/// lock, the statements this function runs included.
+/// A connection to the database at `path`, configured as [`configure`]
+/// describes. For tests only: rearview opens its connections with
+/// [`open_cache`].
+#[cfg(test)]
 pub(super) fn open(
     path: &Path,
     access: Access,
@@ -34,9 +34,10 @@ pub(super) fn open(
     Ok(connection)
 }
 
-/// [`open`] for `base`'s database, as a [`CacheConnection`] from before its
-/// first statement: a setup statement that fails after the write-ahead log
-/// opened closes it under `base`'s low-space close setting too.
+/// A connection to `base`'s database, configured as [`configure`] describes,
+/// as a [`CacheConnection`] from before its first statement: a setup
+/// statement that fails after the write-ahead log opened closes it under
+/// `base`'s low-space close setting too.
 pub(super) fn open_cache(
     base: &CacheBase,
     access: Access,
@@ -45,36 +46,80 @@ pub(super) fn open_cache(
     let mut connection = CacheConnection {
         connection: open_file(&super::database_path(base.path()), access)?,
         base: base.clone(),
+        counted: None,
     };
     configure(&mut connection.connection, access, busy_timeout)?;
     Ok(connection)
 }
 
+/// [`open_cache`], counted among this rearview's open connections to `base`
+/// from before it opens until it closes (see [`CacheBase::open_connection`]).
+pub(super) fn open_counted(
+    base: &CacheBase,
+    access: Access,
+    busy_timeout: Duration,
+) -> crate::error::Result<CacheConnection> {
+    let counted = base.open_connection()?;
+    let mut connection = open_cache(base, access, busy_timeout)?;
+    connection.counted = Some(counted);
+    Ok(connection)
+}
+
 /// A connection to a cache base's database. Once a write of the base found
 /// its drive short of space, it closes without copying the write-ahead log
-/// into the database (see [`super::low_space::Latch::keep_log_on_close`]).
+/// into the database: the copy needs the space the drive lacks.
 pub(super) struct CacheConnection {
     connection: Connection,
     base: CacheBase,
+    /// Declared after `connection`, so the count drops once it closes: a
+    /// low-space deletion waits for it. `None` for a connection
+    /// [`open_cache`] opens alone.
+    counted: Option<OpenConnection>,
+}
+
+impl CacheConnection {
+    /// The cache base this connection's database lives in, as the rearview
+    /// that opened it reaches it.
+    pub(super) fn base(&self) -> &CacheBase {
+        &self.base
+    }
 }
 
 impl std::ops::Deref for CacheConnection {
     type Target = Connection;
 
     fn deref(&self) -> &Connection {
+        #[cfg(debug_assertions)]
+        if let Some(counted) = &self.counted {
+            counted.held_on_this_thread();
+        }
         &self.connection
     }
 }
 
 impl std::ops::DerefMut for CacheConnection {
     fn deref_mut(&mut self) -> &mut Connection {
+        #[cfg(debug_assertions)]
+        if let Some(counted) = &self.counted {
+            counted.held_on_this_thread();
+        }
         &mut self.connection
     }
 }
 
 impl Drop for CacheConnection {
+    /// Once the base's low-space latch is set, turn off the checkpoint
+    /// SQLite runs when the last connection closes.
     fn drop(&mut self) {
-        self.base.low_space().keep_log_on_close(&self.connection);
+        if !self.base.low_space().is_set() {
+            return;
+        }
+        // SQLite fails the call only for an option it does not know.
+        let kept = self.connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        );
+        debug_assert!(kept.is_ok(), "SQLite turns the checkpoint on close off");
     }
 }
 
@@ -97,6 +142,10 @@ fn open_file(path: &Path, access: Access) -> rusqlite::Result<Connection> {
     Ok(connection)
 }
 
+/// Gives `connection` a persistent write-ahead log: the next connection
+/// reuses the `-wal` and `-shm` files instead of creating them again. Each
+/// statement waits at most `busy_timeout` for a lock, the statements this
+/// function runs included.
 fn configure(
     connection: &mut Connection,
     access: Access,
@@ -462,7 +511,8 @@ pub(crate) mod test_hooks {
     /// Records a busy wait for each lock met by a connection [`super::open`]
     /// opens on this thread, until dropped. The connection gives up at once
     /// instead of sleeping, and the wait it would have slept, its busy
-    /// timeout, is recorded: a test counts waits without timing them.
+    /// timeout, is recorded: a test counts waits without timing them. A
+    /// connection without a busy timeout records a zero wait.
     pub(crate) struct BusyWaits {
         waits: Arc<Mutex<Vec<Duration>>>,
         _not_send: std::marker::PhantomData<*const ()>,
@@ -490,19 +540,35 @@ pub(crate) mod test_hooks {
         }
     }
 
-    /// Replace `connection`'s busy wait of `busy_timeout` with a recorded one
-    /// while a [`BusyWaits`] records on this thread. A connection that does
-    /// not wait records nothing.
+    std::thread_local! {
+        /// The action [`at_the_first_busy_wait`] armed on this thread.
+        static AT_FIRST_BUSY_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `action` when the next connection [`super::open`] opens on this
+    /// thread first meets a lock, inside that connection's busy wait. The
+    /// connection then retries at once, and waits out the rest of its busy
+    /// timeout as SQLite's handler does; a connection without a busy
+    /// timeout gives up after the action. A test releases a lock inside the
+    /// wait without timing it.
+    pub(crate) fn at_the_first_busy_wait(action: impl FnOnce() + Send + 'static) {
+        AT_FIRST_BUSY_WAIT.with(|armed| *armed.borrow_mut() = Some(Box::new(action)));
+    }
+
+    /// Replace `connection`'s busy wait of `busy_timeout` with the one a
+    /// test arranged on this thread: a recorded wait while a [`BusyWaits`]
+    /// records, or the wait [`at_the_first_busy_wait`] armed.
     pub(super) fn record_busy_waits(
         connection: &mut Connection,
         busy_timeout: Duration,
     ) -> rusqlite::Result<()> {
+        if let Some(action) = AT_FIRST_BUSY_WAIT.with(|armed| armed.borrow_mut().take()) {
+            return wait_after_first_busy(connection, busy_timeout, action);
+        }
         let Some(waits) = RECORDED_BUSY_WAITS.with(|recorded| recorded.borrow().clone()) else {
             return Ok(());
         };
-        if busy_timeout.is_zero() {
-            return Ok(());
-        }
         connection.busy_handler(Some(move |attempt: i32| {
             if attempt == 0 {
                 waits
@@ -511,6 +577,25 @@ pub(crate) mod test_hooks {
                     .push(busy_timeout);
             }
             false
+        }))
+    }
+
+    /// The busy wait [`at_the_first_busy_wait`] arms on `connection`.
+    fn wait_after_first_busy(
+        connection: &mut Connection,
+        busy_timeout: Duration,
+        action: Box<dyn FnOnce() + Send>,
+    ) -> rusqlite::Result<()> {
+        let mut action = Some(action);
+        let mut first_busy = None;
+        connection.busy_handler(Some(move |_attempt: i32| {
+            let started = *first_busy.get_or_insert_with(std::time::Instant::now);
+            if let Some(action) = action.take() {
+                action();
+                return !busy_timeout.is_zero();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            started.elapsed() < busy_timeout
         }))
     }
 

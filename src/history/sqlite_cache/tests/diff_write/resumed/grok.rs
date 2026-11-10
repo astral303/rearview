@@ -300,6 +300,42 @@ fn summarys_model_is_replaced_once_a_turn_names_one() {
     );
 }
 
+/// A stored copy with fewer leading rows than the read's leading entries, its
+/// model row moved off line 0, is read whole: a resumed write rewrites the
+/// leading rows in place and never moves the entries after them. The write
+/// matches a fresh write, semantic turns included.
+#[test]
+fn leading_row_count_other_than_the_reads_reads_session_whole() {
+    let asked = [
+        user(1_000, "Start the work", 0),
+        reply(1_100, "Starting.", "p1"),
+    ];
+    let mut session = GrokSession::stored(&asked, json!({}), None);
+    let id = session.fixture().session_id(&session.cache);
+    let moved = session
+        .cache
+        .connection
+        .execute(
+            "UPDATE entries SET record_line = 1 \
+             WHERE session = ?1 AND sequence = 0 AND record_line = 0",
+            [id],
+        )
+        .unwrap();
+    assert_eq!(
+        moved, 1,
+        "the stored copy opens with the summary's model row"
+    );
+    let mut records = asked.to_vec();
+    records.push(reply(1_150, "Still starting.", "p1"));
+    write_records(&session.own, &records);
+
+    assert_eq!(
+        session.update().outcome,
+        Err(WholeRead::LeadingChanged),
+        "a leading row count other than the read's reads the session whole"
+    );
+}
+
 #[test]
 fn input_completed_for_call_before_checkpoint_is_read_whole() {
     let mut open = call(

@@ -3,15 +3,13 @@
 //! connection of its own: row ranges, read through `parts_by_session` when
 //! the scan names its sessions, or under an active window, runs of each
 //! session's messages through `parts_by_message`. A text's row holds its
-//! session, its place and its message number.
-//!
-//! [`scan_copies`] runs the tasks and rechecks the sessions read, for this
-//! scan and for [`super::semantic_scan`]'s.
+//! session, its place and its message number. [`scan_copies`] runs the
+//! tasks and rechecks the sessions read.
 
-use super::{CachedSession, SearchedFields, SqliteCache};
-use crate::error::{AppError, Result};
+use super::copies_scan::{CopiesScan, KeySplit, ScannedCopies, SessionsById, scan_copies};
+use super::{CachedSession, SearchedFields};
+use crate::error::Result;
 use crate::time_filter::TimeFilter;
-use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
@@ -102,106 +100,6 @@ pub(crate) enum ScanScope {
     AllWorkspaces,
 }
 
-/// Row ranges a scan of each large table is split into, per thread: rows
-/// differ in size by orders of magnitude, so many small ranges keep every
-/// thread busy until the scan ends.
-const RANGES_PER_THREAD: i64 = 16;
-/// The fewest rows a range holds, so a small table is one range.
-const MIN_ROWS_PER_RANGE: i64 = 4096;
-
-/// A scan's reads, one per task, and the copies it could not read.
-pub(crate) struct ScannedCopies<R> {
-    pub(crate) reads: Vec<R>,
-    /// The position of each copy whose session is no longer in the session
-    /// cache.
-    pub(crate) no_longer_cached: Vec<usize>,
-    /// The position of each copy another write replaced before the scan
-    /// ended, with the generation of the copy the cache holds now. The
-    /// reads may hold content of either copy: callers drop it.
-    pub(crate) replaced: Vec<(usize, i64)>,
-}
-
-/// One cache base's part of a scan of many sessions' copies, split into
-/// tasks that threads read, each in a snapshot of its own.
-pub(super) trait CopiesScan: Sync {
-    type Task: Send;
-    type Read: Send;
-    /// The scan's tasks, planned on `connection` in the snapshot that found
-    /// the scanned sessions.
-    fn tasks(&self, connection: &Connection) -> Result<Vec<Self::Task>>;
-    /// `task`'s read on `connection`, inside a snapshot of its own.
-    fn read(&self, connection: &Connection, task: Self::Task) -> Result<Self::Read>;
-}
-
-/// The reads of the tasks `plan` makes of the sessions `copies` read, on
-/// the rayon pool, each thread on a read connection of its own. `plan`
-/// receives the sessions the cache holds as each copy read them; a copy
-/// another write replaced, or no longer in the session cache, is reported
-/// and not scanned. Reads each copy as the cache holds it, whether or not
-/// its transcripts changed since.
-///
-/// Once every task ends, each scanned session's generation is read again: a
-/// session another write replaced during the scan is reported in
-/// `replaced`.
-pub(super) fn scan_copies<S: CopiesScan>(
-    copies: &[&CachedSession],
-    plan: impl Fn(&Connection, SessionsById) -> Result<S>,
-) -> Result<ScannedCopies<S::Read>> {
-    let mut by_base: HashMap<&std::path::Path, Vec<usize>> = HashMap::new();
-    for (position, copy) in copies.iter().enumerate() {
-        by_base.entry(copy.base.path()).or_default().push(position);
-    }
-    let mut scanned = ScannedCopies {
-        reads: Vec::new(),
-        no_longer_cached: Vec::new(),
-        replaced: Vec::new(),
-    };
-    for positions in by_base.into_values() {
-        let first = copies[positions[0]];
-        let Some(cache) = SqliteCache::open_waiting(&first.base)? else {
-            scanned.no_longer_cached.extend(positions);
-            continue;
-        };
-        let (found, planned) = cache.with_read_snapshot(|connection| {
-            let mut found = ScannedSessions::of(connection, copies, positions.iter().copied())?;
-            let sessions = std::mem::take(&mut found.current);
-            if sessions.is_empty() {
-                return Ok((found, None));
-            }
-            let scanned_positions = sessions
-                .values()
-                .map(|&(position, _)| position)
-                .collect::<Vec<_>>();
-            let scan = plan(connection, sessions)?;
-            let tasks = scan.tasks(connection)?;
-            Ok((found, Some((scan, tasks, scanned_positions))))
-        })?;
-        scanned.no_longer_cached.extend(found.no_longer_cached);
-        scanned.replaced.extend(found.replaced);
-        let Some((scan, tasks, scanned_positions)) = planned else {
-            continue;
-        };
-        scanned.reads.extend(
-            tasks
-                .into_par_iter()
-                .map_init(
-                    || None,
-                    |reader: &mut Option<SqliteCache>, task| {
-                        let cache = open_once(reader, &first.base, first)?;
-                        cache.with_read_snapshot(|connection| scan.read(connection, task))
-                    },
-                )
-                .collect::<Result<Vec<_>>>()?,
-        );
-        let rechecked = cache.with_read_snapshot(|connection| {
-            ScannedSessions::of(connection, copies, scanned_positions.into_iter())
-        })?;
-        scanned.no_longer_cached.extend(rechecked.no_longer_cached);
-        scanned.replaced.extend(rechecked.replaced);
-    }
-    Ok(scanned)
-}
-
 /// Calls `visitor()`'s methods for each search text in `fields` of the
 /// sessions `copies` read, within `window`: with `window` active, only the
 /// texts of messages inside it, without the title, the summary or text
@@ -245,6 +143,17 @@ impl<V: TextVisitor, F: Fn() -> V + Sync> CopiesScan for TextScan<'_, F> {
         self.scan.tasks(connection)
     }
 
+    fn copy_of(&self, task: &ScanTask) -> Option<usize> {
+        match task {
+            ScanTask::Messages { session, .. } => self
+                .scan
+                .sessions
+                .get(session)
+                .map(|&(position, _)| position),
+            ScanTask::Parts(_) | ScanTask::SubagentMetadata => None,
+        }
+    }
+
     fn read(&self, connection: &Connection, task: ScanTask) -> Result<V> {
         let mut visitor = (self.visitor)();
         TaskScan {
@@ -257,50 +166,12 @@ impl<V: TextVisitor, F: Fn() -> V + Sync> CopiesScan for TextScan<'_, F> {
     }
 }
 
-/// The scanned copies by their session's row id: each copy's position and
-/// generation.
-pub(super) type SessionsById = HashMap<i64, (usize, i64)>;
-
 /// One cache base's part of a scan.
 struct Scan {
     sessions: SessionsById,
     only: SessionFilter,
     fields: SearchedFields,
     window: Option<MessagesInWindow>,
-}
-
-/// The copies the cache holds at the addresses of some scanned copies, and
-/// the scanned copies no longer in the session cache or replaced, by the
-/// copies' positions.
-#[derive(Default)]
-struct ScannedSessions {
-    /// The copies the cache holds, by their session's row id.
-    current: SessionsById,
-    /// As [`ScannedCopies::no_longer_cached`].
-    no_longer_cached: Vec<usize>,
-    /// As [`ScannedCopies::replaced`].
-    replaced: Vec<(usize, i64)>,
-}
-
-impl ScannedSessions {
-    fn of(
-        connection: &Connection,
-        copies: &[&CachedSession],
-        positions: impl Iterator<Item = usize>,
-    ) -> Result<Self> {
-        let mut found = Self::default();
-        for position in positions {
-            let copy = copies[position];
-            match copy.listed_in(connection)? {
-                Some(stored) if stored.generation == copy.generation => {
-                    found.current.insert(stored.id, (position, copy.generation));
-                }
-                Some(stored) => found.replaced.push((position, stored.generation)),
-                None => found.no_longer_cached.push(position),
-            }
-        }
-        Ok(found)
-    }
 }
 
 /// The scan's condition on a text's session: none when the scan reads every
@@ -351,13 +222,6 @@ impl SessionFilter {
         self.ids
             .as_ref()
             .map_or_else(String::new, |ids| format!(" AND +session IN ({ids})"))
-    }
-}
-
-fn not_in_cache(copy: &CachedSession) -> AppError {
-    AppError::SessionCacheNotReady {
-        session: copy.address().cache_key.clone(),
-        reason: "the session is not in the session cache".to_owned(),
     }
 }
 
@@ -531,35 +395,7 @@ impl Scan {
     }
 }
 
-fn open_once<'r>(
-    reader: &'r mut Option<SqliteCache>,
-    base: &super::CacheBase,
-    copy: &CachedSession,
-) -> Result<&'r SqliteCache> {
-    if reader.is_none() {
-        *reader = SqliteCache::open_waiting(base)?;
-    }
-    reader.as_ref().ok_or_else(|| not_in_cache(copy))
-}
-
-/// A key, from its least to its greatest value, split into ranges of equal
-/// width: a table's across threads, or one session's rows.
-pub(super) struct KeySplit {
-    least: i64,
-    greatest: i64,
-    width: i64,
-}
-
 impl KeySplit {
-    /// The split of `table`'s `key`, the first column of an index. An empty
-    /// table has no range.
-    fn of(connection: &Connection, table: &str, key: &str) -> Result<Self> {
-        let bounds = connection.query_row(&Self::bounds_query(table, key), [], |row| {
-            Ok(row.get::<_, Option<i64>>(0)?.zip(row.get(1)?))
-        })?;
-        Ok(Self::spanning(bounds))
-    }
-
     /// The split of the part ids of `sessions`, from the least to the
     /// greatest, each end read from `parts_by_session` per session.
     fn of_sessions_parts(
@@ -581,45 +417,6 @@ impl KeySplit {
             }
         }
         Ok(Self::spanning(bounds))
-    }
-
-    /// The split of the keys from the least to the greatest of `bounds`; no
-    /// range without bounds.
-    fn spanning(bounds: Option<(i64, i64)>) -> Self {
-        let span = bounds.map_or(0, |(least, greatest)| {
-            (greatest - least).saturating_add(1).max(0)
-        });
-        let threads = i64::try_from(rayon::current_num_threads()).unwrap_or(1);
-        let count = (span / MIN_ROWS_PER_RANGE)
-            .clamp(1, threads * RANGES_PER_THREAD)
-            .min(span.max(1));
-        Self::of_width(bounds, (span + count - 1) / count)
-    }
-
-    /// The split of the keys from the least to the greatest of `bounds`
-    /// into ranges of at most `width` keys; no range without bounds.
-    pub(super) fn of_width(bounds: Option<(i64, i64)>, width: i64) -> Self {
-        let (least, greatest) = bounds.unwrap_or((1, 0));
-        Self {
-            least,
-            greatest,
-            width: width.max(1),
-        }
-    }
-
-    /// The least and the greatest `key` of `table`, each in its own subquery:
-    /// SQLite reads a lone MIN or MAX from one end of an index, but scans the
-    /// whole table for the two together.
-    fn bounds_query(table: &str, key: &str) -> String {
-        format!("SELECT (SELECT MIN({key}) FROM {table}), (SELECT MAX({key}) FROM {table})")
-    }
-
-    pub(super) fn ranges(&self) -> impl Iterator<Item = RangeInclusive<i64>> + use<> {
-        let (least, greatest, width) = (self.least, self.greatest, self.width);
-        (0..)
-            .map(move |index| least + index * width)
-            .take_while(move |start| *start <= greatest)
-            .map(move |start| start..=start.saturating_add(width - 1).min(greatest))
     }
 }
 
@@ -807,8 +604,11 @@ pub(super) fn text_at<'r>(row: &'r rusqlite::Row<'_>, index: usize) -> rusqlite:
 
 #[cfg(test)]
 mod tests {
+    use super::super::SqliteCache;
+    use super::super::copies_scan::CopyOutcome;
     use super::super::tests::admitted_cache;
     use super::*;
+    use crate::error::AppError;
     use chrono::TimeZone;
     use std::collections::BTreeSet;
     use std::ops::ControlFlow;
@@ -839,7 +639,9 @@ mod tests {
     /// [`super::super::tests::every_record_copies`]. The first session gets a
     /// sub-agent metadata part, and each entry without a message a searched
     /// part, written directly: the fixtures don't hold either.
-    fn every_record_copies(base: &std::path::Path) -> Vec<CachedSession> {
+    fn every_record_copies_with_texts_outside_messages(
+        base: &std::path::Path,
+    ) -> Vec<CachedSession> {
         let copies = super::super::tests::every_record_copies(base);
         let cache = admitted_cache(base);
         cache
@@ -872,8 +674,12 @@ mod tests {
     ) -> Vec<(usize, PlacedText)> {
         let scanned = scan_search_texts(copies, fields, window, scope, KeepEvery::default).unwrap();
         assert!(
-            scanned.no_longer_cached.is_empty(),
-            "the cache holds every copy"
+            scanned
+                .copies
+                .iter()
+                .all(|outcome| matches!(outcome, CopyOutcome::Scanned(_))),
+            "the scan reads every copy: {:?}",
+            scanned.copies
         );
         let mut kept = scanned
             .reads
@@ -908,7 +714,7 @@ mod tests {
     #[test]
     fn every_layout_group_and_kind_of_part_holding_search_text_contributes_texts() {
         let base = tempfile::tempdir().unwrap();
-        let copies = every_record_copies(base.path());
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
         let references = copies.iter().collect::<Vec<_>>();
 
         let kept = kept_rows(
@@ -952,18 +758,18 @@ mod tests {
         );
     }
 
-    /// [`KeepEvery`] that replaces `copy` the first time any task examines a
-    /// text, as a refresh writing while the scan reads does.
-    struct ReplacesDuringScan<'a> {
+    /// [`KeepEvery`] that runs `write` the first time any task examines a
+    /// text, as a refresh writing while the scan reads does, and holds its
+    /// result in `written`.
+    struct WritesDuringScan<'a, T> {
         kept: KeepEvery,
-        copy: &'a CachedSession,
-        replaced: &'a std::sync::OnceLock<i64>,
+        write: &'a (dyn Fn() -> T + Sync),
+        written: &'a std::sync::OnceLock<T>,
     }
 
-    impl TextVisitor for ReplacesDuringScan<'_> {
+    impl<T: Send + Sync> TextVisitor for WritesDuringScan<'_, T> {
         fn examine(&mut self, text: &str) -> bool {
-            self.replaced
-                .get_or_init(|| super::super::tests::replace_copy(self.copy));
+            self.written.get_or_init(self.write);
             self.kept.examine(text)
         }
 
@@ -975,30 +781,37 @@ mod tests {
     #[test]
     fn session_replaced_during_scan_is_reported_and_others_keep_their_texts() {
         let base = tempfile::tempdir().unwrap();
-        let copies = every_record_copies(base.path());
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
         let references = copies.iter().collect::<Vec<_>>();
         let replaced = std::sync::OnceLock::new();
+        let replace = || super::super::tests::replace_copy(&copies[1]);
         let scanned = scan_search_texts(
             &references,
             SearchedFields::Agent,
             &TimeFilter::default(),
             ScanScope::AllWorkspaces,
-            || ReplacesDuringScan {
+            || WritesDuringScan {
                 kept: KeepEvery::default(),
-                copy: &copies[1],
-                replaced: &replaced,
+                write: &replace,
+                written: &replaced,
             },
         )
         .unwrap();
-        assert!(
-            scanned.no_longer_cached.is_empty(),
-            "the cache holds every session"
-        );
-        assert_eq!(
-            scanned.replaced,
-            vec![(1, *replaced.get().expect("a task examined a text"))],
-            "the replaced session is reported with the generation the cache holds"
-        );
+        let generation = *replaced.get().expect("a task examined a text");
+        for (position, outcome) in scanned.copies.iter().enumerate() {
+            if position == 1 {
+                assert!(
+                    matches!(outcome, CopyOutcome::Replaced(held) if *held == generation),
+                    "the replaced session is reported with the generation the cache holds: \
+                     {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, CopyOutcome::Scanned(_)),
+                    "copy {position} is scanned: {outcome:?}"
+                );
+            }
+        }
         let kept = scanned
             .reads
             .iter()
@@ -1013,9 +826,69 @@ mod tests {
     }
 
     #[test]
+    fn session_written_before_or_during_scan_fails_alone_and_others_keep_their_texts() {
+        let base = tempfile::tempdir().unwrap();
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
+        let references = copies.iter().collect::<Vec<_>>();
+        let (fields, window) = (SearchedFields::Agent, TimeFilter::default());
+        let own = copies
+            .iter()
+            .map(|copy| read_by_range(copy, fields, &window))
+            .collect::<Vec<_>>();
+        let (before, during) = (0, 2);
+        super::super::tests::mark_writing(&copies[before]);
+        let marked = std::sync::OnceLock::new();
+        let mark = || super::super::tests::mark_writing(&copies[during]);
+
+        let scanned = scan_search_texts(
+            &references,
+            fields,
+            &window,
+            ScanScope::AllWorkspaces,
+            || WritesDuringScan {
+                kept: KeepEvery::default(),
+                write: &mark,
+                written: &marked,
+            },
+        )
+        .unwrap();
+
+        let mut kept = copies.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+        for (copy, text) in scanned
+            .reads
+            .into_iter()
+            .flat_map(|visitor| visitor.kept.kept)
+        {
+            kept[copy].push(text);
+        }
+        for (position, outcome) in scanned.copies.iter().enumerate() {
+            if position == before || position == during {
+                assert!(
+                    matches!(
+                        outcome,
+                        CopyOutcome::Failed(AppError::SessionCacheNotReady { .. })
+                    ),
+                    "copy {position}, written while the scan reads, fails as not ready: \
+                     {outcome:?}"
+                );
+            } else {
+                kept[position].sort();
+                assert!(
+                    matches!(outcome, CopyOutcome::Scanned(_)),
+                    "copy {position} is scanned: {outcome:?}"
+                );
+                assert_eq!(
+                    kept[position], own[position],
+                    "copy {position} keeps its texts"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn launch_read_and_read_per_copy_hold_texts_of_session_replaced_since_its_row() {
         let base = tempfile::tempdir().unwrap();
-        let copies = every_record_copies(base.path());
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
         let alone = |copy: &CachedSession| {
             crate::search::lexical::SessionSearchTexts::read(copy)
                 .unwrap()
@@ -1046,7 +919,7 @@ mod tests {
     #[test]
     fn scan_of_some_sessions_doesnt_examine_texts_of_others() {
         let base = tempfile::tempdir().unwrap();
-        let copies = every_record_copies(base.path());
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
         let selections = [vec![&copies[0]], vec![&copies[1], &copies[2]]];
         for (scanned, scope) in selections.iter().flat_map(|scanned| {
             [ScanScope::Project, ScanScope::AllWorkspaces].map(|scope| (scanned, scope))
@@ -1081,7 +954,7 @@ mod tests {
     #[test]
     fn every_row_read_in_one_scan_is_laid_out_as_each_session_read_alone_for_every_provider() {
         let base = tempfile::tempdir().unwrap();
-        let copies = every_record_copies(base.path());
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
         let read = |are_every_row| {
             crate::search::CopiesToRead {
                 copies: copies.clone(),
@@ -1097,71 +970,6 @@ mod tests {
                 scanned.expect("the scan reads the copy").joined(),
                 alone.expect("the range reads read the copy").joined(),
                 "{key:?}: the scan lays out the session's texts as its own read does"
-            );
-        }
-    }
-
-    /// The split of a table holding rows of `ids`.
-    fn split_of_rows(ids: &[i64]) -> KeySplit {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch("CREATE TABLE texts (id INTEGER PRIMARY KEY)")
-            .unwrap();
-        let mut insert = connection
-            .prepare("INSERT INTO texts (id) VALUES (?1)")
-            .unwrap();
-        for id in ids {
-            insert.execute([id]).unwrap();
-        }
-        KeySplit::of(&connection, "texts", "id").unwrap()
-    }
-
-    #[test]
-    fn row_ranges_cover_each_row_once_with_gaps_in_ids_and_with_single_row_or_none() {
-        let deleted_sessions =
-            (1..=40_000).filter(|id| !(5_000..12_000).contains(id) && id % 7 != 0);
-        for (case, ids) in [
-            ("gaps", deleted_sessions.collect::<Vec<_>>()),
-            ("single row", vec![42]),
-            ("no row", Vec::new()),
-        ] {
-            let ranges = split_of_rows(&ids).ranges().collect::<Vec<_>>();
-            if case == "gaps" {
-                assert!(
-                    ranges.len() > 1,
-                    "{case}: the table splits into several ranges"
-                );
-            }
-            for id in &ids {
-                let covering = ranges.iter().filter(|range| range.contains(id)).count();
-                assert_eq!(covering, 1, "{case}: one range covers row {id}: {ranges:?}");
-            }
-            if ids.is_empty() {
-                assert!(ranges.is_empty(), "{case}: an empty table has no range");
-            }
-        }
-    }
-
-    #[test]
-    fn split_bounds_read_each_scanned_tables_index_without_scanning_it() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(super::super::schema::CREATE)
-            .unwrap();
-        for (table, key) in [("parts", "id"), ("entries", "id"), ("messages", "id")] {
-            let query = KeySplit::bounds_query(table, key);
-            let plan = connection
-                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
-                .unwrap()
-                .query_map([], |row| row.get::<_, String>(3))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-                .join("\n");
-            assert!(
-                plan.contains(&format!("SEARCH {table}"))
-                    && !plan.contains(&format!("SCAN {table}")),
-                "{query}: the bounds come from the ends of an index, without a scan: {plan}"
             );
         }
     }
@@ -1280,7 +1088,7 @@ mod tests {
     #[test]
     fn session_read_by_range_returns_full_scans_texts_in_its_order_for_every_provider() {
         let base = tempfile::tempdir().unwrap();
-        let copies = every_record_copies(base.path());
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
         let references = copies.iter().collect::<Vec<_>>();
         let since_1970 = TimeFilter {
             after: Some(crate::clock::Zone::System.timestamp_opt(0, 0).unwrap()),
@@ -1325,12 +1133,23 @@ mod tests {
     #[test]
     fn scan_of_some_sessions_reads_ranges_from_their_least_to_greatest_part_id() {
         let base = tempfile::tempdir().unwrap();
-        let copies = every_record_copies(base.path());
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
         let cache = SqliteCache::open_waiting(&copies[0].base).unwrap().unwrap();
         let scanned = [&copies[1], &copies[2]];
         let (tasks, bounds) = cache
             .with_read_snapshot(|connection| {
-                let sessions = ScannedSessions::of(connection, &scanned, 0..scanned.len())?.current;
+                let sessions = scanned
+                    .iter()
+                    .enumerate()
+                    .map(|(position, copy)| {
+                        let CopyOutcome::Scanned(session) =
+                            CopyOutcome::of_lookup(connection, copy)
+                        else {
+                            panic!("the cache holds the copy");
+                        };
+                        (session, (position, copy.generation))
+                    })
+                    .collect::<SessionsById>();
                 let ids = sessions.keys().map(i64::to_string).collect::<Vec<_>>();
                 let bounds: (i64, i64) = connection.query_row(
                     &format!(

@@ -37,7 +37,8 @@ pub(crate) struct StoredResume {
     /// Each stored sub-agent metadata part: the path of its transcript and
     /// its text.
     pub(crate) subagent_metadata: Vec<(PathBuf, String)>,
-    /// The stored rows of the session's leading entries, at sequence 0 on.
+    /// The number of stored rows of the session's leading entries, at
+    /// sequence 0 on.
     pub(crate) leading_rows: usize,
     /// The session's roots, which place its stored paths.
     places: Places,
@@ -408,11 +409,10 @@ fn stored_subagent_metadata(
 pub(crate) struct WindowUpdate {
     pub(crate) session: i64,
     pub(crate) generation: i64,
-    /// How many stored rows held the session's leading entries, which the
-    /// record's leading entries replace.
-    pub(crate) stored_leading_rows: usize,
+    /// The session's leading entries, as many as the stored leading rows
+    /// they replace.
     pub(crate) leading: Vec<(RecordLine, LogEntry)>,
-    /// The checkpoint the tail starts after, before the leading rows move.
+    /// The checkpoint the tail starts after.
     pub(crate) checkpoint: SessionCheckpoint,
     /// Rows before the checkpoint the read of a changed sub-agent transcript
     /// changed in place: each entry, with the stored row's id, sequence and
@@ -420,6 +420,17 @@ pub(crate) struct WindowUpdate {
     pub(crate) in_place: Vec<InPlaceRow>,
     /// The call that launched each sub-agent thread, by its transcript.
     pub(crate) launch_calls: Vec<(PathBuf, Option<String>)>,
+}
+
+impl WindowUpdate {
+    /// Each row changed in place's record and entry, in the shape the rows
+    /// of a session's entries are built from.
+    pub(super) fn in_place_entries(&self) -> Vec<(RecordLine, LogEntry)> {
+        self.in_place
+            .iter()
+            .map(|row| (row.record.clone(), row.entry.clone()))
+            .collect()
+    }
 }
 
 pub(crate) struct InPlaceRow {

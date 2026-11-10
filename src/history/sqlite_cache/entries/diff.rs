@@ -43,71 +43,32 @@ pub(in super::super) fn update_tail(
 }
 
 /// Makes `rows`, the rows of the session's leading entries, the stored
-/// rows at sequence 0 on, where `stored_count` rows held them: every later
-/// entry moves by the change in their number, and every later entry of the
-/// session's own thread moves its position by as much. An unchanged leading
-/// row is kept, a changed one updated in place.
+/// rows at sequence 0 on, which hold as many entries: an unchanged row is
+/// kept, a changed one updated in place.
 pub(in super::super) fn replace_leading(
     connection: &Connection,
     session: i64,
     places: &WrittenPlaces,
     rows: &SessionRows,
-    stored_count: usize,
 ) -> Result<()> {
     let stored: Vec<(i64, i64)> = connection
         .prepare_cached(
             "SELECT id, digest FROM entries WHERE session = ?1 AND sequence < ?2 ORDER BY sequence",
         )?
-        .query_map(params![session, stored_count as i64], |row| {
+        .query_map(params![session, rows.entries.len() as i64], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    for (id, _) in stored.iter().skip(rows.entries.len()) {
-        connection
-            .prepare_cached("DELETE FROM entries WHERE id = ?1")?
-            .execute([id])?;
-    }
     let mut writer = RowWriter::new(connection, session, places)?;
-    let delta = rows.entries.len() as i64 - stored_count as i64;
-    if delta != 0 {
-        // Through negative sequences, so no two entries hold one at once.
-        connection
-            .prepare_cached(
-                "UPDATE entries SET sequence = -sequence - 1 WHERE session = ?1 AND sequence >= ?2",
-            )?
-            .execute(params![session, stored_count as i64])?;
-        connection
-            .prepare_cached(
-                "UPDATE entries SET sequence = -sequence - 1 + ?2 WHERE session = ?1 AND sequence < 0",
-            )?
-            .execute(params![session, delta])?;
-        connection
-            .prepare_cached(
-                "UPDATE entries SET position = position + ?3 WHERE session = ?1 \
-                 AND sequence >= ?2 AND child IS NULL AND (message IS NULL OR message IN \
-                 (SELECT m.id FROM messages m JOIN threads t ON t.id = m.thread \
-                 WHERE m.session = ?1 AND t.number = 0))",
-            )?
-            .execute(params![session, stored_count as i64 + delta, delta])?;
-        writer.shift_search_places(stored_count as i64, delta)?;
-    }
-    let mut ids = RowIds::new(rows);
-    for index in 0..rows.entries.len() {
-        let row = &rows.entries[index];
-        match stored.get(index) {
-            Some(&(id, digest)) => {
-                if digest == row.digest() {
-                    continue;
-                }
-                let place = EntryPlace::of(row, rows.sequence_of(index), &ids);
-                let search = SearchPlace::of(rows, index);
-                writer.update_content(row, id, search)?;
-                writer.place_entry(row, &place, search, id)?;
-            }
-            None => {
-                writer.insert_entry(rows, &mut ids, index)?;
-            }
+    let ids = RowIds::new(rows);
+    for (index, (row, &(id, digest))) in rows.entries.iter().zip(&stored).enumerate() {
+        if digest == row.digest() {
+            continue;
         }
+        let place = EntryPlace::of(row, rows.sequence_of(index), &ids);
+        let search = SearchPlace::of(rows, index);
+        writer.update_content(row, id, search)?;
+        writer.place_entry(row, &place, search, id)?;
     }
     Ok(())
 }
@@ -585,12 +546,9 @@ fn update_entries(
         Ok(order) => order,
         Err(order) => {
             // Move each entry out of the way first, so no two entries hold
-            // one sequence at once: to its id, negated, which no sequence
-            // takes.
+            // one sequence at once.
             for (entry, _) in &order {
-                connection
-                    .prepare_cached("UPDATE entries SET sequence = -id WHERE id = ?1")?
-                    .execute([entry.id])?;
+                writer.move_aside(entry.id)?;
             }
             order
         }

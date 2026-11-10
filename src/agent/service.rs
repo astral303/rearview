@@ -1258,7 +1258,7 @@ impl AgentService {
         }
         let no_longer_cached = || AppError::SessionCacheNotReady {
             session: key.session_id.clone(),
-            reason: "cache no longer available".to_owned(),
+            reason: "the session is no longer in the session cache".to_owned(),
         };
         let transcript = self.perf.time_transcript_parse(key, || {
             self.read_when_unlocked(|| {

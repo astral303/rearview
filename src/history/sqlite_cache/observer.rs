@@ -114,7 +114,7 @@ fn observe_waiting(base: &CacheBase, lock_wait: Duration) -> Result<Observation>
         return Ok(Observation::Idle);
     }
     let observed = (|| {
-        let connection = connection::open(&path, Access::ReadOnly, lock_wait)?;
+        let connection = connection::open_cache(base, Access::ReadOnly, lock_wait)?;
         let has_refresh_state = super::refresh::has_refresh_state(&connection)?;
         connection.busy_timeout(Duration::ZERO)?;
         if !has_refresh_state {

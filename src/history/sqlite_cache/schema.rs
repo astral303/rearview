@@ -1,10 +1,25 @@
 //! The session cache database's tables. Change [`SCHEMA_VERSION`] with any
 //! change here: a database at another version is emptied and rebuilt.
 
+use crate::semantic::filter::SEMANTIC_TURN_VERSION;
+
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 37;
+pub(super) const SCHEMA_VERSION: u32 = 39;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
+/// The `meta` key holding the [`SEMANTIC_TURN_VERSION`] of the stored
+/// `semantic_turns`. A database holding another is emptied and rebuilt, as
+/// for another schema version.
+pub(super) const SEMANTIC_TURN_VERSION_KEY: &str = "semantic_turn_version";
+
+/// Each `meta` key a current database holds with its value: a database
+/// holding another value under any of them is emptied and rebuilt.
+pub(super) fn layout_versions() -> [(&'static str, String); 2] {
+    [
+        (SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_string()),
+        (SEMANTIC_TURN_VERSION_KEY, SEMANTIC_TURN_VERSION.to_string()),
+    ]
+}
 
 /// Tables an earlier version held, dropped before [`TABLES`] when the schema
 /// changes.
@@ -13,6 +28,7 @@ pub(super) const RETIRED_TABLES: &[&str] =
 
 /// Every table, dropped in this order when the schema changes.
 pub(super) const TABLES: &[&str] = &[
+    "semantic_turns",
     "result_items",
     "parts",
     "entries",
@@ -326,6 +342,24 @@ CREATE INDEX IF NOT EXISTS entries_by_child ON entries (child, record_line)
     WHERE child IS NOT NULL;
 CREATE INDEX IF NOT EXISTS entries_by_time ON entries (timestamp_ms)
     WHERE timestamp_ms IS NOT NULL;
+
+-- Each user, assistant and metadata entry's semantic turn, as
+-- `entry_semantic_turn` computes it from the entry as written, terminal
+-- codes included. Entries without a semantic turn have no row. The semantic
+-- stage reads a session's turns from here alone. A write moving an entry moves its turn in the same function;
+-- the key is checked at the commit, as the two rows move in separate
+-- statements. A deleted entry deletes its turn.
+CREATE TABLE IF NOT EXISTS semantic_turns (
+    session INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    -- The ordinal of the entry's message when the entry contributes to it,
+    -- as the parts' `message_ordinal`; a turn without one isn't read.
+    ordinal INTEGER,
+    text TEXT NOT NULL,
+    PRIMARY KEY (session, sequence),
+    FOREIGN KEY (session, sequence) REFERENCES entries (session, sequence)
+        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+) WITHOUT ROWID;
 
 -- Each content part retains its original position, including reference-only
 -- images and unknown blocks. Parts numbered below zero are read by search

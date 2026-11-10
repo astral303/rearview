@@ -2,6 +2,58 @@ use crate::search::literal::Literal;
 use crate::semantic::types::EmbeddedChunk;
 use std::borrow::Cow;
 
+/// The version of the semantic turns the session cache stores: what
+/// [`filter_turn`] keeps, and which entries and texts
+/// [`crate::history::parser::entry_semantic_turn`] passes it. A cache holding
+/// another version is emptied and rebuilt: bump it with any change to
+/// either.
+pub(crate) const SEMANTIC_TURN_VERSION: i64 = 2;
+
+/// The tag pairs whose spans a turn drops, and whose tags left in a block
+/// drop the block.
+const STRUCTURAL_TAGS: &[(&str, &str)] = &[
+    ("<system-reminder>", "</system-reminder>"),
+    ("<local-command-caveat>", "</local-command-caveat>"),
+    ("<local-command-stdout>", "</local-command-stdout>"),
+    ("<local-command-stderr>", "</local-command-stderr>"),
+    ("<command-message>", "</command-message>"),
+    ("<command-name>", "</command-name>"),
+];
+
+/// An assistant block naming one of these and one of [`COMMAND_TERMS`] is a
+/// status report, dropped.
+const VALIDATION_TERMS: &[&str] = &[
+    "validation passed",
+    "all checks pass",
+    "working tree clean",
+    "committed",
+    "commit:",
+    "validation:",
+];
+const COMMAND_TERMS: &[&str] = &["cargo test", "just check", "git status", "git diff"];
+
+/// Box-drawing characters: a turn splits into blocks where they start and
+/// end, and a block mostly of them is dropped.
+const ARTIFACT_CHARS: &[char] = &[
+    '─', '━', '│', '┃', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '╭', '╮', '╰', '╯', '═', '║',
+    '╔', '╗', '╚', '╝',
+];
+
+/// The punctuation a table or code block is mostly made of.
+const ARTIFACT_PUNCTUATION: &[char] = &['|', '-', '+', '=', '_', '`'];
+
+/// A block with these beside much punctuation is code, dropped.
+const CODE_MARKERS: &[&str] = &[
+    "::{",
+    "=>",
+    "</",
+    "<div",
+    "function ",
+    "const ",
+    "let ",
+    "fn ",
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemanticTurnRole {
     User,
@@ -76,14 +128,7 @@ fn strip_structural_tag_spans(text: Cow<'_, str>) -> Cow<'_, str> {
         return text;
     }
     let mut stripped = text;
-    for (open, close) in [
-        ("<system-reminder>", "</system-reminder>"),
-        ("<local-command-caveat>", "</local-command-caveat>"),
-        ("<local-command-stdout>", "</local-command-stdout>"),
-        ("<local-command-stderr>", "</local-command-stderr>"),
-        ("<command-message>", "</command-message>"),
-        ("<command-name>", "</command-name>"),
-    ] {
+    for &(open, close) in STRUCTURAL_TAGS {
         if stripped.contains(open) {
             stripped = Cow::Owned(strip_tag_pair(&stripped, open, close));
         }
@@ -139,31 +184,9 @@ fn split_semantic_blocks(text: &str) -> Vec<&str> {
 }
 
 fn is_artifact_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '─' | '━'
-            | '│'
-            | '┃'
-            | '┌'
-            | '┐'
-            | '└'
-            | '┘'
-            | '├'
-            | '┤'
-            | '┬'
-            | '┴'
-            | '┼'
-            | '╭'
-            | '╮'
-            | '╰'
-            | '╯'
-            | '═'
-            | '║'
-            | '╔'
-            | '╗'
-            | '╚'
-            | '╝'
-    )
+    // Skip the list for a character outside the Box Drawing block, which
+    // holds every entry.
+    ('\u{2500}'..='\u{257f}').contains(&ch) && ARTIFACT_CHARS.contains(&ch)
 }
 
 fn is_low_value_turn(turn: &str) -> bool {
@@ -171,23 +194,9 @@ fn is_low_value_turn(turn: &str) -> bool {
     trimmed.is_empty()
         || trimmed.starts_with('/')
         || trimmed.contains('<')
-            && contains_any(
-                trimmed,
-                &[
-                    "<system-reminder>",
-                    "</system-reminder>",
-                    "<local-command-caveat>",
-                    "</local-command-caveat>",
-                    "<local-command-stdout>",
-                    "</local-command-stdout>",
-                    "<local-command-stderr>",
-                    "</local-command-stderr>",
-                    "<command-message>",
-                    "</command-message>",
-                    "<command-name>",
-                    "</command-name>",
-                ],
-            )
+            && STRUCTURAL_TAGS
+                .iter()
+                .any(|(open, close)| trimmed.contains(open) || trimmed.contains(close))
 }
 
 fn is_status_artifact(role: SemanticTurnRole, block: &str) -> bool {
@@ -200,17 +209,7 @@ fn is_status_artifact(role: SemanticTurnRole, block: &str) -> bool {
     } else {
         block.to_lowercase()
     };
-    let validation_terms = [
-        "validation passed",
-        "all checks pass",
-        "working tree clean",
-        "committed",
-        "commit:",
-        "validation:",
-    ];
-    let command_terms = ["cargo test", "just check", "git status", "git diff"];
-    validation_terms.iter().any(|term| lower.contains(term))
-        && command_terms.iter().any(|term| lower.contains(term))
+    contains_any(&lower, VALIDATION_TERMS) && contains_any(&lower, COMMAND_TERMS)
 }
 
 fn is_artifact_block(block: &str) -> bool {
@@ -218,7 +217,7 @@ fn is_artifact_block(block: &str) -> bool {
     for c in block.chars() {
         chars += usize::from(!c.is_whitespace());
         box_chars += usize::from(is_artifact_char(c));
-        punctuation += usize::from(matches!(c, '|' | '-' | '+' | '=' | '_' | '`'));
+        punctuation += usize::from(ARTIFACT_PUNCTUATION.contains(&c));
         alphanumeric += usize::from(c.is_alphanumeric());
     }
     if chars == 0 {
@@ -231,17 +230,7 @@ fn is_artifact_block(block: &str) -> bool {
         return true;
     }
 
-    let code_markers = [
-        "::{",
-        "=>",
-        "</",
-        "<div",
-        "function ",
-        "const ",
-        "let ",
-        "fn ",
-    ];
-    punctuation > alphanumeric / 4 && contains_any(block, &code_markers)
+    punctuation > alphanumeric / 4 && contains_any(block, CODE_MARKERS)
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -329,10 +318,60 @@ mod tests {
                 assert_eq!(
                     filter_turn(role, text),
                     reference::filter_turn(role, text),
-                    "the filter keeps what it kept before for {role:?} {text:?}"
+                    "filter_turn keeps what the reference keeps for {role:?} {text:?}"
                 );
             }
         }
+    }
+
+    /// Fails when the lists [`filter_turn`] reads, or what it keeps of
+    /// [`FAST_PATH_TURNS`] in either role, change without a new
+    /// [`SEMANTIC_TURN_VERSION`]. A change to an unlisted rule these turns
+    /// don't reach, or to the entries and texts the parse passes
+    /// `filter_turn`, does not fail it.
+    #[test]
+    fn filter_lists_and_outputs_change_only_with_semantic_turn_version() {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        let mut add = |text: &str| {
+            digest.update(text.len().to_le_bytes());
+            digest.update(text.as_bytes());
+        };
+        for (open, close) in STRUCTURAL_TAGS {
+            add(open);
+            add(close);
+        }
+        for term in VALIDATION_TERMS
+            .iter()
+            .chain(COMMAND_TERMS)
+            .chain(CODE_MARKERS)
+        {
+            add(term);
+        }
+        for ch in ARTIFACT_CHARS.iter().chain(ARTIFACT_PUNCTUATION) {
+            add(ch.encode_utf8(&mut [0; 4]));
+        }
+        for turn in FAST_PATH_TURNS {
+            for role in [SemanticTurnRole::User, SemanticTurnRole::Assistant] {
+                match filter_turn(role, turn) {
+                    Some(kept) => {
+                        add("kept");
+                        add(&kept);
+                    }
+                    None => add("dropped"),
+                }
+            }
+        }
+
+        assert_eq!(
+            (SEMANTIC_TURN_VERSION, format!("{:x}", digest.finalize())),
+            (
+                2,
+                "7bb928518625c90ab1162db3df0b08a6cbf9bb7881b2a9ab2c1831bd66b24212".to_owned()
+            ),
+            "filter_turn's lists and outputs change only with a new SEMANTIC_TURN_VERSION: \
+             bump it, then record the new digest"
+        );
     }
 
     #[test]

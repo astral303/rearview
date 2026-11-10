@@ -283,10 +283,10 @@ fn search_worker_stops_once_app_drops_its_commands_while_a_read_runs() {
             conversations: Arc::new(rows.into_iter().map(Arc::new).collect()),
         })
         .unwrap();
-    let reading = worker.texts_held.recv_timeout(TEXTS_READ_LANDS).unwrap();
+    let reading = worker.texts_held.recv_timeout(TEXTS_READ_LIMIT).unwrap();
 
     drop(worker.commands);
-    let after_drop = worker.results.recv_timeout(TEXTS_READ_LANDS);
+    let after_drop = worker.results.recv_timeout(TEXTS_READ_LIMIT);
     gate.open();
 
     assert_eq!(
@@ -314,7 +314,7 @@ fn panicking_read_replies_with_every_copy_of_its_batch_failed() {
 
     reader.send(TextsToRead::new(copies, reply)).unwrap();
     let reads = replies
-        .recv_timeout(TEXTS_READ_LANDS)
+        .recv_timeout(TEXTS_READ_LIMIT)
         .expect("the reader replies")
         .into_texts_read()
         .expect("the reply holds the batch's reads");
@@ -349,12 +349,12 @@ fn search_bar_text(app: &super::App) -> String {
 }
 
 /// Longer than the text reader takes to read a fixture session.
-const TEXTS_READ_LANDS: std::time::Duration = std::time::Duration::from_secs(10);
+const TEXTS_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Receives the search worker's counts until `is_done`, failing after
-/// [`TEXTS_READ_LANDS`].
+/// [`TEXTS_READ_LIMIT`].
 fn receive_until(app: &mut super::App, is_done: impl Fn(&super::App) -> bool) {
-    let deadline = std::time::Instant::now() + TEXTS_READ_LANDS;
+    let deadline = std::time::Instant::now() + TEXTS_READ_LIMIT;
     loop {
         app.receive_search_results();
         if is_done(app) {
@@ -467,7 +467,7 @@ fn texts_read_after_semantic_results_show_dont_rerun_their_lexical_fallback() {
     let generation = app.search_generation();
     let fallback = app
         .search_rx
-        .recv_timeout(TEXTS_READ_LANDS)
+        .recv_timeout(TEXTS_READ_LIMIT)
         .expect("the search worker answers the lexical fallback over the texts held");
     send_semantic_complete_response(
         &response_tx,
@@ -480,7 +480,7 @@ fn texts_read_after_semantic_results_show_dont_rerun_their_lexical_fallback() {
 
     gate.open();
     let mut reruns = Vec::new();
-    let deadline = std::time::Instant::now() + TEXTS_READ_LANDS;
+    let deadline = std::time::Instant::now() + TEXTS_READ_LIMIT;
     while app.texts_held.sessions_without_texts.loading > 0 || app.texts_held.updates_applied == 0 {
         assert!(
             std::time::Instant::now() < deadline,

@@ -1,11 +1,11 @@
 //! A session cache directory as one rearview reaches it.
 
 use super::low_space;
+use super::refresh::WriteAccess;
 use crate::clock::Clock;
 use crate::error::AppError;
 use crate::history::provider::walk::Canonicaliser;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -38,15 +38,24 @@ struct BaseState {
     closed: Condvar,
 }
 
+/// This rearview's open connections to a base, as [`CacheBase::open_connection`]
+/// counts them. Refresh ownership's own connections, the low-space
+/// deletion's among them, and the observer's read are not counted: each
+/// opens and closes within one call, and the deletion doesn't wait for
+/// them, so a thread holding one cannot wait for itself.
 #[derive(Default)]
 struct Connections {
     open: usize,
     /// True while the low-space deletion refuses new connections. The
     /// deletion's own connections are not counted.
     refusing: bool,
-    /// The thread that opened each of the `open` connections.
+    /// The thread holding each of the `open` connections, by its serial:
+    /// the thread that opened it, or the last one that used it (see
+    /// [`OpenConnection::held_on_this_thread`]).
     #[cfg(debug_assertions)]
-    opened_on: Vec<std::thread::ThreadId>,
+    holders: std::collections::HashMap<u64, std::thread::ThreadId>,
+    #[cfg(debug_assertions)]
+    next_serial: u64,
 }
 
 impl BaseState {
@@ -62,7 +71,26 @@ impl BaseState {
 pub(crate) struct OpenConnection {
     state: Arc<BaseState>,
     #[cfg(debug_assertions)]
-    opened_on: std::thread::ThreadId,
+    serial: u64,
+    #[cfg(debug_assertions)]
+    holder: std::cell::Cell<std::thread::ThreadId>,
+}
+
+impl OpenConnection {
+    /// Record this thread as the connection's holder. A connection moved to
+    /// another thread is recorded there at its first use: until then, the
+    /// thread it left still holds it for the low-space deletion's debug
+    /// check.
+    #[cfg(debug_assertions)]
+    pub(super) fn held_on_this_thread(&self) {
+        let current = std::thread::current().id();
+        if self.holder.replace(current) != current {
+            self.state
+                .connections()
+                .holders
+                .insert(self.serial, current);
+        }
+    }
 }
 
 impl Drop for OpenConnection {
@@ -70,14 +98,7 @@ impl Drop for OpenConnection {
         let mut connections = self.state.connections();
         connections.open -= 1;
         #[cfg(debug_assertions)]
-        {
-            let index = connections
-                .opened_on
-                .iter()
-                .position(|thread| *thread == self.opened_on)
-                .expect("an open connection records its thread");
-            connections.opened_on.swap_remove(index);
-        }
+        connections.holders.remove(&self.serial);
         drop(connections);
         self.state.closed.notify_all();
     }
@@ -123,18 +144,15 @@ impl Drop for RebuildMark {
 struct HeldOwner {
     canonical_base: PathBuf,
     identity: String,
-    /// The write permission every copy of the owner's token shares.
-    writable: Arc<AtomicBool>,
-    /// The owner's turn, held by each of its write batches.
-    turn: Arc<Mutex<()>>,
+    access: Arc<WriteAccess>,
 }
 
 /// An ownership [`ProcessIdentity::revoke_every_owner_of`] revoked.
 pub(crate) struct RevokedOwner {
     pub(crate) identity: String,
-    /// True when one of the owner's write batches held its turn at the
-    /// revocation, and so may hold SQLite's writer lock.
-    pub(crate) is_writing: bool,
+    /// True when a write batch or a free-space check held the owner's turn
+    /// at the revocation; a write batch may then hold SQLite's writer lock.
+    pub(crate) is_turn_held: bool,
 }
 
 /// The free space on the drive a path is on, as rearview asks for it.
@@ -221,19 +239,12 @@ impl ProcessIdentity {
     }
 
     /// Record `owner` as this rearview's ownership of `canonical_base`, with
-    /// the write permission and the turn its tokens share.
-    pub(crate) fn hold(
-        &self,
-        canonical_base: &Path,
-        owner: &str,
-        writable: Arc<AtomicBool>,
-        turn: Arc<Mutex<()>>,
-    ) {
+    /// the write access its tokens share.
+    pub(crate) fn hold(&self, canonical_base: &Path, owner: &str, access: Arc<WriteAccess>) {
         self.held().owners.push(HeldOwner {
             canonical_base: canonical_base.to_path_buf(),
             identity: owner.to_owned(),
-            writable,
-            turn,
+            access,
         });
     }
 
@@ -273,13 +284,10 @@ impl ProcessIdentity {
             .iter()
             .filter(|owner| owner.canonical_base == canonical_base)
             .map(|owner| {
-                owner.writable.store(false, Ordering::Release);
+                owner.access.revoke();
                 RevokedOwner {
                     identity: owner.identity.clone(),
-                    is_writing: matches!(
-                        owner.turn.try_lock(),
-                        Err(std::sync::TryLockError::WouldBlock)
-                    ),
+                    is_turn_held: owner.access.is_turn_held(),
                 }
             })
             .collect()
@@ -300,6 +308,8 @@ pub struct CacheBase {
     /// `path` canonical, once it was asked for. Held while it canonicalises,
     /// so concurrent first callers canonicalise it once.
     canonical_path: Arc<Mutex<Option<PathBuf>>>,
+    /// The longest each step of the low-space deletion waits.
+    low_space_wait: Duration,
     /// Made by [`Self::new`] and kept by clones and [`Self::canonical`].
     state: Arc<BaseState>,
 }
@@ -321,6 +331,7 @@ impl CacheBase {
             disk: Arc::new(SystemDiskSpace),
             canonicaliser,
             canonical_path: Arc::default(),
+            low_space_wait: super::WAITING_BUSY_TIMEOUT,
             state: Arc::default(),
         }
     }
@@ -335,25 +346,39 @@ impl CacheBase {
         }
         connections.open += 1;
         #[cfg(debug_assertions)]
-        connections.opened_on.push(std::thread::current().id());
+        let (serial, holder) = {
+            let serial = connections.next_serial;
+            connections.next_serial += 1;
+            let holder = std::thread::current().id();
+            connections.holders.insert(serial, holder);
+            (serial, holder)
+        };
         Ok(OpenConnection {
             state: Arc::clone(&self.state),
             #[cfg(debug_assertions)]
-            opened_on: std::thread::current().id(),
+            serial,
+            #[cfg(debug_assertions)]
+            holder: std::cell::Cell::new(holder),
         })
     }
 
     /// Refuse this rearview's new connections to this base (see
     /// [`Self::open_connection`]) until the result drops, and wait up to
-    /// `wait` for the open ones to close. Call on a thread that opened none
+    /// `wait` for the open ones to close. Call on a thread that holds none
     /// of them: the wait would end only at `wait`.
     pub(super) fn refuse_connections(&self, wait: Duration) -> RefusedConnections {
         let mut connections = self.state.connections();
         #[cfg(debug_assertions)]
-        assert!(
-            !connections.opened_on.contains(&std::thread::current().id()),
-            "the thread refusing connections holds none of them open"
-        );
+        {
+            let current = std::thread::current().id();
+            assert!(
+                !connections
+                    .holders
+                    .values()
+                    .any(|holder| *holder == current),
+                "the thread refusing connections holds none of them open"
+            );
+        }
         connections.refusing = true;
         let deadline = Instant::now() + wait;
         while connections.open > 0 {
@@ -380,14 +405,18 @@ impl CacheBase {
     }
 
     /// This base, each step of its low-space deletion waiting at most
-    /// `wait`. Call before the base is cloned.
+    /// `wait`. Clones made earlier keep their wait.
     #[cfg(test)]
-    pub(crate) fn with_low_space_wait(mut self, wait: Duration) -> Self {
-        Arc::get_mut(&mut self.state)
-            .expect("a base's low-space wait is set before the base is cloned")
-            .low_space
-            .set_wait(wait);
-        self
+    pub(crate) fn with_low_space_wait(self, wait: Duration) -> Self {
+        Self {
+            low_space_wait: wait,
+            ..self
+        }
+    }
+
+    /// The longest each step of this base's low-space deletion waits.
+    pub(super) fn low_space_wait(&self) -> Duration {
+        self.low_space_wait
     }
 
     /// This base, keying session roots and files through `canonicaliser`.

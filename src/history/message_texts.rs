@@ -162,6 +162,12 @@ pub(crate) struct MessageTextBuilder {
 }
 
 impl MessageTextBuilder {
+    /// True until a part is pushed: [`Self::finish`] then gives an empty
+    /// text and default starts.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.outside_messages.is_empty() && self.messages.is_empty()
+    }
+
     pub(crate) fn into_parts(self) -> impl Iterator<Item = String> {
         self.outside_messages
             .into_iter()

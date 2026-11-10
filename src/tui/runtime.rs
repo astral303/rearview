@@ -322,9 +322,22 @@ impl Runtime {
         })
     }
 
-    /// The rows the list holds, for the action the TUI exits with.
-    pub(crate) fn into_conversations(self) -> Vec<Conversation> {
-        self.app.into_conversations()
+    /// The action the TUI exited with, `exit`, and the rows the list holds,
+    /// once the supervisor's drop waited for the free-space checks begun
+    /// before the exit. Fails with the low-space error once a write found
+    /// the cache's drive short of space, whatever the exit: rearview then
+    /// deletes the cache and stops (see [`crate::finish_command`]).
+    pub(crate) fn finish(self, exit: Result<Action>) -> Result<(Action, Vec<Conversation>)> {
+        let Self {
+            app, supervisor, ..
+        } = self;
+        let base = supervisor.cache_base().clone();
+        drop(supervisor);
+        let conversations = app.into_conversations();
+        if let Some(error) = base.low_space().error() {
+            return Err(error);
+        }
+        exit.map(|action| (action, conversations))
     }
 
     /// Apply every message the launch has sent. Fails with the launch's
@@ -483,8 +496,7 @@ pub fn run_with_loader(
     let exit = run_until_exit(&mut runtime, &mut guard);
     // Restore the terminal before the runtime waits for its free-space checks.
     drop(guard);
-    let conversations = runtime.into_conversations();
-    exit.map(|action| (action, conversations))
+    runtime.finish(exit)
 }
 
 fn run_until_exit(runtime: &mut Runtime, guard: &mut TerminalGuard) -> Result<Action> {

@@ -151,7 +151,7 @@ impl HeldCopy<'_> {
         )
     }
 
-    /// Calls `visit` with each search text and semantic text the copy
+    /// Calls `visit` with each search text and semantic turn the copy
     /// stores, as [`super::search_parts::visit_search_parts`] lays them out.
     pub(crate) fn stored_search_parts(&self, visit: impl FnMut(super::SearchPart)) -> Result<()> {
         super::search_parts::visit_search_parts(self.connection, self.session, visit)
@@ -165,7 +165,7 @@ impl HeldCopy<'_> {
         super::search_parts::visit_agent_search_texts(self.connection, self.session, &mut visit)
     }
 
-    /// [`Self::stored_search_parts`]'s semantic texts alone.
+    /// [`Self::stored_search_parts`]'s semantic turns alone.
     pub(crate) fn stored_semantic_turns(
         &self,
         mut visit: impl FnMut(super::SearchPart),

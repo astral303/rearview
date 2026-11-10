@@ -176,8 +176,9 @@ fn drawing_thread_reads_behind_rebuild_wait_out_single_busy_timeout() {
     ] {
         assert_eq!(
             waits,
-            [INTERACTIVE_BUSY_TIMEOUT],
-            "{read} behind a rebuild waits out one busy timeout"
+            [INTERACTIVE_BUSY_TIMEOUT, Duration::ZERO],
+            "{read} behind a rebuild waits out one busy timeout, then meets the lock once \
+             more without waiting"
         );
     }
 }

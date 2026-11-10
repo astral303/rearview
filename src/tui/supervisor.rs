@@ -6,7 +6,7 @@ use super::list_change::{ListChange, ListChangeOutcome};
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
 use crate::history::provider::{DirectFileRead, open_direct_file};
-use crate::history::sqlite_cache::Coordinator;
+use crate::history::sqlite_cache::{Coordinator, SHUTDOWN_RELEASE_WAIT};
 use crate::history::{
     Cancellation, Environment, LoaderMessage, OperationScope, OtherRearview, Patience,
     RefreshOptions, RefreshOutcome, WaitStatus, stream_all_conversations,
@@ -76,6 +76,11 @@ impl TaskSupervisor {
             OperationScope::new(environment.cache_base(), Patience::UntilAcquired, wait)
                 .cancelled_by(&cancellation)
         }
+    }
+
+    /// The session cache this supervisor's jobs read and write.
+    pub(crate) fn cache_base(&self) -> &crate::history::CacheBase {
+        self.environment.cache_base()
     }
 
     /// True while the worker runs nothing and is not shut down.
@@ -236,9 +241,15 @@ impl TaskSupervisor {
     /// running job writes nothing more, and a job waiting for ownership fails
     /// instead of acquiring it.
     pub(crate) fn shutdown(&mut self) {
+        self.shutdown_releasing_within(SHUTDOWN_RELEASE_WAIT);
+    }
+
+    /// [`Self::shutdown`], waiting at most `busy_lock_wait` to release each
+    /// ownership while another connection holds SQLite's writer lock.
+    fn shutdown_releasing_within(&mut self, busy_lock_wait: Duration) {
         self.worker = None;
         self.cancellation.cancel();
-        Coordinator::of(self.environment.cache_base()).shutdown();
+        Coordinator::of(self.environment.cache_base()).shutdown(busy_lock_wait);
     }
 }
 
@@ -249,11 +260,16 @@ const SPACE_CHECK_WAIT: Duration = Duration::from_secs(1);
 impl Drop for TaskSupervisor {
     /// Shut the worker down, then wait up to [`SPACE_CHECK_WAIT`] for a
     /// free-space check begun before the shutdown, so the cache base's
-    /// low-space latch is final when rearview reads it. The running job is
-    /// not joined: a parse group can run for seconds, and it ends with the
-    /// process.
+    /// low-space latch is final when rearview reads it; a check still
+    /// running then can no longer set it. Each release is tried once,
+    /// without a wait: the exit tick's shutdown, when one ran, already
+    /// waited.
+    ///
+    /// The running job is not joined, since a parse group can run for
+    /// seconds. After a resume or a select, its parse group keeps using CPU
+    /// until it ends; it writes nothing.
     fn drop(&mut self) {
-        self.shutdown();
+        self.shutdown_releasing_within(Duration::ZERO);
         self.environment
             .cache_base()
             .low_space()

@@ -412,10 +412,56 @@ fn json_error(error: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::provider::contract_tests::every_record_sessions;
+    use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
     use crate::history::sqlite_cache::tests::{
         admitted_cache, parsed_record, parsed_record_and_row, root_of, storage_of, stub_of,
     };
+    use serde_json::{Value, json};
+
+    /// A Claude session holding two user messages that the numbering numbers
+    /// but that show no preview, so neither holds a semantic turn: one whose
+    /// later text block holds `<local-command-stdout>`, and a task report
+    /// with an empty summary and a result. A question and two answers around
+    /// them hold turns.
+    fn claude_session_with_unshown_user_messages(home: &Path) -> AgentSession {
+        let path = home
+            .join("-tmp-claude-unshown-messages")
+            .join("1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = |second: u32, role: &str, content: Value| {
+            json!({
+                "type": role,
+                "timestamp": format!("2026-10-01T12:00:{second:02}Z"),
+                "uuid": format!("record-{second}"),
+                "message": {"role": role, "content": content}
+            })
+            .to_string()
+        };
+        let text = |text: &str| json!({"type": "text", "text": text});
+        let lines = [
+            record(0, "user", json!("Which files changed?")),
+            record(1, "assistant", json!([text("Two files changed.")])),
+            record(
+                2,
+                "user",
+                json!([
+                    text("Ran the status command"),
+                    text("<local-command-stdout>two files</local-command-stdout>")
+                ]),
+            ),
+            record(
+                3,
+                "user",
+                json!(
+                    "<task-notification><task-id>t1</task-id><summary></summary>\
+                     <result>The audit found two stale indexes.</result></task-notification>"
+                ),
+            ),
+            record(4, "assistant", json!([text("The audit is done.")])),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        AgentSession::new(Source::Claude, path, Vec::new(), Vec::new())
+    }
 
     #[test]
     fn rows_content_is_its_copy_as_it_is_and_replaced_copy_is_miss() {
@@ -494,7 +540,9 @@ mod tests {
     fn catalogue_metadata_matches_each_providers_row_without_reading_bodies() {
         let base = tempfile::tempdir().unwrap();
         let mut cache = admitted_cache(base.path());
-        for session in every_record_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let unshown = claude_session_with_unshown_user_messages(home.path());
+        for session in every_record_sessions().into_iter().chain([unshown]) {
             let root = root_of(&session);
             let stub = stub_of(&session, 1);
             let (record, original) = parsed_record_and_row(session.row.source, &root, &stub);

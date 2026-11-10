@@ -246,10 +246,10 @@ mod tests {
     use super::super::text_scan::parts_of_messages;
     use super::*;
 
-    /// One session's read, and a write moving its search places, cost what
-    /// the session holds, not what the cache holds, only while each statement
-    /// reads through an index, without sorting: those two through
-    /// `parts_by_session`. The sub-agent metadata read uses the index of
+    /// One session's read costs what the session holds, not what the cache
+    /// holds, only while each statement reads through an index, without
+    /// sorting: the read through `parts_by_session`. The sub-agent metadata
+    /// read uses the index of
     /// those parts alone; a windowed read or scan reads a run of messages'
     /// parts through `parts_by_message`.
     #[test]
@@ -264,10 +264,6 @@ mod tests {
                 (parts_of_messages_query(fields), "parts_by_message"),
                 (SUBAGENT_METADATA_READ.to_owned(), "parts_outside_entries"),
                 (parts_of_messages(fields), "parts_by_message"),
-                (
-                    super::super::entries::SHIFT_SEARCH_PLACES.to_owned(),
-                    "parts_by_session",
-                ),
             ] {
                 let mut statement = connection
                     .prepare(&format!("EXPLAIN QUERY PLAN {query}"))

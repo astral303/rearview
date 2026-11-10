@@ -18,11 +18,21 @@ pub(crate) struct Latch {
     state: Mutex<State>,
     /// Held while the deletion runs, so it runs once.
     deleting: Mutex<()>,
-    /// The longest each step of the deletion waits.
-    wait: Duration,
-    /// The free-space checks that may still set the latch.
-    checks_in_flight: Mutex<usize>,
+    checks: Mutex<Checks>,
     check_ended: Condvar,
+    /// Runs once the next [`Latch::wait_for_checks`] begins, for a test of
+    /// what a check does during that wait.
+    #[cfg(test)]
+    on_wait_start: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// The free-space checks that may still set the latch.
+#[derive(Default)]
+struct Checks {
+    in_flight: usize,
+    /// True once [`Latch::wait_for_checks`] gave up on a check: no check sets
+    /// the latch from then on.
+    sealed: bool,
 }
 
 /// One free-space check that may set the latch, counted until it drops.
@@ -30,10 +40,23 @@ pub(super) struct SpaceCheck<'a> {
     latch: &'a Latch,
 }
 
+impl SpaceCheck<'_> {
+    /// Set the latch with the check's finding of `free_bytes` free; false,
+    /// leaving the latch as it is, once the latch is sealed.
+    pub(super) fn publish(&self, free_bytes: u64) -> bool {
+        let checks = self.latch.checks();
+        if checks.sealed {
+            return false;
+        }
+        self.latch.set(free_bytes);
+        true
+    }
+}
+
 impl Drop for SpaceCheck<'_> {
     fn drop(&mut self) {
-        let mut checks = self.latch.checks_in_flight();
-        *checks -= 1;
+        let mut checks = self.latch.checks();
+        checks.in_flight -= 1;
         self.latch.check_ended.notify_all();
     }
 }
@@ -56,9 +79,10 @@ impl Default for Latch {
         Self {
             state: Mutex::default(),
             deleting: Mutex::default(),
-            wait: super::WAITING_BUSY_TIMEOUT,
-            checks_in_flight: Mutex::default(),
+            checks: Mutex::default(),
             check_ended: Condvar::new(),
+            #[cfg(test)]
+            on_wait_start: Mutex::default(),
         }
     }
 }
@@ -68,33 +92,43 @@ impl Latch {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn checks_in_flight(&self) -> MutexGuard<'_, usize> {
-        self.checks_in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn checks(&self) -> MutexGuard<'_, Checks> {
+        self.checks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Count a free-space check while `can_publish` holds; `None` when it
-    /// does not. A write permission revoked before
-    /// [`Self::wait_for_checks`] then lets no later check set the latch.
+    /// Count a free-space check while `can_publish` holds and the latch is
+    /// not sealed; `None` otherwise. After a write permission's revocation,
+    /// later checks of its owner cannot start.
     pub(super) fn begin_check(&self, can_publish: impl FnOnce() -> bool) -> Option<SpaceCheck<'_>> {
-        let mut checks = self.checks_in_flight();
-        if !can_publish() {
+        let mut checks = self.checks();
+        if checks.sealed || !can_publish() {
             return None;
         }
-        *checks += 1;
+        checks.in_flight += 1;
         Some(SpaceCheck { latch: self })
     }
 
     /// Wait up to `limit` for the free-space checks begun before this call
-    /// to end; false when one still runs then. Call once every write
-    /// permission of the base is revoked: the latch then stays as it is.
-    pub(crate) fn wait_for_checks(&self, limit: Duration) -> bool {
+    /// to end, then seal the latch should one still run: its finding is
+    /// dropped, and no later check starts. Call once every write permission
+    /// of the base is revoked. A check by an ownership acquired after this
+    /// call can still set a latch left unsealed.
+    pub(crate) fn wait_for_checks(&self, limit: Duration) {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .on_wait_start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            hook();
+        }
         let deadline = Instant::now() + limit;
-        let mut checks = self.checks_in_flight();
-        while *checks > 0 {
+        let mut checks = self.checks();
+        while checks.in_flight > 0 {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                return false;
+                checks.sealed = true;
+                return;
             };
             checks = self
                 .check_ended
@@ -102,12 +136,11 @@ impl Latch {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        true
     }
 
     /// Set the latch: a write found `free_bytes` free on the drive, below
     /// the floor. A set latch keeps the first write's free bytes.
-    pub(super) fn set(&self, free_bytes: u64) {
+    fn set(&self, free_bytes: u64) {
         let mut state = self.state();
         if matches!(*state, State::Clear) {
             *state = State::Set { free_bytes };
@@ -146,24 +179,13 @@ impl Latch {
         }
     }
 
-    /// Once the latch is set, turn off the checkpoint SQLite runs when
-    /// `connection`, about to close, is the last connection: copying the
-    /// write-ahead log into the database needs the space the drive lacks.
-    pub(super) fn keep_log_on_close(&self, connection: &rusqlite::Connection) {
-        if !self.is_set() {
-            return;
-        }
-        // SQLite fails the call only for an option it does not know.
-        let kept = connection.set_db_config(
-            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-            true,
-        );
-        debug_assert!(kept.is_ok(), "SQLite turns the checkpoint on close off");
-    }
-
+    /// Run `hook` once the next [`Self::wait_for_checks`] begins.
     #[cfg(test)]
-    pub(super) fn set_wait(&mut self, wait: Duration) {
-        self.wait = wait;
+    pub(crate) fn on_wait_start(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .on_wait_start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 }
 
@@ -185,7 +207,7 @@ pub(crate) fn run_deletion(base: &CacheBase) -> Option<CacheDeletion> {
         State::Ran { outcome, .. } => return Some(outcome.clone()),
         State::Set { free_bytes } => *free_bytes,
     };
-    let outcome = delete(base, latch.wait);
+    let outcome = delete(base, base.low_space_wait());
     *latch.state() = State::Ran {
         free_bytes,
         outcome: outcome.clone(),

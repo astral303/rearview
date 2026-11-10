@@ -3,6 +3,7 @@
 
 use super::parts::{self, EntryIds};
 use super::rows::{EntryRow, SessionRows};
+use super::semantic;
 use crate::agent::sanitize::split_terminal_codes;
 use crate::history::sqlite_cache::roots::WrittenPlaces;
 use rusqlite::{CachedStatement, Connection, ToSql, params};
@@ -25,11 +26,6 @@ impl RowIds {
         }
     }
 }
-
-/// Moves the search place of the session `?1`'s parts from sequence `?2` on
-/// by `?3`.
-pub(in crate::history::sqlite_cache) const SHIFT_SEARCH_PLACES: &str = "UPDATE parts SET entry_sequence = entry_sequence + ?3 \
-     WHERE session = ?1 AND entry_sequence >= ?2";
 
 /// The columns an entry's place in its session sets.
 const ENTRY_PLACE_COLUMNS: &[&str] = &[
@@ -315,21 +311,31 @@ impl<'connection> RowWriter<'connection> {
         bind_entry(&mut self.insert_entry, self.session, row, &place)?;
         self.insert_entry.raw_execute()?;
         let id = self.connection.last_insert_rowid();
+        let search = SearchPlace::of(rows, index);
         self.parts.write(
             EntryIds {
                 session: self.session,
                 entry: id,
             },
             &row.build_parts(),
-            SearchPlace::of(rows, index),
+            search,
         )?;
+        if let Some(turn) = &row.semantic_turn {
+            semantic::insert(
+                self.connection,
+                self.session,
+                place.sequence,
+                search.ordinal,
+                turn,
+            )?;
+        }
         Ok(id)
     }
 
     /// Writes `row`'s content over the stored entry `id`, keeping its place:
-    /// the columns when their digest changed, else the digest alone, and the
+    /// the columns when their digest changed, else the digest alone, the
     /// parts through [`parts::Writer::update`], a changed or new part at
-    /// `search`.
+    /// `search`, and the semantic turn when it changed.
     pub(super) fn update_content(
         &mut self,
         row: &EntryRow,
@@ -360,6 +366,12 @@ impl<'connection> RowWriter<'connection> {
             },
             &row.build_parts(),
             search,
+        )?;
+        semantic::replace_of_entry(
+            self.connection,
+            id,
+            search.ordinal,
+            row.semantic_turn.as_deref(),
         )
     }
 
@@ -403,8 +415,8 @@ impl<'connection> RowWriter<'connection> {
         Ok(())
     }
 
-    /// Moves the stored entry `id` to `place`, and the parts search reads to
-    /// `search`.
+    /// Moves the stored entry `id` and its semantic turn to `place`. Sets
+    /// `search` on the parts search reads, and `search`'s ordinal on the turn.
     pub(super) fn place_entry(
         &self,
         row: &EntryRow,
@@ -412,6 +424,13 @@ impl<'connection> RowWriter<'connection> {
         search: SearchPlace,
         id: i64,
     ) -> rusqlite::Result<()> {
+        semantic::place(
+            self.connection,
+            self.session,
+            id,
+            place.sequence,
+            search.ordinal,
+        )?;
         let mut statement = self
             .connection
             .prepare_cached(&update_sql("entries", &[ENTRY_PLACE_COLUMNS]))?;
@@ -427,10 +446,20 @@ impl<'connection> RowWriter<'connection> {
         Ok(())
     }
 
-    /// Sets the search place's ordinal of the parts search reads of each
-    /// stored entry contributing to the message `message` to `ordinal`, the
-    /// message's new ordinal. An entry moving to another message or changing
-    /// whether it contributes gets its place from [`Self::place_entry`].
+    /// Moves the stored entry `id` and its semantic turn to the free sequence
+    /// `-id`, out of the way of the entries moving after it.
+    pub(super) fn move_aside(&self, id: i64) -> rusqlite::Result<()> {
+        semantic::move_to(self.connection, self.session, id, -id)?;
+        self.connection
+            .prepare_cached("UPDATE entries SET sequence = -id WHERE id = ?1")?
+            .execute([id])?;
+        Ok(())
+    }
+
+    /// Sets `ordinal`, the new ordinal of `message`, on the search places of
+    /// the parts of the stored entries contributing to it, and on their
+    /// semantic turns. An entry moving to another message, or changing
+    /// whether it contributes, gets its place from [`Self::place_entry`].
     pub(super) fn renumber_search_places(
         &self,
         message: i64,
@@ -443,17 +472,7 @@ impl<'connection> RowWriter<'connection> {
                  AND entry_sequence IS NOT NULL",
             )?
             .execute(params![message, ordinal])?;
-        Ok(())
-    }
-
-    /// Moves the search place of the parts search reads of each of the
-    /// session's entries from sequence `from` on by `delta`, as the entries
-    /// moved.
-    pub(super) fn shift_search_places(&self, from: i64, delta: i64) -> rusqlite::Result<()> {
-        self.connection
-            .prepare_cached(SHIFT_SEARCH_PLACES)?
-            .execute(params![self.session, from, delta])?;
-        Ok(())
+        semantic::renumber(self.connection, message, ordinal)
     }
 }
 

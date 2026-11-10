@@ -203,17 +203,6 @@ impl FoldCheckpoint {
         }
         Some(self)
     }
-
-    /// This checkpoint with one more leading entry in the session's own
-    /// thread, or one fewer for a negative `delta`.
-    pub(crate) fn with_leading_entries_moved(mut self, delta: i64) -> Self {
-        if let Some((_, position)) = self.positions.iter_mut().find(|(thread, _)| *thread == 0) {
-            *position += delta;
-        } else if delta > 0 {
-            self.positions.push((0, delta));
-        }
-        self
-    }
 }
 
 /// What numbering an entry gave it.

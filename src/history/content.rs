@@ -1,15 +1,15 @@
 //! Content is loaded when a consumer needs it, keeping catalogue loads small.
 
 use super::Conversation;
+use super::MessageTimes;
 use super::message_texts::{MessageTextBuilder, push_separated};
 use super::sqlite_cache::{
     self, CachedSession, HeldCopy, RouteKey, ScannedTurns, SearchField, SearchPart, SemanticRoute,
+    SemanticTurns,
 };
-use crate::agent::refs::MessageRange;
 use crate::error::Result;
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 impl Conversation {
     /// This row with the content of the copy the session cache holds at its
@@ -98,54 +98,42 @@ impl Conversation {
         self.message_text_starts = Default::default();
     }
 
-    /// Each of `rows`, each a row and its copy, with the semantic turns of the
-    /// copy the cache holds at its address now, whichever generation it is,
-    /// as [`Self::load_held_content`] reads them; the search texts stay
-    /// empty. One result per row, in order; `None` when the session is no
-    /// longer in the session cache.
-    ///
-    /// The rows are read together in tasks across threads
-    /// ([`sqlite_cache::scan_semantic_turns`]); a row whose copy another
-    /// write replaced is read alone. Fails when the cache cannot be opened or
-    /// read before any row's turns; a failed read of one row's turns fails
-    /// that row alone.
+    /// `rows`, pairs of a row and its copy, with the semantic turns of the
+    /// copy the cache holds at the row's address now, as
+    /// [`Self::load_held_content`] reads them; the search texts stay empty.
+    /// - One result per row, in order: `None` when the session is no longer
+    ///   in the session cache.
+    /// - The copy read is of whichever generation the cache holds.
+    /// - The rows are read together in tasks across threads
+    ///   ([`sqlite_cache::scan_semantic_turns`]); a row's copy replaced by
+    ///   another write during the scan is read alone.
+    /// - A failed lookup or read of one row's turns fails that row alone;
+    ///   a cache base that cannot be opened or read fails them all.
     pub(crate) fn load_held_semantic_turns_of(
         rows: &[(&Conversation, &CachedSession)],
-    ) -> Result<Vec<Result<Option<CopyContent>>>> {
+    ) -> Result<Vec<Result<Option<HeldParts<()>>>>> {
         let copies = rows.iter().map(|&(_, cached)| cached).collect::<Vec<_>>();
         let scanned = sqlite_cache::scan_semantic_turns(&copies)?;
-        Ok(rows
-            .par_iter()
+        Ok(Self::with_scanned_turns_of(rows, scanned))
+    }
+
+    /// `rows` with `scanned`, the scan of their copies' semantic turns, as
+    /// [`Self::load_held_semantic_turns_of`] gives them.
+    pub(in crate::history) fn with_scanned_turns_of(
+        rows: &[(&Conversation, &CachedSession)],
+        scanned: Vec<ScannedTurns>,
+    ) -> Vec<Result<Option<HeldParts<()>>>> {
+        rows.par_iter()
             .zip(scanned)
             .map(|(&(row, cached), scanned)| match scanned {
                 ScannedTurns::Read(turns) => {
-                    let mut parts = ContentBuilder::default();
-                    for (ordinal, text) in turns {
-                        parts.push(SearchPart {
-                            ordinal: Some(ordinal),
-                            field: SearchField::Semantic,
-                            text,
-                        });
-                    }
-                    let mut loaded = row.clone();
-                    parts.finish(&mut loaded);
-                    Ok(Some(CopyContent {
-                        row: loaded,
-                        generation: cached.generation(),
-                    }))
+                    Ok(Some(row.with_scanned_turns(turns, cached.generation())))
                 }
-                ScannedTurns::Replaced => {
-                    Ok(row
-                        .read_held_semantic_turns(cached)?
-                        .map(|held| CopyContent {
-                            row: held.row,
-                            generation: held.generation,
-                        }))
-                }
+                ScannedTurns::Replaced => row.read_held_semantic_turns(cached),
                 ScannedTurns::NoLongerCached => Ok(None),
                 ScannedTurns::Failed(error) => Err(error),
             })
-            .collect())
+            .collect()
     }
 
     /// This row with the semantic turns of `cached`'s copy the cache holds
@@ -178,27 +166,50 @@ impl Conversation {
             Ok((parts, result, replaced_times, held.generation()))
         })?;
         Ok(read.map(|(parts, result, replaced_times, generation)| {
-            let mut row = self.clone();
-            if let Some((message_count, message_times)) = replaced_times {
-                row.message_count = message_count;
-                row.message_times = message_times;
-            }
-            parts.finish(&mut row);
-            HeldParts {
-                row,
-                generation,
-                result,
-            }
+            self.with_parts(parts, generation, replaced_times, result)
         }))
+    }
+
+    /// This row with `turns`, scanned from the row's own copy, of
+    /// `generation`: the row keeps its message count and times.
+    fn with_scanned_turns(&self, turns: SemanticTurns, generation: i64) -> HeldParts<()> {
+        self.with_parts(
+            ContentBuilder::of_semantic_turns(turns),
+            generation,
+            None,
+            (),
+        )
+    }
+
+    /// This row with `parts`, read of the copy of `generation`, and with
+    /// `replaced_times`, the message count and times of a copy that replaced
+    /// the row's.
+    fn with_parts<T>(
+        &self,
+        parts: ContentBuilder,
+        generation: i64,
+        replaced_times: Option<(usize, MessageTimes)>,
+        result: T,
+    ) -> HeldParts<T> {
+        let mut row = self.clone();
+        if let Some((message_count, message_times)) = replaced_times {
+            row.message_count = message_count;
+            row.message_times = message_times;
+        }
+        parts.finish(&mut row);
+        HeldParts {
+            row,
+            generation,
+            result,
+        }
     }
 }
 
-/// A read of [`Conversation::read_held_parts`].
-struct HeldParts<T> {
-    /// The row with the parts read.
-    row: Conversation,
+/// A row with the parts read of the copy the cache holds.
+pub(crate) struct HeldParts<T> {
+    pub(crate) row: Conversation,
     /// The generation of the copy read.
-    generation: i64,
+    pub(crate) generation: i64,
     /// The result of the read's `read_parts`.
     result: T,
 }
@@ -209,14 +220,6 @@ pub(crate) struct HeldContent<'r> {
     /// The generation of the copy the content was read from; `None` for a
     /// row without a copy.
     pub(crate) generation: Option<i64>,
-}
-
-/// A cached row with the content of the copy the cache holds, read by
-/// [`Conversation::load_held_semantic_turns_of`].
-pub(crate) struct CopyContent {
-    pub(crate) row: Conversation,
-    /// The generation of the copy read.
-    pub(crate) generation: i64,
 }
 
 /// A row's semantic content, read by [`Conversation::load_semantic_content`].
@@ -243,33 +246,47 @@ struct ContentBuilder {
     agent: MessageTextBuilder,
     thinking: MessageTextBuilder,
     supplement: Vec<String>,
-    semantic: Vec<String>,
-    semantic_ranges: Vec<MessageRange>,
-    semantic_indices: HashMap<usize, usize>,
+    semantic: SemanticTurns,
 }
 
 impl ContentBuilder {
+    fn of_semantic_turns(semantic: SemanticTurns) -> Self {
+        Self {
+            semantic,
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, part: SearchPart) {
         match part.field {
             SearchField::Full => self.full.push(part.ordinal, part.text),
             SearchField::Agent => self.agent.push(part.ordinal, part.text),
             SearchField::Thinking => self.thinking.push(part.ordinal, part.text),
             SearchField::Supplement => self.supplement.push(part.text),
-            SearchField::Semantic => {
-                let ordinal = part.ordinal.expect("a semantic turn has a message");
-                if let Some(&index) = self.semantic_indices.get(&ordinal) {
-                    self.semantic[index].push(' ');
-                    self.semantic[index].push_str(&part.text);
-                } else {
-                    self.semantic_indices.insert(ordinal, self.semantic.len());
-                    self.semantic.push(part.text);
-                    self.semantic_ranges.push(MessageRange::single(ordinal));
-                }
-            }
+            SearchField::Semantic => self.semantic.push(
+                part.ordinal.expect("a semantic turn has a message"),
+                part.text,
+            ),
         }
     }
 
+    fn holds_search_texts(&self) -> bool {
+        !(self.full.is_empty()
+            && self.agent.is_empty()
+            && self.thinking.is_empty()
+            && self.supplement.is_empty())
+    }
+
     fn finish(self, row: &mut Conversation) {
+        let holds_search_texts = self.holds_search_texts();
+        (row.semantic_turns, row.semantic_turn_ranges) = self.semantic.into_parts();
+        row.cached_session = None;
+        // Empty builders finish as the row's texts cleared, without a pass
+        // over every message.
+        if !holds_search_texts {
+            row.clear_search_texts();
+            return;
+        }
         let identity = |text: &str| text.to_owned();
         (row.full_text, row.message_text_starts.full_text) =
             self.full.finish(row.message_count, identity);
@@ -285,8 +302,5 @@ impl ContentBuilder {
             push_separated(&mut row.agent_search_text, &text);
         }
         row.search_text_lower = crate::search::normalize_for_search(&row.full_text);
-        row.semantic_turns = self.semantic;
-        row.semantic_turn_ranges = self.semantic_ranges;
-        row.cached_session = None;
     }
 }

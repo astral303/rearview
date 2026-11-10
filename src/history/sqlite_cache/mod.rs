@@ -15,6 +15,7 @@ mod cached_session;
 mod catalogue;
 pub(crate) mod connection;
 mod coordinator;
+mod copies_scan;
 mod entries;
 mod files;
 mod free_space;
@@ -49,8 +50,9 @@ pub(crate) use cached_session::{CopyKey, SessionKey};
 #[cfg(test)]
 pub(crate) use catalogue::RecordEntries;
 pub(crate) use catalogue::{ListedRecord, RecordPlace, SessionRecord, SessionStatus, StubStamps};
-pub(crate) use coordinator::Coordinator;
 pub use coordinator::WaitStatus;
+pub(crate) use coordinator::{Coordinator, SHUTDOWN_RELEASE_WAIT};
+pub(crate) use copies_scan::CopyOutcome;
 pub(crate) use entries::StoredEntries;
 pub use interactive::{
     AdoptedCopy, CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead,
@@ -65,7 +67,7 @@ pub(crate) use read_catalogue::CatalogueSession;
 pub(crate) use refresh::FREE_SPACE_FLOOR;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_when_unlocked};
-pub(crate) use search_parts::{SearchField, SearchPart};
+pub(crate) use search_parts::{SearchField, SearchPart, SemanticTurns};
 pub(crate) use search_texts::SearchedFields;
 pub(crate) use semantic_routes::{
     RouteKey, RoutesStored, SemanticRoute, store_routes as store_semantic_routes,
@@ -190,15 +192,9 @@ pub(crate) fn is_busy_error(error: &AppError) -> bool {
 /// rebuilds or invalidates a cache; [`CacheWriter`] holds every write.
 pub(crate) struct SqliteCache {
     connection: connection::CacheConnection,
-    /// The base this connection's database lives in, as the rearview that
-    /// opened it reaches it.
-    base: CacheBase,
     /// The wait of this connection, and of the reads of each session it
     /// finds.
     wait: ReaderWait,
-    /// Declared after `connection`, so the count drops once it closes: a
-    /// low-space deletion waits for it.
-    _open: base::OpenConnection,
 }
 
 /// A connection that writes a cache base's database for a refresh owner.
@@ -229,7 +225,8 @@ enum StoredLayout {
     Current,
     /// No tables yet.
     Missing,
-    /// Another schema version or page size: a writer rebuilds it.
+    /// Another schema version, semantic turn version or page size, older or
+    /// newer: a writer empties and rebuilds it.
     Outdated,
 }
 
@@ -256,14 +253,8 @@ impl SqliteCache {
         if !path.is_file() {
             return Ok(None);
         }
-        let open = base.open_connection()?;
-        let connection = connection::open_cache(base, Access::ReadOnly, wait.busy_timeout())?;
-        let cache = Self {
-            connection,
-            base: base.clone(),
-            wait,
-            _open: open,
-        };
+        let connection = connection::open_counted(base, Access::ReadOnly, wait.busy_timeout())?;
+        let cache = Self { connection, wait };
         if cache.stored_layout()? != StoredLayout::Current || !cache.is_admitted()? {
             return Ok(None);
         }
@@ -272,8 +263,8 @@ impl SqliteCache {
 
     /// Opens `base`'s database for `owner`'s refresh, creating it and its
     /// tables when missing, and emptying it when its tables are of another
-    /// schema version or page size. A failure revokes `owner`'s write
-    /// permission.
+    /// schema version, semantic turn version or page size. A failure revokes
+    /// `owner`'s write permission.
     pub(crate) fn open_for_refresh(owner: &refresh::RefreshToken) -> Result<CacheWriter> {
         CacheWriter::open(owner).inspect_err(|_| owner.revoke())
     }
@@ -293,13 +284,12 @@ impl SqliteCache {
         if !has_meta {
             return Ok(StoredLayout::Missing);
         }
-        Ok(
-            if self.meta(schema::SCHEMA_VERSION_KEY)? == Some(schema::SCHEMA_VERSION.to_string()) {
-                StoredLayout::Current
-            } else {
-                StoredLayout::Outdated
-            },
-        )
+        for (key, version) in schema::layout_versions() {
+            if self.meta(key)? != Some(version) {
+                return Ok(StoredLayout::Outdated);
+            }
+        }
+        Ok(StoredLayout::Current)
     }
 
     fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -308,13 +298,13 @@ impl SqliteCache {
 
     /// The cache base this connection's database lives in.
     fn base(&self) -> &CacheBase {
-        &self.base
+        self.connection.base()
     }
 
     /// `root` and the directories beside it, with the keys this database
     /// stores them under.
     pub(crate) fn session_roots(&self, root: &SessionRoot) -> SessionRoots {
-        SessionRoots::of(root, self.base.canonicaliser().as_ref())
+        SessionRoots::of(root, self.base().canonicaliser().as_ref())
     }
 
     pub(crate) fn storage_is_current(&self, storage: SessionCache) -> Result<bool> {
@@ -493,6 +483,52 @@ impl SqliteCache {
     }
 }
 
+/// The rows a resumed read's [`window::WindowUpdate`] writes, built before
+/// the write's transaction.
+struct WindowRows<'a> {
+    leading: entries::SessionRows<'a>,
+    tail: entries::SessionRows<'a>,
+    in_place: entries::SessionRows<'a>,
+    /// Each stored row the in-place rows replace: its id, message and digest.
+    stored_in_place: Vec<(i64, Option<i64>, i64)>,
+}
+
+impl<'a> WindowRows<'a> {
+    /// The rows of `update`, whose entries from the checkpoint on are
+    /// `entries` and whose rows changed in place hold `in_place_entries`.
+    fn of(
+        update: &'a window::WindowUpdate,
+        entries: &'a TranscriptEntries,
+        in_place_entries: &'a [(RecordLine, LogEntry)],
+        subagents: &HashSet<&Path>,
+    ) -> Self {
+        let fold = &update.checkpoint.fold;
+        let start = entries::RowsStart {
+            numbering: fold.numbering().clone(),
+            positions: fold.positions(),
+            sequence: update.checkpoint.sequence,
+        };
+        Self {
+            leading: entries::SessionRows::from(
+                &update.leading,
+                subagents,
+                &entries::RowsStart::default(),
+            ),
+            tail: entries::SessionRows::from(&entries.entries, subagents, &start),
+            in_place: entries::SessionRows::from(
+                in_place_entries,
+                subagents,
+                &entries::RowsStart::default(),
+            ),
+            stored_in_place: update
+                .in_place
+                .iter()
+                .map(|row| (row.id, row.message, row.digest))
+                .collect(),
+        }
+    }
+}
+
 impl CacheWriter {
     /// The writer of `owner`'s database, in this release's layout and
     /// admitted. A database an earlier release left unadmitted, its first
@@ -520,8 +556,7 @@ impl CacheWriter {
         interactive::refuse_the_drawing_thread("open a session cache writer");
         let base = owner.cache_base();
         std::fs::create_dir_all(base.path())?;
-        let open = base.open_connection()?;
-        let connection = connection::open_cache(&base, Access::Create, WAITING_BUSY_TIMEOUT)?;
+        let connection = connection::open_counted(&base, Access::Create, WAITING_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "page_size", PAGE_SIZE)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
@@ -532,9 +567,7 @@ impl CacheWriter {
         Ok(Self {
             cache: SqliteCache {
                 connection,
-                base,
                 wait: ReaderWait::Waiting(WAITING_BUSY_TIMEOUT),
-                _open: open,
             },
             owner,
         })
@@ -582,11 +615,9 @@ impl CacheWriter {
     fn create_schema_in_turn(&self, turn: &refresh::Turn<'_>) -> Result<()> {
         let batch = refresh::transaction_in_turn(&self.connection, &self.owner, turn)?;
         batch.execute_batch(schema::CREATE)?;
-        put_meta(
-            &batch,
-            schema::SCHEMA_VERSION_KEY,
-            &schema::SCHEMA_VERSION.to_string(),
-        )?;
+        for (key, version) in schema::layout_versions() {
+            put_meta(&batch, key, &version)?;
+        }
         refresh::commit(batch, &self.owner)?;
         Ok(())
     }
@@ -723,38 +754,13 @@ impl CacheWriter {
         entries: &TranscriptEntries,
         subagents: &HashSet<&Path>,
     ) -> Result<i64> {
-        // Build the rows before the transaction: hashing them inside it
-        // would keep other rearviews' writes waiting.
-        let leading =
-            entries::SessionRows::from(&update.leading, subagents, &entries::RowsStart::default());
-        let moved = update.leading.len() as i64 - update.stored_leading_rows as i64;
-        let fold = update
-            .checkpoint
-            .fold
-            .clone()
-            .with_leading_entries_moved(moved);
-        let sequence = (update.checkpoint.sequence as i64 + moved) as usize;
-        let start = entries::RowsStart {
-            numbering: fold.numbering().clone(),
-            positions: fold.positions(),
-            sequence,
-        };
-        let tail = entries::SessionRows::from(&entries.entries, subagents, &start);
-        let in_place_entries: Vec<(RecordLine, LogEntry)> = update
-            .in_place
-            .iter()
-            .map(|row| (row.record.clone(), row.entry.clone()))
-            .collect();
-        let in_place = entries::SessionRows::from(
-            &in_place_entries,
-            subagents,
-            &entries::RowsStart::default(),
-        );
-        let stored_in_place: Vec<(i64, Option<i64>, i64)> = update
-            .in_place
-            .iter()
-            .map(|row| (row.id, row.message, row.digest))
-            .collect();
+        let in_place_entries = update.in_place_entries();
+        let WindowRows {
+            leading,
+            tail,
+            in_place,
+            stored_in_place,
+        } = WindowRows::of(update, entries, &in_place_entries, subagents);
         let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
         let keys = &catalogue_keys(&batch, &record.catalogue)?;
         let places = &keys.places;
@@ -787,13 +793,7 @@ impl CacheWriter {
                 )?
                 .execute(params![session, place.root, place.path, launch_call])?;
         }
-        entries::replace_leading(
-            &batch,
-            session,
-            places,
-            &leading,
-            update.stored_leading_rows,
-        )?;
+        entries::replace_leading(&batch, session, places, &leading)?;
         entries::update_tail(&batch, session, places, &tail)?;
         entries::rewrite_in_place(&batch, session, places, &in_place, &stored_in_place)?;
         write_malformed_lines(&batch, session, entries)?;

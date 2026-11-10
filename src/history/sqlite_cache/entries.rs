@@ -9,6 +9,7 @@ mod messages;
 mod parts;
 mod rows;
 mod search;
+mod semantic;
 mod threads;
 mod times;
 mod write;
@@ -17,7 +18,6 @@ use super::roots::{Places, WrittenPlaces};
 use crate::agent::sanitize::join_terminal_codes;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
-use crate::history::parser::{TurnSource, semantic_turn};
 use crate::history::{MalformedLine, MalformedLineDetail, TranscriptEntries};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, UserContent, UserMessage,
@@ -31,12 +31,13 @@ use std::path::Path;
 #[cfg(test)]
 pub(super) use context::CALLS_AND_RESULTS;
 pub(super) use diff::{replace_leading, rewrite_in_place, update, update_tail};
-pub(super) use parts::SearchOnlyKind;
 #[cfg(test)]
-pub(super) use rows::PART_ROW_BUILDS;
+pub(super) use parts::PART_ROW_BUILDS;
+pub(super) use parts::SearchOnlyKind;
 pub(super) use rows::{RowsStart, SessionRows};
 #[cfg(test)]
-pub(super) use write::SHIFT_SEARCH_PLACES;
+pub(super) use semantic::SEMANTIC_TURNS;
+pub(super) use semantic::{read_semantic_turns, read_semantic_turns_in};
 
 /// Entries a first write of a session writes per transaction, so a session
 /// of hundreds of thousands of entries does not hold the database's write
@@ -406,113 +407,6 @@ pub(super) fn read_messages(
         vec![session.into(), ordinals.into()],
     );
     read_selected(connection, session, places, &selected)
-}
-
-/// Each contributing user and assistant entry of `session` with a message
-/// number and a sequence from `?2` to `?3`, with each of its text parts, and
-/// each such metadata entry, in order: everything [`semantic_turn`] reads of
-/// an entry. A message entry without a text part has no semantic turn.
-pub(super) const SEMANTIC_ENTRIES: &str = "SELECT e.sequence, m.ordinal, e.kind, e.content, \
-     e.text, e.text_codes, p.text, p.text_codes FROM entries e JOIN messages m ON m.id = e.message \
-     LEFT JOIN parts p ON p.entry = e.id AND p.kind = 'text' \
-     WHERE e.session = ?1 AND e.sequence BETWEEN ?2 AND ?3 AND e.contributes \
-     AND m.ordinal IS NOT NULL AND e.kind IN ('user', 'assistant', 'pi-metadata') \
-     AND (p.id IS NOT NULL OR e.kind = 'pi-metadata') ORDER BY e.sequence, p.part";
-
-/// Calls `visit` with the message number and the semantic text of each
-/// entry of `session` holding one, in the session's order, as the parse
-/// computes it.
-pub(super) fn read_semantic_texts(
-    connection: &Connection,
-    session: i64,
-    visit: impl FnMut(usize, String),
-) -> Result<()> {
-    read_semantic_texts_of_entries(connection, session, i64::MIN..=i64::MAX, visit)
-}
-
-/// [`read_semantic_texts`] of the entries of `session` with a sequence in
-/// `sequences`.
-pub(super) fn read_semantic_texts_of_entries(
-    connection: &Connection,
-    session: i64,
-    sequences: RangeInclusive<i64>,
-    mut visit: impl FnMut(usize, String),
-) -> Result<()> {
-    let mut statement = connection.prepare_cached(SEMANTIC_ENTRIES)?;
-    let mut rows = statement.query([session, *sequences.start(), *sequences.end()])?;
-    let mut entry: Option<(i64, SemanticEntry)> = None;
-    let mut finish = |entry: Option<(i64, SemanticEntry)>| {
-        if let Some((_, entry)) = entry
-            && let Some(turn) = semantic_turn(entry.source, &entry.text)
-        {
-            visit(entry.ordinal, turn);
-        }
-    };
-    while let Some(row) = rows.next()? {
-        let sequence: i64 = row.get(0)?;
-        let block = text_ref_with_codes(row, 6, 7)?;
-        if let Some((current, entry)) = &mut entry
-            && *current == sequence
-        {
-            entry.push_block(block.as_deref());
-            continue;
-        }
-        finish(entry.take());
-        let (source, text) = match row.get_ref(2)?.as_str().map_err(rusqlite::Error::from)? {
-            "user" => (TurnSource::User, None),
-            "assistant" => (TurnSource::Assistant, None),
-            _ => (TurnSource::Metadata, text_with_codes(row, 4, 5)?),
-        };
-        let content = row
-            .get_ref(3)?
-            .as_str_or_null()
-            .map_err(rusqlite::Error::from)?;
-        let mut read = SemanticEntry {
-            ordinal: row.get::<_, i64>(1)? as usize,
-            source,
-            string_content: content == Some(CONTENT_STRING),
-            text: text.unwrap_or_default(),
-            block_count: 0,
-        };
-        read.push_block(block.as_deref());
-        entry = Some((sequence, read));
-    }
-    finish(entry);
-    Ok(())
-}
-
-/// The text [`semantic_turn`] reads of one entry, as the parse builds it.
-struct SemanticEntry {
-    ordinal: usize,
-    source: TurnSource,
-    /// True for a user message recorded as one string, held in its first
-    /// text part.
-    string_content: bool,
-    /// A metadata row's own text; a message's text blocks, joined.
-    text: String,
-    /// The count of text blocks read.
-    block_count: usize,
-}
-
-impl SemanticEntry {
-    /// Adds the entry's next text block, `None` for an entry without one.
-    fn push_block(&mut self, block: Option<&str>) {
-        let Some(block) = block else {
-            return;
-        };
-        let joins = match self.source {
-            TurnSource::Metadata => false,
-            TurnSource::User if self.string_content => self.block_count == 0,
-            TurnSource::User | TurnSource::Assistant => true,
-        };
-        if joins {
-            if self.block_count > 0 {
-                self.text.push(' ');
-            }
-            self.text.push_str(block);
-        }
-        self.block_count += 1;
-    }
 }
 
 /// Render the returned transcript only within `messages`; other bodies
