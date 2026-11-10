@@ -19,7 +19,7 @@ use crate::history::sqlite_cache::refresh::RefreshToken;
 use crate::history::sqlite_cache::{
     self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, InteractiveCache, ListedRecord,
     LiveOwner, NextStep, OperationAccess, OperationScope, Publication, RecordPlace, SessionAddress,
-    SessionRecord, SessionStatus, SqliteCache, StubStamps,
+    SessionRecord, SessionStatus, SqliteCache, StubStamps, WriteOutcome,
 };
 use crate::history::{
     Conversation, Environment, FilterTerm, ParsePermit, Source, TranscriptEntries,
@@ -1741,8 +1741,12 @@ impl<'a> DatabaseWrites<'a> {
             .flatten()
     }
 
-    fn write(&self, record: SessionRecord) {
-        let _ = self.writes.send(CacheWrite::Session(Box::new(record)));
+    /// Queues the write of `record`; returns the receiver its outcome
+    /// arrives on, which disconnects when the write is dropped unwritten.
+    fn write(&self, record: SessionRecord) -> mpsc::Receiver<WriteOutcome> {
+        let (write, outcome) = CacheWrite::session(record);
+        let _ = self.writes.send(write);
+        outcome
     }
 
     /// The listed row the database held for `stub`'s session when the load
@@ -1757,12 +1761,7 @@ impl<'a> DatabaseWrites<'a> {
     /// Writes `resumed`'s record and waits for the write; returns its row,
     /// reading the copy the write left. `None` when the write failed.
     fn write_resumed(&self, resumed: ResumedSession) -> Option<Conversation> {
-        let (reply, replied) = mpsc::channel();
-        let record = Box::new(resumed.record);
-        self.writes
-            .send(CacheWrite::Resumed { record, reply })
-            .ok()?;
-        let generation = replied.recv().ok()?.ok()??;
+        let generation = self.write(resumed.record).recv().ok()?.ok()??;
         Some(published_at(resumed.row, generation))
     }
 }

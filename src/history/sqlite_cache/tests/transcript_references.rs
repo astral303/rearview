@@ -257,13 +257,9 @@ fn write_failing_its_references_at_commit_rolls_back_alone_and_later_writes_land
         )
         .unwrap();
     let (send, receive) = mpsc::channel();
-    let (reply, failure) = mpsc::channel();
-    send.send(CacheWrite::Resumed {
-        record: Box::new(record_of(failing, 2)),
-        reply,
-    })
-    .unwrap();
-    send.send(CacheWrite::Session(Box::new(record_of(later, 1))))
+    let (write, failure) = CacheWrite::session(record_of(failing, 2));
+    send.send(write).unwrap();
+    send.send(CacheWrite::session(record_of(later, 1)).0)
         .unwrap();
     drop(send);
 

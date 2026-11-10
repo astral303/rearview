@@ -91,7 +91,7 @@ use roots::{Places, WrittenPlaces};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 /// The database's file name in the cache base.
@@ -1267,14 +1267,18 @@ fn session_transaction<'a>(
     Ok(batch)
 }
 
+/// What [`CacheWriter::write`] returned for a session's record, or why the
+/// write failed.
+pub(crate) type WriteOutcome = std::result::Result<Option<i64>, String>;
+
 /// A change the writer applies to a cache base's database.
 pub(crate) enum CacheWrite {
-    Session(Box<SessionRecord>),
-    /// A resumed read's record, whose writer reports what
-    /// [`CacheWriter::write`] returned, or why the write failed.
-    Resumed {
+    /// A session's record. The writer sends the write's outcome on
+    /// `reply`. A write the writer leaves unwritten once it stops is dropped
+    /// with `reply`, and its receiver disconnects.
+    Session {
         record: Box<SessionRecord>,
-        reply: std::sync::mpsc::Sender<std::result::Result<Option<i64>, String>>,
+        reply: Sender<WriteOutcome>,
     },
     /// The sessions `storage` no longer finds at these cache keys under the
     /// root.
@@ -1283,6 +1287,18 @@ pub(crate) enum CacheWrite {
         root: SessionRoot,
         cache_keys: Vec<String>,
     },
+}
+
+impl CacheWrite {
+    /// The write of `record`, and the receiver its outcome arrives on.
+    pub(crate) fn session(record: SessionRecord) -> (Self, Receiver<WriteOutcome>) {
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let write = Self::Session {
+            record: Box::new(record),
+            reply,
+        };
+        (write, outcome)
+    }
 }
 
 /// Applies every write `writes` receives to `writer`, in order, until every
@@ -1317,11 +1333,9 @@ pub(crate) fn apply_writes(
             outcome
         };
         let outcome = match &write {
-            CacheWrite::Session(record) => write_logged(record).map(|_| ()),
-            CacheWrite::Resumed { record, reply } => {
+            CacheWrite::Session { record, reply } => {
                 let outcome = write_logged(record);
                 let _ = reply.send(outcome.as_ref().copied().map_err(ToString::to_string));
-
                 outcome.map(|_| ())
             }
             CacheWrite::Removed {

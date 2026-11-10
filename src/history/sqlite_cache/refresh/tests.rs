@@ -462,7 +462,7 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
     newer.catalogue.fingerprint.mtime_secs = 2;
     current.write(&newer).unwrap();
     let (send, receive) = mpsc::channel();
-    send.send(CacheWrite::Session(Box::new(original))).unwrap();
+    send.send(CacheWrite::session(original).0).unwrap();
     send.send(CacheWrite::Removed {
         storage: Source::Pi.provider().storage().cache(),
         root: record_root(),
@@ -985,7 +985,7 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
     let (send, receive) = mpsc::channel();
     let mut changed = record();
     changed.catalogue.fingerprint.mtime_secs = 2;
-    send.send(CacheWrite::Session(Box::new(changed))).unwrap();
+    send.send(CacheWrite::session(changed).0).unwrap();
     send.send(CacheWrite::Removed {
         storage: Source::Pi.provider().storage().cache(),
         root: record_root(),
