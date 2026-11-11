@@ -828,8 +828,13 @@ fn rebuild_blocked_at_begin_exclusive_preserves_existing_tables() {
             row.get::<_, String>(0)
         })
         .unwrap();
-    cache.connection.busy_timeout(Duration::ZERO).unwrap();
+    let busy_waits = connection::test_hooks::BusyWaits::record_on_this_thread();
     assert!(matches!(cache.rebuild(), Err(AppError::SessionCache(error)) if is_busy(&error)));
+    assert_eq!(
+        busy_waits.take().iter().sum::<Duration>(),
+        super::super::WAITING_BUSY_TIMEOUT,
+        "the rebuild waits out its whole wait for the exclusive lock"
+    );
     drop(cache);
     assert_eq!(
         reader

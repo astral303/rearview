@@ -360,6 +360,8 @@ pub(super) fn take_exclusive_lock(
     // from a reserved lock.
     connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
     connection.busy_timeout(wait.attempt_timeout())?;
+    #[cfg(test)]
+    connection::test_hooks::record_busy_waits_of_new_timeout(connection, wait.attempt_timeout());
     let attempts = wait.attempts();
     let mut attempt = 1;
     let batch = loop {

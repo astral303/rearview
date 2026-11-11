@@ -124,6 +124,8 @@ impl Drop for CacheConnection {
 }
 
 fn open_file(path: &Path, access: Access) -> rusqlite::Result<Connection> {
+    #[cfg(test)]
+    test_hooks::skip_syncs_to_disk();
     let connection = match access {
         // Without SQLite's lock on each call: rusqlite's `Connection` is not
         // `Sync`, which keeps two threads from using one connection at once.
@@ -510,7 +512,8 @@ pub(crate) mod test_hooks {
     }
 
     /// Records a busy wait for each lock met by a connection [`super::open`]
-    /// opens on this thread, until dropped. The connection gives up at once
+    /// opens on this thread, and by each attempt at SQLite's exclusive lock
+    /// on this thread, until dropped. The connection gives up at once
     /// instead of sleeping, and the wait it would have slept, its busy
     /// timeout, is recorded: a test counts waits without timing them. A
     /// connection without a busy timeout records a zero wait.
@@ -581,6 +584,52 @@ pub(crate) mod test_hooks {
         }))
     }
 
+    /// While a [`BusyWaits`] records on this thread, record the busy wait of
+    /// `busy_timeout` that `connection` was just set to, as
+    /// [`record_busy_waits`] does for a connection opening: setting a busy
+    /// timeout replaces the recording handler.
+    pub(crate) fn record_busy_waits_of_new_timeout(
+        connection: &Connection,
+        busy_timeout: Duration,
+    ) {
+        let is_recording = RECORDED_BUSY_WAITS.with(|recorded| recorded.borrow().is_some());
+        if !is_recording {
+            return;
+        }
+        // SAFETY: the handler reads its argument, the timeout in
+        // milliseconds, and the recording of the thread SQLite calls it on,
+        // the thread running the statement.
+        let code = unsafe {
+            rusqlite::ffi::sqlite3_busy_handler(
+                connection.handle(),
+                Some(record_and_give_up),
+                busy_timeout.as_millis() as usize as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(
+            code,
+            rusqlite::ffi::SQLITE_OK,
+            "SQLite sets the busy handler"
+        );
+    }
+
+    unsafe extern "C" fn record_and_give_up(
+        busy_timeout_millis: *mut std::ffi::c_void,
+        attempt: std::ffi::c_int,
+    ) -> std::ffi::c_int {
+        if attempt == 0 {
+            RECORDED_BUSY_WAITS.with(|recorded| {
+                if let Some(waits) = recorded.borrow().as_ref() {
+                    waits
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(Duration::from_millis(busy_timeout_millis as u64));
+                }
+            });
+        }
+        0
+    }
+
     /// The busy wait [`at_the_first_busy_wait`] arms on `connection`.
     fn wait_after_first_busy(
         connection: &mut Connection,
@@ -598,6 +647,102 @@ pub(crate) mod test_hooks {
             std::thread::sleep(Duration::from_millis(1));
             started.elapsed() < busy_timeout
         }))
+    }
+
+    /// Make SQLite's default VFS the system's without its syncs to disk, from
+    /// the first connection [`super::open_file`] opens on. A sync matters
+    /// only to a database outliving a crash of the machine, which no test
+    /// makes, and syncs took a third of the unit suite's time. Locks, the
+    /// write-ahead log, its shared memory and checkpoints stay the system's.
+    pub(super) fn skip_syncs_to_disk() {
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        REGISTERED.call_once(unsynced_vfs::register_as_default);
+    }
+
+    /// The system's VFS, each file it opens given a copy of its I/O methods
+    /// whose sync does nothing.
+    mod unsynced_vfs {
+        use rusqlite::ffi;
+        use std::ffi::c_int;
+        use std::sync::{Mutex, OnceLock, PoisonError};
+
+        /// The system's VFS, by address: SQLite keeps it for the process.
+        static SYSTEM: OnceLock<usize> = OnceLock::new();
+        /// Each I/O method table the system's VFS gave a file, and its copy
+        /// without syncs, by address: both last for the process.
+        static UNSYNCED_METHODS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+        pub(super) fn register_as_default() {
+            // SAFETY: `sqlite3_vfs_find` with a null name returns the default
+            // VFS, which SQLite never frees. The copy is leaked, so it outlives
+            // every connection, as `sqlite3_vfs_register` requires.
+            unsafe {
+                let system = ffi::sqlite3_vfs_find(std::ptr::null());
+                assert!(!system.is_null(), "SQLite has a default VFS");
+                SYSTEM
+                    .set(system as usize)
+                    .expect("the unsynced VFS is registered once");
+                let unsynced = Box::leak(Box::new(ffi::sqlite3_vfs {
+                    zName: c"rearview-test-unsynced".as_ptr(),
+                    pNext: std::ptr::null_mut(),
+                    xOpen: Some(open),
+                    ..*system
+                }));
+                let code = ffi::sqlite3_vfs_register(unsynced, 1);
+                assert_eq!(code, ffi::SQLITE_OK, "SQLite registers the unsynced VFS");
+            }
+        }
+
+        /// The system's open, passed the system's VFS: its open reads its own
+        /// settings from the VFS it is given.
+        unsafe extern "C" fn open(
+            _unsynced: *mut ffi::sqlite3_vfs,
+            name: ffi::sqlite3_filename,
+            file: *mut ffi::sqlite3_file,
+            flags: c_int,
+            out_flags: *mut c_int,
+        ) -> c_int {
+            let system =
+                *SYSTEM.get().expect("the unsynced VFS is registered") as *mut ffi::sqlite3_vfs;
+            // SAFETY: SQLite passes `open` the arguments of a VFS open, which
+            // the system's open takes as they are; `file` is valid until
+            // SQLite closes it through the methods set here.
+            unsafe {
+                let system_open = (*system).xOpen.expect("the system's VFS opens files");
+                let code = system_open(system, name, file, flags, out_flags);
+                if code == ffi::SQLITE_OK && !(*file).pMethods.is_null() {
+                    (*file).pMethods = unsynced_methods((*file).pMethods);
+                }
+                code
+            }
+        }
+
+        unsafe extern "C" fn sync(_file: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
+            ffi::SQLITE_OK
+        }
+
+        fn unsynced_methods(
+            system: *const ffi::sqlite3_io_methods,
+        ) -> *const ffi::sqlite3_io_methods {
+            let mut known = UNSYNCED_METHODS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some((_, unsynced)) = known
+                .iter()
+                .find(|(methods, _)| *methods == system as usize)
+            {
+                return *unsynced as *const ffi::sqlite3_io_methods;
+            }
+            // SAFETY: the system's VFS sets a file's methods to a static table.
+            let unsynced: &'static ffi::sqlite3_io_methods = Box::leak(Box::new(unsafe {
+                ffi::sqlite3_io_methods {
+                    xSync: Some(sync),
+                    ..*system
+                }
+            }));
+            known.push((system as usize, unsynced as *const _ as usize));
+            unsynced
+        }
     }
 
     pub(super) fn install(mut connection: Connection, path: &Path) -> Connection {
