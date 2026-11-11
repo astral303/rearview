@@ -2,6 +2,33 @@
 
 ### Enhancements
 
+- Use about 4–6x less memory in the TUI and 3–50x less in agent commands (on
+  one example corpus): sessions stay in the session cache until a view or
+  command needs them. Gains grow with the session store; a small one gains
+  little.
+- Speed up agent commands about 2–5x (on one example corpus): `agent search`
+  about 3.6x in lexical and exact mode, 2.4x in semantic and 2x in hybrid;
+  `agent read` and `outline` of a message range about 4x; and
+  `agent sessions`, `agent within` and a whole session's `read` or `outline`
+  about 2–3x.
+- Speed up the first command after a large session gains messages about 6x (on
+  one example session): the session is read on from where its last read
+  stopped.
+- Speed up the session list's search about 6–18x per keystroke (on one example
+  corpus). It searches texts read into memory in the background after launch.
+  - Until a session's texts are read, it matches on its title, summary and
+    project name, and the search bar shows ` · N sessions loading`.
+    ` · N sessions unreadable` counts sessions whose texts could not be read.
+  - Reading those texts takes about 3–4x as long as before. The list loads
+    faster, and becomes searchable about 1.5x sooner after launch.
+- Open a large session about 2.5x faster (on one example corpus), and keep the
+  list and its search drawing while it opens. Reloading an open session after
+  a refresh no longer freezes the viewer.
+- Speed up semantic search (on one example corpus): a TUI query of quoted
+  phrases alone about 5.5x, and `--semantic-search` and
+  `--debug-semantic-search` about 1.5x.
+  - In the TUI, a repeated semantic query takes about 1.8x as long and the
+    prewarm about 1.3x as long. The first query takes about as long as before.
 - Show that a slow agent command is still running: after 2 seconds, and every
   5 seconds until its result, it writes a `protocol agent-progress` record to
   stderr naming its stage, such as `stage=refresh done=120 total=860`.
@@ -27,7 +54,12 @@
   names those sessions' refs and, in `cached-until=`, the earliest time their
   copies end.
 - Parse new and changed sessions in one rearview at a time: while one refreshes
-  the session cache, the others read the cache and parse nothing.
+  the session cache, the others read the cache as it is or wait for that
+  refresh.
+  - A search leaves out a session another rearview is writing. `agent search`
+    names it in its `stale-cache` warning, `--semantic-search` prints
+    `Skipped session <id>: its cached copy is not ready yet.`, and the list's
+    search bar counts it as loading.
 - Add `--perf-stats` to every agent command, such as
   `agent read <ref> --perf-stats`. It reports on stderr each stage's time, what
   each agent's load read, each transcript parsed, and the peak memory.
@@ -52,13 +84,19 @@
 
 - Fix `agent within` showing a Codex, Grok Build or Kimi Code session's
   old name after a rename until its transcript changed.
+- Fix `agent read` merging two Claude sub-agents' replies into one message
+  when they share a reply ID. Every later message was numbered one lower.
 
 ### Changes
 
 - The first run after upgrading parses every session once to build the new
-  session cache, then removes the old cache's files.
-- rearview stops when it finds no directory for the session cache, naming
-  `REARVIEW_CACHE_DIR`, instead of reading sessions without caching them. Agent
+  session cache, then removes the old cache's files. It takes about 1.9x as
+  long as a first run did before, with about 3.4x less memory (on one example
+  corpus).
+- The session cache takes about 1.3x the disk space it did (on one example
+  corpus).
+- rearview stops when it can't find a directory for the session cache, naming
+  `REARVIEW_CACHE_DIR`. Before, it read sessions without caching them. Agent
   commands report the same in a `protocol agent-error` record. `update`,
   `--render`, `--show-dir` and `--clear-semantic-cache` run without one.
 - The `Ctrl+X` actions menu greys out rename and delete, with the reason, while
@@ -66,8 +104,9 @@
   (`F2`) shows the reason. Both stay available while that work waits for
   another rearview's refresh.
 - rearview deletes its session cache and stops when a cache write finds less
-  than 1 GB free on its drive, naming the free space. Agent commands report the
-  same in a `protocol agent-error` record.
+  than 1 GB free on its drive. The message names the free space and reports
+  `The session cache was deleted.` Agent commands report the same in a
+  `protocol agent-error` record.
   - A cache another rearview has open is left in place, and the message
     reports it.
 
