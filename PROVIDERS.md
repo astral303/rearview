@@ -58,18 +58,25 @@ Three registry queries answer the questions a caller can have:
 cannot be read, so a guard never mistakes an unreadable transcript for one that
 belongs to somebody else.
 
-Caches live under `~/.cache/rearview/`, or under the directory
-`REARVIEW_CACHE_DIR` names. `SessionCacheStore` holds the
-directory and the identity together, and takes both from `storage.cache()`, so a
-provider cannot stamp a file with one identity and file it under another. The
-root hash keeps two roots apart. A root that moves misses the cache. It does not
-read stale entries.
+The session cache is one SQLite database for every provider,
+`history.sqlite3` under `~/.cache/rearview/`, or under the directory
+`REARVIEW_CACHE_DIR` names. `storage.cache()` gives a provider's two values
+in it:
 
-A root's session cache is sharded, N=16 today, each session assigned to a
-shard by a hash of its cache key. A load rewrites only the shards holding a
-session that was reread, recorded empty, or deleted. Opening a
-session by ID rewrites its shard. A `sessions.bin` from an earlier release is
-migrated on the next load.
+- The cache key (`directory`) keys the provider's sessions in the database.
+  It is also the name of the folder where releases before the database kept
+  the provider's cache files.
+- The schema version versions what the database records of each of the
+  provider's sessions. Bump it when the provider's parse changes what is
+  recorded; the next load then reads every session of the provider again.
+
+A session's files are stored below their root, and a root is keyed by its
+canonical path. Two roots stay apart, and two spellings of one root share
+their sessions' copies. A root that moves misses the cache.
+
+A changed session is read on from where its last read stopped, and only its
+changed rows are written. A load that writes a root's sessions removes the
+cache files an earlier release kept for that root.
 
 An agent's own archive flag is not a reason to skip a session. OpenCode's
 `session.time_archived` and Kimi's `archived` in `state.json` mark a session
@@ -252,8 +259,8 @@ Claude overrides two provider defaults:
 | Sub-agent transcripts | `<session-id>/subagents/agent-<id>.jsonl`, `agent-<id>.meta.json` beside each; nested ones in the same directory |
 | Sub-agent label       | the `agentType` its sidecar names                                                                                |
 | Excluded files        | `agent-*.jsonl` beside the sessions, an older flat layout                                                        |
-| Cache directory       | `claude/`                                                                                                        |
-| Cache magic / schema  | `CLHIST02` / 18                                                                                                  |
+| Cache key             | `claude`                                                                                                         |
+| Cache schema version  | 19                                                                                                               |
 
 Releases up to v0.3.1 cached Claude per project directory, in `projects/` under
 the cache directory. Each load deletes the cache files left there, then the
@@ -407,8 +414,8 @@ in the source they attribute a transcript to.
 | Sub-agent transcripts       | none: Pi does not support sub-agents                           | the `.jsonl` files directly inside `<name>/`, the artifacts directory beside each `<name>.jsonl`, at every nesting level |
 | Sub-agent label             | —                                                              | its file stem, the output id (`Parent.Child` for a nested one)                                                           |
 | Excluded files              | none                                                           | none                                                                                                                     |
-| Cache files                 | `pi/root-<hash>/shard-NN.bin`                                  | `omp/root-<hash>/shard-NN.bin`                                                                                           |
-| Cache magic / schema        | `PIHIST01` / 16                                                | `OMHIST01` / 18                                                                                                          |
+| Cache key                   | `pi`                                                           | `omp`                                                                                                                    |
+| Cache schema version        | 17                                                             | 19                                                                                                                       |
 
 - A root override moves the root; the agent still stores each working
   directory's sessions in a child directory of its own under it.
@@ -535,8 +542,8 @@ None recorded.
 | Session, from the database | a `threads` row no edge names as a sub-agent, other than a skipped one; its sub-agent threads are the rows beneath it by `thread_spawn_edges` |
 | Session, from the headers  | a rollout whose header names no parent, or names one with no rollout; its sub-agent threads are every rollout whose header chain reaches it   |
 | Schema pin                 | `_sqlx_migrations` version 59                                                                                                                 |
-| Cache files                | `codex/root-<hash>/shard-NN.bin`                                                                                                              |
-| Cache magic / schema       | `CXHIST01` / 25                                                                                                                               |
+| Cache key                  | `codex`                                                                                                                                       |
+| Cache schema version       | 26                                                                                                                                            |
 
 The session state database is Codex's own list of its threads:
 
@@ -730,8 +737,8 @@ list.
 | Sub-agent transcripts | the other `agents/*/wire.jsonl` in the session directory                                                          |
 | Sub-agent label       | the agent part of its `<session>#<agent>` ID                                                                      |
 | External titles       | each session's `state.json`                                                                                       |
-| Cache files           | `kimi/root-<hash>/shard-NN.bin`                                                                                   |
-| Cache magic / schema  | `KIHIST01` / 17                                                                                                   |
+| Cache key             | `kimi`                                                                                                            |
+| Cache schema version  | 18                                                                                                                |
 
 Kimi names a workspace directory `wd_<slug>_<hash>`: a slug of the working
 directory's last component, and the first 12 hex digits of the SHA-256 hash
@@ -829,8 +836,8 @@ reader shows each kind as Kimi shows it when it reopens a session:
 | Sub-agent transcripts | the sessions those `meta.json` files name, nested ones after their parent |
 | Sub-agent label       | the sub-agent type from its `summary.json`                                |
 | External titles       | each session's `summary.json`                                             |
-| Cache files           | `grok/root-<hash>/shard-NN.bin`                                           |
-| Cache magic / schema  | `GKHIST01` / 9                                                            |
+| Cache key             | `grok`                                                                    |
+| Cache schema version  | 10                                                                        |
 
 The cwd directory is the working directory URL-encoded while that is at most
 255 bytes, else a slug of its last component and the first 16 hex digits of
@@ -960,8 +967,8 @@ beneath it — the one exception to every filter the list applies.
 | Session              | a `session_v2` or `session` row whose `parent_id` is null, or names an ID with no row   |
 | Sub-agent sessions   | the rows beneath it by `parent_id`                                                      |
 | External titles      | none needed; the title is part of the fingerprint                                       |
-| Cache files          | `opencode/root-<hash>/shard-NN.bin`                                                     |
-| Cache magic / schema | `OCHIST01` / 15                                                                         |
+| Cache key            | `opencode`                                                                              |
+| Cache schema version | 16                                                                                      |
 
 OpenCode 1 keeps a session in `session`, with `message` and `part` rows.
 OpenCode 2 keeps it in `session_v2`, with `session_message` rows. A session in
@@ -1109,8 +1116,8 @@ missing.
    | `subagent_by_id_is_capable_only_where_subagents_and_session_id_lookup_are` | `subagent_by_id` declared Not Capable, or `subagents` and `session_id_lookup` declared Capable |
    | `providers_md_capability_table_is_up_to_date` | The table `mise run update-capability-table` writes |
    | `ref_namespaces_are_unique_across_providers` | Reference namespaces no other provider uses |
-   | `session_caches_do_not_share_directory_or_magic` | A cache directory and magic no other provider uses |
-   | `session_cache_identities_are_pinned` | The provider's cache directory, magic and schema version |
+   | `session_caches_dont_share_directory` | A cache key no other provider uses |
+   | `session_cache_identities_are_pinned` | The provider's cache key and schema version |
    | Clippy `disallowed_methods` under `src/history` | Environment reads through `RootEnvironment` in `roots_in`, each variable listed in `storage_env_vars` |
    | `readme_and_crate_description_list_every_registered_agent` | The agent's row in the README's `Supported agents` table, with its list label, and the row's Agent name in the README introduction and the crate description |
    | `providers_md_records_every_registered_agent_consistently` | The agent's row in `## Upstream releases`, with the release the provider was written against in both version columns and today's date as "Last review", and its `### Upstream findings: <agent>` subsection |
