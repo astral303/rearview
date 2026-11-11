@@ -127,9 +127,9 @@ fn hit_messages_give_whole_transcripts_hits_for_every_agent() {
     );
 }
 
-/// A literal ending in a space matches a message's text ending in that
-/// space, as retrieval matches it, though the session's ranking matches the
-/// text without the whitespace at its edges.
+/// Hit messages match a literal's trailing space at the end of a message's
+/// text, as retrieval does. The session's ranking matches the text without
+/// the whitespace at its edges.
 #[test]
 fn literal_ending_in_space_selects_message_whose_text_ends_in_it() {
     use crate::search::test_fixtures::{cached_claude_sessions, claude_user_record, october};
@@ -549,9 +549,10 @@ fn queries(transcript: &AgentTranscript) -> Vec<(String, SearchMode)> {
 ///   a bare one, and a bare token before an unfinished quote, in lexical
 ///   mode. In exact mode the last two retrieve the phrase of both tokens.
 /// - a word without its first and last characters, in exact mode;
-/// - adjacent tokens as one phrase, and a segment's first token quoted with
-///   a space before it and its last with a space after it, which run in
-///   exact mode whatever the mode asked.
+/// - adjacent tokens quoted as one phrase, and a segment's first token
+///   quoted with a space before it and its last with a space after it, in
+///   lexical mode. A quoted phrase runs in exact mode whatever the mode
+///   asked.
 fn every_drawn_query(
     transcript: &AgentTranscript,
     window: TimeFilter,

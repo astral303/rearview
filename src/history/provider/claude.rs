@@ -427,7 +427,7 @@ fn discover_projects(
 }
 
 /// The project folders under `root`, listed through `lister`, most recently
-/// modified first. A root that does not exist holds none.
+/// modified first. A missing root doesn't hold any.
 fn project_directories_newest_first(
     lister: &dyn DirectoryLister,
     root: &Path,
@@ -541,8 +541,9 @@ fn delete_session_under(permit: ParsePermit<'_>, root: &Path, path: &Path) -> Re
 /// The sub-agent transcripts of the session at `transcript`, listed through
 /// `lister`, as every path that starts from the session names them: the
 /// list, session-ID lookup, delete and the agent CLI. A `subagents/`
-/// directory that cannot be read leaves the session with none and is
-/// reported at warn level, so the session still lists, opens and deletes.
+/// directory that cannot be read is reported at warn level and leaves the
+/// session without sub-agent transcripts, so the session still lists, opens
+/// and deletes.
 pub(crate) fn subagent_transcripts(
     lister: &dyn DirectoryLister,
     transcript: &Path,

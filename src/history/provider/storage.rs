@@ -135,8 +135,8 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
-    /// The fingerprint of a session whose transcripts discovery did not
-    /// list, such as a cached session under a directory it could not list.
+    /// The fingerprint of a session discovery didn't list, such as a cached
+    /// session under a directory discovery couldn't list.
     pub const UNKNOWN: Self = Self {
         size: 0,
         modified: None,
@@ -263,7 +263,7 @@ pub trait SessionStorage: Sync {
     }
 
     /// Parse one session into a conversation, its sub-agent transcripts
-    /// merged in, or the reason the list shows no row for it, such as a
+    /// merged in, or the reason the list doesn't show a row for it, such as a
     /// locator holding nothing this provider recognises.
     ///
     /// `root` is supplied because the user can redirect a provider's session
@@ -311,8 +311,8 @@ pub trait SessionStorage: Sync {
         &FullRead
     }
 
-    /// The linker of this provider's sub-agent threads, which a resumed
-    /// read relinks them through. The default links nothing.
+    /// The linker a resumed read relinks this provider's sub-agent threads
+    /// through. The default doesn't link any.
     fn thread_linker(&self) -> &'static dyn ThreadLinker {
         &NoLinks
     }

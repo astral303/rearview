@@ -9,7 +9,7 @@ pub(super) enum CacheAccess<'a> {
     /// Read the database, and parse and write for this owner while it is
     /// live.
     Refresh(&'a LiveOwner<'a>),
-    /// Read the database as it is through a waiting reader; parse nothing.
+    /// Read the database as it is through a waiting reader, without parsing.
     AsIs,
 }
 
@@ -55,9 +55,9 @@ pub(super) fn publishing(owner: Option<&RefreshToken>) -> Option<&RefreshToken> 
 /// The reader a read opens the database with when it does not write it.
 #[derive(Clone, Copy)]
 pub(super) enum DatabaseReader {
-    /// A reader whose statements fail at once while another connection holds
-    /// an exclusive lock, as a rebuild does: a probe, and a read of the cache
-    /// as it is, which waits through
+    /// Its statements fail at once while another connection holds an
+    /// exclusive lock, as a rebuild does. Probes use it, and so does a read
+    /// of the cache as it is; that read waits through
     /// [`OperationScope::read_when_unlocked`].
     WithoutWaiting,
     /// [`InteractiveCache::open`]: the TUI's drawing thread.
@@ -197,8 +197,8 @@ impl SessionLoader<'_> {
     /// Each group asks `access`'s owner for a permit as it starts, and
     /// parses inside one writer-locked batch. Once the owner is no longer
     /// live, or a batch cannot start, the group and the rest stay unparsed.
-    /// A read of the cache as it is parses nothing: its caller hands it no
-    /// items.
+    /// A read of the cache as it is doesn't parse anything: its caller
+    /// doesn't hand it any items.
     ///
     /// `after_group` runs outside the writer lock: a record sent to the
     /// bounded database queue under the lock could fill it and block the
@@ -215,7 +215,7 @@ impl SessionLoader<'_> {
         let CacheAccess::Refresh(owner) = access else {
             assert!(
                 items.is_empty(),
-                "a read of the session cache as it is gets no sessions to parse"
+                "a read of the session cache as it is doesn't get any sessions to parse"
             );
             return items;
         };

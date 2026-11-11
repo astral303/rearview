@@ -19,7 +19,7 @@ struct ClaudeSession {
     subagents: Vec<PathBuf>,
     /// The stub's modification time, in seconds, moved on with each update.
     updates: u64,
-    /// Another spelling of `home`, which later reads name the session's
+    /// Another spelling of `home` for later reads to name the session's
     /// files through; `None` for `home` as it is.
     home_spelling: Option<PathBuf>,
 }
@@ -76,8 +76,8 @@ impl ClaudeSession {
     }
 
     /// Name the session's files from now on through `home` spelled through
-    /// a directory inside it and `..`, which the file system canonicalises
-    /// to `home`.
+    /// a directory inside it and `..`. The file system canonicalises that
+    /// spelling to `home`.
     fn spell_home_through_parent(&mut self) {
         let elsewhere = self.home.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -429,9 +429,9 @@ fn append_after_root_spelling_changes_resumes_as_fresh_parse() {
 }
 
 #[test]
-fn ai_title_appended_takes_the_summary_search_reads_from_one_before_checkpoint() {
-    // Before the reply the checkpoint stands before, the last of the turn
-    // before the stable cursor.
+fn ai_title_appended_replaces_the_summary_search_reads_from_one_before_checkpoint() {
+    // The first title goes in before the reply the checkpoint stands
+    // before: the last reply of the turn before the stable cursor.
     let mut titled = opening();
     titled.insert(
         1,
@@ -528,8 +528,8 @@ fn hook_naming_call_before_stable_cursor_reads_that_file_whole() {
     );
 }
 
-/// A sub-agent whose transcript holds no record: NUL bytes without a line
-/// ending, as a crash leaves one. A read leaves it out of the session.
+/// A sub-agent whose transcript doesn't hold a record: NUL bytes without a
+/// line ending, as a crash leaves one. A read leaves it out of the session.
 const LEFT_OUT: &str = "a2222222222222222";
 
 /// The session of [`opening`] and [`SCOUT`], with [`LEFT_OUT`]'s transcript
@@ -767,7 +767,7 @@ fn subagent_reply_continued_after_an_image_record_reads_subagent_whole() {
 /// Claude Code writes each block of a reply as a record of its own under the
 /// reply's message id. A sub-agent window holding a new reply of two
 /// records, after the open reply the window starts at, looks each of its two
-/// reply ids up once, finds neither stored before it, and resumes.
+/// reply ids up once, doesn't find either stored before it, and resumes.
 #[test]
 fn subagent_window_looks_each_reply_id_up_once() {
     let mut session = ClaudeSession::stored(&opening_past_subagent(), &[(SCOUT, scout(&[]))]);

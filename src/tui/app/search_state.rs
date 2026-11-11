@@ -27,7 +27,7 @@ pub(super) struct SemanticSearchState {
     pub(super) error: Option<String>,
     pub(super) results: HashMap<usize, SemanticResultMetadata>,
     /// The sessions the semantic results on screen searched without semantic
-    /// turns, by why; `None` while semantic results aren't on screen.
+    /// turns, by reason; `None` while semantic results aren't on screen.
     pub(super) without_turns: Option<crate::search::SessionsWithoutTexts>,
     pub(super) worker_tx: Option<mpsc::Sender<SemanticWorkerCommand>>,
     pub(super) worker_rx: Option<mpsc::Receiver<SemanticSearchMessage>>,
@@ -66,8 +66,8 @@ impl SemanticSearchState {
 /// What a query that could name a session turned out to be.
 enum SessionLookup {
     Listed(usize),
-    /// A session the cache lacks, at this path, until the list applies its
-    /// refresh.
+    /// A session not in the session cache, at this path, until the list
+    /// applies its refresh.
     Loading(PathBuf),
     Unresolved,
     NotAnId,
@@ -713,7 +713,7 @@ impl App {
     }
 
     /// Show every row the filters keep, newest first: the list without a
-    /// query. Reads no session cache.
+    /// query. Doesn't read the session cache.
     fn show_unsearched_list(&mut self) {
         let now = self.clock().wall().with_timezone(&Local);
         let filtered = search::search_with_texts(
@@ -774,11 +774,12 @@ impl App {
         }
     }
 
-    /// Load a session the list does not hold — one an active `--since` window
-    /// excludes — from whichever agent stores it, as the cache holds its row.
-    /// A session the cache lacks is refreshed as an opened one is, and its
-    /// row joins the list when the list applies the refresh. `None` when no
-    /// agent resolves the ID, or its session is gone or empty.
+    /// Load a session the list does not hold, such as one an active `--since`
+    /// window excludes, from whichever agent stores it, as the cache holds its
+    /// row. A session not in the session cache is refreshed as an opened one
+    /// is, and its row joins the list when the list applies the refresh.
+    /// `None` when no agent resolves the ID, its session is gone or empty, or
+    /// its read fails.
     fn load_session_by_id(&mut self, session_id: &str) -> Option<SessionLookup> {
         use crate::history::provider::SessionRead;
 
@@ -808,7 +809,7 @@ impl App {
         }
     }
 
-    /// The session found by ID at `path` has no row to list: the lookup
+    /// The session found by ID at `path` doesn't have a row to list: the lookup
     /// that waited for it reports the ID unresolved.
     pub(super) fn report_lookup_unresolved(&mut self, path: &Path) {
         if let Some(SessionIdQuery::Loading {

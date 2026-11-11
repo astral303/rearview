@@ -1,8 +1,9 @@
-//! The proof a transcript parse may run: every parse entry point takes a
-//! [`ParsePermit`], and only the refresh owner of the session cache, the
-//! terminal printout of a file the user named (`--render`) and the read of a
-//! direct file outside every session root can build one. The TUI's drawing
-//! thread can build none, and [`ParsePermit::admit`] refuses it.
+//! Every transcript parse entry point takes a [`ParsePermit`]. Outside test
+//! builds, three callers build one: the refresh owner of the session cache,
+//! the terminal printout of a file the user named (`--render`) and the read
+//! of a direct file outside every session root. Debug builds panic when
+//! [`ParsePermit::admit`] runs on a thread the TUI marks as its drawing
+//! thread; release builds don't check.
 
 use std::marker::PhantomData;
 
@@ -14,10 +15,10 @@ pub struct ParsePermit<'a> {
     _grant: PhantomData<&'a ()>,
 }
 
-/// One transcript file's read a [`ParsePermit`] admitted. Only
-/// [`ParsePermit::admit`] and [`Admitted::admit_linked`] make one, so a
-/// format's own reading of a transcript cannot run without a permit, and
-/// each file read takes its own admission.
+/// One transcript file's read a [`ParsePermit`] admitted. Its private field
+/// limits its construction to [`ParsePermit::admit`] and
+/// [`Admitted::admit_linked`]: a format's own reading of a transcript can't
+/// run without a permit, and each file read needs its own admission.
 pub struct Admitted {
     _proof: (),
 }
@@ -76,8 +77,8 @@ impl<'a> ParsePermit<'a> {
     }
 }
 
-/// The permit tests parse their fixture transcripts with. A test that
-/// asserts no parse never uses it.
+/// The permit tests parse their fixture transcripts with. A test asserting
+/// that a transcript isn't parsed doesn't use it.
 #[cfg(test)]
 pub(crate) const FOR_FIXTURES: ParsePermit<'static> = ParsePermit {
     _grant: PhantomData,
@@ -85,13 +86,12 @@ pub(crate) const FOR_FIXTURES: ParsePermit<'static> = ParsePermit {
 
 /// Every transcript file read a [`ParsePermit`] admitted in this test
 /// process, by path: the file a parse names, each sub-agent transcript it
-/// reads and each earlier rollout a Codex thread continues. A test counts
-/// the parses of its own files here, whichever route reads them. Reads of
-/// a file's opening lines only, as discovery and Codex's search for the
-/// rollouts a thread continues make them, are not counted. Temporary
-/// directories keep parallel tests' paths apart. A second parse of a session
-/// shows the same output, and a parse whose write fails doesn't change the
-/// cache: only this record shows how many times a transcript was parsed.
+/// reads and each earlier rollout a Codex thread continues. Reads of a
+/// file's opening lines only, by discovery and by Codex's search for the
+/// rollouts a thread continues, aren't counted. Tests count the parses of
+/// their own files here, whichever route reads them, because a repeated
+/// parse shows the same output and a parse whose write fails doesn't change
+/// the cache. Temporary directories keep parallel tests' paths apart.
 #[cfg(test)]
 pub(crate) mod admitted_reads {
     use std::path::{Path, PathBuf};

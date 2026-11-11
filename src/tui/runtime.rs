@@ -341,7 +341,7 @@ impl Runtime {
     }
 
     /// Apply every message the launch has sent. Fails with the launch's
-    /// fatal error, or when the finished launch found no session.
+    /// fatal error, or when the finished launch didn't find any session.
     fn receive_load(&mut self) -> Result<()> {
         while let Some(message) = self.supervisor.next_launch_message() {
             match message {
@@ -378,7 +378,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Hand the worker its next job once it runs none: a confirmed rename or
+    /// Hand the worker its next job once it doesn't run one: a confirmed rename or
     /// delete first, then the read of a file opened directly, then a
     /// requested list refresh, then the sessions waiting for a refresh. A
     /// list refresh also waits until the list applies every finished
@@ -459,7 +459,7 @@ impl Runtime {
     }
 }
 
-/// Show `app`'s loaded list; fails when it holds no session.
+/// Show `app`'s loaded list; fails when it doesn't hold any session.
 fn finish_loading(app: &mut App) -> Result<()> {
     app.finish_loading();
     if app.conversations().is_empty() {

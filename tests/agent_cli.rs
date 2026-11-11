@@ -184,8 +184,8 @@ fn assert_hides(output: &str, needle: &str) {
     );
 }
 
-/// `output`'s stderr holds nothing but the progress records a command
-/// prints once it has run for a while.
+/// `output`'s stderr holds only the progress records a command prints once
+/// it has run for a while.
 #[track_caller]
 fn assert_stderr_shows_only_progress(output: &Output) {
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2006,7 +2006,7 @@ fn assert_perf_records_in_order(
         .map(|line| line.split(' ').nth(1).unwrap_or_default())
         .collect::<Vec<_>>();
     let agents = names.iter().filter(|name| **name == "discovery").count();
-    assert!(agents > 0, "{records}");
+    assert!(agents > 0, "some agent's discovery is recorded: {records}");
     let mut expected = stages
         .iter()
         .map(|stage| format!("stage={stage}"))
@@ -2024,7 +2024,7 @@ fn assert_perf_records_in_order(
         expected.extend(["reads", "retrieval"].map(str::to_owned));
     }
     expected.extend(["memory", "total"].map(str::to_owned));
-    assert_eq!(names, expected, "{records}");
+    assert_eq!(names, expected, "the perf records come in order: {records}");
 }
 
 /// The Claude Code record of `kind` (`discovery`, `cache` or `refresh`).

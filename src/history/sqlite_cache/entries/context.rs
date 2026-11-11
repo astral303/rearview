@@ -58,8 +58,8 @@ pub(super) fn read(
             subagent,
             parts: Vec::new(),
         };
-        // Headers and handle ordering still see every message's span.
-        // These empty parts are context only; selected bodies replace them.
+        // Empty text parts carry the message's first and last time for
+        // headers and handle ordering. Selected bodies replace them.
         for millis in [row.get::<_, Option<i64>>(5)?, row.get::<_, Option<i64>>(6)?]
             .into_iter()
             .flatten()
@@ -125,10 +125,9 @@ pub(super) fn read(
 }
 
 /// The `call_context` a write stores for a call of `tool` with `input`: the
-/// fields of the input the sub-agent links read. The links read them from
-/// `Agent` and `AgentMessage` calls alone. `None` for any other call, and
-/// for an input without any of the fields; a bounded read gives such a
-/// call an empty context.
+/// fields of the input the sub-agent links read. `None` for a call other
+/// than `Agent` or `AgentMessage`, and for an input without any of the
+/// fields; a bounded read gives such a call an empty context.
 pub(super) fn stored_call_context(tool: Tool, input: &Value) -> Option<String> {
     if !matches!(tool, Tool::Agent | Tool::AgentMessage) {
         return None;

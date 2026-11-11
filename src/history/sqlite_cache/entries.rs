@@ -44,9 +44,9 @@ pub(super) use semantic::{read_semantic_turns, read_semantic_turns_in};
 /// lock while all of it is written.
 const ENTRIES_PER_TRANSACTION: usize = 20_000;
 
-/// Inserts `rows`, the entry rows of the session with id `session`, whose
-/// row is marked writing and holds none yet, a slice of entries per
-/// transaction.
+/// Inserts `rows`, the entry rows of the session row `session`, a slice of
+/// entries per transaction. The session row is marked writing and doesn't
+/// hold any entries yet.
 pub(super) fn insert(
     connection: &mut Connection,
     session: i64,
@@ -348,7 +348,8 @@ fn text_with_codes(row: &Row, text: usize, codes: usize) -> rusqlite::Result<Opt
     Ok(text_ref_with_codes(row, text, codes)?.map(Cow::into_owned))
 }
 
-/// [`text_with_codes`], borrowed from `row` when the text has no codes.
+/// [`text_with_codes`], borrowed from `row` when the text doesn't have any
+/// codes.
 fn text_ref_with_codes<'r>(
     row: &'r Row<'_>,
     text: usize,
@@ -409,8 +410,9 @@ pub(super) fn read_messages(
     read_selected(connection, session, places, &selected)
 }
 
-/// Render the returned transcript only within `messages`; other bodies
-/// contain reference context, never an empty successful content read.
+/// The transcript of `session`, with message bodies for the messages in
+/// `messages` alone. Every other message holds the reference context of
+/// [`context::read`]; its empty bodies are not its content.
 pub(super) fn read_range(
     connection: &Connection,
     session: i64,

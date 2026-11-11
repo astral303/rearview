@@ -12,9 +12,9 @@
 //! its first prompt has a summary and no transcript; it reads as a session
 //! with no entries.
 //!
-//! Grok appends to the transcript and rewrites `summary.json`, so a read of
-//! a changed transcript resumes from its stable cursor and reads
-//! `summary.json` again.
+//! A read of a changed transcript resumes from its stable cursor and reads
+//! `summary.json` again, because Grok appends to the transcript and rewrites
+//! `summary.json`.
 
 use super::dropped::DroppedRecords;
 use super::lines::{self, LineCursor, visit_line_spans_from};
@@ -97,11 +97,11 @@ impl SessionFormat for GrokUpdatesFormat {
 }
 
 /// Resumes a read of a Grok transcript from its stable cursor: the last
-/// record boundary where no message is still streaming and no call the
-/// current turn opened waits for its result, since a later update completes
-/// a call's input. The identity is the transcript's first line with what the
-/// read takes from `summary.json` besides the title and the model; every
-/// read takes those again.
+/// record boundary where a message isn't streaming and a call the current
+/// turn opened isn't waiting for its result, because a later update
+/// completes a call's input. The identity is a hash of the transcript's first
+/// line and of the `summary.json` fields a read uses besides the title and
+/// the model; every read rereads those two.
 impl TranscriptReader for GrokUpdatesFormat {
     fn identity(&self, source: &Path) -> Result<Vec<u8>> {
         if source.file_name() != Some(OsStr::new(UPDATES_FILE)) {
@@ -187,7 +187,8 @@ impl TranscriptReader for GrokUpdatesFormat {
     }
 
     /// The entries `summary.json` adds: the session's title, and the
-    /// summary's model while the transcript, as `read` read it, names none.
+    /// summary's model while the transcript, as `read` read it, doesn't name
+    /// one.
     fn leading_entries(
         &self,
         source: &Path,
@@ -207,9 +208,8 @@ impl TranscriptReader for GrokUpdatesFormat {
     }
 }
 
-/// The transcript's identity: a hash of its first line, given as
-/// `first_line`'s hash, and of what a read takes from `summary` besides the
-/// title and the model.
+/// The transcript's identity: a hash of `first_line`, its first line's hash,
+/// and of the `summary` fields a read uses besides the title and the model.
 fn stream_identity(first_line: blake3::Hash, summary: &SessionSummary) -> Vec<u8> {
     let facts = serde_json::to_vec(&(
         first_line.to_hex().as_str(),
@@ -296,9 +296,8 @@ pub(crate) fn session_summary(session_dir: &Path) -> Option<SessionSummary> {
 }
 
 /// The entries `summary` adds before the transcript's, at line 0, and the
-/// title's text: the session's title, then the summary's model when the
-/// transcript names none, as no completed turn did when `named_a_model` is
-/// false.
+/// title's text: the session's title, then the summary's model when
+/// `named_a_model` is false, because a completed turn didn't name a model.
 fn summary_entries(
     summary: &SessionSummary,
     named_a_model: bool,
@@ -404,32 +403,32 @@ fn parse_updates(
     Ok(projector.finish())
 }
 
-/// What a read of the update stream carries from one record to the next, as
-/// the next read restarts with it.
+/// The state a read of the update stream carries from one record to the
+/// next; the next read restarts with it.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct StreamState {
     last_model: Option<String>,
     named_a_model: bool,
-    /// Each sub-agent's type by its session id, from its spawn record.
+    /// Each sub-agent's type by its session ID, from its spawn record.
     subagent_types: BTreeMap<String, String>,
-    /// The id of each call opened before the place the state stands at. An
-    /// update completing one's input changes an entry before that place.
+    /// The ID of each call opened before the state's place. An update
+    /// completing one's input changes an entry before that place.
     earlier_calls: BTreeSet<String>,
 }
 
-/// What a read of the update stream leaves for the next, as its
+/// The state a read of the update stream leaves for the next read, as its
 /// [`TranscriptRead::parser_state`].
 #[derive(Debug, Deserialize, Serialize)]
 struct StreamRead {
     /// The state at the stable cursor.
     at_stable: StreamState,
     /// True when a completed turn named a model by the stream's end: the
-    /// summary's model then adds no entry.
+    /// summary's model then doesn't add an entry.
     names_a_model: bool,
 }
 
-/// Where a read of the update stream stopped, and what it leaves for the
-/// next.
+/// The end of a read of the update stream, and the state it leaves for the
+/// next read.
 struct StreamReadEnd {
     cursor: LineCursor,
     stable_cursor: LineCursor,
@@ -437,8 +436,8 @@ struct StreamReadEnd {
 }
 
 impl StreamReadEnd {
-    /// What this read leaves for the next, for the transcript `file` holds,
-    /// whose identity is `identity`.
+    /// The [`TranscriptRead`] the next read resumes from, for the transcript
+    /// with the identity `identity` that `file` holds.
     fn transcript_read(&self, identity: Vec<u8>, file: &mut File) -> Result<TranscriptRead> {
         Ok(TranscriptRead {
             cursor: self.cursor.encode(),
@@ -484,13 +483,13 @@ struct Projector {
     malformed_lines: Vec<usize>,
     /// The run of chunk records not yet emitted.
     run: Option<ChunkRun>,
-    /// Each tool call this read opened, by call id, with its index in
+    /// Each tool call this read opened, by call ID, with its index in
     /// `entries`, so a later update can complete its input.
     calls: HashMap<String, usize>,
-    /// The state the read started with, its earlier calls those opened
-    /// before the read, moved on record by record.
+    /// The state, updated record by record from the state the read started
+    /// with. Its earlier calls are the calls opened before the read.
     state: StreamState,
-    /// The id of each call this read opened, in order.
+    /// The ID of each call this read opened, in order.
     opened: Vec<String>,
     /// The calls the current turn opened that wait for their result. A
     /// prompt or a completed turn ends the turn.
@@ -498,8 +497,8 @@ struct Projector {
     /// True once an update would complete the input of a call opened before
     /// the read.
     changes_earlier_entry: bool,
-    /// The last record boundary where no message streamed and no call of
-    /// the current turn waited.
+    /// The last record boundary where a message wasn't streaming and a call
+    /// of the current turn wasn't waiting.
     stable: StablePlace,
     /// The hash of the first line holding more than whitespace that ends in
     /// a line ending.
@@ -586,8 +585,8 @@ impl Projector {
         }
     }
 
-    /// `cursor` as a place the next read can restart from, with the state
-    /// now.
+    /// `cursor` as a place the next read can restart from, with the current
+    /// state.
     fn place(&self, cursor: LineCursor) -> StablePlace {
         StablePlace {
             cursor,
@@ -2361,8 +2360,9 @@ mod tests {
         /// Asserts that `prefix`, a read of a transcript's beginning, up to
         /// the window's first line, and then `window`, the read resumed from
         /// it over the whole transcript, hold what `full`, one read of the
-        /// whole transcript, holds, and leave what it leaves. The entries at
-        /// line 0 come from `summary.json`, which every read takes again.
+        /// whole transcript, holds, and that `window` leaves the same
+        /// [`TranscriptRead`] as `full`. The entries at line 0 come from
+        /// `summary.json`, which every read rereads.
         fn assert_window_completes(
             name: &str,
             path: &Path,
@@ -2401,7 +2401,7 @@ mod tests {
             );
             assert_eq!(
                 window.read, full.transcript_read,
-                "{name}: the window leaves what the full read leaves"
+                "{name}: the window leaves the full read's `TranscriptRead`"
             );
             let leading = reader().leading_entries(path, &window.read).unwrap();
             assert_eq!(
@@ -2692,7 +2692,7 @@ mod tests {
             assert_eq!(
                 reader().identity(&path).unwrap(),
                 read.identity,
-                "the title is not part of the identity: every read takes it again"
+                "the title is not part of the identity: every read rereads it"
             );
 
             std::fs::write(
@@ -2712,7 +2712,7 @@ mod tests {
             assert_ne!(
                 reader().identity(&path).unwrap(),
                 read.identity,
-                "the first line is the identity"
+                "the first line is part of the identity"
             );
         }
     }

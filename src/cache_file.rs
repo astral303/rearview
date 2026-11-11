@@ -26,8 +26,8 @@ const STALE_TEMP_FILE_AGE: Duration = Duration::from_secs(60 * 60);
 /// The override exists so tests that spawn the binary keep cache writes out of
 /// the user's real cache; it also lets a user relocate the cache outright. A
 /// unit test build reads a temporary directory of the running test's own,
-/// never the developer's cache, which another rearview may be refreshing
-/// while the tests run.
+/// not the developer's cache, because another rearview may be refreshing
+/// that cache while the tests run.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn user_cache_base() -> Option<PathBuf> {
     #[cfg(test)]
@@ -190,8 +190,8 @@ pub(crate) mod test_support {
     use crate::clock::TestClock;
 
     thread_local! {
-        /// libtest runs each test on a thread of its own, so the directory
-        /// is the test's, and it is removed when the test ends.
+        /// One directory per test, removed when the test ends, because
+        /// libtest runs each test on a thread of its own.
         static TEST_CACHE_DIRECTORY: tempfile::TempDir =
             tempfile::tempdir().expect("a temporary session cache directory");
     }
@@ -418,7 +418,7 @@ mod tests {
 
         assert!(
             !fixture.in_progress.exists(),
-            "a stalled write keeps its file"
+            "a write stalled past the stale age loses its temp file"
         );
     }
 }

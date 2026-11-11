@@ -60,8 +60,8 @@ where
 }
 
 /// Every conversation [`build_chunks_with_sources`] built chunks of in this
-/// test process, by path, on any thread. Building chunks leaves no trace
-/// outside its result: only this record shows `has_chunks` answering
+/// test process, by path, on any thread. Building chunks doesn't leave a
+/// trace outside its result: only this record shows `has_chunks` answering
 /// without building them.
 #[cfg(test)]
 pub(crate) mod chunked_conversations {

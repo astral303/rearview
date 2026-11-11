@@ -40,7 +40,7 @@ pub struct AgentTranscript {
 pub enum CachedTranscript {
     /// The copy of a listed session.
     Copy(AgentTranscript),
-    /// The cache holds no copy.
+    /// The session is not in the session cache.
     NotCached,
 }
 
@@ -195,9 +195,9 @@ impl AgentTranscript {
     }
 
     /// The transcript at `path`, attributed to `source`, with the sub-agent
-    /// transcripts at `subagents` spliced in, parsed for a session the cache
-    /// holds no copy of: one that holds no conversation the provider lists,
-    /// or one whose read failed. Only that provider's format reads it, so a
+    /// transcripts at `subagents` spliced in, parsed for a session not in the
+    /// session cache: its transcript doesn't hold a conversation the provider
+    /// lists, or its read failed. Only that provider's format reads it, so a
     /// locator never meets a foreign format.
     pub fn parse_uncached(
         permit: crate::history::ParsePermit<'_>,
@@ -213,8 +213,7 @@ impl AgentTranscript {
         Self::of_uncached_entries(source, path, entries)
     }
 
-    /// The transcript `entries`, the read of `source`'s session at `path`,
-    /// hold.
+    /// The transcript of `entries`, the read of `source`'s session at `path`.
     fn of_uncached_entries(
         source: crate::history::Source,
         path: &Path,
@@ -255,7 +254,7 @@ impl AgentTranscript {
 
     /// The transcript at `path`, kept at `address`, as the cache under `base`
     /// holds it: its newest copy, with the sub-agents the copy lists, whether
-    /// or not the transcript changed since. Parses nothing. Fails at once
+    /// or not the transcript changed since. Doesn't parse. Fails at once
     /// with a busy error while the database is exclusively locked, as during
     /// a rebuild.
     pub fn load_cached_as_is(
@@ -1434,8 +1433,8 @@ pub(crate) fn agent_read_error(path: &Path, error: &AppError) -> AgentError {
     }
 }
 
-/// The warning an agent command prints for `source`'s session the list shows
-/// no row for, for `reason`. It names no session.
+/// The warning an agent command prints for `source`'s session missing from
+/// the list, for `reason`. It doesn't name a session.
 pub(crate) fn unlisted_warning(
     source: crate::history::Source,
     reason: UnlistedReason,
@@ -1454,8 +1453,8 @@ pub(crate) fn unlisted_warning(
     }
 }
 
-/// The warning for a transcript whose read failed with `error`. It names no
-/// session.
+/// The warning for a transcript whose read failed with `error`. It doesn't
+/// name a session.
 fn failure_warning(error: &AgentError) -> AgentWarning {
     AgentWarning {
         reference: None,
@@ -1463,8 +1462,8 @@ fn failure_warning(error: &AgentError) -> AgentWarning {
     }
 }
 
-/// The warning an agent command prints for the transcript at `path`, whose
-/// read failed with `error`. It names no session.
+/// The warning an agent command prints when the read of the transcript at
+/// `path` failed with `error`. It doesn't name a session.
 pub(crate) fn read_failure_warning(path: &Path, error: &AppError) -> AgentWarning {
     failure_warning(&agent_read_error(path, error))
 }

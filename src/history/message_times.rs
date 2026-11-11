@@ -168,8 +168,8 @@ impl MessageTimesBuilder {
         MessageTimes::new(&self.spans)
     }
 
-    /// [`Self::finish`] for a builder that numbered no message among the
-    /// first ones, whose spans are `before`, in order.
+    /// [`Self::finish`] for a builder that didn't number any of the first
+    /// messages; `before` holds their spans, in order.
     pub(crate) fn finish_after(
         mut self,
         message_count: usize,

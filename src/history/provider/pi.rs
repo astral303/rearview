@@ -129,9 +129,8 @@ fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<Pa
 }
 
 /// Every log under `root` stating `session_id` that the list attributes to Pi,
-/// by its header alone. A log with an OMP title slot is OMP's whichever
-/// directory holds it, and the two agents can share one, so it is left for
-/// OMP to find.
+/// by its header alone. A log with an OMP title slot is left for OMP to find,
+/// whichever directory holds it, because the two agents can share one.
 fn sessions_pi_owns_with_id(root: &FileRoot, session_id: &str) -> Result<Vec<PathBuf>> {
     let mut owned = Vec::new();
     for path in pi_log::sessions_with_id(&root.root.path, root.depth, session_id)? {
@@ -288,7 +287,7 @@ pub(super) mod tests {
             self.write_session_in(home, PROJECT_DIR, session)
         }
 
-        /// The session is a version 1 log, whose entries carry no ids.
+        /// The session is a version 1 log; its entries don't carry IDs.
         fn append_turn(&self, locator: &Path, reply: &str) {
             let prompt = serde_json::json!({
                 "type": "message", "timestamp": "2024-01-01T00:03:00.000Z",

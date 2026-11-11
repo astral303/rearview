@@ -23,16 +23,16 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// The order OpenCode 1 reads a session's messages and parts in: creation
-/// time, then id.
+/// time, then `id`.
 type RowKey = (i64, String);
 
-/// Where a read of an OpenCode 1 session's rows starts: the first message it
+/// The start of a read of an OpenCode 1 session's rows: the first message it
 /// reads, and the last part before that message's. The default starts at the
 /// session's first row.
 ///
-/// Parts are numbered across the session, so a read from a cursor reads
-/// only once every part of an earlier message comes before every part of a
-/// later one.
+/// A read leaves a cursor only when every part of an earlier message comes
+/// before every part of a later one, because parts are numbered across the
+/// session.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Cursor {
     message: Option<RowKey>,
@@ -47,10 +47,10 @@ const PARTS: usize = 1;
 /// it came from, `start` being the state the rows before `from` left; the
 /// records dropped on the way are counted in `dropped`.
 ///
-/// The next read starts before the session's last message, which OpenCode
-/// still writes while a reply streams, unless a part comes before a part of
-/// an earlier message. A part from `from` on of a message before it leaves no
-/// next read.
+/// The next read starts before the session's last message: OpenCode writes
+/// to it while a reply streams. The read doesn't leave a next read when a
+/// part comes before a part of an earlier message, or when a part from
+/// `from` on belongs to a message before `from`.
 pub(super) fn read(
     connection: &Connection,
     session_id: &str,
@@ -156,9 +156,9 @@ pub(super) fn read(
 }
 
 /// The latest place before a message, short of the last, where every part
-/// of a message before it comes before every part of a message from it on;
-/// `owners` gives each part's message, `None` for one of no message, which
-/// comes first. `None` when no place is.
+/// of a message before it comes before every part of a message from it on.
+/// `owners` gives each part's message; a part without a message (`None`)
+/// counts as before every place. `None` when there isn't such a place.
 fn split_point(messages: usize, owners: &[Option<usize>]) -> Option<usize> {
     let last_message = messages.saturating_sub(1);
     // The last part of each message and of the ones before it, and the first
@@ -252,10 +252,11 @@ struct PartRows {
     is_complete: bool,
 }
 
-/// The parts after `from`'s last part: every one of the session's, while
-/// `from` starts at its first message; else the parts of the messages from
-/// `from` on, through their index, counted against the session's parts with
-/// `parts_before`, the parts through `from`'s last part.
+/// The parts after `from`'s last part. When `from` starts at the session's
+/// first message, these are all of the session's parts; otherwise the parts
+/// of the messages from `from` on, fetched through the message index.
+/// `parts_before`, the count of parts through `from`'s last part, checks
+/// them against the session's part count.
 fn part_rows(
     connection: &Connection,
     session_id: &str,
@@ -334,7 +335,7 @@ pub(super) fn rows_before(
     ])
 }
 
-/// The session's parts through `last`; none for `None`.
+/// The session's parts through `last`; an empty count for `None`.
 fn rows_through(
     connection: &Connection,
     session_id: &str,

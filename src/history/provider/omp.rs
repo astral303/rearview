@@ -953,10 +953,7 @@ pub(super) mod tests {
             } else {
                 Vec::new()
             };
-            let mut expected = vec![(
-                home.path(),
-                "the directory searched from, which is the home",
-            )];
+            let mut expected = vec![(home.path(), "the directory searched from: the home")];
             expected.extend(launch_directory);
             expected.push((&temp, "the temporary directory"));
             assert_canonicalised(&canonicaliser.canonicalised(), &expected);

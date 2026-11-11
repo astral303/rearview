@@ -24,7 +24,7 @@ pub(super) const SUBAGENT_REPLY_STORED: &str = "SELECT EXISTS (SELECT 1 FROM mes
      WHERE m.session = ?1 AND m.reply_id = ?2 AND e.record_line < ?5 AND e.child = \
      (SELECT id FROM transcripts WHERE session = ?1 AND root = ?3 AND path = ?4))";
 
-/// What a resumed read of a stored session starts from.
+/// The start of a resumed read of a stored session.
 pub(crate) struct StoredResume {
     pub(crate) session: i64,
     pub(crate) generation: i64,
@@ -40,7 +40,7 @@ pub(crate) struct StoredResume {
     /// The number of stored rows of the session's leading entries, at
     /// sequence 0 on.
     pub(crate) leading_rows: usize,
-    /// The session's roots, which place its stored paths.
+    /// The session's roots, to place its stored paths.
     places: Places,
 }
 
@@ -407,7 +407,7 @@ fn stored_subagent_metadata(
     Ok(parts)
 }
 
-/// What a resumed read changed in a stored session.
+/// The changes a resumed read made to a stored session.
 pub(crate) struct WindowUpdate {
     pub(crate) session: i64,
     pub(crate) generation: i64,

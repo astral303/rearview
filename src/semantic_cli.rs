@@ -583,7 +583,7 @@ fn semantic_turns<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, Cow<'r,
 }
 
 /// A read of each row's copy the session cache holds now, and the rows of the
-/// sessions skipped, each with why.
+/// sessions skipped, each with the reason.
 struct HeldReads<'r, T> {
     /// One read per row whose copy was read, in the rows' order.
     held: Vec<T>,
@@ -592,7 +592,7 @@ struct HeldReads<'r, T> {
 
 impl<'r, T: Send> HeldReads<'r, T> {
     /// `read` of each of `rows`, on the rayon pool, as [`Self::of_reads`]
-    /// takes them.
+    /// accepts them.
     fn of(
         rows: &[&'r Conversation],
         read: impl Fn(&'r Conversation) -> CopyRead<T> + Sync,
@@ -618,7 +618,7 @@ impl<'r, T: Send> HeldReads<'r, T> {
     }
 
     /// The reads, after writing one line to `stderr` for each session
-    /// skipped, with why.
+    /// skipped, with the reason.
     fn reporting_skipped(self, stderr: &mut impl std::io::Write) -> Vec<T> {
         for (row, miss) in self.skipped {
             let _ = writeln!(
@@ -632,7 +632,8 @@ impl<'r, T: Send> HeldReads<'r, T> {
     }
 }
 
-/// Why the semantic commands skip a session whose read missed with `miss`.
+/// The reason the semantic commands skip a session whose read missed with
+/// `miss`.
 fn skipped_reason(miss: &CopyMiss) -> Cow<'static, str> {
     match miss {
         CopyMiss::NotThere => Cow::Borrowed("it is no longer in the session cache"),

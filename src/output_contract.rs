@@ -10,7 +10,7 @@
 //! sessions, the cache and the clock fixed, so the outputs are the same on
 //! every machine and every day:
 //! - The home holds each provider's every-record session at the provider's
-//!   first default root, with fixed modification times, and no
+//!   first default root, with fixed modification times. It doesn't hold a
 //!   configuration file. Every provider's storage variables and session
 //!   variables are unset.
 //! - The cache starts empty, and no command searches semantically.
@@ -38,7 +38,7 @@ use std::sync::{Arc, OnceLock};
 /// The test the child process runs, by its path in the test binary.
 const CHILD_TEST: &str = "output_contract::child_process_writes_outputs";
 /// Names the directory the child process writes the outputs to. Unset, the
-/// child test does nothing.
+/// child test doesn't do anything.
 const OUTPUT_DIR_VARIABLE: &str = "REARVIEW_OUTPUT_CONTRACT_OUTPUT";
 /// Set to write the expected files from the outputs instead of comparing.
 const WRITE_VARIABLE: &str = "REARVIEW_WRITE_OUTPUT_CONTRACT";
@@ -351,7 +351,7 @@ fn set_modified_under(directory: &Path, modified: std::time::SystemTime) {
 
 /// Writes every surface's output to the directory [`OUTPUT_DIR_VARIABLE`]
 /// names. The surface tests run it in a child process with its environment
-/// fixed; without the variable it does nothing.
+/// fixed; without the variable it doesn't do anything.
 #[test]
 #[ignore = "the output contract tests run it in a child process"]
 fn child_process_writes_outputs() {
@@ -376,7 +376,7 @@ fn child_process_writes_outputs() {
 }
 
 /// The TUI's search queries: a word every agent's session holds, a phrase,
-/// a quoted phrase, a sub-agent's marker, and a word no session holds.
+/// a quoted phrase, a sub-agent's marker, and a word not in any session.
 const TUI_QUERIES: &[&str] = &[
     "answer",
     "tool output",
@@ -472,7 +472,7 @@ const SEARCH_CASES: &[&[&str]] = &[
     &["agent", "search"],
 ];
 
-/// A handle no session's digest starts with.
+/// A handle that isn't a prefix of any session's digest.
 const UNKNOWN_HANDLE: &str = "ch_000000000000";
 
 /// The output of each agent command, one file's worth per command.
@@ -487,7 +487,7 @@ struct AgentOutputs {
 impl AgentOutputs {
     /// Runs every case. The `within`, `read` and `outline` cases run on each
     /// session `agent sessions` lists, then inside [`WINDOWS`], then on
-    /// refs that resolve to no session.
+    /// refs that don't resolve to a session.
     fn run() -> Self {
         let mut outputs = Self {
             sessions: records_of(SESSIONS_CASES),

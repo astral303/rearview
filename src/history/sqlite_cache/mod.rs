@@ -432,7 +432,7 @@ impl SqliteCache {
     }
 
     /// The entries written for the session `storage` found at `cache_key`
-    /// under `root`; `None` when the database holds no such session.
+    /// under `root`; `None` when the session is not in the session cache.
     #[cfg(test)]
     pub(crate) fn entries(
         &self,
@@ -535,8 +535,9 @@ impl<'a> WindowRows<'a> {
 
 impl CacheWriter {
     /// The writer of `owner`'s database, in this release's layout and
-    /// admitted. A database an earlier release left unadmitted, its first
-    /// build's sample stopped part way, loses that sample's sessions.
+    /// admitted. The writer removes every session of an unadmitted database:
+    /// an earlier release left one when its first build's sample stopped
+    /// part way.
     fn open(owner: &refresh::RefreshToken) -> Result<Self> {
         let mut writer = Self::connect(owner.clone())?;
         if writer.stored_layout()? == StoredLayout::Outdated {
@@ -607,8 +608,8 @@ impl CacheWriter {
     fn rebuild(&self) -> Result<()> {
         let turn = self.owner.take_turn();
         self.begin_rebuild(&turn)?;
-        // Do not discard the existing cache until exclusion and the journal
-        // transition have succeeded. Interrupted rebuilds remain retryable.
+        // Drop the tables only once the exclusive lock and the journal change
+        // succeeded, so an interrupted rebuild can run again.
         let batch = refresh::transaction_in_turn(&self.connection, &self.owner, &turn)?;
         drop_session_tables(&batch)?;
         refresh::commit(batch, &self.owner)?;
@@ -765,8 +766,8 @@ impl CacheWriter {
             return self.update_window(record, update, entries, &subagents);
         }
         let rows = written.map(|entries| entries::SessionRows::of(entries, &subagents));
-        // The free space is checked above, outside the transaction: the check
-        // takes the owner's turn, which the transaction holds.
+        // The free-space check above runs outside the transaction, because
+        // the check takes the owner's turn and the transaction holds it.
         if let (Some(rows), Some(entries)) = (&rows, written)
             && let Some(generation) = self.update_stored(record, rows, entries)?
         {
@@ -838,8 +839,8 @@ impl CacheWriter {
     /// Writes `record`, a listed session with `entries`, whose rows are
     /// `rows`, over its stored rows in one transaction, writing only the
     /// rows that differ, and returns the generation it gave the session's
-    /// row. `None`, without writing, when the cache holds no complete listed
-    /// copy of the session to compare with.
+    /// row. `None`, without writing, when the cache doesn't hold a complete
+    /// listed copy of the session to compare with.
     fn update_stored(
         &mut self,
         record: &SessionRecord,
@@ -1078,7 +1079,8 @@ fn is_storage_current(connection: &Connection, storage: SessionCache) -> Result<
     )
 }
 
-/// A generation no earlier write in this database gave a session row.
+/// The next generation for a session row: one more than the last, counted
+/// from 1 again once a rebuild or a low-space deletion drops `meta`.
 fn next_generation(connection: &Connection) -> Result<i64> {
     Ok(connection.query_row(
         "INSERT INTO meta (key, value) VALUES ('last_generation', '1') \
@@ -1275,8 +1277,8 @@ fn session_transaction<'a>(
     Ok(batch)
 }
 
-/// What [`CacheWriter::write`] returned for a session's record, or why the
-/// write failed.
+/// The result of [`CacheWriter::write`] for a session's record, or the
+/// reason the write failed.
 pub(crate) type WriteOutcome = std::result::Result<Option<i64>, String>;
 
 /// A change the writer applies to a cache base's database.

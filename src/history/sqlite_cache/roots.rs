@@ -233,8 +233,8 @@ impl WrittenPlaces {
         Ok((places, stored))
     }
 
-    /// The row of the root sessions list under, which [`Self::of`]
-    /// inserted.
+    /// The row of the root sessions list under. [`Self::of`] inserted it
+    /// when the database didn't hold it.
     pub(super) fn written_listing_root(&self) -> i64 {
         self.listing
             .expect("a written root has its row in the database")

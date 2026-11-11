@@ -127,8 +127,9 @@ fn open_file(path: &Path, access: Access) -> rusqlite::Result<Connection> {
     #[cfg(test)]
     test_hooks::skip_syncs_to_disk();
     let connection = match access {
-        // Without SQLite's lock on each call: rusqlite's `Connection` is not
-        // `Sync`, which keeps two threads from using one connection at once.
+        // Open without SQLite's lock on each call: rusqlite's `Connection`
+        // isn't `Sync`, and that keeps two threads from using one connection
+        // at once.
         Access::ReadOnly => Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -651,9 +652,10 @@ pub(crate) mod test_hooks {
 
     /// Make SQLite's default VFS the system's without its syncs to disk, from
     /// the first connection [`super::open_file`] opens on. A sync matters
-    /// only to a database outliving a crash of the machine, which no test
-    /// makes, and syncs took a third of the unit suite's time. Locks, the
-    /// write-ahead log, its shared memory and checkpoints stay the system's.
+    /// only to a database outliving a crash of the machine; tests don't
+    /// crash the machine, and syncs took a third of the unit suite's time.
+    /// Locks, the write-ahead log, its shared memory and checkpoints stay the
+    /// system's.
     pub(super) fn skip_syncs_to_disk() {
         static REGISTERED: std::sync::Once = std::sync::Once::new();
         REGISTERED.call_once(unsynced_vfs::register_as_default);

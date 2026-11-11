@@ -294,8 +294,8 @@ impl App {
     /// The entries an export of the open session writes: the file opened
     /// directly outside every provider's session roots as the background
     /// worker last parsed it, or the session's copy in the cache when it is
-    /// current. `None` for an out-of-date or missing copy, whose next step
-    /// is recorded.
+    /// current. `None` for an out-of-date or missing copy, after recording
+    /// the copy's next step.
     pub(super) fn current_export_entries(&mut self) -> Option<DisplayEntries> {
         if let Some(entries) = &self.opened_file_entries {
             return Some(entries.clone());
@@ -316,7 +316,7 @@ impl App {
     }
 
     /// Export the open session as the export menu's `option`, rendering
-    /// `entries`, the session's; `None` for JSONL, which copies the
+    /// `entries`, the session's; `None` for JSONL, because JSONL copies the
     /// transcript file.
     pub(super) fn export_now(
         &mut self,

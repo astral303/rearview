@@ -48,7 +48,7 @@ impl ExportFormat {
         }
     }
 
-    /// True for JSONL, which copies the transcript file as it is; the other
+    /// True for JSONL. JSONL copies the transcript file as it is; the other
     /// formats render the session's entries.
     pub fn copies_the_transcript(self) -> bool {
         matches!(self, ExportFormat::Jsonl)

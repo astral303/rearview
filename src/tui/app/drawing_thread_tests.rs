@@ -435,16 +435,16 @@ fn assert_no_action_parses_writes_or_waits(
     drop(other);
 }
 
-/// Beside no other rearview and another rearview's refresh, idle,
-/// committing or rebuilding, no drawing-thread action parses a transcript,
-/// opens a writable connection or waits past the drawing thread's busy
-/// timeout: in the list and the viewer, and for a file opened directly.
+/// Without another rearview, and beside another rearview's refresh that is
+/// idle, committing or rebuilding, a drawing-thread action doesn't parse a
+/// transcript, open a writable connection or wait past the drawing thread's
+/// busy timeout: in the list and the viewer, and for a file opened directly.
 /// Waits are measured on the app's injected clock; SQLite's own busy wait
 /// sleeps on the system's. Each case runs on a thread of its own, its
 /// drawing thread. The cases open the session and prepare its refresh one
 /// at a time: each preparation grows the shared transcript.
 #[test]
-fn no_app_action_parses_writes_or_waits_beside_another_rearviews_activity() {
+fn app_actions_dont_parse_write_or_wait_beside_another_rearviews_activity() {
     let session = &CachedEveryRecordSession::new(registered_fixtures()[0]);
     let one_preparation_at_a_time = &std::sync::Mutex::new(());
     let prepared = |open: &dyn Fn() -> App| {
@@ -889,7 +889,7 @@ fn another_rearviews_rebuild_after_takeover_doesnt_read_as_this_processs_refresh
     drop(paused_refresh);
 }
 
-/// An app listing nothing, reading the session cache under `base`.
+/// An app with an empty list, reading the session cache under `base`.
 fn app_reading_cache(base: &Path) -> App {
     app_reading(Vec::new(), real_time_environment(Vec::new(), Some(base)))
 }

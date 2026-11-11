@@ -35,8 +35,8 @@ fn rank(sessions: &CachedClaudeSessions, query: &str) -> AgentRanking {
     .unwrap()
 }
 
-/// The hit read of row `index` for `ranking`; `None` when its session left
-/// the cache.
+/// The hit read of row `index` for `ranking`; `None` when its session is no
+/// longer in the session cache.
 fn read_hits(
     sessions: &CachedClaudeSessions,
     ranking: &AgentRanking,
@@ -157,8 +157,8 @@ fn ranking_counts_copy_cache_holds_after_rewrite_during_scan() {
     );
 }
 
-/// A session removed during the ranking scan leaves the ranking; one
-/// removed after it leaves the hit read.
+/// A session removed during the ranking scan drops out of the ranking. A
+/// session removed after the scan drops out of the hit read.
 #[test]
 fn session_removed_during_search_leaves_ranking_or_hit_read() {
     let both = || {

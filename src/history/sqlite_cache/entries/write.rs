@@ -121,7 +121,7 @@ pub(super) struct EntryPlace {
 
 impl EntryPlace {
     /// `row`'s place at `sequence`, with the ids `ids` gives its message and
-    /// transcripts, which are written already.
+    /// transcripts. Write the message and transcripts first.
     pub(super) fn of(row: &EntryRow, sequence: usize, ids: &RowIds) -> Self {
         let transcript =
             |index: usize| ids.transcripts[index].expect("an entry's transcript is written first");
@@ -162,7 +162,7 @@ impl SearchPlace {
 pub(super) struct RowWriter<'connection> {
     connection: &'connection Connection,
     session: i64,
-    /// The session's roots, which place each transcript it writes.
+    /// The session's roots, to place each transcript the writer inserts.
     places: &'connection WrittenPlaces,
     insert_entry: CachedStatement<'connection>,
     parts: parts::Writer<'connection>,
@@ -186,7 +186,8 @@ impl<'connection> RowWriter<'connection> {
         })
     }
 
-    /// The id of the transcript at `index`, inserting it when `ids` has none.
+    /// The id of the transcript at `index`, inserting the transcript when
+    /// `ids` doesn't have its id.
     pub(super) fn transcript(
         &self,
         rows: &SessionRows,
@@ -205,7 +206,8 @@ impl<'connection> RowWriter<'connection> {
         Ok(id)
     }
 
-    /// The id of the thread at `index`, inserting it when `ids` has none.
+    /// The id of the thread at `index`, inserting the thread when `ids`
+    /// doesn't have its id.
     pub(super) fn thread(
         &self,
         rows: &SessionRows,
@@ -242,7 +244,8 @@ impl<'connection> RowWriter<'connection> {
         Ok(id)
     }
 
-    /// The id of the message at `index`, inserting it when `ids` has none.
+    /// The id of the message at `index`, inserting the message when `ids`
+    /// doesn't have its id.
     pub(super) fn message(
         &self,
         rows: &SessionRows,

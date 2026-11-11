@@ -117,7 +117,7 @@ impl Zone {
 }
 
 /// A [`Zone`]'s offset at one moment, with the zone: a time moved by a
-/// duration takes the zone's offset at its new moment.
+/// duration gets the zone's offset at its new moment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ZoneOffset {
     zone: Zone,
@@ -195,9 +195,9 @@ mod us_eastern {
         }
     }
 
-    /// The offsets `local` can be in: each one whose UTC time for `local`
-    /// the zone is in then. None in the hour skipped in March; both, the
-    /// earlier instant's first, in the hour repeated in November.
+    /// The offsets `local` can be in: each offset the zone is in at the UTC
+    /// time `local` names in that offset. None in the hour skipped in March;
+    /// both, the earlier instant's first, in the hour repeated in November.
     pub(super) fn offsets_at_local(local: &NaiveDateTime) -> MappedLocalTime<FixedOffset> {
         let fitting: Vec<FixedOffset> = [daylight(), standard()]
             .into_iter()
@@ -356,8 +356,8 @@ mod tests {
         assert_eq!(us_eastern_offset_at("2026-11-01T06:00:00Z"), hours_east(-5));
     }
 
-    /// A local time in the skipped hour has no offset; one in the repeated
-    /// hour has both, the earlier instant's first.
+    /// A local time in the skipped hour doesn't have an offset. A local time
+    /// in the repeated hour has both, the earlier instant's first.
     #[test]
     fn us_eastern_time_skips_hour_in_march_and_repeats_one_in_november() {
         let offsets = |time| {

@@ -63,8 +63,8 @@ impl EntryRow<'_> {
             .flatten()
     }
 
-    /// The digest of the whole row: a stored entry whose digest equals it is
-    /// not written.
+    /// The digest of the whole row. A write skips a stored entry with an equal
+    /// digest.
     pub(super) fn digest(&self) -> i64 {
         self.digests.entry
     }
@@ -100,7 +100,7 @@ impl EntryRow<'_> {
     }
 }
 
-/// Where a session's rows start: the numbering of the entries before them,
+/// The start of a session's rows: the numbering of the entries before them,
 /// and the sequence of their first entry.
 #[derive(Default)]
 pub(in super::super) struct RowsStart {

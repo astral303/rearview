@@ -55,7 +55,7 @@ pub(super) struct Placement {
 
 impl Numbering {
     /// The numbering after the entries `numbering` and `positions` were
-    /// checkpointed past, holding no transcript or thread row yet.
+    /// checkpointed past, before it holds any transcript or thread row.
     pub(super) fn resumed(numbering: &NumberingCheckpoint, positions: &HashMap<i64, i64>) -> Self {
         Self {
             positions: positions.clone(),
@@ -108,8 +108,9 @@ impl Numbering {
             }
             _ => ThreadOrigin::default(),
         };
-        // Metadata changes get their own stored origin, preserving each
-        // message's attribution without repeating the strings on entries.
+        // Each change of a thread's metadata stores its own `threads` row:
+        // each message keeps its attribution, and entries don't repeat the
+        // strings.
         let record_transcript = transcript.filter(|_| record.transcript != key.transcript);
         let number = self
             .logical_threads

@@ -33,14 +33,14 @@ impl SessionReads {
 enum Probe {
     /// One settled outcome per requested session, in order.
     Read(Vec<SessionOutcome>),
-    /// The database does not hold one of the sessions as it is now.
+    /// One of the sessions is not in the database as it is now.
     Missed,
     /// The database stayed busy past the read's timeout.
     Busy,
 }
 
-/// A session one read returned, before the next step of a session the
-/// database does not hold as read is decided.
+/// A session one read returned, before the next step is decided for a
+/// session not in the database as read.
 struct AttemptRead {
     /// Settled.
     outcome: SessionOutcome,
@@ -50,7 +50,7 @@ struct AttemptRead {
     is_current: bool,
 }
 
-/// `reads` as outcomes. Each read that is not current takes the step
+/// `reads` as outcomes. Each read that is not current gets the step
 /// `next_step` returns. `next_step` runs once, and only when such a read
 /// exists.
 fn with_next_steps(
@@ -252,7 +252,7 @@ impl SessionLoader<'_> {
 
     /// The stub of the session at `locator` under `root`, found through
     /// [`SessionStorage::rediscover_unlisted_session`]; `None` when the
-    /// provider finds no session there, or names another file.
+    /// provider doesn't find a session there, or names another file.
     fn rediscover_same_file(
         &self,
         root: &SessionRoot,
@@ -279,7 +279,7 @@ impl SessionLoader<'_> {
     /// reads them: from the session cache alone, through the interactive
     /// reader. A copy the database holds as the transcripts are now is
     /// settled. An older copy, or [`SessionRead::NotCached`] for a session
-    /// missing from the database, takes its
+    /// missing from the database, gets its
     /// [`NextStep::after_read_without_writing`], or its
     /// [`NextStep::after_failed_interactive_read`] when the database could
     /// not be opened.
@@ -348,15 +348,14 @@ impl SessionLoader<'_> {
     /// that may wait: refreshes and the TUI's background refresh.
     ///
     /// When the session cache database holds every stub as it is now, each
-    /// restores from it without refresh ownership. Otherwise the read takes
-    /// `operation`'s refresh ownership, discovers the root again, and reads
-    /// the stubs `after_rediscovery` picks from that discovery; without
-    /// ownership it reads the cache as it is. Those that the database does
-    /// not hold are read from their transcripts and written to the database;
-    /// once the owner is no longer live, the rest read as their cached
-    /// copies, without parsing. Each session the database does not hold as
-    /// read gets its [`NextStep::after_read_without_writing`] as the read
-    /// ends. Fails on a database error other than a busy lock.
+    /// restores from it without refresh ownership. Otherwise the read
+    /// acquires `operation`'s refresh ownership, discovers the root again,
+    /// and reads the stubs `after_rediscovery` picks from that discovery;
+    /// without ownership it reads the cache as it is. Stubs missing from the
+    /// database are read from their transcripts and written to it; once the
+    /// owner is no longer live, the rest read as their cached copies,
+    /// without parsing. Each session not in the database as read gets its
+    /// [`NextStep::after_read_without_writing`] as the read ends. Fails on a database error other than a busy lock.
     pub(super) fn read_stubs(
         &self,
         root: &SessionRoot,
@@ -546,8 +545,8 @@ impl SessionLoader<'_> {
         }
     }
 
-    /// `stub`'s session restored from `cache`; `None` when the database does
-    /// not hold the session as it is now.
+    /// `stub`'s session restored from `cache`; `None` when the session is not
+    /// in the database as it is now.
     fn read_from_database(
         &self,
         cache: &SqliteCache,
@@ -575,10 +574,10 @@ impl SessionLoader<'_> {
         }))
     }
 
-    /// The copy of `stub`'s session `database` holds, as it is, whether or
-    /// not the transcript changed since, its row unpublished;
-    /// [`SessionRead::NotCached`] when the session is missing from it, since
-    /// nothing may parse the transcript.
+    /// `stub`'s session as `database` holds it, whether or not the transcript
+    /// changed since, with its row unpublished; [`SessionRead::NotCached`]
+    /// when the session is missing from the database, because this read may
+    /// not parse the transcript.
     fn cached_copy(
         &self,
         database: Option<&CacheDatabase>,
@@ -631,12 +630,12 @@ impl SessionLoader<'_> {
     /// `stubs` read through the cache as `access` selects: each from the
     /// database when it holds the session as it is now, the others parsed
     /// from their transcripts, in writer-locked groups while the refresh
-    /// owner is live, and written to the database. A whole parse whose copy
-    /// does not hold its entries keeps them on its outcome, as does the
+    /// owner is live, and written to the database. The outcome of a whole
+    /// parse keeps its entries when the written copy lacks them, as does the
     /// parse of a session without a row; a resumed read whose write fails
-    /// reads as the stored copy. A read of the cache as it
-    /// is, and every session left once the owner is no longer live, parses
-    /// nothing: see [`Self::cached_copy`].
+    /// reads as the stored copy. A read of the cache as it is doesn't parse
+    /// any session, nor does a session left once the owner is no longer
+    /// live: see [`Self::cached_copy`].
     fn read_stubs_attempt(
         &self,
         root: &SessionRoot,
@@ -836,8 +835,8 @@ impl SessionLoader<'_> {
     }
 
     /// The listed row `database` holds for `stub`'s session, whether or not
-    /// its transcripts changed since; `None` when it holds none, or the
-    /// catalogue cannot be read, which reads the session whole.
+    /// its transcripts changed since; `None` when it doesn't hold one, or the
+    /// catalogue cannot be read. The session is then read whole.
     fn stored_listed_row(
         &self,
         database: &CacheDatabase,

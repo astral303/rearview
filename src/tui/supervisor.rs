@@ -37,7 +37,7 @@ pub(crate) struct TaskSupervisor {
     direct_file: Option<Receiver<Result<DirectFileRead>>>,
     /// The wait a list or session refresh, a rename or a delete publishes.
     refresh_wait: Arc<WaitStatus>,
-    /// Set at shutdown: the running job parses nothing more.
+    /// Set at shutdown: the running job doesn't parse any more transcripts.
     cancellation: Cancellation,
 }
 
@@ -48,8 +48,8 @@ impl TaskSupervisor {
         let (worker, jobs) = mpsc::channel::<Job>();
         std::thread::spawn(move || {
             for job in jobs {
-                // A job that panics drops its channel, which the runtime reads
-                // as a job that stopped; the next job still runs.
+                // A job that panics drops its channel. The runtime reads a
+                // dropped channel as a job that stopped, and the next job runs.
                 let _ = catch_unwind(AssertUnwindSafe(job));
             }
         });
@@ -83,7 +83,7 @@ impl TaskSupervisor {
         self.environment.cache_base()
     }
 
-    /// True while the worker runs nothing and is not shut down.
+    /// True while the worker doesn't run a job and is not shut down.
     pub(crate) fn can_take_job(&self) -> bool {
         self.worker.is_some() && !self.is_running_a_job()
     }
@@ -139,8 +139,9 @@ impl TaskSupervisor {
         self.run(Box::new(move || {
             let operation = operation(&environment);
             let changed = change.make(&operation);
-            // Ignore the finish: only a cache write that found the drive
-            // low on space fails it, and a rename or delete writes none.
+            // Ignore the finish, because only a cache write that found the
+            // drive low on space fails it, and a rename or delete doesn't
+            // make that write.
             let _ = operation.finish();
             let _ = outcome.send(changed);
         }));
@@ -236,10 +237,10 @@ impl TaskSupervisor {
         }
     }
 
-    /// Take no more jobs, stop the running one before its next parse, and
-    /// give up this rearview's refresh ownership of the session cache: the
-    /// running job writes nothing more, and a job waiting for ownership fails
-    /// instead of acquiring it.
+    /// Stop taking jobs, stop the running one before its next parse, and
+    /// release this rearview's refresh ownership of the session cache: the
+    /// running job doesn't write anything more, and a job waiting for
+    /// ownership fails instead of acquiring it.
     pub(crate) fn shutdown(&mut self) {
         self.shutdown_releasing_within(SHUTDOWN_RELEASE_WAIT);
     }
@@ -265,9 +266,9 @@ impl Drop for TaskSupervisor {
     /// without a wait: the exit tick's shutdown, when one ran, already
     /// waited.
     ///
-    /// The running job is not joined, since a parse group can run for
+    /// The running job is not joined, because a parse group can run for
     /// seconds. After a resume or a select, its parse group keeps using CPU
-    /// until it ends; it writes nothing.
+    /// until it ends; it doesn't write anything.
     fn drop(&mut self) {
         self.shutdown_releasing_within(Duration::ZERO);
         self.environment

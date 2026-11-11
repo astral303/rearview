@@ -44,7 +44,7 @@ fn session(name: &str, text: &str, minute: u32, size: u64) -> Conversation {
     row
 }
 
-/// An app listing `rows`, newest first, reading no agent's storage.
+/// An app listing `rows`, newest first, without any agent's storage.
 fn app_listing(rows: Vec<Conversation>) -> App {
     app_reading(rows, test_environment(Vec::new(), None))
 }

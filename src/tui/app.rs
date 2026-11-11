@@ -157,7 +157,7 @@ pub struct App {
     /// A copy or export asked for while the open session's refresh was
     /// pending, run once the refresh finishes
     deferred_copy: Option<view_state::DeferredCopy>,
-    /// A confirmed rename or delete, until the background worker takes it
+    /// A confirmed rename or delete, until the background worker receives it
     list_change: Option<super::list_change::ListChange>,
     /// The load filters that narrowed this list, named for the user: the
     /// ones it launched with, then the terms the last load or refresh
@@ -180,8 +180,9 @@ pub struct App {
     /// thread reads the session cache only through
     /// [`Self::interactive_cache`].
     environment: Environment,
-    /// Marks the thread the app lives on, the drawing thread, so the waiting
-    /// session cache reader, refresh ownership and cache writers refuse it.
+    /// Marks the thread the app runs on, the drawing thread, so the waiting
+    /// session cache reader, refresh ownership and cache writers refuse it in
+    /// debug builds.
     _drawing_thread: DrawingThread,
     /// True when rows preview their last messages (`--last`), as the load
     /// built them; a session read again or opened by ID gets the same preview
@@ -232,7 +233,7 @@ type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
 /// The background worker's read of a file opened directly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirectFileJob {
-    /// Asked for; the worker has not taken it yet.
+    /// Asked for; the worker has not received it yet.
     Requested,
     Running,
 }
@@ -456,9 +457,9 @@ impl App {
         })
     }
 
-    /// Create an app for viewing `file`, reading `environment`. It parses
-    /// nothing: the viewer shows `Loading…` until the background worker
-    /// reads the file (see [`Self::begin_direct_file_read`]).
+    /// Create an app for viewing `file`, reading `environment`. It doesn't
+    /// parse the file: the viewer shows `Loading…` until the background worker
+    /// reads it (see [`Self::begin_direct_file_read`]).
     pub fn new_single_file(
         file: DirectFile,
         tool_display: ToolDisplayMode,
@@ -697,8 +698,8 @@ impl App {
         self.session_id_query.is_some()
     }
 
-    /// True while the query names a session the cache lacks, until the list
-    /// applies the refresh that reads its row.
+    /// True while the query names a session that is not in the session cache,
+    /// until the list applies the refresh that reads its row.
     pub fn is_session_lookup_loading(&self) -> bool {
         matches!(self.session_id_query, Some(SessionIdQuery::Loading { .. }))
     }
@@ -811,7 +812,7 @@ impl App {
             .checked_duration_since(self.clock().now())
     }
 
-    /// How long until something timed on screen changes by itself: a status
+    /// The time until something timed on screen changes by itself: a status
     /// message expiring, the count highlight ending, or the next check for
     /// the completion of the cache refresh rows wait for.
     pub fn next_timed_redraw(&self) -> Option<Duration> {
@@ -828,7 +829,7 @@ impl App {
         .min()
     }
 
-    /// The time an event loop with no work in flight waits for input: until
+    /// The time an event loop without work in flight waits for input: until
     /// the next timed redraw, or an hour when nothing on screen is timed.
     /// Call [`Self::check_awaited_refresh`] first: a check that is due and
     /// not run leaves the wait at zero.

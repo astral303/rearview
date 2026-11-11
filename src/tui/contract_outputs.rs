@@ -19,7 +19,7 @@ const FRAME_HEIGHT: u16 = 48;
 /// The rows the list leaves to sessions: the frame without its search line,
 /// status line and border.
 const VIEWPORT_HEIGHT: usize = FRAME_HEIGHT as usize - 3;
-/// The longest a search may take before the capture gives up on it.
+/// The longest a search may take before the capture stops waiting for it.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The text of each TUI surface the output contract compares.
@@ -173,8 +173,8 @@ fn viewer_text(app: &mut App, heading: &str) -> String {
     text
 }
 
-/// The session's agent and its transcript's file name, which names it
-/// without the directory a run builds its home in.
+/// The session's agent and its transcript's file name. The file name names
+/// the session without the directory a run builds its home in.
 fn listed_name(conversation: &Conversation) -> String {
     let file_name = conversation
         .path

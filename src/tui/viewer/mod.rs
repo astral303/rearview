@@ -324,7 +324,8 @@ pub fn parse_conversation_file_interactively(
 
 /// A bare file the user names (`--render`, a direct path argument), read by
 /// whichever registered format recognises it. The agent's roots come from
-/// `environment`, which canonicalises its directory and a stored copy's.
+/// `environment`; `environment` canonicalises the file's directory and a
+/// stored copy's.
 pub fn parse_unattributed_conversation_file(
     permit: crate::history::ParsePermit<'_>,
     file_path: &Path,

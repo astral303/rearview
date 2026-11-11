@@ -210,8 +210,8 @@ pub trait SessionProvider: Sync {
     ///
     /// For one-shot commands rather than a keystroke, so it may cost what
     /// [`SessionIdResolver::resolve_session_id`] may not. More than one path
-    /// comes back from an agent that does not keep its ids unique, and what an
-    /// ambiguous id means is the caller's to decide. The roots come from
+    /// comes back from an agent that does not keep its session IDs unique, and
+    /// the caller decides what an ambiguous ID means. The roots come from
     /// `environment`.
     fn find_sessions_by_id(
         &self,
@@ -272,7 +272,7 @@ pub trait SessionProvider: Sync {
 }
 
 /// The directory a session recorded, canonicalised on request through the
-/// directories its command or load canonicalised: the sessions recorded in
+/// `CanonicalDirectories` of its command or load, so the sessions recorded in
 /// one directory share one canonicalisation of it.
 #[derive(Clone, Copy)]
 pub struct RecordedDirectory<'a> {
@@ -340,7 +340,7 @@ pub trait SessionIdResolver: Sync {
 
     /// The session `session_id` names under `root`, as the stub discovery
     /// would report for it there; `None` when it is not under `root`.
-    /// Called only with a query of the session id shape.
+    /// Called only with a query of the session ID shape.
     ///
     /// Runs on a keystroke, so it answers from the provider's own index of
     /// its sessions and must not parse a transcript in full. Where
@@ -449,9 +449,8 @@ pub fn resolve_session_id(
 
 /// Every session any of `environment`'s agents stored under `session_id`.
 ///
-/// Unlike [`resolve_session_id`] this asks every agent, since an id that two
-/// of them could answer for is exactly the case a caller must not resolve by
-/// guessing.
+/// Asks every agent, unlike [`resolve_session_id`], because a caller must not
+/// guess between two agents that answer for one session ID.
 pub fn find_sessions_by_id(
     environment: &crate::history::Environment,
     session_id: &str,
@@ -476,7 +475,7 @@ pub fn find_sessions_by_id(
 /// `resolve_session_id`: a provider declaring `session_id_lookup` Not Capable
 /// doesn't have a resolver. False when the lookup fails. The roots come from
 /// `environment`, and each file's directory is canonicalised through its
-/// directory memo.
+/// `CanonicalDirectories`.
 pub fn is_stored_session(
     source: Source,
     session_id: &str,
@@ -779,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn session_caches_do_not_share_directory() {
+    fn session_caches_dont_share_directory() {
         let caches = providers()
             .iter()
             .map(|provider| (provider.labels().name, provider.storage().cache()))

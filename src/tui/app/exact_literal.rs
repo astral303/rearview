@@ -55,9 +55,9 @@ fn first_range_window(conversation: &Conversation, evidence: &LexicalEvidence) -
     Some(preview)
 }
 
-/// `conversation_index` is the conversation's position in the corpus: a
-/// refresh shares unchanged rows between corpus versions, so the row's own
-/// `index` can name its position in an earlier one.
+/// `conversation_index` is the conversation's position in the corpus. The
+/// row's own `index` can name its position in an earlier corpus version,
+/// because a refresh shares unchanged rows between versions.
 fn exact_literal_metadata(
     conversation: &Conversation,
     conversation_index: usize,

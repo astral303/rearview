@@ -1,6 +1,7 @@
-//! The hash a row's `digest` column holds: what the row stores, fed field by
-//! field, each with its length or a presence mark, so two rows hash alike
-//! only when every field matches.
+//! The hash a row's `digest` column holds: the first 8 bytes of a BLAKE3
+//! hash of the fields the row stores, in order. Each field enters with a
+//! presence mark; a text or byte field also with its length, and a JSON
+//! value as the hash of its text.
 
 use crate::log_entry::TokenUsage;
 
@@ -94,9 +95,8 @@ mod tests {
         assert_eq!(json_digest(record), json_digest(record));
     }
 
-    /// One object written with its keys in two orders hashes alike: the hash
-    /// follows the object's content, not the order of its keys. Turning on
-    /// `serde_json`'s `preserve_order` feature fails this test.
+    /// Turning on `serde_json`'s `preserve_order` feature fails this test,
+    /// because the hash then follows the order of the keys.
     #[test]
     fn one_object_in_two_key_orders_hashes_alike() {
         assert_eq!(

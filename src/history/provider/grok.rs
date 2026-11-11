@@ -750,8 +750,8 @@ pub(super) mod tests {
         write_session_recorded_in(home, PROJECT_DIR, PROJECT, id)
     }
 
-    /// [`write_session`], recorded in the working directory `project`, whose
-    /// cwd directory is `cwd_dir`.
+    /// [`write_session`], recorded in the working directory `project` and
+    /// filed in the cwd directory `cwd_dir`.
     fn write_session_recorded_in(home: &Path, cwd_dir: &str, project: &str, id: &str) -> PathBuf {
         write_grok_session(
             &sessions_under(home),
@@ -828,9 +828,9 @@ pub(super) mod tests {
             write_session(home, session)
         }
 
-        /// The turn names no model, as [`Self::write_session`]'s doesn't: a
-        /// turn's model replaces the session's leading model entry, which
-        /// reads the session whole.
+        /// The turn doesn't name a model, like [`Self::write_session`]'s,
+        /// because a turn's model replaces the session's leading model entry,
+        /// and that replacement reads the session whole.
         fn append_turn(&self, locator: &Path, text: &str) {
             append_lines(
                 locator,

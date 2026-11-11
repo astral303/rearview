@@ -24,7 +24,7 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
             .unwrap()
             .unwrap()
         else {
-            panic!("listed fixture")
+            panic!("the fixture session is listed")
         };
         let expected =
             AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
@@ -109,7 +109,7 @@ fn bounded_transcript_doesnt_load_unrelated_large_call_and_result_bodies() {
         .unwrap()
         .unwrap()
     else {
-        panic!("listed fixture")
+        panic!("the fixture session is listed")
     };
     let transcript = cached
         .cached_session
@@ -158,7 +158,7 @@ fn bounded_read_doesnt_read_unselected_call_inputs() {
         .unwrap()
         .unwrap()
     else {
-        panic!("listed fixture")
+        panic!("the fixture session is listed")
     };
     let read = || {
         cached
@@ -320,7 +320,7 @@ fn sql_windows_keep_full_message_spans_and_final_millisecond() {
         .unwrap()
         .unwrap()
     else {
-        panic!("listed fixture")
+        panic!("the fixture session is listed")
     };
     let second = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:01Z")
         .unwrap()

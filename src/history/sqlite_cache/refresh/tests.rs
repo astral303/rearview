@@ -65,7 +65,8 @@ impl OwnerActivity {
     }
 
     /// The activity the parent test set for this helper process. Read from
-    /// the process's own variables: a test build's `RootEnvironment` sets none.
+    /// the process's own variables: a test build's `RootEnvironment` doesn't
+    /// set any.
     #[allow(clippy::disallowed_methods)]
     fn of_process() -> Self {
         match std::env::var(Self::VARIABLE).ok().as_deref() {
@@ -1535,7 +1536,7 @@ fn low_space_deletion_of_missing_database_reports_it_deleted_without_creating_it
 /// connection to the end of its wait.
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "the thread refusing connections holds none of them open")]
+#[should_panic(expected = "the thread refusing connections doesn't hold any of them open")]
 fn low_space_deletion_on_thread_holding_its_connection_fails_debug_check() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path())
@@ -1775,9 +1776,10 @@ fn wait_for_refusal(base: &CacheBase) {
 }
 
 /// While a low-space deletion waits for this rearview's reader, held open
-/// past the takeover window, it holds no ownership to lapse: a competing
-/// rearview takes the cache over and writes, and once both are done the
-/// deletion acquires the ownership and empties the database.
+/// past the takeover window, it doesn't hold an ownership that could
+/// lapse: a competing rearview takes the cache over and writes, and once
+/// both are done the deletion acquires the ownership and empties the
+/// database.
 #[test]
 fn low_space_deletion_waiting_for_reader_past_takeover_window_empties_database_competitor_wrote() {
     let directory = tempfile::tempdir().unwrap();
@@ -2332,8 +2334,8 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
     drop(other);
 }
 
-/// How the ownership lifecycle sweep ends a refresh ownership whose write
-/// permission a failed batch revoked.
+/// The ending the ownership lifecycle sweep gives a refresh ownership whose
+/// write permission a failed batch revoked.
 #[derive(Clone, Copy, Debug)]
 enum RevokedOwnershipEnd {
     /// Its operation finishes, dropping the ownership.

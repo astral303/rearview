@@ -1,7 +1,7 @@
 //! Tables whose rows a session numbers by position: `(session, position)`
 //! is the key. A write matches each new row with the stored row of the same
-//! key, keeps an unchanged one, moves one whose position changed, updates
-//! one whose columns changed, and deletes or inserts the rest.
+//! key. It keeps an unchanged row, moves a row to its new position, updates
+//! changed columns, and deletes or inserts the rest.
 
 use crate::error::{AppError, Result};
 use rusqlite::Connection;

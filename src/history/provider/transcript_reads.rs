@@ -1,5 +1,5 @@
-//! Resumable transcript reading: what a read of one transcript leaves for the
-//! next read to resume from, and the reader each agent's storage supplies.
+//! Resumable transcript reading: the state a read of one transcript leaves for
+//! the next read to resume from, and the reader each agent's storage supplies.
 //! The session cache stores a [`TranscriptRead`] per transcript and never
 //! interprets its values; only the reader that wrote them does.
 
@@ -10,13 +10,15 @@ use crate::history::{MalformedLine, ParsePermit};
 use crate::log_entry::LogEntry;
 use std::path::Path;
 
-/// What a read of one transcript leaves for the next, as the agent's reader
-/// encodes it. Every value is opaque to the session cache.
+/// The state a read of one transcript leaves for the next read, as the
+/// agent's reader encodes it. Every value is opaque to the session cache.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptRead {
-    /// Where the next read continues: past the last record read whole.
+    /// The position the next read continues from: past the last record read
+    /// whole.
     pub cursor: Vec<u8>,
-    /// Where the next read restarts deriving entries; never after `cursor`.
+    /// The position the next read restarts deriving entries from; never after
+    /// `cursor`.
     pub stable_cursor: Vec<u8>,
     /// A hash of what the agent never changes in the transcript.
     pub identity: Vec<u8>,
@@ -54,7 +56,7 @@ pub struct ResumedWindow {
     pub start_line: usize,
     pub entries: Vec<(RecordLine, LogEntry)>,
     pub malformed_lines: Vec<MalformedLine>,
-    /// What this read leaves for the next.
+    /// The state this read leaves for the next read.
     pub read: TranscriptRead,
     /// The bytes read from the stable cursor on.
     pub bytes_read: u64,
@@ -76,7 +78,7 @@ pub enum Resumption {
 /// agent's storage supplies its reader; [`FullRead`] is the default.
 pub trait TranscriptReader: Sync {
     /// A hash of what the agent never changes in the transcript at `source`;
-    /// empty when the reader keeps no identity.
+    /// empty when the reader doesn't keep an identity.
     fn identity(&self, source: &Path) -> Result<Vec<u8>>;
 
     /// True when the content of `source` before `read`'s cursor may have
@@ -110,10 +112,10 @@ pub trait TranscriptReader: Sync {
         source: &Path,
     ) -> Result<Option<crate::history::format::SessionProjection>>;
 
-    /// The transcript at `source`'s leading entries: those at line 0, which
-    /// the agent keeps outside the transcript, such as a title, and every
-    /// read derives again. `read` is what the transcript's latest read
-    /// leaves for the next.
+    /// The leading entries of the transcript at `source`: the entries at line
+    /// 0, such as a title, that the agent keeps outside the transcript and
+    /// every read derives again. `read` is the state the transcript's latest
+    /// read left.
     fn leading_entries(
         &self,
         source: &Path,
@@ -177,7 +179,7 @@ pub struct LinkWindow<'a> {
     pub entries: &'a [(RecordLine, LogEntry)],
 }
 
-/// What a resumed read changes in how a session's threads link.
+/// The changes a resumed read makes to how a session's threads link.
 pub struct LinkUpdate {
     pub ledger: Vec<u8>,
     /// The call that launched each thread, in the order of the threads the
@@ -230,7 +232,7 @@ pub trait ThreadLinker: Sync {
     ) -> Option<Vec<u8>>;
 }
 
-/// The linker of a storage whose threads link to nothing.
+/// The linker of a storage that doesn't link its threads.
 pub struct NoLinks;
 
 impl ThreadLinker for NoLinks {

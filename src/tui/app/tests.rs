@@ -839,7 +839,7 @@ fn semantic_search_worker_returns_lexical_fallback() {
 
 /// A semantic query of quoted phrases alone: the search worker answers it
 /// as exact matches, newest first within the list's filters, and the
-/// semantic worker gets no search.
+/// semantic worker doesn't get a search.
 #[test]
 fn quoted_only_semantic_query_shows_search_workers_exact_matches_newest_first() {
     let row = |project, uuid, text, day| {
@@ -886,7 +886,11 @@ fn quoted_only_semantic_query_shows_search_workers_exact_matches_newest_first() 
     app.dispatch_search();
     app.settle_search_for_test();
 
-    assert_eq!(app.filtered, vec![1, 0], "the hits in scope, newest first");
+    assert_eq!(
+        app.filtered,
+        vec![1, 0],
+        "the list shows the hits in scope, newest first"
+    );
     for index in [0, 1] {
         let explanation = &app.semantic_result_metadata(index).unwrap().explanation;
         assert_eq!(
@@ -904,13 +908,14 @@ fn quoted_only_semantic_query_shows_search_workers_exact_matches_newest_first() 
     );
     assert!(
         last_semantic_search(&drain_semantic_commands(&request_rx)).is_none(),
-        "the semantic worker gets no search"
+        "the semantic worker doesn't get a search"
     );
     assert!(!app.has_search_work_in_flight());
 }
 
-/// A quoted-only semantic hit whose phrase the row's preview lacks previews
-/// the first range of its lexical evidence, with context on each side.
+/// A quoted-only semantic hit previews the first range of its lexical
+/// evidence, with context on each side, when the row's preview doesn't
+/// contain its phrase.
 #[test]
 fn quoted_only_semantic_hit_previews_its_first_evidence_range() {
     let mut row = conversation(

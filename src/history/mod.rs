@@ -201,8 +201,8 @@ pub struct ParseError {
 #[derive(Clone)]
 pub struct Conversation {
     /// The persisted content of a row restored from the cache, or parsed
-    /// and written with its entries. A parsed row whose write didn't land
-    /// and a synthetic conversation carry their content in the fields below.
+    /// and written with its entries. A parsed row whose write failed and a
+    /// synthetic conversation carry their content in the fields below.
     pub cached_session: Option<sqlite_cache::CachedSession>,
     /// The address of this row's session in the session cache. The viewer,
     /// the printout and the agent commands read the session through it.
@@ -429,7 +429,7 @@ pub enum LoaderMessage {
 }
 
 /// A session a load read from a copy older than its transcripts, or left
-/// unlisted because the cache holds no copy of it.
+/// unlisted because it is not in the session cache.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StaleSession {
     pub source: Source,

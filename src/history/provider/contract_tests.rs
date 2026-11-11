@@ -404,10 +404,9 @@ pub(crate) trait ProviderFixture: Sync {
         self.cannot_run("write its every-record session where discovery finds it")
     }
 
-    /// Appends one complete turn after the last record of the session at
-    /// `locator`, which [`write_session`](Self::write_session) wrote: a
-    /// prompt and a reply holding `reply`, as the agent appends them while
-    /// it works.
+    /// Appends one complete turn after the last record of the session
+    /// [`write_session`](Self::write_session) wrote at `locator`: a prompt and
+    /// a reply holding `reply`, as the agent appends them while it works.
     fn append_turn(&self, _locator: &Path, _reply: &str) {
         self.cannot_run("append a turn to a session")
     }
@@ -442,15 +441,14 @@ pub(crate) trait ProviderFixture: Sync {
         self.storage().discover(&self.root_under(home), lister)
     }
 
-    /// One listable session in another directory than
-    /// [`write_session`](Self::write_session)'s, one discovery lists apart
-    /// from it; returns its locator.
+    /// One listable session in a directory discovery lists apart from
+    /// [`write_session`](Self::write_session)'s; returns its locator.
     fn write_session_in_another_directory(&self, _home: &Path, _session: &str) -> PathBuf {
         self.cannot_run("write a session in another directory")
     }
 
     /// The directory discovery lists to find the session at `locator`;
-    /// `None` for an agent whose discovery lists no directory.
+    /// `None` for an agent whose discovery doesn't list a directory.
     fn listed_directory_of(&self, locator: &Path) -> Option<PathBuf> {
         locator.parent().map(Path::to_path_buf)
     }
@@ -1299,10 +1297,11 @@ fn reads_as_parsed(read: &SessionRead, lists: bool) -> bool {
     )
 }
 
-/// A pasted sub-agent ID the cache lacks reads as not cached and asks for a
-/// session refresh, which reads it as the sub-agent's parsed session.
+/// A pasted sub-agent ID missing from the session cache reads as not cached
+/// and asks for a session refresh. The refresh reads it as the sub-agent's
+/// parsed session.
 #[test]
-fn sub_agent_id_cache_lacks_reads_as_its_parsed_session_through_session_refresh() {
+fn uncached_subagent_id_reads_as_its_parsed_session_through_session_refresh() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1349,7 +1348,7 @@ fn sub_agent_id_cache_lacks_reads_as_its_parsed_session_through_session_refresh(
 /// discovery leaves out, and the cache serves it after. Otherwise the
 /// completed refresh removes the sub-agent's row.
 #[test]
-fn sub_agent_opened_by_id_during_refresh_is_read_again_once_it_completes() {
+fn subagent_opened_by_id_during_refresh_is_read_again_once_it_completes() {
     run_contract(Contract::SubagentIdReadThroughCache, |fixture| {
         let home = tempfile::tempdir().unwrap();
         let cache_base = tempfile::tempdir().unwrap();
@@ -1674,8 +1673,8 @@ fn forward_slashes_in_variables_name_roots_with_platform_separator() {
 
 /// The agent's directory named another way, as a user who sets the agent's
 /// variable in two shells names it, keys the sessions the first name cached:
-/// the load restores each of them, parses none, and the cache keeps one copy
-/// of each.
+/// the load restores each of them without parsing any, and the cache keeps
+/// one copy of each.
 #[test]
 fn other_spelling_of_root_restores_sessions_first_spelling_cached() {
     run_contract(Contract::RootSpelling, |fixture| {
@@ -1906,7 +1905,8 @@ fn reads_of_session_by_path_canonicalise_roots_and_recorded_and_transcript_direc
         let rows = rows_loaded_through(&environment);
         let row = rows.first().expect("the load lists the session");
         if !row.path.is_file() {
-            // A session an agent keeps in a database is read by its id, not its path.
+            // A session an agent keeps in a database is read by its session
+            // ID, not its path.
             return;
         }
         let canonical = crate::history::provider::walk::SystemCanonicaliser::shared()
@@ -2053,8 +2053,8 @@ fn spelled_transcripts(
 }
 
 /// Rows restored through another name of the agent's directory keep their
-/// places in the list: a list refresh finds each by its path and reports no
-/// change. While discovery cannot list the directory of one of them, the
+/// places in the list: a list refresh finds each by its path and doesn't
+/// report a change. While discovery cannot list the directory of one of them, the
 /// load and the list refresh keep its row.
 #[test]
 fn rows_restored_through_other_spelling_are_found_by_their_paths() {
@@ -2103,8 +2103,8 @@ fn rows_restored_through_other_spelling_are_found_by_their_paths() {
                 "a list refresh through {} keeps the row under the directory it cannot list",
                 spelling.display()
             );
-            // The app marks this thread as the TUI's drawing thread, which
-            // agent commands refuse to run on.
+            // Dropped first: the app marks this thread as the TUI's drawing
+            // thread, and agent commands refuse to run on that thread.
             drop(app);
             let agent = |arguments: &[&str]| {
                 crate::agent::service::execute(
@@ -2139,7 +2139,8 @@ fn rows_restored_through_other_spelling_are_found_by_their_paths() {
 
 /// The agent's directory named with forward slashes: a load parsing its
 /// sessions and a load restoring them show every transcript path with the
-/// platform's separator, and the cache stores none spelled otherwise.
+/// platform's separator, and the cache doesn't store a path spelled
+/// otherwise.
 #[test]
 fn directory_named_with_forward_slashes_stores_and_shows_platform_separators() {
     run_contract(Contract::RootSpelling, |fixture| {
@@ -2239,10 +2240,10 @@ fn stored_session_count(cache_base: &Path) -> usize {
         .unwrap() as usize
 }
 
-/// A directory discovery cannot list hides no session: the other
+/// A directory discovery cannot list doesn't hide any session: the other
 /// directories still list, discovery reports the directory, and the cached
 /// sessions under it stay listed from the session cache, by the list and by
-/// agent `sessions`, which names the directory in one `io` warning.
+/// agent `sessions`. Agent `sessions` names the directory in one `io` warning.
 #[test]
 fn unreadable_directory_keeps_its_cached_sessions_listed() {
     run_contract(Contract::UnreadableDirectory, |fixture| {

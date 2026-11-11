@@ -1,8 +1,8 @@
-//! What a resumed read of a changed session starts from, for every agent:
-//! where in the view's order the stored session stays as it is, the session
-//! row's fold there, and each sub-agent transcript's share of the row at its
-//! stable cursor. Nothing here knows a format; each agent's reader and
-//! thread linker supply what does.
+//! The starting point of a resumed read of a changed session, for every
+//! agent: the place in the view's order up to which the stored session stays
+//! as it is, the session row's fold there, and each sub-agent transcript's
+//! share of the row at its stable cursor. This module doesn't read any
+//! format; each agent's reader and thread linker supply the format's facts.
 
 mod read;
 #[cfg(test)]
@@ -19,8 +19,8 @@ use crate::log_entry::{LogEntry, SubagentIdentity};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Where a resumed read of a session starts its session row and numbering:
-/// before the entry at `sequence` in the view's order. Every entry before
+/// The point a resumed read of a session starts its session row and
+/// numbering from: before the entry at `sequence` in the view's order. Every entry before
 /// it stays where it is stored.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct SessionCheckpoint {
@@ -31,7 +31,7 @@ pub(crate) struct SessionCheckpoint {
     /// The time the session's header names, for a session without
     /// activity.
     pub(crate) header_time: String,
-    /// True for a session whose format states no header: its row is dated
+    /// True for a session whose format doesn't state a header: its row is dated
     /// by its last activity, and its working directory is the first one an
     /// entry names.
     pub(crate) is_headerless: bool,
@@ -86,7 +86,7 @@ impl SessionCheckpoint {
 /// it cannot name.
 pub(crate) type TranscriptRename<'a> = &'a dyn Fn(&Path) -> Option<PathBuf>;
 
-/// What the entries before a checkpoint bound in the view's order: a new
+/// The bounds the entries before a checkpoint set in the view's order: a new
 /// entry must sort after all of them to be placed after the checkpoint.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct SpliceBound {
@@ -306,13 +306,13 @@ pub(crate) fn walk_steps<'a, T>(
 }
 
 /// A sub-agent transcript's share of its session's row at the transcript's
-/// stable cursor, and who its thread is.
+/// stable cursor, and its thread's label and identity.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ThreadFold {
     pub(crate) label: String,
     pub(crate) identity: SubagentIdentity,
     pub(crate) started: String,
-    /// The timestamp the thread's next turn inherits when it has none: the
+    /// The timestamp the thread's next turn inherits when it doesn't have one: the
     /// last one before the stable cursor, else `started`.
     pub(crate) last_timestamp: String,
     /// The fold of the transcript's entries before the stable cursor, as a

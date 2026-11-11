@@ -321,7 +321,7 @@ fn searched_texts_and_parse(session: &AgentSession) -> (Vec<String>, Conversatio
         .unwrap()
         .unwrap()
     else {
-        panic!("listed fixture")
+        panic!("the fixture session is listed")
     };
     let searched = listed
         .title_and_summary_texts()

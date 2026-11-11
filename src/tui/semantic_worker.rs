@@ -62,8 +62,8 @@ pub struct SemanticSearchResponse {
     pub error: Option<String>,
     pub progress: SemanticProgress,
     pub prewarm: bool,
-    /// The listed sessions searched without semantic turns, by why: their
-    /// read missed, and none of an earlier copy are held.
+    /// The listed sessions searched without semantic turns, by reason: their
+    /// read missed, and the worker doesn't hold an earlier copy's turns.
     pub without_turns: SessionsWithoutTexts,
 }
 
@@ -415,8 +415,8 @@ struct WorkerCorpus {
 struct HeldTurns {
     /// The newest turns read; `None` until a read of the session lands.
     turns: Option<TurnsRead>,
-    /// The corpus version the last read of the row's copy missed in, and
-    /// why. Read the copy again once the corpus changes.
+    /// The corpus version the last read of the row's copy missed in, and the
+    /// reason. Read the copy again once the corpus changes.
     missed: Option<(u64, ReadFailure)>,
 }
 
@@ -490,7 +490,7 @@ fn read_turns(rows: &[(&Conversation, &CachedSession)]) -> Vec<TurnsReadResult> 
 /// The corpus's rows as the semantic stage searches them.
 struct LoadedCorpus {
     candidates: Vec<SemanticIndexCandidate>,
-    /// The cached rows without semantic turns, counted by why: their read
+    /// The cached rows without semantic turns, counted by reason: their read
     /// missed, and the worker doesn't hold an earlier copy's turns.
     without_turns: SessionsWithoutTexts,
 }
@@ -777,7 +777,7 @@ mod tests {
     use std::time::Duration;
 
     /// The longest a test waits for the worker's next message before it
-    /// fails. The model's first load sends none, and beside a full test run
+    /// fails. The model's first load doesn't send one, and beside a full test run
     /// it runs many times slower than alone.
     const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -1030,7 +1030,7 @@ mod tests {
                 Vec::new(),
                 vec!["kept question".to_owned()]
             ],
-            "the replaced row searches the copy the cache holds; the removed one, nothing"
+            "the replaced row searches the cache's copy; the removed one doesn't search any turns"
         );
         assert_eq!(
             corpus.without_turns.unreadable, 1,

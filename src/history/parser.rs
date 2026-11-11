@@ -42,10 +42,10 @@ use std::time::SystemTime;
 pub enum UnlistedReason {
     /// The file is not a transcript in the agent's format.
     ForeignTranscript,
-    /// The transcript holds no message the list numbers.
+    /// The transcript doesn't hold any message the list numbers.
     NoVisibleMessages,
-    /// The transcript holds messages, but no text the list previews, or only
-    /// `/clear` commands.
+    /// The transcript holds messages, but doesn't hold any text the list
+    /// previews, or holds only `/clear` commands.
     NoConversationMetadata,
 }
 
@@ -106,8 +106,8 @@ impl std::fmt::Debug for UnlistedSession {
     }
 }
 
-/// A row builder's result: the row the list shows, or the reason it shows
-/// none.
+/// A row builder's result: the row the list shows, or the reason the list
+/// doesn't show one.
 pub(crate) type ParsedRow = std::result::Result<Conversation, UnlistedReason>;
 
 /// A listed session's parse.
@@ -116,19 +116,21 @@ pub struct ListedSession {
     pub(crate) transcripts: SessionTranscripts,
 }
 
-/// What a listed session's parse read of its transcripts. The session
-/// cache's record is built from it, so no transcript is read twice.
+/// The contents a listed session's parse read of its transcripts. The
+/// session cache's record is built from them, so that no transcript is read
+/// twice.
 pub(crate) struct SessionTranscripts {
     /// The session's own entries and malformed lines.
     own: TranscriptEntries,
     /// Each earlier transcript the session's own continues, stamped before
     /// it was read.
     own_earlier_transcripts: Vec<FileStamp>,
-    /// What the read of the session's own transcript leaves for the next.
+    /// The state the read of the session's own transcript leaves for the
+    /// next read.
     own_read: TranscriptRead,
     subagents: SubagentTranscripts,
-    /// Where a resumed read of the session starts; `None` when its own
-    /// transcript does not resume.
+    /// The point a resumed read of the session starts from; `None` when its
+    /// own transcript does not resume.
     pub(crate) checkpoint: Option<SessionCheckpoint>,
     /// The agent's ledger of what links the session's threads.
     pub(crate) ledger: Vec<u8>,
@@ -157,13 +159,14 @@ impl SessionTranscripts {
         self.subagents.folds.get(path).map(Vec::as_slice)
     }
 
-    /// What the read of the session's own transcript leaves for the next.
+    /// The state the read of the session's own transcript leaves for the
+    /// next read.
     pub(crate) fn own_read(&self) -> &TranscriptRead {
         &self.own_read
     }
 
-    /// What the read of the sub-agent transcript at `path` leaves for the
-    /// next; `None` when the parse did not read it.
+    /// The state the read of the sub-agent transcript at `path` leaves for
+    /// the next read; `None` when the parse did not read it.
     pub(crate) fn subagent_read(&self, path: &Path) -> Option<&TranscriptRead> {
         self.subagents.reads.get(path)
     }
@@ -208,7 +211,7 @@ impl SessionTranscripts {
     }
 }
 
-/// A sub-agent transcript read whole, as a resumed read takes it in.
+/// A sub-agent transcript read whole, as input to a resumed read.
 pub(crate) struct SubagentShare {
     pub(crate) fold: ThreadFold,
     pub(crate) subagent_metadata: Vec<String>,
@@ -216,8 +219,8 @@ pub(crate) struct SubagentShare {
     pub(crate) read: TranscriptRead,
 }
 
-/// `projection`, the sub-agent transcript at `path` read whole, as a
-/// resumed read takes it in.
+/// `projection`, the sub-agent transcript at `path` read whole, as input to
+/// a resumed read.
 pub(crate) fn subagent_share(path: &Path, mut projection: SessionProjection) -> SubagentShare {
     let (_, fold) = SubagentContribution::of_projection(&projection);
     let subagent_metadata =
@@ -308,7 +311,7 @@ pub(crate) fn fold_tail(
 }
 
 /// `entry`, read at `record`, as the mark of the spliced turn it is, when
-/// it came from one of `subagents`. The mark carries no texts.
+/// it came from one of `subagents`. The mark doesn't carry any texts.
 fn spliced_mark(
     record: &RecordLine,
     entry: &LogEntry,
@@ -364,7 +367,7 @@ pub fn process_conversation_file(
 /// without any time is dated `clock`'s current time.
 ///
 /// A caller that knows which root a transcript came from knows more than the file
-/// does: a Pi-family transcript with no OMP title slot belongs to whichever agent
+/// does: a Pi-family transcript without an OMP title slot belongs to whichever agent
 /// owns the directory holding it.
 pub fn process_session_file(
     permit: ParsePermit<'_>,
@@ -564,15 +567,16 @@ fn row_with_subagents(
     Ok(ListedSession { row, transcripts })
 }
 
-/// The parse of a session whose format states no header, as
+/// The parse of a session whose format doesn't state a header, as
 /// [`headerless_session`] builds it.
 pub(crate) struct HeaderlessSession<'a> {
     pub(crate) source: Source,
     pub(crate) stub: &'a SessionStub,
-    /// The id the format's own rule names the session by.
+    /// The session ID the format's own rule gives the session.
     pub(crate) session_id: String,
     pub(crate) own: TranscriptEntries,
-    /// What the read of the session's own transcript leaves for the next.
+    /// The state the read of the session's own transcript leaves for the
+    /// next read.
     pub(crate) own_read: TranscriptRead,
     pub(crate) subagents: SubagentReads,
     /// The format's ledger of what links the session's threads.
@@ -715,8 +719,8 @@ pub(crate) struct SubagentReads {
     unreadable: Vec<(PathBuf, AppError)>,
 }
 
-/// What a session's sub-agent transcripts hold for its record in the
-/// session cache.
+/// The part of a session's record in the session cache that its sub-agent
+/// transcripts hold.
 #[derive(Default)]
 pub(crate) struct SubagentTranscripts {
     /// Every sub-agent turn, in the view's splice order.
@@ -793,8 +797,8 @@ impl SubagentRecordParts {
     }
 
     /// [`Self::of_entries`] for `projection`, whose share of the row at its
-    /// stable cursor is `fold`; takes its earlier transcripts and what its
-    /// read leaves for the next.
+    /// stable cursor is `fold`. Moves its earlier transcripts and the state
+    /// its read leaves for the next read out of `projection`.
     fn of_projection(projection: &mut SessionProjection, fold: ThreadFold) -> Self {
         let earlier_transcripts = std::mem::take(&mut projection.earlier_transcripts);
         Self {
@@ -1319,9 +1323,9 @@ pub(crate) enum TurnSource {
 /// - an assistant reply's text blocks joined
 /// - a metadata row's text
 ///
-/// `None` when [`filter_turn`] keeps nothing. Bump
+/// `None` when [`filter_turn`] doesn't keep any text. Bump
 /// [`SEMANTIC_TURN_VERSION`](crate::semantic::filter::SEMANTIC_TURN_VERSION)
-/// when what this returns changes.
+/// when this function's output changes.
 fn semantic_turn(source: TurnSource, text: &str) -> Option<String> {
     match source {
         TurnSource::User => filter_turn(SemanticTurnRole::User, text),
@@ -1336,10 +1340,10 @@ fn semantic_turn(source: TurnSource, text: &str) -> Option<String> {
 /// - an assistant reply's text blocks joined
 /// - a metadata row's text
 ///
-/// `None` for any other entry, and when [`filter_turn`] keeps nothing. The
-/// session cache reads each entry's turn from here; the parse calls
-/// [`shown_user_turn`] and [`assistant_semantic_turn`] on the texts it has
-/// extracted. Bump
+/// `None` for any other entry, and when [`filter_turn`] doesn't keep any
+/// text. The session cache reads each entry's turn from here; the parse
+/// calls [`shown_user_turn`] and [`assistant_semantic_turn`] on the texts it
+/// has extracted. Bump
 /// [`SEMANTIC_TURN_VERSION`](crate::semantic::filter::SEMANTIC_TURN_VERSION)
 /// when the entries with a turn change.
 pub(crate) fn entry_semantic_turn(entry: &LogEntry) -> Option<String> {
@@ -1389,7 +1393,8 @@ fn assistant_semantic_turn(text: &str) -> Option<String> {
 }
 
 /// The preview a user message shows: its skill's, else its own unless that
-/// is [`is_clear_metadata_message`]. `None` when the message shows none.
+/// is [`is_clear_metadata_message`]. `None` when the message doesn't show
+/// one.
 fn shown_user_preview(preview: String, skill_preview: Option<String>) -> Option<String> {
     let shown = match skill_preview {
         Some(skill_preview) => skill_preview,
@@ -1702,8 +1707,9 @@ impl ConversationBuilder {
         }
     }
 
-    /// The accumulated conversation, or the reason it holds nothing worth
-    /// listing: a `/clear`-only session, or one with no previewable text.
+    /// The accumulated conversation, or the reason it doesn't hold anything
+    /// worth listing: a `/clear`-only session, or a session without
+    /// previewable text.
     fn finish(
         self,
         source: Source,
@@ -1807,8 +1813,8 @@ impl ConversationBuilder {
 }
 
 /// The row facts of `fold`, the fold of the session at `path`, or the
-/// reason it holds nothing worth listing: a `/clear`-only session, or one
-/// without previewable text.
+/// reason it doesn't hold anything worth listing: a `/clear`-only session,
+/// or a session without previewable text.
 pub(crate) fn folded_row(
     fold: &RowFold,
     path: &Path,
@@ -1947,7 +1953,6 @@ pub(crate) fn is_clear_only_conversation(user_messages: &[String]) -> bool {
     super::row_fold::is_clear_only(user_messages)
 }
 
-/// Normalize whitespace in a string
 pub(crate) fn normalize_whitespace(s: &str) -> String {
     let mut normalized = String::with_capacity(s.len());
     for word in s.split_whitespace() {
@@ -3083,11 +3088,11 @@ mod tests {
         ] {
             assert!(
                 searched.contains(included),
-                "{included} missing from {searched}"
+                "the searched text contains {included}: {searched}"
             );
             assert!(
                 searched_lower.contains(included),
-                "{included} missing from {searched_lower}"
+                "the lower-cased searched text contains {included}: {searched_lower}"
             );
         }
         assert!(!conv.full_text.contains("/cwd/private-sentinel"));
@@ -3505,8 +3510,14 @@ mod tests {
             .unwrap()
             .semantic_route_text();
 
-        assert!(!route_text.contains("weighing"), "{route_text}");
-        assert!(!route_text.contains("WebFetch"), "{route_text}");
+        assert!(
+            !route_text.contains("weighing"),
+            "the route text leaves out thinking: {route_text}"
+        );
+        assert!(
+            !route_text.contains("WebFetch"),
+            "the route text leaves out tool names: {route_text}"
+        );
     }
 
     #[test]
@@ -3822,7 +3833,10 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(session.subagents, subagents);
         let route_text = session.semantic_route_text();
-        assert!(route_text.contains("thread"), "{route_text}");
+        assert!(
+            route_text.contains("thread"),
+            "the route text includes the sub-agent threads' text: {route_text}"
+        );
     }
 
     #[test]

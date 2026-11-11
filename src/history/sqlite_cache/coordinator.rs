@@ -42,7 +42,8 @@ impl Coordinator {
         &self.base
     }
 
-    /// Who owns the cache's refresh now, without waiting or writing.
+    /// The current owner of the cache's refresh, observed without waiting or
+    /// writing.
     pub(crate) fn observe(&self) -> Result<Observation> {
         observer::observe(&self.base)
     }

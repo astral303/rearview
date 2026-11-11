@@ -44,9 +44,10 @@ impl SqliteCache {
         self.read_catalogue(storage, source, root, show_last, None)
     }
 
-    /// What each session under `root` recorded of itself, by cache key: its
-    /// id and working directory when it is listed, `None` when it holds no
-    /// conversation or could not be read. Read without the rows' text.
+    /// The record each session under `root` kept of itself, by cache key:
+    /// its session ID and working directory when it is listed, `None` when
+    /// it doesn't hold a conversation or could not be read. Read without the
+    /// rows' text.
     pub(crate) fn recorded_sessions(
         &self,
         storage: SessionCache,

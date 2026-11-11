@@ -129,7 +129,7 @@ pub(crate) fn newest_unverified_migration(connection: &Connection) -> Option<Str
 
 /// The session is its database: a query that fails is the failure the list
 /// reports, worded the same way. Every query runs in one read transaction,
-/// so the session's rows are read as of one moment.
+/// to read the session's rows as of one moment.
 fn project_session(
     connection: &Connection,
     reference: &SessionRef,
@@ -203,12 +203,12 @@ fn project_session(
 }
 
 /// Resumes a read of an OpenCode session's rows from the session's last
-/// message, which OpenCode rewrites while its reply streams. The rewrite check
-/// counts the rows before the cursor and takes the latest time OpenCode
-/// updated one, so a deleted or edited earlier row reads the session whole;
-/// an edit that leaves `time_updated` as it was is not detected. The identity
-/// is the session row's table, id, creation time, directory and whether it
-/// has a parent; every read takes the title again.
+/// message: OpenCode rewrites that message while its reply streams. The
+/// rewrite check counts the rows before the cursor and keeps the latest time
+/// OpenCode updated one: a deleted or edited earlier row makes the session
+/// read whole, and an edit that leaves `time_updated` unchanged is not
+/// detected. The identity is a hash of the session row's table, ID, creation
+/// time, directory and whether it has a parent; every read rereads the title.
 impl TranscriptReader for OpenCodeDbFormat {
     fn identity(&self, source: &Path) -> Result<Vec<u8>> {
         let Some(reference) = decode_ref(source) else {
@@ -237,7 +237,7 @@ impl TranscriptReader for OpenCodeDbFormat {
 
     /// True when the session's rows are as `read` found them: as many in
     /// each table, none updated later, and the session row the same, its
-    /// title included. A renamed session changes no message or part row.
+    /// title included. A rename doesn't change any message or part row.
     fn is_unchanged_since(&self, source: &Path, read: &TranscriptRead) -> Result<bool> {
         let (Some(reference), Ok(cursor), Ok(state)) = (
             decode_ref(source),
@@ -369,11 +369,11 @@ fn find_session(
     Ok(None)
 }
 
-/// The session's title: only a top-level session carries it, since a
+/// The session's title: only a top-level session carries it, because a
 /// sub-agent row is read through its parent and is not listed. OpenCode
-/// autogenerates titles and stores no custom-title marker; they are the
-/// session's one display name, so they project as titles, the treatment Pi
-/// titles get.
+/// autogenerates titles and doesn't store a custom-title marker. The title
+/// projects as a title, as Pi's titles do, because it is the session's one
+/// display name.
 fn session_title(session: &SessionRow) -> Option<String> {
     let trimmed = session.title.trim();
     (session.parent_id.is_none() && !trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -390,8 +390,8 @@ fn title_entry(title: &str) -> (usize, LogEntry) {
     )
 }
 
-/// A hash of what a read takes from the session row of `session_id` in
-/// `table` besides the title.
+/// A hash of the fields a read uses from the session row of `session_id` in
+/// `table`, besides the title.
 fn session_identity(table: SessionTable, session_id: &str, session: &SessionRow) -> Vec<u8> {
     let facts = serde_json::to_vec(&(
         table.name(),
@@ -404,9 +404,9 @@ fn session_identity(table: SessionTable, session_id: &str, session: &SessionRow)
     blake3::hash(&facts).as_bytes().to_vec()
 }
 
-/// How many of a session's rows a table holds, and the latest time OpenCode
-/// updated one of them: OpenCode stamps a row with the time it writes it, so
-/// a deleted row lowers the count and an edited one raises the time.
+/// The count of a session's rows in a table, and the latest time OpenCode
+/// updated one of them. A deleted row lowers the count and an edited one
+/// raises the time, because OpenCode stamps a row with the time it writes it.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct RowsSeen {
     count: u64,
@@ -428,11 +428,11 @@ impl RowsSeen {
     }
 }
 
-/// What the rows before a read's cursor leave the read.
+/// The state the rows before a read's cursor leave the read.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct RowsStart {
-    /// The lines their entries take up: the read numbers its entries from
-    /// the line after.
+    /// The count of lines their entries occupy: the read numbers its entries
+    /// from the line after.
     lines_before: usize,
     /// The model the last of them named.
     last_model: Option<String>,
@@ -450,8 +450,8 @@ impl RowsStart {
 /// A read of a session's rows from a cursor of type `C`.
 struct RowsRead<C> {
     sink: EntrySink,
-    /// Where the next read starts, and what the rows before it leave it;
-    /// `None` when the next read cannot resume from this one.
+    /// The next read's cursor, and the state the rows before it leave it;
+    /// `None` when the next read can't resume from this one.
     next: Option<(C, RowsStart)>,
     /// Every row of the session, by table, as the read found them.
     every_row: Vec<RowsSeen>,
@@ -470,7 +470,7 @@ impl<C> RowsRead<C> {
     }
 }
 
-/// Where a read of a session's rows starts, in the table holding the
+/// The start of a read of a session's rows, in the table holding the
 /// session.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 enum RowsCursor {
@@ -512,8 +512,8 @@ impl RowsCursor {
     }
 }
 
-/// What a read of a session's rows leaves at its cursor: the rows before
-/// it, every row the read found, and the session's title.
+/// The state a read of a session's rows leaves at its cursor: the rows
+/// before it, every row the read found, and the session's title.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RowsState {
     start: RowsStart,
@@ -521,8 +521,8 @@ struct RowsState {
     title: Option<String>,
 }
 
-/// The entries of `session_id`'s rows from `cursor` on, `start` being what
-/// the rows before it leave.
+/// The entries of `session_id`'s rows from `cursor` on, `start` being the
+/// state the rows before it leave.
 fn read_rows(
     connection: &Connection,
     session_id: &str,
@@ -542,10 +542,10 @@ fn read_rows(
     })
 }
 
-/// What a read whose next read starts at `next` leaves for it, for the
-/// session whose identity is `identity`, whose title is `title` and whose
-/// rows the read found as `every_row`. The cursor and the stable cursor are
-/// one: every read derives its entries again from where it starts.
+/// The [`TranscriptRead`] for the next read, starting at `next`, of the
+/// session with the identity `identity` and the title `title`, whose rows
+/// the read found as `every_row`. The cursor and the stable cursor are the
+/// same, because every read derives its entries again from its start.
 fn rows_read(
     identity: Vec<u8>,
     title: Option<String>,
@@ -634,9 +634,9 @@ impl SessionTables {
 
     /// One query over every session: a session in both tables from
     /// `opencode_2`, every other from the table holding it. `opencode_1` and
-    /// `opencode_2` select the same columns and each ends with its `FROM`
-    /// clause, which names its session table `s`. A database with neither
-    /// runs `opencode_1`, which fails.
+    /// `opencode_2` select the same columns, and each ends with a `FROM`
+    /// clause that names its session table `s`. A database with neither
+    /// table runs `opencode_1`, and the query fails.
     pub(crate) fn select_sessions(self, opencode_1: &str, opencode_2: &str) -> String {
         match (self.opencode_1, self.opencode_2) {
             (true, true) => format!(
@@ -2117,7 +2117,8 @@ mod tests {
 
         /// Asserts that `prefix`, a read of the session before the window,
         /// up to the window's first line, and then `window`, hold what `full`
-        /// holds, and leave what it leaves for the next read.
+        /// holds, and that `window` leaves the same [`TranscriptRead`] as
+        /// `full`.
         fn assert_window_completes(
             name: &str,
             prefix: &SessionProjection,
@@ -2138,7 +2139,7 @@ mod tests {
             );
             assert_eq!(
                 window.read, full.transcript_read,
-                "{name}: the window leaves what the full read leaves"
+                "{name}: the window leaves the full read's `TranscriptRead`"
             );
         }
 
@@ -2196,7 +2197,7 @@ mod tests {
             );
             assert!(
                 matches!(opencode_1, Resumption::Window(_)),
-                "{opencode_1:?}"
+                "OpenCode 1 resumes after a part completes in place: {opencode_1:?}"
             );
 
             let opencode_2 = resumed_after(
@@ -2207,7 +2208,7 @@ mod tests {
             );
             assert!(
                 matches!(opencode_2, Resumption::Window(_)),
-                "{opencode_2:?}"
+                "OpenCode 2 resumes after a running call completes in place: {opencode_2:?}"
             );
         }
 

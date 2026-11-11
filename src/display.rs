@@ -186,8 +186,8 @@ fn report_malformed_lines(
 
 /// The viewer's ledger rows for `conversation`, as `--render` and the
 /// terminal printout print them on `clock`'s local day: tools whole or
-/// summarized, and every task report and sub-agent reply whole, since nothing
-/// here can expand one.
+/// summarised, and every task report and sub-agent reply whole, because
+/// nothing here can expand one.
 fn rendered_ledger_lines(
     conversation: &ParsedConversation,
     options: &DisplayOptions,
@@ -231,7 +231,7 @@ pub fn render_to_terminal(
     Ok(())
 }
 
-/// The file `--render` names, which the printout parses: only
+/// The file `--render` names, for the printout to parse. Only
 /// [`render_to_terminal`] makes one.
 pub(crate) struct RenderedFile(());
 
@@ -343,9 +343,7 @@ mod tests {
         );
     }
 
-    /// A copy at the generation the command published is current though its
-    /// transcript changed after the write. A copy below that generation is
-    /// older.
+    /// A copy below the generation the command published is older.
     #[test]
     fn copy_at_the_published_generation_is_current_though_its_transcript_changed() {
         use crate::history::sqlite_cache::{Currency, Publication};
@@ -476,7 +474,10 @@ mod tests {
 
         let (entries, notices) = session.printed().unwrap();
 
-        assert!(entries.contains("sub-agent question"), "{entries}");
+        assert!(
+            entries.contains("sub-agent question"),
+            "the printout shows the new sub-agent: {entries}"
+        );
         assert_eq!(notices, "");
     }
 
@@ -496,7 +497,7 @@ mod tests {
 
         assert!(
             entries.contains("first question") && !entries.contains("sub-agent question"),
-            "{entries}"
+            "the printout shows the older copy, without the sub-agent: {entries}"
         );
         assert_eq!(
             notices,
@@ -528,7 +529,10 @@ mod tests {
 
         let (entries, notices) = session.printed().unwrap();
 
-        assert!(entries.contains("sub-agent question"), "{entries}");
+        assert!(
+            entries.contains("sub-agent question"),
+            "the printout shows the copy the refresh published: {entries}"
+        );
         assert_eq!(notices, "");
         assert_eq!(
             (
@@ -557,7 +561,10 @@ mod tests {
 
         let (entries, notices) = uncached.printed().unwrap();
 
-        assert!(entries.contains("unseen question"), "{entries}");
+        assert!(
+            entries.contains("unseen question"),
+            "the printout shows the session the refresh parsed: {entries}"
+        );
         assert_eq!(notices, "");
     }
 
@@ -572,7 +579,7 @@ mod tests {
 
         assert!(
             entries.contains("first question") && !entries.contains("sub-agent question"),
-            "{entries}"
+            "the printout shows the older copy, without the sub-agent: {entries}"
         );
         assert_eq!(
             notices,
@@ -590,13 +597,16 @@ mod tests {
 
         let (entries, notices) = session.beside_another_refresh(|| session.printed().unwrap());
 
-        assert!(entries.contains("sub-agent question"), "{entries}");
+        assert!(
+            entries.contains("sub-agent question"),
+            "the printout shows the copy another rearview published: {entries}"
+        );
         assert_eq!(notices, "");
     }
 
     /// Beside another rearview's refresh, the printout of an uncached
-    /// session fails: the cache doesn't hold a copy, and the printout may
-    /// not parse the session.
+    /// session fails: the session is not in the session cache, and the
+    /// printout may not parse it.
     #[test]
     fn printout_beside_another_refresh_fails_for_uncached_session() {
         let session = SessionWithNewSubAgent::new();
@@ -607,7 +617,10 @@ mod tests {
 
         let printed = uncached.beside_another_refresh(|| uncached.printed());
 
-        assert!(printed.is_err(), "{printed:?}");
+        assert!(
+            printed.is_err(),
+            "the printout of the uncached session fails: {printed:?}"
+        );
     }
 
     /// `--render` has no expand gesture, so a task report prints whole with

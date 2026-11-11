@@ -226,8 +226,7 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
     frame.render_widget(status, area);
 }
 
-/// Static, since the load that follows holds the thread and nothing could
-/// advance a spinner.
+/// The bottom bar while the viewer's read of the session to open runs.
 const OPENING_LABEL: &str = "Opening…";
 /// The viewer's bottom bar while a file opened directly, already shown, is
 /// read again: after `Ctrl+R`, or while its session refresh runs.
@@ -2290,7 +2289,7 @@ enum Recency {
 }
 
 /// Format a timestamp as relative time for recent entries, absolute for older ones,
-/// in `now`'s zone. Returns (formatted_string, recency) for color grading.
+/// in `now`'s zone. Returns (formatted_string, recency) for colour grading.
 fn format_timestamp(timestamp: DateTime<Local>, now: DateTime<Zone>) -> (String, Recency) {
     let timestamp = timestamp.with_timezone(&now.timezone());
     let age = now.signed_duration_since(timestamp);
@@ -2554,7 +2553,7 @@ mod tests {
         }
     }
 
-    /// A timestamp in the test clock's year, so its date carries no year.
+    /// A timestamp in the test clock's year, so its date doesn't show a year.
     fn this_year(rest: &str) -> String {
         use chrono::Datelike;
         format!("{}-{rest}", TestClock::start_wall().year())
@@ -3320,8 +3319,14 @@ mod tests {
         clock.set_wall((last_message + chrono::Duration::days(1)).to_utc());
         let a_day_later = render_list_contents(&app, 100, 4);
 
-        assert!(two_hours_later.contains("2 hours ago"), "{two_hours_later}");
-        assert!(a_day_later.contains("yesterday"), "{a_day_later}");
+        assert!(
+            two_hours_later.contains("2 hours ago"),
+            "two hours on the list's clock show as 2 hours ago: {two_hours_later}"
+        );
+        assert!(
+            a_day_later.contains("yesterday"),
+            "a day on the list's clock shows as yesterday: {a_day_later}"
+        );
     }
 
     /// While a search runs, the results on screen still answer the previous
@@ -3945,10 +3950,13 @@ mod tests {
         let bottom = row_text(&draw_list_mode(&list), BOTTOM_BAR_ROW);
         let viewer_line = viewer_status_bar(&viewer);
 
-        assert!(bottom.contains(ANOTHER_REFRESH_LABEL), "{bottom:?}");
+        assert!(
+            bottom.contains(ANOTHER_REFRESH_LABEL),
+            "the list's bottom bar shows the refresh label: {bottom:?}"
+        );
         assert!(
             viewer_line.contains(ANOTHER_REFRESH_LABEL),
-            "{viewer_line:?}"
+            "the viewer's bottom bar shows the refresh label: {viewer_line:?}"
         );
     }
 
@@ -3961,8 +3969,14 @@ mod tests {
         app.set_cache_wait(Some(OtherRearview::Rebuilding));
         let rebuilding = row_text(&draw_list_mode(&app), BOTTOM_BAR_ROW);
 
-        assert!(refreshing.contains(ANOTHER_REFRESH_LABEL), "{refreshing:?}");
-        assert!(rebuilding.contains(ANOTHER_REBUILD_LABEL), "{rebuilding:?}");
+        assert!(
+            refreshing.contains(ANOTHER_REFRESH_LABEL),
+            "the bottom bar names another rearview's refresh: {refreshing:?}"
+        );
+        assert!(
+            rebuilding.contains(ANOTHER_REBUILD_LABEL),
+            "the bottom bar names another rearview's rebuild: {rebuilding:?}"
+        );
     }
 
     #[test]
@@ -3976,13 +3990,22 @@ mod tests {
         let bottom = row_text(&draw_list_mode(&list), BOTTOM_BAR_ROW);
         let viewer_line = viewer_status_bar(&viewer);
 
-        assert!(!bottom.contains(ANOTHER_REFRESH_LABEL), "{bottom:?}");
-        assert!(bottom.contains("Enter"), "{bottom:?}");
+        assert!(
+            !bottom.contains(ANOTHER_REFRESH_LABEL),
+            "the list's bottom bar doesn't show the refresh label: {bottom:?}"
+        );
+        assert!(
+            bottom.contains("Enter"),
+            "the list's bottom bar shows its keys: {bottom:?}"
+        );
         assert!(
             !viewer_line.contains(ANOTHER_REFRESH_LABEL),
-            "{viewer_line:?}"
+            "the viewer's bottom bar doesn't show the refresh label: {viewer_line:?}"
         );
-        assert!(viewer_line.contains("quit"), "{viewer_line:?}");
+        assert!(
+            viewer_line.contains("quit"),
+            "the viewer's bottom bar shows its keys: {viewer_line:?}"
+        );
     }
 
     fn lexical_list_app() -> App {

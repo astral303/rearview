@@ -22,7 +22,7 @@ pub(crate) enum ListChange {
     },
 }
 
-/// What a [`ListChange`] did to the session at `path`.
+/// The result of a [`ListChange`] on the session at `path`.
 pub(crate) enum ListChangeOutcome {
     Renamed {
         path: PathBuf,
@@ -36,7 +36,7 @@ pub(crate) enum ListChangeOutcome {
 }
 
 impl ListChange {
-    /// Make the change as `operation`'s refresh owner. Fails as acquiring
+    /// Make the change as `operation`'s refresh owner. Fails when acquiring
     /// the ownership fails.
     pub(crate) fn make(self, operation: &OperationScope) -> ListChangeOutcome {
         match self {

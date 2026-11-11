@@ -479,8 +479,8 @@ fn message_copy_during_read_waits_for_it_though_newer_refresh_fails() {
     let copied_during_read = COPIED.with(|copied| copied.borrow().clone());
     gate.open();
     let landed = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
-    // The read found its copy older than the file and asked for a refresh,
-    // which fails as the newer one did.
+    // The read found its copy older than the file and asked for a refresh;
+    // that refresh fails as the newer one did.
     serve_session_refresh(&mut app);
     let copied = COPIED.with(|copied| copied.borrow().clone());
 
@@ -898,8 +898,8 @@ fn press_refresh_outside_every_root(app: &mut App) {
     test_waits::finish_pending_view_reload(app, VIEWPORT);
 }
 
-/// The file at `path` opened directly in an environment reading no
-/// provider's sessions, so it lies outside every session root.
+/// The file at `path` opened directly in an environment without any
+/// provider's storage, so it lies outside every session root.
 fn opened_outside_every_root(path: &Path) -> App {
     let mut app = App::new_single_file_read(
         path.to_path_buf(),
@@ -926,7 +926,7 @@ fn refresh_reads_directly_opened_file_again() {
     assert_eq!(app.conversations()[0].message_count, 5);
 }
 
-/// A session holding only its header lists no row; a refresh once it holds
+/// A session holding only its header doesn't list a row; a refresh once it holds
 /// its conversation shows its sub-agents.
 #[test]
 fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refresh() {
@@ -1115,10 +1115,10 @@ fn refresh_of_cached_session_opened_directly_updates_viewer_whatever_spelling() 
     }
 }
 
-/// The app viewing session `a` of `home`, whose unpublished row expects a
-/// sub-agent that the cached copy lacks: `a`'s parent transcript is
+/// The app viewing session `a` of `home`. Its unpublished row expects a
+/// sub-agent missing from the cached copy: `a`'s parent transcript is
 /// unchanged since the copy was written, and the write that adds the
-/// sub-agent has not landed.
+/// sub-agent has not committed.
 fn viewer_over_unwritten_subagent(home: &ClaudeHome) -> App {
     let environment = home.environment();
     let transcript = home.write("a", 5, &["first question"]);
@@ -1269,7 +1269,11 @@ fn every_reader_finds_session_by_name_renamed_outside_its_transcript() {
                 .unwrap()
         })
         .collect::<Vec<_>>();
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "every reader finds the renamed session:\n{}",
+        wrong.join("\n")
+    );
 }
 
 /// The rows a list launches with.

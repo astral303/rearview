@@ -56,9 +56,9 @@ pub(super) fn validate(connection: &Connection, places: &Places, session: i64) -
     validate_unstamped(connection, places, session, &HashSet::new())
 }
 
-/// [`validate`] for the files of `session` outside `stamped`: files whose
-/// discovery stamps the caller compared with the cache's, and that are not
-/// stat again.
+/// [`validate`] for the files of `session` outside `stamped`. The caller
+/// already compared the discovery stamps of the files in `stamped` with the
+/// cache's, and they aren't stat again.
 pub(super) fn validate_unstamped(
     connection: &Connection,
     places: &Places,

@@ -1,8 +1,8 @@
-//! The session row's fold: what the list's row of a session holds besides
-//! its texts — previews, titles, model, tokens, times, counts and the
-//! message numbering — folded entry by entry in the order the view walks
-//! the session. A fold stops at a checkpoint and starts again from it, so a
-//! resumed read folds only the entries past the checkpoint.
+//! The session row's fold: the previews, titles, model, tokens, times,
+//! counts and message numbering of a session's row in the list, besides its
+//! texts, folded entry by entry in the order the view walks the session. A
+//! fold stops at a checkpoint and starts again from it, so a resumed read
+//! folds only the entries past the checkpoint.
 
 use crate::agent::message_numbering::{MessageNumbering, NumberingCheckpoint, ThreadIdentity};
 use crate::history::message_times::{MessageTimes, MessageTimesBuilder};
@@ -58,7 +58,7 @@ struct RowFacts {
     /// keeps outside the transcript.
     leading_summary: Option<String>,
     /// The last title an entry after the leading ones set: `Some(None)` for
-    /// a blank one, which clears the title.
+    /// a blank one, because a blank title clears the title.
     entry_title: Option<Option<String>>,
     model: Option<String>,
     anonymous_tokens: u64,
@@ -70,8 +70,7 @@ struct RowFacts {
     assistant_messages: usize,
 }
 
-/// The first and the last [`PREVIEW_PARTS`] preview parts, and how many
-/// there are.
+/// The first and the last [`PREVIEW_PARTS`] preview parts, and their count.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct PreviewParts {
     first: Vec<String>,
@@ -205,7 +204,7 @@ impl FoldCheckpoint {
     }
 }
 
-/// What numbering an entry gave it.
+/// The thread and message number the fold gave an entry.
 #[derive(Clone, Copy)]
 pub(crate) struct Folded {
     pub(crate) thread: i64,
@@ -230,7 +229,7 @@ pub(crate) struct FoldedRow {
     pub(crate) last_activity: Option<DateTime<FixedOffset>>,
 }
 
-/// The reason a fold lists no row.
+/// The reason a fold doesn't list a row.
 pub(crate) enum Unlisted {
     ClearOnly,
     Empty {
@@ -490,7 +489,7 @@ impl RowFold {
         self.reply_tokens() + self.facts.anonymous_tokens
     }
 
-    /// The row's facts, or the reason the session lists no row.
+    /// The row's facts, or the reason the session doesn't list a row.
     pub(crate) fn finish(&self) -> Result<FoldedRow, Unlisted> {
         if self.facts.clear_only.is_clear_only() {
             return Err(Unlisted::ClearOnly);

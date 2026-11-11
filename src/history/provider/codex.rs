@@ -1891,10 +1891,10 @@ pub(super) mod tests {
         sessions_root_at(home.join("sessions"))
     }
 
-    /// A session whose rollout before an edit Codex archived, as it did its
-    /// sub-agent's: the cache stores each file below its own root, the
-    /// restored row names each and the viewer reads them all, and a load
-    /// after the files are deleted deletes the session's rows.
+    /// Codex archived the session's and the sub-agent's rollouts from before
+    /// an edit. The cache stores each file below its own root, the restored
+    /// row names each and the viewer reads them all; a load after the files
+    /// are deleted deletes the session's rows.
     #[test]
     fn archived_rollouts_are_stored_below_archived_tree_and_read_with_session() {
         use crate::history::environment::test_support::{
@@ -2639,16 +2639,19 @@ pub(super) mod tests {
         let restored = load_rows(&storage, cache_base.path());
 
         let [parsed] = parsed.as_slice() else {
-            panic!("{} sessions when parsed", parsed.len());
+            panic!("the first load lists one session, not {}", parsed.len());
         };
         assert_eq!(
             parsed.load_held_content().unwrap().row.agent_search_text,
             kept_only.agent_search_text
         );
         let [restored] = restored.as_slice() else {
-            panic!("{} sessions when restored", restored.len());
+            panic!("the second load lists one session, not {}", restored.len());
         };
-        assert!(restored.cached_session.is_some(), "restored from the cache");
+        assert!(
+            restored.cached_session.is_some(),
+            "the second load restores the session from the cache"
+        );
         for row in [parsed, restored] {
             assert_eq!(row.subagents, vec![thread.kept.clone()]);
             assert_eq!(row.message_count, kept_only.message_count);

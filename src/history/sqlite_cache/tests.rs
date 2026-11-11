@@ -41,8 +41,8 @@ pub(crate) fn mark_writing(copy: &super::CachedSession) {
         .unwrap();
 }
 
-/// Gives the session `copy` reads a generation no write gave, as a write of
-/// another copy of it does, and returns that generation.
+/// Gives the session `copy` reads a new generation, as a write of another
+/// copy of it does, and returns that generation.
 pub(crate) fn replace_copy(copy: &super::CachedSession) -> i64 {
     let cache = SqliteCache::open(&copy.base).unwrap();
     cache
@@ -57,8 +57,8 @@ pub(crate) fn replace_copy(copy: &super::CachedSession) -> i64 {
 }
 
 /// A read-write connection to the session cache in `base`, as another
-/// rearview's write opens it. It takes no refresh ownership: a test holding
-/// another rearview's ownership keeps it.
+/// rearview's write opens it. It doesn't take refresh ownership: a test
+/// holding another rearview's ownership keeps it.
 fn other_rearviews_connection(base: &Path) -> Connection {
     let connection = connection::open(
         &database_path(base),
@@ -205,7 +205,7 @@ pub(crate) fn cached_row(base: &Path, session: &AgentSession) -> Conversation {
         .unwrap()
         .unwrap()
     else {
-        panic!("listed fixture")
+        panic!("the fixture session is listed")
     };
     *listed
 }
@@ -230,7 +230,7 @@ pub(super) fn every_record_copies(base: &Path) -> Vec<super::CachedSession> {
                 .unwrap()
                 .unwrap()
             else {
-                panic!("listed fixture")
+                panic!("the fixture session is listed")
             };
             listed.cached_session.unwrap()
         })
@@ -244,7 +244,8 @@ fn source_record(source: Source, path: &Path) -> (SessionRecord, SessionRoot) {
     (record, root)
 }
 
-/// `session`'s stub, as discovery would find its transcripts at `modified`.
+/// `session`'s stub, as discovery would find its transcripts modified at
+/// `modified_secs`.
 pub(super) fn stub_of(session: &AgentSession, modified_secs: u64) -> SessionStub {
     let fingerprint = if session.row.source == Source::OpenCode {
         opencode_fingerprint(&root_of(session), &session.row.path)
@@ -382,7 +383,7 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
         assert_eq!(
             canonical_message_times(read_transcript),
             canonical_message_times(expected_transcript),
-            "{:?} agent messages",
+            "{:?}'s cached agent messages match the parse's",
             row.source,
         );
         assert!(
@@ -418,7 +419,7 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
                     assert_eq!(
                         format!("{:?}", read.lines),
                         format!("{:?}", expected.lines),
-                        "{:?} viewer",
+                        "{:?}'s cached entries render the parse's viewer lines",
                         row.source
                     );
                     assert_eq!(
@@ -579,7 +580,7 @@ fn every_tool_result_is_stored_and_other_opaque_payloads_keep_only_their_positio
         ..
     } = &read.entries[0].1
     else {
-        panic!("a user message")
+        panic!("the first entry reads back as a user message with blocks")
     };
     assert!(
         matches!(&blocks[0], ContentBlock::Thinking { thinking, signature } if thinking == "retained thinking" && signature.is_empty())
@@ -600,7 +601,7 @@ fn every_tool_result_is_stored_and_other_opaque_payloads_keep_only_their_positio
         ..
     } = &blocks[2]
     else {
-        panic!("a result")
+        panic!("the third block reads back as a result with content")
     };
     assert_eq!(content[1]["text"], "retained result");
     assert_eq!(content[2], "retained bare string");
@@ -788,7 +789,7 @@ fn subagent_metadata_is_shared_across_transactions_and_preserves_origins() {
         below_root(&second)
     );
     let LogEntry::Progress { data, extra } = &read.entries[20_002].1 else {
-        panic!("a sub-agent turn")
+        panic!("the renamed sub-agent's turn reads back as a progress entry")
     };
     assert_eq!(data["identity"]["nickname"], "Renamed");
     assert_eq!(data["message"]["message"]["id"], "renamed-reply");
@@ -854,7 +855,7 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
         ..
     } = &read.entries[1].1
     else {
-        panic!("a user result entry")
+        panic!("the second entry reads back as a user message with result blocks")
     };
     assert!(
         matches!(&blocks[0], ContentBlock::ToolResult { content: Some(value), .. } if value == &result_content)
@@ -923,8 +924,6 @@ fn writing_session_again_replaces_its_rows() {
     assert_eq!(read.entries.len(), expected.entries.len());
 }
 
-/// A `SessionCache::schema_version` bump invalidates that provider's
-/// database rows.
 #[test]
 fn storage_written_under_another_schema_version_loses_its_sessions() {
     let base = tempfile::tempdir().unwrap();
@@ -957,7 +956,7 @@ fn storage_written_under_another_schema_version_loses_its_sessions() {
 }
 
 /// A run that stopped between a session's catalogue row and its last entry
-/// leaves the row marked as writing, which is not current.
+/// leaves the row marked writing.
 #[test]
 fn session_still_being_written_is_not_current() {
     let base = tempfile::tempdir().unwrap();
@@ -984,7 +983,7 @@ fn session_still_being_written_is_not_current() {
 }
 
 #[test]
-fn removed_session_leaves_no_rows() {
+fn removed_session_doesnt_leave_rows() {
     let base = tempfile::tempdir().unwrap();
     let mut cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
@@ -1010,7 +1009,10 @@ fn removed_session_leaves_no_rows() {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(rows, 0, "{table}");
+        assert_eq!(
+            rows, 0,
+            "the removal deletes the session's rows from {table}"
+        );
     }
 }
 
@@ -1262,6 +1264,6 @@ fn rebuild_doesnt_leave_write_ahead_log_while_database_is_out_of_wal_mode() {
     );
     assert!(
         !beside_database(base.path(), "-wal").exists(),
-        "the database out of WAL mode has no write-ahead log beside it"
+        "the database out of WAL mode doesn't have a write-ahead log beside it"
     );
 }

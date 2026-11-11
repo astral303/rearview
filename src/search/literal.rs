@@ -43,7 +43,7 @@ impl PartialEq for Literal {
 
 impl Eq for Literal {}
 
-/// How a literal finds its matches in a text.
+/// The literal's search for its matches in a text.
 #[derive(Debug, Clone)]
 enum LiteralSearch {
     /// The literal starts and ends with a word: find its first word, then
@@ -273,7 +273,7 @@ impl Literal {
         Some(end)
     }
 
-    /// False when `text` lacks one of the literal's words, so it holds no
+    /// False when `text` lacks one of the literal's words and can't hold a
     /// match. A case-insensitive literal may match any text holding a
     /// character whose lowercase holds one of its letters.
     fn may_occur_in(&self, text: &str, finders: &WordFinders) -> bool {
@@ -331,7 +331,7 @@ struct FoldedMatcher<'a> {
     resume_at: &'a [usize],
     matched: usize,
     /// The byte where each of the last `folded.len()` fed characters starts,
-    /// as a ring: `next_slot` holds the oldest and takes the next.
+    /// as a ring: `next_slot` holds the oldest and receives the next.
     starts: Vec<usize>,
     next_slot: usize,
 }

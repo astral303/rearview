@@ -65,18 +65,18 @@ impl SystemCanonicaliser {
 }
 
 impl Canonicaliser for SystemCanonicaliser {
-    // The one call every canonicalisation in the environment goes through.
+    // Every canonicalisation in the environment calls this method; the lint
+    // refuses `canonicalize` everywhere else.
     #[allow(clippy::disallowed_methods)]
     fn canonicalise(&self, path: &Path) -> std::io::Result<PathBuf> {
         std::fs::canonicalize(path)
     }
 }
 
-/// The lister one discovery walks a session root through. The root must
-/// list: its error fails the discovery. A directory beneath the root that
-/// cannot be listed, such as one an agent is deleting on Windows, lists as
-/// empty and is recorded, so the walk goes on and the directory hides only
-/// the sessions inside it.
+/// The lister one discovery walks a session root through. An error listing
+/// the root fails the discovery. A directory beneath the root that cannot be
+/// listed, such as one an agent is deleting on Windows, lists as empty and is
+/// recorded, so the walk continues and hides only the sessions inside it.
 pub struct DiscoveryLister<'a> {
     lister: &'a dyn DirectoryLister,
     root: &'a Path,
@@ -134,9 +134,9 @@ pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex;
 
-    /// `link` made a link to the directory `target`: a symbolic link on
-    /// Unix, a junction on Windows. Creating a junction does not require
-    /// administrator rights.
+    /// Makes `link` a link to the directory `target`: a symbolic link on
+    /// Unix, a junction on Windows, because creating a junction doesn't
+    /// require administrator rights.
     pub(crate) fn link_directory(target: &Path, link: &Path) {
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, link).unwrap();

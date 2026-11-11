@@ -148,7 +148,7 @@ impl SessionFormat for ClaudeTranscript {
 }
 
 /// Resumes a read of a Claude transcript from its stable cursor. The
-/// identity is the transcript's first line.
+/// identity is a hash of the transcript's first line.
 impl TranscriptReader for ClaudeTranscript {
     fn identity(&self, source: &Path) -> Result<Vec<u8>> {
         let mut reader = BufReader::new(File::open(source)?);
@@ -271,10 +271,10 @@ impl ThreadLinker for ClaudeTranscript {
     }
 }
 
-/// The thread of each sub-agent transcript at `subagents` that reads and
-/// holds a Claude record, in order, parsed on the rayon pool. The view has no
-/// debug channel for the others: the load reports them when the row is
-/// built.
+/// The thread of each readable sub-agent transcript at `subagents` that
+/// holds a Claude record, in order, parsed on the rayon pool. The view
+/// doesn't have a debug channel for the others; the load reports them when
+/// the row is built.
 fn subagent_threads(permit: ParsePermit<'_>, subagents: &[PathBuf]) -> Vec<SubagentThread> {
     subagents
         .par_iter()
@@ -308,8 +308,8 @@ struct SubagentRead {
     malformed_lines: Vec<MalformedLine>,
 }
 
-/// The sub-agent transcript at `path` read whole; `None` when it holds no
-/// Claude record. `_admitted` is the parse a permit admitted.
+/// The sub-agent transcript at `path` read whole; `None` when it doesn't
+/// hold a Claude record. `_admitted` is the parse a permit admitted.
 fn read_subagent(_admitted: Admitted, path: &Path) -> Result<Option<SubagentRead>> {
     let (transcript, transcript_read) = read_whole_transcript(
         path,
@@ -427,10 +427,10 @@ pub(crate) fn session_row(
 }
 
 /// Every sub-agent transcript at `subagents`, read in parallel and held at
-/// once: dropping an opening message that repeats its launching call's
-/// prompt reads the `Agent` calls of `session`, the session's own entries,
-/// and of every transcript. Returns the reads and the ledger of what links
-/// the threads. An unreadable transcript is left out of the threads to
+/// once, because dropping an opening message that repeats its launching
+/// call's prompt needs the `Agent` calls of `session`, the session's own
+/// entries, and of every transcript. Returns the reads and the encoded
+/// [`LaunchLedger`]. An unreadable transcript is left out of the threads to
 /// splice, as the view leaves it out.
 fn subagent_reads(
     permit: ParsePermit<'_>,
@@ -688,13 +688,13 @@ pub(crate) fn normalize_entry(entry: &mut LogEntry, sidecars: &SubagentSidecars)
 /// One Claude transcript, with no sub-agent transcript spliced in, each entry
 /// normalized by [`normalize_entry`] and repeated skill text dropped. Skill
 /// text is dropped before splicing because a spliced sub-agent turn does not
-/// carry `sourceToolUseID`. `_admitted` is the parse a permit admitted.
+/// carry `sourceToolUseID`. `admitted` is the parse a permit admitted.
 pub(crate) fn transcript_entries(admitted: Admitted, path: &Path) -> Result<TranscriptEntries> {
     Ok(read_transcript(admitted, path)?.0)
 }
 
-/// [`transcript_entries`], with what the read leaves for the next.
-/// `_admitted` is the parse a permit admitted.
+/// [`transcript_entries`], with the [`TranscriptRead`] the next read resumes
+/// from. `_admitted` is the parse a permit admitted.
 fn read_transcript(
     _admitted: Admitted,
     path: &Path,
@@ -745,8 +745,8 @@ fn identity_of(first_line: &str) -> Vec<u8> {
 /// Lines a malformed line keeps on each side of it, for `--debug`.
 const CONTEXT_LINES: usize = 2;
 
-/// What a read of a Claude transcript carries from its stable cursor to the
-/// next read.
+/// The state a read of a Claude transcript carries from its stable cursor to
+/// the next read.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct ReadState {
     /// Each thread's latest slash command, as [`RepeatedSkillText`] keeps it.
@@ -756,11 +756,11 @@ struct ReadState {
     lines_before: Vec<LineSpan>,
     /// The calls hook attachments before the stable cursor name, when the
     /// transcript doesn't hold any of them: a later call or result with one
-    /// of these ids would show the attachment's text.
+    /// of these IDs would show the attachment's text.
     unplaced_hooks: Vec<String>,
 }
 
-/// Where a read of a Claude transcript starts: a cursor, the state there,
+/// The start of a read of a Claude transcript: a cursor, the state there,
 /// and the transcript holding the lines before it.
 #[derive(Default)]
 struct PassStart<'a> {
@@ -775,23 +775,23 @@ struct TranscriptPass {
     malformed_lines: Vec<MalformedLine>,
     /// Past the last line with a line ending.
     cursor: LineCursor,
-    /// Where the next read starts: past the last line that opens a turn,
-    /// moved back to the first hook or hand-back call still without its
-    /// result, and to a malformed line short of its context after it.
+    /// The next read's start: past the last line that opens a turn, moved
+    /// back to the first hook or hand-back call without its result yet, and
+    /// to a malformed line short of its context after it.
     stable_cursor: LineCursor,
     stable_state: ReadState,
     /// The first line holding more than whitespace, read from the start,
     /// when it has a line ending.
     first_line: Option<String>,
-    /// True when a record of the pass shows in an entry before where it
-    /// started: a hook attachment naming a call the pass does not hold, or a
+    /// True when a record of the pass shows in an entry before the pass's
+    /// start: a hook attachment naming a call the pass does not hold, or a
     /// call or result an earlier hook attachment names.
     changes_earlier_entry: bool,
 }
 
 impl TranscriptPass {
-    /// What this read leaves for the next, the transcript's identity being
-    /// `identity` and `file` holding it.
+    /// The [`TranscriptRead`] the next read resumes from, for the transcript
+    /// with the identity `identity` that `file` holds.
     fn transcript_read(&self, identity: Vec<u8>, file: &mut File) -> Result<TranscriptRead> {
         Ok(TranscriptRead {
             cursor: self.cursor.encode(),
@@ -988,12 +988,12 @@ fn read_pass(
     })
 }
 
-/// Where the next read of `visited`, a pass from `from`, starts: past the
-/// last line with a line ending that opens a turn, else `from`; moved back
+/// The start of the next read of `visited`, a pass from `from`: past the
+/// last line with a line ending that opens a turn, else `from`. Moved back
 /// to the first malformed line short of its context after it, and to each
-/// hook or hand-back call whose result or hook message stands at or after
-/// the cursor, or that has no result in a line with a line ending yet. A
-/// later line changes their entries.
+/// hook or hand-back call with its result or hook message at or after the
+/// cursor, or without a result in a line with a line ending yet, because a
+/// later line changes those calls' entries.
 fn stable_cursor(visited: &VisitedLines<'_>, from: LineCursor) -> LineCursor {
     let mut calls: HashMap<&str, (LineCursor, bool)> = HashMap::new();
     let mut answered = HashSet::new();
@@ -1058,7 +1058,7 @@ fn stable_cursor(visited: &VisitedLines<'_>, from: LineCursor) -> LineCursor {
     stable
 }
 
-/// The ids of every call among `visited`'s records.
+/// The IDs of every call among `visited`'s records.
 fn called_ids<'a>(visited: &'a VisitedLines<'_>) -> HashSet<&'a str> {
     visited
         .records
@@ -1584,11 +1584,9 @@ mod tests {
     use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
 
-    /// A load's whole read of a session with two sub-agents, and the
-    /// entries an agent command parses of it, each admit every transcript
-    /// once.
+    /// Covers both the load's read and the entries an agent command parses.
     #[test]
-    fn whole_read_of_session_with_sub_agents_admits_each_transcript_once() {
+    fn whole_read_of_session_with_subagents_admits_each_transcript_once() {
         use crate::history::sqlite_cache::admitted_reads;
         let home = crate::tui::claude_home::ClaudeHome::new();
         let transcript = home.write("parent", 5, &["a question"]);
@@ -1627,15 +1625,11 @@ mod tests {
             .unwrap();
         let entry_reads = reads_since(&before);
 
-        assert_eq!(
-            load_reads,
-            [1, 1, 1],
-            "the load's admitted reads of each file"
-        );
+        assert_eq!(load_reads, [1, 1, 1], "the load admits each file once");
         assert_eq!(
             entry_reads,
             [1, 1, 1],
-            "the entries' admitted reads of each file"
+            "the agent command's parse admits each file once"
         );
     }
 
@@ -3048,7 +3042,8 @@ mod tests {
         /// Asserts that `prefix`, a read of a transcript's beginning, up to
         /// the window's first line, and then `window`, the read resumed from
         /// it over the whole transcript, hold what `full`, one read of the
-        /// whole transcript, holds, and leave what it leaves.
+        /// whole transcript, holds, and that `window` leaves the same
+        /// [`TranscriptRead`] as `full`.
         fn assert_window_completes(name: &str, prefix: &Read, window: &ResumedWindow, full: &Read) {
             let kept = prefix
                 .entries
@@ -3075,7 +3070,7 @@ mod tests {
             );
             assert_eq!(
                 window.read, full.read,
-                "{name}: the window leaves what the full read leaves"
+                "{name}: the window leaves the full read's `TranscriptRead`"
             );
         }
 

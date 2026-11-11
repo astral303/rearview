@@ -10,8 +10,8 @@ pub fn sanitize_agent_text(text: &str) -> String {
     without_terminal_codes(text).into_owned()
 }
 
-/// [`sanitize_agent_text`]'s output, borrowing `text` when it holds no
-/// terminal codes.
+/// [`sanitize_agent_text`]'s output, borrowing `text` when it doesn't hold
+/// any terminal codes.
 pub(crate) fn without_terminal_codes(text: &str) -> Cow<'_, str> {
     let mut runs = code_runs(text).peekable();
     if runs.peek().is_none() {
@@ -32,7 +32,7 @@ pub(crate) struct SplitText<'a> {
     /// [`sanitize_agent_text`]'s output for the text.
     pub(crate) text: Cow<'a, str>,
     /// The codes, encoded as [`join_terminal_codes`] reads them; `None` when
-    /// the text holds none.
+    /// the text doesn't hold any.
     pub(crate) codes: Option<Vec<u8>>,
 }
 

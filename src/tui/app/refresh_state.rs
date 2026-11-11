@@ -76,8 +76,8 @@ impl ListEdit {
 
     /// Record `read`, row `index` read again: a listed row replaces it, and a
     /// session that is gone or empty removes it. A failed read, or a session
-    /// missing from the cache, keeps the row: the read reveals nothing about
-    /// the session.
+    /// missing from the cache, keeps the row, because the read doesn't reveal
+    /// anything about the session.
     fn apply_reread(&mut self, index: usize, read: SessionRead) {
         match read {
             SessionRead::Listed(row) => {
@@ -146,7 +146,7 @@ fn read_by_source<E>(
 
 /// A session refresh: sessions to read again and cache on the background
 /// worker. A session opened out of date, the open session on a viewer
-/// `Ctrl+R`, a session found by ID that the cache lacks, and a session a
+/// `Ctrl+R`, a session found by ID that is not in the cache, and a session a
 /// refresh read without caching it each ask for one. While another refresh
 /// owns the cache, the request waits until that refresh completes.
 pub struct SessionRefresh {
@@ -289,7 +289,7 @@ impl App {
 
     /// The launch's cache writes stopped part way: ask for a session refresh
     /// of every row without a copy, parsed by the launch with a write that
-    /// didn't land, and of each of `stale`, the sessions it read from older
+    /// failed, and of each of `stale`, the sessions it read from older
     /// copies or left unlisted. Each of `stale` the list does not hold is
     /// tracked as found by discovery.
     pub fn refresh_what_the_launch_could_not_cache(&mut self, stale: Vec<StaleSession>) {
@@ -391,11 +391,11 @@ impl App {
         Some(state.conversation_path.clone())
     }
 
-    /// Show what the background worker's read of the file opened directly
-    /// found: a session inside a provider's session roots is followed as a
+    /// Show the result of the background worker's read of the file opened
+    /// directly: a session inside a provider's session roots is followed as a
     /// session refresh's read; a file outside them shows as parsed on the
-    /// next frame. Fails with the first read's failure, which ends the TUI;
-    /// a later read's failure shows as a status.
+    /// next frame. Fails with the first read's failure, and the failure ends
+    /// the TUI; a later read's failure shows as a status.
     pub fn finish_direct_file_read(&mut self, read: Result<DirectFileRead>) -> Result<()> {
         self.direct_file_read = None;
         let now = self.clock().now();
@@ -436,7 +436,7 @@ impl App {
 
     /// Show `row`, the file opened directly read again outside every
     /// provider's session roots, as the list's one row. A read again that
-    /// finds no conversation keeps the row and reports the file empty.
+    /// doesn't find a conversation keeps the row and reports the file empty.
     fn show_opened_file_row(&mut self, row: Option<Conversation>, is_first_read: bool) {
         let mut edit = ListEdit::default();
         match row {
@@ -468,9 +468,9 @@ impl App {
             if self.is_opened_file(&path)
                 && let SessionRead::Listed(row) = &mut read
             {
-                // File the row under the viewer's path, which the header and
-                // the viewer's refreshes find it by; the cache restores the
-                // row in discovery's spelling.
+                // File the row under the viewer's path: the header and the
+                // viewer's refreshes find the row by that path, and the cache
+                // restores the row in discovery's spelling.
                 row.path.clone_from(&path);
             }
             let unlisted = self.store.take_unlisted(&path);
@@ -494,7 +494,7 @@ impl App {
     }
 
     /// True when the list shows `row`, the refreshed row of `unlisted`, a
-    /// tracked session; false for a session nothing tracks.
+    /// tracked session; false for an untracked session.
     fn admits(&self, unlisted: Option<UnlistedSession>, row: &Conversation) -> bool {
         unlisted.is_some_and(|session| self.lists(session.origin(), row))
     }
@@ -617,7 +617,7 @@ impl App {
     /// The other rearview's work the list waits for: the wait the
     /// running load or background job publishes, or the refresh the
     /// sessions in `RowsAwaitingRefresh` wait for; `None` while the list
-    /// waits for no other rearview.
+    /// doesn't wait for another rearview.
     pub fn another_rearview_activity(&self) -> Option<OtherRearview> {
         self.cache_wait
             .or_else(|| match self.store.awaiting.as_ref()?.awaited {
@@ -666,8 +666,9 @@ impl App {
         }
     }
 
-    /// Record what the running load or background job waits for; `None`
-    /// while it waits for no other rearview, or none runs.
+    /// Record the other rearview the running load or background job waits
+    /// for; `None` while it doesn't wait for another rearview, or neither
+    /// runs.
     pub fn set_cache_wait(&mut self, wait: Option<OtherRearview>) {
         self.cache_wait = wait;
     }

@@ -52,8 +52,8 @@ pub(super) enum FinishedRefresh {
     Failed(AppError),
 }
 
-/// One session a session refresh read: the path it answers for, and what the
-/// read found.
+/// One session a session refresh read: the path it answers for, and the
+/// read's result.
 pub(super) struct FinishedRead {
     pub(super) path: PathBuf,
     pub(super) read: SessionRead,
@@ -136,8 +136,8 @@ impl RowsAwaitingRefresh {
 }
 
 impl SessionStore {
-    /// The store of a file opened directly. It requests no session refresh
-    /// until [`Self::allow_session_refreshes`].
+    /// The store of a file opened directly. It doesn't request a session
+    /// refresh until [`Self::allow_session_refreshes`].
     pub(super) fn for_a_file_opened_directly() -> Self {
         Self {
             refuses_session_refreshes: true,
@@ -396,7 +396,7 @@ impl SessionStore {
     }
 
     /// The other rearview's activity the row at `path` awaits; `None` while
-    /// it awaits none.
+    /// it doesn't await one.
     pub(super) fn another_rearview_awaited_by(&self, path: &Path) -> Option<OtherRearview> {
         let awaiting = self
             .awaiting

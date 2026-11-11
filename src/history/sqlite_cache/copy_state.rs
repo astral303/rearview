@@ -2,7 +2,7 @@
 //! classifies a row, [`RowState::at`] reads the row at one session's
 //! address, and [`LISTED_COPY`] and [`SETTLED_ROW`] are the same
 //! classification as SQL conditions for queries over many rows. A read that
-//! holds no data of a copy reports one [`CopyMiss`].
+//! doesn't hold any data of a copy reports one [`CopyMiss`].
 
 use super::files::RootKey;
 use super::{SessionAddress, SessionStatus, catalogue, is_storage_current};
@@ -56,7 +56,8 @@ impl RowState {
     }
 
     /// The state of the row of the session at `address`, in `connection`'s
-    /// snapshot. A storage written under another schema version holds none.
+    /// snapshot. A storage written under another schema version doesn't hold
+    /// a row.
     pub(super) fn at(connection: &Connection, address: &SessionAddress) -> Result<Self> {
         if !is_storage_current(connection, address.storage)? {
             return Ok(Self::NotThere);
@@ -124,13 +125,14 @@ pub(super) fn listed_session_of(
     }
 }
 
-/// A read of one copy of a session: its data, or why it holds none.
+/// A read of one copy of a session: its data, or the reason it doesn't hold
+/// any.
 pub(crate) type CopyRead<T> = std::result::Result<T, CopyMiss>;
 
-/// Why a read of a session's copy holds no data of it.
+/// The reason a read of a session's copy doesn't hold any data of it.
 #[derive(Debug)]
 pub(crate) enum CopyMiss {
-    /// The cache holds no listed copy of the session: none was written,
+    /// A listed copy of the session is not in the cache: none was written,
     /// another write removed it, or the session is no longer listed.
     NotThere,
     /// The session's copy is being written, or its entries were kept out; a
@@ -147,8 +149,8 @@ impl From<AppError> for CopyMiss {
 }
 
 /// `read` as the viewer, the printout and the agent commands take it: `None`
-/// for a copy that is not there or not ready, which an agent command names
-/// in its `stale-cache` record; a failed read as its error.
+/// for a copy that is not there or not ready, and a failed read as its
+/// error. An agent command names a `None` copy in its `stale-cache` record.
 pub(crate) fn found<T>(read: CopyRead<T>) -> Result<Option<T>> {
     match read {
         Ok(data) => Ok(Some(data)),

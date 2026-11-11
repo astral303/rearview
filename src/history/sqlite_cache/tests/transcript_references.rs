@@ -88,8 +88,8 @@ fn statement_journal_files_of(connection: &Connection, statement: &str) -> usize
 /// Counts the files SQLite moves a statement journal past 64 KiB to, with
 /// temporary storage in files: SQLite doesn't report statement journals. In
 /// WAL mode, as the cache runs, a statement journal holds every page its
-/// statement changes. The update of every entry keeps a journal, which shows
-/// the count works.
+/// statement changes. The update of every entry keeps a journal: the test
+/// checks the count against it.
 #[test]
 fn session_removal_doesnt_keep_a_statement_journal() {
     register_counting_vfs();

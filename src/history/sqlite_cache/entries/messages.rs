@@ -101,7 +101,7 @@ pub(super) struct Membership {
 
 impl<'a> Messages<'a> {
     /// The grouping after the entries `numbering` was checkpointed past,
-    /// holding no message yet.
+    /// before it holds any message.
     pub(super) fn resumed(numbering: &NumberingCheckpoint) -> Self {
         Self {
             numbering: MessageNumbering::resumed(numbering),
@@ -157,8 +157,6 @@ impl<'a> Messages<'a> {
         let contributes = numbered.is_some();
         if let Some(message) = stored {
             let row = &mut self.rows[message];
-            // Usage snapshots can change while a reply streams. Match the
-            // catalogue's last-record rule rather than summing the copies.
             if row.ordinal.is_none() && ordinal.is_some() {
                 row.report_has_text = report.is_report.then_some(report.has_text);
                 row.report_task_id = report.sender.task_id;
@@ -174,6 +172,8 @@ impl<'a> Messages<'a> {
             row.cwd = columns.cwd.or(row.cwd);
             row.parent_tool_use_id = columns.parent_tool_use_id.or(row.parent_tool_use_id);
             row.source_tool_use_id = columns.source_tool_use_id.or(row.source_tool_use_id);
+            // Keep the last record's usage, as the catalogue does, rather than
+            // summing the records: usage snapshots change while a reply streams.
             row.usage = columns.usage.or(row.usage);
             return Some(Membership {
                 message,

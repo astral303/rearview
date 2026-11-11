@@ -178,7 +178,7 @@ fn cached_session_count(base: &Path) -> i64 {
 
 /// Refresh ownership of the cache `base` names, acquired on a thread of its
 /// own, as a background thread holds it: the TUI's thread is the drawing
-/// thread, which refuses ownership.
+/// thread, and refresh ownership refuses the drawing thread.
 fn acquired_elsewhere(base: CacheBase) -> RefreshOwnership {
     std::thread::spawn(move || RefreshOwnership::acquire_for_test(&base).unwrap())
         .join()
@@ -228,7 +228,7 @@ fn tick_until_error(runtime: &mut Runtime, terminal: &mut Terminal<TestBackend>)
 
 /// Finish the command whose TUI over the session cache `base` stopped with
 /// `error`, as rearview does: delete the cache database when a write found
-/// its drive low on space. The stderr it writes.
+/// its drive low on space. Returns the stderr it writes.
 fn finish_tui_command(error: AppError, base: &crate::history::CacheBase) -> String {
     let mut report = Vec::new();
     let (failed, written) = crate::finish_command(Err(error), Some(base), &mut report);
@@ -539,7 +539,10 @@ fn launch_behind_another_rearviews_refresh_lists_cache_as_it_is_under_label() {
     drop(other_refresh);
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
 
-    assert!(shown.contains("Another rearview is refreshing…"), "{shown}");
+    assert!(
+        shown.contains("Another rearview is refreshing…"),
+        "the launch shows the waiting label: {shown}"
+    );
     assert_eq!(cached_message_count, 1);
     assert_eq!(runtime.app().conversations()[1].message_count, 2);
 }
@@ -1144,8 +1147,8 @@ fn forget_every_cached_session(cache: &Path) {
         .unwrap();
 }
 
-/// What keeps a job of this rearview from finishing while a test looks at
-/// the screen. Dropping it lets the job finish.
+/// A hold that keeps a job of this rearview from finishing while a test
+/// looks at the screen. Dropping it lets the job finish.
 enum Hold {
     /// No other rearview runs; this rearview's own commit waits at a gate.
     ThisRearviewsCommit { _gate: CommitGate },
@@ -1252,9 +1255,9 @@ fn opening_changed_session_behind_another_rearviews_refresh_shows_copy_under_its
     );
 }
 
-/// Open a session the cache lacks while `hold` keeps its refresh from
-/// finishing: the viewer shows `label` and no message, then the session
-/// once the refresh finishes.
+/// Open a session not in the session cache while `hold` keeps its refresh
+/// from finishing: the viewer shows `label` without any message, then the
+/// session once the refresh finishes.
 fn assert_an_opened_uncached_session_shows(hold: impl FnOnce(&Path) -> Hold, label: &'static str) {
     let home = ClaudeHome::new();
     home.write("a", 5, &["first question"]);
@@ -1337,7 +1340,7 @@ fn fail_session_writes(base: &Path) -> test_hooks::Installed {
 }
 
 /// Typing text only the transcript holds, since the session was cached,
-/// matches no row: the search worker reads the cached copy.
+/// doesn't match any row, because the search worker reads the cached copy.
 #[test]
 fn search_for_text_newer_than_cached_copy_doesnt_match_session() {
     let home = ClaudeHome::new();
@@ -1362,12 +1365,12 @@ fn search_for_text_newer_than_cached_copy_doesnt_match_session() {
     assert!(search_ended, "the search ends");
     assert!(
         listed_ids(runtime.app()).is_empty(),
-        "the search doesn't match text the cached copy lacks"
+        "the search doesn't match text missing from the cached copy"
     );
 }
 
-/// A list refresh whose writes fail is this rearview's own: the list never
-/// names another rearview.
+/// A list refresh whose writes fail is this rearview's own: the list doesn't
+/// name another rearview.
 #[test]
 fn list_refresh_whose_writes_fail_doesnt_report_another_rearview() {
     let home = ClaudeHome::new();
@@ -1437,9 +1440,9 @@ fn viewer_refresh_whose_writes_fail_stays_pending_until_refresh_succeeds() {
 /// on the clipboard.
 static EXPORTED_AFTER_GROWTH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
-/// An export asked for after the open session's transcript grew, with no
-/// refresh pending, waits for the session's refresh: it holds the newest
-/// messages.
+/// An export asked for after the open session's transcript grew, without a
+/// refresh pending, waits for the session's refresh, so that it holds the
+/// newest messages.
 #[test]
 fn export_after_transcript_grew_waits_for_newest_messages() {
     let home = ClaudeHome::new();
@@ -1491,8 +1494,8 @@ fn opened_directly(path: &Path, environment: Environment) -> Runtime {
     Runtime::single_file(app, environment)
 }
 
-/// A session its agent stores, opened directly while the cache lacks it,
-/// shows `Loading…` until its session refresh caches it, then its messages;
+/// A session its agent stores, opened directly while it is not in the
+/// session cache, shows `Loading…` until its session refresh caches it, then its messages;
 /// `Ctrl+R` shows the newest messages.
 #[test]
 fn stored_session_opened_directly_shows_loading_then_its_messages_from_cache() {
@@ -1590,17 +1593,17 @@ fn file_outside_every_root_opened_directly_shows_its_messages_without_caching_th
     );
 }
 
-/// Opening a session the cache lacks shows `Loading…` until its refresh
-/// finishes.
+/// Opening a session not in the session cache shows `Loading…` until its
+/// refresh finishes.
 #[test]
-fn opening_session_cache_lacks_shows_loading_until_its_refresh_lands() {
+fn opening_session_missing_from_cache_shows_loading_until_its_refresh_lands() {
     assert_an_opened_uncached_session_shows(Hold::this_rearviews_commit, "Loading…");
 }
 
-/// Behind another rearview's refresh, a session the cache lacks shows that
-/// rearview's label until that refresh finishes.
+/// Behind another rearview's refresh, a session not in the session cache
+/// shows that rearview's label until that refresh finishes.
 #[test]
-fn opening_session_cache_lacks_behind_another_rearviews_refresh_shows_its_label() {
+fn opening_session_missing_from_cache_behind_another_rearviews_refresh_shows_its_label() {
     assert_an_opened_uncached_session_shows(
         Hold::another_rearviews_refresh,
         "Another rearview is refreshing…",
@@ -1777,10 +1780,10 @@ fn assert_an_id_lookup_lists_the_session_once_its_refresh_lands(hold: impl FnOnc
     );
 }
 
-/// A session found by ID that the cache lacks shows `Loading…`, and is
-/// listed once the list applies its refresh.
+/// A session found by ID that is not in the session cache shows `Loading…`,
+/// and is listed once the list applies its refresh.
 #[test]
-fn id_lookup_of_session_cache_lacks_lists_it_once_its_refresh_lands() {
+fn id_lookup_of_session_missing_from_cache_lists_it_once_its_refresh_lands() {
     assert_an_id_lookup_lists_the_session_once_its_refresh_lands(Hold::this_rearviews_commit);
 }
 
@@ -1886,11 +1889,11 @@ fn rename_and_delete_dont_wait_while_launch_waits_for_another_rearviews_rebuild(
 
     assert!(
         !menu_row(&rows, "Rename…").contains("list loading"),
-        "Rename waits for another rearview's rebuild"
+        "Rename doesn't wait for another rearview's rebuild"
     );
     assert!(
         !menu_row(&rows, "Delete…").contains("list loading"),
-        "Delete waits for another rearview's rebuild"
+        "Delete doesn't wait for another rearview's rebuild"
     );
     drop(rebuild);
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
@@ -1924,11 +1927,11 @@ fn rename_and_delete_stay_available_while_launch_waits_for_another_rearviews_ref
 
     assert!(
         runtime.app().is_action_available(SessionAction::Rename),
-        "Rename waits for another rearview's refresh"
+        "Rename doesn't wait for another rearview's refresh"
     );
     assert!(
         runtime.app().is_action_available(SessionAction::Delete),
-        "Delete waits for another rearview's refresh"
+        "Delete doesn't wait for another rearview's refresh"
     );
     drop(other_refresh);
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
@@ -1974,11 +1977,11 @@ fn rename_and_delete_stay_available_while_list_refresh_waits_for_another_rearvie
 
     assert!(
         !menu_row(&rows, "Delete…").contains("refreshing"),
-        "Delete waits for another rearview's refresh"
+        "Delete doesn't wait for another rearview's refresh"
     );
     assert!(
         !menu_row(&rows, "Rename…").contains("refreshing"),
-        "Rename waits for another rearview's refresh"
+        "Rename doesn't wait for another rearview's refresh"
     );
 }
 
@@ -2028,7 +2031,7 @@ fn only_refreshing_sessions_rename_and_delete_wait_during_its_refresh() {
     assert!(menu_row(&refreshing, "Delete…").contains("refreshing"));
     assert!(
         !menu_row(&other, "Rename…").contains("refreshing"),
-        "another session's rename waits for this session's refresh"
+        "another session's rename doesn't wait for this session's refresh"
     );
 }
 
@@ -2040,11 +2043,11 @@ fn sessions_rename_and_delete_stay_available_while_its_refresh_waits_for_another
 
     assert!(
         !menu_row(&refreshing, "Rename…").contains("refreshing"),
-        "Rename waits for another rearview's refresh"
+        "Rename doesn't wait for another rearview's refresh"
     );
     assert!(
         !menu_row(&refreshing, "Delete…").contains("refreshing"),
-        "Delete waits for another rearview's refresh"
+        "Delete doesn't wait for another rearview's refresh"
     );
 }
 
@@ -2085,11 +2088,11 @@ fn finished_refresh_waiting_for_viewer_to_close_leaves_rename_and_delete_availab
 
     assert!(
         !menu_row(&rows, "Rename…").contains("refreshing"),
-        "Rename waits for an outcome the viewer holds back"
+        "Rename doesn't wait for an outcome the viewer holds back"
     );
     assert!(
         !menu_row(&rows, "Delete…").contains("refreshing"),
-        "Delete waits for an outcome the viewer holds back"
+        "Delete doesn't wait for an outcome the viewer holds back"
     );
 }
 
@@ -2103,15 +2106,15 @@ fn finished_refresh_behind_viewer_and_another_rearviews_refresh_leave_rename_and
 
     assert!(
         !menu_row(&rows, "Rename…").contains("refreshing"),
-        "Rename waits for an outcome the viewer holds back"
+        "Rename doesn't wait for an outcome the viewer holds back"
     );
     assert!(
         !menu_row(&rows, "Delete…").contains("refreshing"),
-        "Delete waits for an outcome the viewer holds back"
+        "Delete doesn't wait for an outcome the viewer holds back"
     );
 }
 
-/// Another rearview's refresh alone blocks neither rename nor delete.
+/// Another rearview's refresh alone doesn't block rename or delete.
 #[test]
 fn another_rearviews_refresh_doesnt_block_rename_or_delete() {
     let home = ClaudeHome::new();

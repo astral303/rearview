@@ -17,8 +17,9 @@ mod platform {
     pub fn peak_bytes() -> Option<u64> {
         let mut counters = PROCESS_MEMORY_COUNTERS::default();
         let size = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?;
-        // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no
-        // closing, and `counters` is a writable struct of `size` bytes.
+        // SAFETY: `GetCurrentProcess` returns a pseudo-handle, which the
+        // caller doesn't close, and `counters` is a writable struct of `size`
+        // bytes.
         let filled = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
         (filled != 0).then_some(counters.PeakWorkingSetSize as u64)
     }
@@ -54,8 +55,8 @@ mod platform {
     }
 }
 
-/// `VmHWM`, the peak resident set size, from the text of `/proc/self/status`,
-/// which reports it in kilobytes.
+/// `VmHWM`, the peak resident set size, in bytes from the text of
+/// `/proc/self/status`. The file reports it in kilobytes.
 #[cfg(any(target_os = "linux", test))]
 fn vm_hwm_bytes(status: &str) -> Option<u64> {
     let value = status
@@ -78,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn status_without_vm_hwm_has_no_peak() {
+    fn status_without_vm_hwm_doesnt_report_peak() {
         assert_eq!(vm_hwm_bytes("Name:\trearview\n"), None);
     }
 

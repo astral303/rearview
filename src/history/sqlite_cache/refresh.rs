@@ -23,7 +23,7 @@ const POLL_EVERY: Duration = Duration::from_millis(200);
 /// then for SQLite's writer lock, before it fails and revokes its write
 /// permission. Opening waits for a connection that holds the database's
 /// exclusive lock, as a connection closing last holds it through its
-/// checkpoint. The writer lock wait bounds the wait behind another
+/// checkpoint. The writer lock wait limits the wait behind another
 /// connection stalled inside a batch. Waits for the same owner's other
 /// threads do not count, because they take turns through the owner's
 /// [`RefreshToken`] before taking the lock.
@@ -39,8 +39,7 @@ pub enum RefreshOwner {
 impl RefreshOwner {
     /// The process `identity`, a stored owner identity of `base`'s cache,
     /// belongs to: this process's when this rearview holds it, another's
-    /// otherwise. Every classification of a refresh's process goes through
-    /// here.
+    /// otherwise. Every classification of a refresh's process calls this.
     pub(super) fn of(base: &CacheBase, identity: &str) -> Self {
         if base.process().holds(identity) {
             Self::ThisProcess
@@ -270,8 +269,8 @@ impl RefreshOwnership {
 thread_local! {
     /// Runs on the deleting thread once a low-space deletion's exclusive
     /// lock ends, before the deletion returns. A test has another rearview
-    /// take the cache over and write in that gap: the deletion does nothing
-    /// there that a test could wait for.
+    /// take the cache over and write in that gap: the deletion doesn't do
+    /// anything there that a test could wait for.
     pub(super) static AFTER_DELETION_LOCK_ENDS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -465,7 +464,7 @@ pub(super) enum Release {
 /// Clear `identity`'s ownership of `base`, a canonical cache base, when it
 /// still owns the cache, retrying a busy writer lock for up to `wait`. A
 /// release that fails leaves the ownership to the takeover window. A missing
-/// database file has no owner to clear.
+/// database file doesn't have an owner to clear.
 pub(super) fn release(base: &CacheBase, identity: &str, wait: Duration) -> Release {
     if !super::database_path(base.path()).is_file() {
         return Release::NotOwner;
@@ -1099,9 +1098,9 @@ pub(super) fn exclusive_transaction<'a>(
 }
 
 /// Commit `batch` with `owner`'s commit time. A failure revokes `owner`'s
-/// write permission, except a row left referencing a deleted one, which
-/// SQLite reports at the commit: dropping `batch` rolls that batch back
-/// alone, and the owner's later batches go on.
+/// write permission, except the commit's foreign-key failure for a row left
+/// referencing a deleted one: dropping `batch` rolls that batch back alone,
+/// and the owner's later batches go on.
 pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
     owner.verify(&batch).inspect_err(|_| owner.revoke())?;
     let changed = batch
@@ -1131,8 +1130,8 @@ fn is_foreign_key_failure(error: &rusqlite::Error) -> bool {
 }
 
 /// `error`, a commit's foreign-key failure in `batch`, still open. Debug
-/// builds name the referencing and the referenced tables, which SQLite's
-/// own message leaves out.
+/// builds name the referencing and the referenced tables; SQLite's own
+/// message leaves them out.
 fn foreign_key_failure(batch: &WriteBatch<'_>, error: rusqlite::Error) -> AppError {
     if cfg!(debug_assertions)
         && let Ok(violations) = foreign_key_violations(batch)

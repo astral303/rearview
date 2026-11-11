@@ -56,7 +56,7 @@ impl ViewState {
     /// Replace the view's publication with `reloaded`'s, or with the
     /// publication of the copy the read adopted in the row's place. The
     /// header shows `copy_row`, the catalogue row of the copy the view
-    /// shows, or `reloaded`'s row while the view shows no copy.
+    /// shows, or `reloaded`'s row while the view doesn't show a copy.
     fn show_reloaded_row(&mut self, reloaded: ReloadedHeader, copy_row: Option<Box<Conversation>>) {
         if let Some(row) = reloaded.row {
             self.external_title = reloaded.external_title;
@@ -267,7 +267,8 @@ enum OpenSessionRead {
 }
 
 impl OpenSessionRead {
-    /// `finished`'s read of the session at `path`; `None` when it read none.
+    /// `finished`'s read of the session at `path`; `None` when it didn't read
+    /// that session.
     fn in_finished(finished: &FinishedRefresh, path: &Path) -> Option<Self> {
         match finished {
             FinishedRefresh::Failed(error) => {

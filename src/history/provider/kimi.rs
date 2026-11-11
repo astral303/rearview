@@ -173,8 +173,8 @@ impl SessionDeleter for KimiProvider {
 
 impl SubagentFinder for KimiProvider {
     /// Every other agent's wire in the session directory of a main wire. A
-    /// sub-agent's wire, and a wire in a directory without a main wire, have
-    /// none. Every wire the listing names, and `locator`, begin with the
+    /// sub-agent's wire, and a wire in a directory without a main wire, don't
+    /// have any. Every wire the listing names, and `locator`, begin with the
     /// session directory as `locator` spells it: the main wire is the one
     /// with `locator`'s path below it, its names and separators compared by
     /// the platform's rule.
@@ -1046,8 +1046,8 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
-        /// Kimi files a session as a directory whose `state.json` names the
-        /// main agent, with one `agents/<agent>/wire.jsonl` per agent.
+        /// Kimi files a session as a directory: a `state.json` naming the
+        /// main agent, and one `agents/<agent>/wire.jsonl` per agent.
         fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
             let main_wire = write_session(home, SESSION, "kimi title", false);
             std::fs::copy(&session.row.path, &main_wire).unwrap();
@@ -1090,7 +1090,7 @@ pub(super) mod tests {
     /// main agent's names the sub-agents. On a file system that ignores
     /// case, the main wire named in another case still names them.
     #[test]
-    fn only_main_agents_wire_names_sub_agents() {
+    fn only_main_agents_wire_names_subagents() {
         let home = tempfile::tempdir().unwrap();
         let ids = KimiFixture.ids();
         let main_wire = KimiFixture.write_session(home.path(), ids.session);
@@ -1104,7 +1104,7 @@ pub(super) mod tests {
         assert_eq!(
             KimiProvider.subagent_transcripts(&subagent).unwrap(),
             [] as [PathBuf; 0],
-            "the sub-agent's wire names none"
+            "the sub-agent's wire doesn't name a sub-agent"
         );
         if cfg!(any(windows, target_os = "macos")) {
             let other_case = main_wire.with_file_name(

@@ -7,8 +7,8 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 /// The texts, each after [`PADDED_MESSAGE_SEPARATOR`] but the first, as one
-/// text. An empty text adds nothing, separator included. Offsets are byte
-/// offsets into the joined text.
+/// text. An empty text doesn't add anything, separator included. Offsets
+/// are byte offsets into the joined text.
 #[derive(Clone, Debug)]
 pub(crate) struct SeparatedTexts<'a> {
     /// Each text and each separator, with its offset, in order.
@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(
             texts.texts().map(|(_, text)| text).collect::<Vec<_>>(),
             ["Ünïcode title", "a summary", "body \u{1e} text"],
-            "an empty text adds nothing"
+            "an empty text doesn't add anything"
         );
     }
 

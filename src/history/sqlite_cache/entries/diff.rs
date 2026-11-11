@@ -207,8 +207,8 @@ fn match_transcripts(
             }
             None => {
                 stored.gone.push(id);
-                // A gone transcript's threads must match no new thread:
-                // the path below an unknown root matches no new path.
+                // A gone transcript's threads mustn't match a new thread.
+                // The path below an unknown root doesn't match any new path.
                 let unplaced = PathBuf::from(&place.path);
                 Arc::from(places.path(place).unwrap_or(unplaced))
             }
@@ -390,8 +390,8 @@ impl StoredEntries {
 
 /// Matches each new message with the stored message its first entry's
 /// stored entry started, giving it that one's id in `ids`, and updates each
-/// matched message whose columns changed. Returns the ids of the stored
-/// messages the new rows do not hold, whose ordinals are cleared.
+/// matched message whose columns changed. Clears the ordinals of the stored
+/// messages the new rows do not hold, and returns their ids.
 fn update_messages(
     connection: &Connection,
     session: i64,

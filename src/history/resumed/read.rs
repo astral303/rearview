@@ -40,17 +40,19 @@ pub(crate) struct ResumedSession {
     pub(crate) bytes_read: u64,
 }
 
-/// A resumed read of a changed session, or why the session is read whole.
+/// A resumed read of a changed session, or the reason the session is read
+/// whole.
 pub(crate) type Resumed = std::result::Result<ResumedSession, WholeRead>;
 
-/// Why a changed session is read whole instead of on from its stored copy.
+/// The reason a changed session is read whole instead of on from its stored
+/// copy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WholeRead {
-    /// The stored copy holds no checkpoint.
+    /// The stored copy doesn't hold a checkpoint.
     NoCheckpoint,
     /// The stored checkpoint or ledger does not decode, or names a
     /// transcript outside every root of the session, or a stored sub-agent
-    /// turn after it names no transcript.
+    /// turn after it doesn't name a transcript.
     CheckpointUnreadable,
     /// The stored copy is not the one the load listed: another load wrote
     /// the session since.
@@ -123,7 +125,7 @@ enum FileChange {
     Rewritten,
 }
 
-/// What a resumed read of one session reads with.
+/// The inputs of a resumed read of one session.
 pub(crate) struct ResumeContext<'a> {
     pub(crate) storage: &'a dyn SessionStorage,
     pub(crate) cache: &'a SqliteCache,
@@ -139,7 +141,7 @@ pub(crate) struct ResumeContext<'a> {
     pub(crate) project_directories: &'a CanonicalDirectories,
 }
 
-/// One sub-agent transcript of the session, as the resumed read takes it.
+/// One sub-agent transcript of the session, as input to the resumed read.
 struct Thread<'a> {
     path: &'a Path,
     /// Its share of the row at its stable cursor, as stored or as read.
@@ -165,9 +167,9 @@ struct Child {
 }
 
 /// The session `context.stub` read on from its stored copy, `context.stored`,
-/// or why it must be read whole: the stored copy holds no checkpoint, its own
-/// transcript does not resume, a sub-agent transcript was removed, or the
-/// read cannot place what changed after the checkpoint.
+/// or the reason it must be read whole: the stored copy doesn't hold a
+/// checkpoint, its own transcript does not resume, a sub-agent transcript was
+/// removed, or the read cannot place the changes after the checkpoint.
 pub(crate) fn read_resumed(
     context: &ResumeContext<'_>,
     permit: ParsePermit<'_>,
@@ -298,8 +300,8 @@ pub(crate) fn read_resumed(
 
 /// The share of its session's row `file`, a stored sub-agent transcript,
 /// holds at its stable cursor; `None` when it does not decode. A transcript
-/// the last read left out, holding no record, stores no share and adds
-/// nothing to the row.
+/// the last read left out because it doesn't hold a record doesn't store a
+/// share or add anything to the row.
 fn stored_share(file: &StoredFile) -> Option<ThreadFold> {
     if file.fold.is_empty() {
         return Some(ThreadFold::default());
@@ -765,7 +767,7 @@ fn finish(
     let bytes_read = bytes_read(&stamps, own_window.as_ref(), &threads);
     let subagents: HashSet<&Path> = stub.subagents.iter().map(PathBuf::as_path).collect();
 
-    // Each file's read, share and token total once the read is taken in.
+    // Each file's read, share and token total after this read.
     let own_read = own_window
         .as_ref()
         .map_or_else(|| own.read.clone(), |window| window.read.clone());
@@ -814,8 +816,8 @@ fn finish(
     }
 
     // The fold from the checkpoint over the entries after it, kept at the
-    // next checkpoint. Store none when the own transcript's stable line moved
-    // back: it can then stand before the checkpoint.
+    // next checkpoint. Don't store one when the own transcript's stable line
+    // moved back, because the line can then stand before the checkpoint.
     let steps = tail_steps(&placed.tail, &subagents);
     let place = checkpoint_place_after(&steps, own_read.stable_line, checkpoint.splice.clone())
         .filter(|_| own_read.stable_line >= own.read.stable_line);

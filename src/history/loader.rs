@@ -261,7 +261,7 @@ pub struct LoadedHistory {
 }
 
 /// The conversations of [`load_history`], waiting for refresh ownership as
-/// long as another rearview keeps it, for callers with no use for the
+/// long as another rearview keeps it, for callers that don't use the
 /// ignored terms.
 pub fn load_all_conversations(
     environment: &Environment,
@@ -422,7 +422,8 @@ impl ProgressThrottle {
 /// Every provider's conversations read with `options`, streamed to `tx` as
 /// the list shows them, ending with [`LoaderMessage::Done`] or
 /// [`LoaderMessage::Fatal`]. `meter` records what the load read and what
-/// it waits for. Once `cancellation` is set, the load parses nothing more.
+/// it waits for. Once `cancellation` is set, the load doesn't parse any more
+/// transcripts.
 pub fn stream_all_conversations(
     tx: &Sender<LoaderMessage>,
     environment: &Environment,
@@ -469,7 +470,7 @@ pub fn stream_all_conversations(
 }
 
 /// Every session `history` read from a copy older than its transcripts, or
-/// left unlisted because the cache holds no copy of it.
+/// left unlisted because it is not in the session cache.
 fn stale_sessions(history: &ProviderHistory) -> Vec<StaleSession> {
     history
         .discovered
@@ -742,13 +743,16 @@ mod tests {
         let mut throttle = ProgressThrottle::new(PROGRESS_INTERVAL);
         let mut admit = |done, total| throttle.admit(done, total, clock.now());
 
-        assert!(admit(0, 10), "a new total");
+        assert!(admit(0, 10), "the throttle admits a new total");
         assert!(!admit(1, 10));
         clock.advance(PROGRESS_INTERVAL);
-        assert!(admit(2, 10), "the interval has passed");
+        assert!(
+            admit(2, 10),
+            "the throttle admits a report once the interval has passed"
+        );
         assert!(!admit(3, 10));
-        assert!(admit(10, 10), "the last report");
-        assert!(admit(0, 5), "the next source's total");
+        assert!(admit(10, 10), "the throttle admits the last report");
+        assert!(admit(0, 5), "the throttle admits the next source's total");
     }
 
     /// Providers stream one batch each, so a session two of them reach must be

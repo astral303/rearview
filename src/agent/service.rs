@@ -280,12 +280,12 @@ struct SessionSelection {
     /// scope and not excluded.
     keys: Vec<agent::refs::AgentConversationKey>,
     warnings: Vec<AgentWarning>,
-    /// The paths of the sessions the load read from the cache as it was
-    /// while another rearview refreshed it, whose copy is older than the
-    /// transcript or missing.
+    /// The paths of the stale sessions: the load read them from the cache as
+    /// it was while another rearview refreshed it, and their copy is older
+    /// than the transcript or missing.
     stale_paths: HashSet<PathBuf>,
-    /// The warning for each session the load read as holding no
-    /// conversation or failing to read, by transcript path.
+    /// The warning for each session the load read as not holding a
+    /// conversation or as failing to read, by transcript path.
     unlisted_warnings: HashMap<PathBuf, AgentWarning>,
 }
 
@@ -295,9 +295,9 @@ impl SessionSelection {
     /// without a row is placed in the window by its file's modification
     /// time, and the skipped-transcript warnings are added by the caller.
     ///
-    /// The stale sessions are taken before the window: a session whose copy
-    /// ends before the window starts has no row in it, and the record still
-    /// names it. The scope, the excluded projects and the current session
+    /// The stale sessions are collected before the window applies: a session
+    /// whose copy ends before the window starts doesn't have a row in it, and
+    /// the record names it. The scope, the excluded projects and the current session
     /// leave it out.
     fn from_loaded(
         loaded: LoadedSessions,
@@ -459,7 +459,7 @@ pub fn execute(command: AgentCommand, environment: history::Environment) -> Resu
 
 /// `key`'s transcript as `environment`'s cache holds it, whether or not the
 /// transcript changed since. Waits through another rearview's rebuild,
-/// publishing the wait on `wait`. Parses nothing.
+/// publishing the wait on `wait`. Doesn't parse the transcript.
 fn read_cached_session(
     environment: &history::Environment,
     wait: &history::WaitStatus,
@@ -480,8 +480,8 @@ fn read_cached_session(
 }
 
 /// The copy [`read_cached_session`] reads of `key`'s transcript, its failure
-/// worded for the agent protocol. The read fails when the cache does not
-/// hold a copy of the session.
+/// worded for the agent protocol. The read fails when the session is not in
+/// the session cache.
 fn read_cached_transcript(
     environment: &history::Environment,
     wait: &history::WaitStatus,
@@ -508,7 +508,7 @@ fn key_of_row<'k>(
 /// replaced the copy the ranking counted, the hit messages of the copy the
 /// cache holds are counted and read, in one read snapshot. `None` when the
 /// session is no longer in the session cache or its cached copy is not
-/// ready. A query without terms reads nothing.
+/// ready. A query without terms doesn't read a message.
 pub(crate) fn read_hit_messages(
     clock: &dyn Clock,
     wait: &history::WaitStatus,
@@ -553,7 +553,7 @@ pub(crate) fn read_hit_messages(
     })
 }
 
-/// About how many bytes the hit read of `conversation`, the ranked session at
+/// The estimated bytes the hit read of `conversation`, the ranked session at
 /// `index`, reads: its transcript's size in the share of its messages that
 /// hold hits; the whole size for a session read whole.
 fn hit_read_bytes(
@@ -571,8 +571,7 @@ fn hit_read_bytes(
 }
 
 /// `key`'s transcript parsed with the refresh owner's `permit`, for a session
-/// the cache does not hold a copy of, its failure worded for the agent
-/// protocol.
+/// not in the session cache, its failure worded for the agent protocol.
 fn parse_uncached_transcript(
     permit: history::ParsePermit<'_>,
     key: &agent::refs::AgentConversationKey,
@@ -712,11 +711,12 @@ enum TargetCopy {
         agent::refs::AgentConversationKey,
         history::provider::StaleCopy,
     ),
-    /// The cache doesn't hold a copy ready to read.
+    /// The session is not in the session cache, or its copy isn't ready to
+    /// read.
     Missing(agent::refs::AgentConversationKey),
 }
 
-/// The rule a copy's currency for a key is decided by.
+/// The rule that decides whether a copy is current for a key.
 type CopyCurrency = fn(
     &history::sqlite_cache::HeldCopy<'_>,
     &history::sqlite_cache::Publication,
@@ -792,9 +792,9 @@ impl AgentService {
         }
     }
 
-    /// Adds the sessions of `changed`, which another rearview removed, wrote
-    /// again or was writing while the command read them, to its stale
-    /// sessions. Resolves each reference against `keys`.
+    /// Adds the sessions of `changed` to the command's stale sessions:
+    /// another rearview removed, rewrote or was writing them while the
+    /// command read them. Resolves each reference against `keys`.
     fn cover_sessions_changed_while_read<'k>(
         &self,
         changed: impl IntoIterator<Item = &'k agent::refs::AgentConversationKey>,
@@ -832,8 +832,7 @@ impl AgentService {
     /// it neither published nor parsed: only the owner parses transcripts.
     /// Once the command's own writes stop, it does not refresh again, and a
     /// missing target is reported as not in the session cache. The refresh
-    /// reads below `reads`' roots and does not read again a target in
-    /// `reads`.
+    /// reads below `reads`' roots and doesn't reread a target in `reads`.
     fn hold_cache_for_reading(
         &self,
         operation: history::OperationScope,
@@ -1144,12 +1143,13 @@ impl AgentService {
             .insert(key.path.clone(), transcript);
     }
 
-    /// Keeps the transcript of `key`'s session, which the refresh read as
-    /// `read` without listing it, for the command's reads: the entries its
-    /// parse read, or the failure its warning reports for a file the parse
-    /// rejected or could not read. The refresh owner parses the transcript,
-    /// under `operation`, of an empty session restored from the cache, which
-    /// does not store its entries, and of a file discovery doesn't find.
+    /// Keeps the transcript of `key`'s session for the command's reads when
+    /// the refresh read the session as `read` without listing it: the
+    /// entries its parse read, or the failure its warning reports for a file
+    /// the parse rejected or could not read. The refresh owner parses, under
+    /// `operation`, the transcript of a file discovery doesn't find and of an
+    /// empty session restored from the cache, because the cache doesn't
+    /// store an empty session's entries.
     /// Without ownership, such a session fails as its warning reports, or
     /// is reported as not in the session cache. A session missing from the
     /// cache, or one a failed discovery kept from being read, does not keep
@@ -1341,8 +1341,8 @@ impl AgentService {
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
         let embedding_budget = configured_embedding_budget(&config.semantic.unwrap_or_default());
-        // Resolved before loading so an inverted range fails without paying for
-        // a full corpus parse.
+        // Resolved before loading so an inverted range fails before the
+        // whole corpus is parsed.
         let time = args.time.resolve(self.clock().as_ref())?;
         let rules = SelectionRules::new(time, &args.scope, &agent_config);
         let SessionSelection {
@@ -1724,7 +1724,7 @@ impl AgentService {
 
 /// Keys for every provider's sessions, sorted by path.
 ///
-/// A sub-agent transcript gets no key: discovery names it on its session's
+/// A sub-agent transcript doesn't get a key: discovery names it on its session's
 /// stub, its content is reachable through that session, and a key of its own
 /// would resolve to a row that does not exist.
 ///
@@ -1734,8 +1734,9 @@ impl AgentService {
 /// Each directory discovery could not list gets a warning, and the cached
 /// sessions under it keep their keys.
 ///
-/// `meter` records what each provider's discovery and cache read. The cache
-/// is read, and a root it holds no session of is cached, under `operation`.
+/// `meter` records what each provider's discovery and cache read. Under
+/// `operation`, the cache is read, and a root without a session in the
+/// session cache is cached.
 fn discover_agent_keys(
     environment: &history::Environment,
     meter: &LoadMeter,
@@ -1830,14 +1831,16 @@ struct KeyedReads {
     /// Each listed agent's roots, canonicalised as the keys canonicalised
     /// them.
     roots: HashMap<history::Source, Vec<history::provider::SessionRoot>>,
-    /// The reads of the sessions key discovery cached to key them, on a
-    /// cache that held no session of their root, by path: written or not.
+    /// The reads of the sessions key discovery cached to key them when the
+    /// session cache didn't hold a session of their root, by path: written
+    /// or not.
     sessions: HashMap<PathBuf, TargetRead>,
 }
 
 /// [`discover_agent_keys`] from the sessions a load discovered and the
-/// directory and id it recorded of each, so a search after a load neither
-/// discovers the sessions nor reads the cache again. With a `workspace`, only
+/// directory and session ID it recorded of each, so a search after a load
+/// neither discovers the sessions nor reads the cache again. With a
+/// `workspace`, only
 /// the sessions each agent's own rule places in it, by the directory the load
 /// recorded, as [`history::Workspace::contains`] places their rows. The
 /// warnings name each agent in `failures`, then each directory in
@@ -1998,9 +2001,9 @@ struct KeyedRoot<'a> {
 /// their copies; those directories are returned beside the keys.
 ///
 /// A session whose path names its key is keyed without being read. Every
-/// other session takes the directory and id it recorded from the session
-/// cache, read under `operation`, so a corpus that can run to gigabytes is
-/// not parsed again. The cache is read only for such a session, or for a
+/// other session reads the directory and session ID it recorded from the
+/// session cache, read under `operation`, so a corpus that can run to
+/// gigabytes is not parsed again. The cache is read only for such a session, or for a
 /// directory discovery could not list.
 fn root_keys(keyed: &KeyedRoot<'_>) -> std::result::Result<RootKeys, KeyDiscoveryFailure> {
     let KeyedRoot {
@@ -2136,16 +2139,16 @@ fn address_in(
 
 #[derive(Default)]
 struct RecordedSessions {
-    /// The directory and id each session recorded, by cache key; `None`
-    /// for a session the cache records as empty or as unreadable.
+    /// The directory and session ID each session recorded, by cache key;
+    /// `None` for a session the cache records as empty or as unreadable.
     recorded: HashMap<String, Option<history::provider::RecordedSession>>,
     /// The reads of the sessions cached to find their records, by path.
     sessions: Vec<(PathBuf, TargetRead)>,
 }
 
-/// The directory and id each session `keyed`'s storage keeps under its root
-/// recorded, from the session cache. When the cache doesn't hold a session
-/// of the root, `keyed`'s refresh owner first caches the sessions `unkeyed`
+/// The directory and session ID each session `keyed`'s storage keeps under
+/// its root recorded, from the session cache. When the session cache
+/// doesn't hold a session of the root, `keyed`'s refresh owner first caches the sessions `unkeyed`
 /// names under that root, and their reads give the records, whether or not
 /// their writes landed. While another rearview keeps the cache, those
 /// sessions stay without a record.
@@ -2305,7 +2308,7 @@ impl StaleCoverage {
 }
 
 /// Warnings for `keys` without a row, and for rows with malformed lines. A
-/// key in `stale_paths` gets none: the stale-cache record names it. A key
+/// key in `stale_paths` doesn't get one: the stale-cache record names it. A key
 /// without a row gets its warning from `unlisted_warnings`, by transcript
 /// path; a key missing there joins the command's stale sessions, with
 /// `operation`'s cause.
@@ -2737,10 +2740,10 @@ fn attach_semantic_hit_anchors<'i, 'c>(
     reads
 }
 
-/// A read of a semantic hit's messages that found none to attach.
+/// A read of a semantic hit's messages that didn't find any to attach.
 enum UnreadMessages {
-    /// The cache no longer holds the copy the hits number: another write
-    /// removed or replaced it, or is writing it.
+    /// The copy the hits number is no longer in the session cache: another
+    /// write removed or replaced it, or is writing it.
     NoLongerCached,
     Failed(AppError),
 }
@@ -2784,7 +2787,7 @@ enum HybridLexicalPass {
     Alone,
 }
 
-/// Runs a hybrid search's semantic half first, since it reads no
+/// Runs a hybrid search's semantic half first, because it doesn't read
 /// transcripts, then one lexical pass, so each transcript is read at most
 /// once. The semantic half's error is returned with the lexical result, not
 /// raised, except a cache write's finding the drive low on space: that stops
@@ -2836,10 +2839,9 @@ fn run_agent_semantic_hits(
 impl AgentService {
     /// Stores `routes`, the route texts the semantic stage computed, when
     /// this command can take refresh ownership without waiting. Fails when
-    /// the drive is low on space. Any other
-    /// skipped or failed write leaves the output as it is: the next semantic
-    /// search computes those routes again. `--perf-stats` reports what was
-    /// stored, or why nothing was.
+    /// the drive is low on space. Any other skipped or failed write leaves
+    /// the output as it is: the next semantic search computes those routes
+    /// again. `--perf-stats` reports what was stored, or why nothing was.
     fn store_semantic_routes(&self, routes: &[history::SemanticRoute]) -> Result<()> {
         if routes.is_empty() {
             return Ok(());
@@ -2866,9 +2868,9 @@ struct SemanticCandidates {
 }
 
 /// The semantic candidates of `inputs`' sessions, each read from the copy
-/// the cache holds now, whichever generation it is. A session whose read
-/// missed has none. The sessions are read on the rayon pool; a failed read
-/// of every session fails the read.
+/// the cache holds now, whichever generation it is. A missed read doesn't
+/// give any candidates. The sessions are read on the rayon pool; a failed
+/// read of every session fails the read.
 fn semantic_candidates(
     inputs: &[agent::search::AgentConversationInput<'_>],
 ) -> Result<SemanticCandidates> {
@@ -3808,8 +3810,8 @@ pub(crate) fn resolve_agent_conversation_arg(
     agent::refs::resolve_conversation_ref(keys, reference, canonicaliser)
 }
 
-/// A service reading no agent's storage and this test's session cache, on
-/// test time.
+/// A service on test time that reads this test's session cache and doesn't
+/// read any agent's storage.
 #[cfg(test)]
 fn test_service() -> AgentService {
     AgentService::new(history::environment::test_support::test_environment(
@@ -3919,9 +3921,12 @@ mod tests {
 
         assert!(
             matches!(halves, Err(AppError::SessionCacheLowSpace { .. })),
-            "the search fails with the free space: {halves:?}"
+            "the search fails with the low-space error: {halves:?}"
         );
-        assert!(passes.is_empty(), "no lexical pass runs: {passes:?}");
+        assert!(
+            passes.is_empty(),
+            "the lexical pass doesn't run: {passes:?}"
+        );
     }
 
     #[test]
@@ -3996,7 +4001,10 @@ mod tests {
             environment.storages().len(),
             "every agent lists its sessions"
         );
-        assert!(directory_warnings.is_empty(), "{directory_warnings:?}");
+        assert!(
+            directory_warnings.is_empty(),
+            "every directory is listed: {directory_warnings:?}"
+        );
         keys
     }
 
@@ -4013,7 +4021,8 @@ mod tests {
 
     /// The thread `tests/fixtures/codex/rollout.jsonl` holds.
     const LISTED_CODEX_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
-    /// A thread whose rollout holds only its header, so no conversation.
+    /// A thread whose rollout holds only its header and doesn't hold a
+    /// conversation.
     const EMPTY_CODEX_THREAD: &str = "019f0000-0000-7000-8000-00000000000c";
 
     /// A Codex sessions tree under `home` holding the fixture's rollout and
@@ -4090,14 +4099,15 @@ mod tests {
             assert_eq!(keys, discovery_keys);
             assert!(
                 keys.iter().any(|key| key.session_id == LISTED_CODEX_THREAD),
-                "{keys:?}"
+                "the listed thread gets a key: {keys:?}"
             );
             assert!(warnings.is_empty());
         }
     }
 
-    /// A Claude Code key is made from its path alone, so only the directory
-    /// the load recorded places it in a workspace, as it places the row.
+    /// Only the directory the load recorded places a Claude Code key in a
+    /// workspace, as it places the row, because the key is made from its
+    /// path alone.
     #[test]
     fn local_search_keys_and_scopes_claude_session_recorded_in_subdirectory() {
         let home = history::workspace::tests::TestHome::new();
@@ -4294,9 +4304,9 @@ mod tests {
         );
     }
 
-    /// The calling session changes with every tool call. A listing leaves it
-    /// out, so the load keeps its cached row unread, and the listing prints
-    /// what a load that reread it prints.
+    /// A listing leaves out the calling session, which changes with every
+    /// tool call: the load doesn't reread its cached row, and the listing
+    /// prints what a load that reread it prints.
     #[test]
     fn changed_calling_session_stays_unread_and_listing_is_unchanged() {
         let claude = history::provider::claude::tests::ConfigDir::new();
@@ -4537,8 +4547,6 @@ mod tests {
         agent::diagnostic::format_warning_records(warnings).1
     }
 
-    /// While another rearview refreshes, a selection reads the cache as it is
-    /// and names the session whose transcript changed since.
     #[test]
     fn selection_beside_another_refresh_reads_cache_and_names_changed_session() {
         let sessions = CachedClaudeSessions::new();
@@ -4566,7 +4574,7 @@ mod tests {
     /// An uncached session counts as changed, and its record leaves out
     /// `cached-until`.
     #[test]
-    fn selection_beside_another_refresh_names_session_cache_lacks_without_cached_until() {
+    fn selection_beside_another_refresh_names_uncached_session_without_cached_until() {
         let sessions = CachedClaudeSessions::new();
         let claude_folder = sessions.changed.parent().unwrap();
         let new_session = "0f000000-0000-4000-8000-000000000003";
@@ -4592,8 +4600,8 @@ mod tests {
         );
     }
 
-    /// A window that ends inside the cached copy's messages misses nothing
-    /// the cache lacks.
+    /// A window that ends inside the cached copy's messages ends before the
+    /// messages missing from the copy.
     #[test]
     fn selection_whose_window_ends_inside_cached_messages_doesnt_warn() {
         let sessions = CachedClaudeSessions::new();
@@ -4612,7 +4620,7 @@ mod tests {
         );
         assert!(
             warning_records(&selection.warnings).is_empty(),
-            "{:?}",
+            "the selection doesn't warn: {:?}",
             selection.warnings
         );
     }
@@ -4655,7 +4663,7 @@ mod tests {
                 },
                 vec![CHANGED_SESSION.to_owned()],
             ),
-            "the current session's stale copy is named"
+            "the current session's stale copy isn't named"
         );
         assert!(
             !names_the_stale_copy(
@@ -4665,7 +4673,7 @@ mod tests {
                 },
                 Vec::new(),
             ),
-            "an excluded project's stale copy is named"
+            "an excluded project's stale copy isn't named"
         );
     }
 
@@ -5032,7 +5040,7 @@ mod tests {
     const INVALID_UTF8_FAILURE: &str =
         "io failed to read transcript: stream did not contain valid UTF-8";
 
-    /// A transcript that gives its session no row in the list.
+    /// A transcript whose session doesn't get a row in the list.
     #[derive(Debug)]
     enum UnlistedTranscript {
         /// The fixture session's first `kept_lines` lines, then `records`.
@@ -5093,8 +5101,8 @@ mod tests {
     }
 
     /// One case per kind of session without a row each provider's fixture
-    /// can produce. OpenCode stores sessions in a database that drops a
-    /// malformed row, so none of its sessions fails to read.
+    /// can produce. OpenCode doesn't have a case of a session that fails to
+    /// read, because its database drops a malformed row.
     fn every_providers_unlisted_cases() -> Vec<UnlistedCase> {
         use UnlistedTranscript::{DeletedRows, InvalidUtf8, Lines};
         use history::Source::{Claude, Codex, Grok, Kimi, Omp, OpenCode, Pi};
@@ -5474,9 +5482,9 @@ mod tests {
     /// empty is read once more because the cache does not store its entries;
     /// an unreadable transcript is not read again.
     ///
-    /// A session keyed by the id and directory it recorded is read by key
-    /// discovery, which finds no record and no key: the read reports it not
-    /// found, and does not read it again from the cache.
+    /// Key discovery reads a session keyed by the session ID and directory it
+    /// recorded, and doesn't find a record or a key: the read reports it not
+    /// found, and doesn't read it again from the cache.
     #[test]
     fn read_of_session_without_row_parses_it_once_then_again_only_from_an_empty_copy() {
         use history::sqlite_cache::admitted_reads;
@@ -5533,8 +5541,9 @@ mod tests {
     }
 
     /// A transcript another program holds open without sharing fails the
-    /// owner's read with an error the next read can clear: the load records
-    /// no row, and the load after the lock is released records the session.
+    /// owner's read with an error the next read can clear: the load doesn't
+    /// record a row, and the load after the lock is released records the
+    /// session.
     #[cfg(windows)]
     #[test]
     fn transcript_locked_during_owners_load_gets_row_only_from_load_after_release() {
@@ -5629,8 +5638,8 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// Decision 4: this Pi session is uncached and its path doesn't contain
-    /// a session ID, so no key names it.
+    /// No key names this Pi session: it is uncached and its path doesn't
+    /// contain a session ID.
     #[test]
     fn uncached_pi_session_without_id_in_path_is_left_out_without_error() {
         let fixture = history::provider::contract_tests::registered_fixtures()
@@ -5724,7 +5733,7 @@ mod tests {
 
         assert!(
             !output.contains(&format!("uuid={CHANGED_SESSION}")),
-            "the changed session has no hit:\n{output}"
+            "the changed session doesn't have a hit:\n{output}"
         );
         assert!(
             output.contains(&format!("uuid={OTHER_SESSION}")),
@@ -5783,8 +5792,8 @@ mod tests {
     }
 
     /// A query of separators ranks every session without reading a
-    /// transcript: each ranked session's hit messages are none, and its hit
-    /// read opens no reader.
+    /// transcript: a ranked session doesn't have any hit messages, and its
+    /// hit read doesn't open a reader.
     #[test]
     fn separators_only_query_doesnt_read_a_transcript() {
         use crate::history::sqlite_cache::connection::test_hooks::{
@@ -6073,8 +6082,8 @@ mod tests {
         );
     }
 
-    /// A route write on a drive low on space fails with the free space and
-    /// sets the cache's low-space latch. The low-space deletion then empties
+    /// A route write on a drive low on space fails with the low-space error
+    /// and sets the cache's low-space latch. The low-space deletion then empties
     /// the cache database.
     #[test]
     fn semantic_route_write_finding_drive_low_on_space_fails_and_deletes_cache() {
@@ -6091,7 +6100,7 @@ mod tests {
 
         assert!(
             matches!(&stored, Err(AppError::SessionCacheLowSpace { .. })),
-            "the write fails with the free space: {stored:?}"
+            "the write fails with the low-space error: {stored:?}"
         );
         assert_eq!(
             history::sqlite_cache::low_space::run_deletion(service.environment.cache_base()),
@@ -6103,7 +6112,7 @@ mod tests {
         );
     }
 
-    /// A route write that fails for another reason leaves the search going;
+    /// A route write that fails for another reason doesn't stop the search;
     /// `--perf-stats` reports the cause.
     #[test]
     fn failed_semantic_route_write_reports_its_cause() {
@@ -6393,20 +6402,26 @@ mod tests {
             let changed = renumbers || lexical_reads_another_copy;
             let hits = output.every_hit().collect::<Vec<_>>();
             if changed {
-                assert!(hits.is_empty(), "{case}: the semantic hit leaves: {hits:?}");
+                assert!(
+                    hits.is_empty(),
+                    "{case}: the semantic hit leaves the output: {hits:?}"
+                );
                 assert_eq!(
                     records,
                     [format!(
                         "protocol agent-warning stale-cache refs={reference} : {STALE_CACHE_SENTENCE}\n"
                     )],
-                    "{case}"
+                    "{case}: the stale-cache record names the session"
                 );
             } else {
                 assert!(
                     hits.len() == 1 && !hits[0].anchors.is_empty(),
                     "{case}: the hit gets its focus message's anchors: {hits:?}"
                 );
-                assert!(records.is_empty(), "{case}: {records:?}");
+                assert!(
+                    records.is_empty(),
+                    "{case}: the command doesn't warn: {records:?}"
+                );
             }
         }
     }
@@ -6664,8 +6679,6 @@ mod tests {
         wrong
     }
 
-    /// One unreadable directory is named in an `io` warning, and the cached
-    /// sessions under it stay listed.
     #[test]
     fn unreadable_directory_is_named_in_io_warning_and_its_cached_sessions_stay_listed() {
         let sessions = CachedClaudeSessions::new();
@@ -6698,9 +6711,6 @@ mod tests {
         );
     }
 
-    /// `search`, `read`, `outline` and `within` each name an unreadable
-    /// directory in exactly one `io` warning and read the cached session
-    /// under it.
     #[test]
     fn search_read_outline_and_within_name_unreadable_directory_once_and_read_its_cached_session() {
         let sessions = CachedClaudeSessions::new();
@@ -6753,8 +6763,8 @@ mod tests {
     }
 
     /// Beside another rearview's refresh, search ranks a changed session on
-    /// its cached copy: text only the transcript holds finds nothing, and the
-    /// `stale-cache` record names the session.
+    /// its cached copy: text only the transcript holds doesn't find a session,
+    /// and the `stale-cache` record names the session.
     #[test]
     fn search_beside_another_refresh_ranks_changed_session_on_its_cached_copy() {
         let sessions = CachedClaudeSessions::new();
@@ -6867,7 +6877,7 @@ mod tests {
     /// cache writes stopped.
     const WRITES_STOPPED_SENTENCE: &str = "rearview could not update these sessions in the session cache; repeat the command to include their newest messages";
 
-    /// A command whose cache writes stop parses nothing more: it reads the
+    /// A command whose cache writes stop doesn't parse again: it reads the
     /// sessions it has not refreshed from their copies, and names them as
     /// sessions it could not update.
     #[test]
@@ -7031,7 +7041,7 @@ mod tests {
             output.contains("a cached question")
                 && output.contains("an unseen question")
                 && !output.contains("agent-error"),
-            "{output}"
+            "both sessions print without an agent-error:\n{output}"
         );
         assert_eq!(
             (
@@ -7039,12 +7049,12 @@ mod tests {
                 admitted_reads::count(&uncached) - before.1
             ),
             (0, 1),
-            "the reads of the cached and the uncached transcript"
+            "the cached transcript isn't read and the uncached one is read once"
         );
         assert_eq!(
             refresh_rounds,
             ["perf refresh-round sessions=1"],
-            "the refresh rounds"
+            "one refresh round refreshes the uncached session"
         );
     }
 
@@ -7067,12 +7077,12 @@ mod tests {
                 && output.contains("an unseen question")
                 && !output.contains("stale-cache")
                 && !output.contains("agent-error"),
-            "{output}"
+            "both sessions print their newest messages without a warning or an error:\n{output}"
         );
         assert_eq!(
             refresh_rounds,
             ["perf refresh-round sessions=2"],
-            "the refresh rounds"
+            "one refresh round refreshes both sessions"
         );
     }
 
@@ -7133,9 +7143,10 @@ mod tests {
                         .unwrap_or_else(crate::error_report);
                     (output, refresh_rounds(&service))
                 });
-                // Only the command's waits move test time. Its first wait for
-                // ownership gives up at its patience, so time past twice that
-                // is its wait after reading the cache as it is.
+                // Test time moves only while the command waits. Time past
+                // twice its patience is its wait after reading the cache as
+                // it is, because its first wait for ownership ends at its
+                // patience.
                 let deadline = std::time::Instant::now() + COMMAND_WAIT_BEGINS_WITHIN;
                 while self.clock.elapsed_since(started) < REFRESH_OWNERSHIP_PATIENCE * 2 {
                     assert!(
@@ -7179,11 +7190,11 @@ mod tests {
         assert_eq!(
             admitted_reads::count(&empty) - before,
             0,
-            "the empty session's reads"
+            "the empty session isn't read"
         );
         assert!(
             output.contains("the%20session%20is%20not%20in%20the%20session%20cache"),
-            "{output}"
+            "the empty session is reported as not in the session cache:\n{output}"
         );
     }
 
@@ -7222,7 +7233,7 @@ mod tests {
                 .unwrap_or_else(crate::error_report);
             assert!(
                 output.contains("first") && output.contains("third"),
-                "{output}"
+                "both ranges print:\n{output}"
             );
             (
                 admitted_reads::count(&transcript) - before,
@@ -7236,12 +7247,12 @@ mod tests {
         assert_eq!(
             cold,
             (1, vec!["perf refresh-round sessions=1".to_owned()]),
-            "the parses and refresh rounds on an empty cache"
+            "on an empty cache: one parse and one refresh round of one session"
         );
         assert_eq!(
             warm,
             (0, vec!["perf refresh-round sessions=1".to_owned()]),
-            "the parses and refresh rounds from the cache"
+            "from the cache: no parse and one refresh round of one session"
         );
     }
 
@@ -7298,8 +7309,14 @@ mod tests {
             checked.stale_copies.contains_key(&key.path)
         };
 
-        assert!(!is_older(generation), "the copy at its generation");
-        assert!(is_older(generation + 1), "a copy before its generation");
+        assert!(
+            !is_older(generation),
+            "the copy at its published generation reads as current"
+        );
+        assert!(
+            is_older(generation + 1),
+            "a copy before its published generation reads as older"
+        );
     }
 
     /// `read` of a Codex session on an empty cache reads the session its
@@ -7320,7 +7337,10 @@ mod tests {
             .execute(agent_command(&["read", &locator.to_string_lossy()]))
             .unwrap_or_else(crate::error_report);
 
-        assert!(!output.contains("agent-error"), "{output}");
+        assert!(
+            !output.contains("agent-error"),
+            "the read succeeds:\n{output}"
+        );
         assert_eq!(refresh_rounds(&service), Vec::<String>::new());
     }
 
@@ -7366,10 +7386,13 @@ mod tests {
         reads.sort();
         let mut expected = vec![1; history::provider::READ_BATCH_LENGTH];
         expected.insert(0, 0);
-        assert_eq!(reads, expected, "each session's reads");
+        assert_eq!(
+            reads, expected,
+            "each session of the first group is read once and the later session isn't read"
+        );
         assert!(
             output.contains("the%20session%20is%20not%20in%20the%20session%20cache"),
-            "{output}"
+            "the later session is reported as not in the session cache:\n{output}"
         );
     }
 
@@ -7775,7 +7798,7 @@ mod tests {
                 "failed%20to%20read%20or%20write%20the%20session%20cache%20for%20Codex%20sessions"
             ) && !output.contains("failed%20to%20list")
                 && output.contains("agent-error"),
-            "{output}"
+            "the error's warning names the session cache, not the listing:\n{output}"
         );
     }
 
@@ -7864,8 +7887,9 @@ mod tests {
         }
     }
 
-    /// Key discovery over a root the cache lacks loads the root as the
-    /// refresh owner, and keys its session from what that load recorded.
+    /// Key discovery over a root without sessions in the session cache loads
+    /// the root as the refresh owner, and keys its session from what that
+    /// load recorded.
     #[test]
     fn session_in_root_without_cache_is_keyed_from_its_owners_load() {
         let directory = tempfile::tempdir().unwrap();

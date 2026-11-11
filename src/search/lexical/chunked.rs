@@ -1,10 +1,10 @@
 //! Matches the search texts held in memory in chunks of about equal size
 //! across threads, whichever session holds them, then adds each session's
-//! counts together: one large session no longer keeps one thread busy while
+//! counts together, so one large session doesn't keep one thread busy while
 //! the others wait.
 
 use super::in_memory::SessionSearchTexts;
-use super::raw::{ADJACENCY_CAP, Counts, PREFIX_CAP, RawQuery};
+use super::raw::{ADJACENCY_LIMIT, Counts, PREFIX_LIMIT, RawQuery};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -24,9 +24,9 @@ impl Counts {
             *found |= *other;
         }
         for (count, other) in self.prefixes.iter_mut().zip(&other.prefixes) {
-            *count = (*count + other).min(PREFIX_CAP);
+            *count = (*count + other).min(PREFIX_LIMIT);
         }
-        self.adjacency = (self.adjacency + other.adjacency).min(ADJACENCY_CAP);
+        self.adjacency = (self.adjacency + other.adjacency).min(ADJACENCY_LIMIT);
         for (found, other) in self.literals.iter_mut().zip(&other.literals) {
             *found |= *other;
         }
@@ -182,8 +182,8 @@ mod tests {
         let one_thread = summary(&count_in_chunks(&sessions, &query, usize::MAX)[&7]);
         assert_eq!(
             (&one_thread.1, one_thread.2),
-            (&vec![PREFIX_CAP, 1, 0], ADJACENCY_CAP),
-            "the session's counts reach their caps"
+            (&vec![PREFIX_LIMIT, 1, 0], ADJACENCY_LIMIT),
+            "the session's counts reach their limits"
         );
         for chunk_bytes in [1, 5, 12, 30] {
             assert!(

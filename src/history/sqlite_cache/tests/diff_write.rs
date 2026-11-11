@@ -161,7 +161,7 @@ impl Fixture {
             .unwrap()
             .unwrap()
         else {
-            panic!("{}: listed fixture", self.label())
+            panic!("{}: the fixture session is listed", self.label())
         };
         *listed
     }
@@ -607,7 +607,7 @@ fn stored_entry_count(cache: &CacheWriter) -> usize {
 }
 
 #[test]
-fn parse_equal_to_stored_session_writes_no_entry_rows_for_every_agent() {
+fn parse_equal_to_stored_session_doesnt_write_entry_rows_for_every_agent() {
     for session in every_record_sessions() {
         let fixture = Fixture::of(session);
         let base = tempfile::tempdir().unwrap();
@@ -629,7 +629,7 @@ fn parse_equal_to_stored_session_writes_no_entry_rows_for_every_agent() {
         assert_eq!(
             take_row_writes(&cache.connection),
             BTreeMap::new(),
-            "{}: a parse equal to the stored session writes no entry row",
+            "{}: a parse equal to the stored session doesn't write any entry row",
             fixture.label()
         );
         assert_eq!(
@@ -879,7 +879,7 @@ fn removed_session_deletes_its_parts_and_result_items() {
             assert_eq!(
                 left,
                 0,
-                "{}: the removed session leaves no {table} row",
+                "{}: the removed session doesn't leave a {table} row",
                 fixture.label()
             );
         }
@@ -986,7 +986,7 @@ fn new_subagent_thread_is_inserted_and_removed_one_deleted() {
             writes_of(&writes, "threads", "DELETE") > 0
                 && writes_of(&writes, "transcripts", "DELETE") > 0
                 && writes_of(&writes, "entries", "INSERT") == 0,
-            "{}: the write deletes the removed sub-agent's rows and inserts none: {writes:?}",
+            "{}: the write deletes the removed sub-agent's rows and doesn't insert any: {writes:?}",
             fixture.label()
         );
         assert_matches_fresh_write(&cache, &fixture, &without);
@@ -1053,7 +1053,7 @@ fn removed_entries_are_deleted_for_every_agent() {
                 writes_of(&writes, "entries", "INSERT")
             ),
             (removed as i64, 0),
-            "{}: the write deletes the removed entries and inserts none: {writes:?}",
+            "{}: the write deletes the removed entries and doesn't insert any: {writes:?}",
             fixture.label()
         );
         assert_matches_fresh_write(&cache, &fixture, &after);
@@ -1076,7 +1076,7 @@ fn blocks_of(entry: &mut LogEntry) -> Option<&mut Vec<ContentBlock>> {
 }
 
 /// Replaces the content of the last result in `record`, or of its last text
-/// when it holds no result, with a stand-in; returns the entry's index.
+/// when it doesn't hold a result, with a stand-in; returns the entry's index.
 fn with_stand_in(record: &mut SessionRecord) -> Option<usize> {
     let entries = &mut entries_of(record).entries;
     let is_result = |block: &ContentBlock| matches!(block, ContentBlock::ToolResult { .. });
@@ -1172,7 +1172,7 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
 /// Asserts that the write of `fixture`'s record over `before` wrote the
 /// semantic turn of the entry at `changed` once when the turn changed and
 /// not otherwise, and stored its new turn; `writes` counts the write's rows.
-/// Returns whether the turn changed.
+/// Returns true when the turn changed.
 fn assert_changed_turn_written(
     cache: &CacheWriter,
     writes: &BTreeMap<(String, String), i64>,

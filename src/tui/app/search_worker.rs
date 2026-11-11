@@ -124,8 +124,8 @@ pub(super) struct SearchRequest {
     mode: ListSearchMode,
 }
 
-/// What the search worker searches: the rows, their search data, and the
-/// search texts read into memory so far.
+/// The search worker's corpus: the rows, their search data, and the search
+/// texts read into memory so far.
 pub(super) struct SearchWorkerState {
     conversations: Arc<Vec<Arc<Conversation>>>,
     searchable: Arc<Vec<SearchableConversation>>,
@@ -174,7 +174,7 @@ pub(super) struct PendingWork {
 }
 
 impl SearchWorkerState {
-    /// No rows yet; the copies whose texts are to be read go to
+    /// An empty corpus; the copies whose texts are to be read are sent on
     /// `copies_to_read`, and their reads reply on `texts_reply`.
     pub(super) fn new(
         copies_to_read: mpsc::Sender<TextsToRead>,

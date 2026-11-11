@@ -15,9 +15,10 @@ pub struct RootEnvironment<'a> {
     home: Option<PathBuf>,
     current_dir: Option<PathBuf>,
     temp_dir: Option<PathBuf>,
-    /// The memo this environment canonicalises directories through: the
-    /// command's, when an [`Environment`](crate::history::Environment) made
-    /// for one command made this environment.
+    /// The `CanonicalDirectories` this environment canonicalises directories
+    /// through: the command's, when an
+    /// [`Environment`](crate::history::Environment) made for one command
+    /// built this environment.
     directories: Arc<CanonicalDirectories>,
 }
 
@@ -61,8 +62,8 @@ mod test_home {
     use std::path::PathBuf;
 
     thread_local! {
-        /// libtest runs each test on a thread of its own, so the directory
-        /// is the test's, and it is removed when the test ends.
+        /// One directory per test, removed when the test ends, because libtest
+        /// runs each test on a thread of its own.
         static HOME: tempfile::TempDir = tempfile::tempdir().expect("a temporary home directory");
     }
 
@@ -131,8 +132,8 @@ impl<'a> RootEnvironment<'a> {
         &self.directories
     }
 
-    /// The variable's value with the platform's separator: every variable a
-    /// provider reads names a directory, or a name joined into one.
+    /// The variable's value with the platform's separator, because every
+    /// variable a provider reads names a directory or a name joined into one.
     pub fn var_os(&self, name: &str) -> Option<OsString> {
         (self.variable)(name).map(|value| with_platform_separators(value).into_os_string())
     }
@@ -246,7 +247,7 @@ impl SessionRoot {
             .find_map(|(position, root)| Some((position, PathBelowRoot::of(path, &root.path)?)))
     }
 
-    /// [`Self::position_of`] `path`, a path below the canonical path of this
+    /// [`Self::position_of`] for a `path` below the canonical path of this
     /// root or of a directory beside it, each canonicalised once per root.
     pub(crate) fn canonical_position_of(
         &self,

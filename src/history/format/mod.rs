@@ -109,11 +109,11 @@ pub struct SessionProjection {
     pub dropped: DroppedRecords,
     pub earlier_turns: EarlierTurns,
     /// Each earlier transcript the read opened, stamped just before it was
-    /// opened; empty for a format whose transcripts continue none.
+    /// opened; empty for a format whose transcripts don't continue earlier
+    /// ones.
     pub earlier_transcripts: Vec<FileStamp>,
-    /// What the read leaves for the agent's transcript reader to resume
-    /// from; [`TranscriptRead::full_read`] for a format whose reads do not
-    /// resume yet.
+    /// The state the agent's transcript reader resumes the next read from;
+    /// [`TranscriptRead::full_read`] for a format whose reads don't resume.
     pub transcript_read: TranscriptRead,
 }
 
@@ -179,7 +179,7 @@ pub trait SessionFormat: Sync {
 
     /// The row the list shows for the transcript at `path`, its sub-agent
     /// transcripts not merged in, or `None` when the file is not a transcript
-    /// in this format or holds no conversation. `dating` dates a row without
+    /// in this format or doesn't hold a conversation. `dating` dates a row without
     /// any time.
     #[cfg(test)]
     fn parse_conversation(
@@ -329,7 +329,6 @@ pub(crate) fn sniffed_conversation(
 /// when the file is the session its agent stores under `session_id`. A copy
 /// outside the agent's tree has none. Skips the stored check for an agent
 /// declaring `subagents` Not Capable: the check can read every log's header.
-/// The agent's roots come from `environment`.
 fn bare_file_subagents(
     source: Source,
     session_id: &str,

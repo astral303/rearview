@@ -9,7 +9,7 @@ use std::io::Write;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-/// When progress records fall due: the first once the command has run for
+/// The progress records' due times: the first once the command has run for
 /// `first`, then one every `every`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgressSchedule {
@@ -187,8 +187,8 @@ mod tests {
         assert!(!records.due_at(ms(7_000)).unwrap().contains("waiting="));
     }
 
-    /// Output shared with the test, which learns when the first record is
-    /// written and when the reporting thread lets go of it.
+    /// Output shared with the test. The test learns when the first record is
+    /// written and when the reporting thread releases the output.
     struct WatchedOutput {
         written: Arc<Mutex<Vec<u8>>>,
         first_record: mpsc::Sender<()>,
@@ -241,8 +241,11 @@ mod tests {
         let written = String::from_utf8(written.lock().unwrap().clone()).unwrap();
         assert!(
             written.starts_with("protocol agent-progress command=search state=running "),
-            "{written}"
+            "the output opens with a running search's progress record: {written}"
         );
-        assert!(written.ends_with('\n'), "{written}");
+        assert!(
+            written.ends_with('\n'),
+            "the last record ends its line: {written}"
+        );
     }
 }

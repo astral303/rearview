@@ -52,10 +52,9 @@ impl DroppedRecords {
         self.counting
     }
 
-    /// An empty count for one record of the transcript this counts:
-    /// counting when this counts, under the version this counts later
-    /// records under. [`Self::add_counts_of`] adds it to this count once the record's
-    /// drops are known to count.
+    /// An empty count for one record of this transcript, counting when `self`
+    /// counts, under `self`'s current version. Add it to `self` with
+    /// [`Self::add_counts_of`] once the record's drops are known to count.
     pub(crate) fn for_one_record(&self) -> Self {
         Self {
             counting: self.counting,

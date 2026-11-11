@@ -97,8 +97,8 @@ fn write_named_conversation(path: &std::path::Path, text: &str) {
     std::fs::write(path, format!("{line}\n")).unwrap();
 }
 
-/// The user's prompt before the agent's calls. A session holding it is one
-/// the list lists, so a load caches it.
+/// The user's prompt before the agent's calls. The list lists a session
+/// holding it, and a load caches that session.
 const OPENING_PROMPT: &str = r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"run it"}}"#;
 
 /// The opening prompt, then one assistant message of a call whose input is

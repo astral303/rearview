@@ -147,7 +147,7 @@ impl App {
         self.list_change.take()
     }
 
-    /// Show what a rename or delete did.
+    /// Show the result of a rename or delete.
     pub(crate) fn finish_list_change(&mut self, outcome: ListChangeOutcome) {
         match outcome {
             ListChangeOutcome::Renamed {

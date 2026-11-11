@@ -101,7 +101,8 @@ pub fn filter_turn(role: SemanticTurnRole, turn: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-/// `text` without its fenced code blocks; borrowed when it holds no fence.
+/// `text` without its fenced code blocks; borrowed when it doesn't hold a
+/// fence.
 fn strip_markdown_code_fences(text: &str) -> Cow<'_, str> {
     if !text.contains("```") {
         return Cow::Borrowed(text);

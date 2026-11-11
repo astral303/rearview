@@ -64,15 +64,14 @@ pub(crate) fn path_key(path: &Path) -> String {
 
 /// A file's path below a root, both as spelled: the names below the root,
 /// joined with the platform's separator whichever separators the path
-/// mixes. Every comparison of a path with a root goes through it.
+/// mixes. Every comparison of a path with a root passes through it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PathBelowRoot(String);
 
 impl PathBelowRoot {
     /// `path` below `root`; `None` when `path` does not begin with `root`,
-    /// or steps through `..` below it, which only the file system
-    /// canonicalises.
-    /// `root` itself is the empty path below it.
+    /// or steps through `..` below it, because only the file system
+    /// canonicalises `..`. `root` itself is the empty path below it.
     pub(crate) fn of(path: &Path, root: &Path) -> Option<Self> {
         let below = path.strip_prefix(root).ok()?;
         let mut text = OsString::new();

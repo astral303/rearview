@@ -90,8 +90,8 @@ impl OpenCodeSession {
             .map(|id| session_ref(&database, id))
             .collect();
         let root = SessionRoot::new(database).in_agent_tree();
-        // A stored OpenCode session validates against the fingerprint its
-        // rows hold now, so the stub carries that one.
+        // Give the stub the fingerprint the rows hold now: a stored OpenCode
+        // session validates against it.
         let discovered = Source::OpenCode
             .provider()
             .storage()

@@ -277,8 +277,8 @@ impl SessionChanges {
                             .unlisted
                             .insert(locator, FoundSession::of(&row));
                     } else {
-                        // The newer messages the copy lacks may fall inside
-                        // the window.
+                        // The newer messages missing from the copy may fall
+                        // inside the window.
                         self.pending.push(PendingSession {
                             source,
                             path: locator,

@@ -543,9 +543,9 @@ const SEARCH_ONLY_GROUPS: usize = 1 + ENTRY_SEARCH_FIELDS.len();
 #[cfg(test)]
 thread_local! {
     /// The calls of [`part_rows`] on this thread: one per entry for its
-    /// digests, and one more per entry a write writes. Building part rows
-    /// leaves no trace in the cache: only this count shows a write building
-    /// an unchanged entry's rows again.
+    /// digests, and one more per entry a write writes. Tests read this count
+    /// to catch a write building an unchanged entry's rows again, because
+    /// building part rows doesn't change the cache.
     pub(in super::super) static PART_ROW_BUILDS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
@@ -699,7 +699,7 @@ impl<'a> Columns<'a> {
 /// Writers store such a part through [`Self::columns`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::history::sqlite_cache) enum SearchOnlyKind {
-    /// A search text no block holds as written.
+    /// A search text stored beside its entry.
     Derived,
     /// The search text of a result with items in `result_items`.
     ResultText,

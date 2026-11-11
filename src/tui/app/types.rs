@@ -63,7 +63,7 @@ pub enum AppMode {
 /// The open session's pending refresh, as the viewer labels it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenSessionStatus {
-    /// The cache holds no copy of the session yet.
+    /// The session is not in the session cache yet.
     Loading,
     /// The viewer shows an out-of-date copy.
     Updating,
@@ -88,10 +88,10 @@ pub struct Focus {
 pub struct ViewState {
     /// Path to the conversation file (stable identity)
     pub conversation_path: PathBuf,
-    /// Which agent recorded the conversation; re-parses and exports route
-    /// through this source's own format rather than sniffing the path.
-    /// `None` for a file opened directly until the background worker reads
-    /// it.
+    /// The agent that recorded the conversation. A session refresh of a file
+    /// opened directly that the list doesn't show reads the file as this
+    /// agent's. `None` for a file opened directly until the background worker
+    /// reads it.
     pub conversation_source: Option<crate::history::Source>,
     /// The conversation's address in the session cache. Re-reads and exports
     /// read its newest copy through it. `None` for a file opened directly
@@ -106,7 +106,7 @@ pub struct ViewState {
     pub publication: crate::history::sqlite_cache::Publication,
     /// The header's fields, and the source of its height: the catalogue row
     /// of the copy the view shows, or the open session's row while the view
-    /// shows no copy. `None` shows the file name alone.
+    /// doesn't show a copy. `None` shows the file name alone.
     pub header: Option<HeaderRow>,
     /// The title stored beside the transcript that the open session's row
     /// shows, as the list or the last refresh read it. The header shows it
@@ -154,7 +154,7 @@ pub struct ViewState {
     /// refresh replaces it.
     pub count_highlight: Option<CountHighlight>,
     /// True while the session is missing from the session cache, so the
-    /// view shows no messages.
+    /// view doesn't show any messages.
     pub is_copy_missing: bool,
 }
 
@@ -241,8 +241,8 @@ pub struct ListScope {
 /// A file the user opened directly (`rearview <file>`).
 #[derive(Clone, Debug)]
 pub struct DirectFile {
-    /// The path as the user typed it, which the viewer shows (`p`) and
-    /// copies (`Y`).
+    /// The path as the user typed it, for the viewer's path display (`p`)
+    /// and path copy (`Y`).
     pub typed: PathBuf,
     /// The path the cache finds the session's copy by.
     pub canonical: PathBuf,

@@ -112,7 +112,10 @@ fn text_without_codes_splits_into_itself_without_codes() {
         matches!(split.text, Cow::Borrowed("plain é\ttext\n")),
         "the text is borrowed as it is"
     );
-    assert!(split.codes.is_none(), "a text without codes stores none");
+    assert!(
+        split.codes.is_none(),
+        "a text without codes doesn't store any"
+    );
 }
 
 #[test]

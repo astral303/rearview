@@ -13,8 +13,9 @@
 //! session directory's `state.json`. Messages removed by a later `context.undo`
 //! are still shown — the wire keeps them, and the view is what happened.
 //!
-//! Kimi appends to a wire and rewrites `state.json`, so a read of a changed
-//! wire resumes from its stable cursor and reads `state.json` again.
+//! A read of a changed wire resumes from its stable cursor and reads
+//! `state.json` again, because Kimi appends to a wire and rewrites
+//! `state.json`.
 
 mod message_origin;
 
@@ -114,10 +115,10 @@ impl SessionFormat for KimiWireFormat {
 }
 
 /// Resumes a read of a Kimi wire from its stable cursor: the last record
-/// boundary before which no `!` command waits for its output, since that
-/// output becomes the command's call's result. The identity is the wire's
-/// metadata line with what the read takes from `state.json` besides the
-/// title; every read takes the title again.
+/// boundary where a `!` command before it isn't waiting for its output,
+/// because that output becomes the command's call's result. The identity is
+/// a hash of the wire's metadata line and of the `state.json` fields a read
+/// uses besides the title; every read rereads the title.
 impl TranscriptReader for KimiWireFormat {
     fn identity(&self, source: &Path) -> Result<Vec<u8>> {
         let mut reader = BufReader::new(File::open(source)?);
@@ -199,8 +200,8 @@ impl TranscriptReader for KimiWireFormat {
 }
 
 /// The wire's identity: a hash of its metadata line, `opening_line`, and of
-/// what a read takes from the session's `state` besides the title, for the
-/// main wire when `is_main`.
+/// the session `state` fields a read uses besides the title, for the main
+/// wire when `is_main`.
 fn wire_identity(opening_line: &str, state: &SessionState, is_main: bool) -> Vec<u8> {
     let facts = serde_json::to_vec(&(
         opening_line,
@@ -212,9 +213,9 @@ fn wire_identity(opening_line: &str, state: &SessionState, is_main: bool) -> Vec
     blake3::hash(&facts).as_bytes().to_vec()
 }
 
-/// The session's title entry and its text, which only the main wire
-/// carries: the title belongs to the session, and a sub-agent wire is read
-/// through the session and has no row.
+/// The session's title entry and its text, for the main wire only: the
+/// title belongs to the session, and a sub-agent wire is read through the
+/// session and doesn't have a row.
 fn title_entry(state: &SessionState, is_main: bool) -> Option<(LogEntry, String)> {
     if !is_main {
         return None;
@@ -360,8 +361,8 @@ struct ParsedWire {
     entries: Vec<(usize, LogEntry)>,
     malformed_lines: Vec<usize>,
     dropped: DroppedRecords,
-    /// Where the read stopped and where the next restarts; `None` while the
-    /// metadata line has no line ending.
+    /// The read's end and the next read's start; `None` while the metadata
+    /// line doesn't have a line ending.
     end: Option<WireReadEnd>,
 }
 
@@ -376,7 +377,7 @@ struct WireOpening {
     protocol: Option<String>,
     /// Past the line.
     records_start: LineCursor,
-    /// False while the line has no line ending: Kimi is still writing it.
+    /// False while the line doesn't have a line ending: Kimi is writing it.
     is_terminated: bool,
 }
 
@@ -441,16 +442,16 @@ fn parse_reader(
     }))
 }
 
-/// What a read of a wire carries from one record to the next where no `!`
-/// command waits for its output.
+/// The state a read of a wire carries from one record to the next, kept at
+/// each boundary where a `!` command isn't waiting for its output.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct WireState {
     /// The model the last turn-scoped usage record named.
     last_model: Option<String>,
 }
 
-/// Where a read of a wire stopped, and where the next read restarts with
-/// which state.
+/// The end of a read of a wire, and the cursor and state the next read
+/// restarts from.
 struct WireReadEnd {
     cursor: LineCursor,
     stable_cursor: LineCursor,
@@ -458,8 +459,8 @@ struct WireReadEnd {
 }
 
 impl WireReadEnd {
-    /// What this read leaves for the next, for the wire `file` holds, whose
-    /// identity is `identity`.
+    /// The [`TranscriptRead`] the next read resumes from, for the wire with
+    /// the identity `identity` that `file` holds.
     fn transcript_read(&self, identity: Vec<u8>, file: &mut File) -> Result<TranscriptRead> {
         Ok(TranscriptRead {
             cursor: self.cursor.encode(),
@@ -481,8 +482,8 @@ struct WireProjector {
     /// output arrives.
     open_shell_call: Option<(usize, ShellCall)>,
     dropped: DroppedRecords,
-    /// The last record boundary where no `!` command waited for its output,
-    /// and the state there.
+    /// The last record boundary where a `!` command wasn't waiting for its
+    /// output, and the state there.
     stable: (LineCursor, WireState),
 }
 
@@ -1455,7 +1456,8 @@ mod tests {
         /// Asserts that `prefix`, a read of a wire's beginning, up to the
         /// window's first line, and then `window`, the read resumed from it
         /// over the whole wire, hold what `full`, one read of the whole wire,
-        /// holds, and leave what it leaves for the next read.
+        /// holds, and that `window` leaves the same [`TranscriptRead`] as
+        /// `full`.
         fn assert_window_completes(
             name: &str,
             prefix: &SessionProjection,
@@ -1487,7 +1489,7 @@ mod tests {
             );
             assert_eq!(
                 window.read, full.transcript_read,
-                "{name}: the window leaves what the full read leaves"
+                "{name}: the window leaves the full read's `TranscriptRead`"
             );
         }
 
@@ -1597,7 +1599,7 @@ mod tests {
                         other => assert!(
                             matches!(other, Resumption::FullRead)
                                 && prefix.transcript_read == TranscriptRead::full_read(),
-                            "{name}: only a wire whose metadata line has no line ending yet reads whole: {other:?}"
+                            "{name}: only a wire with a metadata line that doesn't have a line ending yet reads whole: {other:?}"
                         ),
                     }
                 }
@@ -1663,7 +1665,7 @@ mod tests {
             assert_eq!(
                 reader().identity(&wire).unwrap(),
                 read.identity,
-                "the title is not part of the identity: every read takes it again"
+                "the title is not part of the identity: every read rereads it"
             );
 
             let bytes = std::fs::read_to_string(&wire).unwrap();
@@ -1671,7 +1673,7 @@ mod tests {
             assert_ne!(
                 reader().identity(&wire).unwrap(),
                 read.identity,
-                "the metadata line is the identity"
+                "the metadata line is part of the identity"
             );
         }
     }

@@ -31,7 +31,7 @@ struct CodexSession {
     subagents: Vec<PathBuf>,
     /// The stub's modification time, in seconds, moved on with each update.
     updates: u64,
-    /// Another spelling of `home`, which later reads name the session's
+    /// Another spelling of `home` for later reads to name the session's
     /// files through; `None` for `home` as it is.
     home_spelling: Option<PathBuf>,
 }
@@ -109,8 +109,8 @@ impl CodexSession {
     }
 
     /// Name the session's files from now on through `home` spelled through
-    /// a directory inside it and `..`, which the file system canonicalises
-    /// to `home`.
+    /// a directory inside it and `..`. The file system canonicalises that
+    /// spelling to `home`.
     fn spell_home_through_parent(&mut self) {
         let elsewhere = self.home.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -557,8 +557,8 @@ fn subagent_spawned_and_reporting_over_later_updates_resumes_each_time() {
         "the read opens the new sub-agent transcript alone"
     );
 
-    // The session moves on past the sub-agent's answer, which then stands
-    // before the checkpoint when the report folds it.
+    // The session moves on past the sub-agent's answer. The answer then
+    // stands before the checkpoint when the report folds it.
     let answer = reply("10:05:10.000", "msg_s2", "The notes list the steps.");
     write_lines(&session.subagent(SCOUT), &scout_lines(&[first, answer]));
     let mut more = scout_spawn();
@@ -889,7 +889,7 @@ fn load_after_archived_tree_is_retargeted_reads_the_session_whole_once() {
     assert_eq!(
         reads,
         [1, 1, 1, 1],
-        "the second load's reads of each rollout"
+        "the second load reads each rollout once"
     );
     let row = rows
         .iter()

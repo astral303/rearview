@@ -57,8 +57,8 @@ pub struct LoadedSessions {
     pub unreadable_directories: Vec<UnreadableDirectory>,
 }
 
-/// A session discovery found, and the directory and id of the row the load
-/// listed for it: `None` when the load did not list a row, because the
+/// A session discovery found, and the directory and session ID of the row the
+/// load listed for it: `None` when the load did not list a row, because the
 /// session does not hold a conversation or could not be read.
 pub struct DiscoveredSession {
     pub stub: SessionStub,
@@ -69,8 +69,8 @@ pub struct DiscoveredSession {
     /// transcript, or did not find; `None` when the load read the session
     /// as it is now, or the command leaves its cached row out.
     pub stale: Option<StaleCopy>,
-    /// The warning agent commands print for a session the load read as
-    /// holding no conversation or failing to read; `None` for a listed
+    /// The warning agent commands print for a session the load read as not
+    /// holding a conversation or as failing to read; `None` for a listed
     /// session, a stale copy, or a row the cache recorded without one.
     pub warning: Option<AgentWarning>,
 }
@@ -192,8 +192,8 @@ impl<'a> LeftOutRows<'a> {
 }
 
 /// The options of one provider's [`load_sessions`]. The default previews
-/// each row's first messages, reports nothing, meters nothing and leaves no
-/// row out.
+/// each row's first messages, doesn't report or meter anything, and leaves
+/// every row in.
 #[derive(Clone, Copy)]
 pub struct LoadOptions<'a> {
     /// Preview each row with its last messages instead of its first.
@@ -307,9 +307,9 @@ impl SkippedSessions {
 /// cache as `scope` allows.
 ///
 /// A session the session cache database holds as it is now is restored from
-/// it instead of reparsed, and one that held no conversation is skipped
-/// without being read again. A root holding a session the database does not
-/// hold as it is now is read under `scope`'s refresh ownership, or read as
+/// it instead of reparsed, and a session that didn't hold a conversation is
+/// skipped without being read again. A root with a session not in the
+/// database as it is now is read under `scope`'s refresh ownership, or read as
 /// the cache holds it when `scope` reads the cache as it is. `progress`
 /// hears `(done, total)` in transcripts, a session's own and each
 /// sub-agent's: once every root is discovered, then as each transcript is
@@ -335,8 +335,8 @@ pub fn load_sessions(
 
 /// `storage`'s sessions as discovery finds them now, reading only those
 /// `needs_reading` picks: through the cache under `scope`'s refresh
-/// ownership, as a load reads them, writing only the sessions the database
-/// did not hold.
+/// ownership, as a load reads them, writing only the sessions missing from
+/// the database.
 pub fn rediscover_sessions(
     environment: &Environment,
     storage: &dyn SessionStorage,
@@ -392,7 +392,7 @@ pub fn read_resolved_session(
 /// transcripts, with the preview `show_last` selects. A file discovery
 /// leaves out, such as a sub-agent opened by its ID, is found through
 /// [`SessionStorage::rediscover_unlisted_session`]. Another copy stored
-/// under the same session id is not read. Discovery is shared across the
+/// under the same session ID is not read. Discovery is shared across the
 /// requests. Read as the TUI's drawing thread reads: from the session cache
 /// alone.
 ///
@@ -442,8 +442,8 @@ pub fn reread_sessions(
 /// preview `show_last` selects, or the file found through
 /// [`SessionStorage::rediscover_unlisted_session`]. On a cache miss, wait
 /// for `operation`'s refresh ownership as a load does, discover the files'
-/// roots again under it, and cache each session the database does not
-/// hold. Each session the database does not hold as read gets its
+/// roots again under it, and cache each session missing from the database.
+/// Each session not in the database as read gets its
 /// [`NextStep::after_read_without_writing`] as the read ends: wait for the
 /// refresh running then, or a session refresh. A file under a directory
 /// discovery cannot list reads as its cached copy, settled, or as a
@@ -869,10 +869,10 @@ impl SessionLoader<'_> {
     /// not all read (restored from the cache, empty or unreadable) is topped
     /// up when it completes.
     ///
-    /// A changed session whose cached row `left_out` holds is restored from
-    /// that row; the cache keeps the row unchanged.
+    /// A changed session is restored from its cached row when `left_out`
+    /// leaves that row out; the cache keeps the row unchanged.
     ///
-    /// Beside the conversations, return the sessions that hold no
+    /// Beside the conversations, return the sessions that don't hold a
     /// conversation, the unreadable ones, every stub with what was recorded
     /// of it, and what the root's discovery ignored.
     fn load_root(
@@ -947,8 +947,8 @@ impl SessionLoader<'_> {
     }
 
     /// [`Self::load_root_sessions`] under `owner`'s refresh ownership: the
-    /// root discovered again under the writer lock, every session the
-    /// database does not hold as it is now parsed and written. A discovery
+    /// root discovered again under the writer lock, every session not in the
+    /// database as it is now parsed and written. A discovery
     /// that fails keeps the one from before. Once `owner` is no longer live,
     /// as after a write batch that fails, the root's other sessions are read
     /// from the cache as it is.
@@ -1025,8 +1025,8 @@ impl SessionLoader<'_> {
         })
     }
 
-    /// True when `snapshot` does not hold every stub as it is now, or holds
-    /// a session to remove, as `deletions` decides.
+    /// True when `snapshot` holds a session to remove, as `deletions` decides,
+    /// or lacks a stub as it is now whose cached row `left_out` keeps in.
     fn needs_refresh(
         &self,
         root: &SessionRoot,
@@ -1177,8 +1177,8 @@ impl SessionLoader<'_> {
         Ok(owner.can_publish().then_some(snapshot))
     }
 
-    /// False when the database cannot hold the root: no database file and no
-    /// stubs to write.
+    /// False when the database cannot hold the root: the database file doesn't
+    /// exist and `stubs` is empty.
     fn may_hold_root(&self, stubs: &[SessionStub]) -> bool {
         !stubs.is_empty()
             || self
@@ -1219,12 +1219,12 @@ impl SessionLoader<'_> {
     }
 
     /// [`Self::load_root`]'s sessions, writing to `caches`'s database each
-    /// session it parses, and reading every session that database does not
-    /// hold as it is now from its transcripts while the owner is live; once
-    /// the owner is no longer live, the rest restore from their copies. A
-    /// load that reads the cache as it is parses nothing: it restores what
-    /// the database holds, and lists no row for a session the database
-    /// lacks. The database's listed rows under a directory discovery could
+    /// session it parses, and reading from its transcripts every session not
+    /// in that database as it is now while the owner is live; once the owner
+    /// is no longer live, the rest restore from their copies. A load that
+    /// reads the cache as it is doesn't parse anything: it restores what the
+    /// database holds, and doesn't list a row for a session missing from the
+    /// database. The database's listed rows under a directory discovery could
     /// not list restore as they are.
     ///
     /// Sessions restored from the database or a left-out row are restored in
@@ -1657,8 +1657,9 @@ enum RootRead {
 /// The source of `stub`'s row in a root load, against `database`, the root's
 /// database as the load began; `left_out` and the titles stored beside the
 /// transcripts, `external_titles`, decide a changed session's. A load that
-/// `reads_as_is` takes a changed session's row from the database's copy.
-/// Without a database, the load reads the cache as it is and lists no row.
+/// `reads_as_is` restores a changed session's row from the database's copy.
+/// Without a database, the load reads the cache as it is and doesn't list a
+/// row.
 fn row_source<'a>(
     stub: &SessionStub,
     database: Option<&'a DatabaseWrites<'a>>,
@@ -1740,9 +1741,9 @@ fn adopt_rediscovery(
     stubs
 }
 
-/// The transcripts a refresh of `stubs` parses: those of each stub that
-/// `snapshot`, the cache read before acquiring refresh ownership, does not
-/// hold as it is now, or of every stub without a snapshot.
+/// The transcripts a refresh of `stubs` parses: those of each stub not in
+/// `snapshot`, the cache read before acquiring refresh ownership, as it is
+/// now, or of every stub without a snapshot.
 fn transcripts_to_parse(stubs: &[SessionStub], snapshot: Option<&RootCache>) -> usize {
     stubs
         .iter()
@@ -1759,8 +1760,8 @@ impl RootCache {
     }
 }
 
-/// Sessions read ahead of the database writer, so a load holds no more than
-/// this many sessions' entries waiting to be written.
+/// The most sessions a load reads ahead of the database writer, holding
+/// their entries until they are written.
 const DATABASE_WRITE_QUEUE_LENGTH: usize = 4;
 
 /// A root load's writes to the session cache database, and the fingerprint
@@ -1812,7 +1813,7 @@ impl<'a> DatabaseWrites<'a> {
 }
 
 /// `row`, whose write gave its copy `generation`, as that copy. A row
-/// without a copy, which its own texts serve, keeps them.
+/// without a copy keeps its own texts and serves them.
 fn published_at(mut row: Conversation, generation: i64) -> Conversation {
     match row.cached_session.take() {
         Some(copy) => row.publish_as(copy.of_generation(generation)),
@@ -2039,8 +2040,8 @@ fn restored_row(
 /// A whole parse's record for the session cache database.
 enum ParseRecord {
     Record(Box<SessionRecord>),
-    /// A listed session's parse that no record was built for, with its
-    /// entries.
+    /// A listed session's parse with its entries, when its record could not
+    /// be built.
     Unbuilt(TranscriptEntries),
     /// A read the database does not record.
     NotRecorded,
@@ -2136,9 +2137,9 @@ fn cache_record(
 /// A discovered session's read, before the list's preview and project are
 /// filled in.
 ///
-/// The two reads that yield no conversation are separate variants because
-/// they cache differently. Only `Empty` says something about the transcript's
-/// content, and content is all a fingerprint can stand for. Both carry the
+/// The two reads that don't yield a conversation are separate variants
+/// because they cache differently. Only `Empty` records a fact about the
+/// transcript's content, and content is all a fingerprint can stand for. Both carry the
 /// warning agent commands print for the session: built from the parse, or
 /// as the cache recorded it (`None` for a row recorded without one).
 enum RawRead {
@@ -2146,8 +2147,8 @@ enum RawRead {
     Restored(Conversation),
     /// Read from the transcript.
     Parsed(Conversation),
-    /// Read cleanly and holds no conversation this provider lists, or the cache
-    /// already records it as such. Cached against the fingerprint, so the next
+    /// Read cleanly and doesn't hold a conversation this provider lists, or the
+    /// cache already records it as such. Cached against the fingerprint, so the next
     /// load skips it unopened. A change to a provider's parser therefore needs
     /// a `SessionCache::schema_version` bump to be seen, as it already does for
     /// a session that parsed into a row. `parsed` holds the parse's entries,
@@ -2193,8 +2194,8 @@ impl RawRead {
         }
     }
 
-    /// The warning agent commands print for a session read as holding no
-    /// conversation or failing to read; `None` for a listed session.
+    /// The warning agent commands print for a session read as not holding a
+    /// conversation or as failing to read; `None` for a listed session.
     fn warning(&self) -> Option<&AgentWarning> {
         match self {
             Self::Empty { warning, .. } | Self::Failed(_, warning) => warning.as_ref(),
@@ -2621,10 +2622,17 @@ mod tests {
                 &read,
             );
 
-            assert_eq!(loaded.conversations.len(), 1, "{:?}", row.source);
+            assert_eq!(
+                loaded.conversations.len(),
+                1,
+                "{:?}: the load lists the cached session",
+                row.source
+            );
             assert!(loaded.conversations[0].cached_session.is_some());
             assert!(loaded.conversations[0].full_text.is_empty());
-            let by_id = loader.load_one(&root, &stub).expect("catalogue lookup");
+            let by_id = loader
+                .load_one(&root, &stub)
+                .expect("the session restores from the catalogue");
             assert!(by_id.cached_session.is_some());
             assert_eq!(
                 meter
@@ -2637,7 +2645,7 @@ mod tests {
             );
             assert_eq!(
                 loaded.conversations[0].session_id, row.session_id,
-                "{:?}",
+                "{:?}: the restored row keeps its session ID",
                 row.source
             );
             assert_eq!(
@@ -2812,7 +2820,7 @@ mod tests {
     }
 
     #[test]
-    fn deletion_waits_for_refresh_owner_then_leaves_database() {
+    fn deletion_waits_for_refresh_owner_then_removes_session_from_database() {
         use crate::history::sqlite_cache::refresh::tests::AnotherRearviewsOwner;
         let base = admitted_cache_base();
         let home = ClaudeHome::new();
@@ -3031,7 +3039,10 @@ mod tests {
         assert!(!meter_reported_waiting.load(Ordering::Relaxed));
         let records = String::from_utf8(records).unwrap();
         assert!(!records.is_empty());
-        assert!(!records.contains("waiting="), "{records}");
+        assert!(
+            !records.contains("waiting="),
+            "the progress records don't report waiting: {records}"
+        );
     }
 
     /// The database holds one row per session, with each sub-agent
@@ -3066,7 +3077,7 @@ mod tests {
         assert_eq!(stored_keys_in(cache_base.path(), &home), keys);
     }
 
-    /// A session refresh caches a session opened by id with the
+    /// A session refresh caches a session opened by its ID with the
     /// same step as the list: it joins the root's sessions in the database,
     /// and the next load restores it unparsed.
     #[test]
@@ -3100,7 +3111,7 @@ mod tests {
         assert_eq!(
             home.watch().parsed_sessions(),
             parsed,
-            "the session loaded by id restores from the cache"
+            "the session loaded by its ID restores from the cache"
         );
     }
 
@@ -3136,7 +3147,7 @@ mod tests {
     /// A root can hold sessions the provider found but ignores. The load
     /// words them for the user, one term per reason, so the list can show why
     /// it holds less than the disk does; a reason nothing was ignored for
-    /// makes no term.
+    /// doesn't make a term.
     #[test]
     fn roots_ignored_sessions_are_reported_as_terms_with_its_sessions() {
         let cache_base = tempfile::tempdir().unwrap();
@@ -3190,7 +3201,7 @@ mod tests {
             AgentMeter::UNMETERED,
         )
         .cache_row(&home.root(), &stub)
-        .expect("the session refreshed by ID");
+        .expect("the session refreshed by ID has a row");
 
         assert_eq!(
             home.watch.parses_after_mark(),
@@ -3762,7 +3773,7 @@ mod tests {
     }
 
     /// A discovery batch whose commit fails stops full and targeted reads:
-    /// they parse nothing, repeat no discovery and leave the cache as it was.
+    /// they don't parse or repeat a discovery, and leave the cache as it was.
     #[test]
     fn discovery_batch_whose_commit_fails_stops_read_without_parsing_or_writing() {
         for targeted in [false, true] {
@@ -4009,7 +4020,7 @@ mod tests {
         };
         assert!(
             format!("{:?}", entries.entries).contains("an unwritten question"),
-            "{:?}",
+            "the kept entries hold the unwritten question: {:?}",
             entries.entries
         );
     }
@@ -4065,7 +4076,7 @@ mod tests {
                     .iter()
                     .all(|text| text.is_empty())
                         && row.semantic_turns.is_empty(),
-                    "{case}: the row holds none of its parse's texts"
+                    "{case}: the row doesn't hold any of its parse's texts"
                 );
                 let content = row.load_held_content().unwrap().row;
                 assert_eq!(
@@ -4668,8 +4679,8 @@ mod tests {
     /// Refuse every read of the stored refresh owner on a writable connection
     /// to the cache in `base`, from the one numbered `refused_from` on: the
     /// write batch or parse batch whose ownership check makes it cannot
-    /// start. Mark `watch` at the first refusal. The reads counted until the
-    /// result drops.
+    /// start. Mark `watch` at the first refusal. Returns the installed hooks
+    /// and the count of owner reads, which grows until the hooks drop.
     fn refuse_batches_from(
         base: &Path,
         refused_from: Option<usize>,
@@ -4987,10 +4998,10 @@ mod tests {
         );
     }
 
-    /// A session whose rows left the database is read from its transcript
-    /// again, and its rows written back.
+    /// A session whose rows were removed from the database is read from its
+    /// transcript again, and its rows written back.
     #[test]
-    fn session_database_doesnt_hold_is_read_again() {
+    fn session_missing_from_database_is_read_again() {
         for fixture in super::super::contract_tests::registered_fixtures() {
             let home = tempfile::tempdir().unwrap();
             let base = tempfile::tempdir().unwrap();
@@ -5076,7 +5087,7 @@ mod tests {
     }
 
     #[test]
-    fn session_deleted_from_disk_leaves_database() {
+    fn session_deleted_from_disk_is_removed_from_database() {
         let cache_base = tempfile::tempdir().unwrap();
         let home = ClaudeHome::new();
         let kept = home.write("kept", 1, &["a question"]);
@@ -5120,7 +5131,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_unchanged_sessions_doesnt_take_writer_lock() {
+    fn restoring_unchanged_sessions_doesnt_acquire_writer_lock() {
         assert_eq!(
             commits_reading_a_root_with_one_change(12 * READ_BATCH_LENGTH),
             commits_reading_a_root_with_one_change(READ_BATCH_LENGTH),
@@ -5374,7 +5385,8 @@ mod tests {
         );
     }
 
-    /// A new session has no cached row to leave out, so it is read.
+    /// A new session is read because it doesn't have a cached row to leave
+    /// out.
     #[test]
     fn new_session_is_read_even_when_its_row_is_left_out() {
         let cache_base = admitted_cache_base();
@@ -5637,7 +5649,7 @@ mod tests {
             .map(|outcome| match outcome.into_parts() {
                 (SessionRead::Listed(read), NextStep::Settled) => read.path,
                 (SessionRead::Listed(_), next) => panic!("every session read is settled: {next:?}"),
-                _ => panic!("a session was not read as a listed session"),
+                _ => panic!("every session reads as a listed session"),
             })
             .collect();
         assert_eq!(paths, [second.locator, first.locator], "in the order asked");
@@ -5743,7 +5755,7 @@ mod tests {
         assert_eq!(home.watch().sessions_parsed_after_mark(), [grows]);
     }
 
-    /// When a test's append runs during a parse.
+    /// A hook that runs a test's append at one moment of a parse.
     type ParseHook = fn(&crate::history::provider::ParseWatch, Box<dyn Fn() + Send + Sync>);
 
     /// The two moments an agent's append can land in a parse: before the
@@ -5886,8 +5898,8 @@ mod tests {
 
                 // A source the file system cannot stamp, such as a database's
                 // session, is read in one snapshot. When the snapshot already
-                // holds the appended rows, the next read finds no row changed
-                // since the copy, and the session is read whole once.
+                // holds the appended rows, the next read doesn't find a row
+                // changed since the copy, and the session is read whole once.
                 let is_stamped = CachedFingerprint::of_file(&session.locator)
                     .unwrap()
                     .is_some();
@@ -6044,11 +6056,11 @@ mod tests {
             "the earlier copy stays with its entries, unwritten"
         );
         let [row] = listed.as_slice() else {
-            panic!("{} rows listed", listed.len());
+            panic!("one row is listed, not {}", listed.len());
         };
         assert!(
             row.cached_session.is_none() && row.full_text.contains("another question"),
-            "the row keeps its parse's texts, which no copy holds"
+            "the row keeps its parse's texts and doesn't read a copy"
         );
     }
 
@@ -6374,8 +6386,8 @@ mod tests {
         assert_eq!(reports, vec![(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)]);
     }
 
-    /// A session the database restores reads none of its transcripts; the
-    /// count still reaches the total.
+    /// A session the database restores doesn't read any of its transcripts;
+    /// the count still reaches the total.
     #[test]
     fn progress_reaches_total_when_sessions_are_not_read() {
         let cache_base = admitted_cache_base();

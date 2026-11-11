@@ -137,7 +137,7 @@ pub struct CommandPerf {
     /// `None` until a global search starts.
     search: OnceLock<SearchReads>,
     /// The semantic route texts a semantic search computed; `None` when it
-    /// computed none.
+    /// didn't compute any.
     semantic_routes: Mutex<Option<ComputedRoutes>>,
 }
 
@@ -146,11 +146,11 @@ pub struct CommandPerf {
 #[derive(Clone, Debug)]
 struct ComputedRoutes {
     count: usize,
-    /// Why they were not stored; `None` once stored.
+    /// The reason they were not stored; `None` once stored.
     skipped: Option<RoutesSkipped>,
 }
 
-/// Why computed semantic route texts were not stored.
+/// The reason computed semantic route texts were not stored.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoutesSkipped {
     /// Another rearview owns the refresh.
@@ -602,17 +602,20 @@ mod tests {
                 "memory",
                 "total",
             ],
-            "{records}"
+            "the stages, the agent's load, the transcript, memory and total, in order: {records}"
         );
         assert!(
             records.contains("perf discovery source=codex roots=1 sessions=2 ms=0\n"),
-            "{records}"
+            "the discovery record counts Codex's roots and sessions: {records}"
         );
         assert!(
             records.contains("perf transcript ms=0 bytes=10 messages=1\n"),
-            "{records}"
+            "the transcript record counts its bytes and messages: {records}"
         );
-        assert!(records.contains("perf memory peak-mb=3\n"), "{records}");
+        assert!(
+            records.contains("perf memory peak-mb=3\n"),
+            "the memory record shows the peak in megabytes: {records}"
+        );
     }
 
     #[test]
@@ -639,11 +642,11 @@ mod tests {
                 "retrieval",
                 "total",
             ],
-            "{records}"
+            "the search's reads and retrieval come before the total: {records}"
         );
         assert!(
             records.contains("perf reads sessions=2 transcript-bytes=8 "),
-            "{records}"
+            "the reads count both sessions and their transcripts' bytes: {records}"
         );
         assert!(
             records.contains(" messages=3\n"),
@@ -666,9 +669,18 @@ mod tests {
         clock.advance(Duration::from_millis(5));
 
         let records = perf.records(None);
-        assert!(records.contains("perf stage=load ms=40\n"), "{records}");
-        assert!(records.contains(" thread-ms=25 "), "{records}");
-        assert!(records.contains("perf total ms=70\n"), "{records}");
+        assert!(
+            records.contains("perf stage=load ms=40\n"),
+            "the load stage took 40 ms: {records}"
+        );
+        assert!(
+            records.contains(" thread-ms=25 "),
+            "the read took 25 ms of its thread: {records}"
+        );
+        assert!(
+            records.contains("perf total ms=70\n"),
+            "the command took 70 ms in total: {records}"
+        );
     }
 
     #[test]

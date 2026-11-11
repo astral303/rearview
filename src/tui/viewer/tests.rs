@@ -602,8 +602,8 @@ fn codex_shell_command(seconds: u32, call_id: &str, command: &str) -> String {
     format!("{call}\n{output}")
 }
 
-/// The user's closing prompt, sent at the end of the minute. A session
-/// holding it is one the list lists, so a load caches it.
+/// The user's closing prompt, sent at the end of the minute. The list lists
+/// a session holding it, and a load caches that session.
 fn codex_closing_prompt() -> String {
     codex_record(
         59,
@@ -5155,7 +5155,7 @@ mod subagent_replies {
     }
 }
 
-/// A timestamp in `today`'s year, so a day label carries no year.
+/// A timestamp in `today`'s year, so a day label doesn't show a year.
 fn this_year(rest: &str) -> String {
     use chrono::Datelike;
     format!("{}-{rest}", today().year())

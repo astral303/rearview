@@ -4,7 +4,7 @@
 //! terminal codes, is never normalised.
 //!
 //! An ASCII word is found by a byte search that ignores ASCII case. Text
-//! holding a character lowercasing to ASCII takes the exact path, one
+//! holding a character lowercasing to ASCII follows the exact path, one
 //! character at a time through the normalisation, as do words outside ASCII.
 
 use super::hit_messages::{MessageTerms, RetrievalTerms};
@@ -13,11 +13,11 @@ use crate::search::literal::Literal;
 use crate::text_match::{contains_cjk, is_word_separator};
 
 /// The most prefix matches a word counts in a session's body.
-pub(super) const PREFIX_CAP: usize = 10;
+pub(super) const PREFIX_LIMIT: usize = 10;
 /// The most adjacent pairs a session's body counts.
-pub(super) const ADJACENCY_CAP: usize = 3;
+pub(super) const ADJACENCY_LIMIT: usize = 3;
 
-/// What a session's body holds of the query, summed over its texts.
+/// The query's matches in a session's body, summed over its texts.
 pub(super) struct Counts {
     pub(super) contains: Vec<bool>,
     pub(super) prefixes: Vec<usize>,
@@ -124,8 +124,8 @@ impl RawMatcher<'_> {
     pub(super) fn is_complete(&self, counts: &Counts) -> bool {
         counts.has_text
             && counts.contains.iter().all(|found| *found)
-            && counts.prefixes.iter().all(|count| *count == PREFIX_CAP)
-            && (self.query.pairs.is_empty() || counts.adjacency == ADJACENCY_CAP)
+            && counts.prefixes.iter().all(|count| *count == PREFIX_LIMIT)
+            && (self.query.pairs.is_empty() || counts.adjacency == ADJACENCY_LIMIT)
             && counts.literals.iter().all(|found| *found)
     }
 
@@ -136,7 +136,7 @@ impl RawMatcher<'_> {
         for (index, word) in self.query.words.iter().enumerate() {
             let state = &mut self.word_states[index];
             state.active = false;
-            if counts.contains[index] && counts.prefixes[index] == PREFIX_CAP {
+            if counts.contains[index] && counts.prefixes[index] == PREFIX_LIMIT {
                 continue;
             }
             match &word.ascii {
@@ -153,7 +153,7 @@ impl RawMatcher<'_> {
         for (index, pair) in self.query.pairs.iter().enumerate() {
             let state = &mut self.pair_states[index];
             state.active = false;
-            if counts.adjacency == ADJACENCY_CAP {
+            if counts.adjacency == ADJACENCY_LIMIT {
                 continue;
             }
             match &pair.ascii {
@@ -198,7 +198,7 @@ impl RawMatcher<'_> {
                 }
                 if let Some(match_starts_word) = state.feed(&words[index], ch, starts_word) {
                     counts.contains[index] = true;
-                    if match_starts_word && counts.prefixes[index] < PREFIX_CAP {
+                    if match_starts_word && counts.prefixes[index] < PREFIX_LIMIT {
                         counts.prefixes[index] += 1;
                     }
                 }
@@ -206,7 +206,7 @@ impl RawMatcher<'_> {
             for (index, state) in pair_states.iter_mut().enumerate() {
                 if state.active
                     && state.feed(&pairs[index], ch, starts_word) == Some(true)
-                    && counts.adjacency < ADJACENCY_CAP
+                    && counts.adjacency < ADJACENCY_LIMIT
                 {
                     counts.adjacency += 1;
                 }
@@ -313,8 +313,8 @@ impl Pattern {
 struct PatternState {
     active: bool,
     matched: usize,
-    /// Whether each of the last `chars.len()` characters fed starts a word,
-    /// as a ring: `next_slot` holds the oldest and takes the next.
+    /// True for each of the last `chars.len()` characters fed that starts a
+    /// word, as a ring: `next_slot` holds the oldest and receives the next.
     word_starts: Vec<bool>,
     next_slot: usize,
 }
@@ -407,7 +407,7 @@ fn count_word(text: &str, finder: &AsciiCaselessFinder, index: usize, counts: &m
         counts.contains[index] = true;
         if starts_word(text, start) {
             counts.prefixes[index] += 1;
-            if counts.prefixes[index] == PREFIX_CAP {
+            if counts.prefixes[index] == PREFIX_LIMIT {
                 return;
             }
         }
@@ -416,7 +416,7 @@ fn count_word(text: &str, finder: &AsciiCaselessFinder, index: usize, counts: &m
 }
 
 /// `adjacency` plus the occurrences in `text` of `first`, one space after
-/// normalisation, then `second`, that start a word, up to the cap.
+/// normalisation, then `second`, that start a word, up to the limit.
 fn count_pair(
     text: &str,
     first: &AsciiCaselessFinder,
@@ -436,7 +436,7 @@ fn count_pair(
             {
                 if starts_word(text, start) {
                     adjacency += 1;
-                    if adjacency == ADJACENCY_CAP {
+                    if adjacency == ADJACENCY_LIMIT {
                         return adjacency;
                     }
                 }
@@ -469,7 +469,7 @@ fn separator_end(text: &str, at: usize) -> Option<usize> {
 /// True when the character before byte `start` of `text` is not
 /// alphanumeric, or `start` begins the text. Its normalised form is
 /// alphanumeric when it is, outside LATIN CAPITAL LETTER I WITH DOT ABOVE,
-/// whose text takes the exact path.
+/// whose text follows the exact path.
 fn starts_word(text: &str, start: usize) -> bool {
     text[..start]
         .chars()

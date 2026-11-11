@@ -34,7 +34,7 @@ const SESSION_TEXT: &str = "the session under test";
 /// parse group, so the launch leaves some of them unparsed.
 const SESSIONS_PAST_THE_FIRST_PARSE_GROUP: usize = 8;
 
-/// The way a session comes before the list.
+/// The way a session reaches the list.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Origin {
     FoundById,
@@ -79,7 +79,8 @@ enum ListingPath {
     RefreshAfterStoppedLaunch,
     /// A session-ID lookup of a session the cache holds.
     IdLookup,
-    /// The session refresh of a session found by ID that the cache lacks.
+    /// The session refresh of a session found by ID that is not in the
+    /// session cache.
     RefreshAfterIdLookup,
     /// `--debug-search`, `--semantic-search` and the other printouts: the
     /// rows [`listing::retain_listed`] keeps.

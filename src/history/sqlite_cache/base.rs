@@ -39,8 +39,8 @@ struct BaseState {
 }
 
 /// This rearview's open connections to a base, as [`CacheBase::open_connection`]
-/// counts them. Two kinds of connection go uncounted, each opened and closed
-/// within one call:
+/// counts them. Two kinds of connection aren't counted, each opened and
+/// closed within one call:
 /// - refresh ownership's own connections, the deletion's among them
 /// - the observer's read
 ///
@@ -381,7 +381,7 @@ impl CacheBase {
                     .holders
                     .values()
                     .any(|holder| *holder == current),
-                "the thread refusing connections holds none of them open"
+                "the thread refusing connections doesn't hold any of them open"
             );
         }
         connections.refusing = true;

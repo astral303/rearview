@@ -16,7 +16,7 @@ pub(crate) fn remove(base: &Path, storage: SessionCache, canonical_root: &Path) 
 }
 
 /// The folder name those releases gave the root at `canonical_root`: a hash
-/// of that path, which `DefaultHasher::new()` computes with fixed keys.
+/// of that path. `DefaultHasher::new()` computes it with fixed keys.
 fn root_directory_name(canonical_root: &Path) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     canonical_root.hash(&mut hasher);

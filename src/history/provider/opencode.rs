@@ -316,9 +316,9 @@ struct SessionRows {
 /// `time_updated` across the session and its rows. One statement per table
 /// for discovery and session-id lookup, so the two cannot fingerprint
 /// different columns; `rows_filter` narrows the rows aggregated, and the
-/// lookup filters the union by id too.
+/// lookup filters the union by session ID too.
 ///
-/// `octet_length` takes a payload's size from its record header without
+/// `octet_length` gets a payload's size from its record header without
 /// reading the payload, and one pass per table aggregates both columns.
 fn opencode_1_session_rows_sql(rows_filter: &str) -> String {
     format!(
@@ -820,7 +820,8 @@ pub(super) mod tests {
             self.write_session(home, session)
         }
 
-        /// OpenCode's discovery reads its database and lists no directory.
+        /// OpenCode's discovery reads its database and doesn't list a
+        /// directory.
         fn listed_directory_of(&self, _locator: &Path) -> Option<PathBuf> {
             None
         }

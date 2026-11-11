@@ -6,7 +6,7 @@ use super::sqlite_cache::{OtherRearview, WaitStatus};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-/// A step of one agent's load. Each root goes through discovery, then its
+/// A step of one agent's load. Each root passes through discovery, then its
 /// cache, then the refresh.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LoadStep {
@@ -32,7 +32,7 @@ pub struct ItemCount {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StepProgress {
     pub step: LoadStep,
-    /// `None` for discovery and the cache read, which do not count their
+    /// `None` for discovery and the cache read: those steps don't count their
     /// work.
     pub items: Option<ItemCount>,
 }
@@ -75,9 +75,9 @@ pub struct CacheTotals {
 }
 
 /// The transcripts parsed because they were new or changed, a session's own
-/// and each sub-agent's, with the bytes of their sessions. Sessions are
-/// parsed in parallel, so the time is summed over the threads that parsed
-/// them.
+/// and each sub-agent's, with the bytes of their sessions. The time is the
+/// sum over the threads that parsed them, because sessions are parsed in
+/// parallel.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RefreshTotals {
     pub transcripts: usize,
@@ -157,8 +157,8 @@ impl LoadMeter {
     }
 }
 
-/// Records one agent's load in a [`LoadMeter`], or records nothing for a load
-/// nobody meters.
+/// Records one agent's load in a [`LoadMeter`]; doesn't record anything for a
+/// load nobody meters.
 #[derive(Clone, Copy, Debug)]
 pub struct AgentMeter<'a>(Option<(&'a LoadMeter, Source)>);
 

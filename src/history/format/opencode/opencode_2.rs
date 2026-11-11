@@ -27,7 +27,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Where a read of an OpenCode 2 session's messages starts: the `seq` of the
+/// The start of a read of an OpenCode 2 session's messages: the `seq` of the
 /// first message it reads. The default starts at the session's first.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Cursor {
@@ -35,9 +35,9 @@ pub(super) struct Cursor {
 }
 
 /// The session's messages from `from` on, `start` being the state the
-/// messages before `from` left, and the records dropped on the way, counted
-/// in `dropped`. A row whose JSON does not parse is counted rather than
-/// failing the session.
+/// messages before `from` left; the records dropped on the way are counted
+/// in `dropped`. A row with JSON that does not parse is counted as dropped
+/// and doesn't fail the session.
 ///
 /// The next read starts at the session's last message: OpenCode rewrites a
 /// message in place while its reply streams.

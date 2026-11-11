@@ -30,7 +30,6 @@ const EVENTS_WITHOUT_CALL: [&str; 7] = [
 pub(super) struct HookAttachment {
     tool_use_id: String,
     hook_name: String,
-    /// The attachment's `hookEvent`, when it records one.
     hook_event: Option<String>,
     report: HookReport,
     timestamp: Option<String>,
@@ -75,14 +74,15 @@ impl HookAttachment {
         })
     }
 
-    /// The id of the call the attachment's text belongs to, when
+    /// The ID of the call the attachment's text belongs to, when
     /// [`Self::names_call`].
     pub(super) fn tool_use_id(&self) -> &str {
         &self.tool_use_id
     }
 
-    /// False for an event whose attachment carries a random id. An
-    /// attachment without an event counts as naming its call.
+    /// False when the attachment's event is one of [`EVENTS_WITHOUT_CALL`]:
+    /// their `toolUseID` is random. An attachment without an event counts as
+    /// naming its call.
     pub(super) fn names_call(&self) -> bool {
         self.hook_event
             .as_deref()

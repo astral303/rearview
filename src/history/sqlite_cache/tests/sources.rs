@@ -21,7 +21,7 @@ fn database_backed_sessions_validate_current_logical_fingerprint() {
         .unwrap()
         .unwrap()
     else {
-        panic!("listed fixture")
+        panic!("the fixture session is listed")
     };
     let content = cached.cached_session.as_ref().unwrap();
     let currency = || {
@@ -49,7 +49,7 @@ fn database_backed_sessions_validate_current_logical_fingerprint() {
 }
 
 #[test]
-fn resumed_childs_earlier_files_are_dependencies_before_splicing() {
+fn resumed_subagents_earlier_files_are_dependencies_before_splicing() {
     let home = tempfile::tempdir().unwrap();
     let child = crate::history::format::codex::test_support::write_edited_thread_with_subagents(
         home.path(),
@@ -130,7 +130,7 @@ fn catalogue_read_stats_only_files_discovery_didnt_stamp() {
     );
     assert!(
         !is_current(&[discovered_at(2)]),
-        "a session whose discovery stamp differs from the cache's is stat as before"
+        "a session whose discovery stamp differs from the cache's is stat"
     );
     let earlier = std::fs::read_to_string(&child.root).unwrap();
     std::fs::write(&child.root, earlier.replace("alpha", "omega") + "\n").unwrap();
@@ -288,13 +288,13 @@ fn bounded_read_doesnt_restore_unrelated_result() {
         detail: None,
     });
     let (_, crate::log_entry::LogEntry::User { message, .. }) = &mut written.entries[1] else {
-        panic!("user result")
+        panic!("the second entry is a user message")
     };
     let crate::log_entry::UserContent::Blocks(blocks) = &mut message.content else {
-        panic!("blocks")
+        panic!("the user message holds blocks")
     };
     let crate::log_entry::ContentBlock::ToolResult { tool_use_id, .. } = &mut blocks[0] else {
-        panic!("result")
+        panic!("the first block is a result")
     };
     *tool_use_id = "no-longer-present".to_owned();
     let mut cache = admitted_cache(&base.path().join("cache"));
@@ -314,7 +314,7 @@ fn bounded_read_doesnt_restore_unrelated_result() {
         .unwrap()
         .unwrap()
     else {
-        panic!("listed fixture")
+        panic!("the fixture session is listed")
     };
     let bounded = cached
         .cached_session

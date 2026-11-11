@@ -51,7 +51,7 @@ fn opening_text(content: &Value) -> Option<&str> {
     }
 }
 
-/// The id and prompt of every `Agent` call among `entries`.
+/// The record, ID and prompt of every `Agent` call among `entries`.
 fn agent_call_prompts<'a>(
     entries: impl IntoIterator<Item = &'a (RecordLine, LogEntry)>,
 ) -> impl Iterator<Item = (&'a RecordLine, &'a str, &'a str)> {
@@ -74,8 +74,9 @@ fn agent_call_prompts<'a>(
 }
 
 /// A fork's `entries` without its copy of the `Agent` call its sidecar
-/// names and the result answering that copy, which holds the fork
-/// instructions and the call's prompt. Any other sub-agent's entries stay.
+/// names, and without the result answering that copy: the result holds the
+/// fork instructions and the call's prompt. Any other sub-agent's entries
+/// are returned unchanged.
 pub(crate) fn without_fork_copies<Record>(
     mut entries: Vec<(Record, LogEntry)>,
     sidecar: &SubagentSidecar,
@@ -99,15 +100,15 @@ fn prompt_hash(prompt: &str) -> String {
     blake3::hash(prompt.as_bytes()).to_hex().to_string()
 }
 
-/// Where a ledger item was read: its transcript, `None` for the session's
-/// own, and its line.
+/// The place a ledger item was read from: its transcript, `None` for the
+/// session's own, and its line.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LedgerPlace {
     transcript: Option<PathBuf>,
     line: usize,
 }
 
-/// How a sub-agent thread was launched, as its sidecar records it.
+/// A sub-agent thread's launch, as its sidecar records it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ThreadLaunch {
     transcript: PathBuf,
@@ -131,13 +132,13 @@ impl ThreadLaunch {
     }
 }
 
-/// What links a Claude session's sub-agent threads to the session: each
-/// `Agent` call's prompt, by a hash, and each thread's launch. A
-/// non-fork sub-agent's opening message repeating its launching call's
-/// prompt, which may stand in another transcript, is dropped.
+/// The links between a Claude session and its sub-agent threads: each
+/// `Agent` call's prompt, by a hash, and each thread's launch. A non-fork
+/// sub-agent's opening message is dropped when it repeats its launching
+/// call's prompt, even when that call is in another transcript.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub(crate) struct LaunchLedger {
-    /// Each `Agent` call: its place, its id and its prompt's hash.
+    /// Each `Agent` call: its place, its ID and its prompt's hash.
     prompts: Vec<(LedgerPlace, String, String)>,
     launches: Vec<ThreadLaunch>,
 }
@@ -194,10 +195,11 @@ impl LaunchLedger {
     }
 
     /// The ledger once `windows` replace what it holds of their transcripts,
-    /// for a session whose threads are `threads`: each thread's launching
-    /// call, in `threads` order, and the threads whose opening message the
-    /// windows hold or whose launching call they add, which are read whole
-    /// and given to [`Self::fold`].
+    /// for a session with the sub-agent threads `threads`. Also returns each
+    /// thread's launching call, in `threads` order, and the threads to read
+    /// whole and pass to [`Self::fold`]: a thread whose launching call the
+    /// windows add, or whose opening message in a window repeats that call's
+    /// prompt.
     pub(crate) fn update(
         mut self,
         windows: &[LinkWindow<'_>],
@@ -239,7 +241,8 @@ impl LaunchLedger {
                 .is_some_and(|call| added.contains(call))
                 && launch.opening.is_some();
             match window {
-                // A whole read: the thread is folded as read.
+                // A window from line 0 holds the whole thread, and the
+                // caller folds it: don't reread it.
                 Some(window) if window.start_line == 0 => {
                     launch.opening = opening_of(window.entries);
                     reread = false;

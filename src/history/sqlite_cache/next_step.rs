@@ -10,7 +10,7 @@ use crate::error::{AppError, Result};
 #[must_use = "a session left without its next step is never refreshed"]
 pub enum NextStep {
     /// The database served the read or holds what it read, or a session
-    /// refresh would find nothing to cache.
+    /// refresh wouldn't find anything to cache.
     Settled,
     /// A refresh owns the cache, in this process or another: read the
     /// session again once it completes.

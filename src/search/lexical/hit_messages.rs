@@ -83,8 +83,8 @@ impl SessionHitMessages {
 
 /// The hit messages of each session the ranking scan counted, by the
 /// session's index among the ranked conversations. Missing for a session
-/// the scan did not count or the cache does not hold: search then reads its
-/// transcript whole.
+/// the scan did not count or that is not in the session cache: search then
+/// reads its transcript whole.
 #[derive(Clone, Debug, Default)]
 pub struct HitMessages(pub(super) HashMap<usize, SessionHitMessages>);
 

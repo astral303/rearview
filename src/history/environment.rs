@@ -1,8 +1,8 @@
 //! The inputs one rearview reads: the providers' session storages, the
 //! session cache base, the clock, the directory lister, the canonicaliser
-//! and the working directory. Every production entry point takes an [`Environment`]; `lib.rs`
-//! passes the user's, and a test passes its own fixtures, cache directory,
-//! clock, lister and working directory.
+//! and the working directory. Every production entry point accepts an
+//! [`Environment`]; `lib.rs` passes the user's, and a test passes its own
+//! fixtures, cache directory, clock, lister and working directory.
 
 use super::Source;
 use super::Workspace;
@@ -184,8 +184,8 @@ impl Environment {
         }
     }
 
-    /// This environment with its session cache on a drive whose free space
-    /// `disk` answers.
+    /// This environment with its session cache on a drive; `disk` reports the
+    /// drive's free space.
     #[cfg(test)]
     pub(crate) fn with_disk_space(
         self,
@@ -268,8 +268,8 @@ pub(crate) mod test_support {
         environment_on_clock(storages, cache_base, Arc::new(TestClock::default()))
     }
 
-    /// No agent's storage and this test's own session cache directory, on
-    /// `clock`: what an app over rows a test builds reads.
+    /// This test's own session cache directory on `clock`, without any
+    /// agent's storage, for an app over rows the test builds.
     pub(crate) fn environment_on(clock: Arc<dyn Clock>) -> Environment {
         environment_on_clock(Vec::new(), None, clock)
     }
@@ -312,8 +312,8 @@ pub(crate) mod test_support {
     }
 
     /// One operation on `environment`'s session cache that waits for refresh
-    /// ownership as long as another rearview keeps it, publishing its wait
-    /// nowhere a test reads.
+    /// ownership as long as another rearview keeps it, and doesn't publish
+    /// its wait where a test reads it.
     pub(crate) fn waiting_operation(environment: &Environment) -> crate::history::OperationScope {
         crate::history::OperationScope::new(
             environment.cache_base(),
@@ -469,7 +469,7 @@ pub(crate) mod test_support {
     /// `source`'s session at `locator`, with the sub-agent transcripts
     /// `subagents`, written into this test's own session cache as
     /// [`cache_sessions`] writes it, whether or not the load lists it.
-    /// Returns its row; `None` when the load lists none.
+    /// Returns its row; `None` when the load doesn't list it.
     pub(crate) fn cache_files(
         source: Source,
         locator: &Path,

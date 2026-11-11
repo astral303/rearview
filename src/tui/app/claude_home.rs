@@ -171,12 +171,12 @@ impl ClaudeHome {
         self.lister.run_before_listing(directory, listing, action);
     }
 
-    /// How many times discovery listed the project directory.
+    /// The number of times discovery listed the project directory.
     pub(crate) fn times_project_listed(&self) -> usize {
         self.lister.times_listed(&self.project())
     }
 
-    /// How many times discovery listed `directory`.
+    /// The number of times discovery listed `directory`.
     pub(crate) fn times_listed(&self, directory: &Path) -> usize {
         self.lister.times_listed(directory)
     }

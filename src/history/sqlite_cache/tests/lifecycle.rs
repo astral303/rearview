@@ -40,7 +40,7 @@ fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() 
         let read = cache.read_copy_at(&address, |_| Ok(()));
         assert!(
             matches!(read, Err(CopyMiss::NotThere)),
-            "{status:?}: a read of the session finds no copy: {read:?}"
+            "{status:?}: a read of the session doesn't find a copy: {read:?}"
         );
     }
     let record = parsed_record(row.source, &root, &stub);
@@ -110,7 +110,7 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
 }
 
 #[test]
-fn superseded_writer_doesnt_add_children_or_set_replacements_final_status() {
+fn superseded_writer_doesnt_add_entry_rows_or_set_replacements_final_status() {
     let base = tempfile::tempdir().unwrap();
     let mut older = admitted_cache(base.path());
     let owner = older.token().clone();

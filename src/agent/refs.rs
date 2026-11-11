@@ -213,8 +213,8 @@ impl AgentConversationKey {
 }
 
 /// The key for the session at `stub`, kept at `address`, from the directory
-/// and id a load recorded of it, unless its path names its key. The recorded
-/// directory is canonicalised through `directories`.
+/// and session ID a load recorded of it, unless its path names its key. The
+/// recorded directory is canonicalised through `directories`.
 pub(crate) fn loaded_session_key(
     provider: &dyn SessionProvider,
     stub: &SessionStub,
@@ -226,7 +226,7 @@ pub(crate) fn loaded_session_key(
     session_key(provider, stub, recorded, directories, address)
 }
 
-/// True when the path at `locator` names both the session's id and its
+/// True when the path at `locator` names both the session ID and its
 /// reference project. The key of such a session comes from its path alone.
 pub(crate) fn is_keyed_by_path(provider: &dyn SessionProvider, locator: &Path) -> bool {
     provider.session_id_in_locator(locator).is_some()
@@ -234,8 +234,8 @@ pub(crate) fn is_keyed_by_path(provider: &dyn SessionProvider, locator: &Path) -
 }
 
 /// The key of the session at `address`, built from the recorded identity or,
-/// without one, from the path, so that search coverage can report an unread
-/// session as skipped. `None` when neither identifies the session. The
+/// without one, from the path, so that search coverage can report a session
+/// it couldn't read as skipped. `None` when neither identifies the session. The
 /// recorded directory is canonicalised through `directories`.
 pub(crate) fn session_key(
     provider: &dyn SessionProvider,
@@ -929,9 +929,8 @@ mod tests {
         }
     }
 
-    /// Every agent's keys for sessions recorded in one directory canonicalise
-    /// that directory once. Claude Code files references under the project
-    /// folder and does not canonicalise any directory.
+    /// Claude Code files references under the project folder and doesn't
+    /// canonicalise any directory.
     #[test]
     fn keys_of_sessions_recorded_in_one_directory_canonicalise_it_once() {
         let project = tempfile::tempdir().unwrap();
@@ -1497,7 +1496,7 @@ mod tests {
     /// a link finds its session among keys a discovery listed by
     /// canonicalising the named directory alone, not each key's file.
     #[test]
-    fn named_path_canonicalises_its_directory_once_and_no_listed_key() {
+    fn named_path_canonicalises_its_directory_once_and_doesnt_canonicalise_listed_keys() {
         let dir = tempfile::tempdir().unwrap();
         let root = SessionRoot::new(dir.path());
         let canonicaliser = Arc::new(CountingCanonicaliser::default());

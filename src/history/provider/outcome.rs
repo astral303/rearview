@@ -90,8 +90,8 @@ impl SessionOutcome {
         Self::unread(locator, SessionRead::Missing)
     }
 
-    /// The session at `locator`, which a failed discovery or lookup kept from
-    /// being read: it may still be there, unchanged.
+    /// The session at `locator`, unread because discovery or a lookup failed.
+    /// It may still be there, unchanged.
     pub(super) fn failed_transiently(locator: &Path) -> Self {
         Self::unread(locator, SessionRead::Failed(ReadError::Transient, None))
     }
@@ -146,8 +146,8 @@ impl SessionOutcome {
         matches!(self.read, SessionRead::Listed(_))
     }
 
-    /// The row the list shows for the session; `None` when the read found
-    /// none.
+    /// The row the list shows for the session; `None` when the read didn't
+    /// find one.
     pub fn listed_row(&self) -> Option<&Conversation> {
         match &self.read {
             SessionRead::Listed(row) => Some(row),
@@ -160,8 +160,8 @@ impl SessionOutcome {
         matches!(self.read, SessionRead::Missing)
     }
 
-    /// This outcome with a listed row filed where `listed`, the row it reads
-    /// again, is: at its index, under its project.
+    /// This outcome with its listed row given the index and project of
+    /// `listed`, the row this read refreshes.
     pub fn in_place_of(mut self, listed: &Conversation) -> Self {
         if let SessionRead::Listed(row) = &mut self.read {
             row.index = listed.index;
@@ -171,14 +171,14 @@ impl SessionOutcome {
         self
     }
 
-    /// The read and the next step, which the caller acts on.
+    /// The read and the next step for the caller to act on.
     pub fn into_parts(self) -> (SessionRead, NextStep) {
         (self.read, self.next)
     }
 
-    /// The read, and what its parse found that the session's copy in the
-    /// cache does not hold, for a caller that reads the session's content
-    /// once and refreshes it no further.
+    /// The read, and the parse findings missing from the session's copy in
+    /// the cache, for a caller that reads the session's content once and
+    /// doesn't refresh it.
     pub fn into_read_and_unwritten(self) -> (SessionRead, UnwrittenParse) {
         (self.read, self.unwritten)
     }

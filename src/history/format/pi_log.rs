@@ -78,10 +78,10 @@ pub(crate) fn sessions_with_id(
     )
 }
 
-/// The session id the Pi-family log at `path` states in a header the reader
+/// The session ID the Pi-family log at `path` states in a header the reader
 /// accepts, and the agent the list attributes the log to, as
-/// [`AcceptedHeader::source`] decides it. `None` when the log has no such
-/// header. Reads only up to the header, skipping blank and malformed lines as
+/// [`AcceptedHeader::source`] decides it. `None` when the log doesn't have
+/// such a header. Reads only up to the header, skipping blank and malformed lines as
 /// the reader does.
 pub(crate) fn read_header(path: &Path, default_source: Source) -> Result<Option<(String, Source)>> {
     let file = File::open(path)?;
@@ -106,7 +106,7 @@ pub(crate) fn read_header(path: &Path, default_source: Source) -> Result<Option<
 }
 
 /// A Pi-family log's header as the reader accepts it: a `session` record
-/// stating an id, a timestamp and a directory, in a supported format
+/// stating an ID, a timestamp and a directory, in a supported format
 /// version, either first or after an OMP title slot.
 struct AcceptedHeader<'a> {
     title_slot: Option<&'a Map<String, Value>>,
@@ -153,7 +153,7 @@ impl<'a> AcceptedHeader<'a> {
     }
 
     /// The title the slot states, else the one the header states; `None`
-    /// when neither states one that is not empty.
+    /// when neither states a non-empty title.
     fn title(&self) -> Option<String> {
         self.title_slot
             .and_then(|slot| slot.get("title"))
@@ -164,13 +164,13 @@ impl<'a> AcceptedHeader<'a> {
             .map(str::to_owned)
     }
 
-    /// How many records the header and its title slot take up.
+    /// The count of records the header and its title slot occupy.
     fn record_count(&self) -> usize {
         1 + usize::from(self.title_slot.is_some())
     }
 }
 
-/// A log's header as a read takes it, from the first records.
+/// A log's header as a read finds it, from the first records.
 struct LogHeader {
     id: String,
     timestamp: String,
@@ -178,13 +178,13 @@ struct LogHeader {
     version: u64,
     source: Source,
     title: Option<String>,
-    /// How many records the header and its title slot take up.
+    /// The count of records the header and its title slot occupy.
     record_count: usize,
     /// The end of the title slot, which the agent rewrites in place; 0
     /// without one.
     slot_end: u64,
-    /// The log's identity and where its records start past the header;
-    /// `None` while the header has no line ending.
+    /// The log's identity and the cursor where its records start past the
+    /// header; `None` while the header doesn't have a line ending.
     terminated: Option<(Vec<u8>, LineCursor)>,
 }
 
@@ -238,11 +238,11 @@ impl LogHeader {
     }
 }
 
-/// The records a log's header can take up: an OMP title slot, then the
+/// The most records a log's header can occupy: an OMP title slot, then the
 /// header.
 const HEAD_RECORDS: usize = 2;
 
-/// One line of a Pi-family log as a read takes it.
+/// One line of a Pi-family log as a read finds it.
 struct LogLine {
     number: usize,
     /// Past the line's line ending; `None` for a last line without one.
@@ -290,7 +290,7 @@ fn visit_log_lines(
 /// they settle the header, then the entries after it.
 enum WholeLog {
     /// Before the header settles: the records so far, at most
-    /// [`HEAD_RECORDS`], the lines that hold none, and the count of the
+    /// [`HEAD_RECORDS`], the lines without a record, and the count of the
     /// records the reader drops.
     Head {
         records: Vec<LogLine>,
@@ -302,7 +302,7 @@ enum WholeLog {
         header: LogHeader,
         raw: Box<RawEntries>,
     },
-    /// The first records hold no header the reader accepts.
+    /// The first records don't hold a header the reader accepts.
     Rejected,
 }
 
@@ -316,7 +316,7 @@ impl WholeLog {
         }
     }
 
-    /// Take the log's next line, attributing a log without a title slot to
+    /// Add the log's next line, attributing a log without a title slot to
     /// `default_source`.
     fn read(&mut self, line: LogLine, default_source: Source) {
         match self {
@@ -346,7 +346,7 @@ impl WholeLog {
 
     /// The log once `records`, its first records, settle its header: the
     /// records past the header are its first entries, after
-    /// `malformed_lines`, the lines among them that hold no record.
+    /// `malformed_lines`, the lines among them without a record.
     /// `dropped` counts the drops under the header's format version.
     fn settled(
         records: Vec<LogLine>,
@@ -394,7 +394,7 @@ impl WholeLog {
 }
 
 /// The lines of `reader` up to its first [`HEAD_RECORDS`] records, which
-/// hold its header; lines that hold no record are left out.
+/// hold its header; lines without a record are left out.
 fn head_lines(mut reader: impl BufRead) -> std::io::Result<Vec<LogLine>> {
     let mut head = Vec::new();
     let mut cursor = LineCursor::START;
@@ -439,17 +439,17 @@ struct RawEntry {
     dropped: Option<Box<DroppedRecords>>,
 }
 
-/// A log's entries after its header, each with its id, the id of its
+/// A log's entries after its header, each with its ID, the ID of its
 /// parent, and its record projected as it was read. A record's parsed JSON
 /// is dropped once its line is projected, whichever branch the log shows.
 struct RawEntries {
     version: u64,
     /// The agent the entries are projected for.
     source: Source,
-    /// The id of the entry before the next one: a format 1 entry's parent.
+    /// The ID of the entry before the next one: a format 1 entry's parent.
     previous_id: Option<String>,
     entries: Vec<RawEntry>,
-    /// The lines that hold no record, or a record the format rejects.
+    /// The lines without a record, or with a record the format rejects.
     malformed_lines: Vec<usize>,
     /// The drops of the records the log shows, once [`Self::take_shown`]
     /// adds them.
@@ -458,7 +458,7 @@ struct RawEntries {
 
 impl RawEntries {
     /// The entries of a log in format `version`, read as `source`'s, that
-    /// follow the entry with id `previous_id`; `dropped` counts their drops
+    /// follow the entry with ID `previous_id`; `dropped` counts their drops
     /// while the report counts.
     fn after(
         version: u64,
@@ -476,7 +476,7 @@ impl RawEntries {
         }
     }
 
-    /// Add `line`'s record; a line that holds none is malformed.
+    /// Add `line`'s record; a line without a record is malformed.
     fn push_line(&mut self, line: LogLine) {
         match line.record {
             Some(record) => self.push(line.number, line.end, record),
@@ -547,10 +547,10 @@ struct ShownBranch {
     end: BranchEnd,
 }
 
-/// Where the walk back along a branch stopped.
+/// The end of the walk back along a branch.
 #[derive(Debug, Eq, PartialEq)]
 enum BranchEnd {
-    /// An entry without a parent, or no entry at all.
+    /// An entry without a parent, or a log without entries.
     Root,
     /// A parent the entries do not hold.
     Outside(String),
@@ -559,7 +559,7 @@ enum BranchEnd {
 }
 
 impl ShownBranch {
-    /// The branch `entries` show. Of two entries with one id, the later is
+    /// The branch `entries` show. Of two entries with one ID, the later is
     /// the parent.
     fn of(entries: &[RawEntry]) -> Self {
         let by_id = entries
@@ -606,8 +606,8 @@ impl ShownBranch {
     }
 }
 
-/// What a read of a Pi-family log carries to the next, at the stable
-/// cursor.
+/// The state a read of a Pi-family log carries to the next read, at the
+/// stable cursor.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LogState {
     version: u64,
@@ -615,7 +615,7 @@ struct LogState {
     is_omp: bool,
     /// [`LogHeader::slot_end`].
     slot_end: u64,
-    /// The id of the shown branch's last entry before the stable cursor.
+    /// The ID of the shown branch's last entry before the stable cursor.
     leaf: Option<String>,
 }
 
@@ -625,8 +625,8 @@ impl LogState {
     }
 }
 
-/// Where a read of a Pi-family log stopped, and where the next restarts
-/// with which state.
+/// The end of a read of a Pi-family log, and the cursor and state the next
+/// read restarts from.
 struct LogReadEnd {
     cursor: LineCursor,
     stable_cursor: LineCursor,
@@ -668,8 +668,8 @@ impl LogReadEnd {
         })
     }
 
-    /// What this read leaves for the next, for the log `file` holds, whose
-    /// identity is `identity`.
+    /// The [`TranscriptRead`] the next read resumes from, for the log with
+    /// the identity `identity` that `file` holds.
     fn transcript_read(
         &self,
         identity: Vec<u8>,
@@ -730,8 +730,8 @@ impl SessionFormat for PiLogFormat {
     }
 }
 
-/// The log `reader` holds, read whole. Its title, which OMP rewrites in
-/// place and every read takes again, is its leading entry.
+/// The log `reader` holds, read whole. Its title is its leading entry; OMP
+/// rewrites the title in place, and every read rereads it.
 fn parse_reader(
     mut reader: impl BufRead + Seek,
     default_source: Source,
@@ -789,12 +789,12 @@ fn parse_reader(
 /// Resumes a read of a Pi-family log from its stable cursor: past the last
 /// entry with a line ending on the branch the log shows. A read whose new
 /// entries do not continue that branch changes which earlier entries show,
-/// and reads the log whole. The identity is the header record, and whether
-/// a title slot leads; every read takes the title again, and the rewrite
-/// check leaves out the title slot, which OMP rewrites in place.
+/// and reads the log whole. The identity is a hash of the header record and
+/// of whether a title slot leads. Every read rereads the title, and the
+/// rewrite check leaves out the title slot because OMP rewrites it in place.
 ///
-/// Two entries with one id are not detected: Pi and OMP give each a fresh
-/// one.
+/// Two entries with one ID are not detected: Pi and OMP give each entry a
+/// fresh ID.
 impl TranscriptReader for PiLogFormat {
     fn identity(&self, source: &Path) -> Result<Vec<u8>> {
         Ok(LogHeader::read(source, self.default_source)?
@@ -1443,8 +1443,8 @@ pub fn append_omp_session_rename(
     Ok(())
 }
 
-/// The first eight-hex-digit record id derived from `session_id` and
-/// `written_at` that `taken` does not hold.
+/// The first eight-hex-digit record ID derived from `session_id` and
+/// `written_at` that is not in `taken`.
 fn unused_record_id(
     session_id: &str,
     written_at: DateTime<Utc>,
@@ -1590,7 +1590,7 @@ mod tests {
                     crate::history::format::parse_transcript(crate::history::FOR_FIXTURES, &path)
                         .unwrap()
                 ),
-                "registry: {shown}"
+                "the registered formats attribute {shown} as the header does"
             );
             assert_eq!(
                 read_header(&path, Source::Pi).unwrap(),
@@ -1599,7 +1599,7 @@ mod tests {
                         .parse_transcript(crate::history::FOR_FIXTURES, &path)
                         .unwrap()
                 ),
-                "Pi's reader: {shown}"
+                "Pi's reader attributes {shown} as the header does"
             );
             assert_eq!(
                 read_header(&path, Source::Omp).unwrap(),
@@ -1608,7 +1608,7 @@ mod tests {
                         .parse_transcript(crate::history::FOR_FIXTURES, &path)
                         .unwrap()
                 ),
-                "OMP's reader: {shown}"
+                "OMP's reader attributes {shown} as the header does"
             );
         }
     }
@@ -1725,7 +1725,7 @@ mod tests {
     }
 
     /// The header settles from the first two records, past a line between
-    /// them that holds no record; that line is malformed, in file order with
+    /// them without a record; that line is malformed, in file order with
     /// a malformed entry after it.
     #[test]
     fn malformed_line_between_title_slot_and_header_leaves_the_header() {
@@ -1755,7 +1755,11 @@ mod tests {
             ),
             (Source::Omp, "s", Some("Named"), vec![2, 5])
         );
-        assert_eq!(projection.entries.len(), 2, "the title, then the prompt");
+        assert_eq!(
+            projection.entries.len(),
+            2,
+            "the entries are the title, then the prompt"
+        );
     }
 
     /// Every record is projected as it is read, on whichever branch; the
@@ -2420,7 +2424,8 @@ mod tests {
         /// Asserts that `prefix`, a read of a log's beginning, up to the
         /// window's first line, and then `window`, the read resumed from it
         /// over the whole log, hold what `full`, one read of the whole log,
-        /// holds, and leave what it leaves for the next read.
+        /// holds, and that `window` leaves the same [`TranscriptRead`] as
+        /// `full`.
         fn assert_window_completes(
             name: &str,
             prefix: &SessionProjection,
@@ -2452,12 +2457,12 @@ mod tests {
             );
             assert_eq!(
                 window.read, full.transcript_read,
-                "{name}: the window leaves what the full read leaves"
+                "{name}: the window leaves the full read's `TranscriptRead`"
             );
         }
 
         /// A Pi log whose second branch leaves the first, with a malformed
-        /// line and an entry without an id inside the shown branch.
+        /// line and an entry without an ID inside the shown branch.
         fn branch_with_malformed_lines() -> String {
             [
                 r#"{"type":"session","version":3,"id":"s","timestamp":"2024-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
@@ -2548,14 +2553,14 @@ mod tests {
                         Resumption::FullRead => assert_eq!(
                             prefix.transcript_read,
                             TranscriptRead::full_read(),
-                            "{name}: only a log whose header has no line ending yet reads whole"
+                            "{name}: only a log with a header that doesn't have a line ending yet reads whole"
                         ),
                     }
                 }
             }
             assert!(
                 branch_switches > 0,
-                "a split before a branch switch reads whole"
+                "at least one split before a branch switch reads whole"
             );
         }
 
@@ -2658,7 +2663,7 @@ mod tests {
                     resume(&OMP_LOG, crate::history::FOR_FIXTURES, &path, &read).unwrap(),
                     Resumption::FullRead
                 ),
-                "a slot of another length moves every record"
+                "a slot of another length moves every record and the log reads whole"
             );
 
             let path = renamed_omp_log(directory.path());
@@ -2672,7 +2677,7 @@ mod tests {
             assert_ne!(
                 OMP_LOG.identity(&path).unwrap(),
                 read.identity,
-                "the header record is the identity"
+                "the header record is part of the identity"
             );
         }
     }

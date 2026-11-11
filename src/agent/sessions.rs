@@ -317,7 +317,7 @@ mod tests {
                 output.starts_with(&format!(
                     "protocol agent-sessions cut=none chars=none tz={local_offset}\n"
                 )),
-                "{output}"
+                "the header names the local offset at {utc}: {output}"
             );
         }
     }

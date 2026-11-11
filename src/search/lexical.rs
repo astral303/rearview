@@ -300,8 +300,8 @@ pub fn agent_search(
 pub struct AgentRanking {
     /// The conversations matching the query, best first.
     pub ranked: Vec<usize>,
-    /// The messages of each conversation the session cache holds that hold
-    /// every term `retrieval` requires.
+    /// Each cached conversation's messages holding every term `retrieval`
+    /// requires.
     pub hit_messages: HitMessages,
     /// The conversations in scope whose session was no longer in the session
     /// cache, or whose cached copy was not ready, during the ranking: neither
@@ -316,8 +316,8 @@ pub struct AgentRanking {
 }
 
 impl AgentRanking {
-    /// True when the query holds no word and no literal, such as a query of
-    /// separators: no message holds a hit.
+    /// True when the query doesn't hold a word or a literal, such as a query
+    /// of separators: no message holds a hit.
     pub(crate) fn counts_no_terms(&self) -> bool {
         self.terms.words.trim().is_empty() && self.terms.literals.is_empty()
     }

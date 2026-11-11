@@ -93,7 +93,7 @@ impl From<TranscriptEntries> for DisplayEntries {
     }
 }
 
-/// How long the terminal printout tries for refresh ownership before it
+/// The time the terminal printout tries for refresh ownership before it
 /// reads the cache as it is, as agent commands do.
 const PRINTOUT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -199,8 +199,8 @@ fn printed_session(
     })
 }
 
-/// The printout's failure for the session at `path` when the cache holds no
-/// copy of it after its refresh.
+/// The printout's failure for the session at `path` when the session is not
+/// in the cache after its refresh.
 fn not_in_the_cache(path: &Path) -> crate::error::AppError {
     crate::error::AppError::SessionCacheNotReady {
         session: path.display().to_string(),

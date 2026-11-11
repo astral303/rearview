@@ -92,9 +92,10 @@ impl SessionFormat for CodexRolloutFormat {
     }
 }
 
-/// Resumes the read of a thread's newest rollout. The identity is the
-/// header's `session_meta` line. A thread that continues earlier rollouts
-/// cannot resume, nor can a rollout whose header has no line ending yet.
+/// Resumes the read of a thread's newest rollout. The identity is a hash of
+/// the header's `session_meta` line. A thread that continues earlier
+/// rollouts can't resume, and a rollout can't resume while its header
+/// doesn't have a line ending.
 impl TranscriptReader for CodexRolloutFormat {
     fn identity(&self, source: &Path) -> Result<Vec<u8>> {
         let mut reader = BufReader::new(File::open(source)?);
@@ -261,8 +262,8 @@ impl ThreadLinker for CodexRolloutFormat {
                 rereads.push(thread.transcript.to_path_buf());
             }
         }
-        // A report the windows dropped without adding back unfolds a reply:
-        // read every thread it may have answered again.
+        // A report the windows dropped without adding back unfolds its
+        // reply: reread every thread it may have answered.
         if dropped_report {
             rereads = threads
                 .iter()
@@ -300,8 +301,8 @@ impl ThreadLinker for CodexRolloutFormat {
     }
 }
 
-/// Where a ledger item came from: its transcript, `None` for the session's
-/// own, and its line.
+/// The place a ledger item came from: its transcript, `None` for the
+/// session's own, and its line.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LedgerPlace {
     transcript: Option<PathBuf>,
@@ -327,9 +328,9 @@ impl LedgerPlace {
 /// sub-agents handed back, each with its place.
 #[derive(Default, Deserialize, Serialize)]
 struct LinkLedger {
-    /// Each call's place, id and the time it was made, as written.
+    /// Each call's place, ID and the time it was made, as written.
     calls: Vec<(LedgerPlace, String, Option<String>)>,
-    /// Each result naming a thread: its place, its call's id, and the keys
+    /// Each result naming a thread: its place, its call's ID, and the keys
     /// it names the thread by, `task_name` then `agent_id`.
     results: Vec<(LedgerPlace, String, Vec<String>)>,
     /// Each report: its place, its sender, its body and the time it was
@@ -486,7 +487,7 @@ impl LinkLedger {
 }
 
 /// The call a `spawn_agent` result answers and the keys it names the
-/// thread by: its agent path in `task_name`, or its thread id in
+/// thread by: its agent path in `task_name`, or its thread ID in
 /// `agent_id`. `None` for any other block.
 fn spawn_result(block: &ContentBlock) -> Option<(String, Vec<String>)> {
     let ContentBlock::ToolResult {
@@ -671,7 +672,7 @@ const FINAL_ANSWER_CALL: &str = "final_answer";
 
 /// The thread ending in the rollout at `path`, titled from the session index.
 /// `None` when the file is not a rollout. `admitted` is the read of `path` a
-/// permit admitted; each earlier rollout read takes its own admission.
+/// permit admitted; each earlier rollout's read is admitted separately.
 pub(crate) fn read_thread(
     admitted: Admitted,
     path: &Path,
@@ -861,8 +862,8 @@ struct RolloutOpening {
     header_line: String,
     /// Past the header's line.
     records_start: LineCursor,
-    /// False while the header's line has no line ending: Codex is still
-    /// writing it, and the rollout holds no record yet.
+    /// False while the header's line doesn't have a line ending: Codex is
+    /// writing it, and the rollout doesn't hold a record yet.
     is_header_terminated: bool,
 }
 
@@ -875,9 +876,9 @@ impl RolloutOpening {
             .to_vec()
     }
 
-    /// False for a thread that continues earlier rollouts, which the reader
-    /// reads first, and for a header without a line ending: its read is a
-    /// full read.
+    /// False for a thread that continues earlier rollouts, because the reader
+    /// reads those first, and for a header without a line ending. A rollout
+    /// that can't resume is read in full.
     fn can_resume(&self) -> bool {
         self.is_header_terminated && self.header.history_base.is_none()
     }
@@ -942,7 +943,8 @@ fn parse_thread(
     Ok(Some(thread.finish(opening.header, transcript_read)))
 }
 
-/// What a read of a rollout's records carries from one record to the next.
+/// The state a read of a rollout's records carries from one record to the
+/// next.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RecordState {
     last_shown: LastShown,
@@ -962,8 +964,8 @@ impl RecordState {
     }
 }
 
-/// Where a read of a thread's newest rollout stopped, and where the next
-/// read restarts with which state.
+/// The end of a read of a thread's newest rollout, and the cursor and state
+/// the next read restarts from.
 struct NewestRead {
     cursor: LineCursor,
     stable_cursor: LineCursor,
@@ -971,9 +973,9 @@ struct NewestRead {
 }
 
 impl NewestRead {
-    /// The read that stopped at `cursor` with `state`. A sub-agent whose own
-    /// records have not started restarts at its first record, since its
-    /// first own record clears the entries read before it.
+    /// The read that stopped at `cursor` with `state`. A sub-agent read
+    /// before its own records start restarts at its first record, because
+    /// its first own record clears the entries read before it.
     fn stopped_at(cursor: LineCursor, state: RecordState, opening: &RolloutOpening) -> Self {
         match state.own_history {
             OwnHistory::Pending { .. } => Self {
@@ -989,8 +991,8 @@ impl NewestRead {
         }
     }
 
-    /// What this read leaves for the next, with `file` holding the rollout
-    /// `opening` opens.
+    /// The [`TranscriptRead`] the next read resumes from, with `file`
+    /// holding the rollout `opening` opens.
     fn transcript_read(&self, opening: &RolloutOpening, file: &mut File) -> Result<TranscriptRead> {
         Ok(TranscriptRead {
             cursor: self.cursor.encode(),
@@ -1026,7 +1028,7 @@ impl ThreadProjection {
         Self::with_state(RecordState::at_start(newest), dropped)
     }
 
-    /// A projection that reads on with `state`, holding no entry yet.
+    /// A projection that reads on with `state`, without any entries yet.
     fn with_state(state: RecordState, dropped: DroppedRecords) -> Self {
         Self {
             entries: Vec::new(),
@@ -1041,8 +1043,8 @@ impl ThreadProjection {
     }
 
     /// A rollout that fails to read ends the chain, as a missing one does:
-    /// drop the turns read so far, and read the newer rollouts. Each rollout
-    /// read is admitted as a file the read `admitted` names reads.
+    /// drop the turns read so far, and read the newer rollouts. Each
+    /// rollout's read is admitted as a file linked to `admitted`'s read.
     fn read_earlier_rollouts(
         &mut self,
         admitted: &Admitted,
@@ -1193,7 +1195,7 @@ impl ThreadProjection {
     }
 
     /// The projection, with the facts of the thread's newest rollout, the
-    /// time the thread started, and what its read leaves for the next.
+    /// time the thread started, and `transcript_read`.
     fn finish(self, newest: RolloutHeader, transcript_read: TranscriptRead) -> ThreadRead {
         let projection = SessionProjection {
             source: Source::Codex,
@@ -1713,8 +1715,8 @@ pub(crate) fn forks_continuing(
 /// rollout it rewrites: nothing follows, and the whole file is the thread's
 /// own. A live thread that ended before its first own record has the migrated
 /// shape and shows its copied context as its own.
-/// Without a boundary, retain all recorded turns: timestamps, repeated text
-/// and reply ids cannot distinguish inherited context from genuine work.
+/// Without a boundary, keep every recorded turn, because timestamps, repeated
+/// text and reply IDs can't tell inherited context from the thread's own work.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 enum OwnHistory {
     /// Every line so far sits below the boundary. Its entries are kept until
@@ -3659,7 +3661,7 @@ mod tests {
             "child task question",
             "child answer searchable",
         ] {
-            assert!(json.contains(text), "{text}");
+            assert!(json.contains(text), "the entries keep {text:?}");
         }
     }
 
@@ -4222,7 +4224,7 @@ mod tests {
             .zip(before)
             .map(|(rollout, before)| admitted_reads::count(rollout) - before)
             .collect();
-        assert_eq!(reads, [1, 1, 1], "the admitted reads of each rollout");
+        assert_eq!(reads, [1, 1, 1], "each rollout is admitted once");
     }
 
     #[test]
@@ -5071,7 +5073,8 @@ mod tests {
         /// Asserts that `prefix`, a read of a rollout's beginning, up to the
         /// window's first line, and then `window`, the read resumed from it
         /// over the whole rollout, hold what `full`, one read of the whole
-        /// rollout, holds, and leave what it leaves for the next read.
+        /// rollout, holds, and that `window` leaves the same
+        /// [`TranscriptRead`] as `full`.
         fn assert_window_completes(
             name: &str,
             prefix: &SessionProjection,
@@ -5103,7 +5106,7 @@ mod tests {
             );
             assert_eq!(
                 window.read, full.transcript_read,
-                "{name}: the window leaves what the full read leaves"
+                "{name}: the window leaves the full read's `TranscriptRead`"
             );
         }
 
@@ -5157,7 +5160,7 @@ mod tests {
                         Resumption::FullRead | Resumption::ChangesEarlierEntry => assert_eq!(
                             prefix.transcript_read,
                             TranscriptRead::full_read(),
-                            "{name}: only a rollout whose header has no line ending yet reads whole"
+                            "{name}: only a rollout with a header that doesn't have a line ending yet reads whole"
                         ),
                     }
                 }

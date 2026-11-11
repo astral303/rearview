@@ -2,7 +2,7 @@
 //! in memory, without normalising them.
 
 use super::hit_messages::MessageTerms;
-use super::raw::{ADJACENCY_CAP, Counts, PREFIX_CAP, RawMatcher, RawQuery};
+use super::raw::{ADJACENCY_LIMIT, Counts, PREFIX_LIMIT, RawMatcher, RawQuery};
 use super::*;
 use crate::error::Result;
 use crate::history::sqlite_cache::{
@@ -15,7 +15,7 @@ impl Counts {
         self.literals.iter().all(|found| *found)
     }
 
-    /// Counts nothing found, keeping the lengths.
+    /// Resets every count to not found, keeping the lengths.
     fn clear(&mut self) {
         self.contains.fill(false);
         self.prefixes.fill(0);
@@ -88,7 +88,7 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
     Ok(stored)
 }
 
-/// What a count of sessions' stored search texts found, by the index of
+/// The results of a count of sessions' stored search texts, by the index of
 /// each conversation counted.
 pub(super) struct StoredCounts {
     pub(super) counts: HashMap<usize, Counts>,
@@ -424,14 +424,14 @@ pub(super) fn score(
         if !text.is_empty() {
             let counts = words
                 .iter()
-                .map(|word| count_prefix_matches(text, word, PREFIX_CAP))
+                .map(|word| count_prefix_matches(text, word, PREFIX_LIMIT))
                 .collect::<Vec<_>>();
             fields.push(field_score(
                 name,
                 weight,
                 words,
                 &counts,
-                count_adjacent_pairs(text, pairs, ADJACENCY_CAP),
+                count_adjacent_pairs(text, pairs, ADJACENCY_LIMIT),
             ));
         }
     }

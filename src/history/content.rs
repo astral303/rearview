@@ -216,8 +216,8 @@ impl Conversation {
     }
 }
 
-/// The parts read of the copy the cache holds for a row, before the row
-/// takes them.
+/// The parts read of the copy the cache holds for a row, before they are
+/// written into the row.
 pub(in crate::history) struct PartsRead<T> {
     parts: ContentBuilder,
     /// The result of the read's `read_parts`.
@@ -291,18 +291,18 @@ pub(crate) struct HeldContent<'r> {
 /// A row's semantic content, read by [`Conversation::load_semantic_content`].
 pub(crate) struct SemanticContent<'r> {
     pub(crate) held: HeldContent<'r>,
-    /// The agent route's text; `None` for a copy without semantic turns,
-    /// which has no route.
+    /// The agent route's text; `None` when the copy doesn't have semantic
+    /// turns, because then it doesn't have a route.
     pub(crate) route_text: Option<String>,
     /// The route text computed from the copy's texts, to store with it;
-    /// `None` when it was read as stored, or the row has no copy.
+    /// `None` when it was read as stored, or the row doesn't have a copy.
     pub(crate) computed_route: Option<SemanticRoute>,
 }
 
 /// The route text a copy's read found.
 enum RouteRead {
     Stored(String),
-    /// None stored: computed from the texts read, stored under this key.
+    /// Not stored: computed from the texts read, to store under this key.
     Unstored(RouteKey),
 }
 

@@ -1,8 +1,8 @@
 //! The search field of each search text of an entry, decided as the entry is
-//! written: a block whose stored text search reads as written carries the
-//! field, and every other search text is stored once beside the entry. The
-//! texts come from the parser, so the stored ones match what search read
-//! when it built them from the entry.
+//! written. A block carries the field when search reads its stored text as
+//! written; every other search text is stored once beside the entry. The
+//! stored texts match the texts search builds from the entry, because both
+//! come from the parser.
 
 use super::parts;
 use crate::history::parser::{normalize_full_text, search_parts_of_entry};
@@ -15,7 +15,7 @@ use std::borrow::Cow;
 pub(super) struct EntrySearch {
     /// For each of the entry's blocks, where search reads its stored text.
     pub(super) blocks: Vec<Option<TextPlace>>,
-    /// The texts no block holds as written, each with its place.
+    /// The search texts stored beside the entry, each with its place.
     pub(super) derived: Vec<DerivedText>,
 }
 

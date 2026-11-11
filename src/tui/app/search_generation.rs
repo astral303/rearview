@@ -84,7 +84,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_awaiting_keeps_the_generation_and_awaits_none() {
+    fn stop_awaiting_keeps_the_generation_and_doesnt_await_any() {
         let (mut generation, awaited) = SearchGeneration::start();
         let current = generation.advance();
 

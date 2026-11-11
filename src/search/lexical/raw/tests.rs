@@ -17,9 +17,9 @@ fn normalised_counts(
         words.iter().map(|word| normalised.contains(word)).collect(),
         words
             .iter()
-            .map(|word| count_prefix_matches(&normalised, word, PREFIX_CAP))
+            .map(|word| count_prefix_matches(&normalised, word, PREFIX_LIMIT))
             .collect(),
-        count_adjacent_pairs(&normalised, pairs, ADJACENCY_CAP),
+        count_adjacent_pairs(&normalised, pairs, ADJACENCY_LIMIT),
         literals
             .iter()
             .map(|literal| literal.matches(&collapsed))
@@ -171,7 +171,7 @@ fn normalising_keeps_whether_each_character_is_alphanumeric_outside_dotted_capit
 }
 
 #[test]
-fn counts_stop_at_their_caps_across_texts() {
+fn counts_stop_at_their_limits_across_texts() {
     let words = ["word"];
     let pairs = ["word word".to_owned()];
     let query = RawQuery::new(&words, &pairs, &[]);
@@ -183,11 +183,11 @@ fn counts_stop_at_their_caps_across_texts() {
     }
     assert_eq!(
         (counts.prefixes[0], counts.adjacency),
-        (PREFIX_CAP, ADJACENCY_CAP),
-        "the counts summed over texts stop at their caps"
+        (PREFIX_LIMIT, ADJACENCY_LIMIT),
+        "the counts summed over texts stop at their limits"
     );
     assert!(
         matcher.is_complete(&counts),
-        "the counts are complete at their caps"
+        "the counts are complete at their limits"
     );
 }

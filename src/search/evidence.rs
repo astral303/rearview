@@ -122,9 +122,9 @@ pub fn build_session_list_evidence<C: Borrow<Conversation>>(
 }
 
 /// The evidence for `conversation` in its search texts: its row's title and
-/// summary, then `texts`, those held in memory. A conversation the cache
-/// doesn't hold reads its `full_text` in place of `texts`; a cached one
-/// without texts held reads its title and summary alone.
+/// summary, then `texts`, those held in memory. A conversation not in the
+/// session cache reads its `full_text` in place of `texts`. A cached
+/// conversation without texts in memory reads its title and summary alone.
 pub fn build_lexical_evidence(
     conversation: &Conversation,
     texts: Option<&SessionSearchTexts>,

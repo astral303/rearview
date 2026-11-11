@@ -14,7 +14,7 @@ use crate::history::{
 };
 use std::path::Path;
 
-/// What reading a file opened directly found.
+/// The result of reading a file opened directly.
 pub enum DirectFileRead {
     /// A session inside `source`'s session roots, read as the refresh owner
     /// and cached.
@@ -22,9 +22,9 @@ pub enum DirectFileRead {
         source: Source,
         outcome: SessionOutcome,
     },
-    /// A file outside every provider's session roots, read by the format of
-    /// `source`, which recognises it, and not cached: its row, `None` when
-    /// it does not hold a conversation, and its entries without sub-agents.
+    /// A file outside every provider's session roots, parsed by `source`'s
+    /// format and not cached: its row, `None` when it doesn't hold a
+    /// conversation, and its entries without sub-agents.
     Bare {
         source: Source,
         row: Option<Box<Conversation>>,
@@ -64,8 +64,8 @@ pub fn open_direct_file(
     }
 }
 
-/// The storages with a session root holding the file at `path`, which the
-/// caller canonicalised (`DirectFile::canonical`), each with its roots: below
+/// The storages with a session root holding `path`, each with its roots. The
+/// caller canonicalises `path` (`DirectFile::canonical`); a root holds it below
 /// the root or a directory beside it as spelled, or below its canonical path.
 /// The roots keep the canonical path that matched, so the read of the file
 /// doesn't canonicalise them again.
@@ -90,8 +90,9 @@ fn storages_holding<'a>(
         })
 }
 
-/// A direct file every provider's session roots left out, which its read
-/// parses: only [`open_direct_file`] makes one, after every root missed.
+/// Proof that a direct file is outside every provider's session roots. It
+/// grants the file's parse permit; [`open_direct_file`] makes one after every
+/// root misses.
 pub(crate) struct OutsideEveryRoot(());
 
 /// The file at `path`, outside every provider's session roots, parsed by the

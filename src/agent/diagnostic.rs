@@ -221,7 +221,7 @@ impl AgentWarning {
 
     /// The sessions at `refs`, read from the cache as it was for `cause`.
     /// `cached_until` is the earliest end of their cached messages; `None`
-    /// when the cache held none of them.
+    /// when none of them is in the session cache.
     pub fn stale_cache(
         refs: &[String],
         cached_until: Option<chrono::DateTime<crate::clock::Zone>>,

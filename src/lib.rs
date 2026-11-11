@@ -625,8 +625,8 @@ fn run_with(
             use_pager,
             no_color: args.no_color,
         };
-        // `--render` reads one named file without the session cache, whose
-        // directory `user_environment` requires.
+        // `--render` reads one named file without the session cache, and
+        // runs without the cache directory `user_environment` requires.
         return display::render_to_terminal(
             render_path,
             &display_options,
@@ -945,7 +945,7 @@ mod debug_search_tests {
                 "unreadable: {} (no longer in the session cache)\n",
                 sessions.rows[0].path.display()
             ),
-            "one line names the removed session and why; the kept one has none"
+            "one line names the removed session and why; the kept one doesn't get a line"
         );
     }
 }

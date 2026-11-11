@@ -18,9 +18,9 @@ static DOTTED_CAPITAL_I_FINDER: LazyLock<memmem::Finder<'static>> =
 static KELVIN_SIGN_FINDER: LazyLock<memmem::Finder<'static>> =
     LazyLock::new(|| memmem::Finder::new(KELVIN_SIGN));
 
-/// The needle bytes whose case variants the packed searcher looks for:
-/// Teddy, its SIMD algorithm, fingerprints at most a pattern's first three
-/// bytes, so a longer prefix only multiplies the variants.
+/// The needle bytes whose case variants the packed searcher looks for. A
+/// longer prefix only multiplies the variants, because Teddy, its SIMD
+/// algorithm, fingerprints at most a pattern's first three bytes.
 const PREFIX_LEN: usize = 3;
 
 /// A lowercase ASCII needle, found ignoring ASCII case. Built once per
@@ -33,7 +33,7 @@ pub(crate) struct AsciiCaselessFinder {
     anchor: usize,
 }
 
-/// How the finder reaches the needle's next occurrence.
+/// The finder's search for the needle's next occurrence.
 #[derive(Clone, Debug)]
 enum Candidates {
     /// An empty needle occurs nowhere.

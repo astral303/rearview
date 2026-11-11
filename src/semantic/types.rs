@@ -95,7 +95,7 @@ pub struct TimedBudget<'a> {
 }
 
 impl TimedBudget<'_> {
-    /// `missing`, capped at the passage limit.
+    /// `missing`, at most the passage limit.
     pub fn passages_within(&self, missing: usize) -> usize {
         self.budget.passages_within(missing)
     }

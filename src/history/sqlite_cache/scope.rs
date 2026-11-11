@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 /// A request, shared by every copy, that the operations holding it stop:
-/// each acquires no ownership and parses no more once it is set.
+/// once it is set, each doesn't acquire ownership or parse any more.
 #[derive(Clone, Debug, Default)]
 pub struct Cancellation(Arc<AtomicBool>);
 
@@ -26,7 +26,7 @@ impl Cancellation {
     }
 }
 
-/// Why an operation reads the cache as it is.
+/// The reason an operation reads the cache as it is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaleCause {
     /// Another rearview keeps refresh ownership, or took it over.
@@ -49,7 +49,7 @@ pub enum Patience {
 pub(crate) enum OperationAccess<'s> {
     /// Read it, parse transcripts, and write it as the live refresh owner.
     Owner(LiveOwner<'s>),
-    /// Read it as it is, parsing nothing, for the operation's
+    /// Read it as it is, without parsing, for the operation's
     /// [`OperationScope::stale_cause`].
     AsIs,
 }
@@ -74,8 +74,8 @@ impl<'s> LiveOwner<'s> {
     }
 
     /// `parse` run with the permit to parse as one write batch (see
-    /// [`RefreshToken::parse_batch`]); `None` once the ownership is no longer
-    /// live, so nothing ran.
+    /// [`RefreshToken::parse_batch`]); `None`, without running `parse`, once
+    /// the ownership is no longer live.
     pub(crate) fn parse_batch<T>(
         &self,
         parse: impl for<'p> FnOnce(super::ParsePermit<'p>) -> T,
@@ -191,7 +191,7 @@ impl OperationScope {
         token.can_publish() && !self.cancellation.is_cancelled()
     }
 
-    /// Why the operation owning `token` reads the cache as it is.
+    /// The reason the operation owning `token` reads the cache as it is.
     fn stale_cause_of(token: &RefreshToken) -> StaleCause {
         if token.is_replaced() {
             StaleCause::AnotherRearview
@@ -200,7 +200,7 @@ impl OperationScope {
         }
     }
 
-    /// Why sessions this operation read from copies older than their
+    /// The reason sessions this operation read from copies older than their
     /// transcripts are stale: its own writes stopped, or another rearview
     /// keeps or took over the refresh.
     pub(crate) fn stale_cause(&self) -> StaleCause {

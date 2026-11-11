@@ -117,7 +117,7 @@ pub fn text_message_at(
     }
 }
 
-/// When the agent outputs of tests are written: the test clock's start, in
+/// The time tests' agent outputs are written at: the test clock's start, in
 /// the system's zone.
 pub fn written_at() -> DateTime<Zone> {
     TestClock::start_wall().with_timezone(&Zone::System)

@@ -47,13 +47,13 @@ impl LineCursor {
     }
 }
 
-/// Where a read of lines stopped.
+/// The end of a read of lines.
 pub(crate) struct LinesRead {
     /// Past the last line that ends in a line ending.
     pub(crate) cursor: LineCursor,
     /// The last line, with its number, when it holds more than whitespace
-    /// and has no line ending: a record still being written. It is not
-    /// visited, so the caller can keep its state at `cursor` first.
+    /// and doesn't have a line ending: a record still being written. It is
+    /// not visited, so the caller can keep its state at `cursor` first.
     pub(crate) unterminated: Option<(usize, String)>,
 }
 
@@ -83,8 +83,8 @@ pub(crate) fn visit_parsed_lines<T: Send>(
 }
 
 /// [`visit_parsed_lines`] for `reader` positioned at `from`, except the last
-/// line when it has no line ending: the result holds that line instead, and
-/// the cursor past the last line that has one.
+/// line when it doesn't have a line ending: the result holds that line
+/// instead, and the cursor past the last line that has one.
 pub(crate) fn visit_lines_from<T: Send>(
     reader: impl BufRead,
     from: LineCursor,
@@ -97,7 +97,7 @@ pub(crate) fn visit_lines_from<T: Send>(
     })
 }
 
-/// Where a line stands in its transcript: the cursor at its start, and the
+/// A line's place in its transcript: the cursor at its start, and the
 /// cursor past its line ending.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct LineSpan {

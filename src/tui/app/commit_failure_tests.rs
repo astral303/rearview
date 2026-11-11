@@ -178,9 +178,9 @@ impl DataCommits {
 /// The data commits the sweep fails, from the kinds of a clean run's data
 /// commits: every commit of the first session written, in the first parse
 /// group, and of the last, in a later group. The last session's last commit
-/// is the operation's last data commit. Panics when a commit is of no named
-/// kind or a kind goes unswept: a missed commit can leave a session out of
-/// date without a pending refresh.
+/// is the operation's last data commit. Panics when a commit isn't of a
+/// named kind or the sweep misses a kind, because a missed commit can leave a
+/// session out of date without a pending refresh.
 fn commits_to_fail(operation: Operation, kinds: &[CommitKind]) -> Vec<usize> {
     for (number, kind) in kinds.iter().enumerate() {
         assert!(
@@ -316,7 +316,7 @@ struct Setup {
 }
 
 impl Setup {
-    /// A cache holding none of the sessions.
+    /// A cache without any of the sessions.
     fn cold() -> Self {
         Self {
             corpus: Corpus::new(),
@@ -617,7 +617,7 @@ fn app_applying(environment: &Environment, messages: Vec<LoaderMessage>) -> App 
 /// One operation the sweep fails a commit of.
 #[derive(Clone, Copy, Debug)]
 enum Operation {
-    /// The launch over a cache holding none of the sessions.
+    /// The launch over a cache without any of the sessions.
     ColdLaunch,
     /// The launch over a cache holding every session, each changed since.
     WarmLaunch,

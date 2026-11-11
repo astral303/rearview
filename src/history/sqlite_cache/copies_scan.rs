@@ -21,8 +21,9 @@ const RANGES_PER_THREAD: i64 = 16;
 const MIN_ROWS_PER_RANGE: i64 = 4096;
 
 /// A scan's kept reads, at most one per task, and what it found of each
-/// copy: the copy's data, or why it holds none. A copy's miss leaves the
-/// reads holding none, some or all of its content: callers drop it.
+/// copy: the copy's data, or the reason the scan missed it. A copy's miss
+/// leaves the reads holding some, all or none of its content: callers drop
+/// it.
 pub(crate) struct ScannedCopies<R, A> {
     pub(crate) reads: Vec<R>,
     /// One per scanned copy, by the copy's position.
@@ -268,8 +269,8 @@ pub(super) struct KeySplit {
 }
 
 impl KeySplit {
-    /// The split of `table`'s `key`, the first column of an index. An empty
-    /// table has no range.
+    /// The split of `table`'s `key`, the first column of an index. The split
+    /// of an empty table is empty.
     pub(super) fn of(connection: &Connection, table: &str, key: &str) -> Result<Self> {
         let bounds = connection.query_row(&Self::bounds_query(table, key), [], |row| {
             Ok(row.get::<_, Option<i64>>(0)?.zip(row.get(1)?))
@@ -277,8 +278,8 @@ impl KeySplit {
         Ok(Self::spanning(bounds))
     }
 
-    /// The split of the keys from the least to the greatest of `bounds`; no
-    /// range without bounds.
+    /// The split of the keys from the least to the greatest of `bounds`;
+    /// empty without bounds.
     pub(super) fn spanning(bounds: Option<(i64, i64)>) -> Self {
         let span = bounds.map_or(0, |(least, greatest)| {
             (greatest - least).saturating_add(1).max(0)
@@ -291,7 +292,7 @@ impl KeySplit {
     }
 
     /// The split of the keys from the least to the greatest of `bounds`
-    /// into ranges of at most `width` keys; no range without bounds.
+    /// into ranges of at most `width` keys; empty without bounds.
     pub(super) fn of_width(bounds: Option<(i64, i64)>, width: i64) -> Self {
         let (least, greatest) = bounds.unwrap_or((1, 0));
         Self {
@@ -537,7 +538,10 @@ mod tests {
                 assert_eq!(covering, 1, "{case}: one range covers row {id}: {ranges:?}");
             }
             if ids.is_empty() {
-                assert!(ranges.is_empty(), "{case}: an empty table has no range");
+                assert!(
+                    ranges.is_empty(),
+                    "{case}: an empty table doesn't have a range"
+                );
             }
         }
     }

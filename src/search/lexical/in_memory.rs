@@ -258,7 +258,8 @@ pub(crate) type TextsRead = (CopyKey, TextsReadResult);
 /// The texts a read of a copy found, or the cause of its failure.
 pub(crate) type TextsReadResult = std::result::Result<Arc<SessionSearchTexts>, ReadFailure>;
 
-/// Why a read of a copy's search texts holds none, as the TUI names it.
+/// The reason a read of a copy's search texts didn't return any, as the TUI
+/// names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadFailure {
     /// The session is no longer in the session cache.
@@ -378,14 +379,14 @@ struct HeldTexts {
 enum CopyReadState {
     Held,
     Reading,
-    /// The read holds no texts of the copy. While none of the session's
+    /// The read didn't return the copy's texts. While none of the session's
     /// earlier texts are held, the search bar counts a copy that is not
     /// ready as loading, and any other as unreadable. The copy is read again
     /// when the rows next change.
     Missed(ReadFailure),
 }
 
-/// The sessions without texts in memory, by why.
+/// The sessions without texts in memory, by cause.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionsWithoutTexts {
     /// Sessions whose first read is running, or whose cached copy is not
@@ -447,8 +448,8 @@ impl SearchTextsInMemory {
         held.texts.as_ref().map(|held| &*held.texts)
     }
 
-    /// Why the read of `conversation`'s copy holds no texts; `None` unless
-    /// that read missed.
+    /// The reason the read of `conversation`'s copy didn't return its texts;
+    /// `None` unless that read missed.
     pub fn read_failure(&self, conversation: &Conversation) -> Option<&ReadFailure> {
         match &self.held_session(conversation)?.read {
             CopyReadState::Missed(failure) => Some(failure),

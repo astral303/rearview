@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Reply ids are unique within a logical thread, including when a provider
-/// copies a parent's context into several child transcripts.
+/// copies a parent's context into several sub-agent transcripts.
 #[derive(Clone, Default, Hash, PartialEq, Eq)]
 pub(crate) enum ThreadIdentity {
     #[default]
@@ -113,9 +113,9 @@ impl ThreadKey {
     }
 }
 
-/// What a [`MessageNumbering`] carries past one entry to the next, without
-/// the reply ids it numbered: a numbering resumed from it numbers no record
-/// as continuing a reply started before the checkpoint.
+/// The state a [`MessageNumbering`] carries from one entry to the next,
+/// without the reply ids it numbered: a numbering resumed from it doesn't
+/// number any record as continuing a reply started before the checkpoint.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct NumberingCheckpoint {
     pub(crate) count: usize,
@@ -167,7 +167,7 @@ impl MessageNumbering {
         self.threads.number(identity)
     }
 
-    /// Number entries using reply ids scoped to a logical thread.
+    /// Numbers `entry`, scoping its reply id to `thread`.
     pub(crate) fn number_in_thread(&mut self, entry: &LogEntry, thread: i64) -> Option<Numbered> {
         match entry {
             LogEntry::User { message, .. } => self.user_message(&message.content),
@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_reply_ids_in_distinct_children_are_separate_messages() {
+    fn equal_reply_ids_in_distinct_subagents_are_separate_messages() {
         let first = subagent_progress("assistant", "copied_reply", "First child.");
         let mut second = subagent_progress("assistant", "copied_reply", "Second child.");
         second["data"]["agentId"] = json!("a2");
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_child_labels_in_distinct_transcripts_doesnt_merge_replies() {
+    fn repeated_reply_ids_in_distinct_subagent_transcripts_dont_merge_replies() {
         let records = [
             prompt(),
             subagent_progress("assistant", "copied_reply", "First child."),

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionStatus {
     Listed,
-    /// Read cleanly, and holds no conversation the provider lists.
+    /// Read cleanly, and doesn't hold a conversation the provider lists.
     Empty,
     /// The read hit a permanent error.
     Unreadable,
@@ -64,8 +64,8 @@ pub(crate) struct SessionRecord {
 pub(crate) enum RecordEntries {
     /// Written into the copy with the record.
     Written(TranscriptEntries),
-    /// Kept out of the copy, which stores `reason` as its entries error:
-    /// a file changed after its stamp. `entries` are the parse's.
+    /// Kept out of the copy because a file changed after its stamp; the copy
+    /// stores `reason` as its entries error. `entries` are the parse's.
     Unwritten {
         reason: String,
         entries: TranscriptEntries,
@@ -166,7 +166,7 @@ pub(crate) struct RecordPlace<'a> {
     pub(crate) directories: &'a CanonicalDirectories,
     /// The agent's linker, which names the transcripts its ledger holds.
     pub(crate) linker: &'static dyn ThreadLinker,
-    /// The agent's transcript reader, which tells whether a file still holds
+    /// The agent's transcript reader: it checks whether a file still holds
     /// what a read of it read.
     pub(crate) reader: &'a dyn TranscriptReader,
 }
@@ -682,8 +682,8 @@ impl CatalogueRow {
 
     /// Add each continuation file `transcripts` read to the row's files,
     /// stamped as before its read; a file without that stamp is stamped
-    /// `None` and fails [`Self::check_files_hold_reads`]. Fails for a file below none
-    /// of the row's roots.
+    /// `None` and fails [`Self::check_files_hold_reads`]. Fails for a file
+    /// outside every root of the row.
     fn add_continuation_files(
         &mut self,
         transcripts: &SessionTranscripts,
@@ -845,8 +845,8 @@ fn handle(
     Some(key.conversation_ref().digest_hex().to_owned())
 }
 
-/// The fingerprint of the file at `path`; `None` for a locator that names no
-/// file, as an OpenCode session's does.
+/// The fingerprint of the file at `path`; `None` for a locator that doesn't
+/// name a file, such as an OpenCode session's.
 fn file_fingerprint(path: &Path) -> Option<CachedFingerprint> {
     CachedFingerprint::of_file(path).ok().flatten()
 }
