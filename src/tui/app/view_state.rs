@@ -1496,9 +1496,7 @@ impl App {
     fn copy_focused_call(&mut self) {
         match self.focused_call_text() {
             Ok(text) => self.copy_to_clipboard("Call", &text),
-            Err(e) => {
-                self.status_message = Some((e, self.clock().now()));
-            }
+            Err(e) => self.set_status(e),
         }
     }
 

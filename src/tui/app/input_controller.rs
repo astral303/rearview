@@ -318,7 +318,7 @@ impl App {
             }
             KeyCode::Char('p') => {
                 if let Some(path) = self.open_session_path_text() {
-                    self.status_message = Some((path, self.clock().now()));
+                    self.set_status(path);
                 }
                 None
             }
