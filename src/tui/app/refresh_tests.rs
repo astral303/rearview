@@ -77,7 +77,7 @@ fn changed_session(row: Conversation) -> UpdatedSession {
     }
 }
 
-fn status_text(app: &App) -> Option<&str> {
+pub(super) fn status_text(app: &App) -> Option<&str> {
     app.status_message().map(|(message, _)| message.as_str())
 }
 

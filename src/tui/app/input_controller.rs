@@ -2,6 +2,13 @@ use super::{Action, App, AppMode, DialogMode, ListSearchMode, ViewSearchMode, Vi
 use crate::search;
 use crossterm::event::{KeyCode, KeyModifiers};
 
+/// A Ctrl key combination's character is not typed. On Windows, Ctrl with
+/// Alt is AltGr, and its character is typed.
+fn is_ctrl_combination(modifiers: KeyModifiers) -> bool {
+    let is_altgr = cfg!(windows) && modifiers.contains(KeyModifiers::ALT);
+    modifiers.contains(KeyModifiers::CONTROL) && !is_altgr
+}
+
 impl App {
     fn cursor_left(&mut self) {
         if self.cursor_pos > 0 {
@@ -392,6 +399,7 @@ impl App {
                 self.delete_view_search_word_backwards();
                 None
             }
+            KeyCode::Char(_) if is_ctrl_combination(modifiers) => None,
             KeyCode::Char(c) => {
                 self.push_view_search_char(c);
                 None
@@ -418,8 +426,8 @@ impl App {
         modifiers: KeyModifiers,
         viewport_height: usize,
     ) -> Option<Action> {
-        // Ahead of the loading check, so the key does not type into the
-        // query while the list loads. The refresh waits until then.
+        // Ahead of the loading check: a refresh requested while the list
+        // loads runs when the load ends.
         if code == KeyCode::Char('r') && modifiers.contains(KeyModifiers::CONTROL) {
             return Some(Action::Refresh);
         }
@@ -428,15 +436,23 @@ impl App {
         if let Some(action) = self.handle_session_key(code, modifiers) {
             return action;
         }
+        // Also ahead of it: open and select show that they are unavailable
+        // while the list loads.
+        match code {
+            KeyCode::Enter => {
+                self.request_open();
+                return None;
+            }
+            KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
+                return self.request_select();
+            }
+            _ => {}
+        }
         if self.is_loading() {
             return self.handle_common_list_key(code, modifiers, false);
         }
 
         match code {
-            KeyCode::Enter => {
-                self.request_open();
-                None
-            }
             KeyCode::Home => {
                 self.select_first();
                 None
@@ -448,9 +464,6 @@ impl App {
             KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.select_half_page_down(viewport_height);
                 None
-            }
-            KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.get_selected_path().map(Action::Select)
             }
             _ => self.handle_common_list_key(code, modifiers, true),
         }
@@ -570,6 +583,7 @@ impl App {
             KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.delete_word_backwards()
             }
+            KeyCode::Char(_) if is_ctrl_combination(modifiers) => return false,
             KeyCode::Char(c) => {
                 self.insert_query_char(c);
                 true

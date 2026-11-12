@@ -178,8 +178,7 @@ where
                             return EventLoopResult::Break;
                         }
                         if allow_list_click_enter
-                            && app.handle_list_click(m.row, frame_state.frame_area)
-                            && app.request_open()
+                            && app.open_clicked_row(m.row, frame_state.frame_area)
                         {
                             return EventLoopResult::Break;
                         }

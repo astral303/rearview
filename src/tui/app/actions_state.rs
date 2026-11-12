@@ -168,7 +168,12 @@ impl App {
             if self.is_action_available(SessionAction::Rename) {
                 self.start_rename();
             } else if let Some(work) = self.rename_and_delete_wait() {
-                self.set_status(work.rename_status().to_owned());
+                match work {
+                    ListWork::Loading => self.set_status_until_loaded(work.rename_status()),
+                    ListWork::Refreshing | ListWork::RefreshingSession => {
+                        self.set_status(work.rename_status().to_owned());
+                    }
+                }
             }
             return Some(None);
         }
