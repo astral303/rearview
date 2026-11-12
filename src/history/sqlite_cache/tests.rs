@@ -14,6 +14,7 @@ mod message_schema;
 mod record_from_parse;
 mod search_texts;
 mod sources;
+mod stored_rows;
 mod transcript_references;
 
 const CACHE_KEY: &str = "every-record";
