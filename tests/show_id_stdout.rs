@@ -22,9 +22,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const SESSION_ID: &str = "12345678-1234-4234-9234-123456789abc";
-/// Appears in the fixture conversation's list row once the list has loaded.
+/// Appears in the fixture conversation's list row.
 const SENTINEL: &str = "showid sentinel";
+/// Starts the search bar's status while the list loads.
+const LOADING_STATUS: &str = "Loading";
 const CTRL_O: &[u8] = b"\x0f";
+const TERMINAL_ROWS: u16 = 24;
+const TERMINAL_COLUMNS: u16 = 80;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -35,7 +39,7 @@ fn show_id_prints_only_session_id_when_stdout_is_captured() {
     write_claude_session(config.path());
 
     let mut list = ConversationList::spawn(config.path(), home.path(), &["--show-id"]);
-    list.wait_until_drawn(SENTINEL);
+    list.wait_until_loaded(SENTINEL);
     list.press(CTRL_O);
     let status = list.wait_for_exit();
 
@@ -96,8 +100,8 @@ impl ConversationList {
     fn spawn(config: &Path, home: &Path, args: &[&str]) -> Self {
         let OpenptyResult { master, slave } = openpty(
             &Winsize {
-                ws_row: 24,
-                ws_col: 80,
+                ws_row: TERMINAL_ROWS,
+                ws_col: TERMINAL_COLUMNS,
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             },
@@ -158,14 +162,19 @@ impl ConversationList {
         }
     }
 
-    /// Waits until the text the list has drawn contains `needle`.
-    fn wait_until_drawn(&self, needle: &str) {
+    /// Waits until the list shows `needle` and has finished loading. While
+    /// it loads, the list shows its sessions but doesn't select one on
+    /// Ctrl+O.
+    fn wait_until_loaded(&self, needle: &str) {
         let started = Instant::now();
-        while !self.screen_text().contains(needle) {
+        loop {
+            let screen = self.screen_text();
+            if screen.contains(needle) && !screen.contains(LOADING_STATUS) {
+                return;
+            }
             assert!(
                 started.elapsed() < LOAD_TIMEOUT,
-                "the list did not draw {needle:?} within {LOAD_TIMEOUT:?}; the terminal showed:\n{}",
-                self.screen_text()
+                "the list did not show {needle:?} and finish loading within {LOAD_TIMEOUT:?}; the terminal showed:\n{screen}"
             );
             thread::sleep(Duration::from_millis(50));
         }
@@ -204,10 +213,9 @@ impl ConversationList {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// The terminal output so far without its escape sequences: roughly what
-    /// a person would see, minus layout.
+    /// The terminal's rows as the list last drew them.
     fn screen_text(&self) -> String {
-        visible_text(&self.output.lock().unwrap())
+        drawn_rows(&self.output.lock().unwrap()).join("\n")
     }
 }
 
@@ -219,31 +227,42 @@ impl Drop for ConversationList {
     }
 }
 
-/// Drops ANSI escape sequences, keeping printable text and newlines.
-fn visible_text(raw: &[u8]) -> String {
-    const ESC: u8 = 0x1b;
-    const BEL: u8 = 0x07;
-    let mut text = Vec::with_capacity(raw.len());
-    let mut bytes = raw.iter().copied();
-    while let Some(byte) = bytes.next() {
-        match byte {
-            ESC => match bytes.next() {
+/// The terminal's rows after the output `raw`. Text lands where the cursor
+/// moves put it and a screen clear empties the rows; other escape sequences
+/// are dropped. Every character counts as one column wide.
+fn drawn_rows(raw: &[u8]) -> Vec<String> {
+    const ESC: char = '\u{1b}';
+    const BEL: char = '\u{7}';
+    let mut rows = vec![vec![' '; usize::from(TERMINAL_COLUMNS)]; usize::from(TERMINAL_ROWS)];
+    let (mut row, mut column) = (0, 0);
+    let text = String::from_utf8_lossy(raw);
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            ESC => match characters.next() {
                 // CSI: parameter and intermediate bytes up to a final byte in @..~.
-                Some(b'[') => {
-                    for byte in bytes.by_ref() {
-                        if (0x40..=0x7e).contains(&byte) {
+                Some('[') => {
+                    let mut parameters = String::new();
+                    for character in characters.by_ref() {
+                        if ('@'..='~').contains(&character) {
+                            match character {
+                                'H' => (row, column) = cursor_position(&parameters),
+                                'J' => rows.iter_mut().for_each(|cells| cells.fill(' ')),
+                                _ => {}
+                            }
                             break;
                         }
+                        parameters.push(character);
                     }
                 }
                 // OSC: a string ended by BEL or ESC \.
-                Some(b']') => {
-                    while let Some(byte) = bytes.next() {
-                        if byte == BEL {
+                Some(']') => {
+                    while let Some(character) = characters.next() {
+                        if character == BEL {
                             break;
                         }
-                        if byte == ESC {
-                            bytes.next();
+                        if character == ESC {
+                            characters.next();
                             break;
                         }
                     }
@@ -251,9 +270,25 @@ fn visible_text(raw: &[u8]) -> String {
                 // Two-byte sequences such as ESC 7 and ESC =.
                 _ => {}
             },
-            b'\n' | 0x20.. => text.push(byte),
+            ' '.. => {
+                if let Some(cell) = rows.get_mut(row).and_then(|cells| cells.get_mut(column)) {
+                    *cell = character;
+                }
+                column += 1;
+            }
             _ => {}
         }
     }
-    String::from_utf8_lossy(&text).into_owned()
+    rows.into_iter()
+        .map(|cells| cells.into_iter().collect::<String>().trim_end().to_owned())
+        .collect()
+}
+
+/// The zero-based row and column of a cursor move's `row;column` parameters,
+/// which count from 1 and default to 1.
+fn cursor_position(parameters: &str) -> (usize, usize) {
+    let mut positions = parameters
+        .split(';')
+        .map(|position| position.parse::<usize>().unwrap_or(1).saturating_sub(1));
+    (positions.next().unwrap_or(0), positions.next().unwrap_or(0))
 }
