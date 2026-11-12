@@ -469,3 +469,70 @@ CREATE TABLE IF NOT EXISTS malformed_lines (
     PRIMARY KEY (session, position)
 ) WITHOUT ROWID;
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{CREATE, SCHEMA_VERSION, TABLES};
+    use std::collections::BTreeSet;
+
+    /// The [`SCHEMA_VERSION`] and the hash of [`schema_text`] it was pinned
+    /// with. A change to either fails `schema_text_matches_its_version`
+    /// until both are set again.
+    const PINNED_SCHEMA: (u32, &str) = (
+        40,
+        "9be873efe760a4495d3823c44ab1c45f19321d7afe9fd7c4969ebff95935703f",
+    );
+
+    /// [`CREATE`] without its `--` comments and with its whitespace
+    /// collapsed: a reworded comment keeps the hash, so it doesn't need a
+    /// new `SCHEMA_VERSION`. The normalisation would also alter whitespace or
+    /// `--` inside a quoted SQL literal; `CREATE` doesn't hold such a literal.
+    fn schema_text() -> String {
+        CREATE
+            .lines()
+            .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn schema_text_matches_its_version() {
+        let hash = blake3::hash(schema_text().as_bytes()).to_hex();
+        let (pinned_version, pinned_hash) = PINNED_SCHEMA;
+
+        assert_eq!(
+            SCHEMA_VERSION, pinned_version,
+            "PINNED_SCHEMA in schema.rs pins the current SCHEMA_VERSION: set it to \
+             ({SCHEMA_VERSION}, \"{hash}\")"
+        );
+        assert_eq!(
+            hash.as_str(),
+            pinned_hash,
+            "SCHEMA_VERSION changes with the tables' text: raise it to {next} and set \
+             PINNED_SCHEMA in schema.rs to ({next}, \"{hash}\")",
+            next = SCHEMA_VERSION + 1
+        );
+    }
+
+    #[test]
+    fn tables_list_every_table_the_schema_creates() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(CREATE).unwrap();
+        let created: BTreeSet<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let listed: BTreeSet<String> = TABLES.iter().map(|table| (*table).to_owned()).collect();
+
+        assert_eq!(
+            listed, created,
+            "TABLES in schema.rs lists every table CREATE makes, so a rebuild drops each one"
+        );
+    }
+}
