@@ -86,6 +86,7 @@ pub struct App {
     app_mode: AppMode,
     /// Status message with timestamp for auto-clear
     status_message: Option<(String, Moment)>,
+    is_status_cleared_at_load_end: bool,
     /// Persistent view setting: tool display mode
     tool_display: ToolDisplayMode,
     /// Persistent view setting: whether to show thinking blocks
@@ -283,6 +284,7 @@ impl App {
             dialog_mode: DialogMode::None,
             app_mode: parts.app_mode,
             status_message: None,
+            is_status_cleared_at_load_end: false,
             tool_display: parts.tool_display,
             show_thinking: parts.show_thinking,
             show_timing: false,
@@ -355,6 +357,20 @@ impl App {
 
     fn set_status(&mut self, message: String) {
         self.status_message = Some((message, self.environment.clock().now()));
+        self.is_status_cleared_at_load_end = false;
+    }
+
+    /// Show `message` until the list's load ends or the status expires.
+    fn set_status_until_loaded(&mut self, message: &str) {
+        self.set_status(message.to_owned());
+        self.is_status_cleared_at_load_end = true;
+    }
+
+    fn clear_status_set_until_loaded(&mut self) {
+        if self.is_status_cleared_at_load_end {
+            self.status_message = None;
+            self.is_status_cleared_at_load_end = false;
+        }
     }
 
     fn conversation_snapshot(conversations: &[Conversation]) -> Arc<Vec<Arc<Conversation>>> {
@@ -619,6 +635,7 @@ impl App {
         self.send_search_data();
 
         self.loading_state = LoadingState::Ready;
+        self.clear_status_set_until_loaded();
 
         self.invalidate_search_generation();
         self.rerun_query();
@@ -867,12 +884,13 @@ impl App {
     }
 
     /// Ask to open the selected session on the next frame; false when nothing
-    /// is pending.
+    /// is pending. While the list loads, show that open is unavailable.
     pub fn request_open(&mut self) -> bool {
-        if !matches!(self.app_mode, AppMode::List)
-            || self.dialog_mode != DialogMode::None
-            || self.is_loading()
-        {
+        if !matches!(self.app_mode, AppMode::List) || self.dialog_mode != DialogMode::None {
+            return false;
+        }
+        if self.is_loading() {
+            self.set_status_until_loaded("Open is unavailable while the list loads");
             return false;
         }
         let Some(row) = self
@@ -888,6 +906,16 @@ impl App {
             read: None,
         });
         true
+    }
+
+    /// The action that selects the selected session and exits. While the
+    /// list loads, show that select is unavailable.
+    fn request_select(&mut self) -> Option<Action> {
+        if self.is_loading() {
+            self.set_status_until_loaded("Select is unavailable while the list loads");
+            return None;
+        }
+        self.get_selected_path().map(Action::Select)
     }
 
     /// True between the open request and the viewer showing the session.
@@ -977,14 +1005,16 @@ impl App {
             .is_some_and(view_state::PendingReload::is_reading)
     }
 
+    /// Select the row a left-click landed on and ask to open it, as open
+    /// (`Enter`) does on the selected row. True when an open is pending.
+    pub fn open_clicked_row(&mut self, row: u16, frame_area: Rect) -> bool {
+        self.handle_list_click(row, frame_area) && self.request_open()
+    }
+
     /// Handle a left-click in list mode: select the conversation under the cursor.
-    /// Returns true if the click landed on a list item — the caller is expected to
-    /// then transition into view mode (matching the Enter-key behavior).
+    /// Returns true if the click landed on a list item.
     pub fn handle_list_click(&mut self, row: u16, frame_area: Rect) -> bool {
-        if !matches!(self.app_mode, AppMode::List)
-            || self.dialog_mode != DialogMode::None
-            || self.is_loading()
-        {
+        if !matches!(self.app_mode, AppMode::List) || self.dialog_mode != DialogMode::None {
             return false;
         }
 
@@ -1016,7 +1046,7 @@ impl App {
         let relative_row = (row - list_y) as usize;
         let relative_idx = relative_row / lines_per_item;
         let new_idx = offset + relative_idx;
-        if new_idx < self.filtered.len() {
+        if relative_idx < items_per_page && new_idx < self.filtered.len() {
             self.selected = Some(new_idx);
             self.selection_anchor = None;
             true

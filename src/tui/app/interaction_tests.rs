@@ -1,5 +1,5 @@
 use super::claude_home::{ClaudeHome, app_reading};
-use super::refresh_tests::{serve_list_change, serve_session_refresh};
+use super::refresh_tests::{serve_list_change, serve_session_refresh, status_text};
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::config::KeyBinding;
@@ -749,24 +749,33 @@ fn pending_open_opens_requested_session_after_list_reorders() {
 }
 
 #[test]
-fn row_click_requests_open_as_enter_does() {
+fn row_click_requests_open() {
     let home = ClaudeHome::new();
     let path = home.transcript("plain");
     write_conversation(&path, None);
     let mut app = app_with_conversation(&home, path, None);
     let frame_area = Rect::new(0, 0, 80, 17);
 
-    assert!(app.handle_list_click(3, frame_area));
-    assert!(app.request_open());
+    assert!(app.open_clicked_row(3, frame_area));
 
     assert!(app.is_opening());
 }
 
 #[test]
-fn enter_while_corpus_loads_doesnt_request_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("plain.jsonl");
-    write_conversation(&path, None);
+fn ctrl_o_on_loaded_list_selects_selected_session() {
+    let path = PathBuf::from("plain.jsonl");
+    let row = test_conversation(path.clone(), None);
+    let mut app = app_listing(vec![row], ToolDisplayMode::Hidden);
+
+    let action = press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+    assert!(
+        matches!(action, Some(Action::Select(selected)) if selected == path),
+        "Ctrl+O selects the selected session"
+    );
+}
+
+fn app_loading_with_row(path: PathBuf) -> App {
     let mut app = App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
@@ -777,11 +786,203 @@ fn enter_while_corpus_loads_doesnt_request_open() {
     );
     app.append_conversations(vec![test_conversation(path, None)]);
     assert!(app.is_loading());
+    app
+}
+
+#[test]
+fn enter_while_list_loads_shows_open_is_unavailable_and_doesnt_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plain.jsonl");
+    write_conversation(&path, None);
+    let mut app = app_loading_with_row(path);
     assert_eq!(app.selected(), Some(0));
 
     press(&mut app, KeyCode::Enter);
 
     assert!(!app.is_opening());
+    assert_eq!(
+        status_text(&app),
+        Some("Open is unavailable while the list loads")
+    );
+}
+
+#[test]
+fn row_click_while_list_loads_shows_open_is_unavailable_as_enter_does() {
+    let mut pressed = app_loading_with_row(PathBuf::from("plain.jsonl"));
+    let mut clicked = app_loading_with_row(PathBuf::from("plain.jsonl"));
+    let first_row = 3;
+
+    press(&mut pressed, KeyCode::Enter);
+    let is_opening = clicked.open_clicked_row(first_row, Rect::new(0, 0, 80, 17));
+
+    assert!(!is_opening, "the click doesn't open the session");
+    assert_eq!(
+        status_text(&clicked),
+        Some("Open is unavailable while the list loads")
+    );
+    assert_eq!(status_text(&clicked), status_text(&pressed));
+}
+
+#[test]
+fn row_click_while_list_loads_selects_clicked_row() {
+    let mut app = app_loading_with_row(PathBuf::from("first.jsonl"));
+    app.append_conversations(vec![test_conversation(PathBuf::from("second.jsonl"), None)]);
+    let second_row = 6;
+
+    app.open_clicked_row(second_row, Rect::new(0, 0, 80, 17));
+
+    assert_eq!(app.selected(), Some(1));
+}
+
+#[test]
+fn click_below_last_shown_row_doesnt_open_next_pages_session() {
+    let rows = (0..5)
+        .map(|number| test_conversation(PathBuf::from(format!("{number}.jsonl")), None))
+        .collect();
+    let mut app = app_listing(rows, ToolDisplayMode::Hidden);
+    // Four three-line rows fit; one line below them stays blank.
+    let frame = Rect::new(0, 0, 80, 18);
+    let blank_line = 15;
+
+    let is_opening = app.open_clicked_row(blank_line, frame);
+
+    assert!(!is_opening, "the click doesn't open a session");
+    assert_eq!(app.selected(), Some(0), "the selection stays");
+}
+
+#[test]
+fn ctrl_o_while_list_loads_shows_select_is_unavailable_and_doesnt_type() {
+    let mut app = app_loading_with_row(PathBuf::from("plain.jsonl"));
+
+    let action = press_with(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+    assert!(action.is_none(), "the key doesn't select a session");
+    assert_eq!(app.query(), "", "the key doesn't type into the query");
+    assert_eq!(
+        status_text(&app),
+        Some("Select is unavailable while the list loads")
+    );
+}
+
+#[test]
+fn letter_o_while_list_loads_types_into_list_query() {
+    let mut app = app_loading_with_row(PathBuf::from("plain.jsonl"));
+
+    press(&mut app, KeyCode::Char('o'));
+
+    assert_eq!(app.query(), "o");
+    assert_eq!(status_text(&app), None);
+}
+
+#[test]
+fn load_end_clears_open_select_and_rename_statuses() {
+    for (code, modifiers) in [
+        (KeyCode::Enter, KeyModifiers::empty()),
+        (KeyCode::Char('o'), KeyModifiers::CONTROL),
+        (KeyCode::F(2), KeyModifiers::empty()),
+    ] {
+        let mut app = app_loading_with_row(PathBuf::from("plain.jsonl"));
+        press_with(&mut app, code, modifiers);
+        assert!(
+            status_text(&app).is_some_and(|status| status.ends_with("while the list loads")),
+            "{code:?} with {modifiers:?} shows a status that names the load: {:?}",
+            status_text(&app)
+        );
+
+        app.finish_loading();
+
+        assert_eq!(
+            status_text(&app),
+            None,
+            "the load's end clears the status {code:?} with {modifiers:?} showed"
+        );
+    }
+}
+
+#[test]
+fn load_end_keeps_status_set_after_open_status() {
+    let path = PathBuf::from("plain.jsonl");
+    let mut app = app_loading_with_row(path.clone());
+    press(&mut app, KeyCode::Enter);
+    app.finish_rename(
+        &path,
+        "title",
+        Err(crate::error::AppError::ConfigError("refused".to_owned())),
+    );
+
+    app.finish_loading();
+
+    assert_eq!(
+        status_text(&app),
+        Some("Failed to rename: Configuration error: refused")
+    );
+}
+
+#[test]
+fn ctrl_key_without_action_doesnt_type_into_list_query() {
+    let row = test_conversation(PathBuf::from("plain.jsonl"), None);
+    let mut loaded = app_listing(vec![row], ToolDisplayMode::Hidden);
+    let mut loading = app_loading_with_row(PathBuf::from("plain.jsonl"));
+
+    for (list, app) in [("loaded", &mut loaded), ("loading", &mut loading)] {
+        press_with(app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            app.query(),
+            "",
+            "Ctrl+G doesn't type into the {list} list's query"
+        );
+    }
+}
+
+/// The text a character pressed with Ctrl and Alt types: the character on
+/// Windows, where that is AltGr, and nothing elsewhere.
+fn typed_with_ctrl_and_alt(character: &'static str) -> &'static str {
+    if cfg!(windows) { character } else { "" }
+}
+
+#[test]
+fn ctrl_alt_character_types_into_list_query_on_windows_alone() {
+    let row = test_conversation(PathBuf::from("plain.jsonl"), None);
+    let mut app = app_listing(vec![row], ToolDisplayMode::Hidden);
+
+    press_with(
+        &mut app,
+        KeyCode::Char('@'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+
+    assert_eq!(app.query(), typed_with_ctrl_and_alt("@"));
+}
+
+#[test]
+fn ctrl_key_without_action_doesnt_type_into_viewer_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    press(&mut app, KeyCode::Char('/'));
+
+    press_with(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+    assert_eq!(view_state(&app).search_query, "");
+}
+
+#[test]
+fn ctrl_alt_character_types_into_viewer_search_on_windows_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool.jsonl");
+    write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    press(&mut app, KeyCode::Char('/'));
+
+    press_with(
+        &mut app,
+        KeyCode::Char('@'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+
+    assert_eq!(view_state(&app).search_query, typed_with_ctrl_and_alt("@"));
 }
 
 #[test]

@@ -233,10 +233,7 @@ impl App {
                     self.show_renamed_session(idx, title);
                 }
             }
-            Err(e) => {
-                self.status_message =
-                    Some((format!("Failed to rename: {}", e), self.clock().now()));
-            }
+            Err(e) => self.set_status(format!("Failed to rename: {}", e)),
         }
     }
 
@@ -248,7 +245,7 @@ impl App {
             Some(title.to_owned()).filter(|title| !title.is_empty());
         self.store.request_session_refresh(&path);
         self.dialog_mode = DialogMode::None;
-        self.status_message = Some(("Session renamed".to_string(), self.clock().now()));
+        self.set_status("Session renamed".to_string());
         self.refresh_search_data();
         // The search results arrive later; they keep the renamed row selected.
         self.selection_anchor = Some(path.clone());

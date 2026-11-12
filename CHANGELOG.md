@@ -79,6 +79,15 @@
   session's old name after a rename, and missing the new one, until its
   transcript changed. A Grok Build or Kimi Code session renamed from its
   generated title no longer shows that title beside its new name.
+- Fix an unassigned Ctrl key combination typing its letter into the list's
+  query or the viewer's search.
+- Fix open (`Enter` or a click on a row) giving no feedback while the list
+  loads, and select (`Ctrl+O`) typing `o` into the query. Each now shows a
+  status, such as `Open is unavailable while the list loads`.
+  - The status clears when the load ends. The status of rename (`F2`)
+    now does too.
+- Fix a click on the blank line below the list's last visible row opening
+  a session from the next page.
 
 #### `rearview agent` commands
 
