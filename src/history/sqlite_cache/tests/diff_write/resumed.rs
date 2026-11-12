@@ -12,7 +12,7 @@ mod pi_log;
 
 use super::*;
 use crate::clock::TestClock;
-use crate::history::provider::walk::test_support::link_directory;
+use crate::history::provider::walk::test_support::{link_directory, unlink_directory};
 use crate::history::resumed::{ResumeContext, WholeRead, read_resumed};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -869,7 +869,7 @@ fn load_after_archived_tree_is_retargeted_reads_the_session_whole_once() {
         let entry = entry.unwrap();
         std::fs::copy(entry.path(), archive("archive-two").join(entry.file_name())).unwrap();
     }
-    std::fs::remove_dir(&link).unwrap();
+    unlink_directory(&link);
     link_directory(&archive("archive-two"), &link);
     let rollouts = [
         &bases.session,

@@ -53,9 +53,12 @@ mod platform {
         }
         // SAFETY: `statvfs` returned 0, so `stat` is filled.
         let stat = unsafe { stat.assume_init() };
-        u64::try_from(stat.f_bavail)
-            .ok()?
-            .checked_mul(u64::try_from(stat.f_frsize).ok()?)
+        // `u64::from` widens `f_bavail`, a `u32` on macOS, and `f_frsize`, a
+        // `c_ulong` of 32 bits on some targets; on 64-bit Linux both are
+        // already `u64`.
+        #[allow(clippy::useless_conversion)]
+        let (available_blocks, block_size) = (u64::from(stat.f_bavail), u64::from(stat.f_frsize));
+        available_blocks.checked_mul(block_size)
     }
 }
 

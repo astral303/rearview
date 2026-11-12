@@ -155,6 +155,14 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Removes the link [`link_directory`] made at `link`; its target stays.
+    pub(crate) fn unlink_directory(link: &Path) {
+        #[cfg(unix)]
+        std::fs::remove_file(link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(link).unwrap();
+    }
+
     /// The file system's listing, recording each directory it lists,
     /// running the actions a test schedules before a listing, and refusing
     /// the directories a test names, as a directory the user cannot read

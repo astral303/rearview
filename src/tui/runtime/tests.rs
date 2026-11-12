@@ -1914,6 +1914,10 @@ fn rename_and_delete_stay_available_while_launch_waits_for_another_rearviews_ref
     home.rows(&environment);
     home.append(&a, 6, "written after the cache");
     let other_refresh = another_rearviews_refresh(cache.path());
+    // A waiter's polls on the test clock reach the takeover window within a
+    // fraction of a second, and the launch may take over an idle refresh
+    // between two ticks. It waits behind a write batch until the batch ends.
+    let other_refresh_batch = writer_lock_held(cache.path());
     let mut runtime = launched_in(environment);
     let mut terminal = terminal();
     assert!(
@@ -1933,6 +1937,7 @@ fn rename_and_delete_stay_available_while_launch_waits_for_another_rearviews_ref
         runtime.app().is_action_available(SessionAction::Delete),
         "Delete doesn't wait for another rearview's refresh"
     );
+    drop(other_refresh_batch);
     drop(other_refresh);
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
 }

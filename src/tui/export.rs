@@ -196,6 +196,7 @@ pub fn copy_to_system_clipboard(text: &str) -> Result<ClipboardDestination, Stri
 
 /// Return clipboard tool candidates based on the active display server.
 #[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)]
 fn linux_clipboard_candidates() -> Vec<(&'static str, &'static [&'static str])> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let x11 = std::env::var_os("DISPLAY").is_some();
