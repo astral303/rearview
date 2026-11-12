@@ -3,13 +3,49 @@
 set -euo pipefail
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
 status=0
+on_windows=no
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) on_windows=yes ;;
+esac
+# A script and a native stub the cancellation test started, stopped on exit if
+# they still run.
+started_script_pid=""
+started_stub_windows_pid=""
+clean_up_test() {
+  local step
+  if [ -n "$started_stub_windows_pid" ]; then
+    taskkill //F //PID "$started_stub_windows_pid" > /dev/null 2>&1 || true
+  fi
+  if [ -n "$started_script_pid" ]; then
+    kill "$started_script_pid" 2> /dev/null || true
+    for step in $(seq 1 100); do
+      kill -0 "$started_script_pid" 2> /dev/null || break
+      sleep 0.2
+    done
+    kill -KILL "$started_script_pid" 2> /dev/null || true
+    wait "$started_script_pid" 2> /dev/null || true
+  fi
+  rm -rf "$work"
+}
+trap clean_up_test EXIT
+
+# The script's `sync` after the warm-up runs this stub, not the host's, so the
+# tests don't flush the host's disks.
+mkdir -p "$work/sync-bin"
+printf '#!/usr/bin/env bash\n' > "$work/sync-bin/sync"
+chmod +x "$work/sync-bin/sync"
+export PATH="$work/sync-bin:$PATH"
 
 # Writes the stub binaries `base` and `candidate` into directory `$1`. On each
 # run, a stub prints the next line of `<stub>.agent` (for `agent search`) or
 # `<stub>.debug` (for --debug-search) on stderr, with `;` separating records.
-# The first line answers the warm-up run.
+# The first line answers the warm-up run. The stub first acts on these files
+# next to it:
+# - `<stub>.<command>.burn`: uses some CPU time.
+# - `<stub>.<command>.sleep`: sleeps 0.2 s.
+# - `<stub>.<command>.hook`: runs it with the run's number.
+# - `<stub>.<command>.segv`: kills itself with SIGSEGV.
 write_stubs() {
   mkdir -p "$1"
   local stub
@@ -20,24 +56,32 @@ case "$1" in
   agent) command=agent ;;
   *) command=debug ;;
 esac
+if [ -e "$0.$command.burn" ]; then
+  i=0
+  while [ "$i" -lt 20000 ]; do i=$((i + 1)); done
+fi
+if [ -e "$0.$command.sleep" ]; then sleep 0.2; fi
 counter="$0.$command.count"
 run=$(( $(cat "$counter" 2> /dev/null || echo 0) + 1 ))
 echo "$run" > "$counter"
+if [ -e "$0.$command.hook" ]; then "$0.$command.hook" "$run"; fi
+if [ -e "$0.$command.segv" ]; then kill -SEGV $$; fi
 sed -n "${run}p" "$0.$command" | tr ';' '\n' >&2
 STUB
     chmod +x "$stub"
   done
 }
 
-# Runs the script over the stubs in `$1` for `$2` rounds of query `$3`. Its
-# output goes to $1/out with runs of spaces squeezed, and stderr to $1/err.
-# A failed run prints both before the test stops, since the temporary
-# directory holding them is removed on exit.
+# Runs the script over the binaries `base$4` and `candidate$4` in `$1` for
+# `$2` rounds of query `$3`. The script writes its output to $1/out, with runs
+# of spaces squeezed, and its stderr to $1/err. A failed run prints both
+# before the test stops, since the test removes their directory on exit.
 compare() {
-  if ! scripts/compare-perf.sh --base "$1/base" --base-cache "$1/base-cache" \
-    --candidate "$1/candidate" --candidate-cache "$1/candidate-cache" \
+  local suffix="${4:-}"
+  if ! scripts/compare-perf.sh --base "$1/base$suffix" --base-cache "$1/base-cache" \
+    --candidate "$1/candidate$suffix" --candidate-cache "$1/candidate-cache" \
     --rounds "$2" "$3" 2> "$1/err" | tr -s ' ' > "$1/out"; then
-    printf 'FAIL: scripts/compare-perf.sh failed over the stubs in %s\nstderr:\n' "$1" >&2
+    printf 'FAIL: scripts/compare-perf.sh failed over the binaries in %s\nstderr:\n' "$1" >&2
     cat "$1/err" >&2
     printf 'stdout:\n' >&2
     cat "$1/out" >&2
@@ -45,22 +89,23 @@ compare() {
   fi
 }
 
-expect_line() {
-  local file="$1" line="$2" claim="$3"
-  if ! grep -qxF -- "$line" "$file"; then
-    printf 'FAIL: %s\nexpected the line: %s\nin:\n' "$claim" "$line" >&2
-    cat "$file" >&2
-    status=1
-  fi
+report_failure() {
+  local claim="$1" detail="$2" file="$3"
+  printf 'FAIL: %s\n%s\nin:\n' "$claim" "$detail" >&2
+  cat "$file" >&2
+  status=1
 }
 
-expect_no_match() {
-  local file="$1" text="$2" claim="$3"
-  if grep -qF -- "$text" "$file"; then
-    printf 'FAIL: %s\nunexpected: %s\nin:\n' "$claim" "$text" >&2
-    cat "$file" >&2
-    status=1
-  fi
+expect_line() {
+  grep -qxF -- "$2" "$1" || report_failure "$3" "expected the line: $2" "$1"
+}
+
+expect_line_matching() {
+  grep -qxE -- "$2" "$1" || report_failure "$3" "expected a line matching: $2" "$1"
+}
+
+expect_no_line_matching() {
+  ! grep -qxE -- "$2" "$1" || report_failure "$3" "unexpected line matching: $2" "$1"
 }
 
 # Exits 2 before running either binary, and prints `message` on stderr.
@@ -70,10 +115,98 @@ expect_refusal() {
   local exit_code=0
   scripts/compare-perf.sh "$@" > /dev/null 2> "$work/refusal" || exit_code=$?
   if [ "$exit_code" -ne 2 ] || ! grep -qF -- "$message" "$work/refusal"; then
-    printf 'FAIL: %s\nexpected exit code 2 and: %s\ngot exit code %s and:\n' \
-      "$claim" "$message" "$exit_code" >&2
-    cat "$work/refusal" >&2
-    status=1
+    report_failure "$claim" "expected exit code 2 and: $message; got exit code $exit_code" "$work/refusal"
+  fi
+}
+
+# Runs the script over the binaries `base$3` and `candidate$3` in `$2` and
+# expects it to stop with exit code 1, the "binary failed" line and stderr
+# lines matching each further argument; `$1` names the claim.
+expect_binary_failure() {
+  local claim="$1" directory="$2" suffix="$3" exit_code=0 pattern
+  shift 3
+  scripts/compare-perf.sh --base "$directory/base$suffix" --base-cache "$directory/base-cache" \
+    --candidate "$directory/candidate$suffix" --candidate-cache "$directory/candidate-cache" \
+    --rounds 1 q > /dev/null 2> "$directory/err" || exit_code=$?
+  if [ "$exit_code" -ne 1 ] || ! grep -q "^base binary failed: " "$directory/err"; then
+    report_failure "$claim" "expected exit code 1 and the failed binary named; got exit code $exit_code" "$directory/err"
+    return
+  fi
+  for pattern in "$@"; do
+    grep -qE -- "$pattern" "$directory/err" || report_failure "$claim" "expected a line matching: $pattern" "$directory/err"
+  done
+}
+
+unsigned_ms_pattern='[0-9]+'
+signed_ms_pattern='-?[0-9]+'
+disk_megabytes_pattern='([0-9]+\.[0-9]|<0\.1)'
+# Patterns of the host's others and disk MB cells: `-` once the first
+# comparison's "Not recorded" line names the column.
+host_others_cpu_pattern="$signed_ms_pattern"
+host_disk_megabytes_pattern="$disk_megabytes_pattern"
+# Prints the pattern of a squeezed per-run row of round $1 and command $2:
+# then base and candidate pairs of wall ms, cpu ms, others ms ($3) and disk
+# MB ($4).
+per_run_row_pattern() {
+  local others="${3:-$host_others_cpu_pattern}" disk="${4:-$host_disk_megabytes_pattern}"
+  printf ' %s %s %s %s %s %s %s %s %s %s' "$1" "$2" \
+    "$unsigned_ms_pattern" "$unsigned_ms_pattern" "$unsigned_ms_pattern" "$unsigned_ms_pattern" \
+    "$others" "$others" "$disk" "$disk"
+}
+cpu_median_above_zero_pattern=' agent-search [0-9]+ [1-9][0-9]* (-|[0-9]+\.[0-9]{2})'
+
+cpu_ratio_floor_ms=10
+[ "$on_windows" = no ] || cpu_ratio_floor_ms=156
+milliseconds_per_tick=$((1000 / $(getconf CLK_TCK)))
+# Checks every process cpu row in outputs $@: the ratio is `-` when either
+# median is under the floor, and base / candidate otherwise. A machine whose
+# stubs all use the floor's CPU time or more doesn't test the `-`.
+expect_cpu_ratio_policy() {
+  awk -v floor="$cpu_ratio_floor_ms" '
+    $0 == " process cpu base candidate base/cand" { in_cpu_rows = 1; next }
+    in_cpu_rows && NF == 4 && $2 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/ {
+      rows++
+      if ($2 < floor || $3 < floor) { wanted = "-"; below_floor++ }
+      else wanted = sprintf("%.2f", $2 / $3)
+      if ($4 != wanted) { printf "%s: %s shows %s, expected %s\n", FILENAME, $1, $4, wanted; failed = 1 }
+      next
+    }
+    { in_cpu_rows = 0 }
+    END {
+      if (!rows) { print "no process cpu row was found"; failed = 1 }
+      else if (!below_floor)
+        print "test-compare-perf: no process cpu median under " floor " ms; the - ratio not tested" > "/dev/stderr"
+      exit failed
+    }
+  ' "$@" > "$work/cpu-ratio-mismatches" ||
+    report_failure "the process cpu ratio is - when either median is under $cpu_ratio_floor_ms ms, and base / candidate otherwise" \
+      "the check of every output's process cpu rows reported:" "$work/cpu-ratio-mismatches"
+}
+
+# Expects the legend lines of others in output $1, read from a /proc/stat.
+expect_others_legend() {
+  if [ "$on_windows" = yes ]; then
+    expect_line "$1" " before and after each run, in 15.6 ms ticks" \
+      "Windows counts others in clock ticks"
+    expect_no_line_matching "$1" " others leaves out steal.*" \
+      "Git Bash's /proc/stat doesn't list steal"
+  else
+    expect_line "$1" " before and after each run, in $milliseconds_per_tick ms steps" \
+      "others is counted in /proc/stat's steps"
+    expect_line "$1" " others leaves out steal, the CPU time a VM's host gave other work" \
+      "others names the steal it leaves out"
+  fi
+}
+
+# Expects the line on the warm-up's cache writes in output $1 on macOS and
+# Windows, where the script doesn't wait for them before round 1.
+expect_warm_up_legend() {
+  if [ "$(uname -s)" = Linux ]; then
+    expect_no_line_matching "$1" " early rounds' disk MB.*" \
+      "Linux's sync writes the warm-up's cache writes before round 1"
+  else
+    expect_line "$1" " early rounds' disk MB can include the warm-up's cache writes" \
+      "early rounds can show the warm-up's cache writes"
   fi
 }
 
@@ -86,6 +219,7 @@ perf stage=load ms=10;perf reads sessions=3 transcript-bytes=100 thread-ms=1;per
 perf stage=load ms=30;perf reads sessions=3 transcript-bytes=100 thread-ms=1;perf total ms=40
 perf stage=load ms=20;perf reads sessions=3 transcript-bytes=100 thread-ms=1;perf total ms=40
 RUNS
+touch "$odd/candidate.agent.burn"
 cat > "$odd/candidate.agent" <<'RUNS'
 perf stage=load ms=99;perf stage=ranking ms=1;perf reads sessions=3 transcript-bytes=50 thread-ms=1;perf total ms=99
 perf stage=load ms=5;perf stage=ranking ms=1;perf reads sessions=3 transcript-bytes=50 thread-ms=1;perf total ms=0
@@ -93,7 +227,10 @@ perf stage=load ms=15;perf reads sessions=3 transcript-bytes=50 thread-ms=1;perf
 perf stage=load ms=10;perf stage=ranking ms=1;perf reads sessions=3 transcript-bytes=50 thread-ms=1;perf total ms=0
 RUNS
 printf 'intent: "q"\n%.0s' 1 2 3 4 > "$odd/base.debug"
-printf 'perf stage=search ms=4;perf evidence rows=2;perf total ms=4\n%.0s' 1 2 3 4 > "$odd/candidate.debug"
+{
+  echo 'perf stage=warm-up-only ms=4;perf evidence rows=2;perf total ms=4'
+  printf 'perf stage=search ms=4;perf evidence rows=2;perf total ms=4\n%.0s' 1 2 3
+} > "$odd/candidate.debug"
 compare "$odd" 3 q
 expect_line "$odd/out" " agent-search load 20 10 2.00" \
   "the speedup is the base median over the candidate median"
@@ -110,7 +247,42 @@ expect_line "$odd/out" " debug-search evidence rows: base did not print it" \
 expect_line "$odd/out" \
   " agent-search ranking: base did not print it; candidate printed it in 2 of 3 rounds" \
   "a stage missing from some rounds is named, not compared"
-expect_no_match "$odd/out" "99" "the warm-up run is not timed"
+expect_no_line_matching "$odd/out" ".*warm-up-only.*" "the warm-up run is not timed"
+expect_line_matching "$odd/out" "$cpu_median_above_zero_pattern" \
+  "the process CPU time of a binary that uses CPU is above 0 ms"
+# CI's machines record every figure their platform provides: all on Linux and
+# Windows, all but others on macOS. On another machine, a figure the "Not
+# recorded" line names shows `-`.
+if [ -n "${CI:-}" ]; then
+  if [ "$(uname -s)" = Darwin ]; then
+    host_others_cpu_pattern='-'
+    expect_line "$odd/out" "Not recorded on this machine: others" \
+      "macOS names the column it does not record"
+  else
+    expect_no_line_matching "$odd/out" "Not recorded.*" "Linux and Windows record every figure"
+  fi
+else
+  not_recorded_line="$(grep '^Not recorded on this machine: ' "$odd/out" || true)"
+  not_recorded_columns=", ${not_recorded_line#Not recorded on this machine: }, "
+  case "$not_recorded_columns" in *", others, "*) host_others_cpu_pattern='-' ;; esac
+  case "$not_recorded_columns" in *", disk MB, "*) host_disk_megabytes_pattern='-' ;; esac
+fi
+expect_line "$odd/out" "process cpu base/cand: - when either median is under $cpu_ratio_floor_ms ms" \
+  "the legend names the process cpu ratio's floor"
+if [ "$on_windows" = yes ]; then
+  expect_line "$odd/out" " cpu is counted in 15.6 ms ticks" "Windows counts cpu in clock ticks"
+  expect_no_line_matching "$odd/out" " others also leaves out the CPU of the Windows helper.*" \
+    "scripts run without the Windows helper"
+else
+  expect_no_line_matching "$odd/out" " cpu is counted in .*" "bash's time counts cpu in milliseconds"
+fi
+[ "$host_others_cpu_pattern" = - ] || expect_others_legend "$odd/out"
+for round in 1 2 3; do
+  for command in agent-search debug-search; do
+    expect_line_matching "$odd/out" "$(per_run_row_pattern "$round" "$command")" \
+      "each timed round has a row per command, with every figure the platform records"
+  done
+done
 
 # Two rounds: the median is the mean of the middle two.
 even="$work/even"
@@ -119,12 +291,202 @@ printf 'perf stage=load ms=%s\n' 1 10 20 > "$even/base.agent"
 printf 'perf stage=load ms=%s\n' 1 10 10 > "$even/candidate.agent"
 printf '\n\n\n' > "$even/base.debug"
 printf '\n\n\n' > "$even/candidate.debug"
+touch "$even/base.agent.sleep"
 compare "$even" 2 "tab	query"
 expect_line "$even/out" " agent-search load 15 10 1.50" \
   "an even number of rounds takes the mean of the middle two"
+expect_line_matching "$even/out" " 1 agent-search (2[0-9]{2}|[3-9][0-9]{2}|[0-9]{4,}) .*" \
+  "wall is in milliseconds: a run that sleeps 0.2 s shows 200 or more"
 expect_line "$even/out" "query: tab	query" "a query holding a tab is run and named"
 expect_line "$even/err" "warning: 2 rounds; with fewer than five, one disturbed run can move a median" \
   "fewer than five rounds warns"
+
+# A locale with a decimal comma: bash's `time` then prints 0,123.
+if locale -a 2> /dev/null | grep -qiE '^de_DE\.utf-?8$'; then
+  comma="$work/comma"
+  write_stubs "$comma"
+  touch "$comma/candidate.agent.burn"
+  printf 'perf total ms=1\n%.0s' 1 2 > "$comma/base.agent"
+  cp "$comma/base.agent" "$comma/candidate.agent"
+  cp "$comma/base.agent" "$comma/base.debug"
+  cp "$comma/base.agent" "$comma/candidate.debug"
+  (
+    export LC_ALL=de_DE.UTF-8
+    compare "$comma" 1 q
+  )
+  expect_line_matching "$comma/out" "$cpu_median_above_zero_pattern" \
+    "a decimal comma in bash's time is read as a decimal point"
+  expect_line_matching "$comma/out" "$(per_run_row_pattern 1 agent-search)" \
+    "a decimal comma in bash's time gives every per-run figure"
+else
+  echo "test-compare-perf: no de_DE.UTF-8 locale; decimal comma not tested" >&2
+fi
+
+signal="$work/signal"
+write_stubs "$signal"
+touch "$signal/base.agent.segv"
+printf 'perf total ms=1\n' > "$signal/base.agent"
+# Bash names the signal in the language of LC_MESSAGES.
+LC_ALL=C expect_binary_failure "a binary killed by a signal stops the script with its failure and the signal" \
+  "$signal" "" "Segmentation fault"
+
+# The stub hooks change a fixture /proc/stat and /sys/block during their runs.
+# Base's agent search adds 3000 ticks of user time, 200 of irq, 100 of softirq
+# and 500 of steal, and per run 3048 sectors, 1.6 MB: 2048 read on sda, 500
+# written on nvme0n1, and 300 and 200 written on the hidden path devices of
+# NVMe multipath head nvme1n1. It also adds sectors to that head and to a
+# device-mapper volume. The script leaves both out.
+fixture="$work/fixture"
+write_stubs "$fixture"
+root="$fixture/root"
+mkdir -p "$root/proc"
+echo "cpu  1000 0 1000 50000 0 0 0 0 0 0" > "$root/proc/stat"
+add_fixture_disk() {
+  mkdir -p "$root/sys/block/$1"
+  [ "$2" = no-device ] || mkdir -p "$root/sys/block/$1/device"
+  echo "100 0 4000 0 100 0 8000 0 0 0 0" > "$root/sys/block/$1/stat"
+}
+add_fixture_disk sda device
+add_fixture_disk nvme0n1 device
+add_fixture_disk nvme1n1 device
+add_fixture_disk nvme1c1n1 device
+add_fixture_disk nvme1c2n1 device
+echo 1 > "$root/sys/block/nvme1c1n1/hidden"
+echo 1 > "$root/sys/block/nvme1c2n1/hidden"
+add_fixture_disk dm-0 no-device
+# The script passes COMPARE_PERF_SYSTEM_ROOT on to the stubs, and the hooks
+# find the fixture through it.
+cat > "$fixture/fixture-changes.sh" <<'CHANGES'
+root="$COMPARE_PERF_SYSTEM_ROOT"
+# Adds $2 sectors read and $3 written to disk $1.
+add_sectors() {
+  local fields
+  read -r -a fields < "$root/sys/block/$1/stat"
+  fields[2]=$((fields[2] + $2))
+  fields[6]=$((fields[6] + $3))
+  echo "${fields[*]}" > "$root/sys/block/$1/stat"
+}
+# Adds $1 ticks of user time, $2 of irq, $3 of softirq and $4 of steal.
+add_ticks() {
+  local fields
+  read -r -a fields < "$root/proc/stat"
+  fields[1]=$((fields[1] + $1))
+  fields[6]=$((fields[6] + $2))
+  fields[7]=$((fields[7] + $3))
+  fields[8]=$((fields[8] + $4))
+  echo "${fields[*]}" > "$root/proc/stat"
+}
+CHANGES
+cat > "$fixture/base.agent.hook" <<'HOOK'
+#!/usr/bin/env bash
+. "$(dirname "$0")/fixture-changes.sh"
+add_ticks 3000 200 100 500
+add_sectors sda 2048 0
+add_sectors nvme0n1 0 500
+add_sectors nvme1c1n1 0 300
+add_sectors nvme1c2n1 0 200
+add_sectors nvme1n1 9999 9999
+add_sectors dm-0 7777 7777
+HOOK
+# Candidate's agent search: 50 sectors (under 0.05 MB) in round 1, a new
+# disk in round 2, and a total that decreases in round 3.
+cat > "$fixture/candidate.agent.hook" <<'HOOK'
+#!/usr/bin/env bash
+. "$(dirname "$0")/fixture-changes.sh"
+case "$1" in
+  2) add_sectors sda 50 0 ;;
+  3) mkdir -p "$root/sys/block/sdb/device"; echo "0 0 0 0 0 0 0 0 0 0 0" > "$root/sys/block/sdb/stat" ;;
+  4) add_sectors sda -100 0 ;;
+esac
+HOOK
+chmod +x "$fixture/base.agent.hook" "$fixture/candidate.agent.hook"
+for stub in base candidate; do
+  printf 'perf total ms=1\n%.0s' 1 2 3 4 > "$fixture/$stub.agent"
+  printf 'perf total ms=1\n%.0s' 1 2 3 4 > "$fixture/$stub.debug"
+done
+(
+  export COMPARE_PERF_SYSTEM_ROOT="$root"
+  compare "$fixture" 3 q
+)
+expect_no_line_matching "$fixture/out" "Not recorded.*" "fixture CPU and disk counts are recorded"
+expect_others_legend "$fixture/out"
+expect_line "$fixture/out" " was detected, or the total decreased" \
+  "sysfs disks are compared by name"
+expect_warm_up_legend "$fixture/out"
+# Fields of a squeezed per-run row: 1 round, 2 command, 3-4 wall, 5-6 cpu,
+# 7-8 others, 9-10 disk MB, each pair base then candidate.
+awk -v base_agent_busy_ms=$(((3000 + 200 + 100) * milliseconds_per_tick)) '
+  function expect(what, got, wanted) {
+    if (got != wanted) { printf "round %s %s %s: got %s, expected %s\n", $1, $2, what, got, wanted; failed = 1 }
+  }
+  $2 == "agent-search" && NF == 10 {
+    expect("base others", $7, base_agent_busy_ms - $5)
+    expect("candidate others", $8, -$6)
+    expect("base disk", $9, "1.6")
+    rows++
+  }
+  $2 == "debug-search" && NF == 10 {
+    expect("base others", $7, -$5)
+    expect("candidate others", $8, -$6)
+    expect("base disk", $9, "0.0")
+    expect("candidate disk", $10, "0.0")
+    rows++
+  }
+  $1 == 1 && $2 == "agent-search" { expect("candidate disk", $10, "<0.1") }
+  $1 == 2 && $2 == "agent-search" { expect("candidate disk", $10, "-") }
+  $1 == 3 && $2 == "agent-search" { expect("candidate disk", $10, "-") }
+  END { if (rows != 6) { print "expected 6 per-run rows, got " rows; failed = 1 }; exit failed }
+' "$fixture/out" > "$fixture/mismatches" ||
+  report_failure "others is all cores' busy time with irq and softirq, without steal, minus the binary's CPU; disk counts each physical disk once, NVMe multipath I/O on its path devices, shows <0.1 under 0.05 MB and - after a change in the set of disks or a decrease in their total" \
+    "$(cat "$fixture/mismatches")" "$fixture/out"
+
+# An `ioreg` stub on PATH, as macOS's: each call adds 1 MB read on one driver
+# and 0.5 MB written on another. The script reads the stub on every platform:
+# the fixture root doesn't have a sys/block, and the Windows helper reads a
+# counter category that doesn't exist.
+ioreg_bin="$work/ioreg-bin"
+mkdir -p "$ioreg_bin"
+cat > "$ioreg_bin/ioreg" <<'STUB'
+#!/usr/bin/env bash
+calls=$(( $(cat "$IOREG_STUB_CALLS" 2> /dev/null || echo 0) + 1 ))
+echo "$calls" > "$IOREG_STUB_CALLS"
+case "$IOREG_STUB_OUTPUT" in
+  statistics)
+    echo "    | |   \"Statistics\" = {\"Operations (Read)\"=$calls,\"Bytes (Read)\"=$((calls * 1000000)),\"Bytes (Write)\"=0}"
+    echo "    | |   \"Statistics\" = {\"Bytes (Read)\"=0,\"Operations (Write)\"=$calls,\"Bytes (Write)\"=$((calls * 500000))}"
+    ;;
+  unequal-counts) echo "    | |   \"Statistics\" = {\"Bytes (Read)\"=$((calls * 1000000))}" ;;
+  no-statistics) echo "+-o IOBlockStorageDriver  <class IOBlockStorageDriver>" ;;
+esac
+STUB
+chmod +x "$ioreg_bin/ioreg"
+compare_with_ioreg_stub() {
+  local directory="$work/ioreg-$1"
+  write_stubs "$directory"
+  for stub in base candidate; do
+    printf 'perf total ms=1\n%.0s' 1 2 > "$directory/$stub.agent"
+    printf 'perf total ms=1\n%.0s' 1 2 > "$directory/$stub.debug"
+  done
+  mkdir -p "$directory/root/proc"
+  echo "cpu  1000 0 1000 50000 0 0 0 0 0 0" > "$directory/root/proc/stat"
+  (
+    export PATH="$ioreg_bin:$PATH" IOREG_STUB_OUTPUT="$1" IOREG_STUB_CALLS="$directory/ioreg-calls"
+    export COMPARE_PERF_SYSTEM_ROOT="$directory/root" COMPARE_PERF_DISK_COUNTER_CATEGORY=NoSuchCategory
+    compare "$directory" 1 q
+  )
+}
+compare_with_ioreg_stub statistics
+expect_line_matching "$work/ioreg-statistics/out" \
+  "$(per_run_row_pattern 1 agent-search "$signed_ms_pattern" '1\.5')" \
+  "ioreg's read and write bytes over every driver give the run's disk MB"
+expect_no_line_matching "$work/ioreg-statistics/out" "Not recorded.*" "ioreg's statistics are recorded"
+expect_line "$work/ioreg-statistics/out" " was detected, or the total decreased; the disks are compared by count only" \
+  "ioreg's disks are compared by count"
+for output in unequal-counts no-statistics; do
+  compare_with_ioreg_stub "$output"
+  expect_line "$work/ioreg-$output/out" "Not recorded on this machine: disk MB" \
+    "ioreg output with $output is not recorded"
+done
 
 expect_refusal "one cache directory under two names is refused" "must be different directories" \
   --base "$even/base" --base-cache "$work/shared" \
@@ -133,5 +495,147 @@ expect_refusal "an option without a value is refused with the usage" "needs a va
   --base "$even/base" --base-cache "$work/a" --candidate "$even/candidate" --candidate-cache
 expect_refusal "a missing cache directory is refused" "both required" \
   --base "$even/base" --candidate "$even/candidate" --candidate-cache "$work/b" q
+expect_refusal "a query holding a carriage return is refused" "carriage return" \
+  --base "$even/base" --base-cache "$work/a" --candidate "$even/candidate" --candidate-cache "$work/b" $'a\rb'
+
+# Waits up to 20 s for command $1 to succeed.
+wait_for() {
+  local step
+  for step in $(seq 1 100); do
+    if eval "$1"; then return 0; fi
+    sleep 0.2
+  done
+  return 1
+}
+
+if [ "$on_windows" = yes ]; then
+  # Native Windows stubs run through the Windows helper. Each prints the next
+  # line of `<stub>.exe.<command>` on stderr as the bash stubs do, and appends
+  # its arguments, cache directory and whether its stdin was at its end to
+  # `<stub>.exe.calls`. It acts on these files next to it:
+  # - `<stub>.exe.burn`: spins until its process has used 300 ms of CPU time.
+  # - `<stub>.exe.fail`: exits 3.
+  # - `<stub>.exe.hang`: writes its process ID to `<stub>.exe.pid` and waits.
+  native_build="$work/native-build"
+  mkdir -p "$native_build"
+  cat > "$native_build/stub.cs" <<'SOURCE'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class Stub
+{
+    public static int Main(string[] args)
+    {
+        string self = System.Reflection.Assembly.GetEntryAssembly().Location;
+        string command = args.Length > 0 && args[0] == "agent" ? "agent" : "debug";
+        string counter = self + "." + command + ".count";
+        int run = (File.Exists(counter) ? int.Parse(File.ReadAllText(counter)) : 0) + 1;
+        File.WriteAllText(counter, run.ToString());
+        Task<int> firstByte = Task.Run(() => Console.In.Read());
+        string stdin = !firstByte.Wait(2000) ? "open" : firstByte.Result == -1 ? "at-end" : "data";
+        string[] quoted = new string[args.Length];
+        for (int i = 0; i < args.Length; i++) quoted[i] = "[" + args[i] + "]";
+        File.AppendAllText(self + ".calls", string.Join(" ", quoted) + " cache=" +
+            Environment.GetEnvironmentVariable("REARVIEW_CACHE_DIR") + " stdin=" + stdin + "\n");
+        if (File.Exists(self + ".burn"))
+        {
+            Process stub = Process.GetCurrentProcess();
+            while (stub.TotalProcessorTime.TotalMilliseconds < 300) { }
+        }
+        string[] lines = File.ReadAllLines(self + "." + command);
+        if (run <= lines.Length) Console.Error.WriteLine(lines[run - 1].Replace(';', '\n'));
+        if (File.Exists(self + ".hang"))
+        {
+            File.WriteAllText(self + ".pid", Process.GetCurrentProcess().Id.ToString());
+            Thread.Sleep(Timeout.Infinite);
+        }
+        return File.Exists(self + ".fail") ? 3 : 0;
+    }
+}
+SOURCE
+  # Windows PowerShell's Add-Type, unlike PowerShell 7's, writes executables.
+  cat > "$native_build/build.ps1" <<'BUILD'
+param([string] $Source, [string] $Output)
+Add-Type -TypeDefinition (Get-Content -Raw $Source) -OutputType ConsoleApplication -OutputAssembly $Output
+BUILD
+  powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$native_build/build.ps1")" \
+    -Source "$(cygpath -w "$native_build/stub.cs")" -Output "$(cygpath -w "$native_build/stub.exe")"
+  install_native_stubs() {
+    mkdir -p "$1"
+    cp "$native_build/stub.exe" "$1/base.exe"
+    cp "$native_build/stub.exe" "$1/candidate.exe"
+  }
+
+  native="$work/native"
+  install_native_stubs "$native"
+  printf 'perf stage=load ms=%s\n' 99 20 20 20 > "$native/base.exe.agent"
+  printf 'perf stage=load ms=%s\n' 99 10 10 10 > "$native/candidate.exe.agent"
+  printf 'perf stage=search ms=4;perf total ms=4\n%.0s' 1 2 3 4 > "$native/base.exe.debug"
+  cp "$native/base.exe.debug" "$native/candidate.exe.debug"
+  touch "$native/base.exe.burn" "$native/candidate.exe.burn"
+  # Backslashes before a quote and at the end double when quoted.
+  tricky_query='say \"hi\" \'$'\t''é\'
+  compare "$native" 3 "$tricky_query" .exe
+  expect_line "$native/out" " agent-search load 20 10 2.00" \
+    "a native binary's stderr reaches the medians"
+  at_least_250_ms_pattern='(2[5-9][0-9]|[3-9][0-9]{2}|[0-9]{4,})'
+  expect_line_matching "$native/out" " agent-search $at_least_250_ms_pattern $at_least_250_ms_pattern [0-9]+\.[0-9]{2}" \
+    "cpu is in milliseconds, and medians above the ratio floor show their ratio: binaries that use 300 ms of CPU time show 250 or more"
+  expect_line_matching "$native/out" "$(per_run_row_pattern 1 agent-search)" \
+    "a native binary's run records every figure"
+  expect_line "$native/out" " others also leaves out the CPU of the Windows helper, compare-perf-windows.ps1" \
+    "others names the Windows helper's CPU it leaves out"
+  expect_line "$native/base.exe.calls" \
+    "[agent] [search] [$tricky_query] [--mode] [lexical] [--perf-stats] cache=$(cygpath -aw "$native/base-cache") stdin=at-end" \
+    "a native binary gets each argument unchanged, its cache directory, and a closed stdin"
+
+  no_counters="$work/no-counters"
+  install_native_stubs "$no_counters"
+  printf 'perf total ms=1\n%.0s' 1 2 > "$no_counters/base.exe.agent"
+  for file in candidate.exe.agent base.exe.debug candidate.exe.debug; do
+    cp "$no_counters/base.exe.agent" "$no_counters/$file"
+  done
+  (
+    export COMPARE_PERF_DISK_COUNTER_CATEGORY=NoSuchCategory
+    compare "$no_counters" 1 q .exe
+  )
+  expect_line "$no_counters/out" "Not recorded on this machine: disk MB" \
+    "Windows disk counters that cannot be opened are not recorded"
+
+  failing="$work/failing"
+  install_native_stubs "$failing"
+  printf 'perf total ms=1\n' > "$failing/base.exe.agent"
+  touch "$failing/base.exe.fail"
+  expect_binary_failure "a native binary's failure stops the script with its stderr" \
+    "$failing" .exe "^perf total ms=1$"
+
+  expect_refusal "a native binary against a script is refused" "must both be native Windows programs" \
+    --base "$native/base.exe" --base-cache "$work/a" --candidate "$even/candidate" --candidate-cache "$work/b" q
+
+  hanging="$work/hanging"
+  install_native_stubs "$hanging"
+  printf '\n' > "$hanging/base.exe.agent"
+  touch "$hanging/base.exe.hang"
+  scripts/compare-perf.sh --base "$hanging/base.exe" --base-cache "$hanging/base-cache" \
+    --candidate "$hanging/candidate.exe" --candidate-cache "$hanging/candidate-cache" \
+    --rounds 1 q > /dev/null 2> "$hanging/err" &
+  started_script_pid=$!
+  if ! wait_for '[ -s "$hanging/base.exe.pid" ]'; then
+    report_failure "a hanging native binary starts" "it didn't write its process ID within 20 s" "$hanging/err"
+  else
+    started_stub_windows_pid="$(cat "$hanging/base.exe.pid")"
+    kill -TERM "$started_script_pid"
+    wait_for '! kill -0 "$started_script_pid" 2> /dev/null' ||
+      report_failure "TERM stops the script within 20 s" "it was still running" "$hanging/err"
+    wait_for '! tasklist //FI "PID eq $started_stub_windows_pid" //NH | grep -q base.exe' ||
+      report_failure "TERM ends the native binary the script was running" \
+        "process $started_stub_windows_pid was still running" "$hanging/err"
+  fi
+fi
+
+expect_cpu_ratio_policy "$work"/*/out
 
 exit "$status"

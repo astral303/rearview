@@ -22,15 +22,15 @@ mise run check
 `mise run check` runs these tasks in parallel and does not rewrite files. Run
 one alone with `mise run <task>`.
 
-| Task                  | Fails when                                                                           |
-|-----------------------|--------------------------------------------------------------------------------------|
-| `check-toolchain-pin` | `rust-toolchain.toml` and `mise.lock` specify a different Rust version or components |
-| `check-scripts`       | a bash task or script has a syntax error                                             |
-| `format-check`        | Rust code is not formatted                                                           |
-| `clippy`              | Clippy reports any warning                                                           |
-| `test`                | a test fails                                                                         |
-| `test-compare-perf`   | `scripts/compare-perf.sh` misreports two stub binaries' medians, speedups or counts  |
-| `build`               | a package does not build                                                             |
+| Task                  | Fails when                                                                                           |
+|-----------------------|------------------------------------------------------------------------------------------------------|
+| `check-toolchain-pin` | `rust-toolchain.toml` and `mise.lock` specify a different Rust version or components                 |
+| `check-scripts`       | a bash task or script has a syntax error                                                             |
+| `format-check`        | Rust code is not formatted                                                                           |
+| `clippy`              | Clippy reports any warning                                                                           |
+| `test`                | a test fails                                                                                         |
+| `test-compare-perf`   | `scripts/compare-perf.sh` misreports two stub binaries' medians, speedups, counts or per-run figures |
+| `build`               | a package does not build                                                                             |
 
 ## Versions and dependencies
 
@@ -227,6 +227,13 @@ scripts/compare-perf.sh \
 - Build both binaries with `--release`, each with its own scratch cache.
 - Ideally run five rounds on a quiet machine, so one disturbed run does not
   move the median.
+- Rerun the script when one round's `others` or `disk MB` stands out from the
+  other rounds'. Its per-run table shows each run's CPU time, other
+  processes' CPU time (not on macOS) and every process's disk use, the
+  binary's own included.
+- Before reporting a wall-time difference that CPU time doesn't show, find
+  its cause: other processes, the binary's own disk reads, or a change in how
+  the binary waits or spreads its work over threads.
 
 | Figure | Pull request | Changelog |
 | --- | --- | --- |
