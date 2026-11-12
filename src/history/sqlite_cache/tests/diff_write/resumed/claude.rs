@@ -123,9 +123,20 @@ impl ClaudeSession {
     }
 
     fn update(&mut self) -> Update {
+        let (update, fixture, record) = self.update_unchecked();
+        assert_matches_fresh_write(&self.cache, &fixture, &record);
+        update
+    }
+
+    /// [`Self::update`] without comparing the stored session with a fresh
+    /// write; also returns the session's fixture and the record of a fresh
+    /// parse.
+    fn update_unchecked(&mut self) -> (Update, Fixture, SessionRecord) {
         self.updates += 1;
         let fixture = self.fixture();
-        update_stored(&mut self.cache, self.base.path(), &fixture)
+        let (update, record) =
+            update_stored_changing_files(&mut self.cache, self.base.path(), &fixture, &|| {});
+        (update, fixture, record)
     }
 
     fn bytes_after_stable_cursor(&self, path: &Path) -> u64 {
@@ -541,6 +552,18 @@ fn session_with_left_out_subagent() -> ClaudeSession {
     session
 }
 
+fn stored_ledger(cache: &CacheWriter, fixture: &Fixture) -> Value {
+    let ledger: Vec<u8> = cache
+        .connection
+        .query_row(
+            "SELECT ledger FROM session_checkpoints WHERE session = ?1",
+            [fixture.session_id(cache)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_slice(&ledger).unwrap()
+}
+
 #[test]
 fn subagent_transcript_without_record_stays_left_out_of_resumed_read() {
     let mut session = session_with_left_out_subagent();
@@ -549,12 +572,52 @@ fn subagent_transcript_without_record_stays_left_out_of_resumed_read() {
         &with(&opening(), &[reply("10:01:01", "msg_a3", "Run the tests.")]),
     );
 
-    let update = session.update();
+    let (update, fixture, record) = session.update_unchecked();
 
     assert_eq!(update.outcome, Ok(()), "the session resumes");
     assert_eq!(
         update.transcripts_read, 1,
         "the read opens the changed transcript alone"
+    );
+    let fresh = FreshWrite::of(&fixture, &record);
+    assert_matches_fresh_write_without(
+        &session.cache,
+        &fresh,
+        &fixture,
+        ("session_checkpoints", "ledger"),
+    );
+    // The resumed write stores a launch for every sub-agent transcript, the
+    // fresh write only for those with records. A ledger reader reads the
+    // sidecar for a transcript without a stored launch; the stored launch
+    // holds the sidecar's values as of the resumed write.
+    let mut resumed = stored_ledger(&session.cache, &fixture);
+    let launches = resumed["launches"]
+        .as_array_mut()
+        .expect("the resumed write's ledger holds launches");
+    let left_out = launches
+        .iter()
+        .position(|launch| {
+            launch["transcript"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(&format!("agent-{LEFT_OUT}.jsonl")))
+        })
+        .expect("the resumed write's ledger holds a launch for the transcript without records");
+    let left_out = launches.remove(left_out);
+    assert_eq!(
+        left_out,
+        json!({
+            "transcript": left_out["transcript"],
+            "call": null,
+            "is_fork": false,
+            "opening": null,
+        }),
+        "the launch for the transcript without records doesn't hold a call or an opening, and \
+         isn't a fork"
+    );
+    assert_eq!(
+        resumed,
+        stored_ledger(&fresh.cache, &fixture),
+        "the resumed write's ledger, without that launch, is the fresh write's"
     );
 }
 

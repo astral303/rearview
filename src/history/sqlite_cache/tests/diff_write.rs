@@ -174,134 +174,24 @@ fn entries_of(record: &mut SessionRecord) -> &mut TranscriptEntries {
     entries
 }
 
-/// Each stored row of `session` in `table` from `query`, whose `?1` is the
-/// session's id.
-fn table_rows(cache: &CacheWriter, session: i64, table: &str, query: &str) -> Vec<String> {
-    let mut statement = cache.connection.prepare(query).unwrap();
-    let columns = statement.column_count();
-    statement
-        .query_map([session], |row| {
-            let values = (0..columns)
-                .map(|index| row.get::<_, rusqlite::types::Value>(index))
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(format!("{table} {values:?}"))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap()
-}
-
-/// `fixture`'s session as `cache` stores it, without surrogate ids: each
-/// row of each table, then what its readers return.
-fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
+/// `fixture`'s session as `cache` stores it, without row ids: each row of
+/// [`stored_rows::stored_rows`] without the `(table, column)` `left_out`,
+/// then what its readers return.
+fn stored_session(
+    cache: &CacheWriter,
+    fixture: &Fixture,
+    left_out: Option<(&str, &str)>,
+) -> Vec<String> {
     let session = fixture.session_id(cache);
-    let thread = "(SELECT t.number || ' ' || COALESCE(tr.path, '') || ' ' || COALESCE(t.label, '') \
-        || ' ' || COALESCE(t.nickname, '') || ' ' || COALESCE(t.launch_call, '') FROM threads t \
-        LEFT JOIN transcripts tr ON tr.id = t.transcript WHERE t.id = m.thread)";
-    let first_entry = |message: &str| {
-        format!("(SELECT MIN(x.sequence) FROM entries x WHERE x.message = {message})")
-    };
-    let mut rows = Vec::new();
-    for (table, query) in [
-        (
-            "sessions",
-            "SELECT storage, source, (SELECT key FROM roots WHERE id = root), cache_key, \
-             status, file_size, \
-             mtime_secs, mtime_nsecs, session_id, session_id_key, handle, project_path, \
-             project_name, cwd, timestamp_ms, preview_first, preview_last, summary, custom_title, \
-             model, total_tokens, duration_minutes, message_count, assistant_messages, \
-             is_missing_earlier_turns, entries_error FROM sessions WHERE id = ?1"
-                .to_owned(),
-        ),
-        (
-            "session_files",
-            "SELECT position, kind, (SELECT key FROM roots WHERE id = root), path, key, \
-             file_size, mtime_secs, mtime_nsecs \
-             FROM session_files WHERE session = ?1 ORDER BY position"
-                .to_owned(),
-        ),
-        (
-            "transcript_reads",
-            "SELECT position, (SELECT key FROM roots WHERE id = root), path, cursor, \
-             stable_cursor, identity, rewrite_check, parser_state \
-             FROM transcript_reads WHERE session = ?1 ORDER BY position"
-                .to_owned(),
-        ),
-        (
-            "parse_errors",
-            "SELECT * FROM parse_errors WHERE session = ?1 ORDER BY position".to_owned(),
-        ),
-        (
-            "malformed_lines",
-            "SELECT * FROM malformed_lines WHERE session = ?1 ORDER BY position".to_owned(),
-        ),
-        (
-            "parts outside entries",
-            "SELECT part, kind, search_field, entry_sequence, message_ordinal, search_position, \
-             file_position, text, text_codes, call_id, name, tool, json, result_shape FROM parts \
-             WHERE session = ?1 AND entry IS NULL ORDER BY part"
-                .to_owned(),
-        ),
-        (
-            "transcripts",
-            "SELECT (SELECT key FROM roots WHERE id = root) AS root_key, path FROM transcripts \
-             WHERE session = ?1 ORDER BY root_key, path"
-                .to_owned(),
-        ),
-        (
-            "threads",
-            "SELECT t.number, tr.path, t.label, t.nickname, t.role, t.agent_path, t.agent_id, \
-             t.launch_call FROM threads t LEFT JOIN transcripts tr ON tr.id = t.transcript \
-             WHERE t.session = ?1 ORDER BY 1, 2, 3, 4, 5, 6, 7, 8"
-                .to_owned(),
-        ),
-        (
-            "messages",
-            format!(
-                "SELECT {}, {thread}, m.ordinal, m.role, m.reply_id, m.first_ms, m.last_ms, \
-                 m.model, m.agent, m.cwd, m.parent_tool_use_id, m.source_tool_use_id, \
-                 m.report_has_text, m.report_task_id, m.report_launch_call, m.usage_input, \
-                 m.usage_output, m.usage_cache_creation, m.usage_cache_read, m.digest \
-                 FROM messages m WHERE m.session = ?1 ORDER BY 1",
-                first_entry("m.id")
-            ),
-        ),
-        (
-            "entries",
-            format!(
-                "SELECT e.sequence, e.position, e.contributes, {}, tr.path, e.record_line, \
-                 e.kind, e.timestamp_ms, e.content, e.text, e.text_codes, \
-                 e.label, e.uuid, e.usage_input, e.usage_output, e.usage_cache_creation, \
-                 e.usage_cache_read, e.level, e.duration_ms, e.parent_uuid, e.flag, e.digest \
-                 FROM entries e LEFT JOIN transcripts tr ON tr.id = e.record_transcript \
-                 WHERE e.session = ?1 ORDER BY e.sequence",
-                first_entry("e.message")
-            ),
-        ),
-        (
-            "parts",
-            "SELECT e.sequence, p.part, p.kind, p.search_field, p.entry_sequence, \
-             p.message_ordinal, p.search_position, p.text, p.text_codes, p.call_id, p.name, \
-             p.tool, p.json, p.result_shape FROM parts p \
-             JOIN entries e ON e.id = p.entry WHERE e.session = ?1 ORDER BY 1, 2"
-                .to_owned(),
-        ),
-        (
-            "result_items",
-            "SELECT e.sequence, p.part, i.position, i.kind, i.text, i.text_codes, \
-             i.item_type FROM result_items i JOIN parts p ON p.id = i.part \
-             JOIN entries e ON e.id = p.entry WHERE e.session = ?1 ORDER BY 1, 2, 3"
-                .to_owned(),
-        ),
-        (
-            "semantic_turns",
-            "SELECT sequence, ordinal, text FROM semantic_turns WHERE session = ?1 \
-             ORDER BY sequence"
-                .to_owned(),
-        ),
-    ] {
-        rows.extend(table_rows(cache, session, table, &query));
+    let mut tables = stored_rows::stored_rows(&cache.connection, session);
+    if let Some((table, column)) = left_out {
+        tables
+            .iter_mut()
+            .find(|stored| stored.name == table)
+            .unwrap_or_else(|| panic!("stored_rows reads {table}"))
+            .remove_column(column);
     }
+    let mut rows = stored_rows::lines(&tables);
     let (count, first, last): (i64, Option<i64>, Option<i64>) = cache
         .connection
         .query_row(
@@ -364,37 +254,68 @@ fn stored_session(cache: &CacheWriter, fixture: &Fixture) -> Vec<String> {
     rows
 }
 
+/// A fresh write of a record in a database of its own.
+pub(super) struct FreshWrite {
+    pub(super) cache: OwnedCache,
+    _base: tempfile::TempDir,
+}
+
+impl FreshWrite {
+    pub(super) fn of(fixture: &Fixture, record: &SessionRecord) -> Self {
+        let base = tempfile::tempdir().unwrap();
+        let cache = cache_with(base.path(), fixture, record);
+        Self { cache, _base: base }
+    }
+}
+
 /// Asserts that `cache` stores `fixture`'s session as a fresh write of
 /// `record` in another database does.
 fn assert_matches_fresh_write(cache: &CacheWriter, fixture: &Fixture, record: &SessionRecord) {
-    let base = tempfile::tempdir().unwrap();
-    let mut fresh = admitted_cache(base.path());
-    fresh.admit_storage(fixture.storage()).unwrap();
-    fresh.write(record).unwrap();
-    let expected = stored_session(&fresh, fixture);
-    let actual = stored_session(cache, fixture);
-    for (actual, expected) in actual.iter().zip(&expected) {
-        assert_eq!(
-            actual,
-            expected,
+    let fresh = FreshWrite::of(fixture, record);
+    assert_stores_alike(
+        &stored_session(cache, fixture, None),
+        &stored_session(&fresh.cache, fixture, None),
+        fixture,
+    );
+}
+
+/// [`assert_matches_fresh_write`] against `fresh`, without comparing the
+/// `(table, column)` `left_out`.
+pub(super) fn assert_matches_fresh_write_without(
+    cache: &CacheWriter,
+    fresh: &FreshWrite,
+    fixture: &Fixture,
+    left_out: (&str, &str),
+) {
+    assert_stores_alike(
+        &stored_session(cache, fixture, Some(left_out)),
+        &stored_session(&fresh.cache, fixture, Some(left_out)),
+        fixture,
+    );
+}
+
+fn assert_stores_alike(actual: &[String], expected: &[String], fixture: &Fixture) {
+    stored_rows::assert_same_lines(
+        actual,
+        expected,
+        &format!(
             "{}: the session after the write matches a fresh write",
             fixture.label()
-        );
-    }
-    assert_eq!(
-        actual.len(),
-        expected.len(),
-        "{}: the session after the write holds the rows a fresh write holds",
-        fixture.label()
+        ),
     );
+}
+
+fn cache_with(base: &Path, fixture: &Fixture, record: &SessionRecord) -> OwnedCache {
+    let mut cache = admitted_cache(base);
+    cache.admit_storage(fixture.storage()).unwrap();
+    cache.write(record).unwrap();
+    cache
 }
 
 /// A cache holding `before`, `fixture`'s session as an earlier write left
 /// it, its writes watched from then on.
 fn cache_holding(base: &Path, fixture: &Fixture, before: &SessionRecord) -> OwnedCache {
-    let mut cache = admitted_cache(base);
-    cache.admit_storage(fixture.storage()).unwrap();
-    cache.write(before).unwrap();
+    let cache = cache_with(base, fixture, before);
     watch_row_writes(&cache.connection);
     cache
 }
@@ -850,6 +771,58 @@ fn appended_entries_parts_carry_their_session_for_every_agent() {
             fixture.label()
         );
     }
+}
+
+/// A part of one session moved onto another session's entry of the same
+/// sequence keeps its natural key: the comparison of its session fails on
+/// the reference alone.
+#[test]
+#[should_panic(expected = "references a row of entries of the same session")]
+fn part_on_another_sessions_entry_fails_stored_rows_comparison() {
+    let fixture = Fixture::of(every_record_sessions().remove(0));
+    let base = tempfile::tempdir().unwrap();
+    let mut cache = cache_with(base.path(), &fixture, &fixture.record());
+    let other = SessionStub {
+        cache_key: "other".to_owned(),
+        ..fixture.stub.clone()
+    };
+    cache
+        .write(&parsed_record(fixture.source(), &fixture.root, &other))
+        .unwrap();
+    let session = fixture.session_id(&cache);
+    let (moved, number, sequence): (i64, i64, i64) = cache
+        .connection
+        .query_row(
+            "SELECT p.id, p.part, e.sequence FROM parts p JOIN entries e ON e.id = p.entry \
+             WHERE p.session = ?1 ORDER BY e.sequence, p.part LIMIT 1",
+            [session],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let other_entry: i64 = cache
+        .connection
+        .query_row(
+            "SELECT id FROM entries WHERE session != ?1 AND sequence = ?2",
+            [session, sequence],
+            |row| row.get(0),
+        )
+        .unwrap();
+    cache
+        .connection
+        .execute(
+            "DELETE FROM parts WHERE entry = ?1 AND part = ?2",
+            [other_entry, number],
+        )
+        .unwrap();
+    cache
+        .connection
+        .execute(
+            "UPDATE parts SET entry = ?1 WHERE id = ?2",
+            [other_entry, moved],
+        )
+        .unwrap();
+
+    stored_rows::stored_rows(&cache.connection, session);
 }
 
 #[test]
