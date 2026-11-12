@@ -67,6 +67,7 @@ const NOT_COMPARED: &[(&str, &str, &str)] = &[(
 )];
 
 /// One table's rows of a session, in the order of their values.
+#[derive(Clone)]
 pub(super) struct StoredTable {
     pub(super) name: &'static str,
     pub(super) columns: Vec<String>,
@@ -80,6 +81,11 @@ impl StoredTable {
         for row in &mut self.rows {
             row.remove(index);
         }
+    }
+
+    pub(super) fn column(&self, column: &str) -> Vec<&Value> {
+        let index = self.index_of(column);
+        self.rows.iter().map(|row| &row[index]).collect()
     }
 
     fn index_of(&self, column: &str) -> usize {
@@ -96,6 +102,14 @@ impl StoredTable {
 pub(super) fn stored_rows(connection: &Connection, session: i64) -> Vec<StoredTable> {
     session_tables()
         .map(|table| stored_table(connection, table, session))
+        .collect()
+}
+
+/// Each table but [`SHARED_OR_SEARCH_WRITTEN_TABLES`], with the columns of
+/// it [`stored_rows`] compares, read from the schema `connection` holds.
+pub(super) fn compared_columns(connection: &Connection) -> Vec<(&'static str, Vec<String>)> {
+    session_tables()
+        .map(|table| (table, compared_columns_of(connection, table)))
         .collect()
 }
 

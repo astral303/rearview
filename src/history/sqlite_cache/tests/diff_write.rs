@@ -3,6 +3,7 @@
 //! earlier version of a parse, then the parse, and compares the stored
 //! session with a fresh write of the parse in another database.
 
+mod column_sweep;
 pub(super) mod resumed;
 
 use super::*;
@@ -13,7 +14,10 @@ use crate::log_entry::{ContentBlock, LogEntry, UserContent};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
-/// The tables of a session's entry rows.
+/// The tables a session's entries fill. [`watch_row_writes`] counts their
+/// row writes, and a write of the column sweep holds at most one
+/// perturbation of them: two changes to one entry change its digest
+/// together and hide a column the digest misses.
 const ENTRY_TABLES: &[&str] = &[
     "entries",
     "messages",
@@ -823,6 +827,40 @@ fn part_on_another_sessions_entry_fails_stored_rows_comparison() {
         .unwrap();
 
     stored_rows::stored_rows(&cache.connection, session);
+}
+
+fn tables_holding_rows(fixture: &Fixture, record: &SessionRecord) -> BTreeSet<&'static str> {
+    let fresh = FreshWrite::of(fixture, record);
+    stored_rows::stored_rows(&fresh.cache.connection, fixture.session_id(&fresh.cache))
+        .into_iter()
+        .filter(|table| !table.rows.is_empty())
+        .map(|table| table.name)
+        .collect()
+}
+
+/// Checks [`ENTRY_TABLES`] against Claude's every-record fixture alone.
+#[test]
+fn entry_tables_are_the_tables_a_sessions_entries_fill() {
+    let session = every_record_sessions()
+        .into_iter()
+        .find(|session| session.row.source == Source::Claude)
+        .unwrap();
+    let fixture = Fixture::of(session);
+    let mut without_entries = fixture.record();
+    entries_of(&mut without_entries).entries.clear();
+
+    let filled = tables_holding_rows(&fixture, &fixture.record());
+    let filled_without_entries = tables_holding_rows(&fixture, &without_entries);
+
+    assert_eq!(
+        filled
+            .difference(&filled_without_entries)
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        ENTRY_TABLES.iter().copied().collect(),
+        "ENTRY_TABLES in diff_write.rs lists each table Claude's every-record session fills \
+         with its entries and leaves empty without them"
+    );
 }
 
 #[test]
