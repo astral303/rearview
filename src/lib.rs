@@ -3,15 +3,16 @@
 //!
 //! See [GitHub](https://github.com/astral303/rearview) for more information.
 //!
-//! A limited public library interface is available. It has no semantic
-//! version guarantees and may break or change at any time.
+//! A limited public library interface is available. It doesn't follow
+//! semantic versioning and may break or change at any time.
 
-// Denied in `history` only; see `clippy.toml`.
-#![allow(clippy::disallowed_methods)]
+// Denied everywhere but the functions that allow it; see `clippy.toml`.
+#![deny(clippy::disallowed_methods)]
 
 mod agent;
 mod cache_file;
 mod cli;
+mod clock;
 mod config;
 mod debug;
 mod debug_log;
@@ -21,6 +22,8 @@ mod error;
 mod history;
 mod log_entry;
 mod markdown;
+#[cfg(test)]
+mod output_contract;
 mod pager;
 mod parallel;
 mod search;
@@ -42,28 +45,88 @@ pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 
 use clap::Parser;
 use cli::{Args, Commands, DeleteEmptyArgs};
+use clock::{Clock, SystemClock};
 use error::{AppError, Result};
 use history::provider::{Deleted, Stored};
 use search::mode::{SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use std::process::{Command, ExitCode};
 use tui::ListSearchMode;
 
-/// Run `rearview` with the process's arguments, print any error to stderr,
-/// and return the exit status.
+/// Run `rearview` with the process's arguments on the system clock, print any
+/// error to stderr, and return the exit status.
 pub fn run() -> ExitCode {
-    let Err(error) = try_run() else {
-        return ExitCode::SUCCESS;
-    };
-    match error {
-        AppError::SelectionCancelled => return ExitCode::SUCCESS,
-        AppError::AgentProtocol(output) => eprint!("{output}"),
-        AppError::Agent(error) => eprint!("{}", agent::diagnostic::format_error(&error)),
-        error => eprintln!("Error: {error}"),
+    let reached = ReachedBase::default();
+    let result = history::sqlite_cache::connection::turn_off_memory_statistics()
+        .map_err(AppError::from)
+        .and_then(|()| try_run(Arc::new(SystemClock::new()), &reached));
+    // A failed write to stderr leaves rearview nowhere to report it.
+    let (failed, _stderr_write) = finish_command(result, reached.base(), &mut std::io::stderr());
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
-    ExitCode::FAILURE
+}
+
+/// The session cache base a command reached. [`run`] reads its low-space
+/// latch after the command returns.
+#[derive(Default)]
+struct ReachedBase(std::cell::OnceCell<history::CacheBase>);
+
+impl ReachedBase {
+    fn record(&self, base: &history::CacheBase) {
+        let first = self.0.set(base.clone());
+        debug_assert!(first.is_ok(), "a command reaches one session cache base");
+    }
+
+    fn base(&self) -> Option<&history::CacheBase> {
+        self.0.get()
+    }
+}
+
+/// End a command that returned `result` over the session cache `base`:
+/// write its error to `stderr`, and return true when rearview exits with
+/// failure, with the result of the writes to `stderr`. Once a write of
+/// `base` found the drive low on space, and the low-space deletion has
+/// not run, the deletion decides the exit, whatever `result` holds: write
+/// the low-space message's first sentence, delete the cache database, then
+/// write the deletion's outcome. A failed first write still runs the
+/// deletion.
+fn finish_command(
+    result: Result<()>,
+    base: Option<&history::CacheBase>,
+    stderr: &mut dyn std::io::Write,
+) -> (bool, std::io::Result<()>) {
+    let low_space = base.and_then(|base| {
+        base.low_space()
+            .free_bytes_awaiting_deletion()
+            .map(|free_bytes| (base, free_bytes))
+    });
+    if let Some((base, free_bytes)) = low_space {
+        let lead = error::low_space_lead(free_bytes, history::sqlite_cache::FREE_SPACE_FLOOR);
+        let first = write!(stderr, "{APP_NAME}: {lead}").and_then(|()| stderr.flush());
+        let outcome = history::sqlite_cache::low_space::run_deletion(base)
+            .expect("a base with a pending deletion has its low-space latch set");
+        let rest = writeln!(stderr, "{}", error::low_space_rest(&outcome));
+        return (true, first.and(rest));
+    }
+    match result {
+        Ok(()) | Err(AppError::SelectionCancelled) => (false, Ok(())),
+        Err(error) => (true, write!(stderr, "{}", error_report(error))),
+    }
+}
+
+fn error_report(error: AppError) -> String {
+    match error {
+        AppError::AgentProtocol(output) => output,
+        AppError::Agent(error) => agent::diagnostic::format_error(&error),
+        error @ AppError::NoSessionCacheDirectory => format!("{APP_NAME}: {error}\n"),
+        error => format!("Error: {error}\n"),
+    }
 }
 
 /// Helper function to resolve a boolean setting by merging CLI flags and config values.
@@ -84,13 +147,16 @@ fn resolve_bool_setting(
     }
 }
 
-fn run_delete_empty_command(args: DeleteEmptyArgs) -> Result<()> {
+fn run_delete_empty_command(
+    args: DeleteEmptyArgs,
+    environment: &history::Environment,
+) -> Result<()> {
     let scope = if args.local {
         history::DeleteEmptyScope::Local
     } else {
         history::DeleteEmptyScope::All
     };
-    let summary = history::delete_empty_sessions(scope, args.yes)?;
+    let summary = history::delete_empty_sessions(environment, scope, args.yes)?;
 
     if summary.candidates.is_empty() && summary.refused.is_empty() {
         println!("No empty sessions found.");
@@ -177,19 +243,34 @@ fn delete_empty_summary_line(delete: bool, candidates: &[history::EmptySession])
     )
 }
 
-/// Delete the session `session_id` names, whichever agent recorded it.
+/// Delete the session `session_id` names, whichever of `environment`'s agents
+/// recorded it.
 ///
 /// Each provider removes what the session owns beyond the transcript: Claude
 /// every copy a cross-project fork left, Codex the thread's earlier rollouts
 /// and its sub-agent threads, Kimi the whole session directory.
-fn delete_session_by_id(session_id: &str) -> Result<()> {
-    let found = history::provider::find_sessions_by_id(session_id);
-    let (source, path) = match found.as_slice() {
-        [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
-        [only] => only.clone(),
-        several => return Err(ambiguous_session_id(session_id, several)),
-    };
-    let deleted = history::provider::delete_session(source, &path)?;
+///
+/// Finds and deletes the session as the refresh owner of the session cache:
+/// the providers read the transcripts they check before they delete them.
+fn delete_session_by_id(environment: &history::Environment, session_id: &str) -> Result<()> {
+    let operation = history::OperationScope::new(
+        environment.cache_base(),
+        history::Patience::UntilAcquired,
+        Arc::default(),
+    );
+    let (source, deleted) = operation.wait_to_parse_as_owner(|permit| {
+        let found = history::provider::find_sessions_by_id(environment, session_id);
+        let (source, path) = match found.as_slice() {
+            [] => return Err(AppError::SessionNotFound(session_id.to_owned())),
+            [only] => only.clone(),
+            several => return Err(ambiguous_session_id(session_id, several)),
+        };
+        Ok((
+            source,
+            history::provider::delete_session(permit, source, &path)?,
+        ))
+    })??;
+    operation.finish()?;
     eprintln!("{}", deletion_report(source, session_id, deleted));
     Ok(())
 }
@@ -242,20 +323,49 @@ fn truncate_delete_empty_preview(preview: &str) -> String {
     }
 }
 
-fn try_run() -> Result<()> {
-    let args = Args::parse();
+fn try_run(clock: Arc<dyn Clock>, reached: &ReachedBase) -> Result<()> {
+    run_with(
+        Args::parse(),
+        clock,
+        cache_file::user_cache_base(),
+        update::run,
+        reached,
+    )
+}
+
+/// Run `args` on `clock`, with the session cache under `cache_base`, updating
+/// rearview through `update`, and recording each session cache base the
+/// command reaches in `reached`. A test passes its own `update`: the real
+/// one downloads a release and replaces the running executable.
+fn run_with(
+    args: Args,
+    clock: Arc<dyn Clock>,
+    cache_base: Option<PathBuf>,
+    update: fn() -> Result<()>,
+    reached: &ReachedBase,
+) -> Result<()> {
     config::migrate_pre_rename_config()?;
+    // Only the commands that read sessions through the session cache build
+    // it, so the others run without a cache directory.
+    let user_environment = || {
+        let environment = history::Environment::of_user(cache_base.clone(), Arc::clone(&clock))?;
+        reached.record(environment.cache_base());
+        Ok::<_, AppError>(environment)
+    };
 
     // Handle subcommands
     if let Some(command) = args.command {
         return match command {
-            Commands::Agent { command } => agent::service::execute(*command).map(|output| {
-                print!("{output}");
-            }),
-            Commands::DeleteEmpty { yes, local, all } => {
-                run_delete_empty_command(DeleteEmptyArgs { yes, local, all })
+            Commands::Agent { command } => {
+                let environment = user_environment().map_err(agent::service::protocol_error)?;
+                agent::service::execute(*command, environment).map(|output| {
+                    print!("{output}");
+                })
             }
-            Commands::Update => update::run(),
+            Commands::DeleteEmpty { yes, local, all } => {
+                run_delete_empty_command(DeleteEmptyArgs { yes, local, all }, &user_environment()?)
+            }
+            Commands::Update => update(),
         };
     }
 
@@ -326,48 +436,56 @@ fn try_run() -> Result<()> {
 
     // Handle --delete flag: delete a session by its ID and exit
     if let Some(ref session_id) = args.delete {
-        return delete_session_by_id(session_id);
+        return delete_session_by_id(&user_environment()?, session_id);
     }
 
     // Resolved before the search paths below so every one of them honours the
     // window rather than silently ignoring it.
-    let time_filter = args.time.resolve()?;
+    let time_filter = args.time.resolve(clock.as_ref())?;
+    let load_all_conversations = |environment: &history::Environment| {
+        history::load_all_conversations(environment, show_last, args.debug)
+    };
+    let local_workspace = |environment: &history::Environment| {
+        args.local.then(|| environment.workspace()).transpose()
+    };
 
     // Handle --debug-search flag: debug search result scoring
     if let Some(ref query) = args.debug_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
 
-        let workspace = if args.local {
-            Some(history::Workspace::current()?)
-        } else {
-            None
-        };
+        let workspace = local_workspace(&environment)?;
 
-        let perf = agent::perf::SearchPerf::new();
-        let searchable = perf.time("search-data", || {
-            search::precompute_search_text(&conversations)
+        let perf = agent::perf::DebugSearchPerf::new(Arc::clone(&clock));
+        // Searched as the TUI searches, once its search worker holds the
+        // texts in memory.
+        let (searchable, texts) = perf.time("search-data", || {
+            (
+                search::precompute_search_text(&conversations),
+                search::SearchTextsInMemory::read(&conversations),
+            )
         });
-        let now = chrono::Local::now();
+        let now = clock.wall().with_timezone(&chrono::Local);
         let debug_search = perf.time("search", || {
-            search::debug_search(&conversations, &searchable, query, now, |index| {
+            search::try_debug_search(&conversations, &searchable, &texts, query, now, |index| {
                 workspace
                     .as_ref()
                     .is_none_or(|workspace| workspace.contains(&conversations[index]))
             })
-        });
+        })?;
         let results = debug_search.results;
         let result_indices = results.iter().map(|(index, _)| *index).collect::<Vec<_>>();
         let evidence = perf.time("evidence", || {
             search::build_session_list_evidence(
                 &conversations,
+                &texts,
                 &result_indices,
                 &debug_search.parsed,
             )
         });
-        let perf_records = perf.debug_search_records(evidence.len());
+        let perf_records = perf.records(evidence.len());
 
         eprintln!("intent: {:?}", debug_search.parsed.unquoted());
         if debug_search.parsed.literals().is_empty() {
@@ -379,6 +497,7 @@ fn try_run() -> Result<()> {
             }
         }
         eprintln!();
+        write_unreadable_sessions(&mut std::io::stderr(), &conversations, &texts)?;
 
         for (rank, (idx, debug)) in results.iter().take(30).enumerate() {
             let conv = &conversations[*idx];
@@ -421,11 +540,16 @@ fn try_run() -> Result<()> {
     }
 
     if let Some(ref query) = args.debug_semantic_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::debug_search(query, &conversations, args.local);
+        return semantic_cli::debug_search(
+            query,
+            &conversations,
+            local_workspace(&environment)?.as_ref(),
+            clock.as_ref(),
+        );
     }
 
     if args.generate_semantic_cache {
@@ -436,9 +560,15 @@ fn try_run() -> Result<()> {
                 "--generate-semantic-cache cannot be combined with a time filter".to_string(),
             ));
         }
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::generate_cache(&conversations, args.local);
+        return semantic_cli::generate_cache(
+            &conversations,
+            local_workspace(&environment)?.as_ref(),
+            environment.cache_base(),
+            clock,
+        );
     }
 
     if args.clear_semantic_cache {
@@ -446,20 +576,44 @@ fn try_run() -> Result<()> {
     }
 
     if args.report_dropped_records {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
-        dropped_records_cli::print_report(&conversations);
+        // The report parses every listed transcript again: it loads and
+        // counts as one refresh owner of the session cache.
+        let environment = user_environment()?;
+        let operation = history::OperationScope::new(
+            environment.cache_base(),
+            history::Patience::UntilAcquired,
+            Arc::default(),
+        );
+        let mut conversations = history::load_history(
+            &environment,
+            show_last,
+            args.debug,
+            None,
+            history::provider::LeftOutRows::NONE,
+            &operation,
+        )?
+        .conversations;
+        history::listing::retain_listed(&mut conversations, &time_filter);
+        operation.wait_to_parse_as_owner(|permit| {
+            dropped_records_cli::print_report(permit, &conversations)
+        })?;
+        operation.finish()?;
         return Ok(());
     }
 
     // Handle --semantic-search flag
     if let Some(ref query) = args.semantic_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
-        conversations
-            .retain(|conversation| conversation.message_times.has_message_within(&time_filter));
+        let environment = user_environment()?;
+        let mut conversations = load_all_conversations(&environment)?;
+        history::listing::retain_listed(&mut conversations, &time_filter);
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.timestamp));
-        return semantic_cli::run(query, &conversations, args.semantic_top, args.local);
+        return semantic_cli::run(
+            query,
+            &conversations,
+            args.semantic_top,
+            local_workspace(&environment)?.as_ref(),
+            clock,
+        );
     }
 
     // Handle --render flag: render a JSONL file in ledger format and exit
@@ -471,7 +625,14 @@ fn try_run() -> Result<()> {
             use_pager,
             no_color: args.no_color,
         };
-        return display::render_to_terminal(render_path, &display_options);
+        // `--render` reads one named file without the session cache, and
+        // runs without the cache directory `user_environment` requires.
+        return display::render_to_terminal(
+            render_path,
+            &display_options,
+            clock.as_ref(),
+            &history::provider::RootEnvironment::of_process(),
+        );
     }
 
     // Handle direct file input mode
@@ -488,16 +649,9 @@ fn try_run() -> Result<()> {
                 format!("Not a file: {}", input_file.display()),
             )));
         }
-        let source = history::format::parse_transcript(input_file)?
-            .map(|projection| projection.source)
-            .ok_or_else(|| AppError::UnrecognizedTranscript(input_file.display().to_string()))?;
-        tui::run_single_file(
-            input_file.clone(),
-            source,
-            tool_display,
-            show_thinking,
-            keys,
-        )?;
+        let environment = user_environment()?;
+        let file = tui::DirectFile::canonicalise(input_file.clone(), environment.canonicaliser())?;
+        tui::run_single_file(file, tool_display, show_thinking, keys, environment)?;
         return Ok(());
     }
 
@@ -529,13 +683,14 @@ fn try_run() -> Result<()> {
         return Ok(());
     }
 
-    let workspace = current_dir.map(history::Workspace::at);
-
-    // --local starts with workspace filter on; default is global (filter off)
-    let workspace_filter = use_local;
-
-    // Always use streaming global loader for all conversations
-    let rx = history::load_all_conversations_streaming(show_last, args.debug, time_filter);
+    let environment = user_environment()?;
+    let scope = tui::ListScope {
+        // --local starts with workspace filter on; default is global (filter off)
+        workspace_filter: use_local,
+        workspace: environment.workspace().ok(),
+        exclude_projects,
+    };
+    let load_meter = Arc::new(history::load_meter::LoadMeter::default());
 
     // An empty result is far more often the time filter than an empty history,
     // so say which when a filter is in play.
@@ -546,8 +701,8 @@ fn try_run() -> Result<()> {
         other => other,
     };
 
-    let (conversations, selected_path) = match tui::run_with_loader(
-        rx,
+    let (action, conversations) = tui::run_with_loader(
+        load_meter,
         history::RefreshOptions {
             show_last,
             debug_level: args.debug,
@@ -556,43 +711,29 @@ fn try_run() -> Result<()> {
         tool_display,
         show_thinking,
         keys,
-        workspace_filter,
-        workspace,
-        exclude_projects,
+        scope,
         tui::TuiSearchOptions {
             default_mode: tui_search_mode(search_mode),
         },
         history::active_load_filters(&[&time_filter]),
+        environment.clone(),
     )
-    .map_err(describe_empty)?
-    {
-        (tui::Action::Select(path), convs) => (convs, path),
-        (tui::Action::Resume(path), convs) => {
-            let conv = listed_conversation(&convs, &path)?;
-            resume_with_agent(
-                conv.source,
-                &path,
-                conv.project_path.as_ref(),
-                default_args,
-                false,
-            )?;
-            return Ok(());
-        }
-        (tui::Action::ForkResume(path), convs) => {
-            let conv = listed_conversation(&convs, &path)?;
-            resume_with_agent(
-                conv.source,
-                &path,
-                conv.project_path.as_ref(),
-                default_args,
-                true,
-            )?;
-            return Ok(());
-        }
-        (tui::Action::Quit, _) => return Err(AppError::SelectionCancelled),
-        (tui::Action::Delete(_) | tui::Action::Refresh, _) => {
-            unreachable!("the TUI handles delete and refresh itself")
-        }
+    .map_err(describe_empty)?;
+    let resume = |conversation: &history::Conversation, fork_session| {
+        resume_with_agent(
+            conversation.source,
+            &conversation.path,
+            conversation.project_path.as_ref(),
+            default_args,
+            fork_session,
+        )
+    };
+    let (conversations, selected_path) = match act_on_tui_exit(action, conversations, resume)? {
+        TuiExit::Selected {
+            conversations,
+            path,
+        } => (conversations, path),
+        TuiExit::Resumed => return Ok(()),
     };
 
     if args.show_path {
@@ -635,7 +776,7 @@ fn try_run() -> Result<()> {
     if args.debug.is_some()
         && let Some(conv) = conversations.iter().find(|c| c.path == selected_path)
     {
-        if let Err(e) = debug_log::log_parse_errors(conv) {
+        if let Err(e) = debug_log::log_parse_errors(conv, clock.as_ref()) {
             debug::warn(
                 args.debug,
                 &format!("Failed to write parse errors to log: {}", e),
@@ -663,14 +804,63 @@ fn try_run() -> Result<()> {
         no_color: args.no_color,
     };
 
-    let session = display::read_session_to_print(&conversations, &selected_path)?;
+    let selected = listed_conversation(&conversations, &selected_path)?;
+    let session = history::printed_log_entries(
+        &environment,
+        selected.source,
+        &selected.path,
+        show_last,
+        &mut std::io::stderr(),
+    )?;
     if plain_mode {
-        display::display_conversation_plain(&selected_path, session, &display_options)?;
+        display::display_conversation_plain(
+            &selected_path,
+            session,
+            &display_options,
+            clock.as_ref(),
+        )?;
     } else {
-        display::display_conversation(&selected_path, session, &display_options)?;
+        display::display_conversation(&selected_path, session, &display_options, clock.as_ref())?;
     }
 
     Ok(())
+}
+
+/// The TUI's exit once [`act_on_tui_exit`] acted on it.
+enum TuiExit {
+    /// The list selected the session at `path` among `conversations`.
+    Selected {
+        conversations: Vec<history::Conversation>,
+        path: PathBuf,
+    },
+    /// The selected session's agent resumed it.
+    Resumed,
+}
+
+/// Act on `action`, which the TUI exited with over the listed
+/// `conversations`, resuming a session through `resume` (with true to fork
+/// it).
+fn act_on_tui_exit(
+    action: tui::Action,
+    conversations: Vec<history::Conversation>,
+    resume: impl FnOnce(&history::Conversation, bool) -> Result<()>,
+) -> Result<TuiExit> {
+    let (path, fork_session) = match action {
+        tui::Action::Select(path) => {
+            return Ok(TuiExit::Selected {
+                conversations,
+                path,
+            });
+        }
+        tui::Action::Resume(path) => (path, false),
+        tui::Action::ForkResume(path) => (path, true),
+        tui::Action::Quit => return Err(AppError::SelectionCancelled),
+        tui::Action::Delete(_) | tui::Action::Refresh => {
+            unreachable!("the TUI handles delete and refresh itself")
+        }
+    };
+    resume(listed_conversation(&conversations, &path)?, fork_session)?;
+    Ok(TuiExit::Resumed)
 }
 
 fn tui_search_mode(mode: TuiSearchMode) -> ListSearchMode {
@@ -709,6 +899,55 @@ fn resume_with_agent(
         agent: source.display_label(),
         detail,
     })
+}
+
+/// One line on `out` for each of `conversations` whose search texts `texts`
+/// did not read, with the cause: `loading:` for a copy that is not ready
+/// yet, `unreadable:` for any other.
+fn write_unreadable_sessions(
+    out: &mut impl std::io::Write,
+    conversations: &[history::Conversation],
+    texts: &search::SearchTextsInMemory,
+) -> Result<()> {
+    for conversation in conversations {
+        if let Some(failure) = texts.read_failure(conversation) {
+            let state = if failure.is_loading() {
+                "loading"
+            } else {
+                "unreadable"
+            };
+            writeln!(out, "{state}: {} ({failure})", conversation.path.display())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod debug_search_tests {
+    use super::*;
+    use crate::search::test_fixtures::{cached_claude_sessions, october_messages};
+
+    #[test]
+    fn unreadable_line_names_session_no_longer_in_the_session_cache() {
+        let sessions = cached_claude_sessions(&[
+            ("removed", october_messages(&["removed question"])),
+            ("kept", october_messages(&["kept question"])),
+        ]);
+        sessions.remove(0);
+        let texts = search::SearchTextsInMemory::read(&sessions.rows);
+        let mut written = Vec::new();
+
+        write_unreadable_sessions(&mut written, &sessions.rows, &texts).unwrap();
+
+        assert_eq!(
+            String::from_utf8(written).unwrap(),
+            format!(
+                "unreadable: {} (no longer in the session cache)\n",
+                sessions.rows[0].path.display()
+            ),
+            "one line names the removed session and why; the kept one doesn't get a line"
+        );
+    }
 }
 
 fn format_debug_age(age: chrono::Duration) -> String {
@@ -753,6 +992,7 @@ mod agent_command_tests {
     use crate::agent::test_support::{
         assistant_jsonl_line as assistant, day_record, record_time, user_jsonl_line as user,
     };
+    use crate::history::provider::walk::SystemCanonicaliser;
     use crate::search::mode::SearchMode;
     use cli::{AgentOutlineArgs, AgentOutputFlags, AgentReadArgs};
 
@@ -785,6 +1025,7 @@ mod agent_command_tests {
             lines: None,
             match_query: None,
             context: 3,
+            perf_stats: false,
             output: default_output(),
         }
     }
@@ -896,6 +1137,90 @@ mod agent_command_tests {
     }
 
     #[test]
+    fn run_without_session_cache_directory_prints_how_to_name_one() {
+        assert_eq!(
+            error_report(AppError::NoSessionCacheDirectory),
+            "rearview: no directory for the session cache. Set REARVIEW_CACHE_DIR to a writable \
+             directory and run rearview again.\n"
+        );
+    }
+
+    #[test]
+    fn agent_command_without_session_cache_directory_prints_agent_error_record() {
+        assert_eq!(
+            error_report(agent::service::protocol_error(
+                AppError::NoSessionCacheDirectory
+            )),
+            "protocol agent-error kind=io detail=rearview:%20no%20directory%20for%20the%20session\
+             %20cache.%20Set%20REARVIEW_CACHE_DIR%20to%20a%20writable%20directory%20and%20run\
+             %20rearview%20again.\n"
+        );
+    }
+
+    /// `update` runs a stand-in: the real one downloads a release and
+    /// replaces the running executable.
+    #[test]
+    fn render_show_dir_clear_semantic_cache_and_update_run_without_cache_directory() {
+        let run_without_cache_directory = |arguments: &[&str]| {
+            let args = Args::try_parse_from(std::iter::once("rearview").chain(arguments.to_vec()))
+                .unwrap();
+            run_with(
+                args,
+                Arc::new(clock::TestClock::default()),
+                None,
+                || Ok(()),
+                &ReachedBase::default(),
+            )
+        };
+        let transcripts = tempfile::tempdir().unwrap();
+        let transcript = write_jsonl(
+            &transcripts,
+            "session.jsonl",
+            &[
+                agent::test_support::user_jsonl_line("a question"),
+                agent::test_support::assistant_jsonl_line("an answer"),
+            ],
+        );
+        let semantic_cache = cache_file::test_support::test_cache_directory().join("semantic");
+        std::fs::create_dir_all(&semantic_cache).unwrap();
+        std::fs::write(semantic_cache.join("embeddings-v1.bin"), "").unwrap();
+        let claude_folder = history::provider::RootEnvironment::of_process()
+            .home()
+            .unwrap()
+            .join(".claude")
+            .join("projects")
+            .join(history::provider::claude::convert_path_to_project_dir_name(
+                &std::env::current_dir().unwrap(),
+            ));
+        std::fs::create_dir_all(&claude_folder).unwrap();
+        std::fs::copy(&transcript, claude_folder.join("session.jsonl")).unwrap();
+
+        let refused = run_without_cache_directory(&["agent", "sessions"]);
+        assert!(
+            matches!(&refused, Err(AppError::AgentProtocol(record))
+                if record.contains("no%20directory%20for%20the%20session%20cache")),
+            "an agent command refuses without a cache directory: {refused:?}"
+        );
+        for arguments in [
+            vec!["--render", transcript.to_str().unwrap(), "--no-pager"],
+            vec!["--show-dir", "claude"],
+            vec!["--clear-semantic-cache"],
+            vec!["update"],
+        ] {
+            let outcome = run_without_cache_directory(&arguments);
+            assert!(
+                outcome.is_ok(),
+                "`rearview {}` succeeds without a cache directory: {outcome:?}",
+                arguments.join(" ")
+            );
+        }
+        assert!(
+            !semantic_cache.join("embeddings-v1.bin").exists(),
+            "--clear-semantic-cache deletes the embedding cache"
+        );
+    }
+
+    #[test]
     fn read_validation_rejects_focus_outside_range() {
         let keys = vec![key(
             "project-a",
@@ -906,7 +1231,8 @@ mod agent_command_tests {
             vec![format!("{conversation}:m2..m4")],
             Some("m5".to_string()),
         );
-        let err = resolve_agent_read_args(&args, Some(&keys)).unwrap_err();
+        let err =
+            resolve_agent_read_args(&args, &keys, &SystemCanonicaliser::shared()).unwrap_err();
         assert!(err.to_string().contains("outside"));
     }
 
@@ -925,17 +1251,18 @@ mod agent_command_tests {
         let uuid = "12345678-1234-4234-9234-123456789abc";
 
         let read = read_args(vec![format!("{uuid}:m1..m2")], None);
-        let (resolved, _) = resolve_agent_read_args(&read, Some(&keys)).unwrap();
+        let (resolved, _) =
+            resolve_agent_read_args(&read, &keys, &SystemCanonicaliser::shared()).unwrap();
         assert_eq!(resolved[0].1.key, keys[0]);
 
         let focus = read_args(
             vec![format!("{}:m1..m2", keys[0].conversation_ref().canonical())],
             Some(format!("{uuid}:m1")),
         );
-        assert!(resolve_agent_read_args(&focus, Some(&keys)).is_ok());
+        assert!(resolve_agent_read_args(&focus, &keys, &SystemCanonicaliser::shared()).is_ok());
 
         assert_eq!(
-            resolve_agent_conversation_arg(uuid, Some(&keys))
+            resolve_agent_conversation_arg(uuid, &keys, &SystemCanonicaliser::shared())
                 .unwrap()
                 .key,
             keys[0]
@@ -996,7 +1323,8 @@ mod agent_command_tests {
         let mut args = read_args(vec![format!("{conversation}:m1..m2")], None);
         args.match_query = Some("needle".to_string());
 
-        let error = resolve_agent_read_args(&args, Some(&keys)).unwrap_err();
+        let error =
+            resolve_agent_read_args(&args, &keys, &SystemCanonicaliser::shared()).unwrap_err();
 
         assert!(error.to_string().contains("single-message ref"));
     }
@@ -1042,6 +1370,7 @@ mod agent_command_tests {
         )];
         let args = AgentOutlineArgs {
             conversation: keys[0].conversation_ref().canonical(),
+            perf_stats: false,
             output: default_output(),
         };
 
@@ -1098,7 +1427,10 @@ mod agent_command_tests {
 
         assert!(rendered.starts_with(&format!(
             "protocol agent-search mode=lexical cut=none chars=none policy=per-hit hits=1{}\n",
-            agent::time_span::tz_atom(agent::time_span::output_offset(None))
+            agent::time_span::tz_atom(agent::time_span::output_offset(
+                None,
+                agent::test_support::written_at()
+            ))
         )));
         assert!(rendered.contains(
             "hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678"
@@ -1136,6 +1468,7 @@ mod agent_command_tests {
             lines: None,
             match_query: None,
             context: 3,
+            perf_stats: false,
             output: AgentOutputFlags {
                 budget: Some(6000),
                 no_budget: false,
@@ -1169,6 +1502,7 @@ mod agent_command_tests {
             top: Some(1),
             budget: Some(6000),
             no_budget: false,
+            perf_stats: false,
             search_mode: cli::AgentSearchModeArgs::explicit(SearchMode::Lexical),
             time: cli::MessageTimeArgs::default(),
         };
@@ -1245,7 +1579,6 @@ mod agent_command_tests {
             preview_last: "session".to_string(),
             full_text: "session".to_string(),
             agent_search_text: String::new(),
-            semantic_route_text: String::new(),
             semantic_turns: vec!["session".to_string()],
             semantic_turn_ranges: vec![agent::refs::MessageRange::single(1)],
             search_text_lower: "session".to_string(),
@@ -1259,12 +1592,18 @@ mod agent_command_tests {
             parse_errors: Vec::new(),
             summary: None,
             custom_title: Some("session".to_string()),
+            external_title: None,
             model: None,
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             thinking_and_tool_call_text: String::new(),
         }
     }
@@ -1273,7 +1612,7 @@ mod agent_command_tests {
         history::format::claude::conversation_from_reader(
             path,
             std::io::Cursor::new(std::fs::read_to_string(path).unwrap()),
-            None,
+            history::parser::RowDating::new(None, &clock::TestClock::default()),
             None,
         )
         .unwrap()
@@ -1761,6 +2100,7 @@ mod agent_command_tests {
         let outline = run_agent_outline(
             &AgentOutlineArgs {
                 conversation: resolved.reference.canonical(),
+                perf_stats: false,
                 output: every_part(),
             },
             Some(&keys),
@@ -2063,6 +2403,7 @@ mod agent_command_tests {
         fn outline(&self, window: cli::MessageTimeArgs) -> String {
             let args = AgentOutlineArgs {
                 conversation: self.reference.clone(),
+                perf_stats: false,
                 output: Self::every_part_within(window),
             };
             run_agent_outline(&args, Some(&self.keys)).unwrap()
@@ -2182,7 +2523,7 @@ mod agent_command_tests {
         let conversations = vec![parsed_conversation(&path)];
         let transcript = load_transcript(&path);
         let window = window_args("2026-10-14T15:41:31Z", "2026-10-14T15:41:59Z")
-            .resolve()
+            .resolve(&clock::TestClock::default())
             .unwrap();
         let inputs = [agent::search::AgentConversationInput {
             conversation: &conversations[0],
@@ -2497,7 +2838,7 @@ mod agent_command_tests {
         let conversation = history::format::claude::conversation_from_reader(
             &path,
             std::io::Cursor::new(std::fs::read_to_string(&path).unwrap()),
-            None,
+            history::parser::RowDating::new(None, &clock::TestClock::default()),
             None,
         )
         .unwrap()
@@ -2567,7 +2908,6 @@ mod agent_command_tests {
             preview_last: "visible semantic".to_string(),
             full_text: "visible semantic".to_string(),
             agent_search_text: String::new(),
-            semantic_route_text: String::new(),
             semantic_turns: vec!["visible semantic".to_string()],
             semantic_turn_ranges: vec![agent::refs::MessageRange::single(1)],
             search_text_lower: "visible semantic".to_string(),
@@ -2581,12 +2921,18 @@ mod agent_command_tests {
             parse_errors: Vec::new(),
             summary: None,
             custom_title: Some("visible semantic".to_string()),
+            external_title: None,
             model: None,
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
             thinking_and_tool_call_text: String::new(),
         };
         let input = agent::search::AgentConversationInput {
@@ -2635,7 +2981,7 @@ mod agent_command_tests {
                 "not json".to_string(),
                 assistant("done"),
             ].join("\n")),
-            None,
+            history::parser::RowDating::new(None, &clock::TestClock::default()),
             None,
         )
         .unwrap()
@@ -2742,5 +3088,65 @@ mod agent_command_tests {
         let err = run_agent_read(&args, Some(&keys)).unwrap_err();
 
         assert!(err.to_string().contains("exceeds transcript length"));
+    }
+
+    /// A stderr whose write or flush fails, as a closed pipe's does.
+    struct FailingStderr {
+        fails_on_flush: bool,
+    }
+
+    impl std::io::Write for FailingStderr {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fails_on_flush {
+                Ok(buf.len())
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fails_on_flush {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A load whose cache write finds the drive low on space, reported to
+    /// a stderr whose first write or flush fails: the cache database is
+    /// still deleted, and the write's error returned.
+    #[test]
+    fn low_space_report_whose_first_write_fails_deletes_cache_and_returns_write_error() {
+        use crate::tui::claude_home::ClaudeHome;
+        for fails_on_flush in [false, true] {
+            let home = ClaudeHome::new();
+            home.write("first", 5, &["hello"]);
+            let cache = tempfile::tempdir().unwrap();
+            let environment = home
+                .environment_with_cache(
+                    cache.path(),
+                    history::ProcessIdentity::default(),
+                    Arc::new(clock::TestClock::default()),
+                )
+                .with_free_space(950_000_000);
+            let result = history::load_all_conversations(&environment, false, None).map(|_| ());
+
+            let (failed, written) = finish_command(
+                result,
+                Some(environment.cache_base()),
+                &mut FailingStderr { fails_on_flush },
+            );
+
+            assert!(failed, "rearview exits with failure");
+            assert!(
+                written.is_err(),
+                "the write's error is returned (failing on flush: {fails_on_flush})"
+            );
+            assert!(
+                history::sqlite_cache::is_emptied(cache.path()),
+                "the cache database's contents are deleted (failing on flush: {fails_on_flush})"
+            );
+        }
     }
 }

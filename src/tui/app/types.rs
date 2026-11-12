@@ -1,4 +1,5 @@
-use crate::history::LoadProgress;
+use crate::history::provider::walk::Canonicaliser;
+use crate::history::{LoadProgress, OtherRearview, Workspace};
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
@@ -59,6 +60,17 @@ pub enum AppMode {
     View(ViewState),
 }
 
+/// The open session's pending refresh, as the viewer labels it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenSessionStatus {
+    /// The session is not in the session cache yet.
+    Loading,
+    /// The viewer shows an out-of-date copy.
+    Updating,
+    /// The refresh waits for another rearview's activity.
+    AnotherRearview(OtherRearview),
+}
+
 /// Where message navigation points. The call lives inside the message, so
 /// replacing the message drops the call with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,18 +88,33 @@ pub struct Focus {
 pub struct ViewState {
     /// Path to the conversation file (stable identity)
     pub conversation_path: PathBuf,
-    /// Which agent recorded the conversation; re-parses and exports route
-    /// through this source's own format rather than sniffing the path.
-    pub conversation_source: crate::history::Source,
+    /// The agent that recorded the conversation. A session refresh of a file
+    /// opened directly that the list doesn't show reads the file as this
+    /// agent's. `None` for a file opened directly until the background worker
+    /// reads it.
+    pub conversation_source: Option<crate::history::Source>,
+    /// The conversation's address in the session cache. Re-reads and exports
+    /// read its newest copy through it. `None` for a file opened directly
+    /// until the background worker lists it, or one outside every root.
+    pub cache_address: Option<crate::history::sqlite_cache::SessionAddress>,
     /// The session ID as this conversation's provider recorded it. `None` when
     /// the transcript did not parse; a file name is not guaranteed to be the
     /// session ID.
     pub session_id: Option<String>,
-    /// The sub-agent transcripts the row was built from, spliced into every
-    /// re-parse and export of the view.
-    pub subagents: Vec<PathBuf>,
-    /// The open view's conversation as parsed.
-    pub parsed_conversation: Option<Arc<ParsedConversation>>,
+    /// The open session's row's publication of its copy. It decides whether
+    /// the view and its exports read a copy as current.
+    pub publication: crate::history::sqlite_cache::Publication,
+    /// The header's fields, and the source of its height: the catalogue row
+    /// of the copy the view shows, or the open session's row while the view
+    /// doesn't show a copy. `None` shows the file name alone.
+    pub header: Option<HeaderRow>,
+    /// The title stored beside the transcript that the open session's row
+    /// shows, as the list or the last refresh read it. The header shows it
+    /// over the copy's catalogue row, which holds the title from its parse.
+    pub external_title: Option<crate::history::provider::SessionTitle>,
+    /// The open view's conversation as parsed; empty until a file opened
+    /// directly is read.
+    pub parsed_conversation: Arc<ParsedConversation>,
     /// Current scroll position (line offset)
     pub scroll_offset: usize,
     /// Pre-rendered conversation lines
@@ -126,13 +153,57 @@ pub struct ViewState {
     /// How the view marks a refresh that changed the message count. Each such
     /// refresh replaces it.
     pub count_highlight: Option<CountHighlight>,
+    /// True while the session is missing from the session cache, so the
+    /// view doesn't show any messages.
+    pub is_copy_missing: bool,
+}
+
+/// The fields of a session's row that the view's header shows. The row's
+/// text stays with the row.
+#[derive(Clone, Debug)]
+pub struct HeaderRow {
+    pub project_name: Option<String>,
+    pub custom_title: Option<String>,
+    pub summary: Option<String>,
+    pub model: Option<String>,
+    pub message_count: usize,
+    pub duration_minutes: Option<u64>,
+    pub total_tokens: u64,
+    pub timestamp: chrono::DateTime<chrono::Local>,
+}
+
+impl HeaderRow {
+    pub fn of(row: &crate::history::Conversation) -> Self {
+        Self {
+            project_name: row.project_name.clone(),
+            custom_title: row.custom_title.clone(),
+            summary: row.summary.clone(),
+            model: row.model.clone(),
+            message_count: row.message_count,
+            duration_minutes: row.duration_minutes,
+            total_tokens: row.total_tokens,
+            timestamp: row.timestamp,
+        }
+    }
+
+    /// The header of `copy_row`, a copy's catalogue row, showing `title`,
+    /// the title stored beside the transcript, in place of its parse's.
+    pub fn of_copy(
+        mut copy_row: crate::history::Conversation,
+        title: Option<&crate::history::provider::SessionTitle>,
+    ) -> Self {
+        if let Some(title) = title {
+            crate::history::provider::apply_external_title(&mut copy_row, title);
+        }
+        Self::of(&copy_row)
+    }
 }
 
 /// A refresh's change in the session's message count, marked until `until`:
 /// the total in the bottom bar's line count shows in the session ID color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CountHighlight {
-    pub until: std::time::Instant,
+    pub until: crate::clock::Moment,
     /// Messages the refresh added below a reader at the bottom. While the view
     /// stays at the bottom, a `↓ N new` badge covers the start of the last
     /// content row.
@@ -155,6 +226,40 @@ pub struct TuiSearchOptions {
     pub default_mode: ListSearchMode,
 }
 
+/// The sessions a list starts out showing.
+#[derive(Default)]
+pub struct ListScope {
+    /// True when the list starts filtered to `workspace` (`--local`).
+    pub workspace_filter: bool,
+    /// The workspace the filter narrows to; `None` when the current
+    /// directory could not be read.
+    pub workspace: Option<Workspace>,
+    /// Projects whose sessions the list leaves out.
+    pub exclude_projects: Vec<String>,
+}
+
+/// A file the user opened directly (`rearview <file>`).
+#[derive(Clone, Debug)]
+pub struct DirectFile {
+    /// The path as the user typed it, for the viewer's path display (`p`)
+    /// and path copy (`Y`).
+    pub typed: PathBuf,
+    /// The path the cache finds the session's copy by.
+    pub canonical: PathBuf,
+}
+
+impl DirectFile {
+    /// The file at `typed`, canonicalised through `canonicaliser`. Fails when
+    /// the path doesn't canonicalise.
+    pub fn canonicalise(
+        typed: PathBuf,
+        canonicaliser: &dyn Canonicaliser,
+    ) -> std::io::Result<Self> {
+        let canonical = canonicaliser.canonicalise(&typed)?;
+        Ok(Self { typed, canonical })
+    }
+}
+
 impl Default for TuiSearchOptions {
     fn default() -> Self {
         Self {
@@ -171,21 +276,26 @@ pub enum ListSearchMode {
 }
 
 impl ViewState {
-    /// The view before its first render: timing off, no frame width yet.
+    /// The view before its first render: an empty conversation, timing off,
+    /// no frame width yet.
     pub(super) fn initial(
         conversation_path: PathBuf,
-        conversation_source: crate::history::Source,
+        conversation_source: Option<crate::history::Source>,
         session_id: Option<String>,
-        subagents: Vec<PathBuf>,
         tool_display: ToolDisplayMode,
         show_thinking: bool,
     ) -> Self {
         Self {
             conversation_path,
             conversation_source,
+            cache_address: None,
             session_id,
-            subagents,
-            parsed_conversation: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
+            header: None,
+            external_title: None,
+            parsed_conversation: Arc::new(ParsedConversation::empty()),
             scroll_offset: 0,
             rendered_lines: Vec::new(),
             total_lines: 0,
@@ -204,6 +314,7 @@ impl ViewState {
             expanded_tool_outputs: BTreeSet::new(),
             hovered_tool_output: None,
             count_highlight: None,
+            is_copy_missing: false,
         }
     }
 

@@ -100,9 +100,160 @@ pub enum AppError {
     /// shows it after `Refresh failed: `.
     #[error("it stopped before finishing")]
     RefreshStopped,
+
+    /// The session cache database could not be opened, read or written.
+    #[error("Session cache database error: {0}")]
+    SessionCache(#[from] rusqlite::Error),
+
+    #[error("Session cache refresh was superseded: {0}")]
+    SessionCacheSuperseded(i64),
+
+    #[error("Session cache refresh ownership was lost")]
+    SessionCacheRefreshLost,
+
+    /// Under SQLite's exclusive lock, the database kept the journal mode
+    /// `mode` when switched out of WAL mode.
+    #[error("Session cache could not leave WAL mode: {mode}")]
+    SessionCacheStuckInWal { mode: String },
+
+    #[error("Session cache entries need refreshing for {session}: {reason}")]
+    SessionCacheNotReady { session: String, reason: String },
+
+    /// A file the session cache cannot store below its session's roots.
+    #[error("Session {}: its file {} {reason}", .session.display(), .file.display())]
+    SessionFileNotPlaced {
+        session: std::path::PathBuf,
+        file: std::path::PathBuf,
+        reason: &'static str,
+    },
+
+    /// A session root whose directory could not be canonicalised.
+    #[error(
+        "Session {}: its root {} could not be canonicalised",
+        .session.display(),
+        .root.display()
+    )]
+    SessionRootNotCanonicalised {
+        session: std::path::PathBuf,
+        root: std::path::PathBuf,
+    },
+
+    #[error("Session cache source changed or cannot be validated: {}", .0.display())]
+    SessionCacheSourceChanged(std::path::PathBuf),
+
+    /// A stored file of a session listed under `listing_root` lies below
+    /// `roots` row `root`, and none of this run's roots matches that row: a
+    /// directory beside the root can canonicalise to another path now.
+    #[error(
+        "Session cache source changed: a session under {listing_root} stores its file {file} below `roots` row {root}, and none of this run's roots matches that row"
+    )]
+    StoredRootUnknown {
+        listing_root: String,
+        root: i64,
+        file: String,
+    },
+
+    /// A write to the session cache found less than the cache's floor free
+    /// on its drive: the write stopped, and the cache base's low-space latch
+    /// is set. `outcome` stays pending until the command reporting the error
+    /// runs the cache database's deletion.
+    #[error(
+        "{}{}",
+        low_space_lead(*.free_bytes, *.floor_bytes),
+        low_space_rest(.outcome)
+    )]
+    SessionCacheLowSpace {
+        free_bytes: u64,
+        floor_bytes: u64,
+        outcome: CacheDeletion,
+    },
+
+    /// The session cache's low-space deletion refused a new connection of
+    /// this rearview.
+    #[error("The session cache is being deleted")]
+    SessionCacheBeingDeleted,
+
+    /// Neither `REARVIEW_CACHE_DIR` nor a home directory names where the
+    /// session cache goes: nothing runs.
+    #[error(
+        "no directory for the session cache. Set REARVIEW_CACHE_DIR to a writable directory \
+         and run rearview again."
+    )]
+    NoSessionCacheDirectory,
+}
+
+/// The session cache database's deletion after a write found its drive
+/// low on space.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CacheDeletion {
+    /// Not run yet.
+    Pending,
+    Deleted,
+    /// Another rearview, or a connection of this one, kept the database open
+    /// past the deletion's wait.
+    Deferred,
+    /// Emptying the database `file` or removing the side file `file` failed
+    /// with `error`; a lost refresh ownership fails the emptying.
+    Failed {
+        file: String,
+        error: String,
+    },
+}
+
+impl CacheDeletion {
+    /// The sentence the low-space message gives this deletion, with its
+    /// leading space; empty while the deletion is pending.
+    fn sentence(&self) -> String {
+        match self {
+            Self::Pending => String::new(),
+            Self::Deleted => " The session cache was deleted.".to_owned(),
+            Self::Deferred => {
+                " The session cache was not deleted: another rearview has it open.".to_owned()
+            }
+            Self::Failed { file, error } => {
+                format!(" The session cache could not be deleted: {file}: {error}.")
+            }
+        }
+    }
+}
+
+/// The low-space message's first sentence.
+pub(crate) fn low_space_lead(free_bytes: u64, floor_bytes: u64) -> String {
+    format!(
+        "not enough disk space for the session cache ({} GB free, needs at least {} GB).",
+        gigabytes_down_to_a_tenth(free_bytes),
+        floor_bytes / 1_000_000_000
+    )
+}
+
+/// The low-space message after its first sentence: the deletion's
+/// `outcome`, then the remedy.
+pub(crate) fn low_space_rest(outcome: &CacheDeletion) -> String {
+    format!(
+        "{} Free some space and run rearview again.",
+        outcome.sentence()
+    )
+}
+
+/// `bytes` in gigabytes, rounded down to one decimal place, so the message
+/// doesn't show a drive below the floor as holding it.
+fn gigabytes_down_to_a_tenth(bytes: u64) -> String {
+    let tenths = bytes / 100_000_000;
+    format!("{}.{}", tenths / 10, tenths % 10)
 }
 
 impl AppError {
+    /// True when the session cache's copy of a session no longer matches
+    /// the session's files as this run reads them: a file changed, or a
+    /// stored file lies below a `roots` row that none of this run's roots
+    /// matches.
+    pub(crate) fn is_changed_source(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionCacheSourceChanged(_) | Self::StoredRootUnknown { .. }
+        )
+    }
+
     pub fn home_not_found() -> Self {
         Self::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -139,3 +290,49 @@ impl std::fmt::Display for SessionDatabaseFailure {
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn low_space_message(outcome: CacheDeletion) -> String {
+        AppError::SessionCacheLowSpace {
+            free_bytes: 950_000_000,
+            floor_bytes: 1_000_000_000,
+            outcome,
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn low_space_message_reports_a_completed_deletion() {
+        assert_eq!(
+            low_space_message(CacheDeletion::Deleted),
+            "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+             The session cache was deleted. Free some space and run rearview again."
+        );
+    }
+
+    #[test]
+    fn low_space_message_reports_a_deferred_deletion() {
+        assert_eq!(
+            low_space_message(CacheDeletion::Deferred),
+            "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+             The session cache was not deleted: another rearview has it open. Free some space \
+             and run rearview again."
+        );
+    }
+
+    #[test]
+    fn low_space_message_reports_a_failed_deletion_with_its_file_and_cause() {
+        assert_eq!(
+            low_space_message(CacheDeletion::Failed {
+                file: r"C:\cache\history.sqlite3".to_owned(),
+                error: "Access is denied. (os error 5)".to_owned(),
+            }),
+            "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
+             The session cache could not be deleted: C:\\cache\\history.sqlite3: Access is \
+             denied. (os error 5). Free some space and run rearview again."
+        );
+    }
+}

@@ -1,21 +1,22 @@
-use crate::error::Result;
+use crate::clock::Clock;
+use crate::error::{AppError, Result};
 use crate::history::Conversation;
-use crate::search::literal::{build_literal_corpus, exact_fallback};
+use crate::history::sqlite_cache::{CachedSession, CopyKey, SessionKey};
 use crate::search::query::ParsedQuery;
+use crate::search::{ReadFailure, SessionsWithoutTexts};
 use crate::semantic::cache::write_embedding_cache;
+use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic::fastembed::FastembedEmbedder;
 use crate::semantic::index::{
     SemanticIndexCandidate, SemanticIndexProgress, SemanticIndexRequest, SemanticIndexResponse,
     SemanticIndexState,
 };
-use crate::semantic::types::{
-    ChunkHits, SemanticCancellationToken, SemanticChunkIdentity, SemanticExplanation,
-    SemanticQuality, SemanticRationaleKind, SemanticScoreBreakdown,
-};
+use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 use crate::tui::app::{SemanticProgress, SemanticResultMetadata};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub enum SemanticWorkerCommand {
@@ -61,9 +62,26 @@ pub struct SemanticSearchResponse {
     pub error: Option<String>,
     pub progress: SemanticProgress,
     pub prewarm: bool,
+    /// The listed sessions searched without semantic turns, by reason: their
+    /// read missed, and the worker doesn't hold an earlier copy's turns.
+    pub without_turns: SessionsWithoutTexts,
 }
 
-pub fn spawn_semantic_worker() -> (
+pub fn spawn_semantic_worker(
+    clock: Arc<dyn Clock>,
+) -> (
+    mpsc::Sender<SemanticWorkerCommand>,
+    mpsc::Receiver<SemanticSearchMessage>,
+    SemanticCancellationToken,
+) {
+    spawn_semantic_worker_with(clock, Arc::new(load_fastembed))
+}
+
+/// [`spawn_semantic_worker`] with the model `load_model` loads.
+fn spawn_semantic_worker_with(
+    clock: Arc<dyn Clock>,
+    load_model: ModelLoader,
+) -> (
     mpsc::Sender<SemanticWorkerCommand>,
     mpsc::Receiver<SemanticSearchMessage>,
     SemanticCancellationToken,
@@ -75,7 +93,7 @@ pub fn spawn_semantic_worker() -> (
 
     std::thread::Builder::new()
         .name("semantic-search-worker".into())
-        .spawn(move || run_semantic_worker(cmd_rx, res_tx, worker_cancellation))
+        .spawn(move || run_semantic_worker(cmd_rx, res_tx, worker_cancellation, clock, load_model))
         .expect("failed to spawn semantic search worker thread");
 
     (cmd_tx, res_rx, cancellation)
@@ -85,59 +103,114 @@ fn run_semantic_worker(
     cmd_rx: mpsc::Receiver<SemanticWorkerCommand>,
     res_tx: mpsc::Sender<SemanticSearchMessage>,
     cancellation_source: SemanticCancellationToken,
+    clock: Arc<dyn Clock>,
+    load_model: ModelLoader,
 ) {
-    let mut worker = SemanticWorkerState::default();
-    let mut state = SemanticIndexState::new();
-    let mut embedder: Option<FastembedEmbedder> = None;
+    let mut worker = SemanticWorker {
+        corpus: WorkerCorpus::default(),
+        index: SemanticIndexState::new(clock),
+        model: Model::new(load_model),
+        results: res_tx,
+    };
 
     while let Ok(command) = cmd_rx.recv() {
-        let mut request = worker.apply_command(command, &cancellation_source);
+        let mut request = worker.corpus.apply_command(command, &cancellation_source);
         while let Ok(pending) = cmd_rx.try_recv() {
-            if let Some(search) = worker.apply_command(pending, &cancellation_source) {
+            if let Some(search) = worker.corpus.apply_command(pending, &cancellation_source) {
                 request = Some(search);
             }
         }
+        worker.respond_to(request, &cancellation_source);
+    }
+}
 
-        let Some(request) = request else {
-            continue;
-        };
-        let Some(version_state) = worker.version_state_for(&request) else {
-            continue;
-        };
-        match version_state {
-            VersionState::Future => {
-                worker.pending_search = Some(request);
-                continue;
-            }
-            VersionState::Stale => continue,
-            VersionState::Current => {}
+/// The worker's state across requests.
+struct SemanticWorker {
+    /// The corpus and scope the commands set, and the turns read for them.
+    corpus: WorkerCorpus,
+    index: SemanticIndexState,
+    model: Model,
+    results: mpsc::Sender<SemanticSearchMessage>,
+}
+
+impl SemanticWorker {
+    /// Sends the response to `request`, the newest search the commands sent,
+    /// once its corpus and scope versions have arrived. Drops the turns and
+    /// the index built for an earlier corpus once the corpus is empty.
+    fn respond_to(
+        &mut self,
+        request: Option<SemanticSearchRequest>,
+        cancellation_source: &SemanticCancellationToken,
+    ) {
+        if self.corpus.rows.is_empty() {
+            self.corpus.semantic_turns.clear();
+            self.index.clear_corpus();
         }
+        let Some(request) = request else {
+            return;
+        };
+        match self.corpus.version_state_for(&request) {
+            Some(VersionState::Current) => {}
+            Some(VersionState::Future) => {
+                self.corpus.pending_search = Some(request);
+                return;
+            }
+            Some(VersionState::Stale) | None => return,
+        }
+        let response = self.response_to(&request, &cancellation_source.child());
+        let _ = self.results.send(SemanticSearchMessage::Complete(response));
+    }
 
-        let cancellation = cancellation_source.child();
+    /// The response to `request`. A prewarm works on the full corpus, a
+    /// search on its scope; when that is empty, completes without reading
+    /// turns or loading the model.
+    fn response_to(
+        &mut self,
+        request: &SemanticSearchRequest,
+        cancellation: &SemanticCancellationToken,
+    ) -> SemanticSearchResponse {
         if request.query.is_effectively_empty() && !request.prewarm {
-            let _ = res_tx.send(SemanticSearchMessage::Complete(SemanticSearchResponse {
+            return SemanticSearchResponse {
                 generation: request.generation,
                 filtered: Vec::new(),
                 metadata: HashMap::new(),
                 error: None,
                 progress: SemanticProgress::Idle,
                 prewarm: request.prewarm,
-            }));
-            continue;
+                without_turns: SessionsWithoutTexts::default(),
+            };
         }
-        if request.query.is_quoted_only() {
-            let response = exact_literal_semantic_response(
-                request.generation,
-                request.prewarm,
-                worker.corpus.as_ref(),
-                worker.scope.as_ref(),
-                &request.query,
-            );
-            let _ = res_tx.send(SemanticSearchMessage::Complete(response));
-            continue;
+        let rows_are_empty = if request.prewarm {
+            self.corpus.rows.is_empty()
+        } else {
+            self.corpus.scope.is_empty()
+        };
+        if rows_are_empty {
+            return empty_semantic_response(request.generation, request.prewarm);
         }
-        let full_corpus = worker.full_corpus_candidates();
-        let scope = worker.semantic_candidates();
+        // Start loading the model while the corpus is read.
+        self.model.start_loading(request.generation);
+        self.read_and_rank(request, cancellation)
+    }
+
+    /// The response to `request` over the corpus's turns, read now: its
+    /// ranked rows or its prewarm. Only a request with chunks to work on
+    /// waits for the model.
+    fn read_and_rank(
+        &mut self,
+        request: &SemanticSearchRequest,
+        cancellation: &SemanticCancellationToken,
+    ) -> SemanticSearchResponse {
+        let LoadedCorpus {
+            candidates: full_corpus,
+            without_turns,
+        } = self.corpus.loaded_corpus_candidates();
+        let scope = self
+            .corpus
+            .scope
+            .iter()
+            .filter_map(|index| full_corpus.get(*index).cloned())
+            .collect::<Vec<_>>();
         let index_request = SemanticIndexRequest {
             query: request.query.semantic_text(),
             literal_filters: request.query.literals(),
@@ -147,63 +220,279 @@ fn run_semantic_worker(
             chunk_hits: ChunkHits::None,
             window: crate::time_filter::TimeFilter::default(),
         };
-        let response = match state.has_chunks(&index_request, &cancellation) {
-            Ok(true) => {
-                if embedder.is_none() {
-                    let _ = res_tx.send(SemanticSearchMessage::Progress {
-                        generation: request.generation,
-                        progress: SemanticProgress::InitializingModel,
-                    });
-                    embedder = match FastembedEmbedder::new_quiet() {
-                        Ok(embedder) => Some(embedder),
-                        Err(error) => {
-                            let _ = res_tx.send(SemanticSearchMessage::Complete(
-                                failed_semantic_response(
-                                    request.generation,
-                                    request.prewarm,
-                                    error.to_string(),
-                                ),
-                            ));
-                            continue;
-                        }
-                    };
-                }
-                rank_or_prewarm_semantic_request(
-                    request.generation,
+        let generation = request.generation;
+        let fail = |error: String| failed_semantic_response(generation, request.prewarm, error);
+        let results = &self.results;
+        let report_wait = || {
+            let _ = results.send(SemanticSearchMessage::Progress {
+                generation,
+                progress: SemanticProgress::InitializingModel,
+            });
+        };
+        let mut response = match self.index.has_chunks(&index_request, cancellation) {
+            Ok(true) => match self
+                .model
+                .wait_for_model(generation, cancellation, report_wait)
+            {
+                Ok(embedder) => rank_or_prewarm_semantic_request(
+                    generation,
                     &index_request,
                     &request.query,
-                    &mut state,
-                    embedder.as_mut().unwrap(),
-                    &cancellation,
-                    &res_tx,
+                    &mut self.index,
+                    embedder,
+                    cancellation,
+                    results,
                 )
-                .unwrap_or_else(|error| {
-                    failed_semantic_response(request.generation, request.prewarm, error.to_string())
-                })
-            }
-            Ok(false) => match state.clear_empty(&index_request, &cancellation) {
-                Ok(()) => empty_semantic_response(request.generation, request.prewarm),
-                Err(error) => {
-                    failed_semantic_response(request.generation, request.prewarm, error.to_string())
-                }
+                .unwrap_or_else(|error| fail(error.to_string())),
+                Err(error) => fail(error.to_string()),
             },
-            Err(error) => {
-                failed_semantic_response(request.generation, request.prewarm, error.to_string())
-            }
+            Ok(false) => match self.index.clear_empty(&index_request, cancellation) {
+                Ok(()) => empty_semantic_response(generation, request.prewarm),
+                Err(error) => fail(error.to_string()),
+            },
+            Err(error) => fail(error.to_string()),
         };
-
-        let _ = res_tx.send(SemanticSearchMessage::Complete(response));
+        response.without_turns = without_turns;
+        response
     }
 }
 
+type Embedder = Box<dyn SemanticEmbedder + Send>;
+
+/// Loads the semantic model: [`FastembedEmbedder`], or a test's stand-in.
+type ModelLoader = Arc<dyn Fn() -> Result<Embedder> + Send + Sync>;
+
+fn load_fastembed() -> Result<Embedder> {
+    Ok(Box::new(FastembedEmbedder::new_quiet()?))
+}
+
+/// The worker's model across requests. A load runs on a thread of its own
+/// and keeps running across requests that don't wait for it: those without
+/// chunks to work on, and cancelled ones. Nothing joins a load when the
+/// worker ends.
+struct Model {
+    loader: ModelLoader,
+    state: ModelState,
+}
+
+enum ModelState {
+    Absent,
+    /// Loading, started for the request of generation `started_by`; `ended`
+    /// receives once the load ends.
+    Loading {
+        started_by: u64,
+        load: std::thread::JoinHandle<Result<Embedder>>,
+        ended: mpsc::Receiver<()>,
+    },
+    Ready(Embedder),
+}
+
+/// The interval between a model wait's checks of its request's
+/// cancellation: a cancellation doesn't wake the waiter.
+const CANCELLATION_CHECK_EVERY: Duration = Duration::from_millis(50);
+
+impl Model {
+    fn new(loader: ModelLoader) -> Self {
+        Self {
+            loader,
+            state: ModelState::Absent,
+        }
+    }
+
+    /// Starts loading the model for the request of `generation`, unless it
+    /// is loading or loaded.
+    fn start_loading(&mut self, generation: u64) {
+        if !matches!(self.state, ModelState::Absent) {
+            return;
+        }
+        let loader = Arc::clone(&self.loader);
+        let (end, ended) = mpsc::channel();
+        let load = std::thread::Builder::new()
+            .name("semantic-model-load".into())
+            .spawn(move || {
+                let model = loader();
+                let _ = end.send(());
+                model
+            })
+            .expect("failed to spawn the semantic model load");
+        self.state = ModelState::Loading {
+            started_by: generation,
+            load,
+            ended,
+        };
+    }
+
+    /// The model for the request of `generation`, once its load ends;
+    /// `report_wait` runs each time the request waits for an unfinished
+    /// load.
+    /// - When an earlier request's load failed, a new load starts for this
+    ///   one.
+    /// - When this request's own load fails, the request fails, and the next
+    ///   request loads again.
+    /// - Once `cancellation` is cancelled, stops waiting and leaves the load
+    ///   running for the next request.
+    fn wait_for_model(
+        &mut self,
+        generation: u64,
+        cancellation: &SemanticCancellationToken,
+        mut report_wait: impl FnMut(),
+    ) -> Result<&mut dyn SemanticEmbedder> {
+        loop {
+            match std::mem::replace(&mut self.state, ModelState::Absent) {
+                ModelState::Ready(model) => {
+                    self.state = ModelState::Ready(model);
+                    break;
+                }
+                ModelState::Absent => self.start_loading(generation),
+                ModelState::Loading {
+                    started_by,
+                    load,
+                    ended,
+                } => {
+                    if !load.is_finished() {
+                        report_wait();
+                    }
+                    if let Err(cancelled) = wait_for_end(&ended, cancellation) {
+                        self.state = ModelState::Loading {
+                            started_by,
+                            load,
+                            ended,
+                        };
+                        return Err(cancelled);
+                    }
+                    match joined(load) {
+                        Ok(model) => self.state = ModelState::Ready(model),
+                        Err(error) if started_by == generation => return Err(error),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        match &mut self.state {
+            ModelState::Ready(model) => Ok(model.as_mut()),
+            _ => unreachable!("the loop ends with the model ready"),
+        }
+    }
+}
+
+/// Waits until `ended` receives, or the load holding its sender ends by a
+/// panic; `SemanticSearchCancelled` once `cancellation` is cancelled.
+fn wait_for_end(
+    ended: &mpsc::Receiver<()>,
+    cancellation: &SemanticCancellationToken,
+) -> Result<()> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(AppError::SemanticSearchCancelled);
+        }
+        match ended.recv_timeout(CANCELLATION_CHECK_EVERY) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/// The model `load` loaded; its panic resumes on this thread.
+fn joined(load: std::thread::JoinHandle<Result<Embedder>>) -> Result<Embedder> {
+    load.join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 #[derive(Default)]
-struct SemanticWorkerState {
+struct WorkerCorpus {
     corpus_version: u64,
     scope_version: u64,
     scope_corpus_version: u64,
-    corpus: Arc<Vec<Arc<Conversation>>>,
+    rows: Arc<Vec<Arc<Conversation>>>,
     scope: Arc<Vec<usize>>,
     pending_search: Option<SemanticSearchRequest>,
+    /// The semantic turns read for each session the corpus's rows list.
+    semantic_turns: HashMap<SessionKey, HeldTurns>,
+}
+
+/// One session's semantic turns, as the semantic stage reads them.
+#[derive(Default)]
+struct HeldTurns {
+    /// The newest turns read; `None` until a read of the session lands.
+    turns: Option<TurnsRead>,
+    /// The corpus version the last read of the row's copy missed in, and the
+    /// reason. Read the copy again once the corpus changes.
+    missed: Option<(u64, ReadFailure)>,
+}
+
+/// A copy's semantic turns.
+struct TurnsRead {
+    /// The generation of the copy read: the row's, or a newer copy's that
+    /// replaced it.
+    generation: i64,
+    /// A row with the turns, as the semantic stage reads it. Rows of the same
+    /// copy share it: the stage reads the turns, the path and the session ID
+    /// alone, each the same for every row of the copy.
+    loaded: Arc<Conversation>,
+}
+
+impl HeldTurns {
+    /// The turns to search for a row of `copy`; `None` when they are not
+    /// read, or are of an earlier copy.
+    fn of_copy(&self, copy: &CopyKey) -> Option<&TurnsRead> {
+        self.turns
+            .as_ref()
+            .filter(|turns| turns.generation >= copy.generation)
+    }
+
+    /// True when `copy`'s turns are to be read in corpus version
+    /// `corpus_version`.
+    fn needs_read(&self, copy: &CopyKey, corpus_version: u64) -> bool {
+        self.of_copy(copy).is_none()
+            && self
+                .missed
+                .as_ref()
+                .is_none_or(|(missed_in, _)| *missed_in != corpus_version)
+    }
+
+    /// Holds `read`, the read of a row's turns in corpus version
+    /// `corpus_version`.
+    fn finish_read(&mut self, read: TurnsReadResult, corpus_version: u64) {
+        match read {
+            Ok(turns) => {
+                self.turns = Some(turns);
+                self.missed = None;
+            }
+            Err(failure) => self.missed = Some((corpus_version, failure)),
+        }
+    }
+}
+
+type TurnsReadResult = std::result::Result<TurnsRead, ReadFailure>;
+
+/// Reads the semantic turns of each of `rows`, each a row and its copy, from
+/// the copy the cache holds now: one result per row, in order.
+fn read_turns(rows: &[(&Conversation, &CachedSession)]) -> Vec<TurnsReadResult> {
+    let reads = match Conversation::load_held_semantic_turns_of(rows) {
+        Ok(reads) => reads,
+        Err(error) => {
+            let failure = ReadFailure::of(&error);
+            return rows.iter().map(|_| Err(failure.clone())).collect();
+        }
+    };
+    reads
+        .into_iter()
+        .map(|read| {
+            read.map(|copy| TurnsRead {
+                generation: copy.generation,
+                loaded: Arc::new(copy.row),
+            })
+            .map_err(ReadFailure::of_miss)
+        })
+        .collect()
+}
+
+/// The corpus's rows as the semantic stage searches them.
+struct LoadedCorpus {
+    candidates: Vec<SemanticIndexCandidate>,
+    /// The cached rows without semantic turns, counted by reason: their read
+    /// missed, and the worker doesn't hold an earlier copy's turns.
+    without_turns: SessionsWithoutTexts,
 }
 
 enum VersionState {
@@ -212,7 +501,7 @@ enum VersionState {
     Stale,
 }
 
-impl SemanticWorkerState {
+impl WorkerCorpus {
     fn apply_command(
         &mut self,
         command: SemanticWorkerCommand,
@@ -225,7 +514,7 @@ impl SemanticWorkerState {
             } => {
                 if corpus_version >= self.corpus_version {
                     self.corpus_version = corpus_version;
-                    self.corpus = conversations;
+                    self.rows = conversations;
                     cancellation.cancel();
                 }
                 self.take_ready_pending()
@@ -291,7 +580,7 @@ impl SemanticWorkerState {
     }
 
     fn full_corpus_candidates(&self) -> Vec<SemanticIndexCandidate> {
-        self.corpus
+        self.rows
             .iter()
             .enumerate()
             .map(|(index, conversation)| SemanticIndexCandidate {
@@ -302,11 +591,66 @@ impl SemanticWorkerState {
             .collect()
     }
 
+    /// The corpus's rows as candidates, each cached row with its semantic
+    /// turns. Read each session's turns once for its copy, reading the
+    /// sessions not held yet together, and hold them while a row of the
+    /// corpus lists the session. A row whose read fails keeps its session's
+    /// earlier turns; a row without earlier turns counts as loading while its
+    /// cached copy is not ready, and as unreadable otherwise.
+    fn loaded_corpus_candidates(&mut self) -> LoadedCorpus {
+        let mut held = std::mem::take(&mut self.semantic_turns);
+        let mut kept = HashMap::with_capacity(held.len());
+        let mut sessions_to_read = Vec::new();
+        let mut rows_to_read = Vec::new();
+        for row in self.rows.iter() {
+            let Some(cached) = &row.cached_session else {
+                continue;
+            };
+            let copy = cached.copy_key();
+            if kept.contains_key(&copy.session) {
+                continue;
+            }
+            let turns = held.remove(&copy.session).unwrap_or_default();
+            if turns.needs_read(&copy, self.corpus_version) {
+                sessions_to_read.push(copy.session.clone());
+                rows_to_read.push((row.as_ref(), cached));
+            }
+            kept.insert(copy.session, turns);
+        }
+        let reads = sessions_to_read.into_iter().zip(read_turns(&rows_to_read));
+        for (session, read) in reads {
+            if let Some(turns) = kept.get_mut(&session) {
+                turns.finish_read(read, self.corpus_version);
+            }
+        }
+        self.semantic_turns = kept;
+
+        let mut without_turns = SessionsWithoutTexts::default();
+        let mut candidates = self.full_corpus_candidates();
+        for candidate in &mut candidates {
+            let Some(cached) = &candidate.conversation.cached_session else {
+                continue;
+            };
+            let copy = cached.copy_key();
+            let held = &self.semantic_turns[&copy.session];
+            match (&held.turns, &held.missed) {
+                (Some(turns), _) => candidate.conversation = Arc::clone(&turns.loaded),
+                (None, Some((_, failure))) => without_turns.count(failure),
+                (None, None) => without_turns.unreadable += 1,
+            }
+        }
+        LoadedCorpus {
+            candidates,
+            without_turns,
+        }
+    }
+
+    #[cfg(test)]
     fn semantic_candidates(&self) -> Vec<SemanticIndexCandidate> {
         self.scope
             .iter()
             .filter_map(|&index| {
-                self.corpus
+                self.rows
                     .get(index)
                     .map(|conversation| SemanticIndexCandidate {
                         index,
@@ -323,10 +667,11 @@ fn rank_or_prewarm_semantic_request(
     request: &SemanticIndexRequest<'_>,
     parsed: &ParsedQuery,
     state: &mut SemanticIndexState,
-    embedder: &mut FastembedEmbedder,
+    embedder: &mut dyn SemanticEmbedder,
     cancellation: &SemanticCancellationToken,
     res_tx: &mpsc::Sender<SemanticSearchMessage>,
 ) -> Result<SemanticSearchResponse> {
+    let clock = state.clock();
     let response = state.refresh_or_prewarm(
         request,
         embedder,
@@ -337,7 +682,7 @@ fn rank_or_prewarm_semantic_request(
                 progress: semantic_progress(progress),
             });
         },
-        write_embedding_cache,
+        |cache| write_embedding_cache(cache, clock.as_ref()),
     )?;
     Ok(semantic_search_response(
         generation,
@@ -380,6 +725,7 @@ fn semantic_search_response(
         error: None,
         progress: semantic_progress(response.progress),
         prewarm: response.prewarm,
+        without_turns: SessionsWithoutTexts::default(),
     }
 }
 
@@ -391,127 +737,7 @@ fn empty_semantic_response(generation: u64, prewarm: bool) -> SemanticSearchResp
         error: None,
         progress: SemanticProgress::EmptyCorpus,
         prewarm,
-    }
-}
-
-fn exact_literal_semantic_response(
-    generation: u64,
-    prewarm: bool,
-    conversations: &[Arc<Conversation>],
-    scope: &[usize],
-    parsed: &ParsedQuery,
-) -> SemanticSearchResponse {
-    let corpus = build_literal_corpus(conversations);
-    let scope = scope
-        .iter()
-        .copied()
-        .collect::<std::collections::HashSet<_>>();
-    let filtered = exact_fallback(
-        &corpus,
-        parsed.literals(),
-        |index| scope.contains(&index),
-        |index| conversations[index].timestamp,
-    );
-
-    let metadata = filtered
-        .iter()
-        .filter_map(|&index| {
-            conversations
-                .get(index)
-                .map(|conversation| (index, exact_literal_metadata(conversation, index, parsed)))
-        })
-        .collect();
-
-    SemanticSearchResponse {
-        generation,
-        filtered,
-        metadata,
-        error: None,
-        progress: SemanticProgress::Complete,
-        prewarm,
-    }
-}
-
-fn literal_evidence_preview(
-    conversation: &Conversation,
-    parsed: &ParsedQuery,
-    visible_preview: &str,
-) -> String {
-    parsed
-        .literals()
-        .iter()
-        .filter(|literal| !literal.matches(visible_preview))
-        .chain(parsed.literals().iter())
-        .find_map(|literal| {
-            literal
-                .match_ranges(&conversation.full_text)
-                .first()
-                .map(|range| evidence_window(&conversation.full_text, *range))
-                .or_else(|| {
-                    conversation.project_name.as_deref().and_then(|project| {
-                        literal
-                            .match_ranges(project)
-                            .first()
-                            .map(|range| evidence_window(project, *range))
-                    })
-                })
-        })
-        .unwrap_or_else(|| conversation.preview.clone())
-}
-
-fn evidence_window(text: &str, range: (usize, usize)) -> String {
-    const CONTEXT_CHARS: usize = 80;
-    let (start, end) = range;
-    let prefix_start = text[..start]
-        .char_indices()
-        .rev()
-        .nth(CONTEXT_CHARS)
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-    let suffix_end = text[end..]
-        .char_indices()
-        .nth(CONTEXT_CHARS)
-        .map(|(index, _)| end + index)
-        .unwrap_or(text.len());
-    let mut preview = String::new();
-    if prefix_start > 0 {
-        preview.push('…');
-    }
-    preview.push_str(text[prefix_start..suffix_end].trim());
-    if suffix_end < text.len() {
-        preview.push('…');
-    }
-    preview
-}
-
-/// `conversation_index` is the conversation's position in the corpus: a
-/// refresh shares unchanged rows between corpus versions, so the row's own
-/// `index` can name its position in an earlier one.
-fn exact_literal_metadata(
-    conversation: &Conversation,
-    conversation_index: usize,
-    parsed: &ParsedQuery,
-) -> SemanticResultMetadata {
-    SemanticResultMetadata {
-        score_breakdown: SemanticScoreBreakdown::new(0.0, 0.0),
-        explanation: SemanticExplanation {
-            quality: SemanticQuality::Strong,
-            quality_label: "exact",
-            matched_terms: parsed
-                .literals()
-                .iter()
-                .map(|literal| literal.text().to_string())
-                .collect(),
-            evidence_preview: literal_evidence_preview(conversation, parsed, ""),
-            rationale_kind: SemanticRationaleKind::LexicalBoosted,
-            chunk: SemanticChunkIdentity {
-                conversation_index,
-                source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                session: conversation.session_id.clone(),
-                chunk_index: 0,
-                message_range: crate::agent::refs::MessageRange::single(1),
-            },
-        },
+        without_turns: SessionsWithoutTexts::default(),
     }
 }
 
@@ -527,6 +753,7 @@ fn failed_semantic_response(
         error: Some(error),
         progress: SemanticProgress::Failed,
         prewarm,
+        without_turns: SessionsWithoutTexts::default(),
     }
 }
 
@@ -547,10 +774,12 @@ mod tests {
     use super::*;
     use crate::history::Conversation;
     use crate::semantic::test_fixtures::{SemanticConversationFixture, beta_hit_metadata};
-    use chrono::{Duration as ChronoDuration, Local};
     use std::time::Duration;
 
-    const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+    /// The longest a test waits for the worker's next message before it
+    /// fails. The model's first load doesn't send one, and beside a full test run
+    /// it runs many times slower than alone.
+    const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn conversation(path: &str, semantic_turns: Vec<&str>) -> Conversation {
         SemanticConversationFixture::new(path, semantic_turns)
@@ -640,7 +869,8 @@ mod tests {
 
     #[test]
     fn empty_visible_dialogue_returns_before_embedder_initialization() {
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
         send_worker_setup(&tx, vec![], "alpha", false);
         let response = recv_empty_complete(&rx);
         assert_eq!(response.progress, SemanticProgress::EmptyCorpus);
@@ -648,7 +878,8 @@ mod tests {
 
     #[test]
     fn empty_quoted_search_returns_idle_without_embedding() {
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
         send_worker_setup(&tx, vec!["visible dialogue"], "\"\"", false);
         let response = recv_empty_complete(&rx);
         assert_eq!(response.progress, SemanticProgress::Idle);
@@ -656,7 +887,10 @@ mod tests {
 
     #[test]
     fn empty_prewarm_search_builds_cache_without_idle_short_circuit() {
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
+        let (tx, rx, _cancellation) = spawn_semantic_worker_with(
+            Arc::new(crate::clock::TestClock::default()),
+            Arc::new(|| unit_embedder(0)),
+        );
         send_worker_setup(&tx, vec!["visible dialogue"], "\"\"", true);
 
         loop {
@@ -678,88 +912,8 @@ mod tests {
     }
 
     #[test]
-    fn quoted_only_search_uses_literal_fallback_without_embedding() {
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
-        send_worker_setup(&tx, vec![], "\"title sentinel\"", false);
-        let message = rx
-            .recv_timeout(WORKER_RESPONSE_TIMEOUT)
-            .expect("literal response");
-
-        match message {
-            SemanticSearchMessage::Complete(response) => {
-                assert_eq!(response.filtered, vec![0]);
-                assert!(
-                    response.metadata[&0]
-                        .explanation
-                        .evidence_preview
-                        .contains("title sentinel")
-                );
-                assert_eq!(response.error, None);
-                assert_eq!(response.progress, SemanticProgress::Complete);
-            }
-            SemanticSearchMessage::Progress { progress, .. } => {
-                panic!("unexpected progress before literal response: {progress:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn quoted_only_search_respects_scope_and_orders_newest_first() {
-        let mut old = conversation("/projects/project-a/session-a.jsonl", vec![]);
-        old.timestamp = Local::now() - ChronoDuration::days(1);
-        let mut newest = conversation("/projects/project-a/session-b.jsonl", vec![]);
-        newest.timestamp = Local::now();
-        let mut hidden = conversation("/projects/project-a/session-c.jsonl", vec![]);
-        hidden.timestamp = Local::now() + ChronoDuration::days(1);
-        let (tx, rx, _cancellation) = spawn_semantic_worker();
-        tx.send(SemanticWorkerCommand::UpdateCorpus {
-            corpus_version: 1,
-            conversations: corpus(vec![old, newest, hidden]),
-        })
-        .expect("send corpus");
-        tx.send(SemanticWorkerCommand::UpdateScope {
-            corpus_version: 1,
-            scope_version: 1,
-            indices: Arc::new(vec![0, 1]),
-        })
-        .expect("send scope");
-        tx.send(SemanticWorkerCommand::Search {
-            generation: 1,
-            query: ParsedQuery::parse("\"title sentinel\""),
-            corpus_version: 1,
-            scope_version: 1,
-            prewarm: false,
-        })
-        .expect("send semantic request");
-
-        match rx
-            .recv_timeout(WORKER_RESPONSE_TIMEOUT)
-            .expect("literal response")
-        {
-            SemanticSearchMessage::Complete(response) => {
-                assert_eq!(response.filtered, vec![1, 0]);
-                assert!(
-                    response.metadata[&1]
-                        .explanation
-                        .evidence_preview
-                        .contains("title sentinel")
-                );
-                assert!(
-                    response.metadata[&0]
-                        .explanation
-                        .evidence_preview
-                        .contains("title sentinel")
-                );
-            }
-            SemanticSearchMessage::Progress { progress, .. } => {
-                panic!("unexpected progress before literal response: {progress:?}");
-            }
-        }
-    }
-
-    #[test]
     fn worker_builds_distinct_full_corpus_and_scoped_candidates() {
-        let mut worker = SemanticWorkerState::default();
+        let mut worker = WorkerCorpus::default();
         let cancellation = SemanticCancellationToken::new();
         worker.apply_command(
             SemanticWorkerCommand::UpdateCorpus {
@@ -791,9 +945,250 @@ mod tests {
         assert_eq!(candidates[0].conversation.semantic_turns, vec!["visible"]);
     }
 
+    /// `rows`, as the corpus of version `version`.
+    fn update_corpus(worker: &mut WorkerCorpus, version: u64, rows: &[Conversation]) {
+        worker.apply_command(
+            SemanticWorkerCommand::UpdateCorpus {
+                corpus_version: version,
+                conversations: Arc::new(rows.iter().cloned().map(Arc::new).collect()),
+            },
+            &SemanticCancellationToken::new(),
+        );
+    }
+
+    fn question(text: &str) -> serde_json::Value {
+        crate::search::test_fixtures::claude_user_record(
+            text,
+            crate::search::test_fixtures::october(20, 9),
+        )
+    }
+
+    fn turns_of(corpus: &LoadedCorpus) -> Vec<Vec<String>> {
+        corpus
+            .candidates
+            .iter()
+            .map(|candidate| candidate.conversation.semantic_turns.clone())
+            .collect()
+    }
+
+    /// A copy's semantic turns are read once while a row lists its session:
+    /// the next search, and a row replaced without a new copy, such as on a
+    /// snapshot rebuild or a rename, search the row read for the copy.
+    #[test]
+    fn cached_rows_semantic_turns_are_read_once_per_copy() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[(
+            "turns",
+            vec![question("held question")],
+        )]);
+        let mut worker = WorkerCorpus::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+
+        let first = worker.loaded_corpus_candidates();
+        let second = worker.loaded_corpus_candidates();
+        let mut renamed = sessions.rows[0].clone();
+        renamed.custom_title = Some("renamed".to_owned());
+        update_corpus(&mut worker, 2, &[renamed]);
+        let after_rename = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            turns_of(&first),
+            [["held question"]],
+            "the candidate holds the copy's semantic turns"
+        );
+        for (search, corpus) in [("the next search", second), ("a renamed row", after_rename)] {
+            assert!(
+                Arc::ptr_eq(
+                    &first.candidates[0].conversation,
+                    &corpus.candidates[0].conversation
+                ),
+                "{search} searches the row read for the copy"
+            );
+        }
+    }
+
+    /// A row's copy replaced by another write is searched as the cache holds
+    /// it now. A row of a session no longer in the session cache doesn't
+    /// have any turns and counts as unreadable.
+    #[test]
+    fn replaced_copy_is_searched_and_removed_session_counts_unreadable() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("replaced", vec![question("first wording")]),
+            ("removed", vec![question("gone question")]),
+            ("kept", vec![question("kept question")]),
+        ]);
+        let mut worker = WorkerCorpus::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+        sessions.rewrite(0, &[question("second wording")]);
+        sessions.remove(1);
+
+        let corpus = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            turns_of(&corpus),
+            [
+                vec!["second wording".to_owned()],
+                Vec::new(),
+                vec!["kept question".to_owned()]
+            ],
+            "the replaced row searches the cache's copy; the removed one doesn't search any turns"
+        );
+        assert_eq!(
+            corpus.without_turns.unreadable, 1,
+            "the removed session counts unreadable"
+        );
+    }
+
+    /// A row of a session another rearview is writing doesn't have any turns
+    /// and counts as loading, not unreadable.
+    #[test]
+    fn session_being_written_counts_loading_not_unreadable() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("written", vec![question("first wording")]),
+            ("kept", vec![question("kept question")]),
+        ]);
+        sessions.mark_writing(0);
+        let mut worker = WorkerCorpus::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+
+        let corpus = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            turns_of(&corpus),
+            [Vec::new(), vec!["kept question".to_owned()]],
+            "the other session's turns are searched"
+        );
+        assert_eq!(
+            corpus.without_turns,
+            SessionsWithoutTexts {
+                loading: 1,
+                unreadable: 0
+            },
+            "the session being written counts as loading"
+        );
+    }
+
+    /// When the read of a newer copy fails, its row keeps searching the
+    /// session's earlier turns and doesn't count as unreadable.
+    #[test]
+    fn failed_read_of_newer_copy_keeps_earlier_turns() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("changed", vec![question("first wording")]),
+            ("kept", vec![question("kept question")]),
+        ]);
+        let mut worker = WorkerCorpus::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+        let first = worker.loaded_corpus_candidates();
+        sessions.rewrite(0, &[question("second wording")]);
+        let newer = sessions.listed_row(0);
+        sessions.remove(0);
+        update_corpus(&mut worker, 2, &[newer, sessions.rows[1].clone()]);
+
+        let corpus = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            (turns_of(&corpus), corpus.without_turns.unreadable),
+            (turns_of(&first), 0),
+            "the failed read keeps the session's earlier turns"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &first.candidates[1].conversation,
+                &corpus.candidates[1].conversation
+            ),
+            "the other session's turns stay held"
+        );
+    }
+
+    /// A failed read is not retried in its corpus version, and is retried in
+    /// the next one.
+    #[test]
+    fn failed_read_is_retried_once_the_corpus_changes() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("returning", vec![question("first wording")]),
+            ("kept", vec![question("kept question")]),
+        ]);
+        let mut worker = WorkerCorpus::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+        sessions.remove(0);
+        assert_eq!(
+            worker.loaded_corpus_candidates().without_turns.unreadable,
+            1,
+            "the read of the removed session fails"
+        );
+        sessions.rewrite(0, &[question("written again")]);
+
+        let same_version = worker.loaded_corpus_candidates();
+        update_corpus(&mut worker, 2, &sessions.rows);
+        let next_version = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            (
+                turns_of(&same_version)[0].clone(),
+                same_version.without_turns.unreadable
+            ),
+            (Vec::<String>::new(), 1),
+            "the failed read isn't retried in its corpus version"
+        );
+        assert_eq!(
+            (
+                turns_of(&next_version)[0].clone(),
+                next_version.without_turns.unreadable
+            ),
+            (vec!["written again".to_owned()], 0),
+            "the next corpus version reads the session again"
+        );
+    }
+
+    /// A read that fails for one session of the scan fails that session
+    /// alone: it keeps its earlier turns, isn't read again in its corpus
+    /// version, and is read again in the next one.
+    #[test]
+    fn failed_read_of_one_session_in_scan_keeps_its_earlier_turns_until_next_corpus() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("failing", vec![question("first wording")]),
+            ("read", vec![question("first question")]),
+        ]);
+        let mut worker = WorkerCorpus::default();
+        update_corpus(&mut worker, 1, &sessions.rows);
+        let first = worker.loaded_corpus_candidates();
+        sessions.rewrite(0, &[question("second wording")]);
+        sessions.rewrite(1, &[question("second question")]);
+        sessions.store_turns(0, &[0xff]);
+        let newer = [sessions.listed_row(0), sessions.listed_row(1)];
+        update_corpus(&mut worker, 2, &newer);
+
+        let failed = worker.loaded_corpus_candidates();
+        sessions.store_turns(0, b"second wording");
+        let same_version = worker.loaded_corpus_candidates();
+        update_corpus(&mut worker, 3, &newer);
+        let next_version = worker.loaded_corpus_candidates();
+
+        assert_eq!(
+            (turns_of(&failed), failed.without_turns.unreadable),
+            (
+                vec![
+                    turns_of(&first)[0].clone(),
+                    vec!["second question".to_owned()]
+                ],
+                0
+            ),
+            "the failing session keeps its earlier turns; the other reads its new ones"
+        );
+        assert_eq!(
+            turns_of(&same_version)[0],
+            turns_of(&first)[0],
+            "the failed read isn't retried in its corpus version"
+        );
+        assert_eq!(
+            turns_of(&next_version)[0],
+            ["second wording"],
+            "the next corpus version reads the session again"
+        );
+    }
+
     #[test]
     fn stale_search_is_not_current_after_scope_advances() {
-        let mut worker = SemanticWorkerState::default();
+        let mut worker = WorkerCorpus::default();
         let cancellation = SemanticCancellationToken::new();
         worker.apply_command(
             SemanticWorkerCommand::UpdateCorpus {
@@ -825,5 +1220,578 @@ mod tests {
             worker.version_state_for(&request),
             Some(VersionState::Stale)
         ));
+    }
+
+    /// A stand-in model: every passage and query embeds as one vector.
+    struct UnitEmbedder;
+
+    impl SemanticEmbedder for UnitEmbedder {
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(passages.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+
+        fn embed_query(&mut self, _query: &str) -> Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+    }
+
+    /// A model loader whose loads each report their start, then wait for
+    /// [`Self::release`]; the load numbered `n`, from 0, gives `outcome(n)`.
+    struct GatedLoader {
+        loads: Arc<std::sync::atomic::AtomicUsize>,
+        started: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+
+    impl GatedLoader {
+        fn new(
+            outcome: impl Fn(usize) -> Result<Embedder> + Send + Sync + 'static,
+        ) -> (Self, ModelLoader) {
+            let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (started_tx, started) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            let counted = Arc::clone(&loads);
+            let loader: ModelLoader = Arc::new(move || {
+                let load = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = started_tx.send(());
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(WORKER_RESPONSE_TIMEOUT)
+                    .expect("the test releases the load");
+                outcome(load)
+            });
+            (
+                Self {
+                    loads,
+                    started,
+                    release,
+                },
+                loader,
+            )
+        }
+
+        fn wait_for_start(&self) {
+            self.started
+                .recv_timeout(WORKER_RESPONSE_TIMEOUT)
+                .expect("a model load starts");
+        }
+
+        fn release(&self) {
+            self.release.send(()).expect("the load waits for release");
+        }
+
+        fn loads(&self) -> usize {
+            self.loads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn unit_embedder(_load: usize) -> Result<Embedder> {
+        Ok(Box::new(UnitEmbedder))
+    }
+
+    /// Sends `rows` as the corpus and scope, then a search for `query` of
+    /// `generation`.
+    fn send_search(
+        tx: &mpsc::Sender<SemanticWorkerCommand>,
+        rows: &[Conversation],
+        query: &str,
+        generation: u64,
+    ) {
+        send_search_of_corpus(tx, rows, 1, query, generation);
+    }
+
+    /// [`send_search`] with `rows` as the corpus of `corpus_version`.
+    fn send_search_of_corpus(
+        tx: &mpsc::Sender<SemanticWorkerCommand>,
+        rows: &[Conversation],
+        corpus_version: u64,
+        query: &str,
+        generation: u64,
+    ) {
+        let every_row = (0..rows.len()).collect();
+        send_search_in_scope(tx, rows, corpus_version, every_row, query, generation);
+    }
+
+    /// [`send_search_of_corpus`] over the rows at `scope` alone.
+    fn send_search_in_scope(
+        tx: &mpsc::Sender<SemanticWorkerCommand>,
+        rows: &[Conversation],
+        corpus_version: u64,
+        scope: Vec<usize>,
+        query: &str,
+        generation: u64,
+    ) {
+        tx.send(SemanticWorkerCommand::UpdateCorpus {
+            corpus_version,
+            conversations: Arc::new(rows.iter().cloned().map(Arc::new).collect()),
+        })
+        .expect("send corpus");
+        tx.send(SemanticWorkerCommand::UpdateScope {
+            corpus_version,
+            scope_version: corpus_version,
+            indices: Arc::new(scope),
+        })
+        .expect("send scope");
+        tx.send(SemanticWorkerCommand::Search {
+            generation,
+            query: ParsedQuery::parse(query),
+            corpus_version,
+            scope_version: corpus_version,
+            prewarm: false,
+        })
+        .expect("send semantic request");
+    }
+
+    /// Waits for the worker to report that the search of `generation` waits
+    /// for the model: its corpus read has ended.
+    fn recv_initializing_model(rx: &mpsc::Receiver<SemanticSearchMessage>, generation: u64) {
+        loop {
+            match rx
+                .recv_timeout(WORKER_RESPONSE_TIMEOUT)
+                .expect("the worker waits for the model")
+            {
+                SemanticSearchMessage::Progress {
+                    generation: reported,
+                    progress: SemanticProgress::InitializingModel,
+                } if reported == generation => return,
+                SemanticSearchMessage::Progress { .. } => continue,
+                SemanticSearchMessage::Complete(response) => panic!(
+                    "the search of generation {} completed before it waited for the model: {:?}",
+                    response.generation, response.error
+                ),
+            }
+        }
+    }
+
+    /// The worker's next completed response, past its progress messages.
+    fn recv_complete(rx: &mpsc::Receiver<SemanticSearchMessage>) -> SemanticSearchResponse {
+        loop {
+            match rx
+                .recv_timeout(WORKER_RESPONSE_TIMEOUT)
+                .expect("the worker completes the search")
+            {
+                SemanticSearchMessage::Progress { .. } => continue,
+                SemanticSearchMessage::Complete(response) => return response,
+            }
+        }
+    }
+
+    #[test]
+    fn model_load_starts_before_the_corpus_read_ends() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[(
+            "read",
+            vec![question("alpha question")],
+        )]);
+        let (started_tx, started_rx) = mpsc::channel();
+        let load_model: ModelLoader = Arc::new(move || {
+            let _ = started_tx.send(());
+            Ok(Box::new(UnitEmbedder) as Embedder)
+        });
+        let gate =
+            crate::tui::app::test_waits::ConnectionGate::closed(sessions.cache_path(), |_| true);
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+
+        send_search(&tx, &sessions.rows, "alpha", 1);
+        let started = started_rx.recv_timeout(WORKER_RESPONSE_TIMEOUT);
+        gate.open();
+        let response = recv_complete(&rx);
+
+        assert!(
+            started.is_ok(),
+            "the model load starts while the corpus read waits at the gate"
+        );
+        assert_eq!(
+            (
+                response.error,
+                response.filtered,
+                response.without_turns.unreadable
+            ),
+            (None, vec![0], 0),
+            "the search ranks the session once both end"
+        );
+    }
+
+    /// A load that fails while the search waits for it, held open past the
+    /// corpus read.
+    #[test]
+    fn failed_model_load_fails_the_search_and_the_next_search_loads_again() {
+        let (loader, load_model) = GatedLoader::new(|_| {
+            Err(crate::error::AppError::InvalidEmbeddings(
+                "the model is unavailable".to_owned(),
+            ))
+        });
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+        let rows = [conversation(
+            "/projects/project-a/session-a.jsonl",
+            vec!["alpha question"],
+        )];
+
+        let mut responses = Vec::new();
+        for generation in [1, 2] {
+            send_search(&tx, &rows, "alpha", generation);
+            recv_initializing_model(&rx, generation);
+            loader.release();
+            responses.push(recv_complete(&rx));
+        }
+
+        for response in &responses {
+            assert_eq!(
+                (
+                    &response.progress,
+                    response.filtered.is_empty(),
+                    response
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("the model is unavailable")),
+                ),
+                (&SemanticProgress::Failed, true, true),
+                "the search reports the failed load: {:?}",
+                response.error
+            );
+        }
+        assert_eq!(loader.loads(), 2, "the next search loads the model again");
+    }
+
+    /// The failed read ends while the model load is held open.
+    #[test]
+    fn failed_read_of_one_session_during_model_load_ranks_the_others() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[
+            ("failing", vec![question("alpha wording")]),
+            ("read", vec![question("alpha question")]),
+        ]);
+        sessions.store_turns(0, &[0xff]);
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+
+        send_search(&tx, &sessions.rows, "alpha", 1);
+        recv_initializing_model(&rx, 1);
+        loader.release();
+        let response = recv_complete(&rx);
+
+        assert_eq!(
+            (
+                response.error,
+                response.filtered,
+                response.without_turns.unreadable
+            ),
+            (None, vec![1], 1),
+            "the unreadable session is counted and the other is ranked"
+        );
+        assert_eq!(loader.loads(), 1, "the model loads once");
+    }
+
+    #[test]
+    fn search_without_chunks_doesnt_wait_for_its_load_and_next_search_uses_that_load() {
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+        let without_turns = [conversation("/projects/project-a/session-a.jsonl", vec![])];
+        let with_turns = [conversation(
+            "/projects/project-a/session-a.jsonl",
+            vec!["alpha question"],
+        )];
+
+        send_search_of_corpus(&tx, &without_turns, 1, "alpha", 1);
+        loader.wait_for_start();
+        let without_chunks = recv_complete(&rx);
+        send_search_of_corpus(&tx, &with_turns, 2, "alpha", 2);
+        recv_initializing_model(&rx, 2);
+        loader.release();
+        let ranked = recv_complete(&rx);
+
+        assert_eq!(
+            (without_chunks.error, without_chunks.filtered),
+            (None, Vec::new()),
+            "the search without chunks completes while its load is held"
+        );
+        assert_eq!(
+            (ranked.error, ranked.filtered, loader.loads()),
+            (None, vec![0], 1),
+            "the next search ranks with the load the first one started"
+        );
+    }
+
+    #[test]
+    fn search_joining_an_earlier_searchs_failed_load_loads_again_and_ranks() {
+        let (loader, load_model) = GatedLoader::new(|load| match load {
+            0 => Err(crate::error::AppError::InvalidEmbeddings(
+                "the model is unavailable".to_owned(),
+            )),
+            _ => unit_embedder(load),
+        });
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+        let without_turns = [conversation("/projects/project-a/session-a.jsonl", vec![])];
+        let with_turns = [conversation(
+            "/projects/project-a/session-a.jsonl",
+            vec!["alpha question"],
+        )];
+
+        send_search_of_corpus(&tx, &without_turns, 1, "alpha", 1);
+        loader.wait_for_start();
+        recv_complete(&rx);
+        loader.release();
+        send_search_of_corpus(&tx, &with_turns, 2, "alpha", 2);
+        loader.wait_for_start();
+        loader.release();
+        let ranked = recv_complete(&rx);
+
+        assert_eq!(
+            (ranked.error, ranked.filtered, loader.loads()),
+            (None, vec![0], 2),
+            "the search loads the model again and ranks with that load"
+        );
+    }
+
+    /// A corpus with turns in its first row alone.
+    fn rows_with_turns_in_the_first() -> [Conversation; 2] {
+        [
+            conversation(
+                "/projects/project-a/session-a.jsonl",
+                vec!["alpha question"],
+            ),
+            conversation("/projects/project-a/session-b.jsonl", vec![]),
+        ]
+    }
+
+    /// The cache's reads wait at a closed gate throughout.
+    #[test]
+    fn search_over_an_empty_scope_completes_without_reading_turns_or_loading_the_model() {
+        let sessions = crate::search::test_fixtures::cached_claude_sessions(&[(
+            "read",
+            vec![question("alpha question")],
+        )]);
+        let gate =
+            crate::tui::app::test_waits::ConnectionGate::closed(sessions.cache_path(), |_| true);
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+
+        send_search_in_scope(&tx, &sessions.rows, 1, vec![], "alpha", 1);
+        let response = recv_complete(&rx);
+        gate.open();
+
+        assert_eq!(
+            (
+                response.error,
+                response.filtered,
+                response.progress,
+                loader.loads()
+            ),
+            (None, Vec::new(), SemanticProgress::EmptyCorpus, 0),
+            "the search completes empty and doesn't load the model"
+        );
+    }
+
+    #[test]
+    fn prewarm_with_an_empty_scope_prewarms_the_full_corpus() {
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+        let rows = corpus(vec![conversation(
+            "/projects/project-a/session-a.jsonl",
+            vec!["alpha question"],
+        )]);
+
+        send_commands(&tx, 1, rows, Vec::new(), "", true);
+        loader.wait_for_start();
+        loader.release();
+        let prewarmed = recv_complete(&rx);
+
+        assert_eq!(
+            (
+                prewarmed.prewarm,
+                prewarmed.error,
+                prewarmed.progress,
+                loader.loads()
+            ),
+            (true, None, SemanticProgress::CacheReady, 1),
+            "the prewarm embeds the full corpus's turns"
+        );
+    }
+
+    /// The rows are the worker's alone once the test drops its own.
+    #[test]
+    fn emptied_corpus_drops_the_earlier_rows_without_reading_or_loading() {
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+        let rows = corpus(vec![conversation(
+            "/projects/project-a/session-a.jsonl",
+            vec!["alpha question"],
+        )]);
+        let earlier_row = Arc::downgrade(&rows[0]);
+
+        send_commands(&tx, 1, rows, vec![0], "alpha", false);
+        loader.wait_for_start();
+        loader.release();
+        let ranked = recv_complete(&rx);
+        send_commands(&tx, 2, corpus(Vec::new()), Vec::new(), "alpha", false);
+        let emptied = recv_complete(&rx);
+
+        assert_eq!(ranked.filtered, vec![0], "the first search ranks the row");
+        assert_eq!(
+            (emptied.progress, loader.loads()),
+            (SemanticProgress::EmptyCorpus, 1),
+            "the search over the empty corpus completes without loading again"
+        );
+        assert!(
+            earlier_row.upgrade().is_none(),
+            "the worker drops the earlier corpus's row"
+        );
+    }
+
+    /// Sends `rows` as the corpus of `version`, the rows at `scope` as its
+    /// scope, and a request for `query`, a prewarm when `prewarm` is set,
+    /// of generation `version`.
+    fn send_commands(
+        tx: &mpsc::Sender<SemanticWorkerCommand>,
+        version: u64,
+        rows: Arc<Vec<Arc<Conversation>>>,
+        scope: Vec<usize>,
+        query: &str,
+        prewarm: bool,
+    ) {
+        for command in [
+            SemanticWorkerCommand::UpdateCorpus {
+                corpus_version: version,
+                conversations: rows,
+            },
+            SemanticWorkerCommand::UpdateScope {
+                corpus_version: version,
+                scope_version: version,
+                indices: Arc::new(scope),
+            },
+            SemanticWorkerCommand::Search {
+                generation: version,
+                query: ParsedQuery::parse(query),
+                corpus_version: version,
+                scope_version: version,
+                prewarm,
+            },
+        ] {
+            tx.send(command).expect("send command");
+        }
+    }
+
+    /// Waits until `model`'s load ends.
+    fn wait_until_load_ends(model: &Model) {
+        let deadline = std::time::Instant::now() + WORKER_RESPONSE_TIMEOUT;
+        while !matches!(&model.state, ModelState::Loading { load, .. } if load.is_finished()) {
+            assert!(std::time::Instant::now() < deadline, "the model load ends");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The first load fails and ends before the request that loads again;
+    /// the second load waits until the request reports its wait.
+    #[test]
+    fn load_started_again_after_an_earlier_requests_failed_load_reports_its_wait() {
+        let (loader, load_model) = GatedLoader::new(|load| match load {
+            0 => Err(crate::error::AppError::InvalidEmbeddings(
+                "the model is unavailable".to_owned(),
+            )),
+            _ => unit_embedder(load),
+        });
+        let mut model = Model::new(load_model);
+        model.start_loading(1);
+        loader.wait_for_start();
+        loader.release();
+        wait_until_load_ends(&model);
+
+        let mut waits = 0;
+        let loaded = model
+            .wait_for_model(2, &SemanticCancellationToken::new(), || {
+                waits += 1;
+                loader.release();
+            })
+            .is_ok();
+
+        assert_eq!(
+            (loaded, waits, loader.loads()),
+            (true, 1, 2),
+            "the request reports one wait, for the load started again"
+        );
+    }
+
+    #[test]
+    fn search_whose_scope_doesnt_hold_turns_completes_while_its_load_is_held() {
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
+        let (tx, rx, _cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+        let rows = rows_with_turns_in_the_first();
+
+        send_search_in_scope(&tx, &rows, 1, vec![1], "alpha", 1);
+        let without_turns = recv_complete(&rx);
+        loader.release();
+        send_search_in_scope(&tx, &rows, 2, vec![0], "alpha", 2);
+        let ranked = recv_complete(&rx);
+
+        assert_eq!(
+            (
+                without_turns.error,
+                without_turns.filtered,
+                without_turns.progress
+            ),
+            (None, Vec::new(), SemanticProgress::EmptyCorpus),
+            "the search completes empty without waiting for the model"
+        );
+        assert_eq!(
+            (ranked.error, ranked.filtered),
+            (None, vec![0]),
+            "the next search ranks the turns outside the first one's scope"
+        );
+    }
+
+    #[test]
+    fn cancelled_search_stops_waiting_for_the_model_and_the_next_search_uses_its_load() {
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
+        let (tx, rx, cancellation) =
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
+        let rows = [conversation(
+            "/projects/project-a/session-a.jsonl",
+            vec!["alpha question"],
+        )];
+
+        send_search(&tx, &rows, "alpha", 1);
+        recv_initializing_model(&rx, 1);
+        cancellation.cancel();
+        send_search(&tx, &rows, "", 2);
+        let cancelled = recv_complete(&rx);
+        let without_query = recv_complete(&rx);
+        loader.release();
+        send_search(&tx, &rows, "alpha", 3);
+        let ranked = recv_complete(&rx);
+
+        assert_eq!(
+            (cancelled.generation, cancelled.progress),
+            (1, SemanticProgress::Failed),
+            "the cancelled search ends while the load is held: {:?}",
+            cancelled.error
+        );
+        assert_eq!(
+            (without_query.generation, without_query.progress),
+            (2, SemanticProgress::Idle),
+            "the search without a query completes while the load is held"
+        );
+        assert_eq!(
+            (
+                ranked.generation,
+                ranked.error,
+                ranked.filtered,
+                loader.loads()
+            ),
+            (3, None, vec![0], 1),
+            "the next search ranks with the load the cancelled one started"
+        );
     }
 }

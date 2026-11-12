@@ -1,12 +1,326 @@
-use super::{App, AppMode, CountHighlight, DialogMode, Focus, ViewSearchMode, ViewState};
-use crate::history::Conversation;
+use super::session_store::FinishedRefresh;
+use super::{
+    App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, OpenSessionStatus, ViewSearchMode,
+    ViewState,
+};
+use crate::history::provider::{SessionRead, SessionTitle};
+use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
+use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
 use crate::tui::viewer::{
-    CallArea, CallRange, EntryRelocation, MessageRange, RenderOptions, ToolOutputId, find_matches,
+    CallArea, CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderOptions,
+    ToolOutputId, ViewedConversation, find_matches, parse_conversation_file_interactively,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+
+/// The open session's row as its finished refresh read it, for the viewer's
+/// read of the session from the cache.
+pub(super) struct ReloadedSession {
+    publication: Publication,
+    session_id: Option<String>,
+    /// The header of the row the refresh listed, or of the row a file outside
+    /// every provider's session roots parsed into.
+    row: Option<HeaderRow>,
+    /// The title stored beside the transcript, as the listed row shows it.
+    external_title: Option<SessionTitle>,
+    /// The row's address in the cache; `None` for a file outside every
+    /// provider's session roots.
+    address: Option<SessionAddress>,
+    /// The conversation a file outside every provider's session roots parsed
+    /// into; `None` for a session the viewer reads from the cache.
+    parsed: Option<Arc<ParsedConversation>>,
+}
+
+impl ReloadedSession {
+    /// The file opened directly, outside every provider's session roots, as
+    /// the background worker parsed it into `row`.
+    pub(super) fn parsed(conversation: ParsedConversation, row: Option<&Conversation>) -> Self {
+        Self {
+            publication: Publication::Unpublished {
+                discovered: Vec::new(),
+            },
+            session_id: row.map(|row| row.session_id.clone()),
+            row: row.map(HeaderRow::of),
+            external_title: None,
+            address: None,
+            parsed: Some(Arc::new(conversation)),
+        }
+    }
+}
+
+impl ViewState {
+    /// Replace the view's publication with `reloaded`'s, or with the
+    /// publication of the copy the read adopted in the row's place. The
+    /// header shows `copy_row`, the catalogue row of the copy the view
+    /// shows, or `reloaded`'s row while the view doesn't show a copy.
+    fn show_reloaded_row(&mut self, reloaded: ReloadedHeader, copy_row: Option<Box<Conversation>>) {
+        if let Some(row) = reloaded.row {
+            self.external_title = reloaded.external_title;
+            self.header = Some(row);
+        }
+        self.publication = reloaded.publication;
+        self.adopt(reloaded.adopted);
+        self.show_copy_header(copy_row);
+    }
+
+    /// Read the open session's copies against `adopted`'s publication, when
+    /// the read adopted a copy.
+    fn adopt(&mut self, adopted: Option<AdoptedCopy>) {
+        if let Some(adopted) = adopted {
+            self.publication = adopted.publication;
+        }
+    }
+
+    /// Show `copy_row`, the catalogue row of the copy the view shows, as the
+    /// header, with the row's external title: the copy holds its parse's
+    /// title. Without a row, the header stays as it is.
+    fn show_copy_header(&mut self, copy_row: Option<Box<Conversation>>) {
+        if let Some(copy_row) = copy_row {
+            self.header = Some(HeaderRow::of_copy(*copy_row, self.external_title.as_ref()));
+        }
+    }
+}
+
+/// The open session's refreshed row once its refresh is read again, with its
+/// `publication`, and `adopted`, the copy the read adopted in its place.
+struct ReloadedHeader {
+    row: Option<HeaderRow>,
+    external_title: Option<SessionTitle>,
+    publication: Publication,
+    adopted: Option<AdoptedCopy>,
+}
+
+/// A copy or export asked for while the open session's refresh was pending,
+/// or an export asked for while its copy was out of date or missing.
+pub(super) enum DeferredCopy {
+    /// The export menu's `option`, to the clipboard or to a file.
+    Export { option: usize, to_clipboard: bool },
+    /// The focused message or call, in a viewport `viewport_height` rows high.
+    Focused { viewport_height: usize },
+}
+
+/// A row the viewer opens, as the list held it when the open began.
+pub(super) struct OpenedRow {
+    path: PathBuf,
+    source: Source,
+    session_id: String,
+    publication: Publication,
+    cache_address: Option<SessionAddress>,
+    external_title: Option<SessionTitle>,
+    header: HeaderRow,
+}
+
+impl OpenedRow {
+    pub(super) fn of(row: &Conversation) -> Self {
+        Self {
+            path: row.path.clone(),
+            source: row.source,
+            session_id: row.session_id.clone(),
+            publication: row.publication.clone(),
+            cache_address: row.cache_address.clone(),
+            external_title: row.external_title.clone(),
+            header: HeaderRow::of(row),
+        }
+    }
+
+    /// The viewer's read of the row's copy in `cache`; `None` for a row
+    /// without an address in the cache.
+    fn read(&self, cache: &InteractiveCache) -> Option<InteractiveRead<ViewedConversation>> {
+        let address = self.cache_address.as_ref()?;
+        Some(parse_conversation_file_interactively(
+            cache,
+            address,
+            &self.publication,
+        ))
+    }
+}
+
+/// A read of the session cache for the viewer, running on a thread of its
+/// own so the drawing thread keeps drawing while it runs.
+pub(super) struct ViewerRead<T> {
+    read: mpsc::Receiver<T>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// A row the viewer opens, with the viewer's read of its copy.
+pub(super) type RowRead = (OpenedRow, Option<InteractiveRead<ViewedConversation>>);
+
+/// The open session's row as its finished refresh read it, with the viewer's
+/// read of its copy; `None` for a row without an address in the cache.
+pub(super) type ReloadRead = (ReloadedSession, Option<InteractiveRead<ViewedConversation>>);
+
+impl ViewerRead<RowRead> {
+    /// The viewer's read of `row`'s copy in `cache`.
+    pub(super) fn of_row(row: OpenedRow, cache: InteractiveCache) -> Self {
+        Self::start(move || {
+            let read = row.read(&cache);
+            (row, read)
+        })
+    }
+}
+
+impl<T: Send + 'static> ViewerRead<T> {
+    fn start(read: impl FnOnce() -> T + Send + 'static) -> Self {
+        let (send, receive) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("viewer-read".into())
+            .spawn(move || {
+                let _ = send.send(read());
+            })
+            .expect("failed to spawn the viewer's read thread");
+        Self {
+            read: receive,
+            thread,
+        }
+    }
+
+    /// The read, once it lands within `wait`; `Err(self)` while it runs. A
+    /// panic on the read's thread resumes here.
+    pub(super) fn finish(self, wait: Duration) -> Result<T, Self> {
+        match self.read.recv_timeout(wait) {
+            Ok(read) => Ok(read),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(self),
+            Err(mpsc::RecvTimeoutError::Disconnected) => match self.thread.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(()) => panic!("the viewer's read thread ended without its read"),
+            },
+        }
+    }
+}
+
+/// The open session's reload, once its refresh finished: the viewer shows it
+/// on the next frame, or once the read of its copy lands.
+pub(super) enum PendingReload {
+    /// A file opened directly, already parsed, or a row without an address in
+    /// the cache.
+    Ready(Box<ReloadedSession>),
+    /// At most one read runs: a newer refresh finishing meanwhile is
+    /// `queued`, and its read starts once this one lands.
+    Reading {
+        read: ViewerRead<ReloadRead>,
+        queued: Option<Box<ReloadedSession>>,
+    },
+}
+
+/// A landed reload, and the newer refresh's row to read next.
+pub(super) type LandedReload = (ReloadRead, Option<Box<ReloadedSession>>);
+
+impl PendingReload {
+    /// `reloaded`, reading its copy in `cache` when it has one.
+    pub(super) fn start(reloaded: Box<ReloadedSession>, cache: InteractiveCache) -> Self {
+        if reloaded.parsed.is_some() {
+            return Self::Ready(reloaded);
+        }
+        let Some(address) = reloaded.address.clone() else {
+            return Self::Ready(reloaded);
+        };
+        Self::Reading {
+            read: ViewerRead::start(move || {
+                let read =
+                    parse_conversation_file_interactively(&cache, &address, &reloaded.publication);
+                (*reloaded, Some(read))
+            }),
+            queued: None,
+        }
+    }
+
+    /// This reload followed by `newer`, a later refresh's: a read running
+    /// keeps running with `newer` queued; otherwise `newer` replaces it.
+    fn followed_by(self, newer: Box<ReloadedSession>, cache: InteractiveCache) -> Self {
+        match self {
+            Self::Ready(_) => Self::start(newer, cache),
+            Self::Reading { read, .. } => Self::Reading {
+                read,
+                queued: Some(newer),
+            },
+        }
+    }
+
+    /// The reload and the row queued behind it, once its read lands within
+    /// `wait`; `Err(self)` while it runs.
+    pub(super) fn finish(self, wait: Duration) -> Result<LandedReload, Self> {
+        match self {
+            Self::Ready(reloaded) => Ok(((*reloaded, None), None)),
+            Self::Reading { read, queued } => match read.finish(wait) {
+                Ok(read) => Ok((read, queued)),
+                Err(read) => Err(Self::Reading { read, queued }),
+            },
+        }
+    }
+
+    pub(super) fn is_reading(&self) -> bool {
+        matches!(self, Self::Reading { .. })
+    }
+}
+
+/// A finished refresh's read of the open session.
+enum OpenSessionRead {
+    Listed(Box<ReloadedSession>),
+    /// Gone or empty, with the status that names which.
+    Gone(&'static str),
+    /// The read or the whole refresh failed, with the status to show.
+    Failed(String),
+}
+
+impl OpenSessionRead {
+    /// `finished`'s read of the session at `path`; `None` when it didn't read
+    /// that session.
+    fn in_finished(finished: &FinishedRefresh, path: &Path) -> Option<Self> {
+        match finished {
+            FinishedRefresh::Failed(error) => {
+                Some(Self::Failed(format!("Refresh failed: {error}")))
+            }
+            FinishedRefresh::Reads(reads) => {
+                let read = reads.iter().find(|read| read.path == path)?;
+                Some(match &read.read {
+                    SessionRead::Listed(row) => Self::listed(row),
+                    SessionRead::Missing => Self::Gone("Session not found"),
+                    SessionRead::Empty(_) => Self::Gone("Session is empty"),
+                    SessionRead::Failed(..) | SessionRead::NotCached => Self::read_failed(),
+                })
+            }
+            FinishedRefresh::Changes(changes) => {
+                if let Some(updated) = changes
+                    .updated
+                    .iter()
+                    .find(|updated| updated.row.path == path)
+                {
+                    return Some(Self::listed(&updated.row));
+                }
+                if changes.removed.iter().any(|removed| removed == path) {
+                    return Some(Self::Gone("Session not found"));
+                }
+                changes
+                    .kept
+                    .iter()
+                    .any(|kept| kept.path == path)
+                    .then(Self::read_failed)
+            }
+        }
+    }
+
+    fn listed(row: &Conversation) -> Self {
+        Self::Listed(Box::new(ReloadedSession {
+            publication: row.publication.clone(),
+            session_id: Some(row.session_id.clone()),
+            row: Some(HeaderRow::of(row)),
+            external_title: row.external_title.clone(),
+            address: row.cache_address.clone(),
+            parsed: None,
+        }))
+    }
+
+    fn read_failed() -> Self {
+        Self::Failed(SESSION_READ_FAILED.to_owned())
+    }
+}
+
+/// The status of a refresh that could not read the open session.
+pub(super) const SESSION_READ_FAILED: &str = "Refresh failed: the session could not be read";
 
 impl App {
     /// Open the selected session at once; the event loop defers through
@@ -19,19 +333,41 @@ impl App {
         let Some(&conv_idx) = self.filtered.get(selected) else {
             return;
         };
-        self.open_conversation(conv_idx, frame_width);
+        let row = OpenedRow::of(&self.conversations[conv_idx]);
+        let read = row.read(&self.interactive_cache());
+        self.show_opened(row, read, frame_width);
     }
 
-    pub(super) fn open_conversation(&mut self, conv_idx: usize, frame_width: usize) {
-        use crate::tui::viewer::{
-            content_width, parse_conversation_file, render_parsed_conversation,
+    /// Show `row` in the viewer, from `read`, the viewer's read of its copy.
+    pub(super) fn show_opened(
+        &mut self,
+        row: OpenedRow,
+        read: Option<InteractiveRead<ViewedConversation>>,
+        frame_width: usize,
+    ) {
+        use crate::tui::viewer::{content_width, render_parsed_conversation};
+
+        let OpenedRow {
+            path,
+            source,
+            session_id,
+            publication,
+            cache_address,
+            external_title,
+            header,
+        } = row;
+        let (copy, adopted) = match read {
+            Some(read) => self
+                .take_interactive(&path, read)
+                .current_or_older_with_adopted(),
+            None => (None, None),
         };
-
-        let path = self.conversations[conv_idx].path.clone();
-        let source = self.conversations[conv_idx].source;
-        let session_id = Some(self.conversations[conv_idx].session_id.clone());
-        let subagents = self.conversations[conv_idx].subagents.clone();
-
+        let is_copy_missing = copy.is_none();
+        let (conversation, copy_row) = match copy {
+            Some(copy) => (copy.conversation, copy.row),
+            None => (ParsedConversation::empty(), None),
+        };
+        let conversation = Arc::new(conversation);
         let options = RenderOptions {
             tool_display: self.tool_display,
             show_thinking: self.show_thinking,
@@ -39,53 +375,253 @@ impl App {
             content_width: content_width(frame_width, self.show_timing),
             expanded_tool_outputs: BTreeSet::new(),
             can_expand: true,
+            today: self.today(),
+            zone: self.clock().zone(),
         };
+        let rendered = render_parsed_conversation(&conversation, &options);
+        let total_lines = rendered.lines.len();
+        let first_msg = (!rendered.messages.is_empty()).then_some(Focus {
+            message_index: 0,
+            call_index: None,
+        });
+        let mut state = ViewState {
+            conversation_path: path,
+            conversation_source: Some(source),
+            cache_address,
+            session_id: Some(session_id),
+            publication,
+            header: Some(header),
+            external_title,
+            parsed_conversation: conversation,
+            scroll_offset: 0,
+            rendered_lines: rendered.lines,
+            total_lines,
+            tool_display: self.tool_display,
+            show_thinking: self.show_thinking,
+            show_timing: self.show_timing,
+            frame_width,
+            search_mode: ViewSearchMode::Off,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match_index: 0,
+            message_ranges: rendered.messages,
+            call_ranges: rendered.calls,
+            focus: first_msg,
+            message_nav_active: false,
+            expanded_tool_outputs: BTreeSet::new(),
+            hovered_tool_output: None,
+            count_highlight: None,
+            is_copy_missing,
+        };
+        state.adopt(adopted);
+        state.show_copy_header(copy_row);
+        self.app_mode = AppMode::View(state);
+    }
 
-        match parse_conversation_file(source, &path, &subagents) {
-            Ok(conversation) => {
-                let conversation = Arc::new(conversation);
-                let rendered = render_parsed_conversation(&conversation, &options);
-                let total_lines = rendered.lines.len();
-                let first_msg = (!rendered.messages.is_empty()).then_some(Focus {
-                    message_index: 0,
-                    call_index: None,
-                });
-                self.app_mode = AppMode::View(ViewState {
-                    conversation_path: path,
-                    conversation_source: source,
-                    session_id,
-                    subagents,
-                    parsed_conversation: Some(conversation),
-                    scroll_offset: 0,
-                    rendered_lines: rendered.lines,
-                    total_lines,
-                    tool_display: self.tool_display,
-                    show_thinking: self.show_thinking,
-                    show_timing: self.show_timing,
-                    frame_width,
-                    search_mode: ViewSearchMode::Off,
-                    search_query: String::new(),
-                    search_matches: Vec::new(),
-                    current_match_index: 0,
-                    message_ranges: rendered.messages,
-                    call_ranges: rendered.calls,
-                    focus: first_msg,
-                    message_nav_active: false,
-                    expanded_tool_outputs: BTreeSet::new(),
-                    hovered_tool_output: None,
-                    count_highlight: None,
-                });
+    /// Ask for the open session to be read again (`Ctrl+R`): through a
+    /// session refresh, or, for a file opened directly outside every
+    /// provider's session roots, through the background worker's read of it.
+    pub(super) fn request_open_session_refresh(&mut self) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        if self.store.refuses_session_refreshes() {
+            self.direct_file_read
+                .get_or_insert(super::DirectFileJob::Requested);
+            return;
+        }
+        let path = state.conversation_path.clone();
+        self.store.request_session_refresh(&path);
+    }
+
+    /// The open session's path as path display (`p`) and path copy (`Y`)
+    /// show it: a file opened directly as the user typed it.
+    pub(super) fn open_session_path_text(&self) -> Option<String> {
+        let AppMode::View(state) = &self.app_mode else {
+            return None;
+        };
+        let path = self
+            .opened_file_typed_path
+            .as_ref()
+            .unwrap_or(&state.conversation_path);
+        Some(path.display().to_string())
+    }
+
+    /// True while the open session's refresh waits, runs or awaits another
+    /// refresh, until the viewer shows its reload, and while the background
+    /// worker reads the file opened directly.
+    pub fn is_open_session_updating(&self) -> bool {
+        match &self.app_mode {
+            AppMode::View(state) => {
+                self.direct_file_read.is_some()
+                    || self.pending_view_reload.is_some()
+                    || self.store.is_refresh_pending(&state.conversation_path)
             }
-            Err(e) => {
-                self.status_message =
-                    Some((format!("Failed to open: {}", e), std::time::Instant::now()));
+            AppMode::List => false,
+        }
+    }
+
+    /// The open session's pending refresh as the viewer labels it; `None`
+    /// while no refresh of it is pending. A refresh awaiting another
+    /// rearview's refresh, or running while its job waits for another
+    /// rearview, is that rearview's activity.
+    pub fn open_session_status(&self) -> Option<OpenSessionStatus> {
+        let AppMode::View(state) = &self.app_mode else {
+            return None;
+        };
+        if !self.is_open_session_updating() {
+            return None;
+        }
+        let path = &state.conversation_path;
+        let another_rearview = self.store.another_rearview_awaited_by(path).or_else(|| {
+            self.cache_wait
+                .filter(|_| self.store.is_in_running_session_refresh(path))
+        });
+        Some(match another_rearview {
+            Some(activity) => OpenSessionStatus::AnotherRearview(activity),
+            None if state.is_copy_missing => OpenSessionStatus::Loading,
+            None => OpenSessionStatus::Updating,
+        })
+    }
+
+    /// When the newest finished refresh read the open session: start reading
+    /// it again from the cache, or queue that read behind one still running;
+    /// leave the viewer for a session that is gone or empty, or report the
+    /// failed read.
+    /// The list applies the refresh itself once the viewer closes. A file
+    /// opened directly keeps the viewer when it is gone or empty.
+    pub(super) fn follow_open_session(&mut self) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        let read = self
+            .store
+            .newest_finished()
+            .and_then(|finished| OpenSessionRead::in_finished(finished, &state.conversation_path));
+        match read {
+            Some(OpenSessionRead::Listed(reloaded)) => {
+                let cache = self.interactive_cache();
+                let reload = match self.pending_view_reload.take() {
+                    Some(pending) => pending.followed_by(reloaded, cache),
+                    None => PendingReload::start(reloaded, cache),
+                };
+                self.pending_view_reload = Some(reload);
             }
+            Some(OpenSessionRead::Gone(status)) => {
+                self.deferred_copy = None;
+                if !self.single_file_mode {
+                    self.exit_view_mode();
+                }
+                self.set_status(status.to_owned());
+            }
+            Some(OpenSessionRead::Failed(status)) => {
+                self.set_status(status);
+                self.run_deferred_copy();
+            }
+            None => {}
+        }
+    }
+
+    /// Show the open session again after its refresh finished, as `reloaded`
+    /// lists it, from `read`, the viewer's read of its copy, or the file
+    /// opened directly as parsed, keeping the reader's place. The first read
+    /// of a file opened directly shows from the top, as an open does. A copy
+    /// asked for meanwhile runs once nothing more is pending.
+    pub(super) fn reload_open_session(
+        &mut self,
+        viewport_height: usize,
+        reloaded: ReloadedSession,
+        read: Option<InteractiveRead<ViewedConversation>>,
+    ) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        let path = state.conversation_path.clone();
+        let is_first_read_of_opened_file = self.single_file_mode && state.is_copy_missing;
+        let (conversation, copy_row, adopted) = match (reloaded.parsed, read) {
+            (Some(conversation), _) => (Some(conversation), None, None),
+            (None, Some(read)) => {
+                match self
+                    .take_interactive(&path, read)
+                    .current_or_older_with_adopted()
+                {
+                    (Some(copy), adopted) => (Some(Arc::new(copy.conversation)), copy.row, adopted),
+                    (None, _) => (None, None, None),
+                }
+            }
+            (None, None) => (None, None, None),
+        };
+        if let AppMode::View(state) = &mut self.app_mode {
+            state.cache_address = reloaded.address;
+        }
+        if let Some(conversation) = conversation {
+            let header = ReloadedHeader {
+                row: reloaded.row,
+                external_title: reloaded.external_title,
+                publication: reloaded.publication,
+                adopted,
+            };
+            if is_first_read_of_opened_file {
+                if let AppMode::View(state) = &mut self.app_mode {
+                    state.parsed_conversation = conversation;
+                    state.show_reloaded_row(header, copy_row);
+                    state.session_id = reloaded.session_id;
+                }
+                self.render_view(viewport_height, None, false);
+            } else {
+                self.show_reread_conversation(
+                    viewport_height,
+                    conversation,
+                    header,
+                    copy_row,
+                    reloaded.session_id,
+                );
+            }
+            if let AppMode::View(state) = &mut self.app_mode {
+                state.is_copy_missing = false;
+            }
+        }
+        self.run_deferred_copy();
+    }
+
+    /// True when a copy or export of the open session waits for its
+    /// pending refresh.
+    pub(super) fn defers_copy(&self) -> bool {
+        !self.store.refuses_session_refreshes() && self.is_open_session_updating()
+    }
+
+    /// Run the copy or export asked for while the open session's refresh
+    /// was pending, once no refresh or reload of the open session is
+    /// pending. An export whose copy is still out of date or missing reports
+    /// the failed read.
+    fn run_deferred_copy(&mut self) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        if self.store.is_refresh_pending(&state.conversation_path)
+            || self.pending_view_reload.is_some()
+        {
+            return;
+        }
+        match self.deferred_copy.take() {
+            Some(DeferredCopy::Export {
+                option,
+                to_clipboard,
+            }) => match self.current_export_entries() {
+                Some(entries) => self.export_now(option, to_clipboard, Some(entries)),
+                None => self.set_status(SESSION_READ_FAILED.to_owned()),
+            },
+            Some(DeferredCopy::Focused { viewport_height }) => {
+                self.copy_focused_now(viewport_height);
+            }
+            None => {}
         }
     }
 
     pub fn exit_view_mode(&mut self) {
         self.app_mode = AppMode::List;
-        self.pending_view_refresh = false;
+        self.pending_view_reload = None;
+        self.deferred_copy = None;
     }
 
     pub(super) fn start_view_search(&mut self) {
@@ -237,120 +773,19 @@ impl App {
         self.render_view(viewport_height, None, false);
     }
 
-    /// Read the open session again (`Ctrl+R`): new messages appear, its row
-    /// in the list updates, and the view keeps the reader's place. A changed
-    /// message count is marked in the view; a refresh reports nothing else
-    /// unless it failed. A session no longer found, or now empty, returns to
-    /// the list. False when no session is open, so nothing was read.
-    pub(super) fn refresh_open_session(&mut self, viewport_height: usize) -> bool {
-        use crate::history::format::same_file;
-        use crate::history::provider::SessionRead;
-        use crate::tui::viewer::parse_conversation_file;
-
-        let AppMode::View(state) = &self.app_mode else {
-            return false;
-        };
-        let path = state.conversation_path.clone();
-        let source = state.conversation_source;
-        self.note_changed_during_refresh(&path);
-        let row_index = self
-            .conversations
-            .iter()
-            .position(|row| same_file(&row.path, &path));
-        match self.read_open_session(&path, source, row_index) {
-            Some(SessionRead::Listed(row)) => {
-                let subagents = row.subagents.clone();
-                match parse_conversation_file(source, &path, &subagents) {
-                    Ok(conversation) => {
-                        let session_id = Some(row.session_id.clone());
-                        self.store_open_session_row(row_index, Some(*row));
-                        self.show_reread_conversation(
-                            viewport_height,
-                            Arc::new(conversation),
-                            subagents,
-                            session_id,
-                        );
-                    }
-                    Err(error) => self.set_status(format!("Refresh failed: {error}")),
-                }
-            }
-            Some(SessionRead::Failed(_)) => {
-                self.set_status("Refresh failed: the session could not be read".to_owned());
-            }
-            None => self.leave_session_gone_or_empty(row_index, "Session not found"),
-            Some(SessionRead::Empty) => {
-                self.leave_session_gone_or_empty(row_index, "Session is empty");
-            }
-        }
-        true
-    }
-
-    /// Return to the list from an open session that is gone or now empty,
-    /// removing its row, and show `message`. A file opened directly keeps the
-    /// view.
-    fn leave_session_gone_or_empty(&mut self, row_index: Option<usize>, message: &str) {
-        if !self.single_file_mode {
-            self.store_open_session_row(row_index, None);
-            self.exit_view_mode();
-        }
-        self.set_status(message.to_owned());
-    }
-
-    /// The open session read again as the list builds its row. A file opened
-    /// directly is read by the format it was opened with, since no agent's
-    /// discovery lists it.
-    fn read_open_session(
-        &self,
-        path: &std::path::Path,
-        source: crate::history::Source,
-        row_index: Option<usize>,
-    ) -> Option<crate::history::provider::SessionRead> {
-        use crate::history::provider::{ReadError, SessionRead};
-
-        if self.single_file_mode {
-            if !path.exists() {
-                return None;
-            }
-            return Some(
-                match super::read_single_file(path, source, self.is_opened_file_stored) {
-                    Ok(Some(row)) => SessionRead::Listed(Box::new(row)),
-                    Ok(None) => SessionRead::Empty,
-                    Err(error) => SessionRead::Failed(ReadError::of(&error)),
-                },
-            );
-        }
-        let row = &self.conversations[row_index?];
-        (self.session_reader)(&[row], self.show_last)
-            .pop()
-            .flatten()
-    }
-
-    /// Replace the open session's row with `row`, or remove it when `row` is
-    /// `None`.
-    fn store_open_session_row(&mut self, row_index: Option<usize>, row: Option<Conversation>) {
-        let Some(index) = row_index else {
-            return;
-        };
-        if self.single_file_mode {
-            if let Some(row) = row {
-                self.conversations[index] = row;
-            }
-            return;
-        }
-        self.update_listed_row(index, row);
-    }
-
     /// Show `conversation`, the open session read again, where the reader
     /// was: at the bottom, the view stays at the bottom so new messages show;
     /// otherwise the same message stays at the top. Expanded rows stay
     /// expanded where their entry is still there. A changed message count,
     /// counted as message navigation steps through them, sets the view's
-    /// `CountHighlight`.
+    /// `CountHighlight`. The header shows `copy_row`, the conversation's
+    /// copy's catalogue row, or `header`'s row without it.
     fn show_reread_conversation(
         &mut self,
         viewport_height: usize,
         conversation: Arc<crate::tui::viewer::ParsedConversation>,
-        subagents: Vec<std::path::PathBuf>,
+        header: ReloadedHeader,
+        copy_row: Option<Box<Conversation>>,
         session_id: Option<String>,
     ) {
         let AppMode::View(state) = &mut self.app_mode else {
@@ -358,29 +793,25 @@ impl App {
         };
         let is_at_bottom = state.is_at_bottom(viewport_height);
         let messages_before = state.message_ranges.len();
-        let relocation = state
-            .parsed_conversation
-            .as_ref()
-            .map(|earlier| EntryRelocation::between(earlier, &conversation));
-        if let Some(relocation) = &relocation {
-            state.expanded_tool_outputs = state
-                .expanded_tool_outputs
-                .iter()
-                .filter_map(|id| relocation.tool_output_id(id))
-                .collect();
-        }
+        let relocation = EntryRelocation::between(&state.parsed_conversation, &conversation);
+        state.expanded_tool_outputs = state
+            .expanded_tool_outputs
+            .iter()
+            .filter_map(|id| relocation.tool_output_id(id))
+            .collect();
         state.hovered_tool_output = None;
-        state.subagents = subagents;
+        state.show_reloaded_row(header, copy_row);
         state.session_id = session_id;
-        state.parsed_conversation = Some(conversation);
-        self.render_view(viewport_height, relocation.as_ref(), is_at_bottom);
+        state.parsed_conversation = conversation;
+        self.render_view(viewport_height, Some(&relocation), is_at_bottom);
+        let now = self.clock().now();
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
         let messages_after = state.message_ranges.len();
         if messages_after != messages_before {
             state.count_highlight = Some(CountHighlight {
-                until: std::time::Instant::now() + COUNT_HIGHLIGHT,
+                until: now + COUNT_HIGHLIGHT,
                 arrived_below: (is_at_bottom && messages_after > messages_before)
                     .then(|| messages_after - messages_before),
             });
@@ -398,18 +829,11 @@ impl App {
         relocation: Option<&EntryRelocation>,
         stick_to_bottom: bool,
     ) {
-        use crate::tui::viewer::{parse_conversation_file, render_parsed_conversation};
+        use crate::tui::viewer::render_parsed_conversation;
+
+        let clock = Arc::clone(self.environment.clock());
 
         if let AppMode::View(ref mut state) = self.app_mode {
-            let options = RenderOptions {
-                tool_display: state.tool_display,
-                show_thinking: state.show_thinking,
-                show_timing: state.show_timing,
-                content_width: state.content_width(),
-                expanded_tool_outputs: state.expanded_tool_outputs.clone(),
-                can_expand: true,
-            };
-
             let anchor = capture_anchor(
                 &state.message_ranges,
                 state.scroll_offset,
@@ -431,22 +855,17 @@ impl App {
                 });
             let old_scroll = state.scroll_offset;
 
-            let conversation = match state.parsed_conversation.clone() {
-                Some(conversation) => conversation,
-                None => match parse_conversation_file(
-                    state.conversation_source,
-                    &state.conversation_path,
-                    &state.subagents,
-                ) {
-                    Ok(conversation) => {
-                        let conversation = Arc::new(conversation);
-                        state.parsed_conversation = Some(conversation.clone());
-                        conversation
-                    }
-                    Err(_) => return,
-                },
+            let options = RenderOptions {
+                tool_display: state.tool_display,
+                show_thinking: state.show_thinking,
+                show_timing: state.show_timing,
+                content_width: state.content_width(),
+                expanded_tool_outputs: state.expanded_tool_outputs.clone(),
+                can_expand: true,
+                today: clock.today(),
+                zone: clock.zone(),
             };
-            let rendered = render_parsed_conversation(&conversation, &options);
+            let rendered = render_parsed_conversation(&state.parsed_conversation, &options);
             state.total_lines = rendered.lines.len();
             state.rendered_lines = rendered.lines;
             state.message_ranges = rendered.messages;
@@ -1044,8 +1463,7 @@ impl App {
         // The entry as the viewer read it: the file may have grown since.
         let text = state
             .parsed_conversation
-            .as_ref()
-            .and_then(|conversation| conversation.entry(entry_index))
+            .entry(entry_index)
             .map(|entry| crate::tui::export::format_entry_for_clipboard(entry, options));
 
         match text {
@@ -1057,7 +1475,17 @@ impl App {
         }
     }
 
+    /// Copy the focused call or message; while the open session's refresh is
+    /// pending, once it finishes, so the copy holds the newest messages.
     pub(super) fn copy_focused(&mut self, viewport_height: usize) {
+        if self.defers_copy() {
+            self.deferred_copy = Some(DeferredCopy::Focused { viewport_height });
+            return;
+        }
+        self.copy_focused_now(viewport_height);
+    }
+
+    fn copy_focused_now(&mut self, viewport_height: usize) {
         if self.focused_call_is_active() {
             self.copy_focused_call();
         } else {
@@ -1069,7 +1497,7 @@ impl App {
         match self.focused_call_text() {
             Ok(text) => self.copy_to_clipboard("Call", &text),
             Err(e) => {
-                self.status_message = Some((e, std::time::Instant::now()));
+                self.status_message = Some((e, self.clock().now()));
             }
         }
     }
@@ -1079,10 +1507,7 @@ impl App {
             return Err("Not viewing a conversation".to_string());
         };
         let call = Self::focused_call_range(state).ok_or_else(|| "No call focused".to_string())?;
-        let conversation = state
-            .parsed_conversation
-            .as_ref()
-            .ok_or_else(|| "Call not found".to_string())?;
+        let conversation = &state.parsed_conversation;
         crate::tui::export::extract_call_text(
             |entry_index| conversation.entry(entry_index),
             call.input.location,

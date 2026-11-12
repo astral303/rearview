@@ -1,10 +1,9 @@
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::debug_log;
 use crate::error::Result;
-use crate::history::{
-    Conversation, DisplayEntries, MalformedLine, display_log_entries, sniffed_display_log_entries,
-};
+use crate::history::{DisplayEntries, MalformedLine};
 use crate::pager;
 use crate::tui::viewer::{
     ParsedConversation, RenderedLine, parse_unattributed_conversation_file, parsed_conversation,
@@ -46,24 +45,12 @@ pub(crate) enum DisplayFormat {
     Plain,
 }
 
-/// The session the terminal printout shows for `selected_path`, read through
-/// its row's agent with the row's sub-agent transcripts. A path no row holds
-/// is read by whichever agent's format recognizes it.
-pub fn read_session_to_print(
-    conversations: &[Conversation],
-    selected_path: &Path,
-) -> Result<DisplayEntries> {
-    match conversations.iter().find(|row| row.path == selected_path) {
-        Some(row) => display_log_entries(row.source, &row.path, &row.subagents),
-        None => sniffed_display_log_entries(selected_path),
-    }
-}
-
 /// Print `session`, read from `file_path`, as the viewer's ledger.
 pub fn display_conversation(
     file_path: &Path,
     session: DisplayEntries,
     options: &DisplayOptions,
+    clock: &dyn Clock,
 ) -> Result<()> {
     let content_width = terminal_content_width();
     print_session(
@@ -71,6 +58,7 @@ pub fn display_conversation(
         session,
         options,
         DisplayFormat::Ledger { content_width },
+        clock,
     )
 }
 
@@ -79,8 +67,9 @@ pub fn display_conversation_plain(
     file_path: &Path,
     session: DisplayEntries,
     options: &DisplayOptions,
+    clock: &dyn Clock,
 ) -> Result<()> {
-    print_session(file_path, session, options, DisplayFormat::Plain)
+    print_session(file_path, session, options, DisplayFormat::Plain, clock)
 }
 
 fn print_session(
@@ -88,9 +77,15 @@ fn print_session(
     session: DisplayEntries,
     options: &DisplayOptions,
     format: DisplayFormat,
+    clock: &dyn Clock,
 ) -> Result<()> {
-    report_malformed_lines(file_path, &session.malformed_lines, options.debug_level);
-    let printed = Printout::of(session, options, format);
+    report_malformed_lines(
+        file_path,
+        &session.malformed_lines,
+        options.debug_level,
+        clock,
+    );
+    let printed = Printout::of(session, options, format, clock);
     write_through_pager(options.use_pager, |writer| {
         printed.write(writer, options.no_color);
     });
@@ -104,12 +99,20 @@ enum Printout {
 }
 
 impl Printout {
-    fn of(session: DisplayEntries, options: &DisplayOptions, format: DisplayFormat) -> Self {
+    /// The printout of `session` in `format`, printed on `clock`'s local
+    /// day.
+    fn of(
+        session: DisplayEntries,
+        options: &DisplayOptions,
+        format: DisplayFormat,
+        clock: &dyn Clock,
+    ) -> Self {
         match format {
             DisplayFormat::Ledger { content_width } => Self::Ledger(rendered_ledger_lines(
                 &parsed_conversation(session),
                 options,
                 content_width,
+                clock,
             )),
             DisplayFormat::Plain => Self::Plain(plain_text(
                 session,
@@ -132,7 +135,7 @@ impl Printout {
 }
 
 /// The terminal printout of `session` in `format`, uncolored and without a
-/// pager.
+/// pager, printed on the test clock's day.
 #[cfg(test)]
 pub(crate) fn printout(
     session: DisplayEntries,
@@ -140,7 +143,13 @@ pub(crate) fn printout(
     format: DisplayFormat,
 ) -> String {
     let mut printed = Vec::new();
-    Printout::of(session, options, format).write(&mut printed, true);
+    Printout::of(
+        session,
+        options,
+        format,
+        &crate::clock::TestClock::default(),
+    )
+    .write(&mut printed, true);
     String::from_utf8_lossy(&printed).into_owned()
 }
 
@@ -150,6 +159,7 @@ fn report_malformed_lines(
     file_path: &Path,
     malformed_lines: &[MalformedLine],
     debug_level: Option<DebugLevel>,
+    clock: &dyn Clock,
 ) {
     for line in malformed_lines {
         let Some(detail) = &line.detail else {
@@ -168,18 +178,21 @@ fn report_malformed_lines(
                 line.line_number,
                 &detail.error_message,
                 &detail.line_content,
+                clock,
             );
         }
     }
 }
 
 /// The viewer's ledger rows for `conversation`, as `--render` and the
-/// terminal printout print them: tools whole or summarized, and every task
-/// report and sub-agent reply whole, since nothing here can expand one.
+/// terminal printout print them on `clock`'s local day: tools whole or
+/// summarised, and every task report and sub-agent reply whole, because
+/// nothing here can expand one.
 fn rendered_ledger_lines(
     conversation: &ParsedConversation,
     options: &DisplayOptions,
     content_width: usize,
+    clock: &dyn Clock,
 ) -> Vec<RenderedLine> {
     let render_options = RenderOptions {
         tool_display: if options.no_tools {
@@ -192,19 +205,35 @@ fn rendered_ledger_lines(
         content_width,
         expanded_tool_outputs: std::collections::BTreeSet::new(),
         can_expand: false,
+        today: clock.today(),
+        zone: clock.zone(),
     };
     render_parsed_conversation(conversation, &render_options).lines
 }
 
 /// Render a conversation in TUI ledger format to terminal (for debugging)
-pub fn render_to_terminal(file_path: &Path, options: &DisplayOptions) -> Result<()> {
-    let conversation = parse_unattributed_conversation_file(file_path)?;
-    let lines = rendered_ledger_lines(&conversation, options, terminal_content_width());
+pub fn render_to_terminal(
+    file_path: &Path,
+    options: &DisplayOptions,
+    clock: &dyn Clock,
+    environment: &crate::history::provider::RootEnvironment,
+) -> Result<()> {
+    let rendered = RenderedFile(());
+    let conversation = parse_unattributed_conversation_file(
+        crate::history::ParsePermit::rendered_file(&rendered),
+        file_path,
+        environment,
+    )?;
+    let lines = rendered_ledger_lines(&conversation, options, terminal_content_width(), clock);
     write_through_pager(options.use_pager, |writer| {
         write_rendered_lines(&lines, options.no_color, writer);
     });
     Ok(())
 }
+
+/// The file `--render` names, for the printout to parse. Only
+/// [`render_to_terminal`] makes one.
+pub(crate) struct RenderedFile(());
 
 /// Run `write` against a pager's input when `use_pager` is set and the pager
 /// starts, and against stdout otherwise; then wait for the pager to exit.
@@ -268,6 +297,332 @@ fn write_rendered_lines(lines: &[RenderedLine], no_color: bool, writer: &mut dyn
 mod tests {
     use super::*;
 
+    /// The printout after the TUI of a session whose transcript changed
+    /// since it was cached refreshes the session's copy first, then prints
+    /// the newest messages from the cache.
+    #[test]
+    fn printout_of_changed_session_refreshes_its_cached_copy_first() {
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let a = home.write("a", 5, &["first question"]);
+        let environment = home.environment();
+        let rows = home.rows(&environment);
+        let row = rows.iter().find(|row| row.path == a).unwrap();
+        home.append(&a, 6, "newest question");
+
+        let printed = crate::history::printed_log_entries(
+            &environment,
+            row.source,
+            &a,
+            false,
+            &mut std::io::sink(),
+        )
+        .unwrap();
+
+        assert!(
+            serde_json::to_string(&printed.entries)
+                .unwrap()
+                .contains("newest question"),
+            "the printout shows the newest message"
+        );
+        let currency = crate::history::sqlite_cache::read_copy_waiting(
+            environment.cache_base(),
+            row.cache_address.as_ref().unwrap(),
+            |held| {
+                held.currency(&crate::history::sqlite_cache::Publication::Unpublished {
+                    discovered: row.subagents.clone(),
+                })
+            },
+        )
+        .expect("the cache holds the session");
+        assert!(
+            matches!(
+                currency,
+                crate::history::sqlite_cache::Currency::Adopt { .. }
+            ),
+            "the printout refreshes the session's cached copy: {currency:?}"
+        );
+    }
+
+    /// A copy below the generation the command published is older.
+    #[test]
+    fn copy_at_the_published_generation_is_current_though_its_transcript_changed() {
+        use crate::history::sqlite_cache::{Currency, Publication};
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let a = home.write("a", 5, &["first question"]);
+        let environment = home.environment();
+        let rows = home.rows(&environment);
+        let row = rows.iter().find(|row| row.path == a).unwrap();
+        let read_copy = |read: &dyn Fn(
+            &crate::history::sqlite_cache::HeldCopy<'_>,
+        ) -> crate::error::Result<Currency>| {
+            crate::history::sqlite_cache::read_copy_waiting(
+                environment.cache_base(),
+                row.cache_address.as_ref().unwrap(),
+                read,
+            )
+            .expect("the cache holds the session")
+        };
+        let generation = crate::history::sqlite_cache::read_copy_waiting(
+            environment.cache_base(),
+            row.cache_address.as_ref().unwrap(),
+            |held| Ok(held.generation()),
+        )
+        .expect("the cache holds the session");
+        home.append(&a, 6, "written after the copy");
+        let published = Publication::Published { generation };
+        let published_later = Publication::Published {
+            generation: generation + 1,
+        };
+
+        assert_eq!(
+            read_copy(&|held| held.currency_for_publisher(&published)),
+            Currency::Current
+        );
+        assert_eq!(
+            read_copy(&|held| held.currency_for_publisher(&published_later)),
+            Currency::Older
+        );
+        assert_eq!(
+            read_copy(&|held| held.currency(&published)),
+            Currency::Older,
+            "a check of the transcripts finds the copy out of date"
+        );
+    }
+
+    /// A Claude Code session cached in its own session cache before it
+    /// started a sub-agent.
+    struct SessionWithNewSubAgent {
+        home: crate::tui::claude_home::ClaudeHome,
+        cache: tempfile::TempDir,
+        transcript: std::path::PathBuf,
+        /// The sub-agent transcript started after the session was cached.
+        subagent: std::path::PathBuf,
+    }
+
+    impl SessionWithNewSubAgent {
+        fn new() -> Self {
+            let home = crate::tui::claude_home::ClaudeHome::new();
+            let transcript = home.write("a", 5, &["first question"]);
+            let mut session = Self {
+                home,
+                cache: crate::tui::claude_home::admitted_cache(),
+                transcript,
+                subagent: std::path::PathBuf::new(),
+            };
+            session.home.rows(&session.environment());
+            session.subagent = session.home.write_subagent(
+                &session.transcript,
+                "explore",
+                6,
+                &["sub-agent question"],
+            );
+            session
+        }
+
+        fn environment(&self) -> crate::history::Environment {
+            self.home.environment_with_cache(
+                self.cache.path(),
+                crate::history::ProcessIdentity::default(),
+                std::sync::Arc::new(crate::clock::TestClock::default()),
+            )
+        }
+
+        /// The printout of the session, its entries as JSON, and the notices
+        /// it wrote.
+        fn printed(&self) -> crate::error::Result<(String, String)> {
+            let mut notices = Vec::new();
+            let printed = crate::history::printed_log_entries(
+                &self.environment(),
+                crate::history::Source::Claude,
+                &self.transcript,
+                false,
+                &mut notices,
+            )?;
+            Ok((
+                serde_json::to_string(&printed.entries).unwrap(),
+                String::from_utf8(notices).unwrap(),
+            ))
+        }
+
+        /// `read`'s result while another rearview owns the cache's refresh.
+        fn beside_another_refresh<T>(&self, read: impl FnOnce() -> T) -> T {
+            let other_refresh =
+                crate::history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
+                    &crate::tui::claude_home::another_rearview(
+                        self.cache.path(),
+                        std::sync::Arc::new(crate::clock::TestClock::default()),
+                    ),
+                )
+                .unwrap();
+            let result = read();
+            drop(other_refresh);
+            result
+        }
+
+        /// The notice of the printout of an older copy, for `reason`.
+        fn older_copy_notice(&self, reason: &str) -> String {
+            format!(
+                "Showing an older cached copy of {}: {reason}\n",
+                self.transcript.display()
+            )
+        }
+    }
+
+    #[test]
+    fn printout_of_session_with_new_sub_agent_prints_it() {
+        let session = SessionWithNewSubAgent::new();
+
+        let (entries, notices) = session.printed().unwrap();
+
+        assert!(
+            entries.contains("sub-agent question"),
+            "the printout shows the new sub-agent: {entries}"
+        );
+        assert_eq!(notices, "");
+    }
+
+    /// The printout of a session that started a sub-agent since it was
+    /// cached, whose refresh reads on from the copy and fails to write,
+    /// prints the older copy and names it on one line.
+    #[test]
+    fn printout_whose_resumed_refresh_write_fails_prints_older_copy_with_notice() {
+        let session = SessionWithNewSubAgent::new();
+        let _failing =
+            crate::history::sqlite_cache::connection::test_hooks::fail_the_first_data_commit(
+                session.cache.path(),
+                || {},
+            );
+
+        let (entries, notices) = session.printed().unwrap();
+
+        assert!(
+            entries.contains("first question") && !entries.contains("sub-agent question"),
+            "the printout shows the older copy, without the sub-agent: {entries}"
+        );
+        assert_eq!(
+            notices,
+            session.older_copy_notice("rearview could not update it in the session cache")
+        );
+    }
+
+    /// The printout of a session whose transcript changes once its refresh
+    /// has written the copy prints that copy, without a notice and without
+    /// reading the transcript again: the refresh published it.
+    #[test]
+    fn printout_prints_copy_its_refresh_published_when_transcript_changes_after_the_write() {
+        use crate::history::sqlite_cache::admitted_reads;
+        let session = SessionWithNewSubAgent::new();
+        let transcript = session.transcript.clone();
+        let _appending =
+            crate::history::sqlite_cache::connection::test_hooks::run_at_the_first_data_commit(
+                session.cache.path(),
+                move || {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&transcript)
+                        .unwrap();
+                    std::io::Write::write_all(&mut file, b"{}\n").unwrap();
+                },
+            );
+        let reads_of = |transcript: &std::path::Path| admitted_reads::count(transcript);
+        let before = (reads_of(&session.transcript), reads_of(&session.subagent));
+
+        let (entries, notices) = session.printed().unwrap();
+
+        assert!(
+            entries.contains("sub-agent question"),
+            "the printout shows the copy the refresh published: {entries}"
+        );
+        assert_eq!(notices, "");
+        assert_eq!(
+            (
+                reads_of(&session.transcript) - before.0,
+                reads_of(&session.subagent) - before.1
+            ),
+            (0, 1),
+            "the refresh reads on from the copy, reading the new sub-agent once"
+        );
+    }
+
+    /// The printout of an uncached session, whose refresh fails to write,
+    /// prints the session the refresh parsed, without a notice.
+    #[test]
+    fn printout_of_uncached_session_whose_write_fails_prints_its_parse() {
+        let session = SessionWithNewSubAgent::new();
+        let uncached = SessionWithNewSubAgent {
+            transcript: session.home.write("b", 7, &["unseen question"]),
+            ..session
+        };
+        let _failing =
+            crate::history::sqlite_cache::connection::test_hooks::fail_the_first_data_commit(
+                uncached.cache.path(),
+                || {},
+            );
+
+        let (entries, notices) = uncached.printed().unwrap();
+
+        assert!(
+            entries.contains("unseen question"),
+            "the printout shows the session the refresh parsed: {entries}"
+        );
+        assert_eq!(notices, "");
+    }
+
+    /// Beside another rearview's refresh, the printout of a session that
+    /// started a sub-agent since it was cached prints the older copy and
+    /// names it on one line.
+    #[test]
+    fn printout_beside_another_refresh_prints_older_copy_with_notice() {
+        let session = SessionWithNewSubAgent::new();
+
+        let (entries, notices) = session.beside_another_refresh(|| session.printed().unwrap());
+
+        assert!(
+            entries.contains("first question") && !entries.contains("sub-agent question"),
+            "the printout shows the older copy, without the sub-agent: {entries}"
+        );
+        assert_eq!(
+            notices,
+            session.older_copy_notice("another rearview is refreshing the session cache")
+        );
+    }
+
+    /// Beside another rearview's refresh, the printout of a session whose
+    /// copy another rearview refreshed after it started a sub-agent prints
+    /// that copy as current.
+    #[test]
+    fn printout_beside_another_refresh_prints_copy_another_rearview_published() {
+        let session = SessionWithNewSubAgent::new();
+        session.home.rows(&session.environment());
+
+        let (entries, notices) = session.beside_another_refresh(|| session.printed().unwrap());
+
+        assert!(
+            entries.contains("sub-agent question"),
+            "the printout shows the copy another rearview published: {entries}"
+        );
+        assert_eq!(notices, "");
+    }
+
+    /// Beside another rearview's refresh, the printout of an uncached
+    /// session fails: the session is not in the session cache, and the
+    /// printout may not parse it.
+    #[test]
+    fn printout_beside_another_refresh_fails_for_uncached_session() {
+        let session = SessionWithNewSubAgent::new();
+        let uncached = SessionWithNewSubAgent {
+            transcript: session.home.write("b", 7, &["unseen question"]),
+            ..session
+        };
+
+        let printed = uncached.beside_another_refresh(|| uncached.printed());
+
+        assert!(
+            printed.is_err(),
+            "the printout of the uncached session fails: {printed:?}"
+        );
+    }
+
     /// `--render` has no expand gesture, so a task report prints whole with
     /// tools hidden and with tools shown alike.
     #[test]
@@ -282,14 +637,20 @@ mod tests {
         })
         .to_string();
         std::fs::write(&path, format!("{notification}\n")).unwrap();
-        let conversation = parse_unattributed_conversation_file(&path).unwrap();
+        let conversation = parse_unattributed_conversation_file(
+            crate::history::FOR_FIXTURES,
+            &path,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .unwrap();
 
         for no_tools in [true, false] {
             let options = DisplayOptions {
                 no_tools,
                 ..DisplayOptions::default()
             };
-            let text = rendered_ledger_lines(&conversation, &options, 80)
+            let clock = crate::clock::TestClock::default();
+            let text = rendered_ledger_lines(&conversation, &options, 80, &clock)
                 .iter()
                 .map(|line| {
                     line.spans
@@ -322,7 +683,12 @@ mod tests {
         };
         let project = tempfile::tempdir().unwrap();
         let (transcript, _) = write_launch_session(project.path());
-        let session = crate::history::sniffed_display_log_entries(&transcript).unwrap();
+        let session = crate::history::sniffed_display_log_entries(
+            crate::history::FOR_FIXTURES,
+            &transcript,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .unwrap();
 
         let printed = printout(session, &DisplayOptions::default(), DisplayFormat::Plain);
 
@@ -330,14 +696,27 @@ mod tests {
         assert!(!printed.contains("Async agent launched"), "{printed}");
     }
 
-    /// A path no list row holds is read by detecting its format, so a Pi
-    /// session prints as Pi, not as an empty Claude transcript.
+    /// A Pi row prints as Pi, not as an empty Claude transcript.
     #[test]
-    fn terminal_printout_reads_path_no_row_holds_by_its_format() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl");
+    fn terminal_printout_reads_row_by_its_agents_format() {
+        use crate::history::environment::test_support::{cache_session, environment_reading};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v3-branched.jsonl");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/v3-branched.jsonl"),
+            &path,
+        )
+        .unwrap();
+        let row = cache_session(crate::history::Source::Pi, &path, &[]);
 
-        let session = read_session_to_print(&[], &path).unwrap();
+        let session = crate::history::printed_log_entries(
+            &environment_reading(std::slice::from_ref(&row)),
+            row.source,
+            &row.path,
+            false,
+            &mut std::io::sink(),
+        )
+        .unwrap();
         let printed = printout(session, &DisplayOptions::default(), DisplayFormat::Plain);
 
         assert!(printed.contains("active root question"), "{printed}");
@@ -357,7 +736,12 @@ mod tests {
                 .join("\n"),
         )
         .unwrap();
-        let session = crate::history::sniffed_display_log_entries(&path).unwrap();
+        let session = crate::history::sniffed_display_log_entries(
+            crate::history::FOR_FIXTURES,
+            &path,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .unwrap();
 
         let text = printout(session, &DisplayOptions::default(), DisplayFormat::Plain);
 
@@ -379,8 +763,14 @@ mod tests {
         };
         let project = tempfile::tempdir().unwrap();
         let (transcript, subagents) = write_handback_session(project.path(), true);
-        let session =
-            display_log_entries(crate::history::Source::Claude, &transcript, &subagents).unwrap();
+        let session: DisplayEntries = crate::history::normalized_session(
+            crate::history::FOR_FIXTURES,
+            crate::history::Source::Claude,
+            &transcript,
+            &subagents,
+        )
+        .unwrap()
+        .into();
         let with_thinking = DisplayOptions {
             show_thinking: true,
             ..DisplayOptions::default()

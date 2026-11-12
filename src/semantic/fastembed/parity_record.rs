@@ -129,6 +129,7 @@ fn parity_record_matches_locked_fastembed_and_derived_loader_inputs() {
 #[cfg(not(feature = "release-dynamic-ort"))]
 #[test]
 #[ignore = "loads the semantic model; run after a fastembed upgrade to refresh the parity record"]
+#[allow(clippy::disallowed_methods)]
 fn load_model_embeds_as_fastembeds_loader_does() {
     let folder = FastembedEmbedder::cache_dir();
     assert!(

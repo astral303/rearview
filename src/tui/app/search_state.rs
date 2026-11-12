@@ -1,16 +1,19 @@
+use super::exact_literal::exact_literal_results;
+use super::search_worker::{SearchCommand, SearchResponse};
 use super::{App, ListSearchMode, SemanticProgress, SemanticResultMetadata};
 use crate::history::Conversation;
+use crate::history::listing::SessionOrigin;
 use crate::search::query::ParsedQuery;
-use crate::search::{self, SearchableConversation};
+use crate::search::{self, SearchTextsInMemory};
 use crate::semantic::types::SemanticCancellationToken;
 use crate::tui::semantic_worker::{
-    SemanticSearchMessage, SemanticWorkerCommand, spawn_semantic_worker,
+    SemanticSearchMessage, SemanticSearchResponse, SemanticWorkerCommand, spawn_semantic_worker,
 };
 use chrono::Local;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Instant;
 
 #[allow(dead_code)]
 #[derive(Default)]
@@ -23,14 +26,49 @@ pub(super) struct SemanticSearchState {
     pub(super) last_status: SemanticProgress,
     pub(super) error: Option<String>,
     pub(super) results: HashMap<usize, SemanticResultMetadata>,
+    /// The sessions the semantic results on screen searched without semantic
+    /// turns, by reason; `None` while semantic results aren't on screen.
+    pub(super) without_turns: Option<crate::search::SessionsWithoutTexts>,
     pub(super) worker_tx: Option<mpsc::Sender<SemanticWorkerCommand>>,
     pub(super) worker_rx: Option<mpsc::Receiver<SemanticSearchMessage>>,
     pub(super) cancellation: Option<SemanticCancellationToken>,
 }
 
+/// Leaving the TUI cancels the semantic worker's active request.
+impl Drop for SemanticSearchState {
+    fn drop(&mut self) {
+        self.cancel_active_request();
+    }
+}
+
+impl SemanticSearchState {
+    /// Cancels the semantic worker's active request. The worker keeps its
+    /// model, loading or loaded, for the next request.
+    fn cancel_active_request(&self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+
+    fn clear_results(&mut self) {
+        self.results.clear();
+        self.without_turns = None;
+    }
+
+    fn show_results(&mut self, response: SemanticSearchResponse) {
+        self.last_status = response.progress;
+        self.error = response.error;
+        self.results = response.metadata;
+        self.without_turns = Some(response.without_turns);
+    }
+}
+
 /// What a query that could name a session turned out to be.
 enum SessionLookup {
     Listed(usize),
+    /// A session not in the session cache, at this path, until the list
+    /// applies its refresh.
+    Loading(PathBuf),
     Unresolved,
     NotAnId,
 }
@@ -39,99 +77,18 @@ enum SessionLookup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SessionIdQuery {
     Listed(String),
-    Unresolved(String),
-}
-
-pub(super) enum SearchCommand {
-    UpdateData {
-        conversations: Arc<Vec<Arc<Conversation>>>,
-        searchable: Arc<Vec<SearchableConversation>>,
-    },
-    Search {
+    /// The query named the session at `path`. Its row joins the list when
+    /// the list applies its refresh.
+    Loading {
         query: String,
-        generation: u64,
-        mode: ListSearchMode,
+        path: PathBuf,
     },
-}
-
-pub(super) struct SearchResponse {
-    pub(super) filtered: Vec<usize>,
-    pub(super) generation: u64,
-    pub(super) mode: ListSearchMode,
-    pub(super) evidence: HashMap<usize, search::LexicalEvidence>,
-}
-
-pub(super) fn spawn_search_worker() -> (mpsc::Sender<SearchCommand>, mpsc::Receiver<SearchResponse>)
-{
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>();
-    let (res_tx, res_rx) = mpsc::channel::<SearchResponse>();
-
-    std::thread::Builder::new()
-        .name("search-worker".into())
-        .spawn(move || {
-            let mut conversations: Arc<Vec<Arc<Conversation>>> = Arc::new(Vec::new());
-            let mut searchable: Arc<Vec<SearchableConversation>> = Arc::new(Vec::new());
-
-            while let Ok(cmd) = cmd_rx.recv() {
-                match cmd {
-                    SearchCommand::UpdateData {
-                        conversations: c,
-                        searchable: s,
-                    } => {
-                        conversations = c;
-                        searchable = s;
-                    }
-                    SearchCommand::Search {
-                        mut query,
-                        mut generation,
-                        mut mode,
-                    } => {
-                        while let Ok(pending) = cmd_rx.try_recv() {
-                            match pending {
-                                SearchCommand::UpdateData {
-                                    conversations: c,
-                                    searchable: s,
-                                } => {
-                                    conversations = c;
-                                    searchable = s;
-                                }
-                                SearchCommand::Search {
-                                    query: q,
-                                    generation: g,
-                                    mode: m,
-                                } => {
-                                    query = q;
-                                    generation = g;
-                                    mode = m;
-                                }
-                            }
-                        }
-
-                        let now = chrono::Local::now();
-                        let filtered =
-                            search::search(conversations.as_slice(), &searchable, &query, now);
-                        let parsed = ParsedQuery::parse(&query);
-                        let evidence =
-                            search::build_session_list_evidence(&conversations, &filtered, &parsed);
-
-                        let _ = res_tx.send(SearchResponse {
-                            filtered,
-                            generation,
-                            mode,
-                            evidence,
-                        });
-                    }
-                }
-            }
-        })
-        .expect("failed to spawn search worker thread");
-
-    (cmd_tx, res_rx)
+    Unresolved(String),
 }
 
 impl App {
     pub(super) fn invalidate_search_generation(&mut self) {
-        self.search_generation += 1;
+        self.search_generation.advance();
         self.search_started_at = None;
         self.dispatched_query = None;
         self.shown_results_settled = false;
@@ -142,12 +99,12 @@ impl App {
         self.semantic_search.prewarm_status = None;
         self.semantic_search.last_status = SemanticProgress::Idle;
         self.semantic_search.error = None;
-        self.semantic_search.results.clear();
+        self.semantic_search.clear_results();
     }
 
     fn ensure_semantic_worker(&mut self) {
         if self.semantic_search.worker_tx.is_none() || self.semantic_search.worker_rx.is_none() {
-            let (tx, rx, cancellation) = spawn_semantic_worker();
+            let (tx, rx, cancellation) = spawn_semantic_worker(self.environment.clock().clone());
             self.semantic_search.worker_tx = Some(tx);
             self.semantic_search.worker_rx = Some(rx);
             self.semantic_search.cancellation = Some(cancellation);
@@ -173,11 +130,22 @@ impl App {
     }
 
     /// Send the snapshot and the search data to the search worker.
-    pub(super) fn send_search_data(&self) {
-        let _ = self.search_tx.send(SearchCommand::UpdateData {
+    pub(super) fn send_search_data(&mut self) {
+        let sent = self.search_tx.send(SearchCommand::UpdateData {
             conversations: self.conversations_snapshot.clone(),
             searchable: Arc::new(self.searchable.clone()),
         });
+        if sent.is_ok() {
+            self.search_data_sent += 1;
+        }
+    }
+
+    /// True until the search worker has counted the sessions of the rows
+    /// last sent, and while some of those sessions' first read runs: the
+    /// list's search results can still change without a keystroke.
+    pub fn is_reading_search_texts(&self) -> bool {
+        self.texts_held.updates_applied < self.search_data_sent
+            || self.texts_held.sessions_without_texts.loading > 0
     }
 
     pub(super) fn semantic_scope_indices(&self) -> Arc<Vec<usize>> {
@@ -185,7 +153,7 @@ impl App {
     }
 
     fn reset_semantic_worker(&mut self) {
-        let (tx, rx, cancellation) = spawn_semantic_worker();
+        let (tx, rx, cancellation) = spawn_semantic_worker(self.environment.clock().clone());
         self.semantic_search.worker_tx = Some(tx);
         self.semantic_search.worker_rx = Some(rx);
         self.semantic_search.cancellation = Some(cancellation);
@@ -249,7 +217,7 @@ impl App {
                 self.semantic_search.prewarm_status = prewarm_status;
             }
             self.semantic_search.error = None;
-            self.semantic_search.results.clear();
+            self.semantic_search.clear_results();
             self.update_filter();
             return;
         }
@@ -280,14 +248,21 @@ impl App {
             return;
         }
 
+        self.dispatch_lexical_search(query);
+    }
+
+    /// Search for `query` on the search worker. The worker reads the rows'
+    /// text from the session cache, so the drawing thread does not wait
+    /// behind another rearview's rebuild.
+    fn dispatch_lexical_search(&mut self, query: String) {
         self.dispatched_query = Some(query.clone());
-        self.semantic_search.results.clear();
-        self.search_generation += 1;
-        self.search_started_at = Some(Instant::now());
+        self.semantic_search.clear_results();
+        let generation = self.search_generation.advance();
+        self.search_started_at = Some(self.clock().now());
         self.semantic_search.error = None;
         let _ = self.search_tx.send(SearchCommand::Search {
             query,
-            generation: self.search_generation,
+            generation,
             mode: self.list_search_mode,
         });
     }
@@ -296,23 +271,21 @@ impl App {
     /// response fails the generation check, and the semantic worker's
     /// search is cancelled.
     fn abandon_search_in_flight(&mut self) {
-        self.search_generation += 1;
+        self.search_generation.advance();
         self.search_started_at = None;
         self.semantic_search.pending_generation = None;
         self.semantic_search.pending_status = None;
         self.semantic_search.error = None;
-        if let Some(cancellation) = &self.semantic_search.cancellation {
-            cancellation.cancel();
-        }
+        self.semantic_search.cancel_active_request();
     }
 
     fn dispatch_semantic_search(&mut self, query: String, prewarm: bool) {
-        self.search_generation += 1;
-        self.search_started_at = (!prewarm).then(Instant::now);
+        let generation = self.search_generation.advance();
+        self.search_started_at = (!prewarm).then(|| self.clock().now());
         if !prewarm {
             self.dispatched_query = Some(query.clone());
         }
-        self.semantic_search.pending_generation = Some(self.search_generation);
+        self.semantic_search.pending_generation = Some(generation);
         // Embedding activity remains visible while a replacement query waits for the worker.
         if !matches!(
             self.semantic_search.pending_status,
@@ -321,16 +294,23 @@ impl App {
             self.semantic_search.pending_status = None;
         }
         if prewarm {
-            self.semantic_search.prewarm_generation = Some(self.search_generation);
+            self.semantic_search.prewarm_generation = Some(generation);
             self.semantic_search.prewarm_status = None;
         }
         self.semantic_search.last_status = SemanticProgress::Idle;
         self.semantic_search.error = None;
         if prewarm {
-            self.semantic_search.results.clear();
+            self.semantic_search.clear_results();
         }
-        if let Some(cancellation) = &self.semantic_search.cancellation {
-            cancellation.cancel();
+        self.semantic_search.cancel_active_request();
+        if !prewarm && ParsedQuery::parse(&query).is_quoted_only() {
+            // The search worker answers it over the texts it holds.
+            let _ = self.search_tx.send(SearchCommand::Search {
+                query,
+                generation,
+                mode: ListSearchMode::Semantic,
+            });
+            return;
         }
         let (corpus_version, scope_version) = match self.send_semantic_state() {
             Some(versions) => versions,
@@ -344,7 +324,6 @@ impl App {
                 versions
             }
         };
-        let generation = self.search_generation;
         if !prewarm {
             let _ = self.search_tx.send(SearchCommand::Search {
                 query: query.clone(),
@@ -389,10 +368,23 @@ impl App {
 
     pub fn receive_search_results(&mut self) -> bool {
         let mut applied = false;
+        while let Ok(held) = self.texts_held_rx.try_recv() {
+            applied |= self.texts_held.sessions_without_texts != held.sessions_without_texts;
+            self.texts_held = held;
+        }
         while let Ok(response) = self.search_rx.try_recv() {
+            if response.is_exact_literal {
+                if response.generation == self.search_generation.current()
+                    && self.list_search_mode == ListSearchMode::Semantic
+                {
+                    self.apply_exact_literal_results(response);
+                    applied = true;
+                }
+                continue;
+            }
             let semantic_fallback_pending = response.mode == ListSearchMode::Semantic
                 && self.semantic_search.pending_generation == Some(response.generation);
-            if response.generation == self.search_generation
+            if response.generation == self.search_generation.current()
                 && response.mode == self.list_search_mode
                 && (response.mode == ListSearchMode::Lexical || semantic_fallback_pending)
             {
@@ -403,7 +395,7 @@ impl App {
                 }
                 self.lexical_evidence = response.evidence;
                 if response.mode == ListSearchMode::Semantic {
-                    self.semantic_search.results.clear();
+                    self.semantic_search.clear_results();
                 }
                 self.shown_results_query = self.dispatched_query.clone();
                 self.shown_results_settled = response.mode == ListSearchMode::Lexical;
@@ -415,7 +407,7 @@ impl App {
             }
         }
         if let Some(rx) = self.semantic_search.worker_rx.take() {
-            let active_generation = self.search_generation;
+            let active_generation = self.search_generation.current();
             while let Ok(message) = rx.try_recv() {
                 match message {
                     SemanticSearchMessage::Progress {
@@ -435,7 +427,7 @@ impl App {
                             }
                         }
                     }
-                    SemanticSearchMessage::Complete(response) => {
+                    SemanticSearchMessage::Complete(mut response) => {
                         if self.list_search_mode == ListSearchMode::Semantic {
                             if response.prewarm
                                 && Some(response.generation)
@@ -446,9 +438,7 @@ impl App {
                                 if response.generation == active_generation {
                                     self.semantic_search.pending_generation = None;
                                     self.semantic_search.pending_status = None;
-                                    self.semantic_search.last_status = response.progress;
-                                    self.semantic_search.error = response.error;
-                                    self.semantic_search.results = response.metadata;
+                                    self.semantic_search.show_results(response);
                                     if !self.query.trim().is_empty() {
                                         self.dispatch_semantic_search(
                                             self.query.trim().to_string(),
@@ -458,13 +448,15 @@ impl App {
                                 }
                                 applied = true;
                             } else if response.generation == active_generation {
+                                // Stop texts read from rerunning the lexical
+                                // fallback: the semantic results replace it.
+                                self.search_generation.stop_awaiting();
                                 self.search_started_at = None;
                                 self.semantic_search.pending_generation = None;
                                 self.semantic_search.pending_status = None;
-                                self.semantic_search.last_status = response.progress;
-                                self.semantic_search.error = response.error;
-                                self.semantic_search.results = response.metadata;
-                                let filtered = self.filter_indices(response.filtered);
+                                let filtered = std::mem::take(&mut response.filtered);
+                                self.semantic_search.show_results(response);
+                                let filtered = self.filter_indices(filtered);
                                 self.shown_results_query = self.dispatched_query.clone();
                                 self.shown_results_settled = true;
                                 self.apply_filtered(filtered);
@@ -479,6 +471,26 @@ impl App {
         applied
     }
 
+    /// Shows the rows of `response`, the answer to a quoted-only semantic
+    /// query, that the list's filters keep, as the semantic search's exact
+    /// matches.
+    fn apply_exact_literal_results(&mut self, response: SearchResponse) {
+        let filtered = self.filter_indices(response.filtered);
+        let parsed = ParsedQuery::parse(self.dispatched_query.as_deref().unwrap_or_default());
+        self.search_started_at = None;
+        self.semantic_search.pending_generation = None;
+        self.semantic_search.pending_status = None;
+        self.semantic_search.last_status = SemanticProgress::Complete;
+        self.semantic_search.error = None;
+        self.semantic_search.results =
+            exact_literal_results(&self.conversations, &response.evidence, &filtered, &parsed);
+        self.semantic_search.without_turns = None;
+        self.lexical_evidence = response.evidence;
+        self.shown_results_query = self.dispatched_query.clone();
+        self.shown_results_settled = true;
+        self.apply_filtered(filtered);
+    }
+
     pub fn has_search_work_in_flight(&self) -> bool {
         self.search_started_at.is_some()
             || self.semantic_search.pending_generation.is_some()
@@ -487,7 +499,7 @@ impl App {
 
     #[cfg(test)]
     pub(super) fn search_generation(&self) -> u64 {
-        self.search_generation
+        self.search_generation.current()
     }
 
     #[cfg(test)]
@@ -518,13 +530,28 @@ impl App {
         self.update_filter();
     }
 
+    /// Apply the search worker's results for the lexical search in flight,
+    /// failing after five seconds without them.
+    #[cfg(test)]
+    pub(crate) fn settle_search_for_test(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.search_started_at.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the search worker answers"
+            );
+            self.receive_search_results();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[cfg(test)]
     pub fn set_semantic_receiver_for_test(
         &mut self,
         generation: u64,
         worker_rx: mpsc::Receiver<SemanticSearchMessage>,
     ) {
-        self.search_generation = generation;
+        self.search_generation.advance_to(generation);
         self.dispatched_query = Some(self.query.trim().to_string());
         self.semantic_search.pending_generation = Some(generation);
         self.semantic_search.prewarm_generation = None;
@@ -612,14 +639,18 @@ impl App {
         }
     }
 
+    /// Turn the workspace filter on or off. With a query, the rows on screen
+    /// narrow at once, and the search runs again on its worker.
     pub(super) fn toggle_workspace_filter(&mut self) {
         if self.workspace.is_some() {
             self.workspace_filter = !self.workspace_filter;
             self.invalidate_search_generation();
-            if self.list_search_mode == ListSearchMode::Semantic && !self.query.trim().is_empty() {
+            if !self.query.trim().is_empty() {
                 let shown = std::mem::take(&mut self.filtered);
                 let narrowed = self.filter_indices(shown);
                 self.apply_filtered(narrowed);
+            }
+            if self.list_search_mode == ListSearchMode::Semantic && !self.query.trim().is_empty() {
                 self.dispatch_search();
             } else {
                 self.update_filter();
@@ -635,6 +666,9 @@ impl App {
             ListSearchMode::Lexical => ListSearchMode::Semantic,
             ListSearchMode::Semantic => ListSearchMode::Lexical,
         };
+        if self.list_search_mode == ListSearchMode::Lexical {
+            self.semantic_search.cancel_active_request();
+        }
         self.invalidate_search_generation();
         if self.list_search_mode == ListSearchMode::Semantic && self.query.trim().is_empty() {
             self.prewarm_semantic_cache();
@@ -654,6 +688,16 @@ impl App {
                 self.apply_filtered(vec![index]);
                 true
             }
+            SessionLookup::Loading(path) => {
+                self.session_id_query = Some(SessionIdQuery::Loading {
+                    query: query.to_owned(),
+                    path,
+                });
+                self.shown_results_query = Some(query.to_owned());
+                self.shown_results_settled = true;
+                self.apply_filtered(Vec::new());
+                true
+            }
             SessionLookup::Unresolved => {
                 self.session_id_query = Some(SessionIdQuery::Unresolved(query.to_owned()));
                 self.shown_results_query = Some(query.to_owned());
@@ -668,24 +712,33 @@ impl App {
         }
     }
 
-    pub(super) fn apply_lexical_filter(&mut self) {
-        let now = Local::now();
-        let filtered = search::search(&self.conversations, &self.searchable, &self.query, now);
+    /// Show every row the filters keep, newest first: the list without a
+    /// query. Doesn't read the session cache.
+    fn show_unsearched_list(&mut self) {
+        let now = self.clock().wall().with_timezone(&Local);
+        let filtered = search::search_with_texts(
+            &self.conversations,
+            &self.searchable,
+            &SearchTextsInMemory::default(),
+            "",
+            now,
+        );
         let filtered = self.filter_indices(filtered);
-        let query = self.query.trim();
-        self.shown_results_query =
-            (!ParsedQuery::parse(query).is_effectively_empty()).then(|| query.to_string());
+        self.shown_results_query = None;
         self.shown_results_settled = true;
         self.apply_filtered(filtered);
     }
 
+    /// Filter the list again with the current query. A lexical query
+    /// searches on the search worker; the rows on screen stay until its
+    /// results arrive.
     pub(super) fn update_filter(&mut self) {
         let query = self.query.trim().to_string();
 
         if ParsedQuery::parse(&query).is_effectively_empty() {
             self.semantic_search.error = None;
             self.session_id_query = None;
-            self.apply_lexical_filter();
+            self.show_unsearched_list();
             return;
         }
 
@@ -698,9 +751,7 @@ impl App {
             return;
         }
 
-        self.semantic_search.error = None;
-        self.semantic_search.results.clear();
-        self.apply_lexical_filter();
+        self.dispatch_lexical_search(query);
     }
 
     fn look_up_session(&mut self, query: &str) -> SessionLookup {
@@ -711,8 +762,8 @@ impl App {
         {
             return SessionLookup::Listed(index);
         }
-        if let Some(index) = self.load_session_by_id(query) {
-            return SessionLookup::Listed(index);
+        if let Some(lookup) = self.load_session_by_id(query) {
+            return lookup;
         }
         // A miss is reported only for the shape some agent's session ids
         // have. Anything else is likelier text the user meant to search for.
@@ -723,21 +774,52 @@ impl App {
         }
     }
 
-    /// Load a session the list does not hold — one an active `--since` window
-    /// excludes — from whichever agent stores it, as the list would have
-    /// built its row.
-    fn load_session_by_id(&mut self, session_id: &str) -> Option<usize> {
-        let (_, conv) = crate::history::provider::load_session_by_id(session_id, self.show_last)?;
-        self.note_changed_during_refresh(&conv.path);
+    /// Load a session the list does not hold, such as one an active `--since`
+    /// window excludes, from whichever agent stores it, as the cache holds its
+    /// row. A session not in the session cache is refreshed as an opened one
+    /// is, and its row joins the list when the list applies the refresh.
+    /// `None` when no agent resolves the ID, its session is gone or empty, or
+    /// its read fails.
+    fn load_session_by_id(&mut self, session_id: &str) -> Option<SessionLookup> {
+        use crate::history::provider::SessionRead;
 
-        let idx = self.conversations.len();
-        self.conversations.push(conv);
+        let (source, loaded) = crate::history::provider::load_session_by_id(
+            &self.environment,
+            session_id,
+            self.show_last,
+        )?;
+        let path = loaded.locator().to_path_buf();
+        match self.take_read(loaded) {
+            SessionRead::Listed(conv) if self.lists(SessionOrigin::FoundById, &conv) => {
+                let idx = self.conversations.len();
+                self.conversations.push(*conv);
+                self.searchable = search::precompute_search_text(&self.conversations);
+                self.rebuild_conversations_snapshot();
+                self.send_search_data();
+                Some(SessionLookup::Listed(idx))
+            }
+            SessionRead::NotCached => {
+                self.store.track_lookup(source, &path);
+                Some(SessionLookup::Loading(path))
+            }
+            SessionRead::Listed(_)
+            | SessionRead::Empty(_)
+            | SessionRead::Missing
+            | SessionRead::Failed(..) => None,
+        }
+    }
 
-        self.searchable = search::precompute_search_text(&self.conversations);
-        self.rebuild_conversations_snapshot();
-        self.send_search_data();
-
-        Some(idx)
+    /// The session found by ID at `path` doesn't have a row to list: the lookup
+    /// that waited for it reports the ID unresolved.
+    pub(super) fn report_lookup_unresolved(&mut self, path: &Path) {
+        if let Some(SessionIdQuery::Loading {
+            query,
+            path: awaited,
+        }) = &self.session_id_query
+            && awaited == path
+        {
+            self.session_id_query = Some(SessionIdQuery::Unresolved(query.clone()));
+        }
     }
 
     pub(super) fn refresh_search_data(&mut self) {

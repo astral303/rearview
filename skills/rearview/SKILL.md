@@ -14,7 +14,7 @@ Only take actions required by the current request and active instructions.
 
 ## Workflow
 
-If you have a `ref=ch_...` handle, read or outline it directly:
+With a `ref=ch_...` handle, read or outline it directly:
 
 ```sh
 rearview agent outline ch_1234abcd5678
@@ -27,8 +27,8 @@ rearview agent read ch_1234abcd5678:s3
 `:m7.2` reads one call and its result; `:s3` one sub-agent's launch,
 messages and reports.
 
-If you need a handle, search or list sessions first. Use semantic or hybrid
-search for conceptual recall where wording may differ:
+Without a handle, search or list sessions first. Use semantic or hybrid
+search for concepts whose wording may differ:
 
 ```sh
 rearview agent search "deployment rollback decision" --mode hybrid --top 5
@@ -43,8 +43,8 @@ rearview agent search "auth cache bug" --mode lexical
 rearview agent search "DEPLOYMENT_TOKEN" --mode exact
 ```
 
-`--mode exact` matches the whole query as one phrase. In any other mode, double
-quotes inside the query require the quoted phrase alongside the other words:
+`--mode exact` matches the whole query as one phrase. In other modes, double
+quotes in the query require the quoted phrase alongside the other words:
 `'retry "auth cache bug"'`. Shell quotes do not make a phrase.
 
 Exact search is case-sensitive only when the query has an uppercase letter;
@@ -52,8 +52,8 @@ spacing and line breaks need not match.
 
 Search and `sessions` are global by default. Use `--local` for the current
 workspace or `--all` to override a configured local scope. `--since` and
-`--before` keep only the messages inside the window they set, in every agent
-command; a message counts when its times overlap the window.
+`--before` keep only the messages inside their window, in every agent command;
+a message counts when its times overlap it.
 
 To see what ran in a window, list its sessions, then read each:
 
@@ -62,19 +62,19 @@ rearview agent sessions --after 2026-07-20T14:00 --before 2026-07-20T15:00
 rearview agent read ch_1234abcd5678 --after 2026-07-20T14:00 --before 2026-07-20T15:00 --tools
 ```
 
-Values are a duration back from now (`45s`, `30m`, `3h`, `2d`, `1w`, `6mo`, `1y`,
-or combined as `1d6h`), an absolute local time (`2026-07-20`,
+Values are a duration back from now (`45s`, `30m`, `2d`, `1w`, `6mo`, `1y`, or
+combined as `1d6h`), an absolute local time (`2026-07-20`,
 `2026-07-20T14:30`), or one with a time zone offset (`2026-07-20T14:30-05:00`).
 `m` is minutes and `mo` is months. Bounds are inclusive and an upper
 bound covers the whole unit written, so `--before 2026-07-20` includes all of
 the 20th. `--after` is an alias for `--since`. Grouped search ranks
 conversations. `--flat` ranks message hits across conversations. Use
 `--hits-per-conv` when one conversation needs more evidence and `--all-hits`
-only when duplicate suppression hides relevant tool-heavy evidence.
+only when duplicate suppression hides relevant evidence.
 
 Compact records are the only output. A header's `protocol agent-…` names the
-record grammar. Header `chars=` values are hard Unicode-character limits, and
-`cut=` plus omission fields describe truncation. After search or within
+record grammar. Header `chars=` values are hard Unicode-character limits;
+`cut=` and omission fields describe truncation. After search or within
 truncation, narrow the query or scope, or increase `--budget`. A
 `continue read refs=` record names the omitted refs, `;` between them, and
 the flags that show them. A `continue search offset=N mode=M` or
@@ -99,7 +99,7 @@ Read and outline records:
 - A truncated message prints `m7 omitted lines=4..9 calls=m7.2..3` and a
   `read` record showing them.
 
-A typical grouped result looks like:
+A grouped result looks like:
 
 ```text
 protocol agent-search mode=lexical cut=none chars=6000 policy=per-hit groups=1 hits=1 tz=-04:00
@@ -111,8 +111,8 @@ read ref=ch_1234abcd5678:m7..m9 focus=m8..m8 tools=false tool-results=false thin
 ```
 
 Copy an emitted `read ref=...` or `refs=...` recipe into the next command.
-Preserve its visibility policy: add each corresponding CLI flag for `=true`,
-and leave `=false` categories hidden; `lines=K..N` is `--lines K..N`. A
+Preserve its visibility policy: add the CLI flag for each `=true` and leave
+`=false` categories hidden; `lines=K..N` is `--lines K..N`. A
 read hiding every message ends with one. Do not treat hit order, scores,
 ranks, or chunks as stable addresses.
 
@@ -133,7 +133,7 @@ spans the whole session, its messages inside the window, or a ref's `:m7..m9`
 or `:s3`. `--tail 20` reads the last 20 messages a read shows.
 
 A single message can exceed a useful budget. Select inclusive 1-based content
-lines, or find case-insensitive text with bounded context:
+lines, or find case-insensitive text with context:
 
 ```sh
 rearview agent read ch_1234abcd5678:m8 --lines 40..120
@@ -154,19 +154,22 @@ Branch on `kind=`. Values include `invalid-ref`, `ambiguous-ref`, `not-found`,
 `out-of-range`, `budget-too-small`, `malformed-transcript`, `io`, and
 `semantic-unavailable`.
 
+A `protocol agent-progress` record on stderr means the command is still
+running; wait for it to exit.
+
 Successful output can contain `protocol agent-warning` records. Treat
-`malformed-transcript`, `io`, `skipped`, `ignored`, and `partial-index` as
-partial corpus coverage. Repeated warnings are summarized by `kind=` and
-`count=`, and a budget never cuts them. A `semantic-unavailable` warning on
+`malformed-transcript`, `io`, `skipped`, `ignored`, `partial-index`, and
+`stale-cache` as partial coverage. Repeated warnings are summarized by `kind=`
+and `count=`; a budget never cuts them. A `semantic-unavailable` warning on
 hybrid output means lexical fallback. Mention reduced coverage when it matters.
 
 Agent defaults can come from `[agent]`: scope, mode, output budget, result depth,
-project exclusions, and visibility policy. Command flags override config, and
+project exclusions, and visibility policy. Command flags override config;
 `[agent].mode` overrides `[search].mode`.
 
 Do not read a full transcript by default. Prefer search, then within or outline,
 then a bounded read. Use `--tools`, `--tool-results`, `--thinking`, or
-`--subagents` only when that hidden content is relevant. `read` reports what
+`--subagents` only when that content is relevant. `read` reports what
 they hide as `hidden-<flag>=` atoms and `hidden` records. `--tools`
 shows each tool call's command, file or pattern, such as `Bash: cargo test`;
 `(+N lines)` counts the command's other lines: search matches them, and

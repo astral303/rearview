@@ -1,21 +1,23 @@
 //! Refreshing a loaded list: reading only the sessions new or changed since
 //! it was loaded.
 
-use super::cache::CachedFingerprint;
+use super::fingerprint::CachedFingerprint;
+use super::listing::{self, SessionOrigin, SessionTimes};
 use super::loader::{SeenPaths, sessions_not_loaded_term};
+use super::provider::walk::Canonicaliser;
 use super::provider::{
-    self, FoundSession, ReadError, RediscoveredSessions, SessionRead, SessionStub, SessionTitle,
-    SkippedSessions,
+    self, FoundSession, ReadError, RediscoveredSessions, SessionOutcome, SessionRead, SessionStub,
+    SessionTitle, SkippedSessions,
 };
-use super::{Conversation, FilterTerm, Source};
+use super::sqlite_cache::OperationScope;
+use super::{Conversation, Environment, FilterTerm, NextStep, Source};
 use crate::cli::DebugLevel;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::time_filter::TimeFilter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use std::sync::Arc;
 
 /// Every session the last load or refresh found, by locator, for a refresh to
 /// compare discovery against.
@@ -55,8 +57,8 @@ impl KnownSessions {
     }
 }
 
-/// The options the list was loaded with, so a refresh reads sessions as the
-/// load read them.
+/// The options the list loads with, so a refresh reads sessions as the
+/// launch read them.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RefreshOptions {
     pub show_last: bool,
@@ -69,8 +71,14 @@ pub struct RefreshOptions {
 pub struct SessionChanges {
     /// New sessions, and listed sessions whose transcripts changed.
     pub updated: Vec<UpdatedSession>,
+    /// Listed sessions whose read failed. Each keeps its row as it was.
+    pub kept: Vec<KeptSession>,
     /// Listed sessions that are gone, or now hold no conversation, by path.
     pub removed: Vec<PathBuf>,
+    /// New sessions read from an out-of-date copy without a message inside
+    /// the list's window. Their next step decides whether the list shows
+    /// them.
+    pub pending: Vec<PendingSession>,
     /// The titles each agent stores beside its transcripts, by session id.
     pub external_titles: Vec<(Source, HashMap<String, SessionTitle>)>,
     /// The sessions the next refresh skips until their fingerprint changes.
@@ -86,53 +94,83 @@ pub struct UpdatedSession {
     /// True when the row replaces one the list showed; false for a new
     /// session.
     pub replaces_listed_row: bool,
+    pub next: NextStep,
 }
 
-/// Start [`refresh_sessions`] on a thread of its own; the receiver gets its
-/// one outcome.
-pub fn refresh_in_background(
-    known: KnownSessions,
-    options: RefreshOptions,
-) -> Receiver<Result<SessionChanges>> {
-    let (outcome, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = outcome.send(refresh_sessions(&known, options));
-    });
-    receiver
+/// A listed session whose read failed, by path.
+pub struct KeptSession {
+    pub path: PathBuf,
+    pub next: NextStep,
+}
+
+/// A new session the list does not show until its next step reads it again.
+pub struct PendingSession {
+    pub source: Source,
+    pub path: PathBuf,
+    pub next: NextStep,
+}
+
+/// The one outcome of a list or session refresh on the TUI's background
+/// worker.
+pub enum RefreshOutcome {
+    /// `Ctrl+R` in the list: the changes on disk since the list loaded.
+    Changes(Box<SessionChanges>),
+    /// A session refresh: each requested session read again under refresh
+    /// ownership, one outcome per session, each answering for its row's path.
+    Cached(Vec<SessionOutcome>),
 }
 
 /// The changes on disk since `known`: every agent's sessions discovered
-/// again, and only new and changed ones read.
+/// again, and only new and changed ones read, under `operation`'s refresh
+/// ownership.
 ///
 /// An agent whose discovery fails keeps what the list holds of it. The
-/// refresh fails when every agent's discovery does.
-pub(crate) fn refresh_sessions(
+/// refresh fails when every agent's discovery does, and when a write finds
+/// the cache's drive low on space.
+pub fn refresh_sessions(
+    environment: &Environment,
     known: &KnownSessions,
     options: RefreshOptions,
+    operation: &OperationScope,
 ) -> Result<SessionChanges> {
-    let sources = provider::providers()
+    let sources = environment
+        .storages()
         .iter()
-        .map(|provider| provider.source())
+        .map(|storage| storage.source())
         .collect::<Vec<_>>();
-    refresh_sources(known, &sources, options, &|source, needs_reading| {
-        provider::rediscover_sessions(
-            source.provider().storage(),
-            options.show_last,
-            options.debug_level,
-            needs_reading,
-        )
-    })
+    let canonicaliser = environment.shared_canonicaliser();
+    refresh_sources(
+        known,
+        &sources,
+        options,
+        canonicaliser,
+        &|source, needs_reading| {
+            let storage = environment
+                .storage_of(source)
+                .expect("a source the environment lists");
+            provider::rediscover_sessions(
+                environment,
+                storage,
+                options.show_last,
+                options.debug_level,
+                needs_reading,
+                operation,
+            )
+        },
+    )
 }
 
 /// One agent's discovery, reading the sessions its second argument picks.
 type Rediscover<'a> =
     dyn Fn(Source, &dyn Fn(&SessionStub) -> bool) -> Result<RediscoveredSessions> + 'a;
 
-/// [`refresh_sessions`] over `sources`, in registry order.
+/// [`refresh_sessions`] over `sources`, in registry order. A row's file
+/// outside every root has its directory canonicalised through `canonicaliser`.
 fn refresh_sources(
     known: &KnownSessions,
     sources: &[Source],
     options: RefreshOptions,
+    canonicaliser: &Arc<dyn Canonicaliser>,
     rediscover: &Rediscover<'_>,
 ) -> Result<SessionChanges> {
     let mut changes = SessionChanges::default();
@@ -155,6 +193,7 @@ fn refresh_sources(
             Ok(rediscovered) => {
                 changes.absorb(source, rediscovered, known, &mut claimed, options.time);
             }
+            Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
             Err(error) => {
                 changes
                     .ignored
@@ -180,7 +219,7 @@ fn refresh_sources(
             ),
         );
     }
-    changes.drop_rows_listed_elsewhere();
+    changes.drop_rows_listed_elsewhere(canonicaliser);
     Ok(changes)
 }
 
@@ -194,7 +233,7 @@ impl SessionChanges {
         claimed: &mut HashSet<PathBuf>,
         time: TimeFilter,
     ) {
-        let mut found_now = HashMap::new();
+        let mut found_now = HashSet::new();
         for (locator, fingerprint) in rediscovered.found {
             match known.get(&locator) {
                 Some(found) if found.source != source => continue,
@@ -207,44 +246,78 @@ impl SessionChanges {
                     claimed.insert(locator.clone());
                 }
             }
-            found_now.insert(locator, fingerprint);
+            found_now.insert(locator);
         }
 
-        let as_found_now = |locator: &Path| FoundSession {
-            source,
-            fingerprint: found_now.get(locator).copied().flatten(),
-            has_transient_read_error: false,
-        };
-        for (locator, read) in rediscovered.read {
+        for outcome in rediscovered.outcomes {
+            let locator = outcome.locator().to_path_buf();
             let is_listed = known.is_listed_by(source, &locator);
+            let found = FoundSession {
+                source,
+                fingerprint: outcome.revision(),
+                has_transient_read_error: false,
+            };
+            let origin = if is_listed {
+                SessionOrigin::AlreadyListed
+            } else {
+                SessionOrigin::Discovered
+            };
+            let (read, next) = outcome.into_parts();
             match read {
                 SessionRead::Listed(row) => {
-                    // A listed session stays listed as it changes; the time
-                    // filter decides only whether a new one joins.
-                    if is_listed || row.message_times.has_message_within(&time) {
+                    if listing::is_listed(origin, SessionTimes::Messages(&row.message_times), &time)
+                    {
                         self.updated.push(UpdatedSession {
                             row: *row,
                             replaces_listed_row: is_listed,
+                            next,
                         });
-                    } else {
+                    } else if next == NextStep::Settled {
                         self.skipped
                             .unlisted
                             .insert(locator, FoundSession::of(&row));
+                    } else {
+                        // The newer messages missing from the copy may fall
+                        // inside the window.
+                        self.pending.push(PendingSession {
+                            source,
+                            path: locator,
+                            next,
+                        });
                     }
                 }
-                SessionRead::Empty => {
-                    self.skipped
-                        .unlisted
-                        .insert(locator.clone(), as_found_now(&locator));
+                SessionRead::Empty(_) => {
+                    self.skipped.unlisted.insert(locator.clone(), found);
                     if is_listed {
                         self.removed.push(locator);
                     }
                 }
-                SessionRead::Failed(ReadError::Permanent) => {
-                    let found = as_found_now(&locator);
-                    self.skipped.unreadable.insert(locator, found);
+                SessionRead::Missing => {
+                    if is_listed {
+                        self.removed.push(locator);
+                    }
                 }
-                SessionRead::Failed(ReadError::Transient) => {}
+                SessionRead::Failed(error, _) => {
+                    if error == ReadError::Permanent {
+                        self.skipped.unreadable.insert(locator.clone(), found);
+                    }
+                    if is_listed {
+                        self.kept.push(KeptSession {
+                            path: locator,
+                            next,
+                        });
+                    }
+                }
+                // A refresh read the cache as it is: a listed row keeps the
+                // copy the list already shows.
+                SessionRead::NotCached => {
+                    if is_listed {
+                        self.kept.push(KeptSession {
+                            path: locator,
+                            next,
+                        });
+                    }
+                }
             }
         }
 
@@ -253,7 +326,12 @@ impl SessionChanges {
                 .listed
                 .iter()
                 .filter(|(locator, found)| {
-                    found.source == source && !found_now.contains_key(*locator)
+                    found.source == source
+                        && !found_now.contains(*locator)
+                        && !rediscovered
+                            .unreadable_directories
+                            .iter()
+                            .any(|directory| locator.starts_with(directory))
                 })
                 .map(|(locator, _)| locator.clone()),
         );
@@ -267,20 +345,22 @@ impl SessionChanges {
     /// A file two agents reach under two spellings of its path lists once,
     /// under the first agent in the registry. Drop a new row whose file an
     /// earlier row in this refresh already names, and record it as unlisted.
-    fn drop_rows_listed_elsewhere(&mut self) {
-        let mut seen = SeenPaths::default();
-        let mut kept = Vec::with_capacity(self.updated.len());
+    /// Each row's file is identified below the roots of its address.
+    fn drop_rows_listed_elsewhere(&mut self, canonicaliser: &Arc<dyn Canonicaliser>) {
+        let mut seen = SeenPaths::new(canonicaliser);
+        let mut listed = Vec::with_capacity(self.updated.len());
         for updated in std::mem::take(&mut self.updated) {
-            let first_to_name_it = seen.insert(&updated.row.path);
+            let first_to_name_it =
+                seen.insert(&updated.row.path, updated.row.cache_address.as_ref());
             if first_to_name_it || updated.replaces_listed_row {
-                kept.push(updated);
+                listed.push(updated);
             } else {
                 self.skipped
                     .unlisted
                     .insert(updated.row.path.clone(), FoundSession::of(&updated.row));
             }
         }
-        self.updated = kept;
+        self.updated = listed;
     }
 }
 

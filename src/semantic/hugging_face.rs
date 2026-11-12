@@ -39,6 +39,7 @@ struct HuggingFaceEnvironment<'a> {
 }
 
 impl HuggingFaceEnvironment<'static> {
+    #[allow(clippy::disallowed_methods)]
     fn of_process() -> Self {
         let home = home::home_dir();
         Self {
@@ -88,6 +89,7 @@ impl HuggingFaceEnvironment<'_> {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 fn process_variable(name: &str) -> Option<OsString> {
     std::env::var_os(name)
 }

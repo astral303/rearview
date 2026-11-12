@@ -1,9 +1,11 @@
 use crate::history::Conversation;
 use crate::history::message_texts::push_separated;
+use crate::search::byte_search::{AsciiCaselessFinder, NonAsciiCapitals};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, Local};
+use memchr::memmem;
 use rayon::prelude::*;
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +18,7 @@ pub enum CaseMode {
 /// letter. Each run of whitespace in it matches any run of whitespace in the
 /// text, so the cached text, which collapses whitespace, and an opened
 /// transcript give the same answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Literal {
     text: String,
     case_mode: CaseMode,
@@ -29,13 +31,97 @@ pub struct Literal {
     /// `folded` split at its whitespace: each must appear in a text that
     /// holds a match.
     words: Vec<String>,
+    search: LiteralSearch,
 }
 
-/// The characters outside ASCII whose lowercase holds ASCII: LATIN CAPITAL
-/// LETTER I WITH DOT ABOVE lowercases to `i` and a combining dot, KELVIN SIGN
-/// to `k`. A case-insensitive ASCII literal can match a text holding either
-/// outside the text's ASCII bytes.
-const LOWERCASING_TO_ASCII: [&str; 2] = ["\u{130}", "\u{212A}"];
+/// Every other field follows from these two.
+impl PartialEq for Literal {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.case_mode == other.case_mode
+    }
+}
+
+impl Eq for Literal {}
+
+/// The literal's search for its matches in a text.
+#[derive(Debug, Clone)]
+enum LiteralSearch {
+    /// The literal starts and ends with a word: find its first word, then
+    /// check the rest from there.
+    FirstWord(WordFinders),
+    /// Check that the text holds each word, when the literal has finders for
+    /// them, then fold the text one character at a time.
+    EachChar(Option<WordFinders>),
+}
+
+/// A finder for each of the literal's words.
+#[derive(Debug, Clone)]
+enum WordFinders {
+    /// A case-sensitive literal's words, as written.
+    Exact {
+        finders: Box<[memmem::Finder<'static>]>,
+    },
+    /// A case-insensitive ASCII literal's words, lowercase, ignoring ASCII
+    /// case.
+    IgnoringAsciiCase {
+        finders: Box<[AsciiCaselessFinder]>,
+        capitals: NonAsciiCapitals,
+    },
+}
+
+impl WordFinders {
+    /// `folded` is the literal folded for `case_mode`, and `words` its words.
+    fn new(case_mode: CaseMode, folded: &str, words: &[String]) -> Option<Self> {
+        match case_mode {
+            CaseMode::Sensitive => Some(Self::Exact {
+                finders: words
+                    .iter()
+                    .map(|word| memmem::Finder::new(word.as_bytes()).into_owned())
+                    .collect(),
+            }),
+            CaseMode::Insensitive if folded.is_ascii() => Some(Self::IgnoringAsciiCase {
+                finders: words
+                    .iter()
+                    .map(|word| AsciiCaselessFinder::new(word.as_bytes()))
+                    .collect(),
+                capitals: NonAsciiCapitals::matchable_by(folded.as_bytes()),
+            }),
+            CaseMode::Insensitive => None,
+        }
+    }
+
+    /// The byte where word `index` next occurs in `text` from byte `from`.
+    fn find(&self, index: usize, text: &str, from: usize) -> Option<usize> {
+        match self {
+            Self::Exact { finders, .. } => finders[index]
+                .find(&text.as_bytes()[from..])
+                .map(|offset| from + offset),
+            Self::IgnoringAsciiCase { finders, .. } => finders[index].find(text.as_bytes(), from),
+        }
+    }
+
+    /// The byte where `text` first holds a character whose lowercase holds a
+    /// letter of a case-insensitive literal: from there its ASCII bytes alone
+    /// cannot settle a match.
+    fn first_non_ascii_capital(&self, text: &str) -> Option<usize> {
+        match self {
+            Self::Exact { .. } => None,
+            Self::IgnoringAsciiCase { capitals, .. } => capitals.first_in(text),
+        }
+    }
+
+    fn holds_word(&self, index: usize, text: &str) -> bool {
+        self.find(index, text, 0).is_some()
+    }
+
+    /// True when `candidate`, bytes of a text, matches `word`.
+    fn matches(&self, candidate: &[u8], word: &str) -> bool {
+        match self {
+            Self::Exact { .. } => candidate == word.as_bytes(),
+            Self::IgnoringAsciiCase { .. } => candidate.eq_ignore_ascii_case(word.as_bytes()),
+        }
+    }
+}
 
 impl Literal {
     pub fn new(text: String) -> Self {
@@ -63,19 +149,28 @@ impl Literal {
             }
         }
         let resume_at = resume_positions(&folded);
-        let words = folded
-            .iter()
-            .collect::<String>()
+        let folded_text = folded.iter().collect::<String>();
+        let words: Vec<String> = folded_text
             .split(' ')
             .filter(|word| !word.is_empty())
             .map(str::to_owned)
             .collect();
+        let finders = WordFinders::new(case_mode, &folded_text, &words);
+        let search = match finders {
+            Some(finders)
+                if !words.is_empty() && !text.starts_with(' ') && !text.ends_with(' ') =>
+            {
+                LiteralSearch::FirstWord(finders)
+            }
+            finders => LiteralSearch::EachChar(finders),
+        };
         Self {
             text,
             case_mode,
             folded,
             resume_at,
             words,
+            search,
         }
     }
 
@@ -108,61 +203,58 @@ impl Literal {
     /// Calls `on_match` with the byte range of each match in `text`, left to
     /// right and not overlapping, until it breaks.
     ///
-    /// A case-sensitive literal with no whitespace is found by substring
-    /// search. A case-insensitive ASCII literal that starts and ends with a
-    /// word is found by searching for its first word, ignoring ASCII case,
-    /// and checking the rest from there. Reaching a character that
-    /// lowercases to ASCII, that search folds the rest of `text` one
+    /// A literal that starts and ends with a word, case-sensitive or ASCII,
+    /// is found by searching for its first word and checking the rest from
+    /// there. Reaching a character whose lowercase holds a letter of a
+    /// case-insensitive literal, that search folds the rest of `text` one
     /// character at a time from the end of its last match. Any other literal
-    /// first checks that `text` holds each of its words, then folds `text`
-    /// one character at a time.
+    /// first checks that `text` holds each of its words, when it can, then
+    /// folds `text` one character at a time.
     fn scan(&self, text: &str, mut on_match: impl FnMut(usize, usize) -> ControlFlow<()>) {
         if self.folded.is_empty() {
             return;
         }
-        if self.case_mode == CaseMode::Sensitive && !self.text.contains(' ') {
-            for (start, end) in find_substring_ranges(text, &self.text) {
-                if on_match(start, end).is_break() {
-                    return;
+        let finders = match &self.search {
+            LiteralSearch::FirstWord(finders) => finders,
+            LiteralSearch::EachChar(finders) => {
+                if finders
+                    .as_ref()
+                    .is_none_or(|finders| self.may_occur_in(text, finders))
+                {
+                    self.scan_each_char(text, 0, on_match);
                 }
+                return;
             }
-            return;
-        }
-        let is_ascii_insensitive =
-            self.case_mode == CaseMode::Insensitive && self.folded.iter().all(char::is_ascii);
-        if is_ascii_insensitive && !self.text.starts_with(' ') && !self.text.ends_with(' ') {
-            let mut from = 0;
-            let mut last_match_end = 0;
-            loop {
-                match find_ascii_ignoring_case(text, &self.words[0], from) {
-                    AsciiSearch::Found(start) => match self.ascii_match_end(text, start) {
-                        Some(end) => {
-                            if on_match(start, end).is_break() {
-                                return;
-                            }
-                            from = end;
-                            last_match_end = end;
-                        }
-                        None => from = start + 1,
-                    },
-                    AsciiSearch::Absent => return,
-                    AsciiSearch::LowercasingToAscii => {
-                        self.scan_each_char(text, last_match_end, on_match);
+        };
+        let fold_from = finders.first_non_ascii_capital(text);
+        let mut from = 0;
+        let mut last_match_end = 0;
+        loop {
+            let start = finders.find(0, text, from);
+            if let Some(fold_from) = fold_from
+                && start.is_none_or(|start| start > fold_from)
+            {
+                self.scan_each_char(text, last_match_end, on_match);
+                return;
+            }
+            let Some(start) = start else { return };
+            match self.match_end(text, start, finders) {
+                Some(end) => {
+                    if on_match(start, end).is_break() {
                         return;
                     }
+                    from = end;
+                    last_match_end = end;
                 }
+                None => from = start + 1,
             }
         }
-        if !self.may_occur_in(text, is_ascii_insensitive) {
-            return;
-        }
-        self.scan_each_char(text, 0, on_match);
     }
 
     /// The end of the match starting with the literal's first word at
-    /// `start`: each later word follows a run of whitespace, ignoring ASCII
-    /// case. `None` when the text there departs from the literal.
-    fn ascii_match_end(&self, text: &str, start: usize) -> Option<usize> {
+    /// `start`: each later word follows a run of whitespace. `None` when the
+    /// text there departs from the literal.
+    fn match_end(&self, text: &str, start: usize, finders: &WordFinders) -> Option<usize> {
         let mut end = start + self.words[0].len();
         for word in &self.words[1..] {
             let word_start = text[end..]
@@ -173,11 +265,7 @@ impl Literal {
                 return None;
             }
             let word_end = word_start + word.len();
-            if !text
-                .as_bytes()
-                .get(word_start..word_end)?
-                .eq_ignore_ascii_case(word.as_bytes())
-            {
+            if !finders.matches(text.as_bytes().get(word_start..word_end)?, word) {
                 return None;
             }
             end = word_end;
@@ -185,19 +273,12 @@ impl Literal {
         Some(end)
     }
 
-    /// False when `text` lacks one of the literal's words, so it holds no
-    /// match. Words are compared as written when the literal is
-    /// case-sensitive, and ignoring ASCII case when `is_ascii_insensitive`
-    /// and the word occurs before any character lowercasing to ASCII;
-    /// otherwise any text may hold a match.
-    fn may_occur_in(&self, text: &str, is_ascii_insensitive: bool) -> bool {
-        match self.case_mode {
-            CaseMode::Sensitive => self.words.iter().all(|word| text.contains(word.as_str())),
-            CaseMode::Insensitive if is_ascii_insensitive => self.words.iter().all(|word| {
-                !matches!(find_ascii_ignoring_case(text, word, 0), AsciiSearch::Absent)
-            }),
-            CaseMode::Insensitive => true,
-        }
+    /// False when `text` lacks one of the literal's words and can't hold a
+    /// match. A case-insensitive literal may match any text holding a
+    /// character whose lowercase holds one of its letters.
+    fn may_occur_in(&self, text: &str, finders: &WordFinders) -> bool {
+        finders.first_non_ascii_capital(text).is_some()
+            || (0..self.words.len()).all(|index| finders.holds_word(index, text))
     }
 
     /// [`Self::scan`] by folding `text` from byte `from` one character at a
@@ -249,10 +330,10 @@ struct FoldedMatcher<'a> {
     folded: &'a [char],
     resume_at: &'a [usize],
     matched: usize,
-    fed: usize,
     /// The byte where each of the last `folded.len()` fed characters starts,
-    /// by position modulo `folded.len()`.
+    /// as a ring: `next_slot` holds the oldest and receives the next.
     starts: Vec<usize>,
+    next_slot: usize,
 }
 
 impl<'a> FoldedMatcher<'a> {
@@ -261,8 +342,8 @@ impl<'a> FoldedMatcher<'a> {
             folded: &literal.folded,
             resume_at: &literal.resume_at,
             matched: 0,
-            fed: 0,
             starts: vec![0; literal.folded.len()],
+            next_slot: 0,
         }
     }
 
@@ -270,8 +351,12 @@ impl<'a> FoldedMatcher<'a> {
     /// `start..end` is the text character `ch` was folded from.
     fn feed(&mut self, ch: char, start: usize, end: usize) -> Option<(usize, usize)> {
         let length = self.folded.len();
-        self.starts[self.fed % length] = start;
-        self.fed += 1;
+        self.starts[self.next_slot] = start;
+        self.next_slot = if self.next_slot + 1 == length {
+            0
+        } else {
+            self.next_slot + 1
+        };
         while self.matched > 0 && self.folded[self.matched] != ch {
             self.matched = self.resume_at[self.matched - 1];
         }
@@ -283,7 +368,7 @@ impl<'a> FoldedMatcher<'a> {
             return None;
         }
         self.matched = 0;
-        Some((self.starts[self.fed % length], end))
+        Some((self.starts[self.next_slot], end))
     }
 }
 
@@ -372,30 +457,6 @@ pub fn matches_all_literals(text: &str, literals: &[Literal]) -> bool {
     literals.iter().all(|literal| literal.matches(text))
 }
 
-/// True when each literal matches within one of the texts `agent search`
-/// reads: the session's `full_text`, `agent_search_text` and
-/// `thinking_and_tool_call_text`, and its project name. With `window` active,
-/// only the text of its messages inside the window, without the project name.
-pub fn agent_conversation_matches_all_literals(
-    conversation: &Conversation,
-    literals: &[Literal],
-    window: &TimeFilter,
-) -> bool {
-    let fields: Vec<Cow<'_, str>> = if window.is_active() {
-        conversation.texts_within(window).into_array().into()
-    } else {
-        vec![
-            Cow::Borrowed(conversation.full_text.as_str()),
-            Cow::Borrowed(conversation.agent_search_text.as_str()),
-            Cow::Borrowed(conversation.thinking_and_tool_call_text.as_str()),
-            Cow::Borrowed(conversation.project_name.as_deref().unwrap_or_default()),
-        ]
-    };
-    literals
-        .iter()
-        .all(|literal| fields.iter().any(|field| literal.matches(field)))
-}
-
 pub fn match_literal_ranges(text: &str, literals: &[Literal]) -> Vec<(usize, usize)> {
     literals
         .iter()
@@ -425,63 +486,16 @@ pub fn exact_fallback(
     matches.into_iter().map(|(index, _)| index).collect()
 }
 
-/// The outcome of [`find_ascii_ignoring_case`].
-enum AsciiSearch {
-    /// The byte where the needle first occurs. It starts and ends on ASCII
-    /// bytes, so on character boundaries.
-    Found(usize),
-    /// The rest of the haystack holds neither the needle nor a character
-    /// lowercasing to ASCII.
-    Absent,
-    /// A character in [`LOWERCASING_TO_ASCII`] comes before any occurrence:
-    /// the haystack's ASCII bytes alone cannot settle a match.
-    LowercasingToAscii,
-}
-
-/// Searches `haystack` from byte `from` for `needle`, lowercase ASCII,
-/// ignoring ASCII case, in one pass over its bytes.
-fn find_ascii_ignoring_case(haystack: &str, needle: &str, from: usize) -> AsciiSearch {
-    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
-    let Some(&first) = needle.first() else {
-        return AsciiSearch::Absent;
-    };
-    for start in from..haystack.len() {
-        let rest = &haystack[start..];
-        if !rest[0].is_ascii()
-            && LOWERCASING_TO_ASCII
-                .iter()
-                .any(|lowercasing| rest.starts_with(lowercasing.as_bytes()))
-        {
-            return AsciiSearch::LowercasingToAscii;
-        }
-        if rest[0].to_ascii_lowercase() == first
-            && rest
-                .get(..needle.len())
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
-        {
-            return AsciiSearch::Found(start);
-        }
-    }
-    AsciiSearch::Absent
-}
-
-fn find_substring_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while let Some(pos) = text[start..].find(needle) {
-        let range_start = start + pos;
-        let range_end = range_start + needle.len();
-        ranges.push((range_start, range_end));
-        start = range_end;
-    }
-    ranges
-}
-
 /// A session's texts joined with separators, so quoted text does not match
 /// across two of them.
 fn literal_text(conversation: &Conversation, include_agent_text: bool) -> String {
     let mut text = String::new();
-    push_separated(&mut text, &conversation.full_text);
+    for piece in conversation
+        .title_and_summary_texts()
+        .chain([conversation.full_text.as_str()])
+    {
+        push_separated(&mut text, piece);
+    }
     if include_agent_text {
         push_separated(&mut text, &conversation.agent_search_text);
         push_separated(&mut text, &conversation.thinking_and_tool_call_text);
@@ -536,7 +550,17 @@ mod tests {
             "rust_backtrace",
             "abck",
             "k k",
-        ];
+            "Retry Backoff",
+            "A A",
+            "Ab Ab C",
+            "SQLITE_PROTOCOL",
+            "日本 語",
+            "abi",
+            "kit",
+        ]
+        .map(|literal| Literal::new(literal.to_owned()));
+        let ignoring_case = ["\u{212A}it", "Mixed Case", "SQLITE_PROTOCOL"]
+            .map(|literal| Literal::ignoring_case(literal.to_owned()));
         let texts = [
             "",
             "pass --isolated to panache, not --Isolated twice: --ISOLATED",
@@ -553,35 +577,33 @@ mod tests {
             "abc\u{212A}",
             "k k then \u{212A} k k",
             "\u{212A} k k",
+            "isolated",
+            "xisolatedx éisolatedé isolated中",
+            "SQLITE_PROTOCOL",
+            "sqlite_protocol, then SQLITE_PROTOCOL and SQLITE_PROTOCOLS",
+            "Retry  Backoff, retry backoff, Retry\n\tBackoff, RetryBackoff",
+            "A A A a",
+            "Ab Ab Ab C",
+            "日本 語 日本\u{3000}語 日本語",
+            "abİ abi ABI",
+            "kit \u{212A}it KIT",
         ];
-        for literal in literals {
-            let literal = Literal::new(literal.to_owned());
+        for literal in literals.iter().chain(&ignoring_case) {
             for text in texts {
                 assert_eq!(
                     literal.match_ranges(text),
-                    ranges_folding_each_char(&literal, text),
+                    ranges_folding_each_char(literal, text),
                     "{:?} in {text:?}",
                     literal.text()
                 );
                 assert_eq!(
                     literal.matches(text),
-                    !ranges_folding_each_char(&literal, text).is_empty(),
+                    !ranges_folding_each_char(literal, text).is_empty(),
                     "{:?} in {text:?}",
                     literal.text()
                 );
             }
         }
-    }
-
-    #[test]
-    fn only_kelvin_sign_and_dotted_capital_i_lowercase_to_ascii_outside_ascii() {
-        let lowercasing_to_ascii = (0..=u32::from(char::MAX))
-            .filter_map(char::from_u32)
-            .filter(|ch| !ch.is_ascii() && ch.to_lowercase().any(|lower| lower.is_ascii()))
-            .map(String::from)
-            .collect::<Vec<_>>();
-
-        assert_eq!(lowercasing_to_ascii, LOWERCASING_TO_ASCII);
     }
 
     #[test]
@@ -741,31 +763,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_literal_matches_in_any_cached_text() {
-        let conversation =
-            conversation_with_agent_texts("main reply", "sub-agent reply", "thought it through");
-
-        for phrase in ["main reply", "sub-agent reply", "thought it through"] {
-            assert!(
-                agent_conversation_matches_all_literals(
-                    &conversation,
-                    &[Literal::new(phrase.to_owned())],
-                    &TimeFilter::default(),
-                ),
-                "{phrase}"
-            );
-        }
-    }
-
-    #[test]
     fn agent_literal_spanning_two_cached_texts_doesnt_match() {
         let conversation = conversation_with_agent_texts("ends with alpha", "beta starts", "");
 
-        assert!(!agent_conversation_matches_all_literals(
-            &conversation,
-            &[Literal::new("alpha beta".to_owned())],
-            &TimeFilter::default(),
-        ));
         assert!(
             build_agent_literal_corpus(&[conversation], &TimeFilter::default())
                 .iter()

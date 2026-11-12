@@ -21,9 +21,9 @@ pub const MESSAGE_SEPARATOR: char = PADDED_MESSAGE_SEPARATOR.as_bytes()[1] as ch
 
 /// The start of each message's text in one of a session's search texts.
 ///
-/// The text opens with the text outside every message, such as the title and
-/// the summary; each message's text follows in message order, after a
-/// separator; text past `last_message_end` is outside every message too. A
+/// The text opens with the text outside every message; each message's text
+/// follows in message order, after a separator once the text holds a byte;
+/// text past `last_message_end` is outside every message too. A
 /// windowed search does not match a text longer than 4 GiB: it is stored
 /// without starts, because each offset is 4 bytes.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -95,8 +95,7 @@ pub struct MessageTextStarts {
 }
 
 /// A session's search texts holding only some of its messages, such as those
-/// inside a time window. The title, the summary and other text outside every
-/// message are left out.
+/// inside a time window. Text outside every message is left out.
 pub struct WindowTexts<'a> {
     pub full_text: Cow<'a, str>,
     pub agent_search_text: Cow<'a, str>,
@@ -163,6 +162,18 @@ pub(crate) struct MessageTextBuilder {
 }
 
 impl MessageTextBuilder {
+    /// True until a part is pushed: [`Self::finish`] then gives an empty
+    /// text and default starts.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.outside_messages.is_empty() && self.messages.is_empty()
+    }
+
+    pub(crate) fn into_parts(self) -> impl Iterator<Item = String> {
+        self.outside_messages
+            .into_iter()
+            .chain(self.messages.into_iter().flatten())
+    }
+
     /// Add one part's `text` to message `ordinal`, or outside every message
     /// for `None`. An empty `text` adds nothing.
     pub(crate) fn push(&mut self, ordinal: Option<usize>, text: String) {
@@ -185,17 +196,12 @@ impl MessageTextBuilder {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.outside_messages.is_empty() && self.messages.iter().all(Vec::is_empty)
-    }
-
-    /// `leading` and the parts outside every message, then the parts of each
-    /// of `message_count` messages. Each part is normalised on its own and
+    /// The parts outside every message, then the parts of each of
+    /// `message_count` messages. Each part is normalised on its own and
     /// written after a separator, so quoted text matches within one part and
     /// each start is an offset into the returned text.
-    pub(crate) fn finish<'a>(
+    pub(crate) fn finish(
         self,
-        leading: impl IntoIterator<Item = &'a str>,
         message_count: usize,
         normalize: impl Fn(&str) -> String,
     ) -> (String, MessageStarts) {
@@ -203,8 +209,7 @@ impl MessageTextBuilder {
             self.messages.len() <= message_count,
             "text pushed for a message past message {message_count}"
         );
-        let leading = leading.into_iter().map(str::to_owned);
-        let mut text = separated_parts(leading.chain(self.outside_messages), &normalize);
+        let mut text = separated_parts(self.outside_messages, &normalize);
         let mut starts = Vec::with_capacity(message_count);
         let mut messages = self.messages.into_iter();
         for _ in 0..message_count {
@@ -220,12 +225,14 @@ impl MessageTextBuilder {
     /// transcript's builder holds its metadata rows and nested sub-agents:
     /// records the parent session does not number as messages.
     pub(crate) fn into_text<'a>(
-        self,
+        mut self,
         leading: impl IntoIterator<Item = &'a str>,
         normalize: impl Fn(&str) -> String,
     ) -> String {
         let message_count = self.messages.len();
-        self.finish(leading, message_count, normalize).0
+        self.outside_messages
+            .splice(0..0, leading.into_iter().map(str::to_owned));
+        self.finish(message_count, normalize).0
     }
 }
 
@@ -248,15 +255,16 @@ mod tests {
         text.to_owned()
     }
 
-    /// The title and an outside part, m1's parts "alpha" and "beta", m2
-    /// without text, m3 "gamma".
-    fn title_outside_part_and_three_messages() -> (String, MessageStarts) {
+    /// Two outside parts, m1's parts "alpha" and "beta", m2 without text, m3
+    /// "gamma".
+    fn outside_parts_and_three_messages() -> (String, MessageStarts) {
         let mut builder = MessageTextBuilder::default();
-        builder.push(Some(1), "alpha".to_owned());
         builder.push(None, "outside".to_owned());
+        builder.push(Some(1), "alpha".to_owned());
+        builder.push(None, "beside".to_owned());
         builder.push(Some(3), "gamma".to_owned());
         builder.push(Some(1), "beta".to_owned());
-        builder.finish(["title"], 3, identity)
+        builder.finish(3, identity)
     }
 
     fn range(start: usize, end: usize) -> MessageRange {
@@ -265,17 +273,17 @@ mod tests {
 
     #[test]
     fn messages_parts_sit_together_after_text_outside_every_message() {
-        let (text, _) = title_outside_part_and_three_messages();
+        let (text, _) = outside_parts_and_three_messages();
 
         assert_eq!(
             text,
-            "title \u{1e} outside \u{1e} alpha \u{1e} beta \u{1e} gamma"
+            "outside \u{1e} beside \u{1e} alpha \u{1e} beta \u{1e} gamma"
         );
     }
 
     #[test]
     fn each_messages_slice_holds_its_own_text() {
-        let (text, starts) = title_outside_part_and_three_messages();
+        let (text, starts) = outside_parts_and_three_messages();
 
         assert_eq!(
             starts.text_of(&text, &[range(1, 1)]),
@@ -292,7 +300,7 @@ mod tests {
 
     #[test]
     fn separate_ranges_keep_separator_between_their_text() {
-        let (text, starts) = title_outside_part_and_three_messages();
+        let (text, starts) = outside_parts_and_three_messages();
 
         assert_eq!(
             starts.text_of(&text, &[range(1, 1), range(3, 3)]),
@@ -302,7 +310,7 @@ mod tests {
 
     #[test]
     fn text_after_last_message_is_outside_every_message() {
-        let (mut text, starts) = title_outside_part_and_three_messages();
+        let (mut text, starts) = outside_parts_and_three_messages();
         push_separated(&mut text, "nested");
 
         assert_eq!(starts.text_of(&text, &[range(3, 3)]), " \u{1e} gamma");
@@ -310,11 +318,11 @@ mod tests {
 
     #[test]
     fn without_message_separators_writes_one_space_for_each_separator() {
-        let (text, _) = title_outside_part_and_three_messages();
+        let (text, _) = outside_parts_and_three_messages();
 
         assert_eq!(
             without_message_separators(&text),
-            "title outside alpha beta gamma"
+            "outside beside alpha beta gamma"
         );
     }
 
@@ -324,7 +332,7 @@ mod tests {
         builder.push_parts(Some(1), vec!["  Alpha  ".to_owned(), " Gamma".to_owned()]);
         builder.push(Some(2), "BETA ".to_owned());
 
-        let (text, starts) = builder.finish([], 2, |text| text.trim().to_lowercase());
+        let (text, starts) = builder.finish(2, |text| text.trim().to_lowercase());
 
         assert_eq!(text, "alpha \u{1e} gamma \u{1e} beta");
         assert_eq!(starts.text_of(&text, &[range(1, 1)]), "alpha \u{1e} gamma");
@@ -333,9 +341,12 @@ mod tests {
 
     #[test]
     fn text_without_message_text_is_stored_without_starts() {
-        let (text, starts) = MessageTextBuilder::default().finish(["title"], 4, identity);
+        let mut builder = MessageTextBuilder::default();
+        builder.push(None, "outside".to_owned());
 
-        assert_eq!(text, "title");
+        let (text, starts) = builder.finish(4, identity);
+
+        assert_eq!(text, "outside");
         assert_eq!(starts.starts, Vec::<u32>::new());
         assert_eq!(starts.text_of(&text, &[range(1, 4)]), "");
     }

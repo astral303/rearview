@@ -2,6 +2,7 @@ use std::io;
 use std::process::{Child, Command, Stdio};
 
 /// Get the pager command from $PAGER env var, or default to "less -R"
+#[allow(clippy::disallowed_methods)]
 fn get_pager_command() -> (String, Vec<String>) {
     if let Ok(pager) = std::env::var("PAGER") {
         let parts: Vec<&str> = pager.split_whitespace().collect();

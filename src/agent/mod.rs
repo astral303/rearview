@@ -1,6 +1,8 @@
 pub mod call_links;
 pub mod diagnostic;
 pub mod hidden_parts;
+#[cfg(test)]
+mod hit_read_coverage;
 pub mod message_numbering;
 #[cfg(test)]
 mod message_numbering_coverage;
@@ -11,13 +13,17 @@ mod message_time_coverage;
 pub mod ordered_scan;
 #[cfg(test)]
 mod outline_coverage;
+mod peak_memory;
 pub mod perf;
+pub mod progress;
 pub mod protocol;
 #[cfg(test)]
 mod read_coverage;
 pub mod record_writer;
 pub mod refs;
 pub mod retrieval;
+#[cfg(test)]
+mod rewritten_sessions;
 pub mod sanitize;
 pub mod search;
 #[cfg(test)]

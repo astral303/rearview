@@ -592,7 +592,10 @@ pub(super) fn flush_tool_summary(
     let start_line = rendered.lines.len();
     let label = pending.label(roster);
     let ts = if options.show_timing {
-        pending.started_at.as_deref().and_then(format_timestamp)
+        pending
+            .started_at
+            .as_deref()
+            .and_then(|started_at| format_timestamp(started_at, options.zone))
     } else {
         None
     };

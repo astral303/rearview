@@ -88,7 +88,6 @@ mod tests {
             full_text: String::new(),
             agent_search_text: String::new(),
             thinking_and_tool_call_text: String::new(),
-            semantic_route_text: String::new(),
             semantic_turns: vec![],
             semantic_turn_ranges: vec![],
             search_text_lower: String::new(),
@@ -102,12 +101,18 @@ mod tests {
             parse_errors: vec![],
             summary: None,
             custom_title: Some("custom title".to_string()),
+            external_title: None,
             model: None,
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
         }
     }
 

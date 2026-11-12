@@ -13,29 +13,40 @@ pub(crate) mod subagent_report;
 mod system_text;
 
 use super::dropped::{DroppedRecords, SkippedKinds};
-use super::lines::visit_parsed_lines;
+use super::lines::{self, LineCursor, LineSpan, visit_line_spans_from};
 use super::splice::{SubagentThread, splice_threads};
 use super::{EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::Result;
-use crate::history::parser::{SubagentMark, SubagentReads};
-use crate::history::provider::SessionStub;
+#[cfg(test)]
+use crate::history::Conversation;
+use crate::history::parser::{
+    HeaderlessSession, ParsedSession, RowDating, SubagentReads, SubagentRecordParts,
+    SubagentTranscripts, UnlistedSession,
+};
+#[cfg(test)]
+use crate::history::parser::{ParsedRow, SubagentMark};
+use crate::history::provider::{
+    LinkUpdate, LinkWindow, LinkedThread, ResumedWindow, Resumption, SessionStub, ThreadLinker,
+    TranscriptRead, TranscriptReader,
+};
+use crate::history::skill_text::RepeatedSkillText;
 use crate::history::{
-    Conversation, MalformedLine, MalformedLineDetail, ParseError, Source, TranscriptEntries,
-    parser, skill_text,
+    Admitted, MalformedLine, MalformedLineDetail, ParseError, ParsePermit, Source,
+    TranscriptEntries, parser,
 };
 use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool, UserContent, UserMessage};
 use crate::parallel::ParallelThreshold;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::SystemTime;
+use subagent_launch::LaunchLedger;
 
 /// The directory under `<project>/<session-id>/` holding the session's
 /// sub-agent transcripts, nested ones included.
@@ -51,12 +62,14 @@ impl SessionFormat for ClaudeTranscript {
     /// Claude states no session id, start time or cwd in a header: the id is
     /// the file name, the start time the first record's, and the cwd the
     /// first user record's. `None` unless the file holds a Claude record.
-    fn parse_transcript_counting(
+    fn read_transcript(
         &self,
+        _admitted: Admitted,
         path: &Path,
         mut dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
-        let transcript = transcript_entries_with(path, ParallelThreshold::DEFAULT, &mut dropped)?;
+        let (transcript, transcript_read) =
+            read_whole_transcript(path, ParallelThreshold::DEFAULT, &mut dropped)?;
         if !holds_a_claude_record(&transcript.entries) {
             return Ok(None);
         }
@@ -92,46 +105,183 @@ impl SessionFormat for ClaudeTranscript {
                 .collect(),
             dropped,
             earlier_turns: EarlierTurns::Read,
+            earlier_transcripts: Vec::new(),
+            transcript_read,
         }))
     }
 
+    #[cfg(test)]
     fn parse_conversation(
         &self,
         path: &Path,
-        modified: Option<SystemTime>,
+        dating: RowDating<'_>,
         debug_level: Option<DebugLevel>,
     ) -> Result<Option<Conversation>> {
         let reader = BufReader::new(File::open(path)?);
-        conversation_from_reader(path, reader, modified, debug_level)
+        conversation_from_reader(path, reader, dating, debug_level)
     }
 
     fn session_entries(
         &self,
+        permit: ParsePermit<'_>,
         path: &Path,
         subagents: &[PathBuf],
     ) -> Result<Option<TranscriptEntries>> {
-        let (session, transcripts) = if subagents.is_empty() {
-            (transcript_entries(path), Vec::new())
+        let (session, mut threads) = if subagents.is_empty() {
+            (transcript_entries(permit.admit(path), path), Vec::new())
         } else {
             rayon::join(
-                || transcript_entries(path),
-                || subagent_transcripts(subagents),
+                || transcript_entries(permit.admit(path), path),
+                || subagent_threads(permit, subagents),
             )
         };
         let session = session?;
         if !holds_a_claude_record(&session.entries) {
             return Ok(None);
         }
-        Ok(Some(with_subagents_spliced(session, transcripts)))
+        LaunchLedger::link(&session.entries, &mut threads);
+        Ok(Some(TranscriptEntries {
+            entries: splice_threads(session.entries, threads),
+            malformed_lines: session.malformed_lines,
+        }))
     }
 }
 
-/// The entries of each sub-agent transcript at `subagents` that reads, in
-/// order, parsed on the rayon pool. One that cannot be read is left out.
-fn subagent_transcripts(subagents: &[PathBuf]) -> Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)> {
+/// Resumes a read of a Claude transcript from its stable cursor. The
+/// identity is a hash of the transcript's first line.
+impl TranscriptReader for ClaudeTranscript {
+    fn identity(&self, source: &Path) -> Result<Vec<u8>> {
+        let mut reader = BufReader::new(File::open(source)?);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') {
+                return Ok(Vec::new());
+            }
+            if !line.trim().is_empty() {
+                let text = &line[..line.len() - 1];
+                return Ok(identity_of(text.strip_suffix('\r').unwrap_or(text)));
+            }
+        }
+    }
+
+    fn is_rewritten(&self, source: &Path, read: &TranscriptRead) -> Result<bool> {
+        lines::is_rewritten(source, read)
+    }
+
+    fn read_from(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+        read: &TranscriptRead,
+    ) -> Result<Resumption> {
+        permit.admit(source);
+        let (Some(stable_cursor), Ok(state)) = (
+            LineCursor::decode(&read.stable_cursor),
+            serde_json::from_slice::<ReadState>(&read.parser_state),
+        ) else {
+            return Ok(Resumption::FullRead);
+        };
+        let mut reader = BufReader::new(File::open(source)?);
+        reader.seek(SeekFrom::Start(stable_cursor.offset))?;
+        let pass = read_pass(
+            &mut reader,
+            PassStart {
+                from: Some(stable_cursor),
+                state,
+                source: Some(source),
+            },
+            &SubagentSidecars::of_transcript(source),
+            ParallelThreshold::DEFAULT,
+            &mut DroppedRecords::default(),
+        )?;
+        if pass.changes_earlier_entry {
+            return Ok(Resumption::ChangesEarlierEntry);
+        }
+        let bytes_read = reader
+            .get_ref()
+            .metadata()?
+            .len()
+            .saturating_sub(stable_cursor.offset);
+        let transcript_read = pass.transcript_read(read.identity.clone(), reader.get_mut())?;
+        let entries = if is_subagent_transcript(source) {
+            subagent_window_entries(source, pass.entries)
+        } else {
+            pass.entries
+        };
+        Ok(Resumption::Window(ResumedWindow {
+            start_line: stable_cursor.line,
+            entries,
+            malformed_lines: pass.malformed_lines,
+            read: transcript_read,
+            bytes_read,
+        }))
+    }
+
+    fn read_whole(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+    ) -> Result<Option<SessionProjection>> {
+        Ok(read_subagent(permit.admit(source), source)?.map(|read| read.projection))
+    }
+
+    /// Claude keeps a session's titles in its transcript.
+    fn leading_entries(
+        &self,
+        _source: &Path,
+        _read: &TranscriptRead,
+    ) -> Result<Vec<(RecordLine, LogEntry)>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Links each sub-agent thread to the `Agent` call that launched it, as its
+/// sidecar names it, and drops a non-fork thread's opening message when it
+/// repeats that call's prompt. The ledger is a [`LaunchLedger`].
+impl ThreadLinker for ClaudeTranscript {
+    fn link(&self, session: &[(RecordLine, LogEntry)], threads: &mut [SubagentThread]) -> Vec<u8> {
+        LaunchLedger::link(session, threads).encode()
+    }
+
+    fn update(
+        &self,
+        ledger: &[u8],
+        windows: &[LinkWindow<'_>],
+        threads: &[LinkedThread<'_>],
+    ) -> LinkUpdate {
+        let (ledger, launch_calls, rereads) = LaunchLedger::decode(ledger).update(windows, threads);
+        LinkUpdate {
+            ledger: ledger.encode(),
+            launch_calls,
+            rereads,
+        }
+    }
+
+    fn fold(&self, ledger: &[u8], thread: &mut SubagentThread, _threads: &[LinkedThread<'_>]) {
+        LaunchLedger::decode(ledger).fold(thread);
+    }
+
+    fn with_transcripts_renamed(
+        &self,
+        ledger: &[u8],
+        rename: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<Vec<u8>> {
+        LaunchLedger::with_transcripts_renamed(ledger, rename)
+    }
+}
+
+/// The thread of each readable sub-agent transcript at `subagents` that
+/// holds a Claude record, in order, parsed on the rayon pool. The view
+/// doesn't have a debug channel for the others; the load reports them when
+/// the row is built.
+fn subagent_threads(permit: ParsePermit<'_>, subagents: &[PathBuf]) -> Vec<SubagentThread> {
     subagents
         .par_iter()
-        .filter_map(|subagent| Some((subagent, transcript_entries(subagent).ok()?.entries)))
+        .filter_map(|subagent| {
+            let read = read_subagent(permit.admit(subagent), subagent).ok()??;
+            Some(SubagentThread::of_projection(subagent, read.projection))
+        })
         .collect()
 }
 
@@ -149,127 +299,180 @@ pub(crate) fn session_id_of(path: &Path) -> Option<&str> {
     path.file_stem()?.to_str()
 }
 
-/// `session` with the sub-agent `transcripts` spliced in as `Progress`
-/// entries, as [`threads_to_splice`] shapes them. The malformed lines are the
-/// session's own; a sub-agent transcript's are not reported here, since the
-/// view has no debug channel: the load reports it when the row is built.
-fn with_subagents_spliced(
-    session: TranscriptEntries,
-    transcripts: Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)>,
-) -> TranscriptEntries {
-    let threads = threads_to_splice(&session.entries, transcripts);
-    TranscriptEntries {
-        entries: splice_threads(session.entries, threads),
-        malformed_lines: session.malformed_lines,
-    }
+/// A sub-agent transcript read whole.
+struct SubagentRead {
+    /// The transcript under its sidecar's label, as its thread splices in
+    /// before [`LaunchLedger::fold`] drops an opening message repeating its
+    /// launching call's prompt.
+    projection: SessionProjection,
+    malformed_lines: Vec<MalformedLine>,
 }
 
-/// The sub-agent `transcripts` as threads to splice into `session`, each
-/// under its sidecar's label, without the reminder to hand its report back
-/// or the records repeating its launching `Agent` call, and with a delivered
-/// `SubagentHandback` call folded into one record.
-fn threads_to_splice(
-    session: &[(RecordLine, LogEntry)],
-    transcripts: Vec<(&PathBuf, Vec<(RecordLine, LogEntry)>)>,
-) -> Vec<SubagentThread> {
-    let prompts = subagent_launch::agent_call_prompts(
-        session
-            .iter()
-            .chain(transcripts.iter().flat_map(|(_, entries)| entries))
-            .map(|(_, entry)| entry),
+/// The sub-agent transcript at `path` read whole; `None` when it doesn't
+/// hold a Claude record. `_admitted` is the parse a permit admitted.
+fn read_subagent(_admitted: Admitted, path: &Path) -> Result<Option<SubagentRead>> {
+    let (transcript, transcript_read) = read_whole_transcript(
+        path,
+        ParallelThreshold::DEFAULT,
+        &mut DroppedRecords::default(),
+    )?;
+    if !holds_a_claude_record(&transcript.entries) {
+        return Ok(None);
+    }
+    let sidecar = SubagentSidecar::read(path);
+    let entries = subagent_report::fold_delivered_handbacks(
+        subagent_report::without_handback_reminder(transcript.entries),
     );
-    transcripts
-        .into_iter()
-        .map(|(subagent, entries)| {
-            let sidecar = SubagentSidecar::read(subagent);
-            let entries = subagent_report::fold_delivered_handbacks(
-                subagent_report::without_handback_reminder(entries),
-            );
-            SubagentThread {
-                label: subagent_label(subagent, &sidecar),
-                transcript: Arc::from(subagent.as_path()),
-                identity: SubagentIdentity {
-                    role: sidecar.agent_type.clone(),
-                    agent_id: agent_id_of(subagent).map(str::to_owned),
-                    ..SubagentIdentity::default()
-                },
-                launch_call: sidecar.tool_use_id.clone(),
-                started: entries
-                    .iter()
-                    .find_map(|(_, entry)| entry.timestamp())
-                    .unwrap_or_default()
-                    .to_owned(),
-                entries: subagent_launch::without_launch_repeats(entries, &sidecar, &prompts),
-            }
-        })
-        .collect()
+    let started = entries
+        .iter()
+        .find_map(|(_, entry)| entry.timestamp())
+        .unwrap_or_default()
+        .to_owned();
+    let header = SessionHeader {
+        version: 0,
+        id: session_id_of(path).unwrap_or_default().to_owned(),
+        timestamp: started,
+        cwd: PathBuf::new(),
+        thread_label: Some(subagent_label(path, &sidecar)),
+        subagent_identity: SubagentIdentity {
+            role: sidecar.agent_type.clone(),
+            agent_id: agent_id_of(path).map(str::to_owned),
+            ..SubagentIdentity::default()
+        },
+    };
+    Ok(Some(SubagentRead {
+        projection: SessionProjection {
+            source: Source::Claude,
+            header,
+            title: None,
+            entries: subagent_launch::without_fork_copies(entries, &sidecar),
+            leaf_id: None,
+            malformed_lines: transcript
+                .malformed_lines
+                .iter()
+                .map(|line| line.line_number)
+                .collect(),
+            dropped: DroppedRecords::default(),
+            earlier_turns: EarlierTurns::Read,
+            earlier_transcripts: Vec::new(),
+            transcript_read,
+        },
+        malformed_lines: transcript.malformed_lines,
+    }))
+}
+
+/// `entries`, a window of the sub-agent transcript at `path`, as its thread
+/// shows them: as [`read_subagent`] shapes them.
+fn subagent_window_entries(
+    path: &Path,
+    entries: Vec<(RecordLine, LogEntry)>,
+) -> Vec<(RecordLine, LogEntry)> {
+    let entries = subagent_report::fold_delivered_handbacks(
+        subagent_report::without_handback_reminder(entries),
+    );
+    subagent_launch::without_fork_copies(entries, &SubagentSidecar::read(path))
+}
+
+/// True for a sub-agent's transcript: Claude keeps every one, nested ones
+/// included, in a `subagents/` directory.
+fn is_subagent_transcript(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == SUBAGENTS_DIR)
 }
 
 /// The row for the Claude session `stub`. Each transcript is read once. Each
 /// sub-agent transcript adds the text and tokens of the records the view
-/// shows, and its turns are numbered where [`with_subagents_spliced`] splices
-/// them into the view.
-/// `on_transcript_read` is called once for each transcript read.
+/// shows, and its turns are numbered where the view splices them in.
+/// `on_transcript_read` is called once for each transcript read. A row
+/// without any time is dated `clock`'s current time.
 pub(crate) fn session_row(
+    permit: ParsePermit<'_>,
     stub: &SessionStub,
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
-) -> Result<Option<Conversation>> {
-    let session = transcript_entries(&stub.locator);
+    clock: &dyn Clock,
+) -> Result<ParsedSession> {
+    let session = read_transcript(permit.admit(&stub.locator), &stub.locator);
     on_transcript_read();
-    let TranscriptEntries {
-        entries,
-        malformed_lines,
-    } = session?;
-    let subagents = subagent_reads(&entries, &stub.subagents, debug_level, on_transcript_read);
-    let Some(mut row) = transcript_row(
-        &stub.locator,
-        &entries,
-        subagents.marks(),
-        malformed_lines,
-        stub.fingerprint.modified,
+    let (own, own_read) = session?;
+    if !holds_a_claude_record(&own.entries) {
+        return Ok(Err(UnlistedSession::foreign()));
+    }
+    let (subagents, ledger) = subagent_reads(
+        permit,
+        &own.entries,
+        &stub.subagents,
         debug_level,
-    ) else {
-        return Ok(None);
-    };
-    subagents.merge_into(&mut row, &stub.subagents, debug_level);
-    Ok(Some(row))
+        on_transcript_read,
+    );
+    let parse_errors = own
+        .malformed_lines
+        .iter()
+        .cloned()
+        .filter_map(|line| parse_error(&stub.locator, line, debug_level))
+        .collect();
+    Ok(parser::headerless_session(HeaderlessSession {
+        source: Source::Claude,
+        stub,
+        session_id: session_id_of(&stub.locator).unwrap_or_default().to_owned(),
+        own,
+        own_read,
+        subagents,
+        ledger,
+        parse_errors,
+        dating: RowDating::new(stub.fingerprint.modified, clock),
+        debug_level,
+    }))
 }
 
 /// Every sub-agent transcript at `subagents`, read in parallel and held at
-/// once: launch-repeat removal reads the `Agent` call prompts in `session`,
-/// the session's own entries, and in every transcript. An unreadable
-/// transcript is left out of the threads to splice, as the view leaves it
-/// out.
+/// once, because dropping an opening message that repeats its launching
+/// call's prompt needs the `Agent` calls of `session`, the session's own
+/// entries, and of every transcript. Returns the reads and the encoded
+/// [`LaunchLedger`]. An unreadable transcript is left out of the threads to
+/// splice, as the view leaves it out.
 fn subagent_reads(
+    permit: ParsePermit<'_>,
     session: &[(RecordLine, LogEntry)],
     subagents: &[PathBuf],
     debug_level: Option<DebugLevel>,
     on_transcript_read: &(dyn Fn() + Sync),
-) -> SubagentReads {
-    let transcripts: Vec<_> = subagents
+) -> (SubagentReads, Vec<u8>) {
+    let reads: Vec<_> = subagents
         .par_iter()
         .map(|subagent| {
-            let transcript = transcript_entries(subagent);
+            let read = read_subagent(permit.admit(subagent), subagent);
             on_transcript_read();
-            transcript
+            read
         })
         .collect();
-    let mut read = Vec::new();
+    let mut threads = Vec::new();
+    let mut records = SubagentTranscripts::default();
     let mut unreadable = Vec::new();
-    for (subagent, transcript) in subagents.iter().zip(transcripts) {
-        match transcript {
-            Ok(TranscriptEntries {
-                entries,
+    for (index, (subagent, read)) in subagents.iter().zip(reads).enumerate() {
+        match read {
+            Ok(Some(SubagentRead {
+                mut projection,
                 malformed_lines,
-            }) => {
+            })) => {
                 warn_malformed_lines(subagent, malformed_lines, debug_level);
-                read.push((subagent, entries));
+                records.add(
+                    index + 1,
+                    subagent,
+                    SubagentRecordParts::of_read(&mut projection),
+                );
+                threads.push(SubagentThread::of_projection(subagent, projection));
             }
+            Ok(None) => {}
             Err(error) => unreadable.push((subagent.clone(), error)),
         }
     }
-    SubagentReads::of_threads(threads_to_splice(session, read), unreadable)
+    let ledger = LaunchLedger::link(session, &mut threads);
+    (
+        SubagentReads::of_threads(threads, records, unreadable),
+        ledger.encode(),
+    )
 }
 
 /// One Claude transcript line, parsed by [`parse_record`].
@@ -286,9 +489,10 @@ enum ClaudeRecord {
 }
 
 /// Parse one Claude transcript line into the entries the viewer and the row
-/// both read.
-fn parse_record(line: &str) -> serde_json::Result<ClaudeRecord> {
+/// both read, and whether it [`opens_turn`].
+fn parse_record(line: &str) -> serde_json::Result<(ClaudeRecord, bool)> {
     let entry = serde_json::from_str::<LogEntry>(line)?;
+    let opens = opens_turn(&entry);
     let record = match &entry {
         LogEntry::System { .. } => local_command_message(&entry)
             .or_else(|| system_text::system_text_row(&entry))
@@ -303,49 +507,74 @@ fn parse_record(line: &str) -> serde_json::Result<ClaudeRecord> {
                     .map(ClaudeRecord::Entry)
             }),
         LogEntry::User { .. } if safeguard_note::is_note_to_the_model(line) => {
-            Some(ClaudeRecord::ModelOnly)
+            return Ok((ClaudeRecord::ModelOnly, false));
         }
         _ => None,
     };
-    Ok(record.unwrap_or(ClaudeRecord::Entry(entry)))
+    Ok((record.unwrap_or(ClaudeRecord::Entry(entry)), opens))
+}
+
+/// True for a user message that opens a turn: Claude Code writes it once
+/// every reply before it is complete. A tool result or skill text can stand
+/// between two content blocks of one reply.
+fn opens_turn(entry: &LogEntry) -> bool {
+    let LogEntry::User {
+        message,
+        parent_tool_use_id: None,
+        source_tool_use_id: None,
+        ..
+    } = entry
+    else {
+        return false;
+    };
+    match &message.content {
+        UserContent::String(_) => true,
+        UserContent::Blocks(blocks) => !blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. })),
+    }
 }
 
 /// The row for the Claude transcript at `path`, read from `reader` and built
 /// from the viewer's entries, its sub-agent transcripts not merged in.
+#[cfg(test)]
 pub(crate) fn conversation_from_reader(
     path: &Path,
     reader: impl BufRead,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
 ) -> Result<Option<Conversation>> {
-    let transcript = transcript_entries_from(
+    let pass = read_pass(
         reader,
+        PassStart::default(),
         &SubagentSidecars::of_transcript(path),
         ParallelThreshold::DEFAULT,
         &mut DroppedRecords::default(),
     )?;
     Ok(transcript_row(
         path,
-        &transcript.entries,
+        &pass.entries,
         &[],
-        transcript.malformed_lines,
-        modified,
+        pass.malformed_lines,
+        dating,
         debug_level,
-    ))
+    )
+    .ok())
 }
 
 /// The row for the Claude transcript at `path` holding `entries`, each
 /// sub-agent turn in `marks` numbered where the view splices it in. Each of
 /// `malformed_lines` keeps its text and two lines either side of it for
 /// `--debug`.
+#[cfg(test)]
 fn transcript_row(
     path: &Path,
     entries: &[(RecordLine, LogEntry)],
     marks: &[SubagentMark],
     malformed_lines: Vec<MalformedLine>,
-    modified: Option<SystemTime>,
+    dating: RowDating<'_>,
     debug_level: Option<DebugLevel>,
-) -> Option<Conversation> {
+) -> ParsedRow {
     let parse_errors = malformed_lines
         .into_iter()
         .filter_map(|line| parse_error(path, line, debug_level))
@@ -356,10 +585,10 @@ fn transcript_row(
         entries.iter().map(|(_, entry)| entry),
         marks,
         parse_errors,
-        modified,
+        dating,
         debug_level,
     )?;
-    Some(Conversation {
+    Ok(Conversation {
         session_id: session_id_of(path).unwrap_or_default().to_owned(),
         ..conversation
     })
@@ -459,92 +688,442 @@ pub(crate) fn normalize_entry(entry: &mut LogEntry, sidecars: &SubagentSidecars)
 /// One Claude transcript, with no sub-agent transcript spliced in, each entry
 /// normalized by [`normalize_entry`] and repeated skill text dropped. Skill
 /// text is dropped before splicing because a spliced sub-agent turn does not
-/// carry `sourceToolUseID`.
-pub(crate) fn transcript_entries(path: &Path) -> Result<TranscriptEntries> {
-    transcript_entries_with(
+/// carry `sourceToolUseID`. `admitted` is the parse a permit admitted.
+pub(crate) fn transcript_entries(admitted: Admitted, path: &Path) -> Result<TranscriptEntries> {
+    Ok(read_transcript(admitted, path)?.0)
+}
+
+/// [`transcript_entries`], with the [`TranscriptRead`] the next read resumes
+/// from. `_admitted` is the parse a permit admitted.
+fn read_transcript(
+    _admitted: Admitted,
+    path: &Path,
+) -> Result<(TranscriptEntries, TranscriptRead)> {
+    read_whole_transcript(
         path,
         ParallelThreshold::DEFAULT,
         &mut DroppedRecords::default(),
     )
 }
 
-/// [`transcript_entries`], its lines parsed on the rayon pool for a batch
+/// [`read_transcript`], its lines parsed on the rayon pool for a batch
 /// `parallel` admits, with [`count_dropped_records`] counting into `dropped`.
-fn transcript_entries_with(
+fn read_whole_transcript(
     path: &Path,
     parallel: ParallelThreshold,
     dropped: &mut DroppedRecords,
-) -> Result<TranscriptEntries> {
-    let reader = BufReader::new(File::open(path)?);
-    transcript_entries_from(
-        reader,
+) -> Result<(TranscriptEntries, TranscriptRead)> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let pass = read_pass(
+        &mut reader,
+        PassStart::default(),
         &SubagentSidecars::of_transcript(path),
         parallel,
         dropped,
-    )
+    )?;
+    let identity = pass
+        .first_line
+        .as_deref()
+        .map(identity_of)
+        .unwrap_or_default();
+    let read = pass.transcript_read(identity, reader.get_mut())?;
+    Ok((
+        TranscriptEntries {
+            entries: pass.entries,
+            malformed_lines: pass.malformed_lines,
+        },
+        read,
+    ))
+}
+
+/// A transcript's identity: a hash of its first line, which Claude Code never
+/// rewrites.
+fn identity_of(first_line: &str) -> Vec<u8> {
+    blake3::hash(first_line.as_bytes()).as_bytes().to_vec()
 }
 
 /// Lines a malformed line keeps on each side of it, for `--debug`.
 const CONTEXT_LINES: usize = 2;
 
-/// [`transcript_entries_with`] for the transcript `reader` holds, its
-/// hand-backs described from `sidecars`.
-fn transcript_entries_from(
-    reader: impl BufRead,
-    sidecars: &SubagentSidecars,
-    parallel: ParallelThreshold,
-    dropped: &mut DroppedRecords,
-) -> Result<TranscriptEntries> {
-    let mut records = Vec::new();
-    let mut malformed_lines = Vec::new();
-    let mut lines_before = VecDeque::with_capacity(CONTEXT_LINES + 1);
-    visit_parsed_lines(
-        reader,
-        1,
-        parallel,
-        |line| {
-            parse_record(line).map(|mut record| {
-                if let ClaudeRecord::Entry(entry) = &mut record {
-                    normalize_entry(entry, sidecars);
-                }
-                record
-            })
-        },
-        |line_number, line, parsed| {
-            add_context_after(&mut malformed_lines, &line);
-            match parsed {
-                Ok(record) => {
-                    if dropped.is_counting() {
-                        match &record {
-                            ClaudeRecord::Entry(entry) => {
-                                count_dropped_records(&line, entry, dropped)
-                            }
-                            ClaudeRecord::ModelOnly => count_model_only_record(&line, dropped),
-                            ClaudeRecord::Entries(_) | ClaudeRecord::HookAttachment(_) => {}
-                        }
+/// The state a read of a Claude transcript carries from its stable cursor to
+/// the next read.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ReadState {
+    /// Each thread's latest slash command, as [`RepeatedSkillText`] keeps it.
+    skill_commands: Vec<(Option<String>, Option<String>)>,
+    /// The last [`CONTEXT_LINES`] lines before the stable cursor holding more
+    /// than whitespace: the context a malformed line just after it shows.
+    lines_before: Vec<LineSpan>,
+    /// The calls hook attachments before the stable cursor name, when the
+    /// transcript doesn't hold any of them: a later call or result with one
+    /// of these IDs would show the attachment's text.
+    unplaced_hooks: Vec<String>,
+}
+
+/// The start of a read of a Claude transcript: a cursor, the state there,
+/// and the transcript holding the lines before it.
+#[derive(Default)]
+struct PassStart<'a> {
+    from: Option<LineCursor>,
+    state: ReadState,
+    source: Option<&'a Path>,
+}
+
+/// A read of a Claude transcript from its start or from a stable cursor.
+struct TranscriptPass {
+    entries: Vec<(RecordLine, LogEntry)>,
+    malformed_lines: Vec<MalformedLine>,
+    /// Past the last line with a line ending.
+    cursor: LineCursor,
+    /// The next read's start: past the last line that opens a turn, moved
+    /// back to the first hook or hand-back call without its result yet, and
+    /// to a malformed line short of its context after it.
+    stable_cursor: LineCursor,
+    stable_state: ReadState,
+    /// The first line holding more than whitespace, read from the start,
+    /// when it has a line ending.
+    first_line: Option<String>,
+    /// True when a record of the pass shows in an entry before the pass's
+    /// start: a hook attachment naming a call the pass does not hold, or a
+    /// call or result an earlier hook attachment names.
+    changes_earlier_entry: bool,
+}
+
+impl TranscriptPass {
+    /// The [`TranscriptRead`] the next read resumes from, for the transcript
+    /// with the identity `identity` that `file` holds.
+    fn transcript_read(&self, identity: Vec<u8>, file: &mut File) -> Result<TranscriptRead> {
+        Ok(TranscriptRead {
+            cursor: self.cursor.encode(),
+            stable_cursor: self.stable_cursor.encode(),
+            identity,
+            rewrite_check: lines::rewrite_check(file, self.cursor)?,
+            parser_state: serde_json::to_vec(&self.stable_state).expect("a read state serializes"),
+            stable_line: Some(self.stable_cursor.line),
+        })
+    }
+}
+
+/// The lines of a pass as they are visited, before their entries are
+/// placed.
+struct VisitedLines<'a> {
+    records: Vec<(RecordLine, ClaudeRecord)>,
+    /// Each record's line; `None` for a last line without a line ending.
+    spans: Vec<Option<LineSpan>>,
+    /// Past the last line with a line ending that opens a turn.
+    turn_end: Option<LineCursor>,
+    malformed_lines: Vec<MalformedLine>,
+    /// The start of each malformed line with a line ending, and how many
+    /// such lines holding more than whitespace follow it.
+    malformed_places: Vec<(LineCursor, usize)>,
+    /// Every line with a line ending holding more than whitespace.
+    terminated: Vec<LineSpan>,
+    lines_before: VecDeque<String>,
+    /// The lines before the pass's start that a malformed line's context
+    /// shows, read once one needs them.
+    earlier_lines: &'a [LineSpan],
+    source: Option<&'a Path>,
+    first_line: Option<Option<String>>,
+    error: Option<io::Error>,
+}
+
+impl VisitedLines<'_> {
+    /// Visit the line numbered `line_number`, standing at `span` when it has
+    /// a line ending, as `parse_record` parsed it.
+    fn visit(
+        &mut self,
+        line_number: usize,
+        span: Option<LineSpan>,
+        line: String,
+        parsed: serde_json::Result<(ClaudeRecord, bool)>,
+        dropped: &mut DroppedRecords,
+    ) {
+        self.first_line
+            .get_or_insert_with(|| span.map(|_| line.clone()));
+        add_context_after(&mut self.malformed_lines, &line);
+        if span.is_some() {
+            for (_, after) in &mut self.malformed_places {
+                *after += 1;
+            }
+        }
+        match parsed {
+            Ok((record, opens)) => {
+                if dropped.is_counting() {
+                    match &record {
+                        ClaudeRecord::Entry(entry) => count_dropped_records(&line, entry, dropped),
+                        ClaudeRecord::ModelOnly => count_model_only_record(&line, dropped),
+                        ClaudeRecord::Entries(_) | ClaudeRecord::HookAttachment(_) => {}
                     }
-                    records.push((RecordLine::from(line_number), record));
                 }
-                Err(error) => malformed_lines.push(MalformedLine {
+                if let (true, Some(span)) = (opens, span) {
+                    self.turn_end = Some(span.end);
+                }
+                self.records.push((RecordLine::from(line_number), record));
+                self.spans.push(span);
+            }
+            Err(error) => {
+                let context_before = self.context_before();
+                self.malformed_lines.push(MalformedLine {
                     line_number,
                     detail: Some(MalformedLineDetail {
                         line_content: line.clone(),
                         error_message: error.to_string(),
-                        context_before: lines_before.iter().cloned().collect(),
+                        context_before,
                         context_after: Vec::new(),
                     }),
-                }),
+                });
+                if let Some(span) = span {
+                    self.malformed_places.push((span.start, 0));
+                }
             }
-            lines_before.push_back(line);
-            if lines_before.len() > CONTEXT_LINES {
-                lines_before.pop_front();
+        }
+        if let Some(span) = span {
+            self.terminated.push(span);
+        }
+        self.lines_before.push_back(line);
+        if self.lines_before.len() > CONTEXT_LINES {
+            self.lines_before.pop_front();
+        }
+    }
+
+    /// The lines a malformed line visited next shows before it: the last
+    /// lines visited, after the lines before the pass when too few were.
+    fn context_before(&mut self) -> Vec<String> {
+        let missing = CONTEXT_LINES
+            .saturating_sub(self.lines_before.len())
+            .min(self.earlier_lines.len());
+        let mut context = Vec::with_capacity(CONTEXT_LINES);
+        if let Some(source) = self.source {
+            for span in &self.earlier_lines[self.earlier_lines.len() - missing..] {
+                match lines::read_line_at(source, *span) {
+                    Ok(line) => context.push(line),
+                    Err(error) => {
+                        self.error.get_or_insert(error);
+                    }
+                }
             }
+        }
+        context.extend(self.lines_before.iter().cloned());
+        context
+    }
+}
+
+/// The transcript `reader` holds, read from `start` to its end, its
+/// hand-backs described from `sidecars`; its lines parsed on the rayon pool
+/// for a batch `parallel` admits, with [`count_dropped_records`] counting
+/// into `dropped`.
+fn read_pass(
+    reader: impl BufRead,
+    start: PassStart<'_>,
+    sidecars: &SubagentSidecars,
+    parallel: ParallelThreshold,
+    dropped: &mut DroppedRecords,
+) -> Result<TranscriptPass> {
+    let from = start.from.unwrap_or(LineCursor::START);
+    let state = start.state;
+    let mut visited = VisitedLines {
+        records: Vec::new(),
+        spans: Vec::new(),
+        turn_end: None,
+        malformed_lines: Vec::new(),
+        malformed_places: Vec::new(),
+        terminated: Vec::new(),
+        lines_before: VecDeque::with_capacity(CONTEXT_LINES + 1),
+        earlier_lines: &state.lines_before,
+        source: start.source,
+        first_line: None,
+        error: None,
+    };
+    let parse = |line: &str| {
+        parse_record(line).map(|(mut record, opens)| {
+            if let ClaudeRecord::Entry(entry) = &mut record {
+                normalize_entry(entry, sidecars);
+            }
+            (record, opens)
+        })
+    };
+    let read = visit_line_spans_from(reader, from, parallel, parse, |span, line, parsed| {
+        visited.visit(span.start.line, Some(span), line, parsed, dropped)
+    })?;
+    if let Some((number, line)) = read.unterminated {
+        let parsed = parse(&line);
+        visited.visit(number, None, line, parsed, dropped);
+    }
+    if let Some(error) = visited.error {
+        return Err(error.into());
+    }
+    let stable_cursor = stable_cursor(&visited, from);
+    let changes_earlier_entry =
+        from != LineCursor::START && changes_earlier_entry(&visited, &state);
+    let mut unplaced_hooks = state.unplaced_hooks.clone();
+    unplaced_hooks.extend(
+        unplaced_hook_calls(&visited, stable_cursor)
+            .into_iter()
+            .map(str::to_owned),
+    );
+    let mut lines_before = state.lines_before.clone();
+    lines_before.extend(
+        visited
+            .terminated
+            .iter()
+            .filter(|span| span.end.offset <= stable_cursor.offset),
+    );
+    let lines_before = lines_before[lines_before.len().saturating_sub(CONTEXT_LINES)..].to_vec();
+    let (entries, skill_text) = RepeatedSkillText::of_commands(state.skill_commands)
+        .without_repeated(hooks::place_hook_attachments(visited.records), |record| {
+            record.line >= stable_cursor.line
+        });
+    Ok(TranscriptPass {
+        entries,
+        malformed_lines: visited.malformed_lines,
+        cursor: read.cursor,
+        stable_cursor,
+        stable_state: ReadState {
+            skill_commands: skill_text.commands(),
+            lines_before,
+            unplaced_hooks,
         },
-    )?;
-    Ok(TranscriptEntries {
-        entries: skill_text::without_repeated_skill_text(hooks::place_hook_attachments(records)),
-        malformed_lines,
+        first_line: visited.first_line.flatten(),
+        changes_earlier_entry,
     })
+}
+
+/// The start of the next read of `visited`, a pass from `from`: past the
+/// last line with a line ending that opens a turn, else `from`. Moved back
+/// to the first malformed line short of its context after it, and to each
+/// hook or hand-back call with its result or hook message at or after the
+/// cursor, or without a result in a line with a line ending yet, because a
+/// later line changes those calls' entries.
+fn stable_cursor(visited: &VisitedLines<'_>, from: LineCursor) -> LineCursor {
+    let mut calls: HashMap<&str, (LineCursor, bool)> = HashMap::new();
+    let mut answered = HashSet::new();
+    let mut hooked = HashSet::new();
+    // The start of the last result or hook message naming each call.
+    let mut last_answer: HashMap<&str, u64> = HashMap::new();
+    for ((_, record), span) in visited.records.iter().zip(&visited.spans) {
+        let Some(span) = span else {
+            continue;
+        };
+        match record {
+            ClaudeRecord::Entry(entry) => {
+                for block in hooks::entry_blocks(entry) {
+                    match block {
+                        ContentBlock::ToolUse { id, tool, .. } => {
+                            calls
+                                .entry(id)
+                                .or_insert((span.start, *tool == Tool::AgentReport));
+                        }
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            answered.insert(tool_use_id.as_str());
+                            last_answer.insert(tool_use_id, span.start.offset);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ClaudeRecord::HookAttachment(hook) if hook.names_call() => {
+                hooked.insert(hook.tool_use_id());
+                last_answer.insert(hook.tool_use_id(), span.start.offset);
+            }
+            _ => {}
+        }
+    }
+    let watched: Vec<(&str, LineCursor)> = calls
+        .iter()
+        .filter(|(id, (_, is_handback))| *is_handback || hooked.contains(*id))
+        .map(|(id, (start, _))| (*id, *start))
+        .collect();
+    let short_of_context = visited
+        .malformed_places
+        .iter()
+        .filter(|(_, after)| *after < CONTEXT_LINES)
+        .map(|(start, _)| *start);
+    let mut stable = short_of_context.fold(visited.turn_end.unwrap_or(from), |stable, pin| {
+        if pin.offset < stable.offset {
+            pin
+        } else {
+            stable
+        }
+    });
+    // Moving back can leave another call's result after the cursor.
+    while let Some(&(_, start)) = watched.iter().find(|(id, start)| {
+        start.offset < stable.offset
+            && (!answered.contains(id)
+                || last_answer
+                    .get(id)
+                    .is_some_and(|answer| *answer >= stable.offset))
+    }) {
+        stable = start;
+    }
+    stable
+}
+
+/// The IDs of every call among `visited`'s records.
+fn called_ids<'a>(visited: &'a VisitedLines<'_>) -> HashSet<&'a str> {
+    visited
+        .records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            ClaudeRecord::Entry(entry) => Some(hooks::entry_blocks(entry)),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// True when a record of `visited`, a pass from a stable cursor whose state
+/// is `state`, shows in an entry before the cursor: a hook attachment
+/// naming a call the pass does not hold, or a call or result one of the
+/// state's unplaced hook attachments names.
+fn changes_earlier_entry(visited: &VisitedLines<'_>, state: &ReadState) -> bool {
+    let called = called_ids(visited);
+    let names_earlier_call = visited.records.iter().any(|(_, record)| {
+        matches!(record, ClaudeRecord::HookAttachment(hook)
+            if hook.names_call() && !called.contains(hook.tool_use_id()))
+    });
+    let unplaced: HashSet<&str> = state.unplaced_hooks.iter().map(String::as_str).collect();
+    let answers_unplaced = visited
+        .records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            ClaudeRecord::Entry(entry) => Some(hooks::entry_blocks(entry)),
+            _ => None,
+        })
+        .flatten()
+        .any(|block| match block {
+            ContentBlock::ToolUse { id, .. } => unplaced.contains(id.as_str()),
+            ContentBlock::ToolResult { tool_use_id, .. } => unplaced.contains(tool_use_id.as_str()),
+            _ => false,
+        });
+    names_earlier_call || answers_unplaced
+}
+
+/// The calls hook attachments of `visited` before `stable_cursor` name
+/// without the pass holding the call.
+fn unplaced_hook_calls<'a>(
+    visited: &'a VisitedLines<'_>,
+    stable_cursor: LineCursor,
+) -> Vec<&'a str> {
+    let called = called_ids(visited);
+    visited
+        .records
+        .iter()
+        .zip(&visited.spans)
+        .filter_map(|((_, record), span)| match (record, span) {
+            (ClaudeRecord::HookAttachment(hook), Some(span))
+                if span.end.offset <= stable_cursor.offset
+                    && hook.names_call()
+                    && !called.contains(hook.tool_use_id()) =>
+            {
+                Some(hook.tool_use_id())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// `line` as context after each of the last malformed lines still short of
@@ -1001,8 +1580,58 @@ mod tests {
         SLASH_COMMAND_AS_USER_RECORDS, STOP_HOOK_ERROR, STOP_HOOK_SUMMARY,
     };
     use super::*;
+    use crate::clock::TestClock;
     use crate::history::format::dropped::DropOutcome;
     use crate::log_entry::{UserContent, parse_agent_progress};
+
+    /// Covers both the load's read and the entries an agent command parses.
+    #[test]
+    fn whole_read_of_session_with_subagents_admits_each_transcript_once() {
+        use crate::history::sqlite_cache::admitted_reads;
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let transcript = home.write("parent", 5, &["a question"]);
+        let subagents = ["explore", "plan"]
+            .map(|agent| home.write_subagent(&transcript, agent, 6, &["a sub-agent question"]));
+        let files: Vec<&Path> = std::iter::once(transcript.as_path())
+            .chain(subagents.iter().map(PathBuf::as_path))
+            .collect();
+        let reads_since = |before: &[usize]| -> Vec<usize> {
+            files
+                .iter()
+                .zip(before)
+                .map(|(file, before)| admitted_reads::count(file) - before)
+                .collect()
+        };
+        let cache = crate::tui::claude_home::admitted_cache();
+        let environment = home.environment_with_cache(
+            cache.path(),
+            crate::history::ProcessIdentity::default(),
+            std::sync::Arc::new(TestClock::default()),
+        );
+
+        let before: Vec<usize> = files
+            .iter()
+            .map(|file| admitted_reads::count(file))
+            .collect();
+        home.rows(&environment);
+        let load_reads = reads_since(&before);
+        let before: Vec<usize> = files
+            .iter()
+            .map(|file| admitted_reads::count(file))
+            .collect();
+        CLAUDE_TRANSCRIPT
+            .session_entries(crate::history::FOR_FIXTURES, &transcript, &subagents)
+            .unwrap()
+            .unwrap();
+        let entry_reads = reads_since(&before);
+
+        assert_eq!(load_reads, [1, 1, 1], "the load admits each file once");
+        assert_eq!(
+            entry_reads,
+            [1, 1, 1],
+            "the agent command's parse admits each file once"
+        );
+    }
 
     /// A session resumed under a newer Claude Code mixes versions; each
     /// record counts under its own.
@@ -1024,7 +1653,11 @@ mod tests {
         .unwrap();
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1074,7 +1707,11 @@ mod tests {
         .unwrap();
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1103,7 +1740,7 @@ mod tests {
         let row = |name, records: &[&str]| {
             let path = write_session(directory.path(), name, records);
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .expect("a session holding a slash command is listed")
         };
@@ -1137,7 +1774,7 @@ mod tests {
         );
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a slash command is listed");
 
@@ -1154,7 +1791,11 @@ mod tests {
         );
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1167,7 +1808,7 @@ mod tests {
         let row = |name, records: &[&str]| {
             let path = write_session(directory.path(), name, records);
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .expect("a session holding a prompt is listed")
         };
@@ -1225,7 +1866,9 @@ mod tests {
             ],
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
         let summaries = user_texts(&entries)
             .into_iter()
             .filter_map(parse_task_report)
@@ -1255,7 +1898,11 @@ mod tests {
         );
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1287,7 +1934,11 @@ mod tests {
         );
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1339,7 +1990,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             user_calls(&entries),
@@ -1366,7 +2019,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &ATTACHED_WITH_AT);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1379,7 +2032,9 @@ mod tests {
         let partial = r#"{"type":"attachment","uuid":"p1","attachment":{"type":"file","filename":"/repo/src/main.rs","content":{"type":"text","file":{"filePath":"/repo/src/main.rs","content":"line ten","numLines":5,"startLine":10,"totalLines":40}},"displayPath":"src/main.rs"}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[partial]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         let [(_, _, input, _)] = user_calls(&entries)[..] else {
             panic!("one read: {entries:?}");
@@ -1399,7 +2054,9 @@ mod tests {
             &ATTACHED_AGAIN_AFTER_COMPACTION,
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         let references = user_calls(&entries)
             .into_iter()
@@ -1422,7 +2079,9 @@ mod tests {
         let image = r#"{"type":"attachment","uuid":"m1","attachment":{"type":"file","filename":"/repo/shot.png","content":{"type":"image","file":{"base64":"iVBORw0KGgo=","type":"image/png","originalSize":8}},"displayPath":"shot.png"}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[image]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             user_calls(&entries),
@@ -1441,7 +2100,11 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &records);
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1487,7 +2150,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             results(&entries),
@@ -1514,7 +2179,9 @@ mod tests {
             &[&HOOKED_SHELL_CALLS[..5], &[post_tool_use]].concat(),
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             results(&entries),
@@ -1532,7 +2199,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &HOOKED_SHELL_CALLS[..4]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             results(&entries),
@@ -1549,7 +2218,9 @@ mod tests {
             &HOOK_MESSAGE_WITHOUT_A_CALL,
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             labelled_rows(&entries),
@@ -1577,7 +2248,9 @@ mod tests {
             &[STOP_HOOK_ERROR, STOP_HOOK_SUMMARY],
         );
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         assert_eq!(
             labelled_rows(&entries),
@@ -1599,7 +2272,11 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &records);
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1621,7 +2298,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = write_session(directory.path(), "session.jsonl", &[IDE_DIAGNOSTICS]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         let [report] = user_texts(&entries)
             .into_iter()
@@ -1653,7 +2332,9 @@ mod tests {
         let diagnostics = r#"{"type":"attachment","uuid":"d2","attachment":{"type":"diagnostics","files":[{"uri":"file:///repo/a.rs","diagnostics":[{"message":"no position"}]},{"uri":"file:///repo/b.rs","diagnostics":[]}]}}"#;
         let path = write_session(directory.path(), "session.jsonl", &[diagnostics]);
 
-        let entries = transcript_entries(&path).unwrap().entries;
+        let entries = transcript_entries(crate::history::FOR_FIXTURES.admit(&path), &path)
+            .unwrap()
+            .entries;
 
         let summaries = user_texts(&entries)
             .into_iter()
@@ -1674,7 +2355,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &lines);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1713,7 +2394,11 @@ mod tests {
         .unwrap();
 
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript_counting(&path, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &path,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -1742,7 +2427,7 @@ mod tests {
         let path = write_session(directory.path(), "session.jsonl", &RECAP_AND_REFUSALS);
 
         let row = CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a session holding a prompt is listed");
 
@@ -1757,7 +2442,7 @@ mod tests {
 
     fn session_entries(path: &Path, subagents: &[PathBuf]) -> Vec<(RecordLine, LogEntry)> {
         CLAUDE_TRANSCRIPT
-            .session_entries(path, subagents)
+            .session_entries(crate::history::FOR_FIXTURES, path, subagents)
             .unwrap()
             .expect("a Claude transcript")
             .entries
@@ -1803,7 +2488,11 @@ mod tests {
     #[test]
     fn claude_sessions_sub_agent_turns_splice_in_under_their_agent_type() {
         let transcript = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SUBAGENT_FIXTURE);
-        let subagents = crate::history::provider::claude::subagent_transcripts(&transcript, None);
+        let subagents = crate::history::provider::claude::subagent_transcripts(
+            &crate::history::provider::walk::SystemLister,
+            &transcript,
+            None,
+        );
         assert_eq!(subagents.len(), 3);
 
         let shape = session_entries(&transcript, &subagents)
@@ -1933,7 +2622,9 @@ mod tests {
 
     #[test]
     fn repeated_skill_text_is_dropped_from_session_and_its_sub_agent_transcripts() {
-        use skill_text::test_support::{SKILL_CALL_LOAD, SUB_AGENT_SKILL_CALL_LOAD};
+        use crate::history::skill_text::test_support::{
+            SKILL_CALL_LOAD, SUB_AGENT_SKILL_CALL_LOAD,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
@@ -1974,7 +2665,7 @@ mod tests {
         )
         .unwrap();
         let projection = CLAUDE_TRANSCRIPT
-            .parse_transcript(&claude)
+            .parse_transcript(crate::history::FOR_FIXTURES, &claude)
             .unwrap()
             .expect("a Claude transcript");
         assert_eq!(projection.header.id, "claude");
@@ -1990,12 +2681,15 @@ mod tests {
         ] {
             let path = fixtures.join(foreign);
             assert!(
-                CLAUDE_TRANSCRIPT.parse_transcript(&path).unwrap().is_none(),
+                CLAUDE_TRANSCRIPT
+                    .parse_transcript(crate::history::FOR_FIXTURES, &path)
+                    .unwrap()
+                    .is_none(),
                 "{foreign}"
             );
             assert!(
                 CLAUDE_TRANSCRIPT
-                    .parse_conversation(&path, None, None)
+                    .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                     .unwrap()
                     .is_none(),
                 "{foreign}"
@@ -2011,16 +2705,21 @@ mod tests {
             let path = directory.path().join(name);
             std::fs::write(&path, contents).unwrap();
 
-            assert!(CLAUDE_TRANSCRIPT.parse_transcript(&path).unwrap().is_none());
             assert!(
                 CLAUDE_TRANSCRIPT
-                    .session_entries(&path, &[])
+                    .parse_transcript(crate::history::FOR_FIXTURES, &path)
                     .unwrap()
                     .is_none()
             );
             assert!(
                 CLAUDE_TRANSCRIPT
-                    .parse_conversation(&path, None, None)
+                    .session_entries(crate::history::FOR_FIXTURES, &path, &[])
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                CLAUDE_TRANSCRIPT
+                    .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                     .unwrap()
                     .is_none()
             );
@@ -2035,10 +2734,15 @@ mod tests {
         let path = directory.path().join("summary.jsonl");
         std::fs::write(&path, r#"{"type":"summary","summary":"Only metadata"}"#).unwrap();
 
-        assert!(CLAUDE_TRANSCRIPT.parse_transcript(&path).unwrap().is_some());
         assert!(
             CLAUDE_TRANSCRIPT
-                .parse_conversation(&path, None, None)
+                .parse_transcript(crate::history::FOR_FIXTURES, &path)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            CLAUDE_TRANSCRIPT
+                .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
                 .unwrap()
                 .is_none()
         );
@@ -2049,7 +2753,7 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         std::fs::write(&path, records.join("\n")).unwrap();
         CLAUDE_TRANSCRIPT
-            .parse_conversation(&path, None, None)
+            .parse_conversation(&path, RowDating::new(None, &TestClock::default()), None)
             .unwrap()
             .expect("a conversation")
     }
@@ -2268,8 +2972,8 @@ mod tests {
         let transcript = directory.path().join("long.jsonl");
         std::fs::write(&transcript, long_transcript(400)).unwrap();
         let parsed = |parallel| {
-            let parsed =
-                transcript_entries_with(&transcript, parallel, &mut DroppedRecords::default())
+            let (parsed, _) =
+                read_whole_transcript(&transcript, parallel, &mut DroppedRecords::default())
                     .unwrap();
             let malformed = parsed
                 .malformed_lines
@@ -2293,5 +2997,173 @@ mod tests {
         assert_eq!(pool_malformed, thread_malformed);
         assert_eq!(pool_malformed.len(), 8);
         assert!(pool_entries.contains("answer-399-end"));
+    }
+
+    mod resumed_reads {
+        use super::*;
+        use crate::history::format::lines::record_splits;
+        use crate::history::provider::transcript_reads::resume;
+
+        /// A transcript as the reader reads it whole, a sub-agent's entries
+        /// shaped as the reader shapes its window's.
+        struct Read {
+            entries: Vec<(RecordLine, LogEntry)>,
+            malformed_lines: Vec<MalformedLine>,
+            read: TranscriptRead,
+        }
+
+        fn read_whole(path: &Path) -> Read {
+            let (transcript, read) = read_whole_transcript(
+                path,
+                ParallelThreshold::DEFAULT,
+                &mut DroppedRecords::default(),
+            )
+            .unwrap();
+            let entries = if is_subagent_transcript(path) {
+                subagent_window_entries(path, transcript.entries)
+            } else {
+                transcript.entries
+            };
+            Read {
+                entries,
+                malformed_lines: transcript.malformed_lines,
+                read,
+            }
+        }
+
+        /// `entries` as text a test compares.
+        fn listed(entries: &[(RecordLine, LogEntry)]) -> Vec<String> {
+            entries
+                .iter()
+                .map(|(record, entry)| format!("{} {entry:?}", record.line))
+                .collect()
+        }
+
+        /// Asserts that `prefix`, a read of a transcript's beginning, up to
+        /// the window's first line, and then `window`, the read resumed from
+        /// it over the whole transcript, hold what `full`, one read of the
+        /// whole transcript, holds, and that `window` leaves the same
+        /// [`TranscriptRead`] as `full`.
+        fn assert_window_completes(name: &str, prefix: &Read, window: &ResumedWindow, full: &Read) {
+            let kept = prefix
+                .entries
+                .iter()
+                .filter(|(record, _)| record.line < window.start_line)
+                .chain(&window.entries)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed(&kept),
+                listed(&full.entries),
+                "{name}: the prefix and the window hold the full read's entries"
+            );
+            let malformed = prefix
+                .malformed_lines
+                .iter()
+                .filter(|line| line.line_number < window.start_line)
+                .chain(&window.malformed_lines)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                malformed, full.malformed_lines,
+                "{name}: the prefix and the window hold the full read's malformed lines"
+            );
+            assert_eq!(
+                window.read, full.read,
+                "{name}: the window leaves the full read's `TranscriptRead`"
+            );
+        }
+
+        /// A session's hooked call and a sub-agent's hand-back call, each
+        /// answered only after a prompt: the stable cursor stays before each
+        /// call until its result is read.
+        const CALLS_ANSWERED_AFTER_A_PROMPT: [[&str; 5]; 2] = [
+            [
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:00Z","message":{"role":"user","content":"list the files"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-10-01T12:00:01Z","message":{"role":"assistant","id":"msg_g1","content":[{"type":"tool_use","id":"toolu_g1","name":"Bash","input":{"command":"ls"}}]}}"#,
+                r#"{"type":"attachment","timestamp":"2026-10-01T12:00:02Z","attachment":{"type":"hook_system_message","content":"SAFE: a listing","hookName":"PreToolUse:Bash","toolUseID":"toolu_g1","hookEvent":"PreToolUse"}}"#,
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:03Z","message":{"role":"user","content":"and the tests"}}"#,
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:04Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_g1","content":"a.rs"}]}}"#,
+            ],
+            [
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:00Z","message":{"role":"user","content":"scout the notes"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-10-01T12:00:01Z","message":{"role":"assistant","id":"msg_h1","content":[{"type":"tool_use","id":"toolu_h1","name":"SubagentHandback","input":{"report":"The notes list the steps."}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:02Z","message":{"role":"user","content":"one more thing"}}"#,
+                r#"{"type":"user","timestamp":"2026-10-01T12:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_h1","content":"{\"success\":true}"}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-10-01T12:00:04Z","message":{"role":"assistant","id":"msg_h2","content":[{"type":"text","text":"Done."}]}}"#,
+            ],
+        ];
+
+        /// Copies the tree at `from` into `to`, and returns every transcript
+        /// copied.
+        fn copy_transcripts(from: &Path, to: &Path) -> Vec<PathBuf> {
+            std::fs::create_dir_all(to).unwrap();
+            let mut transcripts = Vec::new();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let path = entry.unwrap().path();
+                let copy = to.join(path.file_name().unwrap());
+                if path.is_dir() {
+                    transcripts.extend(copy_transcripts(&path, &copy));
+                } else {
+                    std::fs::copy(&path, &copy).unwrap();
+                    if copy
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                    {
+                        transcripts.push(copy);
+                    }
+                }
+            }
+            transcripts
+        }
+
+        #[test]
+        fn prefix_and_resumed_read_equal_full_read_at_every_split_of_every_claude_fixture() {
+            let directory = tempfile::tempdir().unwrap();
+            let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude");
+            let mut transcripts = copy_transcripts(&fixtures, directory.path());
+            let generated = directory.path().join("generated.jsonl");
+            std::fs::write(&generated, long_transcript(60)).unwrap();
+            let hooked = directory.path().join("hooked.jsonl");
+            std::fs::write(&hooked, CALLS_ANSWERED_AFTER_A_PROMPT[0].join("\n") + "\n").unwrap();
+            let handing_back = directory.path().join("hooked/subagents/agent-a9.jsonl");
+            std::fs::create_dir_all(handing_back.parent().unwrap()).unwrap();
+            std::fs::write(
+                &handing_back,
+                CALLS_ANSWERED_AFTER_A_PROMPT[1].join("\n") + "\n",
+            )
+            .unwrap();
+            transcripts.extend([generated, hooked, handing_back]);
+            assert!(
+                transcripts.iter().any(|path| is_subagent_transcript(path)),
+                "sub-agent transcripts are among those read"
+            );
+            let reader = Source::Claude.provider().storage().transcript_reader();
+            for path in transcripts {
+                let bytes = std::fs::read(&path).unwrap();
+                let full = read_whole(&path);
+                for split in record_splits(&bytes) {
+                    let name = format!("{} at {split}", path.display());
+                    std::fs::write(&path, &bytes[..split]).unwrap();
+                    let prefix = read_whole(&path);
+                    std::fs::write(&path, &bytes).unwrap();
+
+                    match resume(reader, crate::history::FOR_FIXTURES, &path, &prefix.read).unwrap()
+                    {
+                        Resumption::Window(window) => assert_window_completes(
+                            &format!("{name} from line {}", window.start_line),
+                            &prefix,
+                            &window,
+                            &full,
+                        ),
+                        other => assert!(
+                            matches!(other, Resumption::FullRead)
+                                && prefix.read.identity.is_empty(),
+                            "{name}: only a transcript without a first line ending reads whole: {other:?}"
+                        ),
+                    }
+                }
+            }
+        }
     }
 }

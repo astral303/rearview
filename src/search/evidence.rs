@@ -1,13 +1,39 @@
 use crate::history::Conversation;
+use crate::search::byte_search::{AsciiCaselessFinder, NonAsciiCapitals};
+use crate::search::lexical::{SearchTextsInMemory, SessionSearchTexts};
 use crate::search::literal::Literal;
 use crate::search::query::ParsedQuery;
-use crate::text_match::normalize_for_search;
+use crate::search::separated_texts::SeparatedTexts;
+use crate::text_match::{is_word_start, normalize_for_search};
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LexicalEvidence {
+    /// The row's title and summary as the evidence read them: a refresh can
+    /// retitle the row before the evidence is built again.
+    title_and_summary: Vec<String>,
+    /// The session's other texts, shared with the texts held in memory;
+    /// `None` for the conversation's `full_text`.
+    body: Option<Arc<str>>,
+    /// Ranges in `title_and_summary`, then `body`, each after a separator.
     pub context_ranges: Vec<(usize, usize)>,
+}
+
+impl LexicalEvidence {
+    /// The texts `context_ranges` index, `conversation` being the row the
+    /// evidence was built for.
+    pub(crate) fn texts<'a>(&'a self, conversation: &'a Conversation) -> SeparatedTexts<'a> {
+        let body = self.body.as_deref().unwrap_or(&conversation.full_text);
+        SeparatedTexts::new(
+            self.title_and_summary
+                .iter()
+                .map(String::as_str)
+                .chain([body]),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,9 +102,11 @@ pub const MAX_EVIDENCE_ROWS: usize = 200;
 
 /// The evidence the session list shows under its first [`MAX_EVIDENCE_ROWS`]
 /// search results, keyed by conversation index. `ranked_results` holds the
-/// result indices in rank order.
+/// result indices in rank order; `texts` holds the search texts read into
+/// memory so far.
 pub fn build_session_list_evidence<C: Borrow<Conversation>>(
     conversations: &[C],
+    texts: &SearchTextsInMemory,
     ranked_results: &[usize],
     parsed: &ParsedQuery,
 ) -> HashMap<usize, LexicalEvidence> {
@@ -86,25 +114,38 @@ pub fn build_session_list_evidence<C: Borrow<Conversation>>(
         .iter()
         .take(MAX_EVIDENCE_ROWS)
         .filter_map(|&index| {
-            build_lexical_evidence(conversations[index].borrow(), parsed)
+            let conversation = conversations[index].borrow();
+            build_lexical_evidence(conversation, texts.get(conversation), parsed)
                 .map(|evidence| (index, evidence))
         })
         .collect()
 }
 
+/// The evidence for `conversation` in its search texts: its row's title and
+/// summary, then `texts`, those held in memory. A conversation not in the
+/// session cache reads its `full_text` in place of `texts`. A cached
+/// conversation without texts in memory reads its title and summary alone.
 pub fn build_lexical_evidence(
     conversation: &Conversation,
+    texts: Option<&SessionSearchTexts>,
     parsed: &ParsedQuery,
 ) -> Option<LexicalEvidence> {
     let specs = evidence_specs(parsed);
     if specs.is_empty() {
         return None;
     }
-
-    let ranges = select_context_ranges(&conversation.full_text, &conversation.preview, &specs)?;
-    Some(LexicalEvidence {
-        context_ranges: ranges,
-    })
+    let mut evidence = LexicalEvidence {
+        title_and_summary: conversation
+            .title_and_summary_texts()
+            .map(str::to_owned)
+            .collect(),
+        body: texts.map(|texts| Arc::clone(texts.joined())),
+        context_ranges: Vec::new(),
+    };
+    let ranges =
+        select_context_ranges(&evidence.texts(conversation), &conversation.preview, &specs)?;
+    evidence.context_ranges = ranges;
+    Some(evidence)
 }
 
 fn evidence_specs(parsed: &ParsedQuery) -> Vec<EvidenceSpec> {
@@ -153,7 +194,7 @@ fn dedupe_specs(specs: &[EvidenceSpec]) -> Vec<EvidenceSpec> {
 }
 
 fn select_context_ranges(
-    full_text: &str,
+    full_text: &SeparatedTexts<'_>,
     preview: &str,
     specs: &[EvidenceSpec],
 ) -> Option<Vec<(usize, usize)>> {
@@ -172,7 +213,7 @@ fn select_context_ranges(
     }
 
     if missing_count == 0 {
-        let preview_hit_count = find_all_spec_hits(preview, specs).len();
+        let preview_hit_count = find_all_spec_hits(&SeparatedTexts::new([preview]), specs).len();
         if all_hits.len() <= preview_hit_count {
             return None;
         }
@@ -186,7 +227,7 @@ fn select_context_ranges(
 }
 
 pub(crate) fn select_hidden_context_ranges(
-    full_text: &str,
+    full_text: &SeparatedTexts<'_>,
     hits: &[(usize, usize, usize)],
     missing_mask: u64,
     missing_count: u32,
@@ -211,7 +252,7 @@ pub(crate) fn select_hidden_context_ranges(
             let new_span = new_end.saturating_sub(last.start);
             if close_enough && new_span <= max_cluster_span_bytes {
                 if term_idx != last.last_term_idx && start >= last.last_hit_end {
-                    let gap = &full_text[last.last_hit_end..start];
+                    let gap = full_text.slice(last.last_hit_end..start);
                     if !gap.is_empty() && gap.chars().all(|c| !c.is_alphanumeric()) {
                         last.adjacent_pairs += 1;
                     }
@@ -292,14 +333,18 @@ pub(crate) fn select_hidden_context_ranges(
     )
 }
 
-fn find_all_spec_hits(text: &str, specs: &[EvidenceSpec]) -> Vec<TermHit> {
+/// Every spec's hits in `texts`, sorted by start, each text searched on its
+/// own: a hit doesn't cross a separator.
+fn find_all_spec_hits(texts: &SeparatedTexts<'_>, specs: &[EvidenceSpec]) -> Vec<TermHit> {
     let mut all_hits = Vec::new();
     for (term_idx, spec) in specs.iter().enumerate() {
-        all_hits.extend(spec.ranges(text).into_iter().map(|(start, end)| TermHit {
-            start,
-            end,
-            term_idx,
-        }));
+        for (offset, text) in texts.texts() {
+            all_hits.extend(spec.ranges(text).into_iter().map(|(start, end)| TermHit {
+                start: offset + start,
+                end: offset + end,
+                term_idx,
+            }));
+        }
     }
     all_hits.sort_unstable_by_key(|hit| hit.start);
     all_hits
@@ -309,7 +354,93 @@ fn find_first_normalized_match(text: &str, term: &str) -> Option<(usize, usize)>
     find_normalized_term_ranges(text, term).into_iter().next()
 }
 
+/// The byte range of each match of `term` in `text`, left to right and not
+/// overlapping. Each text character matches `term`'s character it
+/// normalises to. A term starting with an alphanumeric character matches
+/// only at the start of a word.
+///
+/// A term of ASCII characters that normalise to themselves is found by a
+/// byte search, except in the whitespace-bounded span around each character
+/// outside ASCII that normalises to one of the term's letters: that span is
+/// read character by character. Valid for terms without whitespace: each
+/// span ends at whitespace.
 fn find_normalized_term_ranges(text: &str, term: &str) -> Vec<(usize, usize)> {
+    let is_found_by_bytes = term.bytes().all(|byte| {
+        byte.is_ascii_graphic() && normalize_evidence_char(char::from(byte)) == char::from(byte)
+    });
+    if !is_found_by_bytes {
+        return find_term_ranges_each_char(text, term);
+    }
+    let capitals = NonAsciiCapitals::matchable_by(term.as_bytes());
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(capital) = capitals.first_in(&text[from..]).map(|at| from + at) {
+        let span = whitespace_bounded_span(text, from, capital);
+        push_ranges_at(
+            &mut ranges,
+            from,
+            find_ascii_term_ranges(&text[from..span.start], term),
+        );
+        push_ranges_at(
+            &mut ranges,
+            span.start,
+            find_term_ranges_each_char(&text[span.clone()], term),
+        );
+        from = span.end;
+    }
+    push_ranges_at(
+        &mut ranges,
+        from,
+        find_ascii_term_ranges(&text[from..], term),
+    );
+    ranges
+}
+
+/// The span of `text` around byte `at` without whitespace: from just after
+/// the last whitespace character between `from` and `at`, or from `from`,
+/// to the next whitespace character, or the end.
+fn whitespace_bounded_span(text: &str, from: usize, at: usize) -> Range<usize> {
+    let start = text[from..at]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(from, |(index, ch)| from + index + ch.len_utf8());
+    let end = text[at..]
+        .find(char::is_whitespace)
+        .map_or(text.len(), |index| at + index);
+    start..end
+}
+
+/// Adds `found`, ranges in a slice starting at byte `offset`, to `ranges`.
+fn push_ranges_at(ranges: &mut Vec<(usize, usize)>, offset: usize, found: Vec<(usize, usize)>) {
+    ranges.extend(
+        found
+            .into_iter()
+            .map(|(start, end)| (offset + start, offset + end)),
+    );
+}
+
+/// [`find_normalized_term_ranges`] for a term of ASCII characters that
+/// normalise to themselves, in a text without a character outside ASCII
+/// that normalises to one of them: a byte search ignoring ASCII case.
+fn find_ascii_term_ranges(text: &str, term: &str) -> Vec<(usize, usize)> {
+    let finder = AsciiCaselessFinder::new(term.as_bytes());
+    let starts_alphanumeric = term.starts_with(|ch: char| ch.is_alphanumeric());
+    let mut ranges = Vec::new();
+    let mut from = 0;
+    while let Some(start) = finder.find(text.as_bytes(), from) {
+        if starts_alphanumeric && !is_word_start(text, start) {
+            from = start + 1;
+            continue;
+        }
+        let end = start + term.len();
+        ranges.push((start, end));
+        from = end;
+    }
+    ranges
+}
+
+fn find_term_ranges_each_char(text: &str, term: &str) -> Vec<(usize, usize)> {
     let term_chars: Vec<char> = term.chars().collect();
     if term_chars.is_empty() {
         return Vec::new();
@@ -392,7 +523,6 @@ mod tests {
             full_text: full_text.to_string(),
             agent_search_text: String::new(),
             thinking_and_tool_call_text: String::new(),
-            semantic_route_text: String::new(),
             semantic_turns: vec![full_text.to_string()],
             semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
             search_text_lower: normalize_for_search(full_text),
@@ -406,12 +536,144 @@ mod tests {
             parse_errors: Vec::new(),
             summary: None,
             custom_title: None,
+            external_title: None,
             model: None,
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
+        }
+    }
+
+    const TERMS: [&str; 14] = [
+        "cache", "i", "k", "kit", "is", "a", "1st", ".rs", "c++", "über", "x", "session", "tool",
+        "answer",
+    ];
+
+    fn assert_term_ranges_match_reading_each_character(text: &str, context: &str) {
+        for term in TERMS {
+            assert_eq!(
+                find_normalized_term_ranges(text, term),
+                find_term_ranges_each_char(text, term),
+                "{term:?} in {context}: the ranges are those reading each character finds"
+            );
+        }
+    }
+
+    #[test]
+    fn term_ranges_are_those_reading_each_character_finds() {
+        let texts = [
+            "",
+            "x",
+            "cache",
+            "CACHE",
+            "mycache cache_x Cache-y /cache cAcHe",
+            "Caché cache中 中cache éCACHE cache",
+            "\u{130}s is IS i\u{307}s",
+            "\u{212A}it kit KIT k",
+            "a.rs b.RS .rs",
+            "c++ C++ cc++",
+            "über ÜBER uber",
+            "1st 21st 1ST",
+            "aaa a-a a_a a/a",
+        ];
+        for text in texts {
+            assert_term_ranges_match_reading_each_character(text, &format!("{text:?}"));
+        }
+    }
+
+    #[test]
+    fn term_ranges_in_every_providers_fixture_are_those_reading_each_character_finds() {
+        for session in crate::history::provider::contract_tests::every_record_sessions() {
+            let row = &session.row;
+            for text in [
+                &row.full_text,
+                &row.preview,
+                &row.agent_search_text,
+                &row.thinking_and_tool_call_text,
+            ] {
+                assert_term_ranges_match_reading_each_character(text, row.source.label());
+            }
+        }
+    }
+
+    #[test]
+    fn term_ranges_around_capitals_outside_ascii_are_those_reading_each_character_finds() {
+        let separator = crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
+        let bodies = [
+            "\u{130}s is IS kit cache".to_owned(),
+            "cache kit is \u{130}".to_owned(),
+            "cache kit\u{212A} is k".to_owned(),
+            format!("cache is{separator}\u{130}s kit"),
+            format!("is \u{212A}it{separator}kit cache"),
+            "x\u{130}s\u{212A}it\u{130}cache\u{212A} is kit".to_owned(),
+            "\u{130}\u{130} \u{212A}\u{212A} session tool \u{130}s".to_owned(),
+            "session.rs\u{130}cache-kit_\u{212A}it".to_owned(),
+            "is kit cache session answer 1st".to_owned(),
+        ];
+        for body in &bodies {
+            assert_term_ranges_match_reading_each_character(body, &format!("{body:?}"));
+        }
+    }
+
+    #[test]
+    fn every_providers_fixture_with_capitals_outside_ascii_gives_ranges_reading_each_character_finds()
+     {
+        for session in crate::history::provider::contract_tests::every_record_sessions() {
+            let text = &session.row.full_text;
+            let middle = (text.len() / 2..=text.len())
+                .find(|index| text.is_char_boundary(*index))
+                .unwrap_or(text.len());
+            let body = format!(
+                "\u{130}s {}\u{212A}it\u{130}{} kit\u{212A}",
+                &text[..middle],
+                &text[middle..]
+            );
+            assert_term_ranges_match_reading_each_character(&body, session.row.source.label());
+        }
+    }
+
+    #[test]
+    fn titled_rows_context_line_is_that_of_its_title_and_summary_joined_ahead_of_its_text() {
+        let body = "a body that mentions deepgram, then audio_generation and plans";
+        let mut titled = conversation("unrelated preview", body);
+        titled.custom_title = Some("Deepgram plans".to_owned());
+        titled.summary = Some("audio generation notes".to_owned());
+        let mut joined_text = String::new();
+        for text in ["Deepgram plans", "audio generation notes", body] {
+            crate::history::message_texts::push_separated(&mut joined_text, text);
+        }
+        let joined = conversation("unrelated preview", &joined_text);
+        let line = |row: &Conversation, query: &str| {
+            let evidence = build_lexical_evidence(row, None, &ParsedQuery::parse(query))?;
+            crate::search::preview::build_context_segments_from_ranges(
+                &evidence.texts(row),
+                &evidence.context_ranges,
+                40,
+            )
+        };
+
+        for query in [
+            "deepgram",
+            "plans",
+            "notes body",
+            "generation",
+            "\"audio_generation\"",
+            "plans audio",
+        ] {
+            let expected = line(&joined, query);
+            assert!(expected.is_some(), "{query:?} finds a context line");
+            assert_eq!(
+                line(&titled, query),
+                expected,
+                "{query:?}: the context line reads the titles ahead of the text"
+            );
         }
     }
 
@@ -423,7 +685,7 @@ mod tests {
             "unrelated preview followed by hidden deepgram evidence",
         );
 
-        let evidence = build_lexical_evidence(&conversation, &parsed).unwrap();
+        let evidence = build_lexical_evidence(&conversation, None, &parsed).unwrap();
 
         assert_eq!(evidence.context_ranges.len(), 1);
         let (start, end) = evidence.context_ranges[0];
@@ -438,7 +700,7 @@ mod tests {
             "audio generation normalized preview and exact audio_generation evidence",
         );
 
-        let evidence = build_lexical_evidence(&conversation, &parsed).unwrap();
+        let evidence = build_lexical_evidence(&conversation, None, &parsed).unwrap();
 
         let (start, end) = evidence.context_ranges[0];
         assert_eq!(&conversation.full_text[start..end], "audio_generation");
@@ -452,7 +714,7 @@ mod tests {
             "api key normalized preview and exact api_key evidence",
         );
 
-        let evidence = build_lexical_evidence(&conversation, &parsed).unwrap();
+        let evidence = build_lexical_evidence(&conversation, None, &parsed).unwrap();
 
         let snippets = evidence
             .context_ranges
@@ -468,7 +730,7 @@ mod tests {
         let full_text = format!("hidden_unquoted {} exact_literal", "x ".repeat(120));
         let conversation = conversation("visible preview", &full_text);
 
-        let evidence = build_lexical_evidence(&conversation, &parsed).unwrap();
+        let evidence = build_lexical_evidence(&conversation, None, &parsed).unwrap();
         let snippets = evidence
             .context_ranges
             .iter()

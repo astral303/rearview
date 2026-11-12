@@ -81,9 +81,29 @@ impl Default for AgentRetrievalOptions {
 
 #[derive(Clone, Copy)]
 pub struct AgentTranscriptSearchTarget<'a> {
+    /// The session's messages: every one, or at least every message holding
+    /// the query's terms.
     pub transcript: &'a AgentTranscript,
+    /// The session's message count, the end of every hit's read range.
+    pub message_count: usize,
     pub conversation_ref: Option<&'a str>,
     pub timestamp: Option<DateTime<Local>>,
+}
+
+impl<'a> AgentTranscriptSearchTarget<'a> {
+    /// A target holding every message of `transcript`.
+    pub fn whole(
+        transcript: &'a AgentTranscript,
+        conversation_ref: Option<&'a str>,
+        timestamp: Option<DateTime<Local>>,
+    ) -> Self {
+        Self {
+            transcript,
+            message_count: transcript.messages.len(),
+            conversation_ref,
+            timestamp,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -118,11 +138,7 @@ pub fn retrieve_agent_hits(
     options: AgentRetrievalOptions,
 ) -> Vec<AgentSearchHit> {
     retrieve_agent_hits_for_target(
-        AgentTranscriptSearchTarget {
-            transcript,
-            conversation_ref: None,
-            timestamp: None,
-        },
+        AgentTranscriptSearchTarget::whole(transcript, None, None),
         query,
         options,
     )
@@ -147,17 +163,7 @@ pub fn retrieve_agent_hits_for_targets(
 ) -> Vec<AgentSearchHit> {
     let mut candidates = targets
         .iter()
-        .flat_map(|target| {
-            retrieve_agent_hit_candidates(
-                AgentTranscriptSearchTarget {
-                    transcript: target.transcript,
-                    conversation_ref: target.conversation_ref,
-                    timestamp: target.timestamp,
-                },
-                query,
-                options,
-            )
-        })
+        .flat_map(|target| retrieve_agent_hit_candidates(*target, query, options))
         .collect::<Vec<_>>();
     let prefer_dialogue = ParsedQuery::parse(query).is_quoted_only();
     sort_candidates(&mut candidates, prefer_dialogue);
@@ -254,7 +260,7 @@ fn lexical_candidates(
             Some(candidate_from_ranges(CandidateInput {
                 target,
                 message_ordinal: message_segments[0].message_ordinal,
-                message_count: target.transcript.messages.len(),
+                message_count: target.message_count,
                 options,
                 body: &body,
                 query_words: &query_words,
@@ -299,7 +305,7 @@ fn exact_candidates_for_literals(
             Some(candidate_from_ranges(CandidateInput {
                 target,
                 message_ordinal: message_segments[0].message_ordinal,
-                message_count: target.transcript.messages.len(),
+                message_count: target.message_count,
                 options,
                 body: &body,
                 query_words: &[],
@@ -397,17 +403,14 @@ fn build_segments(
     }
 }
 
-/// The text of every segment retrieval searches in `transcript`.
+/// The text of every segment retrieval searches in `transcript` within
+/// `window`.
 #[cfg(test)]
-pub(crate) fn segment_texts(transcript: &AgentTranscript) -> Vec<String> {
-    build_segments(
-        transcript,
-        ParallelThreshold::DEFAULT,
-        TimeFilter::default(),
-    )
-    .into_iter()
-    .map(|segment| segment.text)
-    .collect()
+pub(crate) fn segment_texts(transcript: &AgentTranscript, window: TimeFilter) -> Vec<String> {
+    build_segments(transcript, ParallelThreshold::DEFAULT, window)
+        .into_iter()
+        .map(|segment| segment.text)
+        .collect()
 }
 
 fn message_segments(message: &AgentMessage, window: TimeFilter) -> Vec<Segment> {
@@ -809,26 +812,14 @@ mod tests {
 
         let hits = retrieve_agent_hits_for_targets(
             &[
-                AgentTranscriptSearchTarget {
-                    transcript: &older,
-                    conversation_ref: Some("ch_old"),
-                    timestamp: Some(now - Duration::days(1)),
-                },
-                AgentTranscriptSearchTarget {
-                    transcript: &newer,
-                    conversation_ref: Some("ch_new"),
-                    timestamp: Some(now),
-                },
-                AgentTranscriptSearchTarget {
-                    transcript: &tied_b,
-                    conversation_ref: Some("ch_b"),
-                    timestamp: Some(tied_time),
-                },
-                AgentTranscriptSearchTarget {
-                    transcript: &tied_a,
-                    conversation_ref: Some("ch_a"),
-                    timestamp: Some(tied_time),
-                },
+                AgentTranscriptSearchTarget::whole(
+                    &older,
+                    Some("ch_old"),
+                    Some(now - Duration::days(1)),
+                ),
+                AgentTranscriptSearchTarget::whole(&newer, Some("ch_new"), Some(now)),
+                AgentTranscriptSearchTarget::whole(&tied_b, Some("ch_b"), Some(tied_time)),
+                AgentTranscriptSearchTarget::whole(&tied_a, Some("ch_a"), Some(tied_time)),
             ],
             "\"needle\"",
             AgentRetrievalOptions {
@@ -857,16 +848,12 @@ mod tests {
 
         let hits = retrieve_agent_hits_for_targets(
             &[
-                AgentTranscriptSearchTarget {
-                    transcript: &tool,
-                    conversation_ref: Some("ch_tool"),
-                    timestamp: Some(now),
-                },
-                AgentTranscriptSearchTarget {
-                    transcript: &direct,
-                    conversation_ref: Some("ch_direct"),
-                    timestamp: Some(now - Duration::days(1)),
-                },
+                AgentTranscriptSearchTarget::whole(&tool, Some("ch_tool"), Some(now)),
+                AgentTranscriptSearchTarget::whole(
+                    &direct,
+                    Some("ch_direct"),
+                    Some(now - Duration::days(1)),
+                ),
             ],
             "\"protocol versioning\"",
             AgentRetrievalOptions {

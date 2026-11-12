@@ -1,19 +1,21 @@
 //! OMP sessions, stored under `~/.omp/agent/sessions/`, beside which OMP
 //! writes each session's artifacts.
 
-use super::walk::{FileRoot, SessionFiles};
+use super::walk::{DirectoryLister, DiscoveryLister, FileRoot, SessionFiles, SystemLister};
 use super::{
     Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
     RootOrigin, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
     SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
-    SourceLabels, SubagentFinder, walk,
+    SourceLabels, SubagentFinder, TranscriptReader, walk,
 };
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::Result;
 use crate::history::format::{self, SessionFormat, SessionProjection, pi_log};
 use crate::history::omp_loader::UserDirectories;
-use crate::history::{Conversation, Source, omp_loader, parser};
+use crate::history::{ParsePermit, Source, omp_loader, parser};
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
 pub struct OmpProvider;
@@ -82,8 +84,12 @@ impl SessionProvider for OmpProvider {
 
     /// Read from the header, as Pi's is, and just as capable of repeating
     /// across two logs in one project.
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        sessions_omp_owns_with_id(&omp_loader::session_root()?, session_id)
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        sessions_omp_owns_with_id(&omp_loader::session_root_in(environment)?, session_id)
     }
 
     fn workspace_sessions_dir(&self) -> Capability<SessionsDirLookup> {
@@ -96,8 +102,14 @@ impl SessionProvider for OmpProvider {
 }
 
 impl SessionRenamer for OmpProvider {
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
-        pi_log::append_omp_session_rename(path, title)
+    fn rename_session(
+        &self,
+        permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        pi_log::append_omp_session_rename(permit, path, title, renamed_at)
     }
 }
 
@@ -105,10 +117,10 @@ impl SessionDeleter for OmpProvider {
     /// OMP keeps a session's tool results and sub-agent transcripts in its
     /// artifacts directory, so deleting the transcript alone would orphan
     /// them.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        format::require_owned_transcript(Source::Omp, path)?;
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        format::require_owned_transcript(permit, Source::Omp, path)?;
         let artifacts = artifacts_directory(path);
-        let subagent_sessions = subagent_transcripts_in(&artifacts, None).len();
+        let subagent_sessions = subagent_transcripts_in(&SystemLister, &artifacts, None).len();
         std::fs::remove_file(path)?;
         if artifacts.is_dir() {
             std::fs::remove_dir_all(artifacts)?;
@@ -122,7 +134,7 @@ impl SessionDeleter for OmpProvider {
 
 impl SubagentFinder for OmpProvider {
     fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
-        read_subagent_transcripts(&artifacts_directory(locator))
+        read_subagent_transcripts(&SystemLister, &artifacts_directory(locator))
     }
 }
 
@@ -133,12 +145,17 @@ fn sessions_dir_of(environment: &RootEnvironment, directory: &Path) -> Result<Pa
 }
 
 /// Every log under `root` stating `session_id` that the list attributes to
-/// OMP: those [`attributed_projection`] reads as OMP's.
+/// OMP, by its header alone, as [`attributed_projection`] reads it: every log
+/// under OMP's own tree, and a log with a title slot elsewhere.
 fn sessions_omp_owns_with_id(root: &FileRoot, session_id: &str) -> Result<Vec<PathBuf>> {
+    let untitled_log_source = match root.root.origin() {
+        RootOrigin::AgentTree => Source::Omp,
+        RootOrigin::Redirected => Source::Pi,
+    };
     let mut owned = Vec::new();
     for path in pi_log::sessions_with_id(&root.root.path, root.depth, session_id)? {
-        if attributed_projection(&root.root, &path)?
-            .is_some_and(|session| session.source == Source::Omp)
+        if pi_log::read_header(&path, untitled_log_source)?
+            .is_some_and(|(_, source)| source == Source::Omp)
         {
             owned.push(path);
         }
@@ -151,10 +168,14 @@ fn sessions_omp_owns_with_id(root: &FileRoot, session_id: &str) -> Result<Vec<Pa
 /// directory belongs to no one in particular, so its logs are left to the
 /// registry to attribute rather than claimed outright, and the projection there
 /// may name Pi.
-fn attributed_projection(root: &SessionRoot, path: &Path) -> Result<Option<SessionProjection>> {
+fn attributed_projection(
+    permit: ParsePermit<'_>,
+    root: &SessionRoot,
+    path: &Path,
+) -> Result<Option<SessionProjection>> {
     match root.origin() {
-        RootOrigin::AgentTree => pi_log::OMP_LOG.parse_transcript(path),
-        RootOrigin::Redirected => format::parse_transcript(path),
+        RootOrigin::AgentTree => pi_log::OMP_LOG.parse_transcript(permit, path),
+        RootOrigin::Redirected => format::parse_transcript(permit, path),
     }
 }
 
@@ -177,15 +198,22 @@ fn artifacts_directory(transcript: &Path) -> PathBuf {
 /// A missing artifacts directory yields none; an unreadable one is an error.
 ///
 /// Layout per OMP's `docs/blob-artifact-architecture.md` at `d17c270`.
-fn read_subagent_transcripts(artifacts: &Path) -> Result<Vec<PathBuf>> {
-    walk::jsonl_files_at_depth(artifacts, 0)
+fn read_subagent_transcripts(
+    lister: &dyn DirectoryLister,
+    artifacts: &Path,
+) -> Result<Vec<PathBuf>> {
+    walk::jsonl_files_at_depth(lister, artifacts, 0)
 }
 
 /// [`read_subagent_transcripts`] for discovery and delete: an unreadable
 /// artifacts directory yields none and is reported at warn level, so the
 /// session still lists and deletes.
-fn subagent_transcripts_in(artifacts: &Path, debug_level: Option<DebugLevel>) -> Vec<PathBuf> {
-    read_subagent_transcripts(artifacts).unwrap_or_else(|error| {
+fn subagent_transcripts_in(
+    lister: &dyn DirectoryLister,
+    artifacts: &Path,
+    debug_level: Option<DebugLevel>,
+) -> Vec<PathBuf> {
+    read_subagent_transcripts(lister, artifacts).unwrap_or_else(|error| {
         debug::warn(
             debug_level,
             &format!(
@@ -198,18 +226,21 @@ fn subagent_transcripts_in(artifacts: &Path, debug_level: Option<DebugLevel>) ->
 }
 
 /// Every session `depth` levels under `root`, each with the sub-agent
-/// transcripts its artifacts directory holds.
-fn discover_sessions(root: &SessionRoot, depth: usize) -> Result<DiscoveredSessions> {
-    let sessions = walk::jsonl_files_at_depth(&root.path, depth)?
+/// transcripts its artifacts directory holds, listed through `lister`.
+fn discover_sessions(
+    lister: &dyn DirectoryLister,
+    root: &SessionRoot,
+    depth: usize,
+) -> Result<DiscoveredSessions> {
+    let discovery = DiscoveryLister::beneath(lister, &root.path);
+    let sessions = walk::jsonl_files_at_depth(&discovery, &root.path, depth)?
         .into_iter()
         .map(|transcript| SessionFiles {
-            subagents: subagent_transcripts_in(&artifacts_directory(&transcript), None),
+            subagents: subagent_transcripts_in(lister, &artifacts_directory(&transcript), None),
             transcript,
         })
         .collect();
-    Ok(DiscoveredSessions::complete(walk::session_stubs(
-        root, sessions,
-    )))
+    Ok(discovery.discovered(walk::session_stubs(root, sessions)))
 }
 
 struct OmpStorage;
@@ -222,8 +253,7 @@ impl SessionStorage for OmpStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "omp",
-            magic: *b"OMHIST01",
-            schema_version: 18,
+            schema_version: 19,
         }
     }
 
@@ -233,8 +263,22 @@ impl SessionStorage for OmpStorage {
 
     /// The walk depth belongs to the resolution that produced the root, so it
     /// is re-resolved here rather than guessed from the path.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        discover_sessions(root, omp_loader::session_root()?.depth)
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        discover_sessions(lister, root, omp_loader::session_root()?.depth)
+    }
+
+    /// OMP sessions resolve by ID only once listed.
+    fn rediscover_unlisted_session(
+        &self,
+        _root: &SessionRoot,
+        _locator: &Path,
+        _lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        Ok(None)
     }
 
     /// The artifacts directories beside a session file are OMP's own, so what
@@ -242,18 +286,28 @@ impl SessionStorage for OmpStorage {
     /// claims as a Claude transcript.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> Result<Option<Conversation>> {
+        clock: &dyn Clock,
+    ) -> Result<parser::ParsedSession> {
         parser::process_projected_session(
+            permit,
             stub,
-            attributed_projection(root, &stub.locator)?,
+            attributed_projection(permit, root, &stub.locator)?,
             &pi_log::OMP_LOG,
             debug_level,
             on_transcript_read,
+            clock,
         )
+    }
+
+    /// A resumed read keeps the agent the session's whole read attributed
+    /// it to, in a redirected root too.
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &pi_log::OMP_LOG
     }
 }
 
@@ -262,8 +316,8 @@ pub(super) mod tests {
     use super::*;
     use crate::history::omp_loader;
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
-        fixture_with_lines,
+        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, append_lines,
+        copy_file, fixture_with_lines,
     };
     use crate::log_entry::LogEntry;
     use std::ffi::OsString;
@@ -309,6 +363,37 @@ pub(super) mod tests {
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
             write_session(&project_dir_under(home), session)
+        }
+
+        /// The turn continues the shown branch from the session's last
+        /// entry, `a2`.
+        fn append_turn(&self, locator: &Path, reply: &str) {
+            let prompt = serde_json::json!({
+                "type": "message", "id": "u3", "parentId": "a2",
+                "timestamp": "2026-01-02T03:05:00.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "a later question"}],
+                    "timestamp": 1767323100000_i64,
+                },
+            });
+            let answer = serde_json::json!({
+                "type": "message", "id": "a3", "parentId": "u3",
+                "timestamp": "2026-01-02T03:05:01.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": reply}],
+                    "timestamp": 1767323101000_i64,
+                },
+            });
+            append_lines(locator, &[prompt.to_string(), answer.to_string()]);
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_session(
+                &self.root_under(home).path.join("--tmp-omp-other--"),
+                session,
+            )
         }
 
         fn session_working_dir(&self) -> PathBuf {
@@ -359,6 +444,17 @@ pub(super) mod tests {
             .kept_in(storage)
         }
 
+        /// In the directory `write_session` writes to, with the sub-agent's
+        /// transcript in the session's artifacts directory.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let placed = project_dir_under(home).join(session.row.path.file_name().unwrap());
+            copy_file(&session.row.path, &placed);
+            let [subagent] = session.row.subagents.as_slice() else {
+                panic!("the OMP every-record session holds one sub-agent");
+            };
+            copy_file(subagent, &write_subagent(&placed, SUBAGENT));
+        }
+
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
             write_subagent(
                 &project_dir_under(home).join(format!("{session}.jsonl")),
@@ -377,8 +473,12 @@ pub(super) mod tests {
 
         /// At the depth `write_session` writes: OMP's own discovery takes its
         /// walk depth from the environment.
-        fn discover_under(&self, home: &Path) -> Vec<SessionStub> {
-            discover_sessions(&self.root_under(home), 1).unwrap().stubs
+        fn discover_listed_by(
+            &self,
+            home: &Path,
+            lister: &dyn DirectoryLister,
+        ) -> Result<DiscoveredSessions> {
+            discover_sessions(lister, &self.root_under(home), 1)
         }
 
         fn find_under(&self, home: &Path, id: &str) -> Result<Vec<PathBuf>> {
@@ -422,9 +522,17 @@ pub(super) mod tests {
         .unwrap();
         let stub = walk::file_stubs(&root, vec![path]).remove(0);
         OmpStorage
-            .parse_session(&stub, &root, None, &|| {})
+            .parse_session(
+                crate::history::FOR_FIXTURES,
+                &stub,
+                &root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
             .unwrap()
             .unwrap()
+            .row
             .source
     }
 
@@ -461,7 +569,9 @@ pub(super) mod tests {
         std::fs::create_dir_all(artifacts.join("tool-results")).unwrap();
         std::fs::write(artifacts.join("tool-results/output.txt"), "result").unwrap();
 
-        OmpProvider.delete_session(&session).unwrap();
+        OmpProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap();
 
         assert!(!session.exists());
         assert!(
@@ -487,7 +597,7 @@ pub(super) mod tests {
         .unwrap();
         let root = SessionRoot::new(directory.path()).in_agent_tree();
 
-        let discovered = discover_sessions(&root, 1).unwrap();
+        let discovered = discover_sessions(&SystemLister, &root, 1).unwrap();
 
         assert_eq!(discovered.stubs[0].subagents, vec![worker, nested]);
     }
@@ -505,15 +615,34 @@ pub(super) mod tests {
         let root = SessionRoot::new(directory.path()).in_agent_tree();
         let stub_without_subagents = walk::file_stubs(&root, vec![session.clone()]).remove(0);
         let without_subagents = OmpStorage
-            .parse_session(&stub_without_subagents, &root, None, &|| {})
+            .parse_session(
+                crate::history::FOR_FIXTURES,
+                &stub_without_subagents,
+                &root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
             .unwrap()
-            .unwrap();
-        let stub = discover_sessions(&root, 1).unwrap().stubs.remove(0);
+            .unwrap()
+            .row;
+        let stub = discover_sessions(&SystemLister, &root, 1)
+            .unwrap()
+            .stubs
+            .remove(0);
 
         let merged = OmpStorage
-            .parse_session(&stub, &root, None, &|| {})
+            .parse_session(
+                crate::history::FOR_FIXTURES,
+                &stub,
+                &root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .row;
 
         assert_eq!(merged.source, Source::Omp);
         assert_eq!(
@@ -551,13 +680,24 @@ pub(super) mod tests {
         )
         .unwrap();
         let root = SessionRoot::new(directory.path());
-        let stub = discover_sessions(&root, 0).unwrap().stubs.remove(0);
+        let stub = discover_sessions(&SystemLister, &root, 0)
+            .unwrap()
+            .stubs
+            .remove(0);
         assert_eq!(stub.subagents, vec![claude_shaped, worker]);
 
         let merged = OmpStorage
-            .parse_session(&stub, &root, None, &|| {})
+            .parse_session(
+                crate::history::FOR_FIXTURES,
+                &stub,
+                &root,
+                None,
+                &|| {},
+                &crate::clock::TestClock::default(),
+            )
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .row;
 
         assert_eq!(merged.source, Source::Omp, "the title slot names OMP");
         assert!(
@@ -579,11 +719,13 @@ pub(super) mod tests {
         std::fs::write(&artifacts, "not a directory").unwrap();
         let root = SessionRoot::new(directory.path()).in_agent_tree();
 
-        let discovered = discover_sessions(&root, 0).unwrap();
+        let discovered = discover_sessions(&SystemLister, &root, 0).unwrap();
         assert_eq!(discovered.stubs.len(), 1);
         assert!(discovered.stubs[0].subagents.is_empty());
 
-        let deleted = OmpProvider.delete_session(&session).unwrap();
+        let deleted = OmpProvider
+            .delete_session(crate::history::FOR_FIXTURES, &session)
+            .unwrap();
 
         assert_eq!(deleted, Deleted::just_the_session());
         assert!(!session.exists());
@@ -598,10 +740,15 @@ pub(super) mod tests {
             write_subagent(&session, "worker"),
             write_subagent(&session, "worker.reviewer"),
         ];
-        format::view_projection(&pi_log::OMP_LOG, &session, &subagents)
-            .unwrap()
-            .unwrap()
-            .entries
+        format::view_projection(
+            &pi_log::OMP_LOG,
+            crate::history::FOR_FIXTURES,
+            &session,
+            &subagents,
+        )
+        .unwrap()
+        .unwrap()
+        .entries
     }
 
     /// The label of each spliced entry, with its position in the view.
@@ -714,5 +861,109 @@ pub(super) mod tests {
             Source::Pi,
             "a directory the user redirected OMP to can hold Pi's transcripts"
         );
+    }
+
+    /// `found_sessions_dir` for a subdirectory of a repository whose own
+    /// sessions directory is empty: the first candidate's miss falls through to
+    /// the top level's.
+    #[test]
+    fn sessions_dir_search_canonicalises_each_candidate_directory_and_the_home_once() {
+        use crate::history::provider::walk::test_support::{
+            CountingCanonicaliser, assert_canonicalised,
+        };
+        use std::sync::Arc;
+        let home = tempfile::tempdir().unwrap();
+        let repository = home.path().join("project");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        let subdirectory = repository.join("src");
+        std::fs::create_dir(&subdirectory).unwrap();
+        let sessions = home.path().join("sessions");
+        write_session(&sessions.join("-project"), "session");
+        std::fs::create_dir(sessions.join("-project-src")).unwrap();
+        let agent_directory = home.path().as_os_str().to_owned();
+        let variable = move |name: &str| {
+            (name == crate::history::pi_loader::AGENT_DIR_VARIABLE).then(|| agent_directory.clone())
+        };
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let environment = RootEnvironment::new(&variable, Some(home.path().to_path_buf()), None)
+            .with_canonicaliser(canonicaliser.clone());
+
+        let found = super::super::found_sessions_dir(&OmpProvider, &environment, &subdirectory);
+
+        assert_eq!(found.unwrap(), Some(sessions.join("-project")));
+        assert_canonicalised(
+            &canonicaliser.canonicalised(),
+            &[
+                (
+                    home.path(),
+                    "first candidate: the home, to name the directory below it",
+                ),
+                (&subdirectory, "first candidate: the directory itself"),
+                (&repository, "second candidate: the repository's top level"),
+            ],
+        );
+    }
+
+    /// `found_sessions_dir` for the home directory finds the `-tmp`
+    /// directory OMP files a session started there under: OMP moves to
+    /// `~/tmp`, or without it to the temporary directory, inside the home or
+    /// outside it.
+    #[test]
+    fn sessions_dir_search_from_home_finds_tmp_directory_canonicalising_each_directory_once() {
+        use crate::history::provider::walk::test_support::{
+            CountingCanonicaliser, assert_canonicalised,
+        };
+        use std::sync::Arc;
+        enum Launch {
+            HomeTmp,
+            TempOutsideHome,
+            TempInsideHome,
+        }
+        let search_from_home = |launch: Launch| {
+            let home = tempfile::tempdir().unwrap();
+            let outside_home = tempfile::tempdir().unwrap();
+            let temp = match launch {
+                Launch::TempInsideHome => home.path().join("AppData").join("Local").join("Temp"),
+                Launch::HomeTmp | Launch::TempOutsideHome => outside_home.path().to_path_buf(),
+            };
+            std::fs::create_dir_all(&temp).unwrap();
+            let home_tmp = home.path().join("tmp");
+            let with_home_tmp = matches!(launch, Launch::HomeTmp);
+            if with_home_tmp {
+                std::fs::create_dir(&home_tmp).unwrap();
+            }
+            let sessions = home.path().join("sessions");
+            write_session(&sessions.join("-tmp"), "session");
+            let agent_directory = home.path().as_os_str().to_owned();
+            let variable = move |name: &str| {
+                (name == crate::history::pi_loader::AGENT_DIR_VARIABLE)
+                    .then(|| agent_directory.clone())
+            };
+            let canonicaliser = Arc::new(CountingCanonicaliser::default());
+            let environment =
+                RootEnvironment::new(&variable, Some(home.path().to_path_buf()), None)
+                    .with_temp_dir(temp.clone())
+                    .with_canonicaliser(canonicaliser.clone());
+
+            let found = super::super::found_sessions_dir(&OmpProvider, &environment, home.path());
+
+            assert_eq!(found.unwrap(), Some(sessions.join("-tmp")));
+            let launch_directory = if with_home_tmp {
+                vec![(home_tmp.as_path(), "the launch directory, `~/tmp`")]
+            } else {
+                Vec::new()
+            };
+            let mut expected = vec![(home.path(), "the directory searched from: the home")];
+            expected.extend(launch_directory);
+            expected.push((&temp, "the temporary directory"));
+            assert_canonicalised(&canonicaliser.canonicalised(), &expected);
+        };
+
+        search_from_home(Launch::HomeTmp);
+        // Outside Windows, OMP moves to `/tmp` before the temporary directory.
+        if cfg!(windows) {
+            search_from_home(Launch::TempOutsideHome);
+            search_from_home(Launch::TempInsideHome);
+        }
     }
 }

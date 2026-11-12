@@ -15,9 +15,22 @@ const MESSAGE_ATTACHMENT_TYPE: &str = "hook_system_message";
 pub(super) const ERROR_ATTACHMENT_TYPE: &str = "hook_non_blocking_error";
 const STOP_HOOK_SUMMARY_SUBTYPE: &str = "stop_hook_summary";
 
+/// The hook events whose attachments carry a random `toolUseID` instead of
+/// a call's.
+const EVENTS_WITHOUT_CALL: [&str; 7] = [
+    "Stop",
+    "SubagentStop",
+    "UserPromptSubmit",
+    "SessionStart",
+    "SessionEnd",
+    "Notification",
+    "PreCompact",
+];
+
 pub(super) struct HookAttachment {
     tool_use_id: String,
     hook_name: String,
+    hook_event: Option<String>,
     report: HookReport,
     timestamp: Option<String>,
     uuid: Option<String>,
@@ -53,11 +66,27 @@ impl HookAttachment {
         Some(Self {
             tool_use_id: field("toolUseID")?.to_owned(),
             hook_name: field("hookName")?.to_owned(),
+            hook_event: field("hookEvent").map(str::to_owned),
             report,
             timestamp: record_field("timestamp"),
             uuid: record_field("uuid"),
             cwd: record_field("cwd"),
         })
+    }
+
+    /// The ID of the call the attachment's text belongs to, when
+    /// [`Self::names_call`].
+    pub(super) fn tool_use_id(&self) -> &str {
+        &self.tool_use_id
+    }
+
+    /// False when the attachment's event is one of [`EVENTS_WITHOUT_CALL`]:
+    /// their `toolUseID` is random. An attachment without an event counts as
+    /// naming its call.
+    pub(super) fn names_call(&self) -> bool {
+        self.hook_event
+            .as_deref()
+            .is_none_or(|event| !EVENTS_WITHOUT_CALL.contains(&event))
     }
 
     /// `<hookName> hook: <content>`, or `<hookName> hook error: <stderr>`.
@@ -248,7 +277,7 @@ fn result_holders(records: &[(RecordLine, ClaudeRecord)]) -> HashMap<String, usi
     holders
 }
 
-fn entry_blocks(entry: &LogEntry) -> &[ContentBlock] {
+pub(super) fn entry_blocks(entry: &LogEntry) -> &[ContentBlock] {
     match entry {
         LogEntry::Assistant { message, .. } => &message.content,
         LogEntry::User {

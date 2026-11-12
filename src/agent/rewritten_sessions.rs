@@ -1,0 +1,203 @@
+//! `agent search` over sessions another rearview writes again or removes
+//! while the search reads them: the ranking and the hit read each read the
+//! copy the cache holds when they read it, and a session no longer in the
+//! session cache drops out of the results.
+
+use crate::agent::refs::AgentConversationKey;
+use crate::agent::search::SearchedTranscript;
+use crate::agent::service::{lexically_rank_scoped, read_hit_messages};
+use crate::agent::transcript::agent_part_text;
+use crate::clock::TestClock;
+use crate::history::WaitStatus;
+use crate::history::sqlite_cache::connection::test_hooks::{
+    ReaderAction, ReaderOpening, run_as_a_reader_opens,
+};
+use crate::search::AgentRanking;
+use crate::search::mode::SearchMode;
+use crate::search::test_fixtures::{
+    CachedClaudeSessions, cached_claude_sessions, october_messages as messages,
+};
+use crate::time_filter::TimeFilter;
+
+fn rank(sessions: &CachedClaudeSessions, query: &str) -> AgentRanking {
+    let scope = (0..sessions.rows.len()).collect::<Vec<_>>();
+    lexically_rank_scoped(
+        &sessions.rows,
+        query,
+        crate::agent::service::ScopedSessions {
+            indices: &scope,
+            scope: crate::agent::search::AgentSearchScope::Global,
+        },
+        SearchMode::Lexical,
+        &TimeFilter::default(),
+        &TestClock::default(),
+    )
+    .unwrap()
+}
+
+/// The hit read of row `index` for `ranking`; `None` when its session is no
+/// longer in the session cache.
+fn read_hits(
+    sessions: &CachedClaudeSessions,
+    ranking: &AgentRanking,
+    index: usize,
+) -> Option<SearchedTranscript> {
+    let row = &sessions.rows[index];
+    let key = AgentConversationKey::from_conversation(
+        row,
+        &crate::history::path::CanonicalDirectories::of_system(),
+    )
+    .unwrap();
+    read_hit_messages(
+        &TestClock::default(),
+        &WaitStatus::default(),
+        ranking,
+        row,
+        ranking.hit_messages.of(index).expect("the scan counted it"),
+        &key,
+    )
+    .unwrap()
+}
+
+/// Each read message's number and text.
+fn numbered_texts(read: &SearchedTranscript) -> Vec<(usize, String)> {
+    read.transcript
+        .messages
+        .iter()
+        .map(|message| {
+            let text = message
+                .parts
+                .iter()
+                .filter_map(agent_part_text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (message.ordinal, text)
+        })
+        .collect()
+}
+
+/// A rewrite inserting a message before the hit and appending one holding
+/// the query renumbers the session; the hit read reads the new copy's hit
+/// messages, whether the rewrite lands before the read or as it opens its
+/// reader, after another rewrite.
+#[test]
+fn hit_read_reads_hit_messages_of_copy_cache_holds_as_it_reads() {
+    let renumbered = messages(&["inserted", "zebrafish one", "plain", "zebrafish three"]);
+    let expected = [
+        (2, "zebrafish one".to_owned()),
+        (4, "zebrafish three".to_owned()),
+    ];
+    for rewrites_as_read_opens in [false, true] {
+        let sessions =
+            cached_claude_sessions(&[("session", messages(&["zebrafish one", "plain"]))]);
+        let ranking = rank(&sessions, "zebrafish");
+        assert_eq!(
+            ranking.hit_messages.of(0).unwrap().ordinals,
+            [1],
+            "the ranking finds the hit in the first message"
+        );
+
+        let rewrite = if rewrites_as_read_opens {
+            sessions.rewrite(0, &messages(&["zebrafish elsewhere"]));
+            let (writer, after) = (sessions.writer(0), renumbered.clone());
+            Some(run_as_a_reader_opens(
+                sessions.cache_path(),
+                ReaderOpening::OnThisThread(1),
+                move || writer.rewrite(&after),
+            ))
+        } else {
+            sessions.rewrite(0, &renumbered);
+            None
+        };
+
+        let read = read_hits(&sessions, &ranking, 0).expect("the cache holds the session");
+        assert!(
+            rewrite.as_ref().is_none_or(ReaderAction::has_run),
+            "the rewrite runs as the hit read opens its reader"
+        );
+        assert_eq!(
+            numbered_texts(&read),
+            expected,
+            "the hit read reads the copy the cache holds, rewritten as it read: \
+             {rewrites_as_read_opens}"
+        );
+    }
+}
+
+/// A rewrite during the ranking scan leaves the session ranked on the copy
+/// the cache holds as the scan ends, counted again alone in the scan's last
+/// snapshot: another write cannot land between that snapshot and the count.
+#[test]
+fn ranking_counts_copy_cache_holds_after_rewrite_during_scan() {
+    let sessions = cached_claude_sessions(&[("session", messages(&["plain"]))]);
+    let during_scan = sessions.writer(0);
+    let rewrite = run_as_a_reader_opens(
+        sessions.cache_path(),
+        ReaderOpening::FirstOnAnotherThread,
+        move || during_scan.rewrite(&messages(&["quagga first", "plain", "quagga last"])),
+    );
+    let second_reader =
+        run_as_a_reader_opens(sessions.cache_path(), ReaderOpening::OnThisThread(2), || {});
+
+    let ranking = rank(&sessions, "quagga");
+
+    assert!(
+        rewrite.has_run(),
+        "the rewrite runs as a task's reader opens"
+    );
+    assert!(
+        !second_reader.has_run(),
+        "the session is counted again without a reader of its own"
+    );
+    assert_eq!(ranking.ranked, [0], "the rewritten session ranks");
+    assert_eq!(
+        ranking.hit_messages.of(0).unwrap().ordinals,
+        [1, 3],
+        "the hit messages are the rewritten copy's"
+    );
+}
+
+/// A session removed during the ranking scan drops out of the ranking. A
+/// session removed after the scan drops out of the hit read.
+#[test]
+fn session_removed_during_search_leaves_ranking_or_hit_read() {
+    let both = || {
+        cached_claude_sessions(&[
+            ("removed", messages(&["quagga here"])),
+            ("kept", messages(&["quagga there"])),
+        ])
+    };
+    let sessions = both();
+    let removed = sessions.writer(0);
+    let remove = run_as_a_reader_opens(
+        sessions.cache_path(),
+        ReaderOpening::FirstOnAnotherThread,
+        move || removed.remove(),
+    );
+
+    let ranking = rank(&sessions, "quagga");
+
+    assert!(remove.has_run(), "the removal runs as a reader opens");
+    assert_eq!(ranking.ranked, [1], "the removed session is not ranked");
+    assert_eq!(
+        ranking.no_longer_cached,
+        [0],
+        "the ranking names the removed session"
+    );
+    assert!(
+        ranking.hit_messages.of(0).is_none(),
+        "the removed session doesn't have any hit messages"
+    );
+
+    let sessions = both();
+    let ranking = rank(&sessions, "quagga");
+    sessions.remove(0);
+    assert!(
+        read_hits(&sessions, &ranking, 0).is_none(),
+        "the hit read finds the session no longer in the session cache"
+    );
+    assert!(
+        read_hits(&sessions, &ranking, 1).is_some(),
+        "the hit read of the other session finds it"
+    );
+}

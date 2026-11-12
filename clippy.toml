@@ -1,9 +1,13 @@
-# Denied in `src/history` (`#![deny]` in its `mod.rs`; `lib.rs` allows it
-# elsewhere). Provider code reads the environment through `RootEnvironment`:
-# the root-resolution contract test records only those reads.
+# Denied crate-wide in `lib.rs`. A function that reads the process
+# environment or the file system itself carries `#[allow]`, as does the
+# output contract's test module. Provider code reads the environment
+# through `RootEnvironment` and canonicalises paths through the
+# environment's `Canonicaliser`; the call-count tests check those calls.
 disallowed-methods = [
     { path = "std::env::var", reason = "read it through `RootEnvironment`" },
     { path = "std::env::var_os", reason = "read it through `RootEnvironment`" },
     { path = "home::home_dir", reason = "read it through `RootEnvironment`" },
     { path = "std::env::temp_dir", reason = "read it through `RootEnvironment`" },
+    { path = "std::fs::canonicalize", reason = "resolve it through the environment's `Canonicaliser`" },
+    { path = "std::path::Path::canonicalize", reason = "resolve it through the environment's `Canonicaliser`" },
 ]

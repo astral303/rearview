@@ -119,6 +119,23 @@ pub(crate) fn subagent_turns(threads: Vec<SubagentThread>) -> Vec<SubagentTurn> 
 }
 
 impl SubagentTurn {
+    /// The sub-agent transcript the turn was read from.
+    pub(crate) fn transcript(&self) -> Option<&Path> {
+        self.record.transcript.as_deref()
+    }
+
+    /// The turn's line in its transcript.
+    pub(crate) fn record(&self) -> &RecordLine {
+        &self.record
+    }
+
+    pub(crate) fn thread_identity(&self) -> crate::agent::message_numbering::ThreadIdentity {
+        crate::agent::message_numbering::ThreadIdentity::Progress {
+            transcript: self.record.transcript.clone(),
+            label: self.thread.label.clone(),
+        }
+    }
+
     /// The turn as Claude records a sub-agent turn: an `agent_progress`
     /// payload with the agent label in `agentId`. Every consumer renders it
     /// nested and keeps it out of the session's own index. The record carries
@@ -126,7 +143,7 @@ impl SubagentTurn {
     /// `parentToolUseID` at the top level, as a Claude record carries its
     /// own, and the thread's identity beside `agentId` when the provider
     /// records one.
-    fn into_progress_entry(self) -> (RecordLine, LogEntry) {
+    pub(crate) fn into_progress_entry(self) -> (RecordLine, LogEntry) {
         let role = self.role.progress_type();
         let mut data = json!({
             "type": "agent_progress",
@@ -159,7 +176,15 @@ pub(crate) fn splice_threads(
     parent: Vec<(RecordLine, LogEntry)>,
     threads: Vec<SubagentThread>,
 ) -> Vec<(RecordLine, LogEntry)> {
-    let turns = subagent_turns(threads);
+    splice_turns(parent, subagent_turns(threads))
+}
+
+/// `parent` with `turns`, sorted by timestamp, merged in as `Progress`
+/// entries.
+pub(crate) fn splice_turns(
+    parent: Vec<(RecordLine, LogEntry)>,
+    turns: Vec<SubagentTurn>,
+) -> Vec<(RecordLine, LogEntry)> {
     let mut spliced = Vec::with_capacity(parent.len() + turns.len());
     walk_spliced(
         parent,

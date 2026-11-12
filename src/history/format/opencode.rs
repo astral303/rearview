@@ -18,23 +18,27 @@
 //! - Unknown part and message types are not errors.
 //! - Every query names its columns, because OpenCode migrates its schema
 //!   between versions.
+//! - A read of a changed session resumes from the session's last message,
+//!   and reads it whole when a row before that changed.
 
 use super::dropped::DroppedRecords;
 use super::{
-    EarlierTurns, SessionFormat, SessionHeader, SessionProjection, at_own_lines, rename_key,
-    rfc3339_from_millis,
+    EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection, at_own_lines,
+    rename_key, rfc3339_from_millis,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::{Result, SessionDatabaseFailure};
-use crate::history::Source;
 use crate::history::provider::sqlite::{
     DEFAULT_BUSY_TIMEOUT, open_session_list, unusable_database,
 };
 use crate::history::provider::subagents::SubagentForest;
+use crate::history::provider::{ResumedWindow, Resumption, TranscriptRead, TranscriptReader};
+use crate::history::{ParsePermit, Source};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
 };
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -46,8 +50,9 @@ pub struct OpenCodeDbFormat;
 pub static OPENCODE_DB: OpenCodeDbFormat = OpenCodeDbFormat;
 
 impl SessionFormat for OpenCodeDbFormat {
-    fn parse_transcript_counting(
+    fn read_transcript(
         &self,
+        _admitted: crate::history::Admitted,
         path: &Path,
         dropped: DroppedRecords,
     ) -> Result<Option<SessionProjection>> {
@@ -123,73 +128,58 @@ pub(crate) fn newest_unverified_migration(connection: &Connection) -> Option<Str
 }
 
 /// The session is its database: a query that fails is the failure the list
-/// reports, worded the same way.
+/// reports, worded the same way. Every query runs in one read transaction,
+/// to read the session's rows as of one moment.
 fn project_session(
     connection: &Connection,
     reference: &SessionRef,
     mut dropped: DroppedRecords,
 ) -> Result<Option<SessionProjection>> {
-    let cannot_be_read = |error: rusqlite::Error| {
-        unusable_database(
-            &reference.database,
-            SessionDatabaseFailure::CannotBeRead,
-            &error,
-        )
+    let read = |connection: &Connection| -> rusqlite::Result<_> {
+        let Some((table, session)) = find_session(connection, reference)? else {
+            return Ok(None);
+        };
+        dropped.record_version(|| {
+            connection
+                .query_row(
+                    &format!("SELECT version FROM {} WHERE id = ?1", table.name()),
+                    [&reference.session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+        });
+        let rows = read_rows(
+            connection,
+            &reference.session_id,
+            &RowsCursor::start_of(table),
+            &RowsStart::default(),
+            dropped,
+        )?;
+        Ok(Some((table, session, rows)))
     };
-    let tables = SessionTables::of(connection).map_err(cannot_be_read)?;
-    let mut found = None;
-    for table in tables.reading_order() {
-        if let Some(session) =
-            session_row(connection, table, &reference.session_id).map_err(cannot_be_read)?
-        {
-            found = Some((table, session));
-            break;
-        }
-    }
-    let Some((table, session)) = found else {
+    let Some((table, session, rows)) = in_read_transaction(connection, reference, read)? else {
         return Ok(None);
     };
-    dropped.record_version(|| {
-        connection
-            .query_row(
-                &format!("SELECT version FROM {} WHERE id = ?1", table.name()),
-                [&reference.session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-    });
-    let EntrySink {
-        mut entries,
-        dropped,
+    let RowsRead {
+        sink: EntrySink {
+            entries, dropped, ..
+        },
+        next,
+        every_row,
         ..
-    } = match table {
-        SessionTable::OpenCode1 => opencode_1::entries(connection, &reference.session_id, dropped),
-        SessionTable::OpenCode2 => opencode_2::entries(connection, &reference.session_id, dropped),
-    }
-    .map_err(cannot_be_read)?;
-
-    // The title belongs to the session, so only a top-level session carries
-    // it; a sub-agent row is read through its parent and is not listed. OpenCode
-    // autogenerates titles and stores no custom-title marker; they are the
-    // session's one display name, so they project as titles, the treatment
-    // Pi titles get. Ordinal 0: the title lives in the session row, not
-    // among the messages.
-    let mut title = None;
-    if session.parent_id.is_none() {
-        let trimmed = session.title.trim();
-        if !trimmed.is_empty() {
-            title = Some(trimmed.to_owned());
-            entries.insert(
-                0,
-                (
-                    0,
-                    LogEntry::CustomTitle {
-                        custom_title: trimmed.to_owned(),
-                    },
-                ),
-            );
-        }
-    }
+    } = rows;
+    let title = session_title(&session);
+    let entries = title
+        .iter()
+        .map(|title| title_entry(title))
+        .chain(entries)
+        .collect();
+    let transcript_read = rows_read(
+        session_identity(table, &reference.session_id, &session),
+        title.clone(),
+        next,
+        every_row,
+    );
 
     Ok(Some(SessionProjection {
         source: Source::OpenCode,
@@ -207,7 +197,384 @@ fn project_session(
         malformed_lines: Vec::new(),
         dropped,
         earlier_turns: EarlierTurns::Read,
+        earlier_transcripts: Vec::new(),
+        transcript_read,
     }))
+}
+
+/// Resumes a read of an OpenCode session's rows from the session's last
+/// message: OpenCode rewrites that message while its reply streams. The
+/// rewrite check counts the rows before the cursor and keeps the latest time
+/// OpenCode updated one: a deleted or edited earlier row makes the session
+/// read whole, and an edit that leaves `time_updated` unchanged is not
+/// detected. The identity is a hash of the session row's table, ID, creation
+/// time, directory and whether it has a parent; every read rereads the title.
+impl TranscriptReader for OpenCodeDbFormat {
+    fn identity(&self, source: &Path) -> Result<Vec<u8>> {
+        let Some(reference) = decode_ref(source) else {
+            return Ok(Vec::new());
+        };
+        let found = in_read_transaction(&open(&reference)?, &reference, |connection| {
+            find_session(connection, &reference)
+        })?;
+        Ok(found
+            .map(|(table, session)| session_identity(table, &reference.session_id, &session))
+            .unwrap_or_default())
+    }
+
+    fn is_rewritten(&self, source: &Path, read: &TranscriptRead) -> Result<bool> {
+        let (Some(reference), Ok(cursor)) = (
+            decode_ref(source),
+            serde_json::from_slice::<RowsCursor>(&read.cursor),
+        ) else {
+            return Ok(true);
+        };
+        let before = in_read_transaction(&open(&reference)?, &reference, |connection| {
+            cursor.rows_before(connection, &reference.session_id)
+        })?;
+        Ok(rows_check(&before) != read.rewrite_check)
+    }
+
+    /// True when the session's rows are as `read` found them: as many in
+    /// each table, none updated later, and the session row the same, its
+    /// title included. A rename doesn't change any message or part row.
+    fn is_unchanged_since(&self, source: &Path, read: &TranscriptRead) -> Result<bool> {
+        let (Some(reference), Ok(cursor), Ok(state)) = (
+            decode_ref(source),
+            serde_json::from_slice::<RowsCursor>(&read.cursor),
+            serde_json::from_slice::<RowsState>(&read.parser_state),
+        ) else {
+            return Ok(false);
+        };
+        let (every_row, found) =
+            in_read_transaction(&open(&reference)?, &reference, |connection| {
+                Ok((
+                    cursor.every_row(connection, &reference.session_id)?,
+                    find_session(connection, &reference)?,
+                ))
+            })?;
+        let Some((table, session)) = found else {
+            return Ok(false);
+        };
+        Ok(every_row == state.every_row
+            && session_identity(table, &reference.session_id, &session) == read.identity
+            && session_title(&session) == state.title)
+    }
+
+    fn read_from(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+        read: &TranscriptRead,
+    ) -> Result<Resumption> {
+        permit.admit(source);
+        let (Some(reference), Ok(cursor), Ok(state)) = (
+            decode_ref(source),
+            serde_json::from_slice::<RowsCursor>(&read.stable_cursor),
+            serde_json::from_slice::<RowsState>(&read.parser_state),
+        ) else {
+            return Ok(Resumption::FullRead);
+        };
+        let (window, found) = in_read_transaction(&open(&reference)?, &reference, |connection| {
+            Ok((
+                read_rows(
+                    connection,
+                    &reference.session_id,
+                    &cursor,
+                    &state.start,
+                    DroppedRecords::default(),
+                )?,
+                find_session(connection, &reference)?,
+            ))
+        })?;
+        if window.next.is_none() {
+            return Ok(Resumption::ChangesEarlierEntry);
+        }
+        let title = found.and_then(|(_, session)| session_title(&session));
+        Ok(Resumption::Window(ResumedWindow {
+            start_line: state.start.lines_before + 1,
+            entries: at_own_lines(window.sink.entries),
+            malformed_lines: Vec::new(),
+            read: rows_read(read.identity.clone(), title, window.next, window.every_row),
+            bytes_read: window.bytes_read,
+        }))
+    }
+
+    fn read_whole(
+        &self,
+        permit: ParsePermit<'_>,
+        source: &Path,
+    ) -> Result<Option<SessionProjection>> {
+        self.parse_transcript(permit, source)
+    }
+
+    /// The session's title, from its row.
+    fn leading_entries(
+        &self,
+        source: &Path,
+        _read: &TranscriptRead,
+    ) -> Result<Vec<(RecordLine, LogEntry)>> {
+        let Some(reference) = decode_ref(source) else {
+            return Ok(Vec::new());
+        };
+        let found = in_read_transaction(&open(&reference)?, &reference, |connection| {
+            find_session(connection, &reference)
+        })?;
+        Ok(found
+            .and_then(|(_, session)| session_title(&session))
+            .map(|title| {
+                let (line, entry) = title_entry(&title);
+                (RecordLine::from(line), entry)
+            })
+            .into_iter()
+            .collect())
+    }
+}
+
+fn open(reference: &SessionRef) -> Result<Connection> {
+    open_session_list(&reference.database, DEFAULT_BUSY_TIMEOUT)
+}
+
+/// `read` run over `connection`, the database of `reference`, in one read
+/// transaction; a failure is the database's, worded as the list words it.
+fn in_read_transaction<T>(
+    connection: &Connection,
+    reference: &SessionRef,
+    read: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> Result<T> {
+    let read_rows = || {
+        let transaction = connection.unchecked_transaction()?;
+        read(&transaction)
+    };
+    read_rows().map_err(|error| {
+        unusable_database(
+            &reference.database,
+            SessionDatabaseFailure::CannotBeRead,
+            &error,
+        )
+    })
+}
+
+/// The table holding the session `reference` names, OpenCode 2's first,
+/// and its row.
+fn find_session(
+    connection: &Connection,
+    reference: &SessionRef,
+) -> rusqlite::Result<Option<(SessionTable, SessionRow)>> {
+    for table in SessionTables::of(connection)?.reading_order() {
+        if let Some(session) = session_row(connection, table, &reference.session_id)? {
+            return Ok(Some((table, session)));
+        }
+    }
+    Ok(None)
+}
+
+/// The session's title: only a top-level session carries it, because a
+/// sub-agent row is read through its parent and is not listed. OpenCode
+/// autogenerates titles and doesn't store a custom-title marker. The title
+/// projects as a title, as Pi's titles do, because it is the session's one
+/// display name.
+fn session_title(session: &SessionRow) -> Option<String> {
+    let trimmed = session.title.trim();
+    (session.parent_id.is_none() && !trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// `title` as the session's leading entry: line 0, since the title lives in
+/// the session row, not among the messages.
+fn title_entry(title: &str) -> (usize, LogEntry) {
+    (
+        0,
+        LogEntry::CustomTitle {
+            custom_title: title.to_owned(),
+        },
+    )
+}
+
+/// A hash of the fields a read uses from the session row of `session_id` in
+/// `table`, besides the title.
+fn session_identity(table: SessionTable, session_id: &str, session: &SessionRow) -> Vec<u8> {
+    let facts = serde_json::to_vec(&(
+        table.name(),
+        session_id,
+        session.time_created,
+        &session.directory,
+        session.parent_id.is_some(),
+    ))
+    .expect("a session's identity facts serialize");
+    blake3::hash(&facts).as_bytes().to_vec()
+}
+
+/// The count of a session's rows in a table, and the latest time OpenCode
+/// updated one of them. A deleted row lowers the count and an edited one
+/// raises the time, because OpenCode stamps a row with the time it writes it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct RowsSeen {
+    count: u64,
+    latest_update: i64,
+}
+
+impl RowsSeen {
+    fn add(&mut self, time_updated: i64) {
+        self.count += 1;
+        self.latest_update = self.latest_update.max(time_updated);
+    }
+
+    /// The count and the latest update a query's `row` selects.
+    fn of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            count: row.get::<_, i64>(0)?.max(0) as u64,
+            latest_update: row.get(1)?,
+        })
+    }
+}
+
+/// The state the rows before a read's cursor leave the read.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct RowsStart {
+    /// The count of lines their entries occupy: the read numbers its entries
+    /// from the line after.
+    lines_before: usize,
+    /// The model the last of them named.
+    last_model: Option<String>,
+    /// The rows themselves, by table.
+    before: Vec<RowsSeen>,
+}
+
+impl RowsStart {
+    /// The rows before the cursor in the `table`th table.
+    fn seen(&self, table: usize) -> RowsSeen {
+        self.before.get(table).copied().unwrap_or_default()
+    }
+}
+
+/// A read of a session's rows from a cursor of type `C`.
+struct RowsRead<C> {
+    sink: EntrySink,
+    /// The next read's cursor, and the state the rows before it leave it;
+    /// `None` when the next read can't resume from this one.
+    next: Option<(C, RowsStart)>,
+    /// Every row of the session, by table, as the read found them.
+    every_row: Vec<RowsSeen>,
+    /// The bytes of the rows read.
+    bytes_read: u64,
+}
+
+impl<C> RowsRead<C> {
+    fn with_cursor<D>(self, cursor: impl FnOnce(C) -> D) -> RowsRead<D> {
+        RowsRead {
+            sink: self.sink,
+            next: self.next.map(|(next, start)| (cursor(next), start)),
+            every_row: self.every_row,
+            bytes_read: self.bytes_read,
+        }
+    }
+}
+
+/// The start of a read of a session's rows, in the table holding the
+/// session.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum RowsCursor {
+    OpenCode1(opencode_1::Cursor),
+    OpenCode2(opencode_2::Cursor),
+}
+
+impl RowsCursor {
+    /// The cursor at the first row of a session in `table`.
+    fn start_of(table: SessionTable) -> Self {
+        match table {
+            SessionTable::OpenCode1 => Self::OpenCode1(opencode_1::Cursor::default()),
+            SessionTable::OpenCode2 => Self::OpenCode2(opencode_2::Cursor::default()),
+        }
+    }
+
+    /// The session's rows before the cursor, by table.
+    fn rows_before(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+    ) -> rusqlite::Result<Vec<RowsSeen>> {
+        match self {
+            Self::OpenCode1(cursor) => opencode_1::rows_before(connection, session_id, cursor),
+            Self::OpenCode2(cursor) => opencode_2::rows_before(connection, session_id, cursor),
+        }
+    }
+
+    /// Every row of the session, by table.
+    fn every_row(
+        &self,
+        connection: &Connection,
+        session_id: &str,
+    ) -> rusqlite::Result<Vec<RowsSeen>> {
+        match self {
+            Self::OpenCode1(_) => opencode_1::every_row(connection, session_id),
+            Self::OpenCode2(_) => opencode_2::every_row(connection, session_id),
+        }
+    }
+}
+
+/// The state a read of a session's rows leaves at its cursor: the rows
+/// before it, every row the read found, and the session's title.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RowsState {
+    start: RowsStart,
+    every_row: Vec<RowsSeen>,
+    title: Option<String>,
+}
+
+/// The entries of `session_id`'s rows from `cursor` on, `start` being the
+/// state the rows before it leave.
+fn read_rows(
+    connection: &Connection,
+    session_id: &str,
+    cursor: &RowsCursor,
+    start: &RowsStart,
+    dropped: DroppedRecords,
+) -> rusqlite::Result<RowsRead<RowsCursor>> {
+    Ok(match cursor {
+        RowsCursor::OpenCode1(from) => {
+            opencode_1::read(connection, session_id, from, start, dropped)?
+                .with_cursor(RowsCursor::OpenCode1)
+        }
+        RowsCursor::OpenCode2(from) => {
+            opencode_2::read(connection, session_id, from, start, dropped)?
+                .with_cursor(RowsCursor::OpenCode2)
+        }
+    })
+}
+
+/// The [`TranscriptRead`] for the next read, starting at `next`, of the
+/// session with the identity `identity` and the title `title`, whose rows
+/// the read found as `every_row`. The cursor and the stable cursor are the
+/// same, because every read derives its entries again from its start.
+fn rows_read(
+    identity: Vec<u8>,
+    title: Option<String>,
+    next: Option<(RowsCursor, RowsStart)>,
+    every_row: Vec<RowsSeen>,
+) -> TranscriptRead {
+    let Some((cursor, start)) = next else {
+        return TranscriptRead::full_read();
+    };
+    let cursor = serde_json::to_vec(&cursor).expect("a rows cursor serializes");
+    TranscriptRead {
+        stable_cursor: cursor.clone(),
+        cursor,
+        identity,
+        rewrite_check: rows_check(&start.before),
+        stable_line: Some(start.lines_before + 1),
+        parser_state: serde_json::to_vec(&RowsState {
+            start,
+            every_row,
+            title,
+        })
+        .expect("a rows state serializes"),
+    }
+}
+
+/// The rewrite check of a read whose cursor has `before` before it.
+fn rows_check(before: &[RowsSeen]) -> Vec<u8> {
+    let facts = serde_json::to_vec(before).expect("rows serialize");
+    blake3::hash(&facts).as_bytes().to_vec()
 }
 
 /// The two tables a session row can live in.
@@ -267,9 +634,9 @@ impl SessionTables {
 
     /// One query over every session: a session in both tables from
     /// `opencode_2`, every other from the table holding it. `opencode_1` and
-    /// `opencode_2` select the same columns and each ends with
-    /// `FROM <table> s`. A database with neither runs `opencode_1`, which
-    /// fails.
+    /// `opencode_2` select the same columns, and each ends with a `FROM`
+    /// clause that names its session table `s`. A database with neither
+    /// table runs `opencode_1`, and the query fails.
     pub(crate) fn select_sessions(self, opencode_1: &str, opencode_2: &str) -> String {
         match (self.opencode_1, self.opencode_2) {
             (true, true) => format!(
@@ -572,7 +939,10 @@ pub(crate) mod fixture {
 
     pub(crate) fn opencode_2_projection(database: &Path, session_id: &str) -> SessionProjection {
         OPENCODE_DB
-            .parse_transcript(&session_ref(database, session_id))
+            .parse_transcript(
+                crate::history::FOR_FIXTURES,
+                &session_ref(database, session_id),
+            )
             .unwrap()
             .unwrap()
     }
@@ -1214,7 +1584,10 @@ mod tests {
         drop(connection);
 
         let child = OPENCODE_DB
-            .parse_transcript(&session_ref(&database, "ses_child"))
+            .parse_transcript(
+                crate::history::FOR_FIXTURES,
+                &session_ref(&database, "ses_child"),
+            )
             .unwrap()
             .unwrap();
 
@@ -1288,9 +1661,13 @@ mod tests {
         drop(connection);
 
         let reference = session_ref(&database, "ses_parent");
-        let plain = OPENCODE_DB.parse_transcript(&reference).unwrap().unwrap();
+        let plain = OPENCODE_DB
+            .parse_transcript(crate::history::FOR_FIXTURES, &reference)
+            .unwrap()
+            .unwrap();
         let view = super::super::view_projection(
             &OPENCODE_DB,
+            crate::history::FOR_FIXTURES,
             &reference,
             &[
                 session_ref(&database, "ses_child"),
@@ -1325,14 +1702,20 @@ mod tests {
         )
         .unwrap();
         assert!(
-            OPENCODE_DB.parse_transcript(&pi).unwrap().is_none(),
+            OPENCODE_DB
+                .parse_transcript(crate::history::FOR_FIXTURES, &pi)
+                .unwrap()
+                .is_none(),
             "a transcript file's parent is a directory, so it decodes as no ref"
         );
 
         let database = database_in(directory.path());
         assert!(
             OPENCODE_DB
-                .parse_transcript(&session_ref(&database, "ses_absent"))
+                .parse_transcript(
+                    crate::history::FOR_FIXTURES,
+                    &session_ref(&database, "ses_absent")
+                )
                 .unwrap()
                 .is_none(),
             "a ref to a session the database does not hold is not claimed"
@@ -1380,7 +1763,10 @@ mod tests {
         let not_a_database = directory.path().join("garbage.bin");
         std::fs::write(&not_a_database, "not sqlite at all").unwrap();
 
-        let result = OPENCODE_DB.parse_transcript(&session_ref(&not_a_database, "ses_x"));
+        let result = OPENCODE_DB.parse_transcript(
+            crate::history::FOR_FIXTURES,
+            &session_ref(&not_a_database, "ses_x"),
+        );
 
         assert!(
             result.is_err(),
@@ -1515,5 +1901,384 @@ mod tests {
             decode_ref(&directory.path().join("ses_no_database.jsonl")).is_none(),
             "a ref decodes only under an existing database file"
         );
+    }
+
+    mod resumed_reads {
+        use super::*;
+        use crate::history::provider::transcript_reads::resume;
+
+        const SESSION: &str = "ses_resumed";
+
+        /// One row of a session, as OpenCode writes it.
+        #[derive(Clone)]
+        enum Row {
+            Message {
+                id: String,
+                time: i64,
+                data: Value,
+            },
+            Part {
+                id: String,
+                message: String,
+                time: i64,
+                data: Value,
+            },
+            Message2 {
+                seq: i64,
+                kind: &'static str,
+                data: Value,
+            },
+        }
+
+        fn message(id: &str, time: i64, data: Value) -> Row {
+            Row::Message {
+                id: id.to_owned(),
+                time,
+                data,
+            }
+        }
+
+        fn part(id: &str, message: &str, time: i64, data: Value) -> Row {
+            Row::Part {
+                id: id.to_owned(),
+                message: message.to_owned(),
+                time,
+                data,
+            }
+        }
+
+        fn insert(connection: &Connection, row: &Row) {
+            match row {
+                Row::Message { id, time, data } => {
+                    fixture::insert_message(connection, id, SESSION, *time, data)
+                }
+                Row::Part {
+                    id,
+                    message,
+                    time,
+                    data,
+                } => fixture::insert_part(connection, id, message, SESSION, *time, data),
+                Row::Message2 { seq, kind, data } => {
+                    fixture::insert_opencode_2_message(connection, SESSION, *seq, kind, data)
+                }
+            }
+        }
+
+        fn text(text: &str) -> Value {
+            json!({ "type": "text", "text": text })
+        }
+
+        fn tool(call: &str, status: &str) -> Value {
+            json!({
+                "type": "tool", "tool": "read", "callID": call,
+                "state": { "status": status, "input": { "filePath": "lib.rs" }, "output": "fn defect() {}" },
+            })
+        }
+
+        /// An OpenCode 1 session's rows in the order OpenCode writes them: two
+        /// turns, a model change between them, an injected read, usage, and a
+        /// tool call still running.
+        fn opencode_1_rows() -> Vec<Row> {
+            let assistant = |model: &str, time: i64| json!({ "role": "assistant", "time": { "created": time }, "modelID": model });
+            vec![
+                message(
+                    "msg_1",
+                    100,
+                    json!({ "role": "user", "time": { "created": 100 } }),
+                ),
+                part("prt_1a", "msg_1", 100, text("find the defect")),
+                part(
+                    "prt_1b",
+                    "msg_1",
+                    100,
+                    json!({ "type": "text", "synthetic": true,
+                    "text": "Called the Read tool with the following input: {\"filePath\":\"README.md\"}" }),
+                ),
+                part(
+                    "prt_1c",
+                    "msg_1",
+                    100,
+                    json!({ "type": "text", "synthetic": true, "text": "README contents" }),
+                ),
+                message("msg_2", 200, assistant("model-a", 200)),
+                part("prt_2a", "msg_2", 200, json!({ "type": "step-start" })),
+                part(
+                    "prt_2b",
+                    "msg_2",
+                    210,
+                    json!({ "type": "reasoning", "text": "thinking it over" }),
+                ),
+                part("prt_2c", "msg_2", 220, tool("call_1", "completed")),
+                part("prt_2d", "msg_2", 230, text("the defect hides in lib.rs")),
+                part(
+                    "prt_2e",
+                    "msg_2",
+                    240,
+                    json!({ "type": "step-finish",
+                    "tokens": { "input": 40, "output": 15, "reasoning": 5, "cache": { "read": 2, "write": 0 } } }),
+                ),
+                message(
+                    "msg_3",
+                    300,
+                    json!({ "role": "user", "time": { "created": 300 } }),
+                ),
+                part("prt_3a", "msg_3", 300, text("and the tests?")),
+                message("msg_4", 400, assistant("model-b", 400)),
+                part("prt_4a", "msg_4", 410, text("checking the tests")),
+                part("prt_4b", "msg_4", 420, tool("call_2", "running")),
+            ]
+        }
+
+        /// An OpenCode 2 session's messages in `seq` order: two turns, a
+        /// model change, a shell command, and a reply still streaming.
+        fn opencode_2_rows() -> Vec<Row> {
+            let assistant = |model: &str, time: i64, content: Value| {
+                json!({ "model": { "id": model }, "content": content, "time": { "created": time },
+                        "tokens": { "input": 10, "output": 5, "reasoning": 0, "cache": { "read": 0, "write": 0 } } })
+            };
+            [
+                ("user", json!({ "text": "find the defect", "time": { "created": 100 } })),
+                ("assistant", assistant("model-a", 200, json!([
+                    { "type": "reasoning", "text": "thinking it over" },
+                    { "type": "tool", "id": "call_1", "name": "read",
+                      "state": { "status": "completed", "input": { "path": "lib.rs" },
+                                 "content": [{ "type": "text", "text": "fn defect() {}" }] } },
+                    { "type": "text", "text": "the defect hides in lib.rs" },
+                ]))),
+                ("shell", json!({ "command": "cargo test", "exit": 1, "output": { "output": "1 failed" },
+                                  "time": { "created": 300 } })),
+                ("user", json!({ "text": "and the tests?", "time": { "created": 400 } })),
+                ("assistant", assistant("model-b", 500, json!([
+                    { "type": "text", "text": "checking the tests" },
+                    { "type": "tool", "id": "call_2", "name": "shell", "state": { "status": "running", "input": {} } },
+                ]))),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(seq, (kind, data))| Row::Message2 { seq: seq as i64, kind, data })
+            .collect()
+        }
+
+        /// A new database at `path` holding the session in `version` and
+        /// `rows`.
+        fn database_holding(path: &Path, version: u8, rows: &[Row]) {
+            let connection = if version == 1 {
+                let connection = fixture::create_database(path);
+                fixture::insert_session(
+                    &connection,
+                    &fixture::SessionSpec {
+                        id: SESSION,
+                        parent_id: None,
+                        directory: "/tmp/opencode-project",
+                        title: "resumed session",
+                        created_ms: 100,
+                        updated_ms: 100,
+                        archived_ms: None,
+                    },
+                );
+                connection
+            } else {
+                let connection = fixture::create_opencode_2_database(path);
+                fixture::insert_opencode_2_session_row(&connection, SESSION, None);
+                connection
+            };
+            for row in rows {
+                insert(&connection, row);
+            }
+        }
+
+        fn read_whole(database: &Path) -> SessionProjection {
+            OPENCODE_DB
+                .parse_transcript(
+                    crate::history::FOR_FIXTURES,
+                    &session_ref(database, SESSION),
+                )
+                .unwrap()
+                .unwrap()
+        }
+
+        fn resumed(database: &Path, read: &TranscriptRead) -> Resumption {
+            resume(
+                &OPENCODE_DB,
+                crate::history::FOR_FIXTURES,
+                &session_ref(database, SESSION),
+                read,
+            )
+            .unwrap()
+        }
+
+        /// `entries` as text a test compares.
+        fn listed(entries: &[(RecordLine, LogEntry)]) -> Vec<String> {
+            entries
+                .iter()
+                .map(|(record, entry)| format!("{} {entry:?}", record.line))
+                .collect()
+        }
+
+        /// Asserts that `prefix`, a read of the session before the window,
+        /// up to the window's first line, and then `window`, hold what `full`
+        /// holds, and that `window` leaves the same [`TranscriptRead`] as
+        /// `full`.
+        fn assert_window_completes(
+            name: &str,
+            prefix: &SessionProjection,
+            window: &ResumedWindow,
+            full: &SessionProjection,
+        ) {
+            let kept = prefix
+                .entries
+                .iter()
+                .filter(|(record, _)| record.line < window.start_line)
+                .chain(&window.entries)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed(&kept),
+                listed(&full.entries),
+                "{name}: the prefix and the window hold the full read's entries"
+            );
+            assert_eq!(
+                window.read, full.transcript_read,
+                "{name}: the window leaves the full read's `TranscriptRead`"
+            );
+        }
+
+        /// Runs `change` on the database of the session `rows` hold in
+        /// `version`, after a read of it, and returns the read resumed.
+        fn resumed_after(version: u8, rows: &[Row], change: &str) -> Resumption {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("opencode.db");
+            database_holding(&database, version, rows);
+            let read = read_whole(&database).transcript_read;
+            Connection::open(&database)
+                .unwrap()
+                .execute_batch(change)
+                .unwrap();
+            resumed(&database, &read)
+        }
+
+        #[test]
+        fn read_up_to_every_row_then_resumed_equals_full_read_in_both_versions() {
+            let directory = tempfile::tempdir().unwrap();
+            for (version, rows) in [(1, opencode_1_rows()), (2, opencode_2_rows())] {
+                let full_database = directory.path().join(format!("full-{version}.db"));
+                database_holding(&full_database, version, &rows);
+                let full = read_whole(&full_database);
+                for split in 0..=rows.len() {
+                    let name = format!("OpenCode {version} read up to row {split}");
+                    let database = directory.path().join(format!("split-{version}-{split}.db"));
+                    database_holding(&database, version, &rows[..split]);
+                    let prefix = read_whole(&database);
+                    let connection = Connection::open(&database).unwrap();
+                    for row in &rows[split..] {
+                        insert(&connection, row);
+                    }
+                    drop(connection);
+
+                    match resumed(&database, &prefix.transcript_read) {
+                        Resumption::Window(window) => {
+                            assert_window_completes(&name, &prefix, &window, &full)
+                        }
+                        other => panic!("{name}: appended rows resume: {other:?}"),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn part_completing_in_place_resumes() {
+            let opencode_1 = resumed_after(
+                1,
+                &opencode_1_rows(),
+                &format!(
+                    "UPDATE part SET time_updated = 500, data = '{}' WHERE id = 'prt_4b'",
+                    tool("call_2", "completed")
+                ),
+            );
+            assert!(
+                matches!(opencode_1, Resumption::Window(_)),
+                "OpenCode 1 resumes after a part completes in place: {opencode_1:?}"
+            );
+
+            let opencode_2 = resumed_after(
+                2,
+                &opencode_2_rows(),
+                "UPDATE session_message SET time_updated = 900, \
+                 data = replace(data, '\"running\"', '\"completed\"') WHERE seq = 4",
+            );
+            assert!(
+                matches!(opencode_2, Resumption::Window(_)),
+                "OpenCode 2 resumes after a running call completes in place: {opencode_2:?}"
+            );
+        }
+
+        #[test]
+        fn edited_or_deleted_earlier_row_or_another_session_row_reads_whole() {
+            for (version, rows, changes) in [
+                (
+                    1,
+                    opencode_1_rows(),
+                    [
+                        "UPDATE part SET time_updated = 900, data = '{\"type\":\"text\",\"text\":\"edited\"}' \
+                         WHERE id = 'prt_2d'",
+                        "DELETE FROM part WHERE id = 'prt_3a'",
+                        "UPDATE message SET time_updated = 900 WHERE id = 'msg_2'",
+                        "UPDATE session SET directory = '/tmp/elsewhere'",
+                    ],
+                ),
+                (
+                    2,
+                    opencode_2_rows(),
+                    [
+                        "UPDATE session_message SET time_updated = 900, \
+                         data = replace(data, 'the defect hides', 'edited') WHERE seq = 1",
+                        "DELETE FROM session_message WHERE seq = 2",
+                        "UPDATE session_message SET time_updated = 900 WHERE seq = 0",
+                        "UPDATE session_v2 SET time_created = 1",
+                    ],
+                ),
+            ] {
+                for change in changes {
+                    let resumed = resumed_after(version, &rows, change);
+                    assert!(
+                        matches!(resumed, Resumption::FullRead),
+                        "OpenCode {version}, {change}: reads whole: {resumed:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn part_added_to_earlier_message_reads_whole() {
+            let resumed = resumed_after(
+                1,
+                &opencode_1_rows(),
+                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) \
+                 VALUES ('prt_9', 'msg_2', 'ses_resumed', 900, 900, '{\"type\":\"text\",\"text\":\"late\"}')",
+            );
+            assert!(
+                matches!(resumed, Resumption::ChangesEarlierEntry),
+                "a part of a message before the cursor changes that message's entries: {resumed:?}"
+            );
+        }
+
+        #[test]
+        fn unchanged_session_reports_unchanged_until_a_row_changes() {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("opencode.db");
+            database_holding(&database, 1, &opencode_1_rows());
+            let source = session_ref(&database, SESSION);
+            let read = read_whole(&database).transcript_read;
+            assert!(OPENCODE_DB.is_unchanged_since(&source, &read).unwrap());
+
+            Connection::open(&database)
+                .unwrap()
+                .execute_batch("UPDATE part SET time_updated = 900 WHERE id = 'prt_4b'")
+                .unwrap();
+            assert!(
+                !OPENCODE_DB.is_unchanged_since(&source, &read).unwrap(),
+                "a row updated in place changes the session"
+            );
+        }
     }
 }

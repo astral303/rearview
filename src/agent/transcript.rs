@@ -1,10 +1,12 @@
-use crate::agent::diagnostic::{AgentError, AgentErrorKind};
+use crate::agent::diagnostic::{AgentError, AgentErrorKind, AgentWarning};
 use crate::agent::message_numbering::{MessageNumbering, Numbered, is_visible_block, visible_text};
 use crate::agent::refs::ResolvedConversation;
-use crate::agent::sanitize::sanitize_agent_text;
+use crate::agent::sanitize::{sanitize_agent_text, without_terminal_codes};
 use crate::agent::visibility::ContentVisibility;
 use crate::error::{AppError, Result};
 use crate::history::format::RecordLine;
+use crate::history::parser::UnlistedReason;
+use crate::history::provider::{SessionTitle, TitleAndSummary};
 use crate::history::task_notification::{ReportKind, ReportSender};
 use crate::history::{
     TaskReport, blocks_task_report, extract_skill_preview, parse_task_report, user_task_report,
@@ -32,6 +34,27 @@ pub struct AgentTranscript {
     pub malformed_lines: Vec<usize>,
     pub summary: Option<String>,
     pub custom_title: Option<String>,
+}
+
+/// A session's transcript as the session cache holds it.
+pub enum CachedTranscript {
+    /// The copy of a listed session.
+    Copy(AgentTranscript),
+    /// The session is not in the session cache.
+    NotCached,
+}
+
+impl CachedTranscript {
+    /// The copy; fails without one, naming `session`.
+    pub fn into_copy(self, session: &str) -> Result<AgentTranscript> {
+        match self {
+            Self::Copy(transcript) => Ok(transcript),
+            Self::NotCached => Err(AppError::SessionCacheNotReady {
+                session: session.to_owned(),
+                reason: "the session is not in the session cache".to_owned(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,41 +177,102 @@ pub struct AgentPartSource {
 
 impl AgentTranscript {
     /// Load a bare file, read by the format of the agent its projection
-    /// names. Production reads arrive
-    /// with a resolved key and use [`load_owned`](Self::load_owned); only
-    /// fixtures come in bare.
+    /// names. Production reads arrive with a resolved key and read the
+    /// session cache; only fixtures come in bare.
     #[cfg(test)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let transcript = crate::history::format::sniffed_session_entries(path)
-            .map_err(|error| transcript_error(path, error))?
-            .ok_or_else(|| {
-                unrecognized_transcript(path, "not a transcript of any supported agent".to_owned())
-            })?;
+        let transcript = crate::history::format::sniffed_session_entries(
+            crate::history::FOR_FIXTURES,
+            path,
+            &crate::history::provider::RootEnvironment::of_process(),
+        )
+        .map_err(|error| transcript_error(path, error))?
+        .ok_or_else(|| {
+            unrecognized_transcript(path, "not a transcript of any supported agent".to_owned())
+        })?;
         Self::from_transcript_entries(path, transcript)
     }
 
-    /// Load a transcript already attributed to `source`, with the sub-agent
-    /// transcripts its row names spliced in: only that provider's format
-    /// reads them, so a locator never meets a foreign format.
-    pub fn load_owned(
+    /// The transcript at `path`, attributed to `source`, with the sub-agent
+    /// transcripts at `subagents` spliced in, parsed for a session not in the
+    /// session cache: its transcript doesn't hold a conversation the provider
+    /// lists, or its read failed. Only that provider's format reads it, so a
+    /// locator never meets a foreign format.
+    pub fn parse_uncached(
+        permit: crate::history::ParsePermit<'_>,
         source: crate::history::Source,
         path: impl AsRef<Path>,
         subagents: &[PathBuf],
     ) -> Result<Self> {
         let path = path.as_ref();
-        let provider = source.provider();
-        let transcript = provider
+        let entries = source
+            .provider()
             .format()
-            .session_entries(path, subagents)
+            .session_entries(permit, path, subagents);
+        Self::of_uncached_entries(source, path, entries)
+    }
+
+    /// The transcript of `entries`, the read of `source`'s session at `path`.
+    fn of_uncached_entries(
+        source: crate::history::Source,
+        path: &Path,
+        entries: Result<Option<crate::history::TranscriptEntries>>,
+    ) -> Result<Self> {
+        let transcript = entries
             .map_err(|error| transcript_error(path, error))?
             .ok_or_else(|| {
-                unrecognized_transcript(path, declined_detail(provider.labels().display, path))
+                unrecognized_transcript(
+                    path,
+                    declined_detail(source.provider().labels().display, path),
+                )
             })?;
         Self::from_transcript_entries(path, transcript)
     }
 
-    fn from_transcript_entries(
+    /// `source`'s session at `path` with `subagents`, written into this
+    /// test's own session cache by a load as the refresh owner, then loaded
+    /// as [`Self::load_cached_as_is`] loads it.
+    #[cfg(test)]
+    pub(crate) fn load_cached_for_test(
+        source: crate::history::Source,
+        path: impl AsRef<Path>,
+        subagents: &[PathBuf],
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let row = crate::history::environment::test_support::cache_files(source, path, subagents);
+        let Some(address) = row.and_then(|row| row.cache_address) else {
+            return CachedTranscript::NotCached.into_copy(&path.to_string_lossy());
+        };
+        Self::load_cached_as_is(
+            &crate::history::environment::test_support::test_cache_base(),
+            &address,
+            path,
+        )?
+        .into_copy(&path.to_string_lossy())
+    }
+
+    /// The transcript at `path`, kept at `address`, as the cache under `base`
+    /// holds it: its newest copy, with the sub-agents the copy lists, whether
+    /// or not the transcript changed since. Doesn't parse. Fails at once
+    /// with a busy error while the database is exclusively locked, as during
+    /// a rebuild.
+    pub fn load_cached_as_is(
+        base: &crate::history::CacheBase,
+        address: &crate::history::sqlite_cache::SessionAddress,
+        path: impl AsRef<Path>,
+    ) -> Result<CachedTranscript> {
+        let path = path.as_ref();
+        let read = crate::history::sqlite_cache::read_copy_without_waiting(base, address, |held| {
+            held.numbered_entries(None)
+        });
+        match crate::history::sqlite_cache::found(read)? {
+            Some(stored) => Self::from_stored(path, stored).map(CachedTranscript::Copy),
+            None => Ok(CachedTranscript::NotCached),
+        }
+    }
+
+    pub(crate) fn from_transcript_entries(
         path: &Path,
         transcript: crate::history::TranscriptEntries,
     ) -> Result<Self> {
@@ -228,14 +312,74 @@ impl AgentTranscript {
         entries: Vec<(RecordLine, LogEntry)>,
         malformed_lines: Vec<usize>,
     ) -> Result<Self> {
+        Self::from_entries_with_numbers(path, entries, malformed_lines, None)
+    }
+
+    pub(crate) fn from_stored(
+        path: &Path,
+        stored: crate::history::sqlite_cache::StoredEntries,
+    ) -> Result<Self> {
+        let malformed = stored
+            .transcript
+            .malformed_lines
+            .iter()
+            .map(|line| line.line_number)
+            .collect();
+        Ok(Self::from_entries_with_numbers(
+            path,
+            stored.transcript.entries,
+            malformed,
+            Some(stored.numbers),
+        )?
+        .titled(TitleAndSummary {
+            custom_title: stored.custom_title,
+            summary: stored.summary,
+        }))
+    }
+
+    /// This transcript under `shown`, its session row's title and summary.
+    /// The entries do not hold a title the agent keeps outside the
+    /// transcript.
+    pub(crate) fn titled(mut self, shown: TitleAndSummary) -> Self {
+        let unless_blank = |text: Option<String>| text.filter(|text| !text.trim().is_empty());
+        self.custom_title = unless_blank(shown.custom_title);
+        self.summary = unless_blank(shown.summary);
+        self
+    }
+
+    /// This transcript, a copy the cache holds, under the title and summary
+    /// [`TitleAndSummary::shown`] decides from the copy's and `external`, the
+    /// title the agent keeps outside the transcript.
+    pub(crate) fn titled_with_external_title(self, external: Option<&SessionTitle>) -> Self {
+        let copy = TitleAndSummary {
+            custom_title: self.custom_title.clone(),
+            summary: self.summary.clone(),
+        };
+        let shown = TitleAndSummary::shown(&copy, external);
+        self.titled(shown)
+    }
+
+    fn from_entries_with_numbers(
+        path: &Path,
+        entries: Vec<(RecordLine, LogEntry)>,
+        malformed_lines: Vec<usize>,
+        stored_numbers: Option<Vec<Option<Numbered>>>,
+    ) -> Result<Self> {
         let mut messages: Vec<AgentMessage> = Vec::new();
         let mut summary = None;
         let mut custom_title = None;
         let mut numbering = MessageNumbering::default();
         let mut origins = SubagentOrigins::default();
-        for (record, entry) in entries {
+        for (index, (record, entry)) in entries.into_iter().enumerate() {
             let jsonl_line = record.line;
-            let numbered = numbering.number(&entry);
+            let thread = numbering.thread(crate::agent::message_numbering::ThreadIdentity::of(
+                &entry,
+                record.transcript.as_deref(),
+            ));
+            let numbered = stored_numbers.as_ref().map_or_else(
+                || numbering.number_in_thread(&entry, thread),
+                |numbers| numbers[index],
+            );
             match entry {
                 LogEntry::User {
                     message,
@@ -309,21 +453,35 @@ impl AgentTranscript {
                     });
                 }
                 LogEntry::Progress { data, extra } => {
-                    if let Some(progress) = parse_agent_progress(&data)
-                        && let Some((numbered, mut agent_message)) = progress_message_to_agent(
+                    if let Some(progress) = parse_agent_progress(&data) {
+                        let AgentContent::Blocks(blocks) = &progress.message.message.content;
+                        let numbered = stored_numbers.as_ref().map_or_else(
+                            || {
+                                let role =
+                                    AgentMessageRole::of_progress(&progress.message.message_type)?;
+                                numbering.number_progress_in_thread(
+                                    role,
+                                    blocks,
+                                    progress.message.message.id.as_deref(),
+                                    thread,
+                                )
+                            },
+                            |numbers| numbers[index],
+                        );
+                        if let Some((numbered, mut agent_message)) = progress_message_to_agent(
                             progress,
                             progress_timestamp(&extra),
                             jsonl_line,
-                            &mut numbering,
-                        )
-                    {
-                        agent_message.subagent = Some(origins.of_progress(
-                            &agent_message,
-                            &data,
-                            &extra,
-                            record.transcript,
-                        ));
-                        push_numbered(&mut messages, numbered, agent_message);
+                            numbered,
+                        ) {
+                            agent_message.subagent = Some(origins.of_progress(
+                                &agent_message,
+                                &data,
+                                &extra,
+                                record.transcript,
+                            ));
+                            push_numbered(&mut messages, numbered, agent_message);
+                        }
                     }
                 }
                 LogEntry::Summary { summary: value } => {
@@ -356,10 +514,6 @@ impl AgentTranscript {
             summary,
             custom_title,
         })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
     }
 
     pub fn malformed_warning_detail(&self) -> Option<String> {
@@ -480,13 +634,19 @@ fn unrecognized_transcript(path: &Path, detail: String) -> AppError {
 fn declined_detail(agent: &str, path: &Path) -> String {
     let malformed = lines_that_are_not_json(path);
     if malformed.is_empty() {
-        format!("not a {agent} transcript")
+        not_a_transcript_of(agent)
     } else {
         format!(
-            "not a {agent} transcript; malformed lines: {}",
+            "{}; malformed lines: {}",
+            not_a_transcript_of(agent),
             line_number_list(&malformed)
         )
     }
+}
+
+/// The detail for a file `agent`'s format does not read as its own.
+fn not_a_transcript_of(agent: &str) -> String {
+    format!("not a {agent} transcript")
 }
 
 /// The numbers of the non-blank lines of the text file at `path` that do not
@@ -572,13 +732,20 @@ fn user_message_to_agent(
 /// background task's report, who sent it, and whether it carries the
 /// reported text.
 #[derive(Default)]
-struct MessageReport {
-    is_report: bool,
-    sender: ReportSender,
-    has_text: bool,
+pub(crate) struct MessageReport {
+    pub(crate) is_report: bool,
+    pub(crate) sender: ReportSender,
+    pub(crate) has_text: bool,
 }
 
 impl MessageReport {
+    pub(crate) fn of_blocks(role: AgentMessageRole, blocks: &[ContentBlock]) -> Self {
+        match role {
+            AgentMessageRole::User => Self::of(blocks_task_report(blocks)),
+            AgentMessageRole::Assistant => Self::default(),
+        }
+    }
+
     /// `report`'s facts; none for IDE diagnostics, also written as a report,
     /// and for no report.
     fn of(report: Option<TaskReport>) -> Self {
@@ -678,7 +845,10 @@ fn push_numbered(messages: &mut Vec<AgentMessage>, numbered: Numbered, message: 
     if numbered.starts_message {
         messages.push(message);
     } else {
-        messages[numbered.ordinal - 1].parts.extend(message.parts);
+        let index = messages
+            .binary_search_by_key(&numbered.ordinal, |message| message.ordinal)
+            .expect("a continuing reply has a first entry");
+        messages[index].parts.extend(message.parts);
     }
 }
 
@@ -686,17 +856,14 @@ fn progress_message_to_agent(
     progress: AgentProgressData,
     timestamp: Option<String>,
     jsonl_line: usize,
-    numbering: &mut MessageNumbering,
+    numbered: Option<Numbered>,
 ) -> Option<(Numbered, AgentMessage)> {
     let role = AgentMessageRole::of_progress(&progress.message.message_type)?;
     let ProgressMessage { message, .. } = progress.message;
     let AgentContent::Blocks(blocks) = message.content;
     let reply_id = message.id;
-    let numbered = numbering.number_progress(role, &blocks, reply_id.as_deref())?;
-    let report = match role {
-        AgentMessageRole::User => MessageReport::of(blocks_task_report(&blocks)),
-        AgentMessageRole::Assistant => MessageReport::default(),
-    };
+    let numbered = numbered?;
+    let report = MessageReport::of_blocks(role, &blocks);
     let parent_tool_use_id = Some(progress.agent_id);
     let parts = blocks_to_parts(
         role,
@@ -882,7 +1049,7 @@ fn agent_search_text_from_block(role: AgentMessageRole, block: &ContentBlock) ->
                 AgentMessageRole::User => agent_user_text(text),
                 AgentMessageRole::Assistant => Cow::Borrowed(text.as_str()),
             };
-            non_empty_text(&sanitize_agent_text(&text))
+            unless_blank(sanitize_agent_text(&text))
         }
         ContentBlock::ToolResult { content, .. } => {
             content.as_ref().and_then(tool_result_search_text)
@@ -902,7 +1069,7 @@ fn thinking_or_tool_call_text(block: &ContentBlock) -> Option<String> {
         ContentBlock::Thinking { thinking, .. } => sanitize_agent_text(thinking),
         _ => return None,
     };
-    non_empty_text(&sanitized)
+    unless_blank(sanitized)
 }
 
 fn non_empty_text(text: &str) -> Option<String> {
@@ -1057,9 +1224,9 @@ pub(crate) fn tool_result_text(content: &Value) -> Option<String> {
 /// read it: terminal codes are stripped from each text before they are
 /// joined. The formats keep a result's codes, so the viewer can show them.
 pub(crate) fn tool_result_search_text(content: &Value) -> Option<String> {
-    let texts: Vec<String> = tool_result_texts(content)?
+    let texts: Vec<Cow<str>> = tool_result_texts(content)?
         .into_iter()
-        .map(sanitize_agent_text)
+        .map(without_terminal_codes)
         .collect();
     unless_blank(texts.join("\n"))
 }
@@ -1073,23 +1240,24 @@ fn unless_blank(text: String) -> Option<String> {
 fn tool_result_texts(content: &Value) -> Option<Vec<&str>> {
     match content {
         Value::String(text) => Some(vec![text.as_str()]),
-        Value::Array(items) => Some(
-            items
-                .iter()
-                .filter_map(|item| match item {
-                    Value::String(text) => Some(text.as_str()),
-                    Value::Object(map) => {
-                        let ty = map.get("type").and_then(|value| value.as_str());
-                        if ty.is_none() || ty == Some("text") {
-                            map.get("text").and_then(|value| value.as_str())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                })
-                .collect(),
-        ),
+        Value::Array(items) => Some(items.iter().filter_map(tool_result_item_text).collect()),
+        _ => None,
+    }
+}
+
+/// The text a tool result array's `item` holds: a string, or a text item's
+/// text. `None` for any other item.
+pub(crate) fn tool_result_item_text(item: &Value) -> Option<&str> {
+    match item {
+        Value::String(text) => Some(text.as_str()),
+        Value::Object(map) => {
+            let ty = map.get("type").and_then(|value| value.as_str());
+            if ty.is_none() || ty == Some("text") {
+                map.get("text").and_then(|value| value.as_str())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -1247,6 +1415,59 @@ fn transcript_error(path: &Path, error: AppError) -> AppError {
     }
 }
 
+/// `error`, a failure to parse the transcript at `path`, worded for the
+/// agent protocol.
+pub(crate) fn agent_read_error(path: &Path, error: &AppError) -> AgentError {
+    let reference = path.to_string_lossy();
+    match error {
+        AppError::Agent(error) => error.clone(),
+        AppError::Io(error) => AgentError::io(
+            Some(&reference),
+            format!("failed to read transcript: {error}"),
+        ),
+        AppError::Json(error) => AgentError::malformed_transcript(
+            Some(&reference),
+            format!("failed to parse transcript JSONL: {error}"),
+        ),
+        error => AgentError::malformed_transcript(Some(&reference), error.to_string()),
+    }
+}
+
+/// The warning an agent command prints for `source`'s session missing from
+/// the list, for `reason`. It doesn't name a session.
+pub(crate) fn unlisted_warning(
+    source: crate::history::Source,
+    reason: UnlistedReason,
+) -> AgentWarning {
+    match reason {
+        UnlistedReason::NoVisibleMessages => {
+            AgentWarning::skipped(None, "transcript has no visible messages")
+        }
+        UnlistedReason::NoConversationMetadata => {
+            AgentWarning::skipped(None, "transcript has no searchable conversation metadata")
+        }
+        UnlistedReason::ForeignTranscript => failure_warning(&AgentError::malformed_transcript(
+            None,
+            not_a_transcript_of(source.provider().labels().display),
+        )),
+    }
+}
+
+/// The warning for a transcript whose read failed with `error`. It doesn't
+/// name a session.
+fn failure_warning(error: &AgentError) -> AgentWarning {
+    AgentWarning {
+        reference: None,
+        ..AgentWarning::from_error(error)
+    }
+}
+
+/// The warning an agent command prints when the read of the transcript at
+/// `path` failed with `error`. It doesn't name a session.
+pub(crate) fn read_failure_warning(path: &Path, error: &AppError) -> AgentWarning {
+    failure_warning(&agent_read_error(path, error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1389,8 +1610,13 @@ mod tests {
         let path = directory.path().join("test.jsonl");
         std::fs::write(&path, "{malformed\nnot json").unwrap();
 
-        let error =
-            AgentTranscript::load_owned(crate::history::Source::Claude, &path, &[]).unwrap_err();
+        let error = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
+            crate::history::Source::Claude,
+            &path,
+            &[],
+        )
+        .unwrap_err();
 
         let crate::error::AppError::Agent(AgentError { kind, detail, .. }) = error else {
             panic!("an agent error: {error:?}");
@@ -1445,9 +1671,13 @@ mod tests {
         )
         .unwrap();
 
-        let transcript =
-            AgentTranscript::load_owned(crate::history::Source::Claude, &session, &[subagent])
-                .unwrap();
+        let transcript = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
+            crate::history::Source::Claude,
+            &session,
+            &[subagent],
+        )
+        .unwrap();
 
         let texts = transcript
             .messages
@@ -1940,7 +2170,7 @@ mod tests {
     fn two_sub_agents_sharing_label_are_two_threads_each_naming_its_launch() {
         let turn = |transcript: &str, text: &str, launch_call: &str| {
             let record = RecordLine {
-                transcript: Some(std::sync::Arc::from(Path::new(transcript))),
+                transcript: Some(Arc::from(Path::new(transcript))),
                 line: 1,
             };
             let entry = LogEntry::Progress {

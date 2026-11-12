@@ -1,0 +1,570 @@
+//! Claude Code sessions written to a temporary configuration directory, for
+//! app and load tests that read sessions again through the production entry
+//! points: Claude's storage pinned to that directory with its parses watched,
+//! a lister the test can make refuse a directory, and the test's own session
+//! cache unless it gives one.
+
+use super::{App, ToolDisplayMode, TuiSearchOptions};
+use crate::clock::{Clock, TestClock};
+use crate::config::KeyBindings;
+use crate::history::environment::test_support::waiting_operation;
+use crate::history::provider::walk::test_support::ScriptedLister;
+use crate::history::provider::{
+    LoadOptions, ParseWatch, SessionRoot, SessionStorage, WatchedStorage, load_sessions,
+};
+use crate::history::sqlite_cache::SqliteCache;
+use crate::history::{CacheBase, Conversation, Environment, ProcessIdentity, Source};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// The project directory [`ClaudeHome::write`] writes to.
+const PROJECT: &str = "-tmp-project";
+
+pub(crate) struct ClaudeHome {
+    directory: tempfile::TempDir,
+    lister: Arc<ScriptedLister>,
+    storage: &'static dyn SessionStorage,
+    watch: ParseWatch,
+}
+
+impl ClaudeHome {
+    pub(crate) fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let watch = ParseWatch::default();
+        let storage: &'static dyn SessionStorage = Box::leak(Box::new(WatchedStorage {
+            inner: Source::Claude.provider().storage(),
+            roots: vec![SessionRoot::new(directory.path().join("projects"))],
+            watch: watch.clone(),
+        }));
+        Self {
+            directory,
+            lister: Arc::new(ScriptedLister::default()),
+            storage,
+            watch,
+        }
+    }
+
+    /// Claude's storage pinned to this home's one root.
+    pub(crate) fn storage(&self) -> &'static dyn SessionStorage {
+        self.storage
+    }
+
+    /// The root holding this home's project directories.
+    pub(crate) fn root(&self) -> SessionRoot {
+        SessionRoot::new(self.directory.path().join("projects"))
+    }
+
+    /// The parses of this home's sessions.
+    pub(crate) fn watch(&self) -> &ParseWatch {
+        &self.watch
+    }
+
+    pub(crate) fn project(&self) -> PathBuf {
+        self.project_named(PROJECT)
+    }
+
+    fn project_named(&self, project: &str) -> PathBuf {
+        self.directory.path().join("projects").join(project)
+    }
+
+    /// The transcript of session `name`.
+    pub(crate) fn transcript(&self, name: &str) -> PathBuf {
+        self.project().join(format!("{name}.jsonl"))
+    }
+
+    /// Write session `name`: one user message per text, sent `minute` past
+    /// noon a second apart. Returns its transcript.
+    pub(crate) fn write(&self, name: &str, minute: u32, texts: &[&str]) -> PathBuf {
+        self.write_in(PROJECT, name, minute, texts)
+    }
+
+    /// [`Self::write`] into the project directory `project`.
+    pub(crate) fn write_in(
+        &self,
+        project: &str,
+        name: &str,
+        minute: u32,
+        texts: &[&str],
+    ) -> PathBuf {
+        let directory = self.project_named(project);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{name}.jsonl"));
+        std::fs::write(&path, transcript_lines(minute, texts)).unwrap();
+        path
+    }
+
+    /// Write the transcript of sub-agent `agent` of the session at
+    /// `transcript`, in that session's `subagents/` directory: one user
+    /// message per text, as [`Self::write`] writes them. Returns its path.
+    pub(crate) fn write_subagent(
+        &self,
+        transcript: &Path,
+        agent: &str,
+        minute: u32,
+        texts: &[&str],
+    ) -> PathBuf {
+        let directory = transcript.with_extension("").join("subagents");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("agent-{agent}.jsonl"));
+        std::fs::write(&path, transcript_lines(minute, texts)).unwrap();
+        path
+    }
+
+    /// Rewrite the transcript at `path` from its first line: one user
+    /// message per text, sent `minute` past noon a second apart. A load
+    /// reads a rewritten transcript whole, where it reads an appended one on
+    /// from its stored copy.
+    pub(crate) fn rewrite(&self, path: &Path, minute: u32, texts: &[&str]) {
+        std::fs::write(path, transcript_lines(minute, texts)).unwrap();
+    }
+
+    /// Add a user message with `text`, sent `minute` past noon, to the
+    /// transcript at `path`.
+    pub(crate) fn append(&self, path: &Path, minute: u32, text: &str) {
+        let mut transcript = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        let line = user_line(minute, 0, text) + "\n";
+        std::io::Write::write_all(&mut transcript, line.as_bytes()).unwrap();
+    }
+
+    /// Add a model reply with `text` that used `tokens` tokens, sent
+    /// `minute` past noon, to the transcript at `path`.
+    pub(crate) fn append_reply(&self, path: &Path, minute: u32, text: &str, tokens: u64) {
+        let mut transcript = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        let line = serde_json::json!({
+            "type": "assistant",
+            "timestamp": format!("2026-10-01T12:{minute:02}:59Z"),
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "usage": {"input_tokens": tokens, "output_tokens": 0},
+            }
+        })
+        .to_string()
+            + "\n";
+        std::io::Write::write_all(&mut transcript, line.as_bytes()).unwrap();
+    }
+
+    /// Refuse every later listing of the project directory, as a directory
+    /// the user cannot read refuses.
+    pub(crate) fn refuse_project(&self) {
+        self.refuse(&self.project());
+    }
+
+    /// Refuse every later listing of `directory`.
+    pub(crate) fn refuse(&self, directory: &Path) {
+        self.lister.refuse(directory);
+    }
+
+    /// Refuse the `listing`th listing of `directory` and every one after it.
+    pub(crate) fn refuse_from_listing(&self, directory: &Path, listing: usize) {
+        self.lister.refuse_from_listing(directory, listing);
+    }
+
+    /// Run `action` before the `listing`th listing of `directory`, as
+    /// between one discovery and the next.
+    pub(crate) fn run_before_listing(
+        &self,
+        directory: &Path,
+        listing: usize,
+        action: impl Fn() + Send + Sync + 'static,
+    ) {
+        self.lister.run_before_listing(directory, listing, action);
+    }
+
+    /// The number of times discovery listed the project directory.
+    pub(crate) fn times_project_listed(&self) -> usize {
+        self.lister.times_listed(&self.project())
+    }
+
+    /// The number of times discovery listed `directory`.
+    pub(crate) fn times_listed(&self, directory: &Path) -> usize {
+        self.lister.times_listed(directory)
+    }
+
+    /// Claude's storage pinned here, listed through this home's lister, on
+    /// test time, with this test's own session cache.
+    pub(crate) fn environment(&self) -> Environment {
+        self.environment_on(Arc::new(TestClock::default()))
+    }
+
+    /// [`Self::environment`] on `clock`.
+    pub(crate) fn environment_on(&self, clock: Arc<dyn Clock>) -> Environment {
+        Environment::new(
+            vec![self.storage],
+            crate::cache_file::test_support::test_cache_directory(),
+            ProcessIdentity::default(),
+            clock,
+            self.lister.clone(),
+        )
+    }
+
+    /// [`Self::environment`] with the session cache under `cache_base`, as
+    /// the rearview `process` reaches it, on `clock`.
+    pub(crate) fn environment_with_cache(
+        &self,
+        cache_base: &Path,
+        process: ProcessIdentity,
+        clock: Arc<dyn Clock>,
+    ) -> Environment {
+        Environment::new(
+            vec![self.storage],
+            cache_base.to_path_buf(),
+            process,
+            clock,
+            self.lister.clone(),
+        )
+    }
+
+    /// Every session here, newest first, as a load through `environment`
+    /// lists them.
+    pub(crate) fn rows(&self, environment: &Environment) -> Vec<Conversation> {
+        let operation = waiting_operation(environment);
+        let rows = load_sessions(
+            environment,
+            self.storage,
+            LoadOptions::default(),
+            &operation,
+            &mut |_, _| {},
+        )
+        .unwrap()
+        .conversations;
+        operation.finish().unwrap();
+        rows
+    }
+
+    /// An app listing every session here, loaded through this test's own
+    /// session cache on test time.
+    pub(crate) fn app(&self) -> App {
+        let environment = self.environment();
+        app_reading(self.rows(&environment), environment)
+    }
+}
+
+/// Claude Code sessions in two homes, five in the first and two in the
+/// second, cached by a load and each changed since. Set up once for a
+/// sweep: each case reads the same transcripts over a copy of that cache.
+pub(crate) struct ChangedSessionsTemplate {
+    homes: Arc<[ClaudeHome; 2]>,
+    transcripts: Vec<PathBuf>,
+    cache: TemplateCache,
+}
+
+impl ChangedSessionsTemplate {
+    pub(crate) fn new() -> Self {
+        let homes = Arc::new([ClaudeHome::new(), ClaudeHome::new()]);
+        let mut transcripts = Vec::new();
+        for (root, (home, sessions)) in homes.iter().zip([5, 2]).enumerate() {
+            for index in 0..sessions {
+                let id = format!("0f000000-0000-4000-8000-0000000000{root}{index}");
+                let minute = (root * 10 + index) as u32;
+                transcripts.push((root, home.write(&id, minute, &["a question"])));
+            }
+        }
+        let paths: Vec<PathBuf> = transcripts.iter().map(|(_, path)| path.clone()).collect();
+        let sessions = ChangedSessionsInTwoRoots::over(Arc::clone(&homes), paths, admitted_cache());
+        let environment = sessions.environment();
+        let operation = waiting_operation(&environment);
+        sessions.load(&environment, &operation);
+        operation.finish().unwrap();
+        for (root, transcript) in transcripts {
+            homes[root].append(&transcript, 30, "the newest question");
+        }
+        Self {
+            homes,
+            transcripts: sessions.transcripts,
+            cache: TemplateCache::new(sessions.cache),
+        }
+    }
+
+    /// The sessions over a copy of the cache, read through a storage whose
+    /// parses a new `watch` sees.
+    pub(crate) fn case(&self) -> ChangedSessionsInTwoRoots {
+        ChangedSessionsInTwoRoots::over(
+            Arc::clone(&self.homes),
+            self.transcripts.clone(),
+            self.cache.copy(),
+        )
+    }
+}
+
+/// The sessions of a [`ChangedSessionsTemplate`] over a session cache of
+/// their own, read as two roots of one storage whose parses `watch` sees.
+pub(crate) struct ChangedSessionsInTwoRoots {
+    _homes: Arc<[ClaudeHome; 2]>,
+    pub(crate) transcripts: Vec<PathBuf>,
+    pub(crate) cache: tempfile::TempDir,
+    pub(crate) watch: ParseWatch,
+    storage: &'static dyn SessionStorage,
+}
+
+impl ChangedSessionsInTwoRoots {
+    /// The sessions of a template set up for this test alone.
+    pub(crate) fn new() -> Self {
+        ChangedSessionsTemplate::new().case()
+    }
+
+    fn over(
+        homes: Arc<[ClaudeHome; 2]>,
+        transcripts: Vec<PathBuf>,
+        cache: tempfile::TempDir,
+    ) -> Self {
+        let watch = ParseWatch::default();
+        let storage: &'static dyn SessionStorage = Box::leak(Box::new(WatchedStorage {
+            inner: Source::Claude.provider().storage(),
+            roots: homes
+                .iter()
+                .map(|home| SessionRoot::new(home.project().parent().unwrap()))
+                .collect(),
+            watch: watch.clone(),
+        }));
+        Self {
+            _homes: homes,
+            transcripts,
+            cache,
+            watch,
+            storage,
+        }
+    }
+
+    /// Every session here, newest first, as a full load under `operation`
+    /// through `environment` lists them.
+    pub(crate) fn load(
+        &self,
+        environment: &Environment,
+        operation: &crate::history::OperationScope,
+    ) -> Vec<Conversation> {
+        load_sessions(
+            environment,
+            self.storage,
+            LoadOptions::default(),
+            operation,
+            &mut |_, _| {},
+        )
+        .unwrap()
+        .conversations
+    }
+
+    /// The storage reading both roots, on test time, with the session cache
+    /// these sessions were cached in.
+    pub(crate) fn environment(&self) -> Environment {
+        Environment::new(
+            vec![self.storage],
+            self.cache.path().to_path_buf(),
+            ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+            Arc::new(crate::history::provider::walk::SystemLister),
+        )
+    }
+}
+
+/// An app listing `rows`, reading sessions through `environment`.
+pub(crate) fn app_reading(rows: Vec<Conversation>, environment: Environment) -> App {
+    App::new_with_options(
+        rows,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        Vec::new(),
+        TuiSearchOptions::default(),
+        environment,
+    )
+}
+
+const VIEWPORT: usize = 20;
+
+/// The text the viewer shows for the file at `typed`, opened in
+/// `environment` as `rearview <file>` opens it: canonicalised, read by the
+/// background worker and rendered.
+pub(crate) fn text_of_file_opened_directly(typed: &Path, environment: &Environment) -> String {
+    let file =
+        super::DirectFile::canonicalise(typed.to_path_buf(), environment.canonicaliser()).unwrap();
+    let mut app = App::new_single_file(
+        file,
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        environment.clone(),
+    );
+    app.check_view_resize(80, VIEWPORT);
+    app.serve_direct_file_read();
+    super::test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
+    viewer_text(&app)
+}
+
+/// The text the open viewer shows.
+pub(crate) fn viewer_text(app: &App) -> String {
+    let super::AppMode::View(state) = app.app_mode() else {
+        unreachable!("the viewer is open")
+    };
+    state
+        .rendered_lines
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|(text, _)| text.as_str()))
+        .collect()
+}
+
+/// The viewer over `row`, opened as the list opens it, in an app reading
+/// `environment`.
+pub(crate) fn viewer_over(row: Conversation, environment: Environment) -> App {
+    let mut app = app_reading(vec![row], environment);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    app
+}
+
+/// True when the open viewer didn't find a copy of its session.
+pub(crate) fn viewer_lacks_copy(app: &App) -> bool {
+    let super::AppMode::View(state) = app.app_mode() else {
+        unreachable!("the viewer is open")
+    };
+    state.is_copy_missing
+}
+
+/// The session refresh the open viewer asked for, run as the background
+/// worker runs it, then the viewer's read of what the refresh listed.
+pub(crate) fn recover_viewer(app: &mut App) {
+    super::refresh_tests::serve_session_refresh(app);
+    assert!(super::test_waits::finish_pending_view_reload(app, VIEWPORT));
+}
+
+/// A list `Ctrl+R` of `app` under `window`, run as the background worker
+/// runs it.
+pub(crate) fn serve_list_refresh(app: &mut App, window: crate::time_filter::TimeFilter) {
+    let known = app.begin_refresh().expect("a list refresh begins");
+    let environment = app.environment.clone();
+    let outcome = std::thread::spawn(move || {
+        let operation = crate::history::OperationScope::new(
+            environment.cache_base(),
+            crate::history::Patience::UntilAcquired,
+            Arc::default(),
+        );
+        let options = crate::history::RefreshOptions {
+            time: window,
+            ..Default::default()
+        };
+        let outcome = crate::history::refresh_sessions(&environment, &known, options, &operation)
+            .map(|changes| crate::history::RefreshOutcome::Changes(Box::new(changes)));
+        operation.finish().and(outcome)
+    })
+    .join()
+    .unwrap();
+    app.finish_refresh(outcome);
+}
+
+/// The session cache under `cache_base` as another rearview reaches it, on
+/// `clock`: its refresh ownership reads as another process's.
+pub(crate) fn another_rearview(cache_base: &Path, clock: Arc<dyn Clock>) -> CacheBase {
+    CacheBase::new(
+        cache_base,
+        ProcessIdentity::default(),
+        clock,
+        crate::history::provider::walk::SystemCanonicaliser::shared(),
+    )
+}
+
+/// Claude Code and Codex sessions over an admitted, empty session cache, as
+/// a first fill finds them, on the system clock; with the cache's directory
+/// and the agents' homes.
+pub(crate) fn two_agents_first_fill() -> (Environment, tempfile::TempDir, Vec<tempfile::TempDir>) {
+    use crate::history::provider::contract_tests::{kept_storage_under, registered_fixtures};
+    let mut homes = Vec::new();
+    let mut storages = Vec::new();
+    for source in [Source::Claude, Source::Codex] {
+        let fixture = registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == source)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fixture.write_session(home.path(), fixture.ids().session);
+        storages.push(kept_storage_under(fixture, home.path()));
+        homes.push(home);
+    }
+    let cache = admitted_cache();
+    let environment = crate::history::environment::test_support::real_time_environment(
+        storages,
+        Some(cache.path()),
+    );
+    (environment, cache, homes)
+}
+
+/// A read connection of another rearview to the session cache database in
+/// `cache_base`, open until it drops.
+pub(crate) fn held_open_by_another_rearview(cache_base: &Path) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(
+        cache_base.join(crate::history::sqlite_cache::DATABASE_FILE_NAME),
+    )
+    .unwrap();
+    connection
+        .query_row("SELECT COUNT(*) FROM meta", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    connection
+}
+
+/// A session cache directory holding an admitted database without sessions,
+/// as a first build admits it: a load through it caches what it reads.
+pub(crate) fn admitted_cache() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    SqliteCache::open(&another_rearview(
+        directory.path(),
+        Arc::new(TestClock::default()),
+    ))
+    .unwrap()
+    .mark_admitted()
+    .unwrap();
+    directory
+}
+
+/// A session cache directory a sweep sets up once. Each case starts from a
+/// copy, so the setup runs once per sweep, not once per case.
+pub(crate) struct TemplateCache(tempfile::TempDir);
+
+impl TemplateCache {
+    /// `cache` as a template. Drop every connection to it first, so no
+    /// write or checkpoint changes its files while a case copies them.
+    pub(crate) fn new(cache: tempfile::TempDir) -> Self {
+        Self(cache)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+
+    /// A new session cache directory holding a copy of every file here.
+    pub(crate) fn copy(&self) -> tempfile::TempDir {
+        let copy = tempfile::tempdir().unwrap();
+        copy_directory(self.0.path(), copy.path());
+        copy
+    }
+}
+
+fn copy_directory(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir(&target).unwrap();
+            copy_directory(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .unwrap_or_else(|error| panic!("copy {}: {error}", entry.path().display()));
+        }
+    }
+}
+
+/// One user message per text, sent `minute` past noon a second apart.
+fn transcript_lines(minute: u32, texts: &[&str]) -> String {
+    texts
+        .iter()
+        .enumerate()
+        .map(|(second, text)| user_line(minute, second, text) + "\n")
+        .collect()
+}
+
+fn user_line(minute: u32, second: usize, text: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "timestamp": format!("2026-10-01T12:{minute:02}:{second:02}Z"),
+        "message": {"role": "user", "content": text}
+    })
+    .to_string()
+}

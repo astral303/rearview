@@ -1,3 +1,4 @@
+use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::history::{Conversation, MessageTimes};
 use crate::search::literal::Literal;
@@ -6,6 +7,7 @@ use crate::semantic::cache::{
 };
 #[cfg(test)]
 use crate::semantic::chunk::build_chunks_with_sources;
+use crate::semantic::chunk::builds_any_chunk;
 use crate::semantic::embed::{SemanticEmbedder, embed_valid_query};
 use crate::semantic::filter::matches_every_literal;
 use crate::semantic::rank::rank_prepared;
@@ -20,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 mod resident;
-use resident::{CorpusSignature, ResidentIndex, corpus_has_chunks};
+use resident::{CorpusSignature, ResidentIndex};
 
 #[derive(Clone)]
 pub struct SemanticIndexCandidate {
@@ -64,22 +66,31 @@ pub struct SemanticIndexState {
     resident: ResidentIndex,
     pub cache: EmbeddingCache,
     chunk_config: ChunkConfig,
+    clock: Arc<dyn Clock>,
 }
 
 impl SemanticIndexState {
-    pub fn new() -> Self {
-        Self::with_chunk_config(ChunkConfig::default())
-    }
-
-    pub fn with_chunk_config(chunk_config: ChunkConfig) -> Self {
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        let chunk_config = ChunkConfig::default();
         Self {
             signature: None,
             resident: ResidentIndex::default(),
-            cache: read_embedding_cache(chunk_config),
+            cache: read_embedding_cache(chunk_config, clock.as_ref()),
             chunk_config,
+            clock,
         }
     }
 
+    /// The clock this index runs on, for a save callback that writes the
+    /// cache.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
+    /// True when `request` has chunks to work on: a prewarm in the full
+    /// corpus, a ranking request in its scope. Answers from the resident
+    /// index when it was refreshed for the request's corpus, and otherwise
+    /// from the candidates' semantic turns, without building their chunks.
     pub fn has_chunks(
         &self,
         request: &SemanticIndexRequest<'_>,
@@ -88,12 +99,21 @@ impl SemanticIndexState {
         if cancellation.is_cancelled() {
             return Err(AppError::SemanticSearchCancelled);
         }
+        let candidates = if request.prewarm {
+            request.full_corpus
+        } else {
+            request.scope
+        };
         if self.signature_matches(request) {
-            return Ok(self.resident.chunk_count() > 0);
+            return Ok(self.resident.has_chunks_in(candidates));
         }
-        Ok(corpus_has_chunks(request.full_corpus, self.chunk_config))
+        Ok(any_builds_a_chunk(candidates))
     }
 
+    /// Records that `request`'s full corpus doesn't hold any chunks, once
+    /// [`Self::has_chunks`] didn't find any for it. Keeps the index when a
+    /// ranking request's scope doesn't hold any but the rest of the corpus
+    /// does.
     pub fn clear_empty(
         &mut self,
         request: &SemanticIndexRequest<'_>,
@@ -102,9 +122,18 @@ impl SemanticIndexState {
         if cancellation.is_cancelled() {
             return Err(AppError::SemanticSearchCancelled);
         }
+        if !request.prewarm && any_builds_a_chunk(request.full_corpus) {
+            return Ok(());
+        }
         self.signature = Some(CorpusSignature::of(request.full_corpus));
         self.resident.clear();
         Ok(())
+    }
+
+    /// Drops the index built for the corpus; the embedding cache stays.
+    pub fn clear_corpus(&mut self) {
+        self.signature = None;
+        self.resident.clear();
     }
 
     pub fn refresh_passages(
@@ -164,7 +193,7 @@ impl SemanticIndexState {
             chunks,
             &mut self.cache,
             cancellation,
-            budget,
+            budget.timed_on(self.clock.as_ref()),
             |completed, total| {
                 progress(SemanticIndexProgress::Embedding { completed, total });
             },
@@ -300,20 +329,25 @@ impl SemanticIndexState {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_cache(chunk_config: ChunkConfig, cache: EmbeddingCache) -> Self {
+    pub(crate) fn with_cache(
+        chunk_config: ChunkConfig,
+        cache: EmbeddingCache,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             signature: None,
             resident: ResidentIndex::default(),
             cache,
             chunk_config,
+            clock,
         }
     }
 }
 
-impl Default for SemanticIndexState {
-    fn default() -> Self {
-        Self::new()
-    }
+fn any_builds_a_chunk(candidates: &[SemanticIndexCandidate]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| builds_any_chunk(&candidate.conversation))
 }
 
 /// Each candidate conversation's message times, by its index in the corpus.
@@ -388,10 +422,12 @@ fn candidate_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
     use crate::semantic::cache::{cache_miss_count, embedding_cache_key, empty_embedding_cache};
     use crate::semantic::test_fixtures::{SemanticConversationFixture, beta_hit_metadata};
-    use crate::semantic::types::CachedChunk;
+    use crate::semantic::types::{CachedChunk, DEFAULT_EMBEDDING_BATCH_SIZE};
     use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
 
     struct FakeEmbedder {
         passage_calls: usize,
@@ -442,6 +478,29 @@ mod tests {
             } else {
                 self.query_embedding.clone()
             })
+        }
+    }
+
+    /// Spends `batch_takes` of `clock`'s time on each batch of passages.
+    struct SlowEmbedder {
+        clock: Arc<TestClock>,
+        batch_takes: Duration,
+        passage_calls: usize,
+    }
+
+    impl SemanticEmbedder for SlowEmbedder {
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn embed_passages(&mut self, passages: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.passage_calls += 1;
+            self.clock.sleep(self.batch_takes);
+            Ok(passages.iter().map(|_| vec![0.5, 0.5]).collect())
+        }
+
+        fn embed_query(&mut self, _query: &str) -> Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
         }
     }
 
@@ -522,14 +581,18 @@ mod tests {
         let mut cache = empty_embedding_cache(chunk_config);
         cache_request_passages(&mut cache, request);
         (
-            SemanticIndexState::with_cache(chunk_config, cache),
+            SemanticIndexState::with_cache(chunk_config, cache, Arc::new(TestClock::default())),
             FakeEmbedder::new(),
         )
     }
 
     fn prepare_empty_state(chunk_config: ChunkConfig) -> (SemanticIndexState, FakeEmbedder) {
         (
-            SemanticIndexState::with_cache(chunk_config, empty_embedding_cache(chunk_config)),
+            SemanticIndexState::with_cache(
+                chunk_config,
+                empty_embedding_cache(chunk_config),
+                Arc::new(TestClock::default()),
+            ),
             FakeEmbedder::new(),
         )
     }
@@ -689,7 +752,8 @@ mod tests {
             };
             cache_passage(&mut cache, chunk.text, embedding);
         }
-        let mut state = SemanticIndexState::with_cache(config, cache);
+        let mut state =
+            SemanticIndexState::with_cache(config, cache, Arc::new(TestClock::default()));
         let mut embedder = FakeEmbedder::new();
 
         let response = state
@@ -734,7 +798,7 @@ mod tests {
             chrono::Utc
                 .with_ymd_and_hms(2026, 10, 14, 15, minute, second)
                 .unwrap()
-                .with_timezone(&chrono::Local)
+                .with_timezone(&crate::clock::Zone::System)
         };
         let request = SemanticIndexRequest {
             window: TimeFilter {
@@ -757,7 +821,8 @@ mod tests {
             };
             cache_passage(&mut cache, chunk.text, embedding);
         }
-        let mut state = SemanticIndexState::with_cache(config, cache);
+        let mut state =
+            SemanticIndexState::with_cache(config, cache, Arc::new(TestClock::default()));
 
         let response =
             run_refresh(&mut state, &request, &mut FakeEmbedder::new()).expect("rank succeeds");
@@ -1002,7 +1067,11 @@ mod tests {
             .find(|chunk| chunk.text == "visible alpha")
             .expect("alpha chunk");
         cache_passage(&mut cache, first_chunk.text, vec![1.0, 0.0]);
-        let mut state = SemanticIndexState::with_cache(ChunkConfig::default(), cache);
+        let mut state = SemanticIndexState::with_cache(
+            ChunkConfig::default(),
+            cache,
+            Arc::new(TestClock::default()),
+        );
         let mut embedder = FakeEmbedder::new();
         let mut progress = Vec::new();
 
@@ -1488,6 +1557,61 @@ mod tests {
         );
     }
 
+    /// Each repeated query asks whether its scope holds chunks before it
+    /// waits for the model.
+    #[test]
+    fn has_chunks_answers_for_the_scope_without_building_chunks() {
+        use crate::semantic::chunk::chunked_conversations;
+        // Paths no other test uses: the record holds every test's chunk builds.
+        let paths = [
+            "/projects/has-chunks-without-building/session-a.jsonl",
+            "/projects/has-chunks-without-building/session-b.jsonl",
+        ];
+        let conversations = vec![
+            conversation(paths[0], vec!["visible alpha"]),
+            conversation(paths[1], vec!["  "]),
+        ];
+        let (query, candidates) = request("alpha", conversations, vec![0, 1]);
+        let full = index_request(&query, &candidates);
+        let (mut state, mut embedder) = prepare_indexed_state(&full, ChunkConfig::default());
+        let chunk_builds = || {
+            paths
+                .iter()
+                .map(|path| chunked_conversations::count(std::path::Path::new(path)))
+                .sum::<usize>()
+        };
+        let answers_by_scope = |state: &SemanticIndexState| {
+            let chunked_before = chunk_builds();
+            let answers = [&candidates[..1], &candidates[1..]].map(|scope| {
+                let request = SemanticIndexRequest {
+                    scope,
+                    ..index_request(&query, &candidates)
+                };
+                state
+                    .has_chunks(&request, &SemanticCancellationToken::new())
+                    .unwrap()
+            });
+            let chunked = chunk_builds() - chunked_before;
+            (answers, chunked)
+        };
+
+        let before_refresh = answers_by_scope(&state);
+        run_refresh(&mut state, &full, &mut embedder).expect("the index refreshes");
+        let refreshed = answers_by_scope(&state);
+
+        assert_eq!(
+            before_refresh,
+            ([true, false], 0),
+            "the index not refreshed for the corpus answers from the semantic turns"
+        );
+        assert!(state.signature_matches(&full));
+        assert_eq!(
+            refreshed,
+            ([true, false], 0),
+            "the index refreshed for the corpus answers from its chunks"
+        );
+    }
+
     #[test]
     fn empty_visible_dialogue_returns_without_embedding() {
         let conversations = vec![conversation("/projects/project-a/session-a.jsonl", vec![])];
@@ -1662,6 +1786,61 @@ mod tests {
         );
         assert!(state.signature_matches(&request));
         assert_eq!(response.hits, fresh_index_hits(&request));
+    }
+
+    /// With a two-second limit and 1.5-second batches on the index's own
+    /// clock, the second batch starts at 1.5 s; at 3 s the limit has passed
+    /// and the third does not start.
+    #[test]
+    fn index_stops_embedding_once_time_limit_has_passed_on_its_clock() {
+        const BATCHES: usize = 4;
+        let texts = (0..BATCHES * DEFAULT_EMBEDDING_BATCH_SIZE)
+            .map(|index| format!("visible passage {index}"))
+            .collect::<Vec<_>>();
+        let sessions = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                conversation(
+                    &format!("/projects/project-a/session-{index}.jsonl"),
+                    vec![text.as_str()],
+                )
+            })
+            .collect::<Vec<_>>();
+        let all = candidates_from(&sessions);
+        let request = index_request("passage", &all);
+        let clock = Arc::new(TestClock::default());
+        let mut state = SemanticIndexState::with_cache(
+            ChunkConfig::default(),
+            empty_embedding_cache(ChunkConfig::default()),
+            clock.clone(),
+        );
+        let mut embedder = SlowEmbedder {
+            clock,
+            batch_takes: Duration::from_millis(1500),
+            passage_calls: 0,
+        };
+
+        let response = state
+            .refresh_or_prewarm_with_budget(
+                &request,
+                &mut embedder,
+                &SemanticCancellationToken::new(),
+                EmbeddingBudget::seconds(2),
+                |_| {},
+                |_| {},
+            )
+            .expect("the index ranks the passages it embedded");
+
+        assert_eq!(embedder.passage_calls, 2);
+        assert_eq!(
+            response.missing_chunk_count,
+            (BATCHES - 2) * DEFAULT_EMBEDDING_BATCH_SIZE
+        );
+        assert!(
+            !state.signature_matches(&request),
+            "an index cut short by the time limit is completed on the next request"
+        );
     }
 
     #[test]

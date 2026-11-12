@@ -1,3 +1,4 @@
+use super::path::{CanonicalDirectories, without_verbatim_prefix};
 use super::pi_loader::{
     AGENT_DIR_VARIABLE, SESSION_DIR_VARIABLE, is_session_directory_override, unset_if_empty,
     whole_path_dir_name, with_separators_as_dashes,
@@ -6,6 +7,7 @@ use super::provider::walk::FileRoot;
 use super::provider::{RootEnvironment, SessionRoot};
 use crate::error::{AppError, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Moves OMP's configuration directory, relative to the home directory.
 const CONFIG_DIR_VARIABLE: &str = "PI_CONFIG_DIR";
@@ -121,6 +123,8 @@ pub(crate) fn session_root_from(
 pub(crate) struct UserDirectories {
     home: PathBuf,
     temp: Option<PathBuf>,
+    /// The home, temporary and working directories, each canonicalised once.
+    canonical_directories: Arc<CanonicalDirectories>,
 }
 
 impl UserDirectories {
@@ -131,7 +135,19 @@ impl UserDirectories {
                 .ok_or_else(AppError::home_not_found)?
                 .to_path_buf(),
             temp: environment.temp_dir().map(Path::to_path_buf),
+            canonical_directories: Arc::clone(environment.directories()),
         })
+    }
+
+    /// The home `home` and the temporary directory `temp`, canonicalised by
+    /// the file system.
+    #[cfg(test)]
+    fn at(home: PathBuf, temp: Option<PathBuf>) -> Self {
+        Self {
+            home,
+            temp,
+            canonical_directories: Arc::new(CanonicalDirectories::of_system()),
+        }
     }
 
     /// The directory under `root` OMP writes the sessions recorded in
@@ -152,8 +168,8 @@ impl UserDirectories {
     /// else to the temporary directory (`maybeAutoChdir` in OMP's
     /// `startup-cwd.ts`).
     fn launch_dir(&self, directory: &Path) -> PathBuf {
-        let home = resolved(&self.home);
-        if !is_same_directory(&resolved(directory), &home) {
+        let home = self.canonicalised(&self.home);
+        if !is_same_directory(&self.canonicalised(directory), &home) {
             return directory.to_path_buf();
         }
         let mut candidates = vec![self.home.join("tmp")];
@@ -164,9 +180,9 @@ impl UserDirectories {
             .into_iter()
             .find(|candidate| candidate.is_dir())
             .or_else(|| {
-                self.temp
-                    .clone()
-                    .filter(|temp| temp.is_dir() && !is_same_directory(&resolved(temp), &home))
+                self.temp.clone().filter(|temp| {
+                    temp.is_dir() && !is_same_directory(&self.canonicalised(temp), &home)
+                })
             })
             .unwrap_or_else(|| directory.to_path_buf())
     }
@@ -179,43 +195,31 @@ impl UserDirectories {
     /// - else `-` and the path below the home directory
     /// - else the [`whole_path_dir_name`] Pi gives every working directory
     fn session_dir_name(&self, directory: &Path) -> String {
-        let directory = resolved(directory);
+        let directory = self.canonicalised(directory);
         if let Some(below_temp) = self
             .temp
             .as_deref()
-            .and_then(|temp| path_below(&directory, &resolved(temp)))
+            .and_then(|temp| path_below(&directory, &self.canonicalised(temp)))
         {
             return name_below("-tmp", &below_temp);
         }
-        if let Some(below_home) = path_below(&directory, &resolved(&self.home)) {
+        if let Some(below_home) = path_below(&directory, &self.canonicalised(&self.home)) {
             return name_below("-", &below_home);
         }
         whole_path_dir_name(&directory.to_string_lossy())
     }
-}
 
-/// `path` with symbolic links resolved, as OMP's `resolveEquivalentPath`
-/// does; `path` itself when it cannot be resolved.
-fn resolved(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path)
-        .map(|canonical| without_verbatim_prefix(&canonical))
-        .unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// A Windows path without the `\\?\` prefix `canonicalize` adds, as OMP
-/// spells it.
-fn without_verbatim_prefix(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{share}"))
-    } else if let Some(local) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(local)
-    } else {
-        path.to_path_buf()
+    /// `path` canonicalised, as OMP's `resolveEquivalentPath` does; `path`
+    /// itself when it doesn't canonicalise.
+    fn canonicalised(&self, path: &Path) -> PathBuf {
+        self.canonical_directories
+            .canonical(path)
+            .map(|canonical| without_verbatim_prefix(&canonical))
+            .unwrap_or_else(|| path.to_path_buf())
     }
 }
 
-/// True when two resolved paths name one directory; Windows compares them
+/// True when two canonicalised paths name one directory; Windows compares them
 /// case-insensitively.
 fn is_same_directory(left: &Path, right: &Path) -> bool {
     if cfg!(windows) {
@@ -423,13 +427,13 @@ mod tests {
         assert_eq!(empty_agent_dir.unwrap(), default, "PI_CODING_AGENT_DIR");
     }
 
-    /// Paths that do not exist: none resolves to another spelling.
+    /// Paths that do not exist: none canonicalises to another spelling.
     #[test]
     fn working_directory_gets_directory_omp_names_for_it() {
-        let user_directories = UserDirectories {
-            home: PathBuf::from("/home/alice"),
-            temp: Some(PathBuf::from("/var/alice-temp")),
-        };
+        let user_directories = UserDirectories::at(
+            PathBuf::from("/home/alice"),
+            Some(PathBuf::from("/var/alice-temp")),
+        );
         for (directory, name) in [
             ("/home/alice/work/pi", "-work-pi"),
             ("/var/alice-temp/scratch", "-tmp-scratch"),
@@ -450,10 +454,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_working_directory_gets_directory_omp_names_for_it() {
-        let user_directories = UserDirectories {
-            home: PathBuf::from(r"C:\Users\alice-test"),
-            temp: Some(PathBuf::from(r"C:\Users\alice-test\AppData\Local\Temp")),
-        };
+        let user_directories = UserDirectories::at(
+            PathBuf::from(r"C:\Users\alice-test"),
+            Some(PathBuf::from(r"C:\Users\alice-test\AppData\Local\Temp")),
+        );
         for (directory, name) in [
             (r"C:\Users\alice-test\AppData\Local\Temp\abc", "-tmp-abc"),
             (r"C:\Users\alice-test\Documents\proj", "-Documents-proj"),
@@ -467,14 +471,42 @@ mod tests {
         }
     }
 
+    /// Naming the sessions directories of several working directories, each
+    /// through a `UserDirectories` of its own as a workspace's candidate
+    /// directories do, canonicalises the home directory once through the
+    /// environment's canonicaliser.
+    #[test]
+    fn home_directory_canonicalises_once_for_every_working_directory() {
+        use crate::history::provider::walk::test_support::CountingCanonicaliser;
+        let home = tempfile::tempdir().unwrap();
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let no_variable = |_: &str| -> Option<std::ffi::OsString> { None };
+        let environment = RootEnvironment::new(&no_variable, Some(home.path().to_path_buf()), None)
+            .with_canonicaliser(canonicaliser.clone());
+        let working_directories = ["a", "b", "c"].map(|name| home.path().join(name));
+
+        for directory in &working_directories {
+            UserDirectories::of(&environment)
+                .unwrap()
+                .session_dir_name(directory);
+        }
+
+        let home_canonicalisations = canonicaliser
+            .canonicalised()
+            .iter()
+            .filter(|path| path.as_path() == home.path())
+            .count();
+        assert_eq!(
+            home_canonicalisations, 1,
+            "the home directory canonicalises once"
+        );
+    }
+
     #[test]
     fn working_directory_is_named_after_its_resolved_path() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("work/pi")).unwrap();
-        let user_directories = UserDirectories {
-            home: home.path().to_path_buf(),
-            temp: None,
-        };
+        let user_directories = UserDirectories::at(home.path().to_path_buf(), None);
 
         assert_eq!(
             user_directories.session_dir_name(&home.path().join("work/../work/pi")),
@@ -488,10 +520,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir(home.path().join("real")).unwrap();
         std::os::unix::fs::symlink(home.path().join("real"), home.path().join("link")).unwrap();
-        let user_directories = UserDirectories {
-            home: home.path().to_path_buf(),
-            temp: None,
-        };
+        let user_directories = UserDirectories::at(home.path().to_path_buf(), None);
 
         assert_eq!(
             user_directories.session_dir_name(&home.path().join("link")),
@@ -503,10 +532,7 @@ mod tests {
     fn omp_started_in_home_directory_names_directory_it_moves_to() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir(home.path().join("tmp")).unwrap();
-        let user_directories = UserDirectories {
-            home: home.path().to_path_buf(),
-            temp: None,
-        };
+        let user_directories = UserDirectories::at(home.path().to_path_buf(), None);
         let root = FileRoot {
             root: SessionRoot::new("/sessions"),
             depth: 1,
@@ -520,10 +546,10 @@ mod tests {
 
     #[test]
     fn session_directory_override_holds_every_working_directorys_sessions() {
-        let user_directories = UserDirectories {
-            home: PathBuf::from("/home/alice"),
-            temp: Some(PathBuf::from("/var/alice-temp")),
-        };
+        let user_directories = UserDirectories::at(
+            PathBuf::from("/home/alice"),
+            Some(PathBuf::from("/var/alice-temp")),
+        );
         let root = FileRoot {
             root: SessionRoot::new("/shared"),
             depth: 0,

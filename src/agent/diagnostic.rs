@@ -64,6 +64,18 @@ impl AgentError {
     pub fn semantic_unavailable(detail: impl Into<String>) -> Self {
         Self::new(AgentErrorKind::SemanticUnavailable, None, detail)
     }
+
+    /// Converts `warning`, a session read's warning, into the error for
+    /// `reference` when it reports a failed read; `None` for a skipped
+    /// session's warning.
+    pub(crate) fn of_read_warning(warning: &AgentWarning, reference: &str) -> Option<Self> {
+        let kind = match warning.kind {
+            AgentWarningKind::MalformedTranscript => AgentErrorKind::MalformedTranscript,
+            AgentWarningKind::Io => AgentErrorKind::Io,
+            _ => return None,
+        };
+        Some(Self::new(kind, Some(reference), warning.detail.clone()))
+    }
 }
 
 impl fmt::Display for AgentError {
@@ -87,6 +99,11 @@ pub enum AgentWarningKind {
     /// Passages the semantic index has no embedding for, so they could not be
     /// ranked; the detail gives the counts and the remedy.
     PartialIndex,
+    /// Sessions whose cached copy is out of date or missing, because another
+    /// rearview was refreshing the cache or this rearview's writes stopped;
+    /// the detail holds the record's `refs=` and `cached-until=` atoms and
+    /// the sentence for its cause.
+    StaleCache,
 }
 
 impl AgentWarningKind {
@@ -98,9 +115,33 @@ impl AgentWarningKind {
             Self::SemanticUnavailable => "semantic-unavailable",
             Self::Ignored => "ignored",
             Self::PartialIndex => "partial-index",
+            Self::StaleCache => "stale-cache",
         }
     }
+
+    /// The kind `atom` names, as [`Self::as_str`] writes it.
+    fn of_atom(atom: &str) -> Option<Self> {
+        [
+            Self::Skipped,
+            Self::MalformedTranscript,
+            Self::Io,
+            Self::SemanticUnavailable,
+            Self::Ignored,
+            Self::PartialIndex,
+            Self::StaleCache,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == atom)
+    }
 }
+
+/// The sentence a stale-cache record ends with while another rearview
+/// refreshes the cache.
+const STALE_CACHE_SENTENCE: &str = "another rearview is refreshing these sessions; repeat the command after it finishes to include their newest messages";
+
+/// The sentence a stale-cache record ends with once the command's own cache
+/// writes stopped.
+const WRITES_STOPPED_SENTENCE: &str = "rearview could not update these sessions in the session cache; repeat the command to include their newest messages";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentWarning {
@@ -137,6 +178,23 @@ impl AgentWarning {
         }
     }
 
+    /// The warning as the session cache records it: its kind's atom, a
+    /// space, then its detail. The reference is left out.
+    pub(crate) fn to_recorded(&self) -> String {
+        format!("{} {}", self.kind.as_str(), self.detail)
+    }
+
+    /// The warning `recorded` holds, as [`Self::to_recorded`] writes it,
+    /// without a reference; `None` when it does not start with a kind.
+    pub(crate) fn from_recorded(recorded: &str) -> Option<Self> {
+        let (atom, detail) = recorded.split_once(' ')?;
+        Some(Self {
+            kind: AgentWarningKind::of_atom(atom)?,
+            reference: None,
+            detail: detail.to_owned(),
+        })
+    }
+
     pub fn skipped(reference: Option<&str>, detail: impl Into<String>) -> Self {
         Self {
             kind: AgentWarningKind::Skipped,
@@ -160,6 +218,31 @@ impl AgentWarning {
             detail: detail.into(),
         }
     }
+
+    /// The sessions at `refs`, read from the cache as it was for `cause`.
+    /// `cached_until` is the earliest end of their cached messages; `None`
+    /// when none of them is in the session cache.
+    pub fn stale_cache(
+        refs: &[String],
+        cached_until: Option<chrono::DateTime<crate::clock::Zone>>,
+        cause: crate::history::StaleCause,
+    ) -> Self {
+        let mut detail = format!("refs={}", refs.join(","));
+        if let Some(cached_until) = cached_until {
+            detail.push_str(" cached-until=");
+            detail.push_str(&cached_until.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+        }
+        detail.push_str(" : ");
+        detail.push_str(match cause {
+            crate::history::StaleCause::AnotherRearview => STALE_CACHE_SENTENCE,
+            crate::history::StaleCause::WritesStopped => WRITES_STOPPED_SENTENCE,
+        });
+        Self {
+            kind: AgentWarningKind::StaleCache,
+            reference: None,
+            detail,
+        }
+    }
 }
 
 pub fn format_error(error: &AgentError) -> String {
@@ -172,6 +255,13 @@ pub fn format_error(error: &AgentError) -> String {
 }
 
 pub fn format_warning(warning: &AgentWarning) -> String {
+    if warning.kind == AgentWarningKind::StaleCache {
+        return format!(
+            "protocol agent-warning {} {}\n",
+            warning.kind.as_str(),
+            warning.detail
+        );
+    }
     format_record(
         "agent-warning",
         warning.kind.as_str(),
@@ -238,10 +328,15 @@ fn format_record(protocol: &str, kind: &str, reference: Option<&str>, detail: &s
     }
     if !detail.is_empty() {
         output.push_str(" detail=");
-        output.push_str(&escape_atom(&sanitize_agent_text(detail)));
+        output.push_str(&encode_detail(detail));
     }
     output.push('\n');
     output
+}
+
+/// `detail`, free text, as one field's value of a protocol or `perf` record.
+pub(crate) fn encode_detail(detail: &str) -> String {
+    escape_atom(&sanitize_agent_text(detail))
 }
 
 #[cfg(test)]

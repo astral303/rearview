@@ -1,0 +1,582 @@
+//! The session row's fold: the previews, titles, model, tokens, times,
+//! counts and message numbering of a session's row in the list, besides its
+//! texts, folded entry by entry in the order the view walks the session. A
+//! fold stops at a checkpoint and starts again from it, so a resumed read
+//! folds only the entries past the checkpoint.
+
+use crate::agent::message_numbering::{MessageNumbering, NumberingCheckpoint, ThreadIdentity};
+use crate::history::message_times::{MessageTimes, MessageTimesBuilder};
+use crate::log_entry::{LogEntry, TokenUsage};
+use chrono::{DateTime, FixedOffset};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+
+/// The preview parts a row shows: its first three and its last three.
+const PREVIEW_PARTS: usize = 3;
+
+/// A session row's fold.
+#[derive(Default)]
+pub(crate) struct RowFold {
+    facts: RowFacts,
+    numbering: MessageNumbering,
+    /// The entries placed so far in each thread, by thread number.
+    positions: HashMap<i64, i64>,
+    message_times: MessageTimesBuilder,
+    /// Each reply's preview part, by the reply's ordinal: a later record of
+    /// the reply appends to it. Holds only replies numbered since the fold
+    /// started.
+    reply_previews: HashMap<usize, usize>,
+    /// Each reply's last token usage, by its thread and reply id. Holds only
+    /// replies numbered since the fold started.
+    keyed_tokens: HashMap<(i64, String), u64>,
+    /// The token total of the replies before the checkpoint the fold
+    /// started from.
+    closed_reply_tokens: u64,
+}
+
+/// The fold's facts a checkpoint stores as they are.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct RowFacts {
+    preview: PreviewParts,
+    /// True once a user message entered the preview. Replies before it stay
+    /// out of the preview, so the preview opens with the user's text.
+    has_user_preview: bool,
+    clear_only: ClearOnlyMarkers,
+    /// True once a non-empty part entered the row's search text.
+    has_search_text: bool,
+    cwd: Option<PathBuf>,
+    /// The first summary after the leading entries, or a later AI title in
+    /// its place.
+    summary: Option<String>,
+    /// True when `summary` is an AI title's. It replaces the leading summary.
+    is_summary_ai_title: bool,
+    /// The leading entries' custom title, such as a title kept outside the
+    /// transcript. A resumed read sets it again on every read.
+    leading_title: Option<String>,
+    /// The leading entries' summary, such as a title the agent generated and
+    /// keeps outside the transcript.
+    leading_summary: Option<String>,
+    /// The last title an entry after the leading ones set: `Some(None)` for
+    /// a blank one, because a blank title clears the title.
+    entry_title: Option<Option<String>>,
+    model: Option<String>,
+    anonymous_tokens: u64,
+    /// The first and the last activity times, as written.
+    first_activity: Option<String>,
+    last_activity: Option<String>,
+    /// The latest activity time, as written.
+    latest_activity: Option<String>,
+    assistant_messages: usize,
+}
+
+/// The first and the last [`PREVIEW_PARTS`] preview parts, and their count.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PreviewParts {
+    first: Vec<String>,
+    last: VecDeque<String>,
+    count: usize,
+}
+
+impl PreviewParts {
+    fn push(&mut self, part: String) {
+        if self.first.len() < PREVIEW_PARTS {
+            self.first.push(part.clone());
+        }
+        if self.last.len() == PREVIEW_PARTS {
+            self.last.pop_front();
+        }
+        self.last.push_back(part);
+        self.count += 1;
+    }
+
+    /// Append `text` to the part at `index`, when the row shows that part.
+    fn append(&mut self, index: usize, text: &str) {
+        let append = |part: &mut String| {
+            part.push(' ');
+            part.push_str(text);
+        };
+        if let Some(part) = self.first.get_mut(index) {
+            append(part);
+        }
+        if let Some(from_last) = (self.count - index).checked_sub(1)
+            && from_last < self.last.len()
+        {
+            let at = self.last.len() - 1 - from_last;
+            append(&mut self.last[at]);
+        }
+    }
+}
+
+/// The markers of a `/clear`-only conversation among the user messages,
+/// folded message by message: every message a `/clear` command's caveat,
+/// command or output, and each of the three present.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ClearOnlyMarkers {
+    has_messages: bool,
+    has_substantive_message: bool,
+    caveat: bool,
+    command: bool,
+    stdout: bool,
+}
+
+impl ClearOnlyMarkers {
+    fn add(&mut self, message: &str) {
+        self.has_messages = true;
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let is_caveat = trimmed.starts_with(
+            "Caveat: The messages below were generated by the user while running local commands.",
+        );
+        let has_command_tag = trimmed.contains("<command-name>/clear</command-name>");
+        let has_stdout_tag = trimmed.contains("<local-command-stdout>");
+        self.caveat |= is_caveat;
+        self.command |= has_command_tag;
+        self.stdout |= has_stdout_tag;
+        if !(is_caveat || has_command_tag || has_stdout_tag) {
+            self.has_substantive_message = true;
+        }
+    }
+
+    fn is_clear_only(&self) -> bool {
+        self.has_messages
+            && !self.has_substantive_message
+            && self.caveat
+            && self.command
+            && self.stdout
+    }
+}
+
+/// True when `user_messages` hold only a `/clear` command's caveat, command
+/// and output.
+#[cfg(test)]
+pub(crate) fn is_clear_only(user_messages: &[String]) -> bool {
+    let mut markers = ClearOnlyMarkers::default();
+    for message in user_messages {
+        markers.add(message);
+    }
+    markers.is_clear_only()
+}
+
+/// A fold as a checkpoint stores it: everything but the reply ids it
+/// numbered. A fold resumed from it cannot continue a reply started before
+/// the checkpoint: a resumed read whose new records continue such a reply
+/// reads the transcript whole instead.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct FoldCheckpoint {
+    facts: RowFacts,
+    numbering: NumberingCheckpoint,
+    positions: Vec<(i64, i64)>,
+    /// The token total of every reply before the checkpoint, each reply's
+    /// last usage counted once.
+    closed_reply_tokens: u64,
+}
+
+impl FoldCheckpoint {
+    /// The message count at the checkpoint.
+    pub(crate) fn message_count(&self) -> usize {
+        self.numbering.count
+    }
+
+    /// The next position in each thread at the checkpoint, by thread number.
+    pub(crate) fn positions(&self) -> HashMap<i64, i64> {
+        self.positions.iter().copied().collect()
+    }
+
+    pub(crate) fn numbering(&self) -> &NumberingCheckpoint {
+        &self.numbering
+    }
+
+    /// This checkpoint with the transcript of each thread it numbers
+    /// renamed by `rename`; `None` when `rename` cannot rename one.
+    pub(crate) fn with_transcripts_renamed(
+        mut self,
+        rename: crate::history::resumed::TranscriptRename<'_>,
+    ) -> Option<Self> {
+        for (thread, _) in &mut self.numbering.threads {
+            if let Some(transcript) = &mut thread.transcript {
+                *transcript = rename(transcript)?;
+            }
+        }
+        Some(self)
+    }
+}
+
+/// The thread and message number the fold gave an entry.
+#[derive(Clone, Copy)]
+pub(crate) struct Folded {
+    pub(crate) thread: i64,
+    pub(crate) numbered: Option<crate::agent::message_numbering::Numbered>,
+}
+
+/// The facts a fold leaves for the list's row.
+pub(crate) struct FoldedRow {
+    pub(crate) preview_first: String,
+    pub(crate) preview_last: String,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) summary: Option<String>,
+    pub(crate) custom_title: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) total_tokens: u64,
+    pub(crate) duration_minutes: Option<u64>,
+    pub(crate) message_count: usize,
+    pub(crate) assistant_messages: usize,
+    /// The latest activity time of the session's own entries.
+    pub(crate) latest_activity: Option<DateTime<FixedOffset>>,
+    /// The last activity time, in the order the view walks the entries.
+    pub(crate) last_activity: Option<DateTime<FixedOffset>>,
+}
+
+/// The reason a fold doesn't list a row.
+pub(crate) enum Unlisted {
+    ClearOnly,
+    Empty {
+        has_search_text: bool,
+        previews: usize,
+    },
+}
+
+impl RowFold {
+    /// The fold `checkpoint` stored.
+    pub(crate) fn resumed(checkpoint: &FoldCheckpoint) -> Self {
+        Self {
+            facts: checkpoint.facts.clone(),
+            numbering: MessageNumbering::resumed(&checkpoint.numbering),
+            positions: checkpoint.positions.iter().copied().collect(),
+            message_times: MessageTimesBuilder::default(),
+            reply_previews: HashMap::new(),
+            keyed_tokens: HashMap::new(),
+            closed_reply_tokens: checkpoint.closed_reply_tokens,
+        }
+    }
+
+    /// The fold as a checkpoint stores it.
+    pub(crate) fn checkpoint(&self) -> FoldCheckpoint {
+        let mut positions: Vec<(i64, i64)> = self.positions.iter().map(|(&t, &p)| (t, p)).collect();
+        positions.sort_unstable();
+        FoldCheckpoint {
+            facts: self.facts.clone(),
+            numbering: self.numbering.checkpoint(),
+            positions,
+            closed_reply_tokens: self.reply_tokens(),
+        }
+    }
+
+    /// The token total of the replies folded so far.
+    fn reply_tokens(&self) -> u64 {
+        self.closed_reply_tokens + self.keyed_tokens.values().sum::<u64>()
+    }
+
+    /// Place a parent entry in `identity`'s thread and number it.
+    pub(crate) fn place_parent(&mut self, entry: &LogEntry, identity: ThreadIdentity) -> Folded {
+        self.record_activity(entry);
+        let thread = self.place(identity);
+        let numbered = self.numbering.number_in_thread(entry, thread);
+        if let Some(numbered) = numbered {
+            self.message_times.add(numbered.ordinal, entry.timestamp());
+        }
+        Folded { thread, numbered }
+    }
+
+    /// Place a spliced sub-agent turn of `identity`'s thread, written at
+    /// `timestamp`, numbering it when it `is_message`.
+    pub(crate) fn place_child(
+        &mut self,
+        identity: ThreadIdentity,
+        is_message: bool,
+        reply_id: Option<&str>,
+        timestamp: &str,
+    ) -> Option<usize> {
+        let thread = self.place(identity);
+        is_message.then(|| {
+            let numbered = self.numbering.number_subagent_message(reply_id, thread);
+            self.message_times.add(numbered.ordinal, Some(timestamp));
+            numbered.ordinal
+        })
+    }
+
+    /// Number a parent's sub-agent progress record, written at `timestamp`.
+    pub(crate) fn number_progress(
+        &mut self,
+        role: crate::agent::transcript::AgentMessageRole,
+        blocks: &[crate::log_entry::ContentBlock],
+        reply_id: Option<&str>,
+        thread: i64,
+        timestamp: Option<&str>,
+    ) -> Option<crate::agent::message_numbering::Numbered> {
+        let numbered = self
+            .numbering
+            .number_progress_in_thread(role, blocks, reply_id, thread);
+        if let Some(numbered) = numbered {
+            self.message_times.add(numbered.ordinal, timestamp);
+            if numbered.starts_message
+                && role == crate::agent::transcript::AgentMessageRole::Assistant
+            {
+                self.facts.assistant_messages += 1;
+            }
+        }
+        numbered
+    }
+
+    fn place(&mut self, identity: ThreadIdentity) -> i64 {
+        let thread = self.numbering.thread(identity);
+        *self.positions.entry(thread).or_default() += 1;
+        thread
+    }
+
+    fn record_activity(&mut self, entry: &LogEntry) {
+        let Some(text) = entry.activity_timestamp() else {
+            return;
+        };
+        let Some(time) = parse_time(text) else {
+            return;
+        };
+        if self.facts.first_activity.is_none() {
+            self.facts.first_activity = Some(text.to_owned());
+        }
+        self.facts.last_activity = Some(text.to_owned());
+        let is_later = self
+            .facts
+            .latest_activity
+            .as_deref()
+            .and_then(parse_time)
+            .is_none_or(|latest| time > latest);
+        if is_later {
+            self.facts.latest_activity = Some(text.to_owned());
+        }
+    }
+
+    pub(crate) fn add_anonymous_usage(&mut self, usage: &TokenUsage) {
+        self.facts.anonymous_tokens += usage_total(usage);
+    }
+
+    /// Count `usage`, a reply's: the last usage of each reply id counts once.
+    pub(crate) fn add_reply_usage(&mut self, thread: i64, id: Option<&str>, usage: &TokenUsage) {
+        match id {
+            Some(id) => {
+                self.keyed_tokens
+                    .insert((thread, id.to_owned()), usage_total(usage));
+            }
+            None => self.add_anonymous_usage(usage),
+        }
+    }
+
+    pub(crate) fn add_cwd(&mut self, cwd: &str) {
+        if self.facts.cwd.is_none() {
+            self.facts.cwd = Some(PathBuf::from(cwd));
+        }
+    }
+
+    pub(crate) fn add_first_model(&mut self, model: &str) {
+        if self.facts.model.is_none() {
+            self.facts.model = Some(model.to_owned());
+        }
+    }
+
+    pub(crate) fn set_model(&mut self, model: &str) {
+        self.facts.model = Some(model.to_owned());
+    }
+
+    pub(crate) fn add_user_message(&mut self, message: &str) {
+        self.facts.clear_only.add(message);
+    }
+
+    pub(crate) fn note_search_text(&mut self, parts: &[String]) {
+        self.facts.has_search_text |= parts.iter().any(|part| !part.is_empty());
+    }
+
+    pub(crate) fn add_user_preview(&mut self, preview: String) {
+        self.facts.preview.push(preview);
+        self.facts.has_user_preview = true;
+    }
+
+    pub(crate) fn add_assistant_message(&mut self) {
+        self.facts.assistant_messages += 1;
+    }
+
+    /// Add one record's `text` of the reply at `ordinal` to the preview,
+    /// once a user message opened it: `reply` for a record carrying a reply
+    /// id, whose later records append to its part.
+    pub(crate) fn add_reply_preview(&mut self, ordinal: usize, text: String, reply: bool) {
+        if !self.facts.has_user_preview {
+            return;
+        }
+        if !reply {
+            self.facts.preview.push(text);
+            return;
+        }
+        match self.reply_previews.get(&ordinal).copied() {
+            Some(index) => self.facts.preview.append(index, &text),
+            None => {
+                self.reply_previews
+                    .insert(ordinal, self.facts.preview.count);
+                self.facts.preview.push(text);
+            }
+        }
+    }
+
+    pub(crate) fn add_summary(&mut self, summary: &str) {
+        if self.facts.summary.is_none() {
+            self.facts.summary = Some(summary.to_owned());
+        }
+    }
+
+    /// Sets the summary to `ai_title`, an AI title entry's text, unless it is
+    /// blank. It replaces the leading summary and every summary entry's.
+    pub(crate) fn set_summary(&mut self, ai_title: &str) {
+        let trimmed = ai_title.trim();
+        if !trimmed.is_empty() {
+            self.facts.summary = Some(trimmed.to_owned());
+            self.facts.is_summary_ai_title = true;
+        }
+    }
+
+    /// Set the title a custom title entry names.
+    pub(crate) fn set_title(&mut self, title: &str) {
+        self.facts.entry_title = Some(shown_title(title));
+    }
+
+    /// Sets the leading title from `entry` when it is a custom title, and the
+    /// leading summary when it is an AI title. A later custom title replaces
+    /// the leading title, and a later AI title the leading summary.
+    pub(crate) fn add_leading_title(&mut self, entry: &crate::log_entry::LogEntry) {
+        use crate::log_entry::LogEntry;
+        match entry {
+            LogEntry::CustomTitle { custom_title } => {
+                self.facts.leading_title = shown_title(custom_title);
+            }
+            LogEntry::AiTitle { ai_title } => {
+                if let Some(summary) = shown_title(ai_title) {
+                    self.facts.leading_summary = Some(summary);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Replaces the leading title and summary with those `titles` set, the
+    /// title entries [`super::parser::take_leading_titles`] returns.
+    pub(crate) fn replace_leading_titles(&mut self, titles: &[crate::log_entry::LogEntry]) {
+        self.facts.leading_title = None;
+        self.facts.leading_summary = None;
+        for title in titles {
+            self.add_leading_title(title);
+        }
+    }
+
+    pub(crate) fn custom_title(&self) -> Option<&String> {
+        match &self.facts.entry_title {
+            Some(title) => title.as_ref(),
+            None => self.facts.leading_title.as_ref(),
+        }
+    }
+
+    /// The summary as the entries set it in order, the leading ones first.
+    pub(crate) fn summary(&self) -> Option<&String> {
+        if self.facts.is_summary_ai_title {
+            return self.facts.summary.as_ref();
+        }
+        self.facts
+            .leading_summary
+            .as_ref()
+            .or(self.facts.summary.as_ref())
+    }
+
+    /// The token total so far.
+    pub(crate) fn total_tokens(&self) -> u64 {
+        self.reply_tokens() + self.facts.anonymous_tokens
+    }
+
+    /// The row's facts, or the reason the session doesn't list a row.
+    pub(crate) fn finish(&self) -> Result<FoldedRow, Unlisted> {
+        if self.facts.clear_only.is_clear_only() {
+            return Err(Unlisted::ClearOnly);
+        }
+        if !self.facts.has_search_text || self.facts.preview.count == 0 {
+            return Err(Unlisted::Empty {
+                has_search_text: self.facts.has_search_text,
+                previews: self.facts.preview.count,
+            });
+        }
+        let preview = &self.facts.preview;
+        let preview_first = super::parser::normalize_whitespace(&preview.first.join(" ... "));
+        let preview_last = super::parser::normalize_whitespace(
+            &preview
+                .last
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ... "),
+        );
+        let first = self.facts.first_activity.as_deref().and_then(parse_time);
+        let last = self.facts.last_activity.as_deref().and_then(parse_time);
+        let duration_minutes = match (first, last) {
+            (Some(first), Some(last)) => {
+                let minutes = last.signed_duration_since(first).num_minutes();
+                (minutes > 0).then_some(minutes as u64)
+            }
+            _ => None,
+        };
+        Ok(FoldedRow {
+            preview_first,
+            preview_last,
+            cwd: self.facts.cwd.clone(),
+            summary: self.summary().cloned(),
+            custom_title: self.custom_title().cloned(),
+            model: self.facts.model.clone(),
+            total_tokens: self.total_tokens(),
+            duration_minutes,
+            message_count: self.numbering.count(),
+            assistant_messages: self.facts.assistant_messages,
+            latest_activity: self.facts.latest_activity.as_deref().and_then(parse_time),
+            last_activity: last,
+        })
+    }
+
+    /// The last activity time folded so far.
+    pub(crate) fn last_activity(&self) -> Option<DateTime<FixedOffset>> {
+        self.facts.last_activity.as_deref().and_then(parse_time)
+    }
+
+    /// The latest activity time folded so far.
+    pub(crate) fn latest_activity(&self) -> Option<DateTime<FixedOffset>> {
+        self.facts.latest_activity.as_deref().and_then(parse_time)
+    }
+
+    /// True when no message has been numbered.
+    pub(crate) fn has_no_messages(&self) -> bool {
+        self.numbering.count() == 0
+    }
+
+    /// Each message's time span: those numbered before the fold resumed
+    /// from `before`, the rest as the fold numbered them.
+    pub(crate) fn message_times(self, before: Option<(&MessageTimes, usize)>) -> MessageTimes {
+        let count = self.numbering.count();
+        match before {
+            None => self.message_times.finish(count),
+            Some((stored, resumed_at)) => self
+                .message_times
+                .finish_after(count, (1..=resumed_at).map(|ordinal| stored.span(ordinal))),
+        }
+    }
+}
+
+/// `title` trimmed; `None` for a blank one.
+fn shown_title(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn usage_total(usage: &TokenUsage) -> u64 {
+    usage.input_tokens
+        + usage.output_tokens
+        + usage.cache_creation_input_tokens
+        + usage.cache_read_input_tokens
+}
+
+fn parse_time(text: &str) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(text).ok()
+}

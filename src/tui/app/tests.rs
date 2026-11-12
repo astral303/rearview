@@ -1,5 +1,7 @@
 use super::semantic_test_helpers::*;
 use super::*;
+use crate::clock::TestClock;
+use crate::history::environment::test_support::{environment_on, test_environment};
 use crate::history::workspace::tests::workspace_at_home;
 use crate::history::{Conversation, LoadProgress, Source};
 use chrono::{Local, TimeZone};
@@ -20,7 +22,6 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         full_text: text.to_string(),
         agent_search_text: String::new(),
         thinking_and_tool_call_text: String::new(),
-        semantic_route_text: String::new(),
         semantic_turns: vec![text.to_string()],
         semantic_turn_ranges: vec![crate::agent::refs::MessageRange::single(1)],
         search_text_lower: search::normalize_for_search(text),
@@ -34,12 +35,18 @@ fn conversation(project: Option<&str>, project_dir: &str, uuid: &str, text: &str
         parse_errors: Vec::new(),
         summary: None,
         custom_title: None,
+        external_title: None,
         model: None,
         total_tokens: 0,
         duration_minutes: None,
         fingerprint: None,
         has_transient_read_error: false,
         is_missing_earlier_turns: false,
+        cached_session: None,
+        cache_address: None,
+        publication: crate::history::sqlite_cache::Publication::Unpublished {
+            discovered: Vec::new(),
+        },
     }
 }
 
@@ -62,12 +69,19 @@ fn mixed_sources_are_identified_and_pi_local_filter_uses_header_cwd() {
 }
 
 fn app(conversations: Vec<Conversation>, excluded: Vec<&str>) -> App {
-    App::new(
+    app_with_options(conversations, excluded, TuiSearchOptions::default())
+}
+
+/// The list of `conversations`, on a `clock` the test moves.
+fn app_on_clock(conversations: Vec<Conversation>, clock: Arc<TestClock>) -> App {
+    App::new_with_options(
         conversations,
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        excluded.into_iter().map(str::to_string).collect(),
+        Vec::new(),
+        TuiSearchOptions::default(),
+        environment_on(clock),
     )
 }
 
@@ -83,6 +97,7 @@ fn app_with_options(
         KeyBindings::default(),
         excluded.into_iter().map(str::to_string).collect(),
         search_options,
+        test_environment(Vec::new(), None),
     )
 }
 
@@ -308,7 +323,7 @@ fn stale_response_with_current_generation_but_old_mode_is_ignored() {
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.filtered.clear();
     app.selected = None;
 
@@ -317,6 +332,7 @@ fn stale_response_with_current_generation_but_old_mode_is_ignored() {
         generation: 7,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -382,7 +398,7 @@ fn stale_semantic_response_is_ignored_while_lexical_mode_is_active() {
     let (response_tx, response_rx) = mpsc::channel();
     app.semantic_search.worker_tx = Some(_request_tx);
     app.semantic_search.worker_rx = Some(response_rx);
-    app.search_generation = 3;
+    app.search_generation.advance_to(3);
     app.semantic_search.pending_generation = Some(3);
     drop(request_rx);
 
@@ -412,7 +428,7 @@ fn semantic_response_after_mode_toggle_is_ignored() {
     app.query = "needle".to_string();
     app.dispatch_search();
     drop(request_rx);
-    let semantic_generation = app.search_generation;
+    let semantic_generation = app.search_generation();
 
     app.toggle_list_search_mode();
     assert_eq!(app.list_search_mode(), ListSearchMode::Lexical);
@@ -456,7 +472,7 @@ fn current_generation_semantic_response_is_ignored_while_lexical_mode_is_active(
     app.semantic_search.worker_tx = Some(_request_tx);
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Lexical;
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.filtered = vec![0];
     app.selected = Some(0);
     drop(request_rx);
@@ -494,7 +510,7 @@ fn stale_semantic_response_with_old_generation_is_ignored() {
     app.semantic_search.worker_tx = Some(_request_tx);
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 3;
+    app.search_generation.advance_to(3);
     app.semantic_search.pending_generation = Some(3);
     app.filtered.clear();
     app.selected = None;
@@ -605,7 +621,7 @@ fn semantic_nonempty_query_dispatches_worker_request() {
 fn semantic_search_dispatches_lexical_fallback() {
     let (mut app, request_rx, _response_tx) =
         app_with_single_visible_conversation_and_semantic_worker();
-    let (search_tx, search_rx) = mpsc::channel();
+    let (search_tx, search_rx) = SearchCommands::observed();
     app.search_tx = search_tx;
     app.query = "needle".to_string();
 
@@ -665,12 +681,11 @@ fn load_progress_outlives_appended_batches_and_ends_with_loading() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        false,
-        None,
-        vec![],
+        ListScope::default(),
         TuiSearchOptions {
             default_mode: ListSearchMode::Lexical,
         },
+        test_environment(Vec::new(), None),
     );
     let codex = LoadProgress {
         source: Source::Codex,
@@ -702,12 +717,11 @@ fn finish_loading_dispatches_buffered_semantic_query() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        false,
-        None,
-        vec![],
+        ListScope::default(),
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        test_environment(Vec::new(), None),
     );
     app.append_conversations(vec![conversation(
         Some("Visible"),
@@ -737,12 +751,11 @@ fn semantic_dispatch_after_loading_keeps_snapshot_aligned() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        false,
-        None,
-        vec![],
+        ListScope::default(),
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        test_environment(Vec::new(), None),
     );
     app.append_conversations(vec![conversation(
         Some("Visible"),
@@ -803,7 +816,8 @@ fn semantic_search_worker_returns_lexical_fallback() {
             default_mode: ListSearchMode::Semantic,
         },
     );
-    let (tx, rx) = spawn_search_worker();
+    let worker = spawn_search_worker(Arc::new(TestClock::default()));
+    let (tx, rx) = (worker.commands, worker.results);
     tx.send(SearchCommand::UpdateData {
         conversations: app.conversations_snapshot.clone(),
         searchable: Arc::new(app.searchable.clone()),
@@ -821,6 +835,131 @@ fn semantic_search_worker_returns_lexical_fallback() {
     assert_eq!(response.filtered, vec![0]);
     assert_eq!(response.generation, 7);
     assert_eq!(response.mode, ListSearchMode::Semantic);
+}
+
+/// A semantic query of quoted phrases alone: the search worker answers it
+/// as exact matches, newest first within the list's filters, and the
+/// semantic worker doesn't get a search.
+#[test]
+fn quoted_only_semantic_query_shows_search_workers_exact_matches_newest_first() {
+    let row = |project, uuid, text, day| {
+        let mut row = conversation(Some(project), &format!("-tmp-{project}"), uuid, text);
+        row.timestamp = Local.with_ymd_and_hms(2026, 5, day, 12, 0, 0).unwrap();
+        row
+    };
+    let mut app = app_with_options(
+        vec![
+            row(
+                "old",
+                "11111111-1111-4111-8111-111111111111",
+                "a title sentinel",
+                1,
+            ),
+            row(
+                "new",
+                "22222222-2222-4222-8222-222222222222",
+                "a title sentinel",
+                2,
+            ),
+            row(
+                "hidden",
+                "33333333-3333-4333-8333-333333333333",
+                "a title sentinel",
+                3,
+            ),
+            row(
+                "other",
+                "44444444-4444-4444-8444-444444444444",
+                "unrelated",
+                4,
+            ),
+        ],
+        vec!["hidden"],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    let (request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
+    drop(request_tx);
+
+    app.query = "\"title sentinel\"".to_string();
+    app.dispatch_search();
+    app.settle_search_for_test();
+
+    assert_eq!(
+        app.filtered,
+        vec![1, 0],
+        "the list shows the hits in scope, newest first"
+    );
+    for index in [0, 1] {
+        let explanation = &app.semantic_result_metadata(index).unwrap().explanation;
+        assert_eq!(
+            (
+                explanation.quality_label,
+                explanation.evidence_preview.as_str()
+            ),
+            ("exact", "a title sentinel"),
+            "each hit is an exact match showing its phrase"
+        );
+    }
+    assert!(
+        app.semantic_result_metadata(2).is_none(),
+        "the hit the list's filters hide doesn't get a preview"
+    );
+    assert!(
+        last_semantic_search(&drain_semantic_commands(&request_rx)).is_none(),
+        "the semantic worker doesn't get a search"
+    );
+    assert!(!app.has_search_work_in_flight());
+}
+
+/// A quoted-only semantic hit previews the first range of its lexical
+/// evidence, with context on each side, when the row's preview doesn't
+/// contain its phrase.
+#[test]
+fn quoted_only_semantic_hit_previews_its_first_evidence_range() {
+    let mut row = conversation(
+        Some("body"),
+        "-tmp-body",
+        "11111111-1111-4111-8111-111111111111",
+        "unrelated preview",
+    );
+    row.full_text = format!(
+        "{} the title sentinel {} the title sentinel again",
+        "opening ".repeat(20),
+        "middle ".repeat(20)
+    );
+    row.search_text_lower = search::normalize_for_search(&row.full_text);
+    let mut app = app_with_options(
+        vec![row],
+        vec![],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    connect_semantic_search_channels(&mut app);
+
+    app.query = "\"title sentinel\"".to_string();
+    app.dispatch_search();
+    app.settle_search_for_test();
+
+    let evidence = app.lexical_evidence(0).expect("the hit has evidence");
+    let texts = evidence.texts(&app.conversations()[0]);
+    let &(start, end) = evidence.context_ranges.first().unwrap();
+    let first_range = texts.slice(start..end).into_owned();
+    let preview = &app
+        .semantic_result_metadata(0)
+        .unwrap()
+        .explanation
+        .evidence_preview;
+    assert!(
+        first_range.contains("title sentinel") && preview.contains(first_range.as_str()),
+        "the preview shows the evidence's first range: {preview:?}"
+    );
+    assert!(
+        preview.starts_with('…') && preview.ends_with('…'),
+        "the preview cuts the text on each side: {preview:?}"
+    );
 }
 
 #[test]
@@ -847,7 +986,7 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
     );
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.semantic_search.pending_generation = Some(7);
     app.semantic_search.results = HashMap::from([(1, test_semantic_metadata(1, "old"))]);
     app.filtered = vec![1];
@@ -857,6 +996,7 @@ fn semantic_search_applies_lexical_fallback_while_pending() {
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -876,7 +1016,7 @@ fn empty_lexical_fallback_doesnt_clear_rows_while_semantic_search_is_pending() {
     )]);
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.semantic_search.pending_generation = Some(7);
     app.semantic_search.results = HashMap::from([(0, test_semantic_metadata(0, "old"))]);
     app.filtered = vec![0];
@@ -886,6 +1026,7 @@ fn empty_lexical_fallback_doesnt_clear_rows_while_semantic_search_is_pending() {
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -905,7 +1046,7 @@ fn semantic_search_ignores_lexical_fallback_after_completion() {
     )]);
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.semantic_search.pending_generation = None;
     app.filtered = vec![0];
     app.selected = Some(0);
@@ -914,6 +1055,7 @@ fn semantic_search_ignores_lexical_fallback_after_completion() {
         generation: 7,
         mode: ListSearchMode::Semantic,
         evidence: HashMap::new(),
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -1008,6 +1150,7 @@ fn semantic_request_after_refresh_uses_refreshed_conversations() {
                 "needle",
             ),
             replaces_listed_row: false,
+            next: crate::history::NextStep::Settled,
         }],
         ..Default::default()
     });
@@ -1126,8 +1269,8 @@ fn semantic_response_applies_ranked_indices_and_metadata() {
     app.semantic_search.worker_tx = Some(_request_tx);
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 7;
-    app.search_started_at = Some(std::time::Instant::now());
+    app.search_generation.advance_to(7);
+    app.search_started_at = Some(app.clock().now());
     app.semantic_search.pending_generation = Some(7);
     app.filtered.clear();
     app.selected = None;
@@ -1188,8 +1331,8 @@ fn semantic_search_in_flight() -> (
     app.semantic_search.worker_tx = Some(request_tx);
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 7;
-    app.search_started_at = Some(std::time::Instant::now());
+    app.search_generation.advance_to(7);
+    app.search_started_at = Some(app.clock().now());
     app.semantic_search.pending_generation = Some(7);
     app.filtered.clear();
     app.selected = None;
@@ -1204,6 +1347,7 @@ fn send_semantic_fallback(fallback_tx: &mpsc::Sender<SearchResponse>, filtered: 
             generation: 7,
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
+            is_exact_literal: false,
         })
         .unwrap();
 }
@@ -1231,19 +1375,22 @@ fn semantic_fallback_keeps_spinner_until_semantic_result_arrives() {
 
 #[test]
 fn new_keystroke_restarts_elapsed_seconds() {
-    let mut app = app(
+    let clock = Arc::new(TestClock::default());
+    let mut app = app_on_clock(
         vec![conversation(Some("project"), "-tmp-project", "id", "m1")],
-        vec![],
+        clock.clone(),
     );
-    app.search_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+    app.search_started_at = Some(clock.now());
+    clock.advance(Duration::from_secs(5));
 
     app.set_query_for_test("m1");
     app.dispatch_search();
 
-    let restarted = app
-        .search_started_at
-        .expect("a dispatched search records its start");
-    assert!(restarted.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(
+        app.search_started_at,
+        Some(clock.now()),
+        "a dispatched search records its start"
+    );
 }
 
 #[test]
@@ -1257,12 +1404,11 @@ fn rows_answer_previous_query_until_new_results_land() {
         )],
         vec![],
     );
-    let (search_tx, _search_rx) = mpsc::channel();
+    let (search_tx, _search_rx) = SearchCommands::observed();
     let (response_tx, response_rx) = mpsc::channel();
     app.search_tx = search_tx;
     app.search_rx = response_rx;
-    app.query = "needle".to_string();
-    app.update_filter();
+    app.set_query_for_test("needle");
     assert_eq!(app.shown_results_query(), "needle");
 
     app.query = "needle x".to_string();
@@ -1275,6 +1421,7 @@ fn rows_answer_previous_query_until_new_results_land() {
             generation: app.search_generation(),
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
+            is_exact_literal: false,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -1285,7 +1432,7 @@ fn rows_answer_previous_query_until_new_results_land() {
 /// channels under the test's control.
 fn lexical_app_showing_needle() -> (
     App,
-    mpsc::Receiver<SearchCommand>,
+    search_worker::ObservedCommands,
     mpsc::Sender<SearchResponse>,
 ) {
     let mut app = app(
@@ -1297,7 +1444,7 @@ fn lexical_app_showing_needle() -> (
         )],
         vec![],
     );
-    let (search_tx, search_rx) = mpsc::channel();
+    let (search_tx, search_rx) = SearchCommands::observed();
     let (response_tx, response_rx) = mpsc::channel();
     app.search_tx = search_tx;
     app.search_rx = response_rx;
@@ -1312,6 +1459,7 @@ fn lexical_app_showing_needle() -> (
             generation: app.search_generation(),
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
+            is_exact_literal: false,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -1343,6 +1491,7 @@ fn backspacing_to_shown_results_query_abandons_search_and_keeps_rows() {
             generation: abandoned,
             mode: ListSearchMode::Lexical,
             evidence: HashMap::new(),
+            is_exact_literal: false,
         })
         .unwrap();
     assert!(!app.receive_search_results());
@@ -1366,7 +1515,7 @@ fn backspacing_to_shown_results_query_abandons_semantic_search_too() {
         ),
     ]);
     let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
-    let (search_tx, _search_rx) = mpsc::channel();
+    let (search_tx, _search_rx) = SearchCommands::observed();
     let (fallback_tx, fallback_rx) = mpsc::channel();
     app.search_tx = search_tx;
     app.search_rx = fallback_rx;
@@ -1400,6 +1549,7 @@ fn backspacing_to_shown_results_query_abandons_semantic_search_too() {
             generation: abandoned,
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
+            is_exact_literal: false,
         })
         .unwrap();
     send_semantic_complete_response(
@@ -1432,7 +1582,7 @@ fn backspacing_to_semantic_placeholder_doesnt_abandon_search() {
         ),
     ]);
     let (_request_tx, request_rx, _response_tx) = connect_semantic_search_channels(&mut app);
-    let (search_tx, _search_rx) = mpsc::channel();
+    let (search_tx, _search_rx) = SearchCommands::observed();
     let (fallback_tx, fallback_rx) = mpsc::channel();
     app.search_tx = search_tx;
     app.search_rx = fallback_rx;
@@ -1444,6 +1594,7 @@ fn backspacing_to_semantic_placeholder_doesnt_abandon_search() {
             generation: app.search_generation(),
             mode: ListSearchMode::Semantic,
             evidence: HashMap::new(),
+            is_exact_literal: false,
         })
         .unwrap();
     assert!(app.receive_search_results());
@@ -1468,7 +1619,7 @@ fn backspacing_to_semantic_placeholder_doesnt_abandon_search() {
 
 /// A lexical app whose search commands land on the returned receiver, with
 /// `needle` already dispatched and its command drained.
-fn lexical_app_with_needle_dispatched() -> (App, mpsc::Receiver<SearchCommand>) {
+fn lexical_app_with_needle_dispatched() -> (App, search_worker::ObservedCommands) {
     let mut app = app(
         vec![conversation(
             Some("project"),
@@ -1478,7 +1629,7 @@ fn lexical_app_with_needle_dispatched() -> (App, mpsc::Receiver<SearchCommand>) 
         )],
         vec![],
     );
-    let (search_tx, search_rx) = mpsc::channel();
+    let (search_tx, search_rx) = SearchCommands::observed();
     app.search_tx = search_tx;
     app.set_query_for_test("needle");
     app.dispatch_search();
@@ -1514,7 +1665,7 @@ fn same_query_dispatches_again_after_results_are_invalidated() {
 fn mode_toggle_dispatches_same_query_again() {
     let (mut app, request_rx, _response_tx) =
         app_with_single_visible_conversation_and_semantic_worker();
-    let (search_tx, search_rx) = mpsc::channel();
+    let (search_tx, search_rx) = SearchCommands::observed();
     app.search_tx = search_tx;
     app.set_query_for_test("needle");
     app.dispatch_search();
@@ -1609,7 +1760,7 @@ fn semantic_progress_messages_update_activity_status_text() {
     )]);
     let (_request_tx, request_rx, response_tx) = connect_semantic_search_channels(&mut app);
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.semantic_search.pending_generation = Some(7);
     drop(request_rx);
 
@@ -1646,7 +1797,7 @@ fn clearing_query_preserves_in_flight_prewarm_preparing_status() {
         },
     );
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 10;
+    app.search_generation.advance_to(10);
     app.semantic_search.pending_generation = Some(10);
     app.semantic_search.prewarm_generation = Some(9);
     app.semantic_search.prewarm_status = Some(SemanticProgress::InitializingModel);
@@ -1676,7 +1827,7 @@ fn clearing_query_preserves_in_flight_prewarm_progress() {
         },
     );
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 10;
+    app.search_generation.advance_to(10);
     app.semantic_search.pending_generation = Some(10);
     app.semantic_search.prewarm_generation = Some(9);
     app.semantic_search.prewarm_status = Some(SemanticProgress::Embedding {
@@ -1783,7 +1934,7 @@ fn prewarm_generation_keeps_search_polling_until_completion() {
         },
     );
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 10;
+    app.search_generation.advance_to(10);
     app.semantic_search.prewarm_generation = Some(9);
     app.semantic_search.prewarm_status = Some(SemanticProgress::Embedding {
         completed: 10,
@@ -1791,6 +1942,58 @@ fn prewarm_generation_keeps_search_polling_until_completion() {
     });
 
     assert!(app.has_search_work_in_flight());
+}
+
+/// An app in semantic mode searching for "needle", and the cancellation of
+/// the semantic worker's active request.
+fn app_with_active_semantic_request() -> (App, crate::semantic::types::SemanticCancellationToken) {
+    let mut app = app_with_options(
+        vec![conversation(
+            Some("Visible"),
+            "-tmp-visible",
+            "22222222-2222-4222-8222-222222222222",
+            "needle",
+        )],
+        vec![],
+        TuiSearchOptions {
+            default_mode: ListSearchMode::Semantic,
+        },
+    );
+    let (request_tx, _request_rx) = mpsc::channel();
+    let (_response_tx, response_rx) = mpsc::channel();
+    app.semantic_search.worker_tx = Some(request_tx);
+    app.semantic_search.worker_rx = Some(response_rx);
+    app.list_search_mode = ListSearchMode::Semantic;
+    app.query = "needle".to_string();
+    let cancellation = crate::semantic::types::SemanticCancellationToken::new();
+    let active_request = cancellation.child();
+    app.semantic_search.cancellation = Some(cancellation);
+    (app, active_request)
+}
+
+#[test]
+fn switching_to_lexical_mode_cancels_the_active_semantic_request() {
+    let (mut app, active_request) = app_with_active_semantic_request();
+
+    app.toggle_list_search_mode();
+
+    assert_eq!(app.list_search_mode, ListSearchMode::Lexical);
+    assert!(
+        active_request.is_cancelled(),
+        "the semantic request is cancelled"
+    );
+}
+
+#[test]
+fn leaving_the_tui_cancels_the_active_semantic_request() {
+    let (app, active_request) = app_with_active_semantic_request();
+
+    app.into_conversations();
+
+    assert!(
+        active_request.is_cancelled(),
+        "the semantic request is cancelled"
+    );
 }
 
 #[test]
@@ -1812,7 +2015,7 @@ fn semantic_query_interrupts_prewarm_and_keeps_activity_until_query_starts() {
     app.semantic_search.worker_tx = Some(request_tx);
     app.semantic_search.worker_rx = Some(response_rx);
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 9;
+    app.search_generation.advance_to(9);
     app.semantic_search.prewarm_generation = Some(9);
     app.semantic_search.prewarm_status = Some(SemanticProgress::Embedding {
         completed: 3,
@@ -1861,7 +2064,7 @@ fn semantic_empty_corpus_status_is_visible_after_completion() {
     )]);
     let (_request_tx, request_rx, response_tx) = connect_semantic_search_channels(&mut app);
     app.list_search_mode = ListSearchMode::Semantic;
-    app.search_generation = 7;
+    app.search_generation.advance_to(7);
     app.semantic_search.pending_generation = Some(7);
     drop(request_rx);
 
@@ -1945,6 +2148,7 @@ fn configured_ctrl_t_binding_takes_precedence_over_semantic_toggle() {
         TuiSearchOptions {
             default_mode: ListSearchMode::Semantic,
         },
+        test_environment(Vec::new(), None),
     );
 
     app.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL, 10);
@@ -2016,8 +2220,8 @@ fn uuid_dispatch_invalidates_stale_search_response() {
 
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
-    app.search_generation = 1;
-    app.search_started_at = Some(std::time::Instant::now());
+    app.search_generation.advance_to(1);
+    app.search_started_at = Some(app.clock().now());
 
     app.query = uuid.to_string();
     app.dispatch_search();
@@ -2028,6 +2232,7 @@ fn uuid_dispatch_invalidates_stale_search_response() {
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -2041,16 +2246,15 @@ fn finish_loading_invalidates_stale_loading_search_response() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        false,
-        None,
-        vec![],
+        ListScope::default(),
         TuiSearchOptions::default(),
+        test_environment(Vec::new(), None),
     );
 
     let (tx, rx) = mpsc::channel();
     app.search_rx = rx;
-    app.search_generation = 1;
-    app.search_started_at = Some(std::time::Instant::now());
+    app.search_generation.advance_to(1);
+    app.search_started_at = Some(app.clock().now());
 
     app.append_conversations(vec![conversation(
         Some("Visible"),
@@ -2066,6 +2270,7 @@ fn finish_loading_invalidates_stale_loading_search_response() {
         generation: 1,
         mode: ListSearchMode::Lexical,
         evidence: HashMap::new(),
+        is_exact_literal: false,
     })
     .unwrap();
 
@@ -2079,10 +2284,12 @@ fn workspace_filter_without_project_context_keeps_rows() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        true,
-        None,
-        vec![],
+        ListScope {
+            workspace_filter: true,
+            ..ListScope::default()
+        },
         TuiSearchOptions::default(),
+        test_environment(Vec::new(), None),
     );
 
     app.append_conversations(vec![conversation(
@@ -2101,10 +2308,12 @@ fn exclude_projects_filters_incremental_loading() {
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
-        false,
-        None,
-        vec!["Hidden".to_string()],
+        ListScope {
+            exclude_projects: vec!["Hidden".to_string()],
+            ..ListScope::default()
+        },
         TuiSearchOptions::default(),
+        test_environment(Vec::new(), None),
     );
 
     app.append_conversations(vec![
@@ -2165,12 +2374,16 @@ fn project_without_name_is_never_excluded() {
 
 #[test]
 fn single_file_mode_has_no_project_exclusions() {
+    let path = PathBuf::from("/tmp/hidden.jsonl");
     let app = App::new_single_file(
-        PathBuf::from("/tmp/hidden.jsonl"),
-        Source::Claude,
+        DirectFile {
+            typed: path.clone(),
+            canonical: path,
+        },
         ToolDisplayMode::Truncated,
         false,
         KeyBindings::default(),
+        test_environment(Vec::new(), None),
     );
 
     let row = conversation(
@@ -2181,4 +2394,71 @@ fn single_file_mode_has_no_project_exclusions() {
     );
     assert!(!app.excluded_projects.excludes(&row));
     assert!(app.is_single_file_mode());
+}
+
+#[test]
+fn sessions_without_texts_text_counts_loading_then_unreadable() {
+    let shown = |loading, unreadable| {
+        describe_sessions_without_texts(SessionsWithoutTexts {
+            loading,
+            unreadable,
+        })
+    };
+
+    assert_eq!(shown(0, 0), "", "every session's texts are held");
+    assert_eq!(shown(37, 0), " · 37 sessions loading");
+    assert_eq!(shown(0, 1), " · 1 session unreadable");
+    assert_eq!(
+        shown(37, 1),
+        " · 37 sessions loading · 1 session unreadable",
+        "the unreadable count follows the loading text"
+    );
+    assert_eq!(shown(1, 2), " · 1 session loading · 2 sessions unreadable");
+}
+
+#[test]
+fn semantic_results_count_sessions_their_search_could_not_read() {
+    let mut app = app_with_semantic_mode(vec![conversation(
+        Some("Visible"),
+        "-tmp-visible",
+        "22222222-2222-4222-8222-222222222222",
+        "needle",
+    )]);
+    let (_request_tx, _request_rx, response_tx) = connect_semantic_search_channels(&mut app);
+    // The list's search counts as this test sets it, not as its worker does.
+    app.texts_held_rx = mpsc::channel().1;
+    app.texts_held.sessions_without_texts = SessionsWithoutTexts {
+        loading: 1,
+        unreadable: 5,
+    };
+    app.query = "needle".to_string();
+    app.dispatch_search();
+    let before_results = app.sessions_without_texts_text();
+    response_tx
+        .send(SemanticSearchMessage::Complete(
+            crate::tui::semantic_worker::SemanticSearchResponse {
+                generation: app.search_generation(),
+                filtered: vec![0],
+                metadata: HashMap::new(),
+                error: None,
+                progress: SemanticProgress::Complete,
+                prewarm: false,
+                without_turns: SessionsWithoutTexts {
+                    loading: 0,
+                    unreadable: 2,
+                },
+            },
+        ))
+        .unwrap();
+    app.receive_search_results();
+
+    assert_eq!(
+        before_results, " · 1 session loading · 5 sessions unreadable",
+        "before the semantic results, the list's search counts its own"
+    );
+    assert_eq!(
+        app.sessions_without_texts_text(),
+        " · 2 sessions unreadable",
+        "the semantic results show their own counts in place of the list's"
+    );
 }

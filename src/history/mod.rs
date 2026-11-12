@@ -8,12 +8,14 @@
 //! - `provider` - Each agent's storage, lookup and references
 //! - `format` - Each agent's transcript format
 
-#![deny(clippy::disallowed_methods)]
-
-pub mod cache;
+mod content;
 mod display_entries;
+pub(crate) mod environment;
 mod filter;
+pub mod fingerprint;
 pub mod format;
+pub mod listing;
+pub mod load_meter;
 mod loader;
 pub mod message_texts;
 pub mod message_times;
@@ -23,7 +25,13 @@ pub mod path;
 pub mod pi_loader;
 pub mod provider;
 mod refresh;
+pub(crate) mod resumed;
+pub(crate) mod row_fold;
+#[cfg(test)]
+mod semantic_route_tests;
+mod shard_files;
 pub(crate) mod skill_text;
+pub(crate) mod sqlite_cache;
 pub mod task_notification;
 #[cfg(test)]
 mod token_count_coverage;
@@ -31,17 +39,21 @@ pub(crate) mod workspace;
 
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Local};
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 // Re-export public API
+pub(crate) use content::SemanticContent;
 pub use display_entries::{
-    DisplayEntries, EntryOrigin, display_log_entries, sniffed_display_log_entries,
+    DisplayEntries, EntryOrigin, display_log_entries_interactively, printed_log_entries,
+    sniffed_display_log_entries, viewed_copy_interactively,
 };
+pub use environment::Environment;
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
 pub(crate) use loader::SeenPaths;
 pub use loader::{
     DeleteEmptyScope, EmptySession, LoadedHistory, delete_empty_sessions, load_all_conversations,
-    load_all_conversations_streaming, load_history, missing_earlier_turns_terms,
+    load_history, missing_earlier_turns_terms, stream_all_conversations,
 };
 pub use message_texts::{MESSAGE_SEPARATOR, MessageTextStarts};
 pub use message_times::{MessageTimes, MessagesInWindow};
@@ -49,12 +61,26 @@ pub(crate) use parser::{extract_skill_preview, is_clear_metadata_message};
 pub use path::{ExcludedProjects, format_short_name_from_path};
 pub use provider::{FoundSession, SkippedSessions};
 pub use refresh::{
-    KnownSessions, RefreshOptions, SessionChanges, UpdatedSession, refresh_in_background,
+    KnownSessions, RefreshOptions, RefreshOutcome, SessionChanges, UpdatedSession, refresh_sessions,
 };
+#[cfg(test)]
+pub(crate) use sqlite_cache::FOR_FIXTURES;
+#[cfg(test)]
+pub use sqlite_cache::ProcessIdentity;
+pub use sqlite_cache::{
+    Admitted, AwaitedRefresh, CacheBase, CachedRead, Cancellation, CurrentCopy, DrawingThread,
+    InteractiveCache, InteractiveRead, NextStep, OperationScope, OtherRearview, ParsePermit,
+    Patience, StaleCause, WaitStatus,
+};
+pub(crate) use sqlite_cache::{RoutesStored, SemanticRoute, store_semantic_routes};
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
 };
 pub use workspace::Workspace;
+
+/// The version of [`Conversation::semantic_route_text`]'s output. A route
+/// text the session cache stored under another version is computed again.
+pub(crate) const SEMANTIC_ROUTE_VERSION: i64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(test, derive(strum::EnumIter))]
@@ -89,7 +115,9 @@ impl Source {
 /// Only `source`'s own format reads the locator — a session the list already
 /// attributed to a provider never meets a foreign format, which is what lets a
 /// provider's locators be something other than openable files.
+#[cfg(test)]
 pub(crate) fn normalized_session(
+    permit: ParsePermit<'_>,
     source: Source,
     path: &std::path::Path,
     subagents: &[PathBuf],
@@ -97,14 +125,18 @@ pub(crate) fn normalized_session(
     source
         .provider()
         .format()
-        .session_entries(path, subagents)?
+        .session_entries(permit, path, subagents)?
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
-/// [`normalized_session`] for a bare file (`--render`, a direct path), read by
-/// the format of the agent its projection names.
-pub(crate) fn sniffed_session(path: &std::path::Path) -> Result<TranscriptEntries> {
-    format::sniffed_session_entries(path)?
+/// A bare file's normalised entries (`--render`, a direct path), read by the
+/// format of the agent its projection names.
+pub(crate) fn sniffed_session(
+    permit: ParsePermit<'_>,
+    path: &std::path::Path,
+    environment: &provider::RootEnvironment,
+) -> Result<TranscriptEntries> {
+    format::sniffed_session_entries(permit, path, environment)?
         .ok_or_else(|| AppError::UnrecognizedTranscript(path.display().to_string()))
 }
 
@@ -116,9 +148,12 @@ pub struct TranscriptEntries {
 }
 
 impl TranscriptEntries {
-    /// A format's projected entries. A projection records only a malformed
-    /// line's number.
-    fn of_projection(projection: format::SessionProjection) -> Self {
+    /// A format's projected entries, after [`parser::take_leading_titles`]
+    /// removes the leading title entries, so every view numbers the entries
+    /// as the session cache stores them. A projection records only a
+    /// malformed line's number.
+    fn of_projection_without_leading_titles(mut projection: format::SessionProjection) -> Self {
+        parser::take_leading_titles(&mut projection.entries);
         Self {
             entries: projection.entries,
             malformed_lines: projection
@@ -134,6 +169,7 @@ impl TranscriptEntries {
 }
 
 /// A transcript line that did not parse as an entry.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MalformedLine {
     pub(crate) line_number: usize,
     /// `None` for a format that records only the line's number.
@@ -142,6 +178,7 @@ pub(crate) struct MalformedLine {
 
 /// A malformed line as written, why it did not parse, and the lines around
 /// it.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MalformedLineDetail {
     pub(crate) line_content: String,
     pub(crate) error_message: String,
@@ -163,6 +200,17 @@ pub struct ParseError {
 
 #[derive(Clone)]
 pub struct Conversation {
+    /// The persisted content of a row restored from the cache, or parsed
+    /// and written with its entries. A parsed row whose write failed and a
+    /// synthetic conversation carry their content in the fields below.
+    pub cached_session: Option<sqlite_cache::CachedSession>,
+    /// The address of this row's session in the session cache. The viewer,
+    /// the printout and the agent commands read the session through it.
+    /// `None` for a row neither a load nor a targeted read listed, such as a
+    /// file opened outside every root.
+    pub cache_address: Option<sqlite_cache::SessionAddress>,
+    /// The row's publication of its copy at `cache_address`.
+    pub publication: sqlite_cache::Publication,
     pub source: Source,
     pub session_id: String,
     /// The sub-agent transcripts merged into this row, spliced into its
@@ -183,7 +231,6 @@ pub struct Conversation {
     /// [`tool_call_text`](crate::agent::transcript::tool_call_text), the
     /// session's and its sub-agents'. Only `agent search` reads it.
     pub thinking_and_tool_call_text: String,
-    pub semantic_route_text: String,
     pub semantic_turns: Vec<String>,
     pub semantic_turn_ranges: Vec<crate::agent::refs::MessageRange>,
     /// Pre-normalized lowercase search text (avoids re-normalizing on every startup)
@@ -208,6 +255,10 @@ pub struct Conversation {
     pub summary: Option<String>,
     /// Custom session title set by user via /rename (from type=custom-title JSONL entry)
     pub custom_title: Option<String>,
+    /// The title stored beside the transcript that the row shows in place
+    /// of its parsed `custom_title` and `summary`; `None` when it shows the
+    /// parsed ones.
+    pub external_title: Option<provider::SessionTitle>,
     /// Model name from assistant messages (e.g., "claude-opus-4-5-20251101")
     pub model: Option<String>,
     /// Total tokens used in the conversation (input + output + cache)
@@ -219,7 +270,7 @@ pub struct Conversation {
     /// reads the session again when discovery finds another fingerprint.
     /// `None` for a row read outside discovery, or from transcripts with no
     /// modified time.
-    pub fingerprint: Option<cache::CachedFingerprint>,
+    pub fingerprint: Option<fingerprint::CachedFingerprint>,
     /// True when a sub-agent transcript or an earlier transcript hit a
     /// transient error and the row was built without it. The row is not
     /// cached, and a refresh reads the session again until a read hits no
@@ -230,32 +281,65 @@ pub struct Conversation {
     pub is_missing_earlier_turns: bool,
 }
 
-pub(crate) fn semantic_route_text(full_text: &str, agent_search_text: &str) -> String {
-    const ROUTE_EVIDENCE_CHARS: usize = 1_000;
-    const ROUTE_EVIDENCE_SEGMENTS: usize = 4;
-    const ROUTE_KEYWORDS: usize = 100;
-    const ROUTE_KEYWORD_CHARS: usize = 800;
+impl Conversation {
+    /// The row's title, then its summary. Search reads them from the row,
+    /// ahead of the session's other texts, to match a name changed outside
+    /// the transcript.
+    pub(crate) fn title_and_summary_texts(&self) -> impl Iterator<Item = &str> {
+        [&self.custom_title, &self.summary]
+            .into_iter()
+            .filter_map(|text| text.as_deref())
+    }
 
-    let mut text = message_texts::without_message_separators(full_text).into_owned();
-    if !agent_search_text.is_empty() {
-        text.push(' ');
-        text.push_str(&message_texts::without_message_separators(
-            agent_search_text,
-        ));
+    /// [`Self::title_and_summary_texts`], then `full_text`, each after a
+    /// separator.
+    pub(crate) fn full_text_after_title_and_summary(&self) -> Cow<'_, str> {
+        let mut title_and_summary = self.title_and_summary_texts().peekable();
+        if title_and_summary.peek().is_none() {
+            return Cow::Borrowed(&self.full_text);
+        }
+        let mut text = String::new();
+        for piece in title_and_summary.chain([self.full_text.as_str()]) {
+            message_texts::push_separated(&mut text, piece);
+        }
+        Cow::Owned(text)
     }
-    if text.is_empty() {
-        return String::new();
+
+    /// The session's keywords and an excerpt of its text, from its title,
+    /// summary, `full_text` and `agent_search_text`, for the agent's semantic
+    /// route. The parse doesn't compute it: ranking the keywords takes
+    /// seconds on a large session. The session cache stores it per copy
+    /// (`semantic_routes`). Bump [`SEMANTIC_ROUTE_VERSION`] with any change
+    /// to its output.
+    pub(crate) fn semantic_route_text(&self) -> String {
+        const ROUTE_EVIDENCE_CHARS: usize = 1_000;
+        const ROUTE_EVIDENCE_SEGMENTS: usize = 4;
+        const ROUTE_KEYWORDS: usize = 100;
+        const ROUTE_KEYWORD_CHARS: usize = 800;
+
+        let mut text =
+            message_texts::without_message_separators(&self.full_text_after_title_and_summary())
+                .into_owned();
+        if !self.agent_search_text.is_empty() {
+            text.push(' ');
+            text.push_str(&message_texts::without_message_separators(
+                &self.agent_search_text,
+            ));
+        }
+        if text.is_empty() {
+            return String::new();
+        }
+        let keywords = semantic_route_keywords(&text, ROUTE_KEYWORDS)
+            .chars()
+            .take(ROUTE_KEYWORD_CHARS)
+            .collect::<String>();
+        let excerpt = evenly_spaced_excerpt(&text, ROUTE_EVIDENCE_CHARS, ROUTE_EVIDENCE_SEGMENTS);
+        [keywords, excerpt]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
-    let keywords = semantic_route_keywords(&text, ROUTE_KEYWORDS)
-        .chars()
-        .take(ROUTE_KEYWORD_CHARS)
-        .collect::<String>();
-    let excerpt = evenly_spaced_excerpt(&text, ROUTE_EVIDENCE_CHARS, ROUTE_EVIDENCE_SEGMENTS);
-    [keywords, excerpt]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn semantic_route_keywords(text: &str, limit: usize) -> String {
@@ -332,8 +416,24 @@ pub enum LoaderMessage {
     Ignored(FilterTerm),
     /// Sessions the load read without listing them, and the unreadable ones
     SkippedSessions(SkippedSessions),
+    /// The batches so far came from the cache as it was while another
+    /// rearview refreshed it; these are the changes the load read under its
+    /// own refresh ownership since, applied as a list refresh applies them
+    Changes(SessionChanges),
+    /// A failed write batch stopped the load's cache writes part way: the
+    /// rows it parsed rather than restored may be missing from the cache,
+    /// and these sessions it read from older copies or left unlisted
+    CacheWritesStopped(Vec<StaleSession>),
     /// Loading completed
     Done,
+}
+
+/// A session a load read from a copy older than its transcripts, or left
+/// unlisted because it is not in the session cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleSession {
+    pub source: Source,
+    pub path: PathBuf,
 }
 
 /// How far the loader is through one source: `done` of `total` transcripts

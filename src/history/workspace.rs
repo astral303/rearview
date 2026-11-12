@@ -2,9 +2,10 @@
 //! repository to the directory alone.
 
 use super::Conversation;
+use super::path::CanonicalDirectories;
 use super::provider::RootEnvironment;
-use crate::error::Result;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// The directories to scope sessions to: every checkout of the repository
 /// holding a directory, or outside a repository the directory alone.
@@ -13,9 +14,12 @@ pub struct Workspace {
     /// Spelled as the caller and git spell them: an agent that names a
     /// folder after the directory it ran in names it after this spelling.
     directories: Vec<PathBuf>,
-    /// The `directories` that exist, canonicalized, so a session that
-    /// recorded one through a symlink still matches.
+    /// The `directories` that exist, canonicalised. A session that recorded
+    /// one through a symlink matches its canonical path.
     canonical_directories: Vec<PathBuf>,
+    /// The memo `includes` canonicalises a session's recorded directory
+    /// through, shared with the environment the workspace was made in.
+    recorded_directories: Arc<CanonicalDirectories>,
     reach: Reach,
 }
 
@@ -38,31 +42,26 @@ impl Reach {
 }
 
 impl Workspace {
-    pub fn current() -> Result<Self> {
-        Ok(Self::at(std::env::current_dir()?))
-    }
-
-    pub fn at(directory: PathBuf) -> Self {
-        Self::in_environment(directory, &RootEnvironment::of_process())
-    }
-
     /// The workspace of `directory`, with the home directory `environment`
-    /// names. Reads the repository's checkouts once, from its `.git` files.
+    /// names, canonicalising directories through its directory memo. Reads
+    /// the repository's checkouts once, from its `.git` files.
     pub(crate) fn in_environment(directory: PathBuf, environment: &RootEnvironment) -> Self {
+        let memo = Arc::clone(environment.directories());
         match Repository::holding(&directory, environment.home()) {
-            Some(repository) => Self::of(repository.checkouts(), Reach::Inside),
-            None => Self::of(vec![directory], Reach::Itself),
+            Some(repository) => Self::of(repository.checkouts(), Reach::Inside, memo),
+            None => Self::of(vec![directory], Reach::Itself, memo),
         }
     }
 
-    fn of(directories: Vec<PathBuf>, reach: Reach) -> Self {
+    fn of(directories: Vec<PathBuf>, reach: Reach, memo: Arc<CanonicalDirectories>) -> Self {
         let canonical_directories = directories
             .iter()
-            .filter_map(|directory| directory.canonicalize().ok())
+            .filter_map(|directory| memo.canonical(directory))
             .collect();
         Self {
             directories,
             canonical_directories,
+            recorded_directories: memo,
             reach,
         }
     }
@@ -92,9 +91,10 @@ impl Workspace {
                 .any(|directory| self.reach.includes(directory, recorded))
         };
         is_included(recorded, &self.directories)
-            || recorded
-                .canonicalize()
-                .is_ok_and(|canonical| is_included(&canonical, &self.canonical_directories))
+            || self
+                .recorded_directories
+                .canonical(recorded)
+                .is_some_and(|canonical| is_included(&canonical, &self.canonical_directories))
     }
 }
 
@@ -545,6 +545,36 @@ pub(crate) mod tests {
                 deleted.display()
             );
         }
+    }
+
+    /// Most sessions sit outside the workspace, many in one directory: the
+    /// workspace canonicalises each recorded directory once.
+    #[test]
+    fn sessions_recorded_in_one_directory_canonicalise_it_once() {
+        use crate::history::provider::walk::test_support::CountingCanonicaliser;
+        let home = TestHome::new();
+        let repository = home.repository();
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let canonicaliser = Arc::new(CountingCanonicaliser::default());
+        let no_variable = |_: &str| -> Option<OsString> { None };
+        let environment = RootEnvironment::new(&no_variable, Some(home.path().to_path_buf()), None)
+            .with_canonicaliser(canonicaliser.clone());
+        let workspace = Workspace::in_environment(repository.clone(), &environment);
+
+        for transcript in ["first.jsonl", "second.jsonl", "third.jsonl"] {
+            assert!(!workspace.contains(&session(
+                Source::Codex,
+                &home.path().join(transcript),
+                Some(&elsewhere),
+            )));
+        }
+
+        assert_eq!(
+            canonicaliser.canonicalised(),
+            [repository, elsewhere],
+            "the workspace canonicalises its checkout and the recorded directory once each"
+        );
     }
 
     #[test]

@@ -91,7 +91,6 @@ impl SemanticConversationFixture {
     }
 
     pub fn build(self) -> Conversation {
-        let semantic_route_text = crate::history::semantic_route_text(&self.full_text, "");
         Conversation {
             source: crate::history::Source::Claude,
             subagents: Vec::new(),
@@ -110,7 +109,6 @@ impl SemanticConversationFixture {
             full_text: self.full_text,
             agent_search_text: String::new(),
             thinking_and_tool_call_text: String::new(),
-            semantic_route_text,
             semantic_turn_ranges: (1..=self.semantic_turns.len())
                 .map(MessageRange::single)
                 .collect(),
@@ -126,12 +124,18 @@ impl SemanticConversationFixture {
             parse_errors: Vec::new(),
             summary: self.summary,
             custom_title: self.custom_title,
+            external_title: None,
             model: None,
             total_tokens: 0,
             duration_minutes: None,
             fingerprint: None,
             has_transient_read_error: false,
             is_missing_earlier_turns: false,
+            cached_session: None,
+            cache_address: None,
+            publication: crate::history::sqlite_cache::Publication::Unpublished {
+                discovered: Vec::new(),
+            },
         }
     }
 }

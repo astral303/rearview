@@ -5,23 +5,26 @@ mod project_folder;
 pub(crate) use project_folder::convert_path_to_project_dir_name;
 use project_folder::{decode_project_dir_name_to_path, is_project_folder_of};
 
-use super::storage::UnreadableDirectory;
-use super::walk::SessionFiles;
+use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
-    Capability, Deleted, DiscoveredSessions, RefNamespaces, ResolvedSession, RootEnvironment,
-    SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch, SessionProvider,
-    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
-    SourceLabels, Stored, SubagentFinder, resolved_session_paths, walk,
+    Capability, Deleted, DiscoveredSessions, RecordedDirectory, RefNamespaces, ResolvedSession,
+    RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
+    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
+    SessionsDirLookup, SourceLabels, Stored, SubagentFinder, ThreadLinker, TranscriptReader,
+    resolved_session_paths, walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
+use crate::clock::Clock;
 use crate::debug;
 use crate::error::{AppError, Result};
 use crate::history::format::claude::{
     CLAUDE_TRANSCRIPT, SUBAGENT_FILE_PREFIX, SUBAGENTS_DIR, rename, session_id_of, session_row,
 };
 use crate::history::format::{self, SessionFormat};
-use crate::history::{Conversation, Source, Workspace};
+use crate::history::parser::ParsedSession;
+use crate::history::{ParsePermit, Source, Workspace};
+use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -101,8 +104,12 @@ impl SessionProvider for ClaudeProvider {
         Capability::Capable("CLAUDE_CODE_SESSION_ID")
     }
 
-    fn find_sessions_by_id(&self, session_id: &str) -> Result<Vec<PathBuf>> {
-        resolved_session_paths(self, session_id)
+    fn find_sessions_by_id(
+        &self,
+        environment: &RootEnvironment,
+        session_id: &str,
+    ) -> Result<Vec<PathBuf>> {
+        resolved_session_paths(self, &ClaudeStorage, environment, session_id)
     }
 
     fn session_id_in_locator(&self, locator: &Path) -> Option<String> {
@@ -111,7 +118,11 @@ impl SessionProvider for ClaudeProvider {
 
     /// Claude's references are filed under the project folder's name, not
     /// under the directory the session recorded.
-    fn ref_project(&self, path: &Path, _project_dir: Option<&Path>) -> Option<String> {
+    fn ref_project(
+        &self,
+        path: &Path,
+        _project_dir: Option<RecordedDirectory<'_>>,
+    ) -> Option<String> {
         project_folder_name(path).map(str::to_owned)
     }
 
@@ -155,7 +166,13 @@ impl SessionProvider for ClaudeProvider {
 }
 
 impl SessionRenamer for ClaudeProvider {
-    fn rename_session(&self, path: &Path, title: &str) -> Result<()> {
+    fn rename_session(
+        &self,
+        _permit: ParsePermit<'_>,
+        path: &Path,
+        title: &str,
+        _renamed_at: DateTime<Utc>,
+    ) -> Result<()> {
         rename::append_session_rename(path, title)
     }
 }
@@ -164,14 +181,14 @@ impl SessionDeleter for ClaudeProvider {
     /// Claude deletes by session id rather than by path: the same transcript can
     /// exist under several project directories, and all of its copies go, each
     /// with the session directory holding its sub-agent transcripts.
-    fn delete_session(&self, path: &Path) -> Result<Deleted> {
-        delete_session_under(&projects_root()?.path, path)
+    fn delete_session(&self, permit: ParsePermit<'_>, path: &Path) -> Result<Deleted> {
+        delete_session_under(permit, &projects_root()?.path, path)
     }
 }
 
 impl SubagentFinder for ClaudeProvider {
     fn subagent_transcripts(&self, locator: &Path) -> Result<Vec<PathBuf>> {
-        read_subagent_transcripts(locator)
+        read_subagent_transcripts(&SystemLister, locator)
     }
 }
 
@@ -184,11 +201,12 @@ impl SessionIdResolver for ClaudeProvider {
 
     /// The file name is the lookup: Claude names each transcript by its
     /// session id.
-    fn resolve_session_id(&self, session_id: &str) -> Result<Option<ResolvedSession>> {
-        if !self.is_session_id_shape(session_id) {
-            return Ok(None);
-        }
-        resolved_session_under(&projects_root()?, session_id)
+    fn resolve_session_id_in(
+        &self,
+        root: &SessionRoot,
+        session_id: &str,
+    ) -> Result<Option<ResolvedSession>> {
+        resolved_session_under(root, session_id)
     }
 }
 
@@ -202,8 +220,7 @@ impl SessionStorage for ClaudeStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "claude",
-            magic: *b"CLHIST02",
-            schema_version: 18,
+            schema_version: 19,
         }
     }
 
@@ -219,30 +236,51 @@ impl SessionStorage for ClaudeStorage {
     /// An `agent-*.jsonl` beside the sessions is the flat layout Claude once
     /// wrote sub-agent transcripts in. Such a file names its session only in
     /// its own records, so it is skipped.
-    fn discover(&self, root: &SessionRoot) -> Result<DiscoveredSessions> {
-        Ok(discover_projects(
-            root,
-            project_directories_newest_first(&root.path)?,
-        ))
+    fn discover(
+        &self,
+        root: &SessionRoot,
+        lister: &dyn DirectoryLister,
+    ) -> Result<DiscoveredSessions> {
+        let discovery = DiscoveryLister::beneath(lister, &root.path);
+        let found = discover_projects(&discovery, lister, root)?;
+        Ok(DiscoveredSessions {
+            unreadable_directories: discovery.into_unreadable_directories(),
+            ..found
+        })
+    }
+
+    /// Discovery lists every session a Claude session ID resolves to.
+    fn rediscover_unlisted_session(
+        &self,
+        _root: &SessionRoot,
+        _locator: &Path,
+        _lister: &dyn DirectoryLister,
+    ) -> Result<Option<SessionStub>> {
+        Ok(None)
     }
 
     /// The session's project is its transcript's own cwd, or for one recorded
     /// without it, the path decoded from the project folder's name.
     fn parse_session(
         &self,
+        permit: ParsePermit<'_>,
         stub: &SessionStub,
         _root: &SessionRoot,
         debug_level: Option<DebugLevel>,
         on_transcript_read: &(dyn Fn() + Sync),
-    ) -> Result<Option<Conversation>> {
-        let Some(mut conversation) = session_row(stub, debug_level, on_transcript_read)? else {
-            return Ok(None);
-        };
-        let project_path = conversation.cwd.clone().unwrap_or_else(|| {
-            decode_project_dir_name_to_path(project_folder_name(&stub.locator).unwrap_or_default())
-        });
-        conversation.project_path = Some(project_path);
-        Ok(Some(conversation))
+        clock: &dyn Clock,
+    ) -> Result<ParsedSession> {
+        Ok(
+            session_row(permit, stub, debug_level, on_transcript_read, clock)?.map(|mut listed| {
+                let project_path = listed.row.cwd.clone().unwrap_or_else(|| {
+                    decode_project_dir_name_to_path(
+                        project_folder_name(&stub.locator).unwrap_or_default(),
+                    )
+                });
+                listed.row.project_path = Some(project_path);
+                listed
+            }),
+        )
     }
 
     fn remove_superseded_cache(&self, cache_base: &Path) {
@@ -253,11 +291,19 @@ impl SessionStorage for ClaudeStorage {
                 .as_deref(),
         );
     }
+
+    fn transcript_reader(&self) -> &dyn TranscriptReader {
+        &CLAUDE_TRANSCRIPT
+    }
+
+    fn thread_linker(&self) -> &'static dyn ThreadLinker {
+        &CLAUDE_TRANSCRIPT
+    }
 }
 
 /// The magic each per-project cache file of releases up to v0.3.1 opens
 /// with.
-const PROJECT_CACHE_MAGIC: &[u8; 8] = b"CLHIST01";
+pub(super) const PROJECT_CACHE_MAGIC: &[u8; 8] = b"CLHIST01";
 
 /// Remove the per-project cache of releases up to v0.3.1, kept in
 /// `projects/` under `cache_base`, or in `config-<hash>/projects/` for a
@@ -283,11 +329,10 @@ fn remove_project_cache(cache_base: &Path, config_dir: Option<&str>) {
 /// it. `REARVIEW_CACHE_DIR` can name a directory whose `projects/` holds the
 /// user's own files, and those stay.
 fn remove_project_cache_files(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
+    let Ok(entries) = SystemLister.list(directory) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in entries {
         if is_project_cache_file_name(&path) && opens_with_project_cache_magic(&path) {
             let _ = std::fs::remove_file(path);
         }
@@ -352,30 +397,23 @@ fn project_folder_name(path: &Path) -> Option<&str> {
     path.parent()?.file_name()?.to_str()
 }
 
-/// The sessions in each of `projects`, in that order. A project folder that
-/// cannot be listed is reported, and the others still list: on Windows, a
-/// folder Claude Code is deleting refuses to be listed until the delete
-/// completes.
-fn discover_projects(root: &SessionRoot, projects: Vec<PathBuf>) -> DiscoveredSessions {
+/// The sessions in each project folder under `root`, the most recently
+/// modified folder first: each folder listed through `discovery`, and each
+/// session's sub-agent transcripts through `lister`.
+fn discover_projects(
+    discovery: &DiscoveryLister,
+    lister: &dyn DirectoryLister,
+    root: &SessionRoot,
+) -> Result<DiscoveredSessions> {
     let mut discovered = DiscoveredSessions::complete(Vec::new());
-    for project in projects {
-        let transcripts = match walk::jsonl_files_at_depth(&project, 0) {
-            Ok(transcripts) => transcripts,
-            Err(error) => {
-                discovered.unreadable_directories.push(UnreadableDirectory {
-                    path: project,
-                    error: error.to_string(),
-                });
-                continue;
-            }
-        };
+    for project in project_directories_newest_first(discovery, &root.path)? {
         let mut sessions = Vec::new();
-        for transcript in transcripts {
+        for transcript in walk::jsonl_files_at_depth(discovery, &project, 0)? {
             if is_subagent_transcript(&transcript) {
                 discovered.skipped += 1;
                 continue;
             }
-            let subagents = subagent_transcripts(&transcript, None);
+            let subagents = subagent_transcripts(lister, &transcript, None);
             sessions.push(SessionFiles {
                 transcript,
                 subagents,
@@ -385,16 +423,19 @@ fn discover_projects(root: &SessionRoot, projects: Vec<PathBuf>) -> DiscoveredSe
         project_stubs.sort_by_key(|stub| std::cmp::Reverse(stub.fingerprint.modified));
         discovered.stubs.extend(project_stubs);
     }
-    discovered
+    Ok(discovered)
 }
 
-/// The project folders under `root`, most recently modified first. A root
-/// that does not exist holds none.
-fn project_directories_newest_first(root: &Path) -> Result<Vec<PathBuf>> {
+/// The project folders under `root`, listed through `lister`, most recently
+/// modified first. A missing root doesn't hold any.
+fn project_directories_newest_first(
+    lister: &dyn DirectoryLister,
+    root: &Path,
+) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let mut projects: Vec<(SystemTime, PathBuf)> = walk::subdirectories(root)?
+    let mut projects: Vec<(SystemTime, PathBuf)> = walk::subdirectories(lister, root)?
         .into_iter()
         .map(|project| {
             let modified = std::fs::metadata(&project)
@@ -414,7 +455,7 @@ fn resolved_session_under(root: &SessionRoot, session_id: &str) -> Result<Option
     let Some(transcript) = stored_copies(&root.path, session_id)?.into_iter().next() else {
         return Ok(None);
     };
-    let subagents = subagent_transcripts(&transcript, None);
+    let subagents = subagent_transcripts(&SystemLister, &transcript, None);
     Ok(walk::session_stubs(
         root,
         vec![SessionFiles {
@@ -441,11 +482,7 @@ fn stored_copies(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
     }
     let filename = format!("{}.jsonl", crate::search::session_id_for_lookup(session_id));
     let mut copies = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        let project_dir = entry?.path();
-        if !project_dir.is_dir() {
-            continue;
-        }
+    for project_dir in walk::subdirectories(&SystemLister, root)? {
         let candidate = project_dir.join(&filename);
         if candidate.exists() {
             copies.push(candidate);
@@ -458,7 +495,7 @@ fn stored_copies(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
 /// session directory (`tool-results/`, `subagents/`), and only copies
 /// Claude's format reads as its own. A sub-agent transcript copied with the
 /// session across projects counts once.
-fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
+fn delete_session_under(permit: ParsePermit<'_>, root: &Path, path: &Path) -> Result<Deleted> {
     let session_id = session_id_of(path).unwrap_or_default();
     // Validate format to prevent path traversal
     if session_id.is_empty()
@@ -468,11 +505,11 @@ fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
     {
         return Err(AppError::SessionNotFound(session_id.to_owned()));
     }
-    format::require_owned_transcript(Source::Claude, path)?;
+    format::require_owned_transcript(permit, Source::Claude, path)?;
 
     let mut copies = Vec::new();
     for copy in stored_copies(root, session_id)? {
-        if format::parse_owned_transcript(Source::Claude, &copy)?.is_some() {
+        if format::parse_owned_transcript(permit, Source::Claude, &copy)?.is_some() {
             copies.push(copy);
         }
     }
@@ -483,7 +520,7 @@ fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
     let mut subagent_files = HashSet::new();
     for transcript in &copies {
         subagent_files.extend(
-            subagent_transcripts(transcript, None)
+            subagent_transcripts(&SystemLister, transcript, None)
                 .into_iter()
                 .filter_map(|subagent| subagent.file_name().map(ToOwned::to_owned)),
         );
@@ -501,16 +538,18 @@ fn delete_session_under(root: &Path, path: &Path) -> Result<Deleted> {
     })
 }
 
-/// The sub-agent transcripts of the session at `transcript`, as every path
-/// that starts from the session names them: the list, session-ID lookup,
-/// delete and the agent CLI. A `subagents/` directory that cannot be read
-/// leaves the session with none and is reported at warn level, so the
-/// session still lists, opens and deletes.
+/// The sub-agent transcripts of the session at `transcript`, listed through
+/// `lister`, as every path that starts from the session names them: the
+/// list, session-ID lookup, delete and the agent CLI. A `subagents/`
+/// directory that cannot be read is reported at warn level and leaves the
+/// session without sub-agent transcripts, so the session still lists, opens
+/// and deletes.
 pub(crate) fn subagent_transcripts(
+    lister: &dyn DirectoryLister,
     transcript: &Path,
     debug_level: Option<DebugLevel>,
 ) -> Vec<PathBuf> {
-    read_subagent_transcripts(transcript).unwrap_or_else(|error| {
+    read_subagent_transcripts(lister, transcript).unwrap_or_else(|error| {
         debug::warn(
             debug_level,
             &format!(
@@ -526,20 +565,20 @@ pub(crate) fn subagent_transcripts(
 /// runs agree. An absent `subagents/` directory, the usual case, is no
 /// sub-agents; one that cannot be read is an error. A nested sub-agent's
 /// transcript sits in the same directory, so no walk descends.
-fn read_subagent_transcripts(transcript: &Path) -> Result<Vec<PathBuf>> {
+fn read_subagent_transcripts(
+    lister: &dyn DirectoryLister,
+    transcript: &Path,
+) -> Result<Vec<PathBuf>> {
     let directory = transcript.with_extension("").join(SUBAGENTS_DIR);
-    let entries = match std::fs::read_dir(&directory) {
+    let entries = match lister.list(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
-    let mut transcripts = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if is_subagent_transcript(&path) {
-            transcripts.push(path);
-        }
-    }
+    let mut transcripts: Vec<PathBuf> = entries
+        .into_iter()
+        .filter(|path| is_subagent_transcript(path))
+        .collect();
     transcripts.sort();
     Ok(transcripts)
 }
@@ -705,10 +744,11 @@ fn copy_session_files(
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     std::fs::create_dir_all(destination).map_err(AppError::Io)?;
-    for entry in std::fs::read_dir(source).map_err(AppError::Io)? {
-        let entry = entry.map_err(AppError::Io)?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
+    for source_path in SystemLister.list(source).map_err(AppError::Io)? {
+        let Some(name) = source_path.file_name() else {
+            continue;
+        };
+        let destination_path = destination.join(name);
         if source_path.is_dir() {
             copy_dir_recursive(&source_path, &destination_path)?;
         } else {
@@ -722,15 +762,16 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 pub(crate) mod tests {
     use super::*;
     use crate::agent::transcript::AgentTranscript;
-    use crate::history::cache::SessionCacheStore;
+    use crate::history::Conversation;
+    use crate::history::environment::test_support::{
+        load_rows, test_environment, waiting_operation,
+    };
     use crate::history::provider::contract_tests::{
         AgentSession, CONFIGURED_ARGUMENT, ExpectedCommand, FixtureIds, IdCase, Marker,
-        ProviderFixture, list_row,
+        ProviderFixture, append_lines, copy_tree, list_row,
     };
     use crate::history::provider::storage::RootedStorage;
-    use crate::history::provider::{
-        SessionRead, load_sessions_with_cache, reread_session_with_cache,
-    };
+    use crate::history::provider::{SessionRead, cache_sessions};
     use serde_json::{Value, json};
     use std::ffi::OsString;
 
@@ -773,6 +814,16 @@ pub(crate) mod tests {
     /// The projects root of the configuration directory `home`.
     fn projects_under(home: &Path) -> PathBuf {
         home.join("projects")
+    }
+
+    /// One listable session in the project folder `project_dir` under
+    /// `home`; returns its transcript.
+    fn write_contract_session(home: &Path, project_dir: &str, session: &str) -> PathBuf {
+        let transcript = projects_under(home)
+            .join(project_dir)
+            .join(format!("{session}.jsonl"));
+        write_transcript(&transcript);
+        transcript
     }
 
     /// A Claude Code configuration directory in a temporary directory, for
@@ -823,6 +874,10 @@ pub(crate) mod tests {
             Source::Claude.provider()
         }
 
+        fn canonicalises_recorded_directory(&self) -> bool {
+            false
+        }
+
         fn ids(&self) -> FixtureIds {
             FixtureIds {
                 session: "0f000000-0000-4000-8000-000000000001",
@@ -841,18 +896,30 @@ pub(crate) mod tests {
         }
 
         fn write_session(&self, home: &Path, session: &str) -> PathBuf {
-            let transcript = projects_under(home)
-                .join(PROJECT_DIR)
-                .join(format!("{session}.jsonl"));
-            write_transcript(&transcript);
-            transcript
+            write_contract_session(home, PROJECT_DIR, session)
+        }
+
+        fn append_turn(&self, locator: &Path, reply: &str) {
+            let user = json!({
+                "type": "user", "timestamp": "2026-07-26T06:31:00.000Z",
+                "message": {"role": "user", "content": "a later question"}
+            });
+            let assistant = json!({
+                "type": "assistant", "timestamp": "2026-07-26T06:31:05.000Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}
+            });
+            append_lines(locator, &[user.to_string(), assistant.to_string()]);
+        }
+
+        fn write_session_in_another_directory(&self, home: &Path, session: &str) -> PathBuf {
+            write_contract_session(home, "-tmp-claude-other-project", session)
         }
 
         fn every_record_session(&self) -> AgentSession {
             let session = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/claude/-tmp-claude-every-record-fixture")
                 .join("5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl");
-            let subagents = subagent_transcripts(&session, None);
+            let subagents = subagent_transcripts(&SystemLister, &session, None);
             assert_eq!(
                 subagents.len(),
                 2,
@@ -934,6 +1001,16 @@ pub(crate) mod tests {
             .with_subagent_tokens(157)
         }
 
+        /// The fixture is a project folder: the session and its
+        /// `subagents/` directory.
+        fn write_every_record_session(&self, home: &Path, session: &AgentSession) {
+            let folder = session.row.path.parent().unwrap();
+            copy_tree(
+                folder,
+                &projects_under(home).join(folder.file_name().unwrap()),
+            );
+        }
+
         fn write_subagent(&self, home: &Path, session: &str) -> PathBuf {
             write_contract_subagent(home, session, SUBAGENT)
         }
@@ -954,7 +1031,7 @@ pub(crate) mod tests {
         }
 
         fn delete_under(&self, home: &Path, locator: &Path) -> Result<Deleted> {
-            delete_session_under(&projects_under(home), locator)
+            delete_session_under(crate::history::FOR_FIXTURES, &projects_under(home), locator)
         }
 
         fn session_working_dir(&self) -> PathBuf {
@@ -1020,7 +1097,7 @@ pub(crate) mod tests {
             .join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b.jsonl");
         std::fs::write(&transcript, "{\"type\":\"user\"}\n").unwrap();
         assert_eq!(
-            read_subagent_transcripts(&transcript).unwrap(),
+            read_subagent_transcripts(&SystemLister, &transcript).unwrap(),
             Vec::<PathBuf>::new(),
             "a session with no directory has none"
         );
@@ -1028,7 +1105,7 @@ pub(crate) mod tests {
         let session_dir = project.path().join("7b2f3c1e-4a5d-4e6f-8a9b-0c1d2e3f4a5b");
         std::fs::create_dir_all(session_dir.join("tool-results")).unwrap();
         assert_eq!(
-            read_subagent_transcripts(&transcript).unwrap(),
+            read_subagent_transcripts(&SystemLister, &transcript).unwrap(),
             Vec::<PathBuf>::new(),
             "a session directory with no subagents/ has none"
         );
@@ -1044,7 +1121,7 @@ pub(crate) mod tests {
         std::fs::write(subagents.join("notes.txt"), "kept").unwrap();
 
         assert_eq!(
-            read_subagent_transcripts(&transcript).unwrap(),
+            read_subagent_transcripts(&SystemLister, &transcript).unwrap(),
             vec![first, second]
         );
     }
@@ -1060,7 +1137,7 @@ pub(crate) mod tests {
         let session_dir = project.join(FIXTURE_SESSION);
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(SUBAGENTS_DIR), "not a directory").unwrap();
-        assert!(read_subagent_transcripts(&transcript).is_err());
+        assert!(read_subagent_transcripts(&SystemLister, &transcript).is_err());
 
         let resolved = resolved_session_under(&SessionRoot::new(root.path()), FIXTURE_SESSION)
             .unwrap()
@@ -1104,9 +1181,7 @@ pub(crate) mod tests {
     /// Every session under `root`, through the shared load loop with its
     /// cache under `cache_base`.
     fn load_under(root: &Path, cache_base: &Path) -> Vec<Conversation> {
-        let storage = storage_under(root);
-        let cache = SessionCacheStore::under(cache_base, storage.cache());
-        load_sessions_with_cache(&storage, &cache, false, None).unwrap()
+        load_rows(&storage_under(root), cache_base)
     }
 
     /// The fixture project's one session, through a cache under `cache_base`.
@@ -1118,7 +1193,11 @@ pub(crate) mod tests {
 
     fn parsed_alone(transcript: &Path) -> Conversation {
         CLAUDE_TRANSCRIPT
-            .parse_conversation(transcript, None, None)
+            .parse_conversation(
+                transcript,
+                crate::history::parser::RowDating::new(None, &crate::clock::TestClock::default()),
+                None,
+            )
             .unwrap()
             .expect("the transcript holds a conversation")
     }
@@ -1178,7 +1257,13 @@ pub(crate) mod tests {
         let subagents = [subagent];
 
         let row = list_row(Source::Claude, &transcript, &subagents);
-        let opened = AgentTranscript::load_owned(Source::Claude, &transcript, &subagents).unwrap();
+        let opened = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
+            Source::Claude,
+            &transcript,
+            &subagents,
+        )
+        .unwrap();
 
         assert_eq!(row.message_count, 4);
         assert_eq!(opened.messages.len(), 4);
@@ -1207,47 +1292,35 @@ pub(crate) mod tests {
             .iter()
             .map(|path| parsed_alone(path).total_tokens)
             .sum();
-        let opened = AgentTranscript::load_owned(Source::Claude, &transcript, &subagents).unwrap();
+        let opened = AgentTranscript::parse_uncached(
+            crate::history::FOR_FIXTURES,
+            Source::Claude,
+            &transcript,
+            &subagents,
+        )
+        .unwrap();
         assert!(session.message_count > alone.message_count);
         assert_eq!(session.message_count, opened.messages.len());
         assert_eq!(session.total_tokens, alone.total_tokens + thread_tokens);
+        let content = session.load_held_content().unwrap().row;
         for sentinel in [
             "EXPLORE_SUBAGENT_SENTINEL",
             "GENERAL_SUBAGENT_SENTINEL",
             "NESTED_SUBAGENT_SENTINEL",
         ] {
-            assert!(session.agent_search_text.contains(sentinel), "{sentinel}");
-            assert!(!session.full_text.contains(sentinel), "{sentinel}");
+            assert!(content.agent_search_text.contains(sentinel), "{sentinel}");
+            assert!(!content.full_text.contains(sentinel), "{sentinel}");
         }
-        assert!(session.full_text.contains("PARENT_ANSWER_SENTINEL"));
+        assert!(content.full_text.contains("PARENT_ANSWER_SENTINEL"));
 
-        // The second load restores the row from the cache. The hit is proved
-        // by rewriting a sub-agent transcript under its original size and
-        // mtime: a re-parse would show the rewritten text.
-        let nested = subagents_dir.join(FIXTURE_SUBAGENTS[2]);
-        let modified = std::fs::metadata(&nested).unwrap().modified().unwrap();
-        let rewritten = std::fs::read_to_string(&nested)
-            .unwrap()
-            .replace("NESTED_SUBAGENT_SENTINEL", "NESTED_SUBAGENT_REWRITE_");
-        std::fs::write(&nested, rewritten).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&nested)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
         let restored = load_the_one_session(root.path(), cache.path());
         assert!(
-            restored
-                .agent_search_text
-                .contains("NESTED_SUBAGENT_SENTINEL"),
-            "the second load is a cache hit"
+            restored.cached_session.is_some(),
+            "the second load restores the row from the session cache database"
         );
         assert_eq!(restored.subagents, session.subagents);
         assert_eq!(restored.message_count, session.message_count);
         assert_eq!(restored.total_tokens, session.total_tokens);
-        assert_eq!(restored.agent_search_text, session.agent_search_text);
-        assert_eq!(restored.semantic_route_text, session.semantic_route_text);
     }
 
     /// Semantic and hybrid `agent search` route to a session by its
@@ -1258,14 +1331,13 @@ pub(crate) mod tests {
         let root = fixture_root();
         let cache = tempfile::tempdir().unwrap();
         let session = load_the_one_session(root.path(), cache.path());
+        let content = session.load_held_content().unwrap().row;
 
-        assert!(!session.full_text.contains("NESTED_SUBAGENT_SENTINEL"));
+        assert!(!content.full_text.contains("NESTED_SUBAGENT_SENTINEL"));
+        let route_text = content.semantic_route_text();
         assert!(
-            session
-                .semantic_route_text
-                .contains("NESTED_SUBAGENT_SENTINEL"),
-            "{}",
-            session.semantic_route_text
+            route_text.contains("NESTED_SUBAGENT_SENTINEL"),
+            "{route_text}"
         );
     }
 
@@ -1318,7 +1390,15 @@ pub(crate) mod tests {
 
         assert_eq!(before.subagents.len(), 3);
         assert_eq!(after.subagents.len(), 4);
-        assert!(after.agent_search_text.contains("LATE_SUBAGENT_SENTINEL"));
+        // A resumed row's texts load lazily, as an unchanged row's do.
+        assert!(
+            after
+                .load_held_content()
+                .unwrap()
+                .row
+                .agent_search_text
+                .contains("LATE_SUBAGENT_SENTINEL")
+        );
         assert_eq!(
             after.message_count,
             before.message_count + parsed_alone(&late).message_count
@@ -1364,7 +1444,8 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(session_dir.join("subagents")).unwrap();
         std::fs::write(session_dir.join("subagents"), "not a directory").unwrap();
 
-        let deleted = delete_session_under(root.path(), &transcript).unwrap();
+        let deleted =
+            delete_session_under(crate::history::FOR_FIXTURES, root.path(), &transcript).unwrap();
 
         assert_eq!(deleted, Deleted::just_the_session());
         assert!(!transcript.exists());
@@ -1381,6 +1462,7 @@ pub(crate) mod tests {
         copy_dir_recursive(&original, &fork).unwrap();
 
         let deleted = delete_session_under(
+            crate::history::FOR_FIXTURES,
             root.path(),
             &original.join(format!("{FIXTURE_SESSION}.jsonl")),
         )
@@ -1408,15 +1490,26 @@ pub(crate) mod tests {
         let original = root.path().join(FIXTURE_PROJECT);
         let fork = root.path().join("-tmp-fork");
         copy_dir_recursive(&original, &fork).unwrap();
-        let cache_base = tempfile::tempdir().unwrap();
-        let storage = storage_under(root.path());
-        let cache = SessionCacheStore::under(cache_base.path(), storage.cache());
+        let storage: &'static RootedStorage<ClaudeStorage> =
+            Box::leak(Box::new(storage_under(root.path())));
+        let environment = test_environment(vec![storage], None);
 
         for project in [&original, &fork] {
             let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
-            let Some(SessionRead::Listed(read)) =
-                reread_session_with_cache(&storage, &cache, &transcript, false)
-            else {
+            let operation = waiting_operation(&environment);
+            let outcome = cache_sessions(
+                &environment,
+                Source::Claude,
+                &[&transcript],
+                false,
+                &operation,
+                crate::history::load_meter::AgentMeter::UNMETERED,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+            operation.finish().unwrap();
+            let (SessionRead::Listed(read), _) = outcome.into_parts() else {
                 panic!("{} was not read as a listed session", transcript.display());
             };
             let subagents_dir = project.join(FIXTURE_SESSION).join("subagents");
@@ -1425,7 +1518,13 @@ pub(crate) mod tests {
                 read.subagents,
                 FIXTURE_SUBAGENTS.map(|name| subagents_dir.join(name))
             );
-            assert!(read.agent_search_text.contains("NESTED_SUBAGENT_SENTINEL"));
+            assert!(
+                read.load_held_content()
+                    .unwrap()
+                    .row
+                    .agent_search_text
+                    .contains("NESTED_SUBAGENT_SENTINEL")
+            );
         }
     }
 
@@ -1449,11 +1548,79 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let deleted = delete_session_under(root.path(), &transcript).unwrap();
+        let deleted =
+            delete_session_under(crate::history::FOR_FIXTURES, root.path(), &transcript).unwrap();
 
         assert_eq!(deleted.stored, Stored::SessionFiles(1));
         assert!(!transcript.exists());
         assert!(foreign.exists());
+    }
+
+    /// `agent read` of two sessions by path refreshes both through one
+    /// targeted read: the command lists the projects root and canonicalises
+    /// it once for its keys and once for the refresh, not once for each
+    /// reference.
+    #[test]
+    fn agent_read_of_two_sessions_refreshes_both_in_one_targeted_read() {
+        use crate::agent::service::AgentService;
+        use crate::agent::test_support::agent_command;
+        use crate::history::provider::walk::test_support::{CountingCanonicaliser, ScriptedLister};
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let user = json!({
+            "type": "user", "timestamp": "2026-07-26T06:30:00.000Z",
+            "cwd": project.path(),
+            "message": {"role": "user", "content": "a question"}
+        });
+        let sessions = [
+            "3a000000-0000-4000-8000-000000000001",
+            "3a000000-0000-4000-8000-000000000002",
+        ]
+        .map(|session| write_session_in(root.path(), "-tmp-project", session, user.clone()));
+        let storage: &'static dyn SessionStorage =
+            Box::leak(Box::new(crate::history::provider::WatchedStorage {
+                inner: &ClaudeStorage,
+                roots: vec![SessionRoot::new(root.path())],
+                watch: Default::default(),
+            }));
+        let canonicaliser = std::sync::Arc::new(CountingCanonicaliser::default());
+        let lister = std::sync::Arc::new(ScriptedLister::default());
+        let environment = crate::history::Environment::new(
+            vec![storage],
+            cache.path().to_path_buf(),
+            crate::history::ProcessIdentity::default(),
+            std::sync::Arc::new(crate::clock::TestClock::default()),
+            lister.clone(),
+        )
+        .with_canonicaliser(canonicaliser.clone());
+        crate::history::environment::test_support::load_rows_in(&environment, storage);
+        let canonicalised_by_load = canonicaliser.canonicalised().len();
+        let listed_by_load = lister.times_listed(root.path());
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&[
+                "read",
+                &sessions[0].to_string_lossy(),
+                &sessions[1].to_string_lossy(),
+            ]))
+            .unwrap();
+
+        assert_eq!(
+            output.matches("an answer").count(),
+            2,
+            "the command reads both sessions: {output}"
+        );
+        assert_eq!(
+            canonicaliser.canonicalised()[canonicalised_by_load..],
+            [root.path().to_path_buf()],
+            "key discovery canonicalises the root once, and the refresh reads below it"
+        );
+        assert_eq!(
+            lister.times_listed(root.path()) - listed_by_load,
+            2,
+            "key discovery and the refresh each list the root once"
+        );
     }
 
     /// A transcript written as `user`, in the project folder `project`.
@@ -1511,7 +1678,7 @@ pub(crate) mod tests {
         );
 
         let discovered = ClaudeStorage
-            .discover(&SessionRoot::new(root.path()))
+            .discover(&SessionRoot::new(root.path()), &SystemLister)
             .unwrap();
 
         let mut keys: Vec<&str> = discovered
@@ -1567,30 +1734,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A file where a project folder should be cannot be listed, as a folder
-    /// mid-delete cannot on Windows.
-    #[test]
-    fn project_folder_that_cannot_be_listed_leaves_others_listed() {
-        let root = fixture_root();
-        let unreadable = root.path().join("-tmp-unreadable");
-        std::fs::write(&unreadable, "not a directory").unwrap();
-
-        let discovered = discover_projects(
-            &SessionRoot::new(root.path()),
-            vec![unreadable.clone(), root.path().join(FIXTURE_PROJECT)],
-        );
-
-        assert_eq!(discovered.stubs.len(), 1);
-        assert_eq!(
-            discovered
-                .unreadable_directories
-                .iter()
-                .map(|directory| &directory.path)
-                .collect::<Vec<_>>(),
-            [&unreadable]
-        );
-    }
-
     /// A Claude session's `ch_` reference and project id are digests of its
     /// project folder's name, whatever directory it recorded; the pinned
     /// values match earlier releases.
@@ -1608,8 +1751,16 @@ pub(crate) mod tests {
             PathBuf::from("/projects/-tmp-project/12345678-1234-4234-9234-123456789abc.jsonl");
         conversation.session_id = "12345678-1234-4234-9234-123456789abc".to_owned();
         conversation.project_path = Some(PathBuf::from("/somewhere/else"));
+        conversation.cache_address = Some(AgentConversationKey::address_for_test(
+            Source::Claude,
+            &conversation.path,
+        ));
 
-        let key = AgentConversationKey::from_conversation(&conversation).unwrap();
+        let key = AgentConversationKey::from_conversation(
+            &conversation,
+            &crate::history::path::CanonicalDirectories::of_system(),
+        )
+        .unwrap();
 
         assert_eq!(key.project_dir_name, "-tmp-project");
         assert_eq!(key.conversation_ref().canonical(), "ch_2eb29a5ff6fe");
@@ -1633,19 +1784,19 @@ pub(crate) mod tests {
 
     /// Releases up to v0.3.1 cached Claude per project directory, under a
     /// directory named for the `CLAUDE_CONFIG_DIR` when one was set. The
-    /// shard cache beside it stays.
+    /// other directories in the cache base stay.
     #[test]
     fn per_project_cache_of_earlier_releases_is_removed() {
         let base = tempfile::tempdir().unwrap();
-        let shards = base.path().join("claude").join("root-0000000000000000");
-        std::fs::create_dir_all(&shards).unwrap();
+        let other = base.path().join("claude").join("root-0000000000000000");
+        std::fs::create_dir_all(&other).unwrap();
         let unconfigured = base.path().join("projects");
         write_project_cache_file(&unconfigured.join("-tmp-project.bin"));
 
         remove_project_cache(base.path(), None);
 
         assert!(!unconfigured.exists());
-        assert!(shards.exists());
+        assert!(other.exists());
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&"/elsewhere/.claude".to_owned(), &mut hasher);
@@ -1658,7 +1809,7 @@ pub(crate) mod tests {
         remove_project_cache(base.path(), Some("/elsewhere/.claude"));
 
         assert!(!configured.exists());
-        assert!(shards.exists());
+        assert!(other.exists());
     }
 
     /// `REARVIEW_CACHE_DIR` can name a directory whose `projects/` is the

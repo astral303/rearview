@@ -16,47 +16,145 @@
 //! assistant message per model request.
 
 use super::{
-    EntrySink, UNKNOWN, assistant_entry, compaction_summary, injected_read_input_from_text,
-    nonempty_text, tool_result_block, tool_result_entry, tool_use_block, usage_entry, user_entry,
+    EntrySink, RowsRead, RowsSeen, RowsStart, UNKNOWN, assistant_entry, compaction_summary,
+    injected_read_input_from_text, nonempty_text, tool_result_block, tool_result_entry,
+    tool_use_block, usage_entry, user_entry,
 };
 use crate::history::format::dropped::DroppedRecords;
 use crate::history::format::{append_exit_code, rfc3339_from_millis};
 use crate::log_entry::{ContentBlock, LogEntry, Tool};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The session's entries, and the records dropped on the way, counted in
-/// `dropped`. A row whose JSON does not parse is counted rather than failing
-/// the session.
-pub(super) fn entries(
+/// The start of a read of an OpenCode 2 session's messages: the `seq` of the
+/// first message it reads. The default starts at the session's first.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Cursor {
+    seq: Option<i64>,
+}
+
+/// The session's messages from `from` on, `start` being the state the
+/// messages before `from` left; the records dropped on the way are counted
+/// in `dropped`. A row with JSON that does not parse is counted as dropped
+/// and doesn't fail the session.
+///
+/// The next read starts at the session's last message: OpenCode rewrites a
+/// message in place while its reply streams.
+pub(super) fn read(
     connection: &Connection,
     session_id: &str,
+    from: &Cursor,
+    start: &RowsStart,
     dropped: DroppedRecords,
-) -> rusqlite::Result<EntrySink> {
-    let mut statement = connection
-        .prepare("SELECT id, type, data FROM session_message WHERE session_id = ?1 ORDER BY seq")?;
-    let rows = statement.query_map([session_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
+) -> rusqlite::Result<RowsRead<Cursor>> {
+    let rows = message_rows(connection, session_id, from)?;
+    let split = rows.len().saturating_sub(1);
     let mut projection = Projection {
         sink: EntrySink {
             dropped,
+            last_model: start.last_model.clone(),
             ..EntrySink::default()
         },
-        line: 0,
+        line: start.lines_before,
     };
-    for row in rows {
-        let (message_id, message_type, data) = row?;
-        match serde_json::from_str::<Value>(&data) {
-            Ok(message) => projection.message(&message_id, &message_type, &message),
+    let mut all = start.seen(0);
+    let mut before = all;
+    let mut at_split = None;
+    let mut bytes_read = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if index < split {
+            before.add(row.time_updated);
+        } else if index == split {
+            at_split = Some((projection.line, projection.sink.last_model.clone()));
+        }
+        all.add(row.time_updated);
+        bytes_read += row.data.len() as u64;
+        match serde_json::from_str::<Value>(&row.data) {
+            Ok(message) => projection.message(&row.id, &row.message_type, &message),
             Err(_) => projection.sink.dropped.failed("session_message.data"),
         }
     }
-    Ok(projection.sink)
+    let (lines_before, last_model) =
+        at_split.unwrap_or_else(|| (projection.line, projection.sink.last_model.clone()));
+    let cursor = Cursor {
+        seq: rows.get(split).map(|row| row.seq).or(from.seq),
+    };
+    Ok(RowsRead {
+        sink: projection.sink,
+        next: Some((
+            cursor,
+            RowsStart {
+                lines_before,
+                last_model,
+                before: vec![before],
+            },
+        )),
+        every_row: vec![all],
+        bytes_read,
+    })
+}
+
+/// One row of the session's `session_message` table.
+struct MessageRow {
+    seq: i64,
+    id: String,
+    message_type: String,
+    time_updated: i64,
+    data: String,
+}
+
+/// The session's messages from `from` on, in `seq` order.
+fn message_rows(
+    connection: &Connection,
+    session_id: &str,
+    from: &Cursor,
+) -> rusqlite::Result<Vec<MessageRow>> {
+    connection
+        .prepare(
+            "SELECT seq, id, type, time_updated, data FROM session_message \
+             WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq",
+        )?
+        .query_map(params![session_id, from.seq.unwrap_or(i64::MIN)], |row| {
+            Ok(MessageRow {
+                seq: row.get(0)?,
+                id: row.get(1)?,
+                message_type: row.get(2)?,
+                time_updated: row.get(3)?,
+                data: row.get(4)?,
+            })
+        })?
+        .collect()
+}
+
+/// The session's messages before `from`.
+pub(super) fn rows_before(
+    connection: &Connection,
+    session_id: &str,
+    from: &Cursor,
+) -> rusqlite::Result<Vec<RowsSeen>> {
+    let Some(seq) = from.seq else {
+        return Ok(vec![RowsSeen::default()]);
+    };
+    Ok(vec![connection.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(time_updated), 0) FROM session_message \
+         WHERE session_id = ?1 AND seq < ?2",
+        params![session_id, seq],
+        RowsSeen::of_row,
+    )?])
+}
+
+/// Every message of the session.
+pub(super) fn every_row(
+    connection: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<RowsSeen>> {
+    Ok(vec![connection.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(time_updated), 0) FROM session_message \
+         WHERE session_id = ?1",
+        [session_id],
+        RowsSeen::of_row,
+    )?])
 }
 
 /// The projection under construction. Entries are numbered in order by the
@@ -420,6 +518,7 @@ mod tests {
 
         let projection = OPENCODE_DB
             .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
                 &session_ref(&database, "ses_v2_counted"),
                 DroppedRecords::counting(),
             )
@@ -469,9 +568,16 @@ mod tests {
         );
         let reference = session_ref(&database, "ses_v2");
 
-        let ordinary = OPENCODE_DB.parse_transcript(&reference).unwrap().unwrap();
+        let ordinary = OPENCODE_DB
+            .parse_transcript(crate::history::FOR_FIXTURES, &reference)
+            .unwrap()
+            .unwrap();
         let counted = OPENCODE_DB
-            .parse_transcript_counting(&reference, DroppedRecords::counting())
+            .parse_transcript_counting(
+                crate::history::FOR_FIXTURES,
+                &reference,
+                DroppedRecords::counting(),
+            )
             .unwrap()
             .unwrap();
 
@@ -570,10 +676,17 @@ mod tests {
             },
         };
 
-        let conversation =
-            crate::history::parser::process_session_file(&stub, &OPENCODE_DB, None, &|| {})
-                .unwrap()
-                .unwrap();
+        let conversation = crate::history::parser::process_session_file(
+            crate::history::FOR_FIXTURES,
+            &stub,
+            &OPENCODE_DB,
+            None,
+            &|| {},
+            &crate::clock::TestClock::default(),
+        )
+        .unwrap()
+        .unwrap()
+        .row;
 
         assert_eq!(conversation.total_tokens, 40 + 15 + 5 + 2);
         assert_eq!(conversation.model.as_deref(), Some("gpt-6-luna"));
@@ -696,6 +809,7 @@ mod tests {
         let reference = session_ref(&database, "ses_parent");
         let view = view_projection(
             &OPENCODE_DB,
+            crate::history::FOR_FIXTURES,
             &reference,
             &[session_ref(&database, "ses_child")],
         )
