@@ -12,6 +12,7 @@
 use super::claude_home::{ClaudeHome, TemplateCache, admitted_cache, another_rearview};
 use super::refresh_tests::serve_session_refresh;
 use super::*;
+use crate::cache_file::test_support::TemporaryCacheDirectory;
 use crate::clock::{Clock, SystemClock, TestClock};
 use crate::history::load_meter::LoadMeter;
 use crate::history::provider::contract_tests::registered_fixtures;
@@ -351,7 +352,7 @@ impl Setup {
 /// storages whose parses `watch` sees, on test time.
 struct Case<'setup> {
     corpus: &'setup Corpus,
-    cache: tempfile::TempDir,
+    cache: TemporaryCacheDirectory,
     watch: ParseWatch,
     clock: Arc<TestClock>,
     environment: Environment,

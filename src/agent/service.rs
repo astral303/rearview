@@ -5324,7 +5324,10 @@ mod tests {
 
         /// A copy of the cache in which `row`'s copy was read at an older
         /// fingerprint than its transcript's.
-        fn cache_with_stale_copy_of(&self, row: &history::Conversation) -> tempfile::TempDir {
+        fn cache_with_stale_copy_of(
+            &self,
+            row: &history::Conversation,
+        ) -> crate::cache_file::test_support::TemporaryCacheDirectory {
             let copy = self.cache.copy();
             let changed = rusqlite::Connection::open(
                 copy.path().join(history::sqlite_cache::DATABASE_FILE_NAME),
@@ -7555,7 +7558,7 @@ mod tests {
     /// owns until a command reading them waits past its patience.
     struct SessionsBesideAnotherRefresh {
         home: crate::tui::claude_home::ClaudeHome,
-        cache: tempfile::TempDir,
+        cache: crate::cache_file::test_support::TemporaryCacheDirectory,
         clock: Arc<TestClock>,
         environment: history::Environment,
     }
@@ -8268,7 +8271,7 @@ mod tests {
     /// Codex's sessions fails.
     struct HomeWithUnlistableCodex {
         _home: tempfile::TempDir,
-        cache: tempfile::TempDir,
+        cache: crate::cache_file::test_support::TemporaryCacheDirectory,
         storages: Vec<&'static dyn history::provider::SessionStorage>,
         lister: Arc<history::provider::walk::test_support::ScriptedLister>,
         claude_reference: String,
@@ -8315,7 +8318,7 @@ mod tests {
 
         fn environment_of(
             storages: &[&'static dyn history::provider::SessionStorage],
-            cache: &tempfile::TempDir,
+            cache: &crate::cache_file::test_support::TemporaryCacheDirectory,
             lister: &Arc<history::provider::walk::test_support::ScriptedLister>,
         ) -> history::Environment {
             history::Environment::new(

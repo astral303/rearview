@@ -181,19 +181,78 @@ fn remove_stale_temp_files(directory: &Path, now: SystemTime) {
     }
 }
 
-/// Files created in a test cache directory, aged as a leftover temp file, a
-/// write in progress, and an unrelated file, for the sweep tests of every
-/// cache.
+/// Test cache directories: the running test's own, temporary session cache
+/// directories, and the files the sweep tests of every cache age in one.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
     use crate::clock::TestClock;
+    use std::time::Instant;
 
     thread_local! {
         /// One directory per test, removed when the test ends, because
         /// libtest runs each test on a thread of its own.
-        static TEST_CACHE_DIRECTORY: tempfile::TempDir =
-            tempfile::tempdir().expect("a temporary session cache directory");
+        static TEST_CACHE_DIRECTORY: TemporaryCacheDirectory = TemporaryCacheDirectory::new();
+    }
+
+    const OPEN_FILE_WAIT: Duration = Duration::from_secs(5);
+    const REMOVAL_RETRY_PAUSE: Duration = Duration::from_millis(10);
+
+    /// A temporary session cache directory. Unlike `TempDir`, its drop
+    /// retries the removal on Windows while a file in it is open, and
+    /// prints the failure when the directory stays.
+    pub(crate) struct TemporaryCacheDirectory(PathBuf);
+
+    impl TemporaryCacheDirectory {
+        pub(crate) fn new() -> Self {
+            Self(
+                tempfile::tempdir()
+                    .expect("a temporary session cache directory")
+                    .keep(),
+            )
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryCacheDirectory {
+        /// Remove the directory, on Windows retrying for up to
+        /// [`OPEN_FILE_WAIT`]. `TaskSupervisor`'s worker thread is not
+        /// joined: it can still have the database open when the test ends,
+        /// and Windows doesn't delete an open file. A directory still there
+        /// after that stays, and the failure is printed to stderr.
+        fn drop(&mut self) {
+            if let Err(error) = remove_directory(&self.0, OPEN_FILE_WAIT) {
+                // Not `eprintln!`: libtest hides its output when the test
+                // passes.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "the temporary session cache directory {} stays: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    /// Removes `directory` and everything in it; a missing directory counts
+    /// as removed. On Windows a failed removal is tried again until it
+    /// succeeds or `patience` has passed. Elsewhere an open file doesn't
+    /// stop the removal, and a failure is returned at once.
+    pub(super) fn remove_directory(directory: &Path, patience: Duration) -> std::io::Result<()> {
+        let deadline = Instant::now() + patience;
+        loop {
+            let error = match std::fs::remove_dir_all(directory) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => error,
+            };
+            if !cfg!(windows) || Instant::now() >= deadline {
+                return Err(error);
+            }
+            std::thread::sleep(REMOVAL_RETRY_PAUSE);
+        }
     }
 
     /// The running test's own session cache directory, created on its first
@@ -246,9 +305,65 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::TempFileFixture;
+    use super::test_support::{TempFileFixture, TemporaryCacheDirectory};
     use super::*;
     use crate::clock::TestClock;
+    use crate::history::sqlite_cache::DATABASE_FILE_NAME;
+
+    /// A session cache directory with a database in it, open on the
+    /// returned connection.
+    fn directory_with_open_database() -> (TemporaryCacheDirectory, rusqlite::Connection) {
+        let directory = TemporaryCacheDirectory::new();
+        let database =
+            rusqlite::Connection::open(directory.path().join(DATABASE_FILE_NAME)).unwrap();
+        database
+            .execute_batch("CREATE TABLE sessions (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        (directory, database)
+    }
+
+    /// Checks the retry on Windows alone: elsewhere the first removal
+    /// succeeds with the database open.
+    #[test]
+    fn dropped_cache_directory_is_gone_once_its_database_closes() {
+        let (directory, database) = directory_with_open_database();
+        let path = directory.path().to_path_buf();
+        // A fixed wait: the drop can't signal its first failed attempt, and a
+        // close that the start of the removal signals beats that attempt.
+        let closing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(database);
+        });
+
+        drop(directory);
+        closing.join().unwrap();
+
+        assert!(
+            !path.exists(),
+            "the drop removes {} once the database closes",
+            path.display()
+        );
+    }
+
+    /// On Windows, a removal that keeps failing past its patience returns
+    /// the error and leaves the directory.
+    #[cfg(windows)]
+    #[test]
+    fn removal_of_directory_with_open_database_fails_once_its_patience_ends() {
+        let (directory, database) = directory_with_open_database();
+
+        let removed = test_support::remove_directory(directory.path(), Duration::from_millis(50));
+
+        assert!(
+            removed.is_err(),
+            "the removal fails while the database is open"
+        );
+        assert!(
+            directory.path().exists(),
+            "the directory stays after the failed removal"
+        );
+        drop(database);
+    }
 
     /// A reader that fails the test when read: a body read past a mismatched
     /// header is the full read the header check exists to skip.

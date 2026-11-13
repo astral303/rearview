@@ -3,6 +3,7 @@
 
 use super::claude_home::{ClaudeHome, TemplateCache, another_rearview, app_reading};
 use super::*;
+use crate::cache_file::test_support::TemporaryCacheDirectory;
 use crate::clock::TestClock;
 use crate::history::ProcessIdentity;
 use crate::history::environment::test_support::{environment_on_clock, real_time_environment};
@@ -293,7 +294,7 @@ struct CachedEveryRecordSession {
 impl CachedEveryRecordSession {
     fn new(fixture: &'static dyn ProviderFixture) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let cache = tempfile::tempdir().unwrap();
+        let cache = TemporaryCacheDirectory::new();
         fixture.write_every_record_session(home.path(), &fixture.every_record_session());
         SqliteCache::open(&rearview(cache.path()))
             .unwrap()
@@ -323,7 +324,7 @@ impl CachedEveryRecordSession {
 
     /// A case's copy of the cache, and its environment reading it on test
     /// time of its own.
-    fn case(&self) -> (tempfile::TempDir, Environment) {
+    fn case(&self) -> (TemporaryCacheDirectory, Environment) {
         let cache = self.template.copy();
         let environment = environment_on_clock(
             vec![kept_storage_under(self.fixture, self.home.path())],
