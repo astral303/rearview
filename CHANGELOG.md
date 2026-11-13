@@ -154,6 +154,8 @@
 - Fix tests on Windows writing their temporary files to the system temp
   folder when started with `cargo test`. They now use `target`, as they
   did under `mise run test`.
+- Fix each test run on Windows leaving about 80 temporary folders in
+  `target`.
 
 ## v0.6.1 (2026-10-26)
 

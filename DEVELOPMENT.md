@@ -36,6 +36,15 @@ On Windows, tests started by `cargo` create their temporary files in `target`
 (see `.cargo/config.toml`). Exclude the project folder from antivirus
 real-time scanning: it otherwise reads every file the tests write.
 
+On Windows, a test fixture drops its session cache, and anything else with
+the cache database open, before the cache's folder, or uses `TemporaryCache`
+or `TemporaryCacheDirectory`: Windows does not delete a folder that contains
+an open file, and the folder then stays in `target`. After changing test
+fixtures, count the `.tmp*` folders in `target` before and after
+`mise run test`, while no other test run uses `target`. The count stays the
+same, or rises by one when a worker thread was running as the tests ended.
+`rearview-test-session-root` stays in `target`; every run reuses it.
+
 ## Versions and dependencies
 
 rearview is an application, not a library. Every version change is a
