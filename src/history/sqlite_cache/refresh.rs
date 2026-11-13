@@ -671,6 +671,16 @@ impl RefreshToken {
         self.access.revoke();
     }
 
+    /// `error`, a failure of this owner's write, after revoking write
+    /// permission for every copy of this token when its class stops writes
+    /// (see [`WriteErrorClass::stops_writes`]).
+    pub(crate) fn fail_with(&self, error: AppError) -> AppError {
+        if WriteErrorClass::of(&error).stops_writes() {
+            self.revoke();
+        }
+        error
+    }
+
     /// Revoke write permission, as a write that found another identity
     /// owning the cache does, and stop counting this identity as this
     /// process's.
@@ -706,10 +716,10 @@ impl RefreshToken {
     /// writer lock, then committing with the batch's end as
     /// `last_commit_ms`. Put reads and parsing inside `work` too: elapsed
     /// wall time cannot permit a takeover while the batch holds the writer
-    /// lock. A failure revokes write permission for every copy of this
-    /// token.
+    /// lock. A failure whose class stops writes revokes write permission for
+    /// every copy of this token.
     pub(crate) fn write_batch<T>(&self, work: impl FnOnce() -> T) -> Result<T> {
-        let result = (|| {
+        (|| {
             if !self.can_publish() {
                 return Err(AppError::SessionCacheRefreshLost);
             }
@@ -717,11 +727,8 @@ impl RefreshToken {
                 connect_writable(&self.base, POLL_EVERY)
             })?;
             WriteBatch::run(&connection, self, |_| Ok(work()))
-        })();
-        if result.is_err() {
-            self.revoke();
-        }
-        result
+        })()
+        .map_err(|error| self.fail_with(error))
     }
 
     /// Run `work` as one write batch, as [`Self::write_batch`] does, and
@@ -753,9 +760,9 @@ impl RefreshToken {
 
     /// Run `read` holding the writer lock, and return its result even when
     /// cache coordination fails. A read that could not start under the lock
-    /// runs without it. Failure revokes write permission for every copy of
-    /// this token, including the one [`apply_writes`](super::apply_writes)
-    /// holds.
+    /// runs without it. A failure revokes write permission as
+    /// [`Self::write_batch`] does, for every copy of this token, including
+    /// the copy [`apply_writes`](super::apply_writes) has.
     pub(crate) fn read<T>(&self, read: impl FnOnce() -> T) -> (T, Result<()>) {
         let mut read = Some(read);
         let mut result = None;
@@ -1041,10 +1048,9 @@ impl<'a> std::ops::Deref for WriteBatch<'a> {
 
 impl<'a> WriteBatch<'a> {
     /// Run `body` as one write batch of `owner` on `connection`, and commit
-    /// it. A failure to begin the batch, of its ownership check or of its
-    /// commit revokes `owner`'s write permission as [`transaction`] and
-    /// [`commit`] decide. A failure of `body` rolls the batch back and
-    /// leaves the write permission as it is.
+    /// it. A failure revokes `owner`'s write permission as [`transaction`]
+    /// and [`commit`] decide; a failure of `body` revokes it when its class
+    /// stops writes, and rolls the batch back.
     pub(super) fn run<T>(
         connection: &'a Connection,
         owner: &'a RefreshToken,
@@ -1101,7 +1107,8 @@ fn end_batch<'a, T>(
     owner: &RefreshToken,
     body: impl FnOnce(&WriteBatch<'a>) -> Result<Option<T>>,
 ) -> Result<Option<T>> {
-    let Some(value) = body(&batch)? else {
+    // Revoke before the rollback releases the writer lock to queued writes.
+    let Some(value) = body(&batch).map_err(|error| owner.fail_with(error))? else {
         return Ok(None);
     };
     commit(batch, owner)?;
@@ -1116,7 +1123,9 @@ fn unwrap_committed<T>(ended: Result<Option<T>>) -> Result<T> {
 /// A write batch. Lock order: `owner`'s turn, then SQLite's writer lock,
 /// then a check that `owner` still owns the refresh. Checking before taking
 /// the writer lock would let another process take over between the check
-/// and the batch. A failure revokes `owner`'s write permission.
+/// and the batch. A failure of the ownership check revokes `owner`'s write
+/// permission; a failure to take the lock revokes it when its class stops
+/// writes.
 fn transaction<'a>(connection: &'a Connection, owner: &'a RefreshToken) -> Result<WriteBatch<'a>> {
     transaction_within(connection, owner, LOCK_WAIT_LIMIT)
 }
@@ -1156,7 +1165,7 @@ fn transaction_during<'a>(
     let transaction = retry_busy(lock_wait_limit, owner.clock(), || {
         Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
     })
-    .inspect_err(|_| owner.revoke())?;
+    .map_err(|error| owner.fail_with(error))?;
     owner.verify(&transaction).inspect_err(|_| owner.revoke())?;
     Ok(WriteBatch {
         transaction,
@@ -1183,9 +1192,10 @@ fn exclusive_transaction<'a>(
 
 /// Commit `batch` with `owner`'s commit time. A failure of the ownership
 /// check or of the `refresh_state` update revokes `owner`'s write
-/// permission, whatever its class. A failure of `COMMIT` revokes it when its
-/// class stops writes (see [`WriteErrorClass`]); otherwise dropping `batch`
-/// rolls that batch back alone, and the owner's later batches go on.
+/// permission, whatever its class: the ownership can't be confirmed or kept
+/// then. A failure of `COMMIT` revokes it when its class stops writes (see
+/// [`WriteErrorClass`]); otherwise dropping `batch` rolls that batch back
+/// alone, and the owner's later batches go on.
 fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
     owner.verify(&batch).inspect_err(|_| owner.revoke())?;
     let changed = batch
@@ -1203,8 +1213,7 @@ fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
             return foreign_key_failure(&batch, error);
         }
         // Revoke before rollback releases the writer lock to queued writes.
-        owner.revoke();
-        error.into()
+        owner.fail_with(error.into())
     })
 }
 

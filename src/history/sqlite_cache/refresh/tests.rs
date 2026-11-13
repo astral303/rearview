@@ -371,11 +371,16 @@ fn record_root() -> SessionRoot {
 }
 
 fn record() -> SessionRecord {
+    record_of("session")
+}
+
+/// The record of an empty Pi session stored at `cache_key`.
+pub(crate) fn record_of(cache_key: &str) -> SessionRecord {
     let root = record_root();
     let stub = SessionStub {
-        locator: root.path.join("session.jsonl"),
+        locator: root.path.join(format!("{cache_key}.jsonl")),
         subagents: Vec::new(),
-        cache_key: "session".to_owned(),
+        cache_key: cache_key.to_owned(),
         fingerprint: Fingerprint {
             size: 100,
             modified: Some(UNIX_EPOCH + Duration::from_secs(1)),
@@ -2035,15 +2040,16 @@ fn batch_whose_ownership_check_fails_doesnt_run_body_and_revokes_write_permissio
 }
 
 #[test]
-fn batch_whose_body_fails_rolls_back_and_keeps_write_permission() {
+fn batch_whose_body_fails_rolls_back_and_revokes_write_permission_by_class() {
     let failures = [
-        ("INSERT INTO missing VALUES (1)", WriteErrorClass::Io),
+        ("INSERT INTO missing VALUES (1)", WriteErrorClass::Io, false),
         (
             "INSERT INTO refresh_state (singleton, last_commit_ms) VALUES (1, 0)",
             WriteErrorClass::Other,
+            true,
         ),
     ];
-    for (statement, class) in failures {
+    for (statement, class, keeps_write_permission) in failures {
         let directory = tempfile::tempdir().unwrap();
         let (owner, connection) = owner_and_sentinel(&rearview(directory.path()));
 
@@ -2059,9 +2065,11 @@ fn batch_whose_body_fails_rolls_back_and_keeps_write_permission() {
             "`{statement}` fails in the body: {ran:?}"
         );
         assert_eq!(sentinel(&connection), 1, "the body's batch rolls back");
-        assert!(
+        assert_eq!(
             owner.token().can_publish(),
-            "a {class:?} failure in the body keeps the owner's write permission"
+            keeps_write_permission,
+            "a {class:?} failure in the body keeps the owner's write permission: \
+             {keeps_write_permission}"
         );
     }
 }

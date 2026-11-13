@@ -267,10 +267,10 @@ impl SqliteCache {
 
     /// Opens `base`'s database for `owner`'s refresh, creating it and its
     /// tables when missing, and emptying it when its tables are of another
-    /// schema version, semantic turn version or page size. A failure revokes
-    /// `owner`'s write permission.
+    /// schema version, semantic turn version or page size. A failure whose
+    /// class stops writes revokes `owner`'s write permission.
     pub(crate) fn open_for_refresh(owner: &refresh::RefreshToken) -> Result<CacheWriter> {
-        CacheWriter::open(owner).inspect_err(|_| owner.revoke())
+        CacheWriter::open(owner).map_err(|error| owner.fail_with(error))
     }
 
     fn stored_layout(&self) -> Result<StoredLayout> {
@@ -716,8 +716,14 @@ impl CacheWriter {
     /// is, older than the transcript, and the next load reads the session
     /// again. Each step of the write checks the free space on the cache's
     /// drive, and fails once it is below the floor (see
-    /// [`refresh::RefreshToken::check_space`]).
+    /// [`refresh::RefreshToken::check_space`]). A failure whose class stops
+    /// writes revokes the owner's write permission.
     pub(crate) fn write(&self, record: &SessionRecord) -> Result<Option<i64>> {
+        self.write_record(record)
+            .map_err(|error| self.owner.fail_with(error))
+    }
+
+    fn write_record(&self, record: &SessionRecord) -> Result<Option<i64>> {
         if !self.is_admitted()? {
             return Err(AppError::SessionCacheNotReady {
                 session: record.catalogue.cache_key.clone(),
@@ -1288,8 +1294,9 @@ impl CacheWrite {
 
 /// Applies every write `writes` receives to `writer`, in order, until every
 /// sender is gone or the owner's write permission is revoked, then
-/// checkpoints and returns `writer`. Other write failures are reported under
-/// `--debug`, and the remaining records are written.
+/// checkpoints and returns `writer`. A failure whose class stops writes
+/// revokes it. Write failures are reported under `--debug`; after a failure
+/// that doesn't stop writes, the remaining records are written.
 pub(crate) fn apply_writes(
     writer: CacheWriter,
     writes: Receiver<CacheWrite>,

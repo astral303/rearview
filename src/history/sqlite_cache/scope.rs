@@ -376,8 +376,9 @@ const UNLOCK_POLL: Duration = Duration::from_millis(200);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::sqlite_cache::refresh::tests::{rearview, replace_owner};
-    use crate::history::sqlite_cache::{DriveRunningOut, SqliteCache};
+    use crate::history::sqlite_cache::connection::test_hooks;
+    use crate::history::sqlite_cache::refresh::tests::{rearview, record_of, replace_owner};
+    use crate::history::sqlite_cache::{CacheWrite, DriveRunningOut, SqliteCache, apply_writes};
 
     fn operation(base: &CacheBase) -> OperationScope {
         OperationScope::new(base, Patience::UntilAcquired, Arc::default())
@@ -478,6 +479,66 @@ mod tests {
                 Err(AppError::SessionCacheLowSpace { .. })
             ),
             "the operation ends failing with the low-space error"
+        );
+    }
+
+    /// Interrupt the statement that first changes the `sessions` table of
+    /// the cache in `base`, as a database failing part way through a write
+    /// does: SQLite reports `SQLITE_INTERRUPT`, a failure of the database
+    /// rather than of the write's rows.
+    fn interrupt_first_session_change(base: &std::path::Path) -> test_hooks::Installed {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        test_hooks::on_every_connection(base, move |connection| {
+            let changed = Arc::new(AtomicBool::new(false));
+            let marked = Arc::clone(&changed);
+            connection
+                .update_hook(Some(
+                    move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                        if table == "sessions" {
+                            marked.store(true, Ordering::SeqCst);
+                        }
+                    },
+                ))
+                .unwrap();
+            let interrupted = Arc::clone(&interrupted);
+            connection
+                .progress_handler(
+                    1,
+                    Some(move || {
+                        changed.load(Ordering::SeqCst) && !interrupted.swap(true, Ordering::SeqCst)
+                    }),
+                )
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn session_write_failing_part_way_stops_later_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = rearview(directory.path());
+        let operation = operation(&base);
+        let _interrupting = interrupt_first_session_change(base.path());
+        let writer = SqliteCache::open_for_refresh(&owner_token(&operation)).unwrap();
+        let (writes, received) = std::sync::mpsc::channel();
+        let (first, first_outcome) = CacheWrite::session(record_of("first"));
+        let (second, second_outcome) = CacheWrite::session(record_of("second"));
+        writes.send(first).unwrap();
+        writes.send(second).unwrap();
+        drop(writes);
+
+        drop(apply_writes(writer, received, None));
+
+        assert!(
+            matches!(first_outcome.recv(), Ok(Err(_))),
+            "the interrupted write fails"
+        );
+        assert!(
+            second_outcome.recv().is_err(),
+            "the later write is dropped unwritten"
+        );
+        assert!(
+            operation.finish().lost_write_permission,
+            "the operation ends without its write permission"
         );
     }
 }
