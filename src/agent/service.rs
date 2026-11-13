@@ -1306,11 +1306,11 @@ impl AgentService {
             eprint!("{}", self.perf.records(agent::peak_memory::peak_bytes()));
         }
         output
-            .and_then(ensure_complete_compact_output)
+            .and_then(CommandOutput::complete)
             .map_err(protocol_error)
     }
 
-    fn execute_inner(&self, command: &AgentCommand) -> Result<String> {
+    fn execute_inner(&self, command: &AgentCommand) -> Result<CommandOutput> {
         match command {
             AgentCommand::Sessions(args) => self.run_sessions(args),
             AgentCommand::Search(args) => self.search(args),
@@ -1343,7 +1343,7 @@ impl AgentService {
             .map_err(AppError::from)
     }
 
-    fn search(&self, args: &cli::AgentSearchArgs) -> Result<String> {
+    fn search(&self, args: &cli::AgentSearchArgs) -> Result<CommandOutput> {
         let perf = &self.perf;
         let reads = perf.search_reads();
         let config = config::load_config()?;
@@ -1467,13 +1467,7 @@ impl AgentService {
                 let mut output = run.output;
                 apply_configured_render_policy(&mut output, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
-                Ok(perf.time(Stage::Render, || {
-                    agent::search::format_agent_output_with_warnings(
-                        &output,
-                        &warnings,
-                        clock.local_wall(),
-                    )
-                }))
+                Ok(self.render_search(&output, warnings))
             }
             SearchMode::Semantic => {
                 let (mut output, semantic_warnings) = perf.time(Stage::Semantic, || {
@@ -1490,13 +1484,7 @@ impl AgentService {
                 let mut warnings = warnings.into_inner();
                 warnings.extend(semantic_warnings);
                 let warnings = self.with_stale_cache_record(warnings, &output);
-                Ok(perf.time(Stage::Render, || {
-                    agent::search::format_agent_output_with_warnings(
-                        &output,
-                        &warnings,
-                        clock.local_wall(),
-                    )
-                }))
+                Ok(self.render_search(&output, warnings))
             }
             SearchMode::Hybrid => {
                 let inputs = agent_inputs_for_indices(&conversations, &keys, &scoped)?;
@@ -1551,15 +1539,24 @@ impl AgentService {
                 };
                 apply_configured_render_policy(&mut output, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
-                Ok(perf.time(Stage::Render, || {
-                    agent::search::format_agent_output_with_warnings(
-                        &output,
-                        &warnings,
-                        clock.local_wall(),
-                    )
-                }))
+                Ok(self.render_search(&output, warnings))
             }
         }
+    }
+
+    fn render_search(
+        &self,
+        output: &agent::search::AgentSearchOutput,
+        warnings: Vec<AgentWarning>,
+    ) -> CommandOutput {
+        let records = self.perf.time(Stage::Render, || {
+            agent::search::format_agent_output_with_warnings(
+                output,
+                &warnings,
+                self.clock().local_wall(),
+            )
+        });
+        CommandOutput { records }
     }
 
     /// Loads the history and the environment, applies `rules`, adds the
@@ -1586,7 +1583,7 @@ impl AgentService {
         Ok(selection)
     }
 
-    fn run_sessions(&self, args: &cli::AgentSessionsArgs) -> Result<String> {
+    fn run_sessions(&self, args: &cli::AgentSessionsArgs) -> Result<CommandOutput> {
         let agent_config = config::load_config()?.agent.unwrap_or_default();
         let rules = SelectionRules::new(
             args.time.resolve(self.clock().as_ref())?,
@@ -1594,7 +1591,7 @@ impl AgentService {
             &agent_config,
         );
         let mut selection = self.select_sessions(&rules)?;
-        self.perf.time(Stage::Render, || {
+        let records = self.perf.time(Stage::Render, || -> Result<String> {
             let listing = selection.listing(
                 &rules.window,
                 args.offset,
@@ -1608,10 +1605,11 @@ impl AgentService {
                 &warnings,
                 self.clock().local_wall(),
             ))
-        })
+        })?;
+        Ok(CommandOutput { records })
     }
 
-    fn run_within(&self, args: &cli::AgentWithinArgs) -> Result<String> {
+    fn run_within(&self, args: &cli::AgentWithinArgs) -> Result<CommandOutput> {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
@@ -1718,7 +1716,7 @@ impl AgentService {
             })
         })?;
         let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
-        let rendered = perf.time(Stage::Render, || {
+        let records = perf.time(Stage::Render, || {
             agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
             apply_configured_render_policy(&mut output, &agent_config);
             agent::search::format_agent_output_with_warnings(
@@ -1728,7 +1726,7 @@ impl AgentService {
             )
         });
         operation.finish().fail_if_low_space()?;
-        Ok(rendered)
+        Ok(CommandOutput { records })
     }
 }
 
@@ -2541,10 +2539,19 @@ fn target_error(error: AppError, resolved: &agent::refs::ResolvedConversation) -
     }
 }
 
-fn ensure_complete_compact_output(output: String) -> Result<String> {
-    if output.ends_with('\n') {
-        Ok(output)
-    } else {
+/// The records a command prints on success.
+#[derive(Debug)]
+pub(crate) struct CommandOutput {
+    records: String,
+}
+
+impl CommandOutput {
+    /// The records; or the `budget-too-small` error when the budget cut them
+    /// short.
+    fn complete(self) -> Result<String> {
+        if self.records.ends_with('\n') {
+            return Ok(self.records);
+        }
         Err(AgentError::new(
             AgentErrorKind::BudgetTooSmall,
             None,
@@ -3569,7 +3576,7 @@ impl AgentService {
         &self,
         args: &AgentReadArgs,
         keys: Option<&[agent::refs::AgentConversationKey]>,
-    ) -> Result<String> {
+    ) -> Result<CommandOutput> {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
@@ -3656,7 +3663,7 @@ impl AgentService {
             },
         ));
         let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
-        let output = perf
+        let records = perf
             .time(Stage::Render, || {
                 agent::protocol::format_read_with_warnings(
                     &requests,
@@ -3672,14 +3679,14 @@ impl AgentService {
                 None => structured_agent_error(error),
             })?;
         operation.finish().fail_if_low_space()?;
-        Ok(output)
+        Ok(CommandOutput { records })
     }
 
     pub(crate) fn run_outline(
         &self,
         args: &AgentOutlineArgs,
         keys: Option<&[agent::refs::AgentConversationKey]>,
-    ) -> Result<String> {
+    ) -> Result<CommandOutput> {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
@@ -3723,7 +3730,7 @@ impl AgentService {
             subagent: outline_ref.subagent,
             call: None,
         };
-        let output = perf
+        let records = perf
             .time(Stage::Render, || {
                 agent::protocol::format_outline_with_warnings(
                     &request,
@@ -3734,7 +3741,7 @@ impl AgentService {
             })
             .map_err(|error| target_error(error, &resolved))?;
         operation.finish().fail_if_low_space()?;
-        Ok(output)
+        Ok(CommandOutput { records })
     }
 }
 
@@ -3893,7 +3900,9 @@ pub(crate) fn run_agent_read(
     args: &AgentReadArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
 ) -> Result<String> {
-    test_service().run_read(args, keys)
+    test_service()
+        .run_read(args, keys)
+        .map(|output| output.records)
 }
 
 #[cfg(test)]
@@ -3901,7 +3910,9 @@ pub(crate) fn run_agent_outline(
     args: &AgentOutlineArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
 ) -> Result<String> {
-    test_service().run_outline(args, keys)
+    test_service()
+        .run_outline(args, keys)
+        .map(|output| output.records)
 }
 
 #[cfg(test)]
@@ -7709,7 +7720,7 @@ mod tests {
             "read by the row's key".to_owned(),
             service()
                 .run_read(&read_args(reference.clone()), Some(keys))
-                .unwrap_or_else(crate::error_report),
+                .map_or_else(crate::error_report, |output| output.records),
         ));
         outputs.push((
             "outline by the row's key".to_owned(),
@@ -7722,7 +7733,7 @@ mod tests {
                     },
                     Some(keys),
                 )
-                .unwrap_or_else(crate::error_report),
+                .map_or_else(crate::error_report, |output| output.records),
         ));
         drop(other_refresh);
 
@@ -8508,7 +8519,8 @@ mod tests {
 
         let output = test_service()
             .run_read(&args, Some(std::slice::from_ref(&key)))
-            .unwrap();
+            .unwrap()
+            .records;
 
         let record = output
             .lines()
@@ -8680,7 +8692,8 @@ mode = "hybrid"
         std::fs::write(&path, "{malformed").unwrap();
         let output = service
             .run_read(&args, Some(std::slice::from_ref(&key)))
-            .unwrap();
+            .unwrap()
+            .records;
 
         assert!(output.contains("cached message"));
         assert_eq!(
@@ -8718,7 +8731,8 @@ mode = "hybrid"
 
         let output = test_service()
             .run_outline(&args, Some(std::slice::from_ref(&key)))
-            .unwrap();
+            .unwrap()
+            .records;
 
         assert!(output.contains("warnings=1"));
         assert!(output.contains("kind=malformed-transcript"));
