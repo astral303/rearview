@@ -2139,15 +2139,15 @@ fn every_agent_command_prints_its_perf_records_in_order() {
     for (args, stages) in [
         (
             vec!["agent", "within", reference, "needle", "--lexical"],
-            &["keys", "refresh", "transcript", "search", "render"][..],
+            &["keys", "transcript", "search", "render"][..],
         ),
         (
             vec!["agent", "read", reference],
-            &["keys", "refresh", "transcript", "render"][..],
+            &["keys", "transcript", "render"][..],
         ),
         (
             vec!["agent", "outline", reference],
-            &["keys", "refresh", "transcript", "render"][..],
+            &["keys", "transcript", "render"][..],
         ),
     ] {
         let records = perf_records_of(&run(
@@ -2157,4 +2157,17 @@ fn every_agent_command_prints_its_perf_records_in_order() {
         assert_perf_records_in_order(&records, stages, 1, false);
         assert_shows(&records, &transcript_record);
     }
+
+    set_modified(&transcript, "2026-01-02");
+    let older_copy = perf_records_of(&run(
+        config.path(),
+        &["agent", "read", reference, "--perf-stats"],
+    ));
+    assert_perf_records_in_order(
+        &older_copy,
+        &["keys", "refresh", "transcript", "render"],
+        1,
+        false,
+    );
+    assert_shows(&older_copy, "perf refresh-round sessions=1\n");
 }
