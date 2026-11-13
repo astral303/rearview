@@ -717,6 +717,18 @@ enum TargetCopy {
     Missing(agent::refs::AgentConversationKey),
 }
 
+/// A target's key, as [`AgentService::check_copy_without_reading`] checks
+/// it against its copy: an older copy is not read.
+enum CopyCheck {
+    /// The copy is current for the key, or the key adopted another copy.
+    Current(agent::refs::AgentConversationKey),
+    /// The copy is older than the key.
+    Older(agent::refs::AgentConversationKey),
+    /// The session is not in the session cache, or its copy isn't ready to
+    /// read.
+    Missing(agent::refs::AgentConversationKey),
+}
+
 /// The rule that decides whether a copy is current for a key.
 type CopyCurrency = fn(
     &history::sqlite_cache::HeldCopy<'_>,
@@ -947,20 +959,37 @@ impl AgentService {
         Ok(checked)
     }
 
-    /// `target` checked against its copy for its key by `currency`, without
-    /// parsing. A copy to adopt is read as current: the key uses its
-    /// generation and sub-agents. An older copy is read as it is, once, and
-    /// kept for the command's reads. A target whose transcript the command
-    /// holds is not checked.
+    /// `target` checked against its copy by `currency`, without parsing:
+    /// [`Self::check_copy_without_reading`], then [`Self::read_older_copy`]
+    /// for an older copy. A target whose transcript the command already has
+    /// is not checked.
     fn check_target_copy(
         &self,
         operation: &history::OperationScope,
-        mut target: agent::refs::AgentConversationKey,
+        target: agent::refs::AgentConversationKey,
         currency: CopyCurrency,
     ) -> Result<TargetCopy> {
         if self.transcripts.borrow().contains_key(&target.path) {
             return Ok(TargetCopy::Current(target));
         }
+        Ok(
+            match self.check_copy_without_reading(operation, target, currency)? {
+                CopyCheck::Current(key) => TargetCopy::Current(key),
+                CopyCheck::Older(key) => self.read_older_copy(key),
+                CopyCheck::Missing(key) => TargetCopy::Missing(key),
+            },
+        )
+    }
+
+    /// `target` checked against its copy for its key by `currency`, without
+    /// reading the copy's entries. A copy to adopt is read as current: the
+    /// key uses its generation and sub-agents.
+    fn check_copy_without_reading(
+        &self,
+        operation: &history::OperationScope,
+        mut target: agent::refs::AgentConversationKey,
+        currency: CopyCurrency,
+    ) -> Result<CopyCheck> {
         let base = self.environment.cache_base();
         let currency = operation.read_when_unlocked(|| {
             history::sqlite_cache::found(history::sqlite_cache::read_copy_without_waiting(
@@ -970,31 +999,34 @@ impl AgentService {
             ))
         })?;
         Ok(match currency {
-            Some(history::sqlite_cache::Currency::Current) => TargetCopy::Current(target),
+            Some(history::sqlite_cache::Currency::Current) => CopyCheck::Current(target),
             Some(history::sqlite_cache::Currency::Adopt {
                 generation,
                 subagents,
             }) => {
                 target.publication = history::sqlite_cache::Publication::Published { generation };
                 target.subagents = subagents;
-                TargetCopy::Current(target)
+                CopyCheck::Current(target)
             }
-            Some(history::sqlite_cache::Currency::Older) => {
-                let copy = self
-                    .perf
-                    .time_transcript_parse(&target, || self.read_transcript(&target));
-                let cached_until = copy.as_ref().ok().and_then(|copy| {
-                    let times = history::MessageTimes::of_messages(&copy.messages);
-                    chrono::TimeZone::timestamp_opt(&chrono::Local, times.last_second()?, 0)
-                        .single()
-                });
-                self.transcripts
-                    .borrow_mut()
-                    .insert(target.path.clone(), copy);
-                TargetCopy::Older(target, history::provider::StaleCopy { cached_until })
-            }
-            None => TargetCopy::Missing(target),
+            Some(history::sqlite_cache::Currency::Older) => CopyCheck::Older(target),
+            None => CopyCheck::Missing(target),
         })
+    }
+
+    /// `target`'s older copy, read as it is once and kept for the command's
+    /// reads.
+    fn read_older_copy(&self, target: agent::refs::AgentConversationKey) -> TargetCopy {
+        let copy = self
+            .perf
+            .time_transcript_parse(&target, || self.read_transcript(&target));
+        let cached_until = copy.as_ref().ok().and_then(|copy| {
+            let times = history::MessageTimes::of_messages(&copy.messages);
+            chrono::TimeZone::timestamp_opt(&chrono::Local, times.last_second()?, 0).single()
+        });
+        self.transcripts
+            .borrow_mut()
+            .insert(target.path.clone(), copy);
+        TargetCopy::Older(target, history::provider::StaleCopy { cached_until })
     }
 
     /// The keys of `targets`, distinct sessions, each copy brought up to
