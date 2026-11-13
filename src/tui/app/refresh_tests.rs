@@ -548,7 +548,7 @@ pub(super) fn serve_list_change(app: &mut App) {
             Arc::default(),
         );
         let outcome = change.make(&operation);
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         outcome
     })
     .join()
@@ -570,7 +570,7 @@ pub(super) fn serve_session_refresh(app: &mut App) {
             Arc::default(),
         );
         let outcome = refresh.refresh(&operation);
-        operation.finish().and(outcome)
+        operation.finish().fail_if_low_space().and(outcome)
     })
     .join()
     .unwrap();

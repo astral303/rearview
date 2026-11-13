@@ -43,7 +43,7 @@ impl KimiSession {
         let base = tempfile::tempdir().unwrap();
         let cache = admitted_cache(base.path());
         cache.admit_storage(storage_of(Source::Kimi)).unwrap();
-        let mut session = Self {
+        let session = Self {
             home,
             base,
             cache,

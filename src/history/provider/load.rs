@@ -1,7 +1,9 @@
 //! The load loop shared by every provider that stores sessions under roots.
 
 use super::outcome::{SessionOutcome, SessionRead, UnwrittenParse};
-use super::storage::{DiscoveredSessions, ResolvedSession, SessionStub, UnreadableDirectory};
+use super::storage::{
+    DiscoveredSessions, ResolvedSession, SessionCache, SessionStub, UnreadableDirectory,
+};
 use super::{Fingerprint, SessionRoot, SessionStorage, SessionTitle, TitleAndSummary};
 use crate::agent::diagnostic::AgentWarning;
 use crate::agent::transcript::{read_failure_warning, unlisted_warning};
@@ -30,7 +32,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 mod cache_access;
 #[cfg(test)]
@@ -1082,22 +1084,15 @@ impl SessionLoader<'_> {
             catalogue,
         } = snapshot;
         let reconciles_deletions = caches.deletions == Deletions::Reconcile;
-        let debug_level = self.debug_level;
         let copies = database.reader().copy_handles();
-        std::thread::scope(|scope| {
-            let (writes, received) = mpsc::sync_channel(DATABASE_WRITE_QUEUE_LENGTH);
-            let writer = match database {
-                CacheDatabase::Writer(writer) if caches.access.owner().is_some() => Some(
-                    scope.spawn(move || sqlite_cache::apply_writes(writer, received, debug_level)),
-                ),
-                CacheDatabase::Writer(_) | CacheDatabase::Reader(_) => {
-                    drop(received);
-                    None
-                }
-            };
+        let writer = match database {
+            CacheDatabase::Writer(writer) if caches.access.owner().is_some() => Some(writer),
+            CacheDatabase::Writer(_) | CacheDatabase::Reader(_) => None,
+        };
+        let (loaded, _) = with_writer_thread(writer, self.debug_level, |writes| {
             let database = DatabaseWrites {
                 current: &current,
-                writes: &writes,
+                writes,
                 catalogue: &catalogue,
                 copies,
             };
@@ -1122,20 +1117,11 @@ impl SessionLoader<'_> {
                 .cloned()
                 .collect();
             if reconciles_deletions && !removed.is_empty() && caches.access.owner().is_some() {
-                let _ = writes.send(CacheWrite::Removed {
-                    storage: self.storage.cache(),
-                    root: root.clone(),
-                    cache_keys: removed,
-                });
-            }
-            drop(writes);
-            if let Some(writer) = writer {
-                writer
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                writes.queue_removal(self.storage.cache(), root.clone(), removed);
             }
             loaded
-        })
+        });
+        loaded
     }
 
     /// The root's cache as it is now, read without refresh ownership through
@@ -1764,11 +1750,76 @@ impl RootCache {
 /// their entries until they are written.
 const DATABASE_WRITE_QUEUE_LENGTH: usize = 4;
 
+/// Run `body` with a [`WriteQueue`]; [`sqlite_cache::apply_writes`] applies
+/// its writes to `writer` on a thread of its own. Returns `body`'s result,
+/// and `writer` once its writes end. Without a writer, each write `body`
+/// queues is dropped unwritten.
+fn with_writer_thread<T>(
+    writer: Option<CacheWriter>,
+    debug_level: Option<DebugLevel>,
+    body: impl FnOnce(&WriteQueue) -> T,
+) -> (T, Option<CacheWriter>) {
+    std::thread::scope(|scope| {
+        let (writes, received) = mpsc::sync_channel(DATABASE_WRITE_QUEUE_LENGTH);
+        let applying = match writer {
+            Some(writer) => {
+                Some(scope.spawn(move || sqlite_cache::apply_writes(writer, received, debug_level)))
+            }
+            None => {
+                drop(received);
+                None
+            }
+        };
+        let queue = WriteQueue(writes);
+        let result = body(&queue);
+        drop(queue);
+        let writer = applying.map(|applying| {
+            applying
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        (result, writer)
+    })
+}
+
+/// The writes a body of [`with_writer_thread`] sends to its writer thread.
+struct WriteQueue(mpsc::SyncSender<CacheWrite>);
+
+impl WriteQueue {
+    fn queue(&self, record: impl Into<Arc<SessionRecord>>) -> QueuedWrite {
+        let record = record.into();
+        let holds_entries = record.writes_its_entries();
+        let (session_write, outcome) = CacheWrite::session(record);
+        let _ = self.0.send(session_write);
+        QueuedWrite {
+            outcome,
+            holds_entries,
+        }
+    }
+
+    /// Writes `record` and waits for the write: the generation it gave the
+    /// session's copy; `None` when it failed, kept the earlier copy, or was
+    /// dropped unwritten.
+    fn write_and_wait(&self, record: impl Into<Arc<SessionRecord>>) -> Option<i64> {
+        self.queue(record).outcome.recv().ok()?.ok()?
+    }
+
+    /// Queues the removal of the sessions `storage` no longer finds at
+    /// `cache_keys` under `root`.
+    fn queue_removal(&self, storage: SessionCache, root: SessionRoot, cache_keys: Vec<String>) {
+        let _ = self.0.send(CacheWrite::Removed {
+            storage,
+            root,
+            cache_keys,
+        });
+    }
+}
+
 /// A root load's writes to the session cache database, and the fingerprint
 /// the database held for each session under the root when the load began.
 struct DatabaseWrites<'a> {
     current: &'a HashMap<String, CachedFingerprint>,
-    writes: &'a mpsc::SyncSender<CacheWrite>,
+    writes: &'a WriteQueue,
     catalogue: &'a HashMap<String, CatalogueSession>,
     /// The handles of the copies the writes make, reading as the
     /// catalogue's rows read.
@@ -1786,13 +1837,7 @@ impl<'a> DatabaseWrites<'a> {
 
     /// Queues the write of `record`.
     fn write(&self, record: SessionRecord) -> QueuedWrite {
-        let holds_entries = record.writes_its_entries();
-        let (write, outcome) = CacheWrite::session(record);
-        let _ = self.writes.send(write);
-        QueuedWrite {
-            outcome,
-            holds_entries,
-        }
+        self.writes.queue(record)
     }
 
     /// The listed row the database held for `stub`'s session when the load
@@ -1807,7 +1852,7 @@ impl<'a> DatabaseWrites<'a> {
     /// Writes `resumed`'s record and waits for the write; returns its row,
     /// reading the copy the write left. `None` when the write failed.
     fn write_resumed(&self, resumed: ResumedSession) -> Option<Conversation> {
-        let generation = self.write(resumed.record).outcome.recv().ok()?.ok()??;
+        let generation = self.writes.write_and_wait(resumed.record)?;
         Some(published_at(resumed.row, generation))
     }
 }
@@ -2400,7 +2445,7 @@ mod tests {
             ..LoadOptions::default()
         };
         let loaded = load_sessions(&environment, storage, options, &operation, &mut |_, _| {});
-        operation.finish().and(loaded)
+        operation.finish().fail_if_low_space().and(loaded)
     }
 
     fn load_metered_with_cache(
@@ -2417,7 +2462,7 @@ mod tests {
             ..LoadOptions::default()
         };
         let loaded = load_sessions(&environment, storage, options, &operation, &mut |_, _| {});
-        operation.finish().and(loaded)
+        operation.finish().fail_if_low_space().and(loaded)
     }
 
     fn load_sessions_with_cache(
@@ -2446,7 +2491,7 @@ mod tests {
             needs_reading,
             &operation,
         );
-        operation.finish().and(rediscovered)
+        operation.finish().fail_if_low_space().and(rediscovered)
     }
 
     /// [`cache_sessions`] for one session in the environment of
@@ -2482,7 +2527,7 @@ mod tests {
             let outcomes =
                 cache_sessions_through(self, self.storage_roots().unwrap(), &named, &operation)
                     .unwrap();
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             outcomes
         }
 
@@ -2490,7 +2535,7 @@ mod tests {
         fn load_waiting(&self) -> Result<LoadedSessions> {
             let operation = waiting_operation(self.environment);
             let loaded = self.load(LeftOutRows::NONE, &operation, &mut |_, _| {});
-            operation.finish().and(loaded)
+            operation.finish().fail_if_low_space().and(loaded)
         }
     }
 
@@ -2518,7 +2563,7 @@ mod tests {
                 .outcomes
                 .pop()
                 .expect("one read");
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             outcome
         }
 
@@ -2533,7 +2578,7 @@ mod tests {
             let loaded = self
                 .load_root(root, found, LeftOutRows::NONE, &operation, read)
                 .unwrap();
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             loaded
         }
 
@@ -2608,7 +2653,7 @@ mod tests {
             )
             .into_record()
             .unwrap_or_else(|| panic!("{:?}'s session has a record", row.source));
-            let mut database = SqliteCache::open_for_refresh(ownership.token()).unwrap();
+            let database = SqliteCache::open_for_refresh(ownership.token()).unwrap();
             database.admit_storage(storage.cache()).unwrap();
             database.write(&record).unwrap();
             drop(database);
@@ -2713,11 +2758,11 @@ mod tests {
             let running = scope.spawn(move || {
                 let loaded =
                     loader.load_root(root_ref, captured, LeftOutRows::NONE, &operation, &read);
-                operation.finish().and(loaded).unwrap()
+                operation.finish().fail_if_low_space().and(loaded).unwrap()
             });
             wait_for_refresh(&meter);
             assert_eq!(home.watch().parses_begun(), 0);
-            let mut writer = SqliteCache::open_for_refresh(&owner.token()).unwrap();
+            let writer = SqliteCache::open_for_refresh(&owner.token()).unwrap();
             for stub in [&old, &added] {
                 writer
                     .write(
@@ -2776,7 +2821,7 @@ mod tests {
         let stub = discovered_stub(&home, &home.write("warm", 0, &["a question"]));
         let storage = home.storage();
         let root = home.root();
-        let mut database = SqliteCache::open(&rearview(base.path())).unwrap();
+        let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         database
@@ -2845,7 +2890,7 @@ mod tests {
                     &operation,
                     &mut |_, _| {},
                 );
-                operation.finish().and(loaded).unwrap()
+                operation.finish().fail_if_low_space().and(loaded).unwrap()
             });
             wait_for_refresh(&meter);
             assert_eq!(stored_keys_in(base.path(), &home), [key]);
@@ -3325,7 +3370,7 @@ mod tests {
             .load(LeftOutRows::NONE, &operation, &mut |_, _| {})
             .unwrap();
         let after_load = log_and_checkpointed_pages();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         home.write("second", 1, &["a changed question"]);
         let operation = waiting_operation(&environment);
         loader
@@ -3338,7 +3383,7 @@ mod tests {
             )
             .unwrap();
         let after_refresh = log_and_checkpointed_pages();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         assert_eq!(sessions_before, 0);
         assert_eq!(
@@ -3881,7 +3926,7 @@ mod tests {
         .unwrap()
         .pop()
         .expect("one read");
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         let (read, next) = outcome.into_parts();
         let SessionRead::Listed(row) = read else {
@@ -3928,7 +3973,7 @@ mod tests {
         .unwrap()
         .pop()
         .expect("one read");
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         let (read, next) = outcome.into_parts();
         let SessionRead::Listed(row) = read else {
@@ -4351,6 +4396,7 @@ mod tests {
             );
             operation
                 .finish()
+                .fail_if_low_space()
                 .and(reads)
                 .unwrap()
                 .outcomes
@@ -4490,7 +4536,7 @@ mod tests {
                 StubsAfterRediscovery::SameFiles,
                 &operation,
             );
-            operation.finish().and(reads).unwrap();
+            operation.finish().fail_if_low_space().and(reads).unwrap();
         } else {
             loader.load_waiting().unwrap();
         }
@@ -4785,7 +4831,7 @@ mod tests {
             &operation,
         )
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         let fresh: Vec<_> = home
             .storage()
@@ -4823,7 +4869,7 @@ mod tests {
             &operation,
         )
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         assert_eq!(
             result.ignored,
             vec![FilterTerm::new(
@@ -5013,7 +5059,7 @@ mod tests {
                 .mark_admitted()
                 .unwrap();
             super::super::contract_tests::load_under(fixture, home.path(), base.path());
-            let mut database = SqliteCache::open(&rearview(base.path())).unwrap();
+            let database = SqliteCache::open(&rearview(base.path())).unwrap();
             let keys = database.stored_keys(storage, &root).unwrap();
             assert_eq!(keys.len(), 1);
             database.remove(storage, &root, &keys).unwrap();
@@ -5326,7 +5372,7 @@ mod tests {
         .unwrap()
         .pop()
         .expect("one read");
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         let (SessionRead::Listed(row), _) = outcome.into_parts() else {
             panic!("the copy is read");
@@ -6190,7 +6236,7 @@ mod tests {
         );
         let operation = waiting_operation(&environment);
         let mut outcomes = loader.rediscover(&|_| true, &operation).unwrap().outcomes;
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         assert_eq!(outcomes.len(), 1, "the rediscovery reads one session");
         outcomes.pop().unwrap().into_parts().0
     }

@@ -132,6 +132,10 @@
   dependency versions rearview was tested with.
 - `--debug-search` now prints a `perf` record for each stage of the session
   list's search on stderr, as `agent search --perf-stats` does for its own.
+- `--debug` now prints `Wrote session … to the session cache database` for
+  the cache writes of a list refresh, as it does for the launch's. A write
+  failure that repeats prints once for each of an agent's session
+  directories.
 - Compare two rearview binaries' search-stage medians and process CPU time
   with `scripts/compare-perf.sh`. Its per-run table also shows other
   processes' CPU time and the machine's disk use.

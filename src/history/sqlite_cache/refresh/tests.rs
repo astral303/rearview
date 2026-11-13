@@ -6,7 +6,7 @@ use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
 use crate::history::sqlite_cache::low_space::run_deletion;
 use crate::history::sqlite_cache::observer::{Observation, observe};
 use crate::history::sqlite_cache::{
-    CacheWrite, CacheWriter, ProcessIdentity, SessionRecord, SessionStatus, SqliteCache,
+    CacheWrite, CacheWriter, ProcessIdentity, SessionRecord, SessionStatus, SqliteCache, is_busy,
 };
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -232,7 +232,7 @@ fn run_owner(base: &Path, activity: OwnerActivity, wait_for_release: impl FnOnce
     match activity {
         OwnerActivity::Idle => wait_for_release(),
         OwnerActivity::InsideBatch => {
-            let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
+            let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
             cache.mark_admitted().unwrap();
             cache.write(&record()).unwrap();
             let batch = transaction(&cache.connection, owner.token()).unwrap();
@@ -453,12 +453,12 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
-    let mut old = SqliteCache::open_for_refresh(owner.token()).unwrap();
+    let old = SqliteCache::open_for_refresh(owner.token()).unwrap();
     old.mark_admitted().unwrap();
     let original = record();
     old.write(&original).unwrap();
     let replacement = replace_owner(&base);
-    let mut current = SqliteCache::open_for_refresh(&replacement).unwrap();
+    let current = SqliteCache::open_for_refresh(&replacement).unwrap();
     let mut newer = record();
     newer.catalogue.fingerprint.mtime_secs = 2;
     current.write(&newer).unwrap();
@@ -486,13 +486,15 @@ fn takeover_between_batches_prevents_more_entries_and_final_status() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
-    let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
+    let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.mark_admitted().unwrap();
     let record = record();
     let (session, _) = cache.write_catalogue(&record, None).unwrap();
     let replacement = replace_owner(&base);
     assert!(matches!(
-        super::super::session_transaction(&mut cache.connection, session, owner.token()),
+        WriteBatch::run(&cache.connection, owner.token(), |batch| {
+            super::super::require_writing(batch, session)
+        }),
         Err(AppError::SessionCacheRefreshLost)
     ));
     assert!(matches!(
@@ -514,7 +516,7 @@ fn schema_and_page_rebuilds_preserve_active_ownership() {
         connection.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta VALUES ('schema_version', 'old')").unwrap();
         drop(connection);
         let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
-        let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
+        let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
         cache.mark_admitted().unwrap();
         cache.write(&record()).unwrap();
         owner.token.write_batch(|| ()).unwrap();
@@ -954,7 +956,7 @@ fn sqlite_content_batches_also_record_their_commit_time() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
-    let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
+    let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.mark_admitted().unwrap();
     cache
         .connection
@@ -976,7 +978,7 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
-    let mut cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
+    let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
     cache.mark_admitted().unwrap();
     let original = record();
     cache.write(&original).unwrap();
@@ -1963,6 +1965,243 @@ fn failure_to_begin_write_batch_revokes_publication() {
             .token
             .write_batch(|| panic!("a failed BEGIN loses write permission"))
             .is_err()
+    );
+}
+
+/// An owner of `base`'s cache, and a refresh connection to it whose
+/// database holds one `sentinel` row of value 1.
+fn owner_and_sentinel(base: &CacheBase) -> (RefreshOwnership, Connection) {
+    let owner = RefreshOwnership::acquire_for_test(base).unwrap();
+    let connection = connect(base.path(), Duration::ZERO).unwrap();
+    connection
+        .execute_batch("CREATE TABLE sentinel (value INTEGER); INSERT INTO sentinel VALUES (1)")
+        .unwrap();
+    (owner, connection)
+}
+
+fn sentinel(connection: &Connection) -> i64 {
+    connection
+        .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn class_of<T>(ran: &Result<T>) -> Option<WriteErrorClass> {
+    ran.as_ref().err().map(WriteErrorClass::of)
+}
+
+#[test]
+fn batch_that_cant_begin_doesnt_run_body_and_revokes_write_permission() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, connection) = owner_and_sentinel(&rearview(directory.path()));
+    connection.execute_batch("BEGIN").unwrap();
+
+    let ran = WriteBatch::run(&connection, owner.token(), |_| -> Result<()> {
+        panic!("a batch that cannot begin doesn't run its body")
+    });
+
+    connection.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        class_of(&ran),
+        Some(WriteErrorClass::Io),
+        "SQLite refuses a BEGIN inside a transaction: {ran:?}"
+    );
+    assert!(
+        !owner.token().can_publish(),
+        "a batch that cannot begin revokes the owner's write permission"
+    );
+}
+
+#[test]
+fn batch_whose_ownership_check_fails_doesnt_run_body_and_revokes_write_permission() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, connection) = owner_and_sentinel(&rearview(directory.path()));
+    connection
+        .execute_batch("ALTER TABLE refresh_state RENAME TO moved_state")
+        .unwrap();
+
+    let ran = WriteBatch::run(&connection, owner.token(), |_| -> Result<()> {
+        panic!("a batch whose ownership check fails doesn't run its body")
+    });
+
+    assert_eq!(
+        class_of(&ran),
+        Some(WriteErrorClass::Io),
+        "the ownership check fails reading a missing table: {ran:?}"
+    );
+    assert!(
+        !owner.token().can_publish(),
+        "a failed ownership check revokes the owner's write permission"
+    );
+}
+
+#[test]
+fn batch_whose_body_fails_rolls_back_and_keeps_write_permission() {
+    let failures = [
+        ("INSERT INTO missing VALUES (1)", WriteErrorClass::Io),
+        (
+            "INSERT INTO refresh_state (singleton, last_commit_ms) VALUES (1, 0)",
+            WriteErrorClass::Other,
+        ),
+    ];
+    for (statement, class) in failures {
+        let directory = tempfile::tempdir().unwrap();
+        let (owner, connection) = owner_and_sentinel(&rearview(directory.path()));
+
+        let ran = WriteBatch::run(&connection, owner.token(), |batch| {
+            batch.execute("UPDATE sentinel SET value = 2", [])?;
+            batch.execute(statement, [])?;
+            Ok(())
+        });
+
+        assert_eq!(
+            class_of(&ran),
+            Some(class),
+            "`{statement}` fails in the body: {ran:?}"
+        );
+        assert_eq!(sentinel(&connection), 1, "the body's batch rolls back");
+        assert!(
+            owner.token().can_publish(),
+            "a {class:?} failure in the body keeps the owner's write permission"
+        );
+    }
+}
+
+#[test]
+fn batch_whose_commit_is_refused_rolls_back_and_revokes_write_permission() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, mut connection) = owner_and_sentinel(&rearview(directory.path()));
+    connection.commit_hook(Some(|| true)).unwrap();
+
+    let ran = WriteBatch::run(&connection, owner.token(), |batch| {
+        Ok(batch.execute("UPDATE sentinel SET value = 2", [])?)
+    });
+
+    assert_eq!(
+        class_of(&ran),
+        Some(WriteErrorClass::Io),
+        "the commit hook refuses the commit: {ran:?}"
+    );
+    assert_eq!(sentinel(&connection), 1, "the refused batch rolls back");
+    assert!(
+        !owner.token().can_publish(),
+        "a refused commit revokes the owner's write permission"
+    );
+}
+
+#[test]
+fn batch_whose_commit_time_isnt_recorded_rolls_back_and_revokes_write_permission() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, connection) = owner_and_sentinel(&rearview(directory.path()));
+    connection
+        .execute_batch(
+            "CREATE TRIGGER refuse_commit_time BEFORE UPDATE ON refresh_state \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+
+    let ran = WriteBatch::run(&connection, owner.token(), |batch| {
+        Ok(batch.execute("UPDATE sentinel SET value = 2", [])?)
+    });
+
+    assert_eq!(
+        class_of(&ran),
+        Some(WriteErrorClass::Other),
+        "a trigger refuses the commit time's update: {ran:?}"
+    );
+    assert_eq!(sentinel(&connection), 1, "the batch rolls back");
+    assert!(
+        !owner.token().can_publish(),
+        "a commit time that can't be recorded revokes the owner's write permission"
+    );
+}
+
+#[test]
+fn batch_whose_commit_fails_foreign_key_rolls_back_and_keeps_write_permission() {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, connection) = owner_and_sentinel(&rearview(directory.path()));
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE parents (id INTEGER PRIMARY KEY);
+             CREATE TABLE children (parent INTEGER REFERENCES parents (id)
+                 DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .unwrap();
+
+    let ran = WriteBatch::run(&connection, owner.token(), |batch| {
+        batch.execute("UPDATE sentinel SET value = 2", [])?;
+        Ok(batch.execute("INSERT INTO children (parent) VALUES (1)", [])?)
+    });
+
+    assert_eq!(
+        class_of(&ran),
+        Some(WriteErrorClass::Other),
+        "the commit fails a deferred foreign key: {ran:?}"
+    );
+    assert_eq!(sentinel(&connection), 1, "the failed batch rolls back");
+    assert!(
+        owner.token().can_publish(),
+        "a foreign-key failure at the commit keeps the owner's write permission"
+    );
+}
+
+#[test]
+fn checked_batch_on_drive_low_on_space_doesnt_begin() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path())
+        .with_disk_space(Arc::new(super::super::DriveRunningOut::after(0, || {})));
+    let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+    let connection = connect(base.path(), Duration::ZERO).unwrap();
+
+    let ran = WriteBatch::run_checking_space(&connection, owner.token(), |_| -> Result<()> {
+        panic!("a batch on a drive low on space doesn't run its body")
+    });
+
+    assert_eq!(
+        class_of(&ran),
+        Some(WriteErrorClass::LowSpace),
+        "the free-space check fails first: {ran:?}"
+    );
+    assert!(
+        !owner.token().can_publish(),
+        "low space revokes the owner's write permission"
+    );
+}
+
+#[test]
+fn batch_whose_body_doesnt_find_anything_rolls_back_without_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let (owner, connection) =
+        owner_and_sentinel(&rearview_on(directory.path(), Arc::clone(&clock)));
+    let last_commit = || -> i64 {
+        connection
+            .query_row("SELECT last_commit_ms FROM refresh_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    let committed_before = last_commit();
+    clock.advance(Duration::from_secs(1));
+
+    let ran = WriteBatch::run_checking_space_or_roll_back(&connection, owner.token(), |batch| {
+        batch.execute("UPDATE sentinel SET value = 2", [])?;
+        Ok(None::<()>)
+    });
+
+    assert!(
+        matches!(ran, Ok(None)),
+        "the body doesn't find anything to write: {ran:?}"
+    );
+    assert_eq!(sentinel(&connection), 1, "the batch rolls back");
+    assert_eq!(
+        last_commit(),
+        committed_before,
+        "a batch whose body doesn't find anything doesn't commit"
+    );
+    assert!(
+        owner.token().can_publish(),
+        "the owner keeps its write permission"
     );
 }
 

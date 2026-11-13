@@ -111,8 +111,8 @@ impl TaskSupervisor {
 
     /// Run `refresh` as one operation on the session cache that waits for
     /// refresh ownership as long as another rearview keeps it. Its outcome
-    /// comes through [`Self::finished_refresh`], failed as
-    /// [`OperationScope::finish`] fails.
+    /// comes through [`Self::finished_refresh`], failed with the low-space
+    /// error of [`OperationScope::finish`].
     pub(crate) fn refresh(
         &mut self,
         refresh: impl FnOnce(&Environment, &OperationScope) -> Result<RefreshOutcome> + Send + 'static,
@@ -124,7 +124,7 @@ impl TaskSupervisor {
         self.run(Box::new(move || {
             let operation = operation(&environment);
             let refreshed = refresh(&environment, &operation);
-            let _ = outcome.send(operation.finish().and(refreshed));
+            let _ = outcome.send(operation.finish().fail_if_low_space().and(refreshed));
         }));
     }
 
@@ -139,9 +139,9 @@ impl TaskSupervisor {
         self.run(Box::new(move || {
             let operation = operation(&environment);
             let changed = change.make(&operation);
-            // Ignore the finish, because only a cache write that found the
-            // drive low on space fails it, and a rename or delete doesn't
-            // make that write.
+            // Ignore the operation's end: a rename or delete doesn't check
+            // free space, and its own outcome carries the error of a write
+            // that stopped it.
             let _ = operation.finish();
             let _ = outcome.send(changed);
         }));
@@ -150,8 +150,8 @@ impl TaskSupervisor {
     /// Read the file at `path`, opened directly, with the preview `show_last`
     /// selects, as one operation on the session cache that waits for refresh
     /// ownership as long as another rearview keeps it. Its read comes through
-    /// [`Self::finished_direct_file`], failed as [`OperationScope::finish`]
-    /// fails.
+    /// [`Self::finished_direct_file`], failed with the low-space error of
+    /// [`OperationScope::finish`].
     pub(crate) fn read_direct_file(&mut self, path: PathBuf, show_last: bool) {
         let (read, received) = mpsc::channel();
         let environment = self.environment.clone();
@@ -160,7 +160,7 @@ impl TaskSupervisor {
         self.run(Box::new(move || {
             let operation = operation(&environment);
             let opened = open_direct_file(&environment, &path, show_last, &operation);
-            let _ = read.send(operation.finish().and(opened));
+            let _ = read.send(operation.finish().fail_if_low_space().and(opened));
         }));
     }
 

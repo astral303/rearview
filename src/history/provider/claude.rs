@@ -1508,7 +1508,7 @@ pub(crate) mod tests {
             .unwrap()
             .pop()
             .unwrap();
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             let (SessionRead::Listed(read), _) = outcome.into_parts() else {
                 panic!("{} was not read as a listed session", transcript.display());
             };

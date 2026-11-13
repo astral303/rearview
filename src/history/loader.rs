@@ -10,7 +10,7 @@ use super::provider::{
 };
 use super::sqlite_cache::{
     AwaitedRefresh, Cancellation, Observation, OperationScope, OtherRearview, Patience,
-    SessionAddress,
+    SessionAddress, WriteErrorClass,
 };
 use super::{
     Conversation, Environment, FilterTerm, KnownSessions, LoadProgress, LoaderMessage,
@@ -152,7 +152,9 @@ impl ProviderHistory {
                 },
             );
             match loaded {
-                Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
+                Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
+                    return Err(error);
+                }
                 Ok(mut loaded) => {
                     history.usable |= root_on_disk;
                     for term in loaded.ignored {
@@ -281,7 +283,7 @@ pub fn load_all_conversations(
         LeftOutRows::NONE,
         &operation,
     )?;
-    operation.finish()?;
+    operation.finish().fail_if_low_space()?;
     Ok(history.conversations)
 }
 
@@ -447,9 +449,14 @@ pub fn stream_all_conversations(
         let stale = loaded.as_ref().map_or_else(|_| Vec::new(), stale_sessions);
         (loaded, stale)
     };
-    let have_writes_stopped = operation.has_lost_write_permission();
-    let history = match loaded.and_then(|history| operation.finish().map(|()| history)) {
-        Ok(history) => history,
+    let finished = loaded.and_then(|history| {
+        let end = operation.finish();
+        let lost_write_permission = end.lost_write_permission;
+        end.fail_if_low_space()
+            .map(|()| (history, lost_write_permission))
+    });
+    let (history, lost_write_permission) = match finished {
+        Ok(finished) => finished,
         Err(error) => {
             let _ = tx.send(LoaderMessage::Fatal(error));
             return;
@@ -463,7 +470,7 @@ pub fn stream_all_conversations(
         debug::warn(options.debug_level, &report);
         let _ = tx.send(LoaderMessage::ProviderError);
     }
-    if have_writes_stopped {
+    if lost_write_permission {
         let _ = tx.send(LoaderMessage::CacheWritesStopped(stale));
     }
     let _ = tx.send(LoaderMessage::Done);
@@ -649,7 +656,7 @@ pub fn delete_empty_sessions(
             ..DeleteEmptySummary::default()
         }
     };
-    operation.finish()?;
+    operation.finish().fail_if_low_space()?;
     Ok(summary)
 }
 

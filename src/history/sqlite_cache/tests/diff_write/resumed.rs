@@ -69,7 +69,7 @@ impl CodexSession {
         let base = tempfile::tempdir().unwrap();
         let cache = admitted_cache(base.path());
         cache.admit_storage(storage_of(Source::Codex)).unwrap();
-        let mut session = Self {
+        let session = Self {
             home,
             base,
             cache,
@@ -859,7 +859,7 @@ fn load_after_archived_tree_is_retargeted_reads_the_session_whole_once() {
         )
         .unwrap()
         .conversations;
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         rows
     };
     load();

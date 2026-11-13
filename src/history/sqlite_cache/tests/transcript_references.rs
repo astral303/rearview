@@ -1,4 +1,5 @@
-use super::super::{CacheWrite, SqliteCache, apply_writes, refresh};
+use super::super::refresh::{self, WriteBatch};
+use super::super::{CacheWrite, SqliteCache, apply_writes};
 use super::{AgentSession, every_record_sessions};
 use crate::error::AppError;
 use rusqlite::{Connection, OpenFlags, ffi};
@@ -133,15 +134,15 @@ fn session_removal_doesnt_keep_a_statement_journal() {
 fn deleted_transcript_still_referenced_fails_the_commit_with_its_cause() {
     let directory = tempfile::tempdir().unwrap();
     let cache = super::admitted_cache(directory.path());
-    let batch = refresh::transaction(&cache.connection, cache.token()).unwrap();
-    batch.execute_batch(SESSION_FROM_A_SUB_AGENT).unwrap();
-    refresh::commit(batch, cache.token()).unwrap();
+    WriteBatch::run(&cache.connection, cache.token(), |batch| {
+        Ok(batch.execute_batch(SESSION_FROM_A_SUB_AGENT)?)
+    })
+    .unwrap();
 
-    let batch = refresh::transaction(&cache.connection, cache.token()).unwrap();
-    batch
-        .execute("DELETE FROM transcripts WHERE id = 1", [])
-        .unwrap();
-    let committed = refresh::commit(batch, cache.token());
+    let committed = WriteBatch::run(&cache.connection, cache.token(), |batch| {
+        batch.execute("DELETE FROM transcripts WHERE id = 1", [])?;
+        Ok(())
+    });
 
     assert!(
         matches!(
@@ -221,7 +222,7 @@ fn write_failing_its_references_at_commit_rolls_back_alone_and_later_writes_land
     let directory = tempfile::tempdir().unwrap();
     let base = super::rearview_at(directory.path());
     let ownership = refresh::RefreshOwnership::acquire_for_test(&base).unwrap();
-    let mut writer = SqliteCache::open_for_refresh(ownership.token()).unwrap();
+    let writer = SqliteCache::open_for_refresh(ownership.token()).unwrap();
     writer.mark_admitted().unwrap();
     let sessions = every_record_sessions();
     let (failing, later) = (&sessions[0], &sessions[1]);

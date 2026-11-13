@@ -8,7 +8,7 @@ fn database_backed_sessions_validate_current_logical_fingerprint() {
         .find(|session| session.row.source == Source::OpenCode)
         .unwrap();
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let storage = storage_of(Source::OpenCode);
     let root = root_of(&session);
     let stub = stub_of(&session, 1);
@@ -72,7 +72,7 @@ fn resumed_subagents_earlier_files_are_dependencies_before_splicing() {
             .any(|file| file.path == child.root && file.kind == "continuation")
     );
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     cache.write(&record).unwrap();
     let newest = CachedFingerprint::of_file(&child.newest).unwrap();
     let earlier = std::fs::read_to_string(&child.root).unwrap();
@@ -106,7 +106,7 @@ fn catalogue_read_stats_only_files_discovery_didnt_stamp() {
     };
     let discovered = discovered_at(1);
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     cache
         .write(&parsed_record(Source::Codex, &root, &discovered))
         .unwrap();
@@ -148,7 +148,7 @@ fn changing_or_removing_earlier_codex_rollout_invalidates_ordinary_text() {
         home.path(),
         "019f0000-0000-7000-8000-000000000099",
     );
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let storage = storage_of(Source::Codex);
     let newest_stamp = CachedFingerprint::of_file(&thread.newest).unwrap();
     let original = std::fs::read_to_string(&thread.root).unwrap();
@@ -297,7 +297,7 @@ fn bounded_read_doesnt_restore_unrelated_result() {
         panic!("the first block is a result")
     };
     *tool_use_id = "no-longer-present".to_owned();
-    let mut cache = admitted_cache(&base.path().join("cache"));
+    let cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
     let storage = storage_of(Source::Claude);
     let selected = cache
@@ -351,7 +351,7 @@ fn text_only_result_arrays_reconstruct_without_fetching_source() {
     let expected =
         serde_json::to_value(&record.entries.as_ref().unwrap().written().unwrap().entries[0].1)
             .unwrap();
-    let mut cache = admitted_cache(&base.path().join("cache"));
+    let cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
     std::fs::remove_file(&source).unwrap();
     let read = cache
@@ -379,7 +379,7 @@ fn object_result_reads_from_cache_without_its_source() {
     let expected =
         serde_json::to_value(&record.entries.as_ref().unwrap().written().unwrap().entries[0].1)
             .unwrap();
-    let mut cache = admitted_cache(&base.path().join("cache"));
+    let cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
     std::fs::remove_file(&source).unwrap();
     let read = cache

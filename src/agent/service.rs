@@ -12,6 +12,7 @@ use crate::history::listing::{self, SessionOrigin, SessionTimes};
 use crate::history::load_meter::{AgentMeter, LoadMeter};
 use crate::history::path::CanonicalDirectories;
 use crate::history::provider::walk::Canonicaliser;
+use crate::history::sqlite_cache::WriteErrorClass;
 use crate::search;
 use crate::search::mode::SearchMode;
 use crate::semantic;
@@ -1572,7 +1573,7 @@ impl AgentService {
                 &selection.unlisted_warnings,
             )
         });
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         selection.warnings.extend(skipped);
         Ok(selection)
     }
@@ -1717,7 +1718,7 @@ impl AgentService {
                 self.clock().local_wall(),
             )
         });
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         Ok(rendered)
     }
 }
@@ -2475,7 +2476,7 @@ fn target_error(error: AppError, resolved: &agent::refs::ResolvedConversation) -
             error.into()
         }
         // Formatted once `execute` has run its low-space deletion.
-        error @ AppError::SessionCacheLowSpace { .. } => error,
+        error if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => error,
         error => structured_agent_error(error),
     }
 }
@@ -2549,7 +2550,10 @@ fn structured_agent_error(error: AppError) -> AppError {
         AppError::TimeFilter(error) => {
             AgentError::out_of_range(Some("command"), error.to_string()).into()
         }
-        error @ (AppError::SessionCacheLowSpace { .. } | AppError::NoSessionCacheDirectory) => {
+        error
+            if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace
+                || matches!(error, AppError::NoSessionCacheDirectory) =>
+        {
             AgentError::io(None, format!("{}: {error}", crate::APP_NAME)).into()
         }
         error => AgentError::io(None, error.to_string()).into(),
@@ -2797,7 +2801,9 @@ fn run_hybrid_halves<S, L>(
     lexical: impl FnOnce(HybridLexicalPass) -> Result<L>,
 ) -> Result<(Result<S>, L)> {
     let semantic = match semantic() {
-        Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
+        Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
+            return Err(error);
+        }
         semantic => semantic,
     };
     let pass = if semantic.is_ok() {
@@ -2851,7 +2857,9 @@ impl AgentService {
             Ok(history::RoutesStored::NotOwner) => {
                 Some(agent::perf::RoutesSkipped::AnotherRearview)
             }
-            Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
+            Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
+                return Err(error);
+            }
             Err(error) => Some(agent::perf::RoutesSkipped::WriteFailed(error.to_string())),
         };
         self.perf.record_semantic_routes(routes.len(), skipped);
@@ -3603,7 +3611,7 @@ impl AgentService {
                 Some((_, resolved)) => target_error(error, resolved),
                 None => structured_agent_error(error),
             })?;
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         Ok(output)
     }
 
@@ -3665,7 +3673,7 @@ impl AgentService {
                 )
             })
             .map_err(|error| target_error(error, &resolved))?;
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         Ok(output)
     }
 }
@@ -3867,7 +3875,7 @@ mod tests {
             &mut |_, _| {},
         )
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         loaded
     }
 
@@ -3995,7 +4003,7 @@ mod tests {
             warnings: directory_warnings,
             reads,
         } = discover_agent_keys(environment, meter, &operation).unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         assert_eq!(
             reads.roots.len(),
             environment.storages().len(),
@@ -4502,7 +4510,7 @@ mod tests {
             let perf = CommandPerf::new(Arc::clone(environment.clock()));
             let operation = command_operation(environment.cache_base(), perf.load_meter());
             let mut loaded = LoadedSessions::load(rules, &perf, &environment, &operation).unwrap();
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             loaded.current_session_ids = current_session_ids;
             let (mut selection, stale_coverage) =
                 SessionSelection::from_loaded(loaded, rules, &perf).unwrap();
@@ -4934,7 +4942,7 @@ mod tests {
             )
             .unwrap()
             .conversations;
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             let rows = locators
                 .iter()
                 .map(|locator| {
@@ -5280,7 +5288,7 @@ mod tests {
             &operation,
         )
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
     }
 
     /// The owner's load records, for each kind of session without a row

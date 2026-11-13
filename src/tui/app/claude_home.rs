@@ -228,7 +228,7 @@ impl ClaudeHome {
         )
         .unwrap()
         .conversations;
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         rows
     }
 
@@ -265,7 +265,7 @@ impl ChangedSessionsTemplate {
         let environment = sessions.environment();
         let operation = waiting_operation(&environment);
         sessions.load(&environment, &operation);
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         for (root, transcript) in transcripts {
             homes[root].append(&transcript, 30, "the newest question");
         }
@@ -444,7 +444,7 @@ pub(crate) fn serve_list_refresh(app: &mut App, window: crate::time_filter::Time
         };
         let outcome = crate::history::refresh_sessions(&environment, &known, options, &operation)
             .map(|changes| crate::history::RefreshOutcome::Changes(Box::new(changes)));
-        operation.finish().and(outcome)
+        operation.finish().fail_if_low_space().and(outcome)
     })
     .join()
     .unwrap();

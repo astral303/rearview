@@ -194,7 +194,7 @@ pub(crate) fn parsed_record(
 /// `session`'s row as the catalogue lists it after its parse is written to
 /// the cache in `base`: a row reading its copy.
 pub(crate) fn cached_row(base: &Path, session: &AgentSession) -> Conversation {
-    let mut cache = admitted_cache(base);
+    let cache = admitted_cache(base);
     let source = session.row.source;
     let storage = storage_of(source);
     cache.admit_storage(storage).unwrap();
@@ -214,7 +214,7 @@ pub(crate) fn cached_row(base: &Path, session: &AgentSession) -> Conversation {
 /// Each agent's every-record session cached in one database in `base`, as
 /// their copies.
 pub(super) fn every_record_copies(base: &Path) -> Vec<super::CachedSession> {
-    let mut cache = admitted_cache(base);
+    let cache = admitted_cache(base);
     every_record_sessions()
         .iter()
         .map(|session| {
@@ -299,7 +299,7 @@ fn every_agents_cached_entries_preserve_agent_messages_and_viewer_output() {
     use crate::tui::viewer::{self, RenderOptions, ToolDisplayMode};
 
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     for session in every_record_sessions() {
         let row = &session.row;
         let storage = storage_of(row.source);
@@ -502,7 +502,7 @@ fn every_tool_result_is_stored_and_other_opaque_payloads_keep_only_their_positio
     use serde_json::{Value, json};
 
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let source = base.path().join("source.jsonl");
     let unused = "opaque-payload".repeat(100_000);
     let blocks = vec![
@@ -844,7 +844,7 @@ fn results_rendered_as_raw_json_are_stored_as_recorded() {
     record.entries = Some(RecordEntries::Written(
         normalized_session(crate::history::FOR_FIXTURES, Source::Claude, &source, &[]).unwrap(),
     ));
-    let mut cache = admitted_cache(&base.path().join("cache"));
+    let cache = admitted_cache(&base.path().join("cache"));
     cache.write(&record).unwrap();
     let read = cache.entries(storage, &root, CACHE_KEY).unwrap().unwrap();
     let LogEntry::User {
@@ -928,7 +928,7 @@ fn writing_session_again_replaces_its_rows() {
 #[test]
 fn storage_written_under_another_schema_version_loses_its_sessions() {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
     let row = &session.row;
     let storage = storage_of(row.source);
@@ -961,7 +961,7 @@ fn storage_written_under_another_schema_version_loses_its_sessions() {
 #[test]
 fn session_still_being_written_is_not_current() {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
     let row = &session.row;
     let storage = storage_of(row.source);
@@ -986,7 +986,7 @@ fn session_still_being_written_is_not_current() {
 #[test]
 fn removed_session_doesnt_leave_rows() {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
     let row = &session.row;
     let storage = storage_of(row.source);
@@ -1023,7 +1023,7 @@ fn removed_session_doesnt_leave_rows() {
 fn database_of_another_semantic_turn_version_is_emptied() {
     use crate::semantic::filter::SEMANTIC_TURN_VERSION;
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
     let row = &session.row;
     let root = root_of(&session);
@@ -1067,7 +1067,7 @@ fn database_of_another_semantic_turn_version_is_emptied() {
 #[test]
 fn database_of_another_schema_version_is_emptied() {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
     let row = &session.row;
     let root = root_of(&session);

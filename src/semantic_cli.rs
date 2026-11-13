@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
-use crate::history::sqlite_cache::{CopyMiss, CopyRead, unless_every_read_failed};
+use crate::history::sqlite_cache::{CopyMiss, CopyRead, WriteErrorClass, unless_every_read_failed};
 use crate::history::{CacheBase, Conversation, SemanticContent, Workspace};
 use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
@@ -503,7 +503,7 @@ fn store_route_texts(base: &CacheBase, content: &[SemanticContent<'_>]) -> Resul
         return Ok(());
     }
     match crate::history::store_semantic_routes(base, &routes) {
-        Err(error @ AppError::SessionCacheLowSpace { .. }) => Err(error),
+        Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => Err(error),
         Ok(_) | Err(_) => Ok(()),
     }
 }

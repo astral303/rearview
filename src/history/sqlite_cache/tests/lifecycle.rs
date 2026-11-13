@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
     let row = &session.row;
     let storage = storage_of(row.source);
@@ -55,7 +55,7 @@ fn unlisted_or_unfinished_session_doesnt_become_empty_successful_content_read() 
 #[test]
 fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let session = every_record_sessions().remove(0);
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
@@ -112,9 +112,9 @@ fn failed_entry_read_keeps_catalogue_but_requires_another_read() {
 #[test]
 fn superseded_writer_doesnt_add_entry_rows_or_set_replacements_final_status() {
     let base = tempfile::tempdir().unwrap();
-    let mut older = admitted_cache(base.path());
+    let older = admitted_cache(base.path());
     let owner = older.token().clone();
-    let mut newer = SqliteCache::open_for_refresh(&owner).unwrap();
+    let newer = SqliteCache::open_for_refresh(&owner).unwrap();
     let session = every_record_sessions().remove(0);
     let storage = storage_of(session.row.source);
     let root = root_of(&session);
@@ -140,7 +140,7 @@ fn superseded_writer_doesnt_add_entry_rows_or_set_replacements_final_status() {
         &std::collections::HashSet::new(),
     );
     assert!(
-        matches!(entries::insert(&mut older.connection, previous, &keys.places, &old_rows, &|| Ok(()), &owner), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
+        matches!(entries::insert(&older.connection, previous, &keys.places, &old_rows, &owner), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
     );
     assert!(
         matches!(older.set_final_status(previous, SessionStatus::Listed, None), Err(AppError::SessionCacheSuperseded(id)) if id == previous)
