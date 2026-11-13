@@ -124,7 +124,10 @@ fn error_report(error: AppError) -> String {
     match error {
         AppError::AgentProtocol(output) => output,
         AppError::Agent(error) => agent::diagnostic::format_error(&error),
-        error @ AppError::NoSessionCacheDirectory => format!("{APP_NAME}: {error}\n"),
+        error @ (AppError::NoSessionCacheDirectory
+        | AppError::SessionCacheRefillLowSpace { .. }) => {
+            format!("{APP_NAME}: {error}\n")
+        }
         error => format!("Error: {error}\n"),
     }
 }

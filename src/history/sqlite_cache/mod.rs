@@ -27,6 +27,7 @@ mod observer;
 mod permit;
 mod positional;
 mod read_catalogue;
+mod refill;
 pub(crate) mod refresh;
 mod roots;
 mod schema;
@@ -41,7 +42,7 @@ mod write_error;
 
 pub use base::{CacheBase, ProcessIdentity};
 #[cfg(test)]
-pub(crate) use base::{DiskSpace, DriveRunningOut};
+pub(crate) use base::{DiskSpace, DriveFilledByCache, DriveRunningOut, UnreportedFreeSpace};
 pub(crate) use cached_session::HeldCopy;
 pub use cached_session::{CachedSession, Publication, SessionAddress};
 pub(crate) use cached_session::{CopyHandles, Currency};
@@ -65,6 +66,8 @@ pub use permit::{Admitted, ParsePermit};
 #[cfg(test)]
 pub(crate) use permit::{FOR_FIXTURES, admitted_reads};
 pub(crate) use read_catalogue::CatalogueSession;
+#[cfg(test)]
+pub(crate) use refill::recorded_cache_bytes;
 pub(crate) use refresh::FREE_SPACE_FLOOR;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_copy_when_unlocked, read_when_unlocked};
@@ -172,7 +175,7 @@ pub(crate) fn is_emptied(base: &Path) -> bool {
 }
 
 /// Drop every table this release or an earlier one created, but
-/// `refresh_state`.
+/// `refresh_state` and `low_space_deletion`.
 fn drop_session_tables(connection: &Connection) -> rusqlite::Result<()> {
     for table in schema::RETIRED_TABLES.iter().chain(schema::TABLES) {
         connection.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;

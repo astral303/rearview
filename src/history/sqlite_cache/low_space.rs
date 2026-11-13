@@ -12,8 +12,9 @@ use crate::error::{AppError, CacheDeletion};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-/// A base's finding that its drive is low on space, and the deletion it
-/// asks for, shared by the base's clones.
+/// A base's finding that its drive is low on space, shared by the base's
+/// clones: a write's, with the deletion it asks for, or an acquisition's
+/// refusal of a refill.
 pub(crate) struct Latch {
     state: Mutex<State>,
     /// Held while the deletion runs, so it runs once.
@@ -45,11 +46,25 @@ impl SpaceCheck<'_> {
     /// Set the latch with the check's finding of `free_bytes` free; false,
     /// leaving the latch as it is, once the latch is sealed.
     pub(super) fn publish(&self, free_bytes: u64) -> bool {
+        self.publish_state(State::Set { free_bytes })
+    }
+
+    /// Set the latch with the check's refusal of a refill that needs
+    /// `needed_bytes` on a drive with `free_bytes` free; false, leaving the
+    /// latch as it is, once the latch is sealed.
+    pub(super) fn publish_refill_refusal(&self, free_bytes: u64, needed_bytes: u64) -> bool {
+        self.publish_state(State::RefillRefused {
+            free_bytes,
+            needed_bytes,
+        })
+    }
+
+    fn publish_state(&self, finding: State) -> bool {
         let checks = self.latch.checks();
         if checks.sealed {
             return false;
         }
-        self.latch.set(free_bytes);
+        self.latch.set(finding);
         true
     }
 }
@@ -73,6 +88,10 @@ enum State {
         free_bytes: u64,
         outcome: CacheDeletion,
     },
+    /// An acquisition found `free_bytes` free, less than the `needed_bytes`
+    /// a refill of a deleted cache needs (see [`super::refill`]). Nothing
+    /// is deleted.
+    RefillRefused { free_bytes: u64, needed_bytes: u64 },
 }
 
 impl Default for Latch {
@@ -139,22 +158,24 @@ impl Latch {
         }
     }
 
-    /// Set the latch: a write found `free_bytes` free on the drive, below
-    /// the floor. A set latch keeps the first write's free bytes.
-    fn set(&self, free_bytes: u64) {
+    /// Set the latch to `finding`, a [`State::Set`] or a
+    /// [`State::RefillRefused`]. A set latch keeps the first finding.
+    fn set(&self, finding: State) {
         let mut state = self.state();
         if matches!(*state, State::Clear) {
-            *state = State::Set { free_bytes };
+            *state = finding;
         }
     }
 
-    /// True once a write found the drive low on space.
+    /// True once a write found the drive low on space, or an acquisition
+    /// refused a refill.
     pub(crate) fn is_set(&self) -> bool {
         !matches!(*self.state(), State::Clear)
     }
 
     /// The low-space error the latch reports, with the deletion's outcome
-    /// once the deletion ran; `None` while the latch is clear.
+    /// once the deletion ran, or the refill's refusal; `None` while the
+    /// latch is clear.
     pub(crate) fn error(&self) -> Option<AppError> {
         let (free_bytes, outcome) = match &*self.state() {
             State::Clear => return None,
@@ -163,6 +184,15 @@ impl Latch {
                 free_bytes,
                 outcome,
             } => (*free_bytes, outcome.clone()),
+            State::RefillRefused {
+                free_bytes,
+                needed_bytes,
+            } => {
+                return Some(AppError::SessionCacheRefillLowSpace {
+                    free_bytes: *free_bytes,
+                    needed_bytes: *needed_bytes,
+                });
+            }
         };
         Some(AppError::SessionCacheLowSpace {
             free_bytes,
@@ -176,7 +206,7 @@ impl Latch {
     pub(crate) fn free_bytes_awaiting_deletion(&self) -> Option<u64> {
         match *self.state() {
             State::Set { free_bytes } => Some(free_bytes),
-            State::Clear | State::Ran { .. } => None,
+            State::Clear | State::Ran { .. } | State::RefillRefused { .. } => None,
         }
     }
 
@@ -192,7 +222,8 @@ impl Latch {
 
 /// Run `base`'s low-space deletion after a write found its drive low on
 /// space, and return the deletion's outcome; `None` while the latch is
-/// clear. A later call returns the first call's outcome without deleting.
+/// clear, and after a refused refill, which doesn't delete anything. A
+/// later call returns the first call's outcome without deleting.
 /// Call once no write of this rearview can set the latch: after its workers
 /// on the base stopped, or after the TUI's shutdown and
 /// [`Latch::wait_for_checks`]. The deletion waits for this rearview's open
@@ -204,7 +235,7 @@ pub(crate) fn run_deletion(base: &CacheBase) -> Option<CacheDeletion> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let free_bytes = match &*latch.state() {
-        State::Clear => return None,
+        State::Clear | State::RefillRefused { .. } => return None,
         State::Ran { outcome, .. } => return Some(outcome.clone()),
         State::Set { free_bytes } => *free_bytes,
     };

@@ -8,7 +8,9 @@ use crate::error::AppError;
 pub(crate) enum WriteErrorClass {
     /// A write found less than the floor free on the cache's drive, or
     /// SQLite or the system reported the disk full. The write returns the
-    /// low-space error once the base's low-space latch is set.
+    /// low-space error once the base's low-space latch is set. Also an
+    /// acquisition's refusal to write a deleted cache again
+    /// ([`AppError::SessionCacheRefillLowSpace`]).
     LowSpace,
     /// Another rearview owns the cache, or this owner's write permission was
     /// revoked.
@@ -34,7 +36,9 @@ pub(crate) enum WriteErrorClass {
 impl WriteErrorClass {
     pub(crate) fn of(error: &AppError) -> Self {
         match error {
-            AppError::SessionCacheLowSpace { .. } => Self::LowSpace,
+            AppError::SessionCacheLowSpace { .. } | AppError::SessionCacheRefillLowSpace { .. } => {
+                Self::LowSpace
+            }
             AppError::SessionCacheRefreshLost => Self::LostOwnership,
             AppError::SessionCache(error) => Self::of_sqlite(error),
             AppError::Io(error) if error.kind() == std::io::ErrorKind::StorageFull => {

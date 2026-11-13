@@ -12,7 +12,7 @@ use crate::history::provider::walk::test_support::ScriptedLister;
 use crate::history::provider::{
     LoadOptions, ParseWatch, SessionRoot, SessionStorage, WatchedStorage, load_sessions,
 };
-use crate::history::sqlite_cache::SqliteCache;
+use crate::history::sqlite_cache::{DriveFilledByCache, FREE_SPACE_FLOOR, SqliteCache};
 use crate::history::{CacheBase, Conversation, Environment, ProcessIdentity, Source};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -354,6 +354,76 @@ impl ChangedSessionsInTwoRoots {
             Arc::new(TestClock::default()),
             Arc::new(crate::history::provider::walk::SystemLister),
         )
+    }
+}
+
+/// Claude Code sessions whose session cache needs about three times the
+/// room its drive leaves above the free-space floor, so a first fill runs
+/// out of space part way. Each environment is another rearview over the one
+/// cache on that drive.
+pub(crate) struct CacheOutgrowingDrive {
+    pub(crate) home: ClaudeHome,
+    pub(crate) cache: tempfile::TempDir,
+    pub(crate) drive: Arc<DriveFilledByCache>,
+    /// The bytes of the cache's files once a load cached every session.
+    full_cache_bytes: u64,
+}
+
+impl CacheOutgrowingDrive {
+    pub(crate) const SESSIONS: u32 = 24;
+
+    pub(crate) fn new() -> Self {
+        let home = ClaudeHome::new();
+        let question = "a question about the session cache's disk space ".repeat(60);
+        let texts = vec![question.as_str(); 12];
+        for minute in 0..Self::SESSIONS {
+            home.write(&format!("session-{minute:02}"), minute, &texts);
+        }
+        let full_cache_bytes = {
+            let scratch = tempfile::tempdir().unwrap();
+            let environment = home
+                .environment_with_cache(
+                    scratch.path(),
+                    ProcessIdentity::default(),
+                    Arc::new(TestClock::default()),
+                )
+                .with_free_space(10 * FREE_SPACE_FLOOR);
+            home.rows(&environment);
+            DriveFilledByCache::database_and_side_file_bytes(scratch.path())
+        };
+        Self {
+            home,
+            cache: tempfile::tempdir().unwrap(),
+            drive: Arc::new(DriveFilledByCache::new(
+                FREE_SPACE_FLOOR + full_cache_bytes / 3,
+            )),
+            full_cache_bytes,
+        }
+    }
+
+    /// A new rearview over the cache on the drive, on test time.
+    pub(crate) fn environment(&self) -> Environment {
+        self.environment_on(Arc::new(TestClock::default()))
+    }
+
+    /// [`Self::environment`] on `clock`.
+    pub(crate) fn environment_on(&self, clock: Arc<dyn Clock>) -> Environment {
+        self.home
+            .environment_with_cache(self.cache.path(), ProcessIdentity::default(), clock)
+            .with_disk_space(self.drive.clone())
+    }
+
+    /// Free room on the drive for the whole cache and the floor.
+    pub(crate) fn free_space(&self) {
+        self.drive
+            .set_capacity(2 * FREE_SPACE_FLOOR + self.full_cache_bytes);
+    }
+
+    /// Leave room on the drive above the floor for five sixths of the whole
+    /// cache, so a first fill runs out of space in its last batches.
+    pub(crate) fn leave_room_for_most_of_cache(&self) {
+        self.drive
+            .set_capacity(FREE_SPACE_FLOOR + self.full_cache_bytes * 5 / 6);
     }
 }
 

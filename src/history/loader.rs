@@ -108,8 +108,13 @@ impl ProviderHistory {
     /// changed session whose cached row `left_out` holds keeps that row
     /// unread.
     ///
-    /// Fails when a write finds the cache's drive low on space; any other
-    /// provider failure is the provider's.
+    /// Clears the record a low-space deletion left once the load ends as
+    /// the live owner (see
+    /// [`OperationScope::clear_deletion_record_after_full_load`]).
+    ///
+    /// Fails when a write finds the cache's drive low on space, or the
+    /// drive doesn't have room for a deleted cache; any other provider
+    /// failure is the provider's.
     fn load(
         environment: &Environment,
         show_last: bool,
@@ -189,6 +194,18 @@ impl ProviderHistory {
                     history.failures.push((source, error));
                 }
             }
+        }
+        match operation.clear_deletion_record_after_full_load() {
+            Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
+                return Err(error);
+            }
+            // The failed batch revoked the write permission when its class
+            // stops writes: the operation ends as any failed write ends it.
+            Err(error) => debug::warn(
+                debug_level,
+                &format!("Failed to clear the session cache's low-space record: {error}"),
+            ),
+            Ok(()) => {}
         }
         Ok(history)
     }
@@ -687,6 +704,8 @@ mod tests {
     use super::*;
     use crate::clock::{Clock, TestClock};
     use crate::error::SessionDatabaseFailure;
+    use crate::history::provider::{ParseWatch, READ_BATCH_LENGTH};
+    use crate::history::sqlite_cache::{FREE_SPACE_FLOOR, recorded_cache_bytes};
 
     fn conversation_at(name: &str) -> Conversation {
         Conversation {
@@ -873,6 +892,286 @@ mod tests {
         assert!(
             super::super::sqlite_cache::is_emptied(cache.path()),
             "the cache database's contents are deleted"
+        );
+    }
+
+    /// A CLI load over `environment`, finished as rearview finishes a
+    /// command: whether rearview exits with failure, and what it writes to
+    /// stderr.
+    fn cli_load(environment: &Environment) -> (bool, String) {
+        let loaded = load_all_conversations(environment, false, None).map(|_| ());
+        let mut report = Vec::new();
+        let (failed, written) =
+            crate::finish_command(loaded, Some(environment.cache_base()), &mut report);
+        written.unwrap();
+        (failed, String::from_utf8(report).unwrap())
+    }
+
+    /// The report of a load whose cache write found less than 1 GB free.
+    const DELETION_REPORT_START: &str = "rearview: not enough disk space for the session cache (";
+
+    #[test]
+    fn run_after_low_space_deletion_doesnt_parse_while_drive_doesnt_have_room_for_deleted_cache() {
+        use crate::tui::claude_home::CacheOutgrowingDrive;
+        let sessions = CacheOutgrowingDrive::new();
+        let (_, first_report) = cli_load(&sessions.environment());
+        assert!(
+            first_report.starts_with(DELETION_REPORT_START)
+                && first_report.contains("The session cache was deleted."),
+            "the first run runs out of space and deletes the cache: {first_report}"
+        );
+        sessions.home.watch().mark();
+
+        let (failed, report) = cli_load(&sessions.environment());
+
+        assert_eq!(
+            sessions.home.watch().parses_after_mark(),
+            0,
+            "the run doesn't parse any session"
+        );
+        assert!(failed, "rearview exits with failure");
+        assert_eq!(
+            report,
+            "rearview: not enough disk space to rebuild the session cache (1.0 GB free, needs \
+             at least 1.1 GB). Free at least 0.1 GB and run rearview again.\n"
+        );
+    }
+
+    /// Once space is freed, the run after a low-space deletion fills the
+    /// cache and clears the deletion's record. Here the user also deleted
+    /// most transcripts, so the full cache is smaller than the record: a
+    /// later drive below the floor is found by the floor check, which
+    /// deletes the cache, not refused by the record.
+    #[test]
+    fn run_after_low_space_deletion_fills_cache_once_space_is_freed_and_clears_record() {
+        use crate::tui::claude_home::CacheOutgrowingDrive;
+        let sessions = CacheOutgrowingDrive::new();
+        cli_load(&sessions.environment());
+        for transcript in std::fs::read_dir(sessions.home.project()).unwrap() {
+            let transcript = transcript.unwrap().path();
+            if !transcript.ends_with("session-00.jsonl") {
+                std::fs::remove_file(transcript).unwrap();
+            }
+        }
+        sessions.free_space();
+
+        let filled = load_all_conversations(&sessions.environment(), false, None);
+
+        let filled = filled.unwrap_or_else(|error| panic!("the run fills the cache: {error}"));
+        assert_eq!(filled.len(), 1, "the run lists the remaining session");
+        sessions.drive.set_capacity(0);
+        sessions.home.append(
+            &sessions.home.transcript("session-00"),
+            40,
+            "a newer question",
+        );
+        let (failed, report) = cli_load(&sessions.environment());
+        assert!(failed, "rearview exits with failure");
+        assert_eq!(
+            report,
+            "rearview: not enough disk space for the session cache (0.0 GB free, needs at least \
+             1 GB). The session cache was deleted. Free some space and run rearview again.\n"
+        );
+    }
+
+    #[test]
+    fn run_after_low_space_deletion_on_drive_without_free_space_report_fills_cache() {
+        use crate::history::sqlite_cache::UnreportedFreeSpace;
+        use crate::tui::claude_home::CacheOutgrowingDrive;
+        let sessions = CacheOutgrowingDrive::new();
+        cli_load(&sessions.environment());
+        sessions.home.watch().mark();
+        let environment = sessions
+            .environment()
+            .with_disk_space(Arc::new(UnreportedFreeSpace));
+
+        let filled = load_all_conversations(&environment, false, None);
+
+        if let Err(error) = filled {
+            panic!("the run fills the cache: {error}");
+        }
+        assert!(
+            sessions.home.watch().parses_after_mark() > 0,
+            "the run parses the sessions"
+        );
+    }
+
+    /// A TUI launch over `environment` that the user cancels as the parse
+    /// after the first `parses` begins.
+    fn launch_cancelled_after(environment: &Environment, watch: &ParseWatch, parses: usize) {
+        let cancellation = Cancellation::default();
+        let begun = std::sync::atomic::AtomicUsize::new(0);
+        watch.run_as_each_parse_begins({
+            let cancellation = cancellation.clone();
+            move || {
+                if begun.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == parses {
+                    cancellation.cancel();
+                }
+            }
+        });
+        let (messages, _received) = std::sync::mpsc::channel();
+        stream_all_conversations(
+            &messages,
+            environment,
+            RefreshOptions::default(),
+            &LoadMeter::default(),
+            &cancellation,
+        );
+        watch.run_as_each_parse_begins(|| {});
+    }
+
+    #[test]
+    fn cancelled_fill_after_low_space_deletion_keeps_record() {
+        use crate::tui::claude_home::CacheOutgrowingDrive;
+        let sessions = CacheOutgrowingDrive::new();
+        cli_load(&sessions.environment());
+        let recorded = recorded_cache_bytes(sessions.cache.path())
+            .expect("the deletion records the cache's size");
+        sessions.free_space();
+
+        launch_cancelled_after(
+            &sessions.environment(),
+            sessions.home.watch(),
+            2 * READ_BATCH_LENGTH,
+        );
+
+        assert_eq!(
+            recorded_cache_bytes(sessions.cache.path()),
+            Some(recorded),
+            "the cancelled fill keeps the record"
+        );
+    }
+
+    /// After a low-space deletion and a fill the user cancelled part way,
+    /// the refill check counts the cache the cancelled fill wrote. A run on
+    /// a drive with the floor free is refused and keeps the cached sessions.
+    /// A run on a drive a byte short of room for the whole record and the
+    /// floor has room for the rest of the record, and fills the cache.
+    #[test]
+    fn run_after_cancelled_fill_needs_room_for_rest_of_record() {
+        use crate::history::sqlite_cache::DriveFilledByCache;
+        use crate::tui::claude_home::CacheOutgrowingDrive;
+        let sessions = CacheOutgrowingDrive::new();
+        sessions.leave_room_for_most_of_cache();
+        let (_, first_report) = cli_load(&sessions.environment());
+        assert!(
+            first_report.contains("The session cache was deleted."),
+            "the first run runs out of space and deletes the cache: {first_report}"
+        );
+        let recorded = recorded_cache_bytes(sessions.cache.path())
+            .expect("the deletion records the cache's size");
+        let emptied = DriveFilledByCache::database_and_side_file_bytes(sessions.cache.path());
+        sessions.free_space();
+        launch_cancelled_after(
+            &sessions.environment(),
+            sessions.home.watch(),
+            4 * READ_BATCH_LENGTH,
+        );
+        let partial = DriveFilledByCache::database_and_side_file_bytes(sessions.cache.path());
+        assert!(
+            emptied < partial && partial < recorded,
+            "the cancelled fill writes part of the record's size: {emptied} < {partial} < {recorded}"
+        );
+        sessions.drive.set_capacity(partial + FREE_SPACE_FLOOR);
+        let (refused, refusal) = cli_load(&sessions.environment());
+        assert!(
+            refused
+                && refusal
+                    .starts_with("rearview: not enough disk space to rebuild the session cache"),
+            "the run on the drive with the floor free is refused: {refusal}"
+        );
+        let cached = DriveFilledByCache::database_and_side_file_bytes(sessions.cache.path());
+        sessions
+            .drive
+            .set_capacity(cached + recorded + FREE_SPACE_FLOOR - 1);
+        sessions.home.watch().mark();
+
+        let (failed, report) = cli_load(&sessions.environment());
+
+        assert!(!failed, "the run fills the cache: {report}");
+        let parsed = sessions.home.watch().parses_after_mark();
+        assert!(
+            parsed > 0 && parsed < CacheOutgrowingDrive::SESSIONS as usize,
+            "the run parses only the sessions the cancelled fill left out, which the refused \
+             run kept cached: {parsed} parsed"
+        );
+        assert_eq!(
+            recorded_cache_bytes(sessions.cache.path()),
+            None,
+            "the full load clears the record"
+        );
+    }
+
+    #[test]
+    fn later_deletion_of_smaller_cache_keeps_larger_recorded_size() {
+        use crate::tui::claude_home::CacheOutgrowingDrive;
+        let sessions = CacheOutgrowingDrive::new();
+        cli_load(&sessions.environment());
+        let recorded = recorded_cache_bytes(sessions.cache.path())
+            .expect("the deletion records the cache's size");
+        sessions.free_space();
+        let drive = Arc::clone(&sessions.drive);
+        sessions
+            .home
+            .watch()
+            .run_as_each_parse_begins(move || drive.set_capacity(0));
+
+        let (_, report) = cli_load(&sessions.environment());
+
+        assert!(
+            report.starts_with(DELETION_REPORT_START)
+                && report.contains("The session cache was deleted."),
+            "the run runs out of space as it begins to parse and deletes the cache: {report}"
+        );
+        assert_eq!(
+            recorded_cache_bytes(sessions.cache.path()),
+            Some(recorded),
+            "the record keeps the first deletion's size"
+        );
+    }
+
+    /// A low-space deletion another rearview defers, while it has the
+    /// cache open, leaves the cache in place and doesn't record its size:
+    /// the next run on the drive still below the floor deletes the cache,
+    /// as the first run tried to.
+    #[test]
+    fn run_after_deferred_low_space_deletion_deletes_cache() {
+        use crate::tui::claude_home::{CacheOutgrowingDrive, held_open_by_another_rearview};
+        let sessions = CacheOutgrowingDrive::new();
+        let first = sessions
+            .environment()
+            .with_low_space_wait(Duration::from_millis(300));
+        let opened_elsewhere = {
+            let first_rows = load_all_conversations(&first, false, None);
+            assert!(first_rows.is_err(), "the first run runs out of space");
+            held_open_by_another_rearview(sessions.cache.path())
+        };
+        let mut first_report = Vec::new();
+        crate::finish_command(Ok(()), Some(first.cache_base()), &mut first_report)
+            .1
+            .unwrap();
+        let first_report = String::from_utf8(first_report).unwrap();
+        assert!(
+            first_report
+                .contains("The session cache was not deleted: another rearview has it open."),
+            "the first run's deletion is deferred: {first_report}"
+        );
+        drop(opened_elsewhere);
+        assert_eq!(
+            recorded_cache_bytes(sessions.cache.path()),
+            None,
+            "the deferred deletion doesn't record the cache's size"
+        );
+
+        let (failed, report) = cli_load(&sessions.environment());
+
+        assert!(failed, "rearview exits with failure");
+        assert!(
+            report.starts_with(DELETION_REPORT_START)
+                && report.ends_with(
+                    "The session cache was deleted. Free some space and run rearview again.\n"
+                ),
+            "the next run deletes the cache: {report}"
         );
     }
 
