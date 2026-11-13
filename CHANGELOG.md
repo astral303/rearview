@@ -158,6 +158,8 @@
   the cache writes of a list refresh, as it does for the launch's. A write
   failure that repeats prints once for each of an agent's session
   directories.
+- CI now uploads macOS crash reports as the `macos-crash-reports` artifact
+  when the macOS check fails.
 - Compare two rearview binaries' search-stage medians and process CPU time
   with `scripts/compare-perf.sh`. Its per-run table also shows other
   processes' CPU time and the machine's disk use.
