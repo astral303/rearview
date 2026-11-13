@@ -2,9 +2,10 @@ use super::*;
 use crate::clock::{SystemClock, TestClock};
 use crate::history::Source;
 use crate::history::provider::walk::SystemCanonicaliser;
-use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
+use crate::history::provider::{Fingerprint, SessionStub};
 use crate::history::sqlite_cache::low_space::run_deletion;
 use crate::history::sqlite_cache::observer::{Observation, observe};
+use crate::history::sqlite_cache::tests::shared_session_root;
 use crate::history::sqlite_cache::{
     CacheWrite, CacheWriter, ProcessIdentity, SessionRecord, SessionStatus, SqliteCache, is_busy,
 };
@@ -397,17 +398,6 @@ fn finds_a_recent_owner(base: &CacheBase, observed: &mut Option<ObservedRefresh>
     )
 }
 
-/// The root of [`record`]'s session, shared by every test: an existing
-/// empty directory, because the cache stores a session only below a root
-/// that canonicalises.
-fn record_root() -> SessionRoot {
-    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    SessionRoot::new(
-        ROOT.get_or_init(|| tempfile::tempdir().expect("a temporary root"))
-            .path(),
-    )
-}
-
 fn record() -> SessionRecord {
     record_of("session")
 }
@@ -420,7 +410,7 @@ pub(crate) fn record_of(cache_key: &str) -> SessionRecord {
 /// [`record_of`], with `reason` as the warning the cache stores for the
 /// session.
 pub(crate) fn record_with_reason(cache_key: &str, reason: &str) -> SessionRecord {
-    let root = record_root();
+    let root = shared_session_root();
     let stub = SessionStub {
         locator: root.path.join(format!("{cache_key}.jsonl")),
         subagents: Vec::new(),
@@ -515,7 +505,7 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
     send.send(CacheWrite::session(original).0).unwrap();
     send.send(CacheWrite::Removed {
         storage: Source::Pi.provider().storage().cache(),
-        root: record_root(),
+        root: shared_session_root(),
         cache_keys: vec!["session".to_owned()],
     })
     .unwrap();
@@ -523,7 +513,11 @@ fn queued_writes_and_deletions_keep_their_original_owner_identity() {
     super::super::apply_writes(old, receive, None);
     assert_eq!(
         current
-            .current_fingerprints(Source::Pi.provider().storage().cache(), &record_root(), &[])
+            .current_fingerprints(
+                Source::Pi.provider().storage().cache(),
+                &shared_session_root(),
+                &[]
+            )
             .unwrap()["session"]
             .mtime_secs,
         2
@@ -1085,7 +1079,7 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
     send.send(CacheWrite::session(changed).0).unwrap();
     send.send(CacheWrite::Removed {
         storage: Source::Pi.provider().storage().cache(),
-        root: record_root(),
+        root: shared_session_root(),
         cache_keys: vec![original.catalogue.cache_key.clone()],
     })
     .unwrap();
@@ -1096,7 +1090,7 @@ fn failed_read_revokes_queued_writes_even_after_failure_clears() {
         cache
             .holds(
                 Source::Pi.provider().storage().cache(),
-                &record_root(),
+                &shared_session_root(),
                 &SessionStub {
                     locator: PathBuf::new(),
                     subagents: Vec::new(),

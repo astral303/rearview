@@ -175,6 +175,20 @@ impl std::ops::DerefMut for TemporaryCache {
     }
 }
 
+/// The session root of tests that store a session's paths without writing
+/// its files: `rearview-test-session-root` in the temp folder, created when
+/// missing. The cache stores a session only below a root that
+/// canonicalises. Every test process reuses this directory and leaves it,
+/// because a temporary directory kept in a `static` is never dropped.
+#[allow(clippy::disallowed_methods)]
+pub(super) fn shared_session_root() -> SessionRoot {
+    // Not through `RootEnvironment::of_process`: in a test build it creates
+    // a home directory for the test.
+    let path = std::env::temp_dir().join("rearview-test-session-root");
+    std::fs::create_dir_all(&path).expect("the shared session root exists");
+    SessionRoot::new(path)
+}
+
 /// Checks the field order on Windows alone: elsewhere a directory is removed
 /// with the database open.
 #[test]
@@ -516,11 +530,7 @@ pub(super) fn write_test_entries(
     );
     // The entries name their transcripts by relative paths: each is a file
     // of the session below the root.
-    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    let root = SessionRoot::new(
-        ROOT.get_or_init(|| tempfile::tempdir().expect("a temporary root"))
-            .path(),
-    );
+    let root = shared_session_root();
     record.catalogue.roots = super::SessionRoots::of_system(&root);
     record.catalogue.files.clear();
     let mut entries = entries;
