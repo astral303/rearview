@@ -309,28 +309,56 @@ pub fn budget_beside_warnings(budget: Option<usize>, warning_records: &[String])
     budget.map(|budget| budget.saturating_sub(warning_chars))
 }
 
+/// The records of `warnings`, by kind, and how many warnings they report.
+/// Within a kind, each warning without a reference prints its own record,
+/// then those with one print as one record, a `count=` record for two
+/// references or more. A warning repeated for one reference, or repeated
+/// whole without one, counts once.
 pub fn format_warning_records(warnings: &[AgentWarning]) -> (usize, Vec<String>) {
     let mut seen = std::collections::HashSet::new();
-    let mut grouped = std::collections::BTreeMap::<AgentWarningKind, Vec<&AgentWarning>>::new();
+    let mut by_kind = std::collections::BTreeMap::<
+        AgentWarningKind,
+        (Vec<&AgentWarning>, Vec<&AgentWarning>),
+    >::new();
     for warning in warnings {
-        if seen.insert((warning.kind, warning.reference.as_deref())) {
-            grouped.entry(warning.kind).or_default().push(warning);
+        let detail_without_reference = warning
+            .reference
+            .is_none()
+            .then_some(warning.detail.as_str());
+        if !seen.insert((
+            warning.kind,
+            warning.reference.as_deref(),
+            detail_without_reference,
+        )) {
+            continue;
+        }
+        let (without_reference, with_reference) = by_kind.entry(warning.kind).or_default();
+        match warning.reference {
+            None => without_reference.push(warning),
+            Some(_) => with_reference.push(warning),
         }
     }
 
-    let total = grouped.values().map(Vec::len).sum();
-    let records = grouped
+    let total = by_kind
+        .values()
+        .map(|(without_reference, with_reference)| without_reference.len() + with_reference.len())
+        .sum();
+    let records = by_kind
         .into_iter()
-        .map(|(kind, warnings)| {
-            if warnings.len() == 1 {
-                format_warning(warnings[0])
-            } else {
-                format!(
+        .flat_map(|(kind, (without_reference, with_reference))| {
+            let referenced_record = match with_reference.as_slice() {
+                [] => None,
+                [warning] => Some(format_warning(warning)),
+                several => Some(format!(
                     "protocol agent-warning kind={} count={}\n",
                     kind.as_str(),
-                    warnings.len()
-                )
-            }
+                    several.len()
+                )),
+            };
+            without_reference
+                .into_iter()
+                .map(format_warning)
+                .chain(referenced_record)
         })
         .collect();
     (total, records)
@@ -447,6 +475,71 @@ mod tests {
                 "protocol agent-warning kind=skipped ref=ch_c detail=empty%20transcript\n",
                 "protocol agent-warning kind=malformed-transcript count=2\n",
             ]
+        );
+    }
+
+    /// The header atoms and the records of `warnings`.
+    fn header_atoms_and_records(warnings: &[AgentWarning]) -> (String, Vec<String>) {
+        let (total, records) = format_warning_records(warnings);
+        (warning_atoms(total, &records), records)
+    }
+
+    fn io_warning(reference: Option<&str>, detail: &str) -> AgentWarning {
+        AgentWarning::from_error(&AgentError::io(reference, detail))
+    }
+
+    const UNLISTED_AGENT_RECORD: &str =
+        "protocol agent-warning kind=io detail=failed%20to%20list%20Codex%20sessions\n";
+
+    #[test]
+    fn warning_without_ref_prints_before_warning_of_its_kind_with_ref() {
+        let (atoms, records) = header_atoms_and_records(&[
+            io_warning(Some("ch_a"), "failed to read transcript"),
+            io_warning(None, "failed to list Codex sessions"),
+        ]);
+
+        assert_eq!(atoms, " warnings=2 warning-records=2");
+        assert_eq!(
+            records,
+            [
+                UNLISTED_AGENT_RECORD,
+                "protocol agent-warning kind=io ref=ch_a detail=failed%20to%20read%20transcript\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn warning_without_ref_prints_before_count_of_its_kind_with_refs() {
+        let (atoms, records) = header_atoms_and_records(&[
+            io_warning(Some("ch_a"), "failed to read transcript"),
+            io_warning(None, "failed to list Codex sessions"),
+            io_warning(Some("ch_b"), "failed to read transcript"),
+        ]);
+
+        assert_eq!(atoms, " warnings=3 warning-records=2");
+        assert_eq!(
+            records,
+            [
+                UNLISTED_AGENT_RECORD,
+                "protocol agent-warning kind=io count=2\n"
+            ]
+        );
+    }
+
+    #[test]
+    fn warnings_of_one_kind_without_ref_each_print_their_detail() {
+        let warnings = [
+            AgentWarning::ignored("Codex: 3 ignored: compressed sessions unsupported"),
+            AgentWarning::ignored("Kimi Code: 2 ignored: session list unreadable"),
+            AgentWarning::ignored("Codex: 3 ignored: compressed sessions unsupported"),
+        ];
+
+        let (total, records) = format_warning_records(&warnings);
+
+        assert_eq!(total, 2, "the repeated warning counts once");
+        assert_eq!(
+            records,
+            vec![format_warning(&warnings[0]), format_warning(&warnings[1]),]
         );
     }
 }

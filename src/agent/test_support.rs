@@ -1,3 +1,4 @@
+use crate::agent::diagnostic::{AgentWarning, format_warning_records};
 use crate::agent::protocol::{MessageLineRange, ProtocolOptions};
 use crate::agent::refs::{AgentConversationKey, ResolvedConversation};
 use crate::agent::time_span::{DayRecords, RecordTime, TimeSpan};
@@ -121,6 +122,40 @@ pub fn text_message_at(
 /// the system's zone.
 pub fn written_at() -> DateTime<Zone> {
     TestClock::start_wall().with_timezone(&Zone::System)
+}
+
+pub fn warnings_of_two_kinds() -> [AgentWarning; 2] {
+    [
+        AgentWarning::skipped(Some("ch_000000000000"), "empty transcript"),
+        AgentWarning::ignored("Codex: 3 ignored: compressed sessions unsupported"),
+    ]
+}
+
+/// Asserts that the output at each budget up to `roomy` is cut short or ends
+/// with every record of `warnings`, and that the output at `roomy` is
+/// complete. A complete output ends with a line break and fits its budget.
+#[track_caller]
+pub fn assert_each_budget_cuts_short_or_ends_with_warnings(
+    roomy: usize,
+    warnings: &[AgentWarning],
+    output_at: impl Fn(usize) -> String,
+) {
+    let (_, warning_records) = format_warning_records(warnings);
+    let warning_records = warning_records.concat();
+    let wrong = (1..=roomy)
+        .map(|budget| (budget, output_at(budget)))
+        .find(|(budget, output)| {
+            output.ends_with('\n')
+                && (output.chars().count() > *budget || !output.ends_with(&warning_records))
+        });
+    assert!(
+        wrong.is_none(),
+        "a complete output fits its budget and ends with every warning record: {wrong:?}"
+    );
+    assert!(
+        output_at(roomy).ends_with('\n'),
+        "the output is complete at {roomy}"
+    );
 }
 
 /// `timestamp` as `agent` output prints it in full: in local time, to the

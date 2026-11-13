@@ -1654,7 +1654,10 @@ fn hit_source_atom(source: AgentHitKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::agent::refs::AgentConversationKey;
-    use crate::agent::test_support::{text_message, text_message_at, written_at};
+    use crate::agent::test_support::{
+        assert_each_budget_cuts_short_or_ends_with_warnings, text_message, text_message_at,
+        warnings_of_two_kinds, written_at,
+    };
     use crate::agent::transcript::{AgentMessage, AgentMessageRole, AgentTranscript};
     use crate::semantic::rank::PreparedChunk;
     use crate::semantic::types::{
@@ -3168,6 +3171,40 @@ mod tests {
         assert!(!rendered.contains("\nhit "), "{rendered}");
         assert!(rendered.contains("\ncontinue search "), "{rendered}");
         assert!(rendered.ends_with(&warning_record), "{rendered}");
+    }
+
+    #[test]
+    fn search_at_each_budget_is_cut_short_or_ends_with_its_warnings() {
+        let hit = |ordinal| {
+            lexical_dialogue_hit(
+                "ch_1234abcd5678",
+                "title",
+                1.0,
+                &format!("hit {ordinal} {}", "x".repeat(100)),
+                MessageRange::single(ordinal),
+                MessageRange::single(ordinal),
+            )
+        };
+        let output = |budget| AgentSearchOutput {
+            protocol: AgentProtocolKind::Search,
+            target: None,
+            query: "needle".to_string(),
+            mode: SearchMode::Lexical,
+            hits: vec![hit(1), hit(2)],
+            groups: vec![],
+            flat: true,
+            budget,
+            coverage: None,
+        };
+        let warnings = warnings_of_two_kinds();
+        let roomy = format_agent_output_with_warnings(&output(None), &warnings, written_at())
+            .chars()
+            .count()
+            + 10;
+
+        assert_each_budget_cuts_short_or_ends_with_warnings(roomy, &warnings, |budget| {
+            format_agent_output_with_warnings(&output(Some(budget)), &warnings, written_at())
+        });
     }
 
     #[test]

@@ -200,7 +200,10 @@ fn session_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::test_support::{resolved_conversation, written_at};
+    use crate::agent::test_support::{
+        assert_each_budget_cuts_short_or_ends_with_warnings, resolved_conversation,
+        warnings_of_two_kinds, written_at,
+    };
     use crate::agent::time_span::TimeSpan;
     use crate::history::MessageTimes;
     use crate::semantic::test_fixtures::SemanticConversationFixture;
@@ -496,6 +499,20 @@ mod tests {
         assert!(output.chars().count() <= budget, "{output}");
         assert!(output.contains("listed=0\n"), "{output}");
         assert!(output.ends_with(&warning_record), "{output}");
+    }
+
+    #[test]
+    fn listing_at_each_budget_is_cut_short_or_ends_with_its_warnings() {
+        let listing = listing(&sessions(), &TimeFilter::default(), 0, 10);
+        let warnings = warnings_of_two_kinds();
+        let roomy = records_with_warnings(&listing, None, &warnings)
+            .chars()
+            .count()
+            + 10;
+
+        assert_each_budget_cuts_short_or_ends_with_warnings(roomy, &warnings, |budget| {
+            records_with_warnings(&listing, Some(budget), &warnings)
+        });
     }
 
     #[test]

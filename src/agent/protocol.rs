@@ -3193,7 +3193,8 @@ mod tests {
     use super::*;
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{
-        day_record, local_time, record_time, source, text_message, text_message_at, written_at,
+        assert_each_budget_cuts_short_or_ends_with_warnings, day_record, local_time, record_time,
+        source, text_message, text_message_at, warnings_of_two_kinds, written_at,
     };
     use crate::agent::transcript::AgentPartSource;
     use crate::log_entry::Tool;
@@ -5683,6 +5684,25 @@ mod tests {
     }
 
     #[test]
+    fn outline_at_each_budget_is_cut_short_or_ends_with_its_warnings() {
+        let resolved = resolved("session.jsonl");
+        let transcript = long_session(24);
+        let warnings = warnings_of_two_kinds();
+        let unbudgeted = ProtocolOptions {
+            budget: None,
+            ..options()
+        };
+        let roomy = outline_with_warnings(&resolved, &transcript, unbudgeted, &warnings)
+            .chars()
+            .count()
+            + 10;
+
+        assert_each_budget_cuts_short_or_ends_with_warnings(roomy, &warnings, |budget| {
+            outline_with_warnings(&resolved, &transcript, with_budget(budget), &warnings)
+        });
+    }
+
+    #[test]
     fn roomy_outline_shows_its_warning() {
         let resolved = resolved("session.jsonl");
         let transcript = long_session(2_000);
@@ -5709,7 +5729,7 @@ mod tests {
         );
     }
 
-    /// Two warnings of one kind print as one record.
+    /// Two warnings of one kind for two refs print as one record.
     #[test]
     fn truncated_outline_counts_its_warning_records_as_other_headers_do() {
         let resolved = resolved("session.jsonl");

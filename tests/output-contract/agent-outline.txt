@@ -69,6 +69,7 @@ seg m22..m22 chars=33 at=2026-08-06T06:03:21 | The notes list the release steps.
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent outline ch_0b26e45343df --budget 500
 --- stderr, exit 1
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 protocol agent-error kind=budget-too-small detail=output%20budget%20cannot%20fit%20a%20complete%20compact%20record%3B%20increase%20--budget
 $ rearview agent outline ch_0b26e45343df:m2..m5
 --- stdout
@@ -106,6 +107,7 @@ seg m32..m35 chars=99 at=2026-08-01T06:03:13 to=2026-08-01T06:03:16 | commit a1b
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent outline ch_74aec3f6df49 --budget 500
 --- stderr, exit 1
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 protocol agent-error kind=budget-too-small detail=output%20budget%20cannot%20fit%20a%20complete%20compact%20record%3B%20increase%20--budget
 $ rearview agent outline ch_74aec3f6df49:m2..m5
 --- stdout

@@ -1306,11 +1306,11 @@ impl AgentService {
             eprint!("{}", self.perf.records(agent::peak_memory::peak_bytes()));
         }
         output
-            .and_then(ensure_complete_compact_output)
+            .and_then(CommandOutput::records_if_complete)
             .map_err(protocol_error)
     }
 
-    fn execute_inner(&self, command: &AgentCommand) -> Result<String> {
+    fn execute_inner(&self, command: &AgentCommand) -> Result<CommandOutput> {
         match command {
             AgentCommand::Sessions(args) => self.run_sessions(args),
             AgentCommand::Search(args) => self.search(args),
@@ -1343,7 +1343,7 @@ impl AgentService {
             .map_err(AppError::from)
     }
 
-    fn search(&self, args: &cli::AgentSearchArgs) -> Result<String> {
+    fn search(&self, args: &cli::AgentSearchArgs) -> Result<CommandOutput> {
         let perf = &self.perf;
         let reads = perf.search_reads();
         let config = config::load_config()?;
@@ -1467,13 +1467,7 @@ impl AgentService {
                 let mut output = run.output;
                 apply_configured_render_policy(&mut output, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
-                Ok(perf.time(Stage::Render, || {
-                    agent::search::format_agent_output_with_warnings(
-                        &output,
-                        &warnings,
-                        clock.local_wall(),
-                    )
-                }))
+                Ok(self.render_search(&output, warnings))
             }
             SearchMode::Semantic => {
                 let (mut output, semantic_warnings) = perf.time(Stage::Semantic, || {
@@ -1490,13 +1484,7 @@ impl AgentService {
                 let mut warnings = warnings.into_inner();
                 warnings.extend(semantic_warnings);
                 let warnings = self.with_stale_cache_record(warnings, &output);
-                Ok(perf.time(Stage::Render, || {
-                    agent::search::format_agent_output_with_warnings(
-                        &output,
-                        &warnings,
-                        clock.local_wall(),
-                    )
-                }))
+                Ok(self.render_search(&output, warnings))
             }
             SearchMode::Hybrid => {
                 let inputs = agent_inputs_for_indices(&conversations, &keys, &scoped)?;
@@ -1551,15 +1539,24 @@ impl AgentService {
                 };
                 apply_configured_render_policy(&mut output, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
-                Ok(perf.time(Stage::Render, || {
-                    agent::search::format_agent_output_with_warnings(
-                        &output,
-                        &warnings,
-                        clock.local_wall(),
-                    )
-                }))
+                Ok(self.render_search(&output, warnings))
             }
         }
+    }
+
+    fn render_search(
+        &self,
+        output: &agent::search::AgentSearchOutput,
+        warnings: Vec<AgentWarning>,
+    ) -> CommandOutput {
+        let records = self.perf.time(Stage::Render, || {
+            agent::search::format_agent_output_with_warnings(
+                output,
+                &warnings,
+                self.clock().local_wall(),
+            )
+        });
+        CommandOutput { records, warnings }
     }
 
     /// Loads the history and the environment, applies `rules`, adds the
@@ -1586,7 +1583,7 @@ impl AgentService {
         Ok(selection)
     }
 
-    fn run_sessions(&self, args: &cli::AgentSessionsArgs) -> Result<String> {
+    fn run_sessions(&self, args: &cli::AgentSessionsArgs) -> Result<CommandOutput> {
         let agent_config = config::load_config()?.agent.unwrap_or_default();
         let rules = SelectionRules::new(
             args.time.resolve(self.clock().as_ref())?,
@@ -1602,16 +1599,17 @@ impl AgentService {
             )?;
             let warnings =
                 self.with_stale_cache_record(std::mem::take(&mut selection.warnings), &listing);
-            Ok(agent::sessions::format_sessions_with_warnings(
+            let records = agent::sessions::format_sessions_with_warnings(
                 &listing,
                 configured_budget(args.no_budget, args.budget, agent_config.output_chars),
                 &warnings,
                 self.clock().local_wall(),
-            ))
+            );
+            Ok(CommandOutput { records, warnings })
         })
     }
 
-    fn run_within(&self, args: &cli::AgentWithinArgs) -> Result<String> {
+    fn run_within(&self, args: &cli::AgentWithinArgs) -> Result<CommandOutput> {
         let config = config::load_config()?;
         let search_config = config.search.unwrap_or_default();
         let agent_config = config.agent.unwrap_or_default();
@@ -1718,7 +1716,7 @@ impl AgentService {
             })
         })?;
         let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
-        let rendered = perf.time(Stage::Render, || {
+        let records = perf.time(Stage::Render, || {
             agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
             apply_configured_render_policy(&mut output, &agent_config);
             agent::search::format_agent_output_with_warnings(
@@ -1728,7 +1726,7 @@ impl AgentService {
             )
         });
         operation.finish().fail_if_low_space()?;
-        Ok(rendered)
+        Ok(CommandOutput { records, warnings })
     }
 }
 
@@ -2541,16 +2539,27 @@ fn target_error(error: AppError, resolved: &agent::refs::ResolvedConversation) -
     }
 }
 
-fn ensure_complete_compact_output(output: String) -> Result<String> {
-    if output.ends_with('\n') {
-        Ok(output)
-    } else {
-        Err(AgentError::new(
+/// The records a command prints on success, and the command's warnings, for
+/// its failure when the budget cut the records short.
+#[derive(Debug)]
+pub(crate) struct CommandOutput {
+    records: String,
+    warnings: Vec<AgentWarning>,
+}
+
+impl CommandOutput {
+    /// The records; or, when the budget cut them short, the
+    /// `budget-too-small` error printed after the warning records.
+    fn records_if_complete(self) -> Result<String> {
+        if self.records.ends_with('\n') {
+            return Ok(self.records);
+        }
+        let error = AgentError::new(
             AgentErrorKind::BudgetTooSmall,
             None,
             "output budget cannot fit a complete compact record; increase --budget",
-        )
-        .into())
+        );
+        Err(failure_after_warnings(error.into(), &self.warnings))
     }
 }
 
@@ -2573,18 +2582,17 @@ pub fn protocol_error(error: AppError) -> AppError {
     }
 }
 
-/// `error` printed after `warnings`, the warnings the command met before it
-/// failed, such as the listing failure that explains a reference not found.
+/// `error` printed after the records of the command's `warnings`, as a
+/// successful output prints them. A reference not found follows the
+/// listing failure that explains it.
 fn failure_after_warnings(error: AppError, warnings: &[AgentWarning]) -> AppError {
     if warnings.is_empty() {
         return error;
     }
     match structured_agent_error(error) {
         AppError::Agent(error) => {
-            let mut output: String = warnings
-                .iter()
-                .map(agent::diagnostic::format_warning)
-                .collect();
+            let (_, warning_records) = agent::diagnostic::format_warning_records(warnings);
+            let mut output = warning_records.concat();
             output.push_str(&agent::diagnostic::format_error(&error));
             AppError::AgentProtocol(output)
         }
@@ -3569,7 +3577,7 @@ impl AgentService {
         &self,
         args: &AgentReadArgs,
         keys: Option<&[agent::refs::AgentConversationKey]>,
-    ) -> Result<String> {
+    ) -> Result<CommandOutput> {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
@@ -3656,7 +3664,7 @@ impl AgentService {
             },
         ));
         let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
-        let output = perf
+        let records = perf
             .time(Stage::Render, || {
                 agent::protocol::format_read_with_warnings(
                     &requests,
@@ -3672,14 +3680,14 @@ impl AgentService {
                 None => structured_agent_error(error),
             })?;
         operation.finish().fail_if_low_space()?;
-        Ok(output)
+        Ok(CommandOutput { records, warnings })
     }
 
     pub(crate) fn run_outline(
         &self,
         args: &AgentOutlineArgs,
         keys: Option<&[agent::refs::AgentConversationKey]>,
-    ) -> Result<String> {
+    ) -> Result<CommandOutput> {
         let perf = &self.perf;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
@@ -3723,7 +3731,7 @@ impl AgentService {
             subagent: outline_ref.subagent,
             call: None,
         };
-        let output = perf
+        let records = perf
             .time(Stage::Render, || {
                 agent::protocol::format_outline_with_warnings(
                     &request,
@@ -3734,7 +3742,7 @@ impl AgentService {
             })
             .map_err(|error| target_error(error, &resolved))?;
         operation.finish().fail_if_low_space()?;
-        Ok(output)
+        Ok(CommandOutput { records, warnings })
     }
 }
 
@@ -3893,7 +3901,9 @@ pub(crate) fn run_agent_read(
     args: &AgentReadArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
 ) -> Result<String> {
-    test_service().run_read(args, keys)
+    test_service()
+        .run_read(args, keys)
+        .map(|output| output.records)
 }
 
 #[cfg(test)]
@@ -3901,7 +3911,9 @@ pub(crate) fn run_agent_outline(
     args: &AgentOutlineArgs,
     keys: Option<&[agent::refs::AgentConversationKey]>,
 ) -> Result<String> {
-    test_service().run_outline(args, keys)
+    test_service()
+        .run_outline(args, keys)
+        .map(|output| output.records)
 }
 
 #[cfg(test)]
@@ -4493,7 +4505,7 @@ mod tests {
     /// Two Claude Code sessions recorded in one directory, `CHANGED_SESSION`
     /// at 06:30 and another at 06:31, cached by a load, and their storage.
     struct CachedClaudeSessions {
-        _claude: history::provider::claude::tests::ConfigDir,
+        claude: history::provider::claude::tests::ConfigDir,
         directory: tempfile::TempDir,
         cache_base: tempfile::TempDir,
         changed: PathBuf,
@@ -4527,7 +4539,7 @@ mod tests {
                 history::provider::LeftOutRows::NONE,
             );
             Self {
-                _claude: claude,
+                claude,
                 directory,
                 cache_base,
                 changed,
@@ -5104,6 +5116,112 @@ mod tests {
             wrong.is_empty(),
             "each output is complete and ends with the count:\n{}",
             wrong.join("\n")
+        );
+    }
+
+    const BUDGET_TOO_SMALL_RECORD: &str = "protocol agent-error kind=budget-too-small detail=output%20budget%20cannot%20fit%20a%20complete%20compact%20record%3B%20increase%20--budget\n";
+
+    impl CachedClaudeSessions {
+        /// The commands among `sessions`, `search`, `within`, `read` and
+        /// `outline` that, at `budget` and beside another refresh, don't fail
+        /// with the `stale-cache` record of the changed session at
+        /// `reference`, then the `budget-too-small` error; each with what it
+        /// printed.
+        fn commands_not_failing_after_stale_record(
+            &self,
+            reference: &str,
+            budget: usize,
+        ) -> Vec<String> {
+            let expected = format!(
+                "{}{BUDGET_TOO_SMALL_RECORD}",
+                changed_session_record(reference)
+            );
+            let budget = budget.to_string();
+            let commands: [Vec<&str>; 5] = [
+                vec!["sessions", "--all"],
+                vec!["search", "question", "--all"],
+                vec!["within", reference, "question"],
+                vec!["read", reference],
+                vec!["outline", reference],
+            ];
+            commands
+                .iter()
+                .filter_map(|command_args| {
+                    let args: Vec<&str> = command_args
+                        .iter()
+                        .copied()
+                        .chain(["--budget", &budget])
+                        .collect();
+                    match self.execute_beside_another_refresh(&args) {
+                        Ok(output) => Some(format!("{} succeeded:\n{output}", command_args[0])),
+                        Err(error) => {
+                            let failure = crate::error_report(error);
+                            (failure != expected)
+                                .then(|| format!("{} failed with:\n{failure}", command_args[0]))
+                        }
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// The budget is 40 characters longer than the `stale-cache` record: too
+    /// short for the record beside any command's header and first records.
+    #[test]
+    fn every_command_at_budget_below_its_shortest_output_prints_its_warning_before_error() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        sessions.append_to_the_changed_session();
+        let record = changed_session_record(&reference);
+
+        let wrong = sessions
+            .commands_not_failing_after_stale_record(&reference, record.chars().count() + 40);
+
+        assert!(
+            wrong.is_empty(),
+            "each command prints the warning record, then the error:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_command_at_budget_shorter_than_its_warning_prints_warning_whole_before_error() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        sessions.append_to_the_changed_session();
+        let record = changed_session_record(&reference);
+
+        let wrong = sessions
+            .commands_not_failing_after_stale_record(&reference, record.chars().count() / 2);
+
+        assert!(
+            wrong.is_empty(),
+            "each command prints the whole warning record, then the error:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// The budget is shorter than any command's header.
+    #[test]
+    fn budget_failure_prints_warnings_of_one_kind_for_two_sessions_as_one_count_record() {
+        let sessions = CachedClaudeSessions::new();
+        for transcript in [sessions.changed.clone(), sessions.other()] {
+            let mut text = std::fs::read_to_string(&transcript).unwrap();
+            text.push_str("{malformed\n");
+            std::fs::write(&transcript, text).unwrap();
+        }
+        let environment =
+            test_environment(vec![sessions.storage], Some(sessions.cache_base.path()));
+
+        let failure = AgentService::new(environment)
+            .execute(agent_command(&["sessions", "--all", "--budget", "60"]))
+            .unwrap_or_else(crate::error_report);
+
+        assert_eq!(
+            failure,
+            format!(
+                "protocol agent-warning kind=malformed-transcript count=2\n{BUDGET_TOO_SMALL_RECORD}"
+            )
         );
     }
 
@@ -6962,6 +7080,98 @@ mod tests {
         );
     }
 
+    impl CachedClaudeSessions {
+        /// An environment over these sessions whose directory listing
+        /// refuses two Claude project folders, and the two folders' names
+        /// as an `io` warning prints them. The first folder contains these
+        /// sessions. The second is the project folder of a session recorded
+        /// in `other_directory`.
+        fn environment_refusing_two_folders(
+            &self,
+            other_directory: &Path,
+        ) -> (history::Environment, [String; 2]) {
+            let other = claude_session_in(
+                &self.claude,
+                other_directory,
+                "0f000000-0000-4000-8000-000000000003",
+                32,
+            );
+            let folders = [self.changed.parent().unwrap(), other.parent().unwrap()];
+            let lister = Arc::new(history::provider::walk::test_support::ScriptedLister::default());
+            for folder in folders {
+                lister.refuse(folder);
+            }
+            let environment = history::Environment::new(
+                vec![self.storage],
+                self.cache_base.path().to_path_buf(),
+                history::ProcessIdentity::default(),
+                Arc::new(TestClock::default()),
+                lister,
+            );
+            let folder_names = folders.map(|folder| {
+                agent::protocol::escape_atom(&folder.file_name().unwrap().to_string_lossy())
+            });
+            (environment, folder_names)
+        }
+    }
+
+    #[test]
+    fn listing_prints_io_warning_for_each_unreadable_directory() {
+        let sessions = CachedClaudeSessions::new();
+        let other_directory = tempfile::tempdir().unwrap();
+        let (environment, folder_names) =
+            sessions.environment_refusing_two_folders(other_directory.path());
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&["sessions", "--all"]))
+            .unwrap_or_else(crate::error_report);
+
+        let io_records: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("protocol agent-warning kind=io "))
+            .collect();
+        assert!(
+            io_records.len() == 2
+                && folder_names
+                    .iter()
+                    .all(|name| io_records.iter().any(|record| record.contains(name))),
+            "each unreadable directory has an io record of its own:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with(" warnings=2 warning-records=2"),
+            "the header counts both warnings:\n{output}"
+        );
+    }
+
+    #[test]
+    fn ref_not_found_prints_io_warning_for_each_unreadable_directory_before_error() {
+        let sessions = CachedClaudeSessions::new();
+        let other_directory = tempfile::tempdir().unwrap();
+        let (environment, folder_names) =
+            sessions.environment_refusing_two_folders(other_directory.path());
+
+        let failure = AgentService::new(environment)
+            .execute(agent_command(&["read", "ch_000000000000"]))
+            .unwrap_or_else(crate::error_report);
+
+        let lines: Vec<&str> = failure.lines().collect();
+        assert!(
+            lines.len() == 3
+                && lines[..2]
+                    .iter()
+                    .all(|line| line.starts_with("protocol agent-warning kind=io "))
+                && folder_names
+                    .iter()
+                    .all(|name| lines[..2].iter().any(|line| line.contains(name)))
+                && lines[2].starts_with("protocol agent-error kind=not-found "),
+            "an io record for each unreadable directory, then the error:\n{failure}"
+        );
+    }
+
     #[test]
     fn search_read_outline_and_within_name_unreadable_directory_once_and_read_its_cached_session() {
         let sessions = CachedClaudeSessions::new();
@@ -7709,7 +7919,7 @@ mod tests {
             "read by the row's key".to_owned(),
             service()
                 .run_read(&read_args(reference.clone()), Some(keys))
-                .unwrap_or_else(crate::error_report),
+                .map_or_else(crate::error_report, |output| output.records),
         ));
         outputs.push((
             "outline by the row's key".to_owned(),
@@ -7722,7 +7932,7 @@ mod tests {
                     },
                     Some(keys),
                 )
-                .unwrap_or_else(crate::error_report),
+                .map_or_else(crate::error_report, |output| output.records),
         ));
         drop(other_refresh);
 
@@ -8508,7 +8718,8 @@ mod tests {
 
         let output = test_service()
             .run_read(&args, Some(std::slice::from_ref(&key)))
-            .unwrap();
+            .unwrap()
+            .records;
 
         let record = output
             .lines()
@@ -8680,7 +8891,8 @@ mode = "hybrid"
         std::fs::write(&path, "{malformed").unwrap();
         let output = service
             .run_read(&args, Some(std::slice::from_ref(&key)))
-            .unwrap();
+            .unwrap()
+            .records;
 
         assert!(output.contains("cached message"));
         assert_eq!(
@@ -8718,7 +8930,8 @@ mode = "hybrid"
 
         let output = test_service()
             .run_outline(&args, Some(std::slice::from_ref(&key)))
-            .unwrap();
+            .unwrap()
+            .records;
 
         assert!(output.contains("warnings=1"));
         assert!(output.contains("kind=malformed-transcript"));
