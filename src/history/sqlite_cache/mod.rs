@@ -93,6 +93,7 @@ use roots::{Places, WrittenPlaces};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
@@ -684,7 +685,7 @@ impl CacheWriter {
     /// checkpoint automatically, and a long-running TUI's log grows until a
     /// checkpoint runs. Skipped once a write found the drive low on space:
     /// the copy would grow the database the low-space deletion empties.
-    pub(crate) fn checkpoint_after_writes(&self) -> Result<()> {
+    fn checkpoint_after_writes(&self) -> Result<()> {
         if self.owner.is_low_space() {
             return Ok(());
         }
@@ -1287,9 +1288,12 @@ pub(crate) type WriteOutcome = std::result::Result<Option<i64>, String>;
 pub(crate) enum CacheWrite {
     /// A session's record. The writer sends the write's outcome on
     /// `reply`. A write the writer leaves unwritten once it stops is dropped
-    /// with `reply`, and its receiver disconnects.
+    /// with `reply`, and its receiver disconnects. Keep `record` declared
+    /// before `reply`: a sender that shares the record regains sole
+    /// ownership of it once the reply arrives or disconnects, and fields
+    /// drop in that order.
     Session {
-        record: Box<SessionRecord>,
+        record: Arc<SessionRecord>,
         reply: Sender<WriteOutcome>,
     },
     /// The sessions `storage` no longer finds at these cache keys under the
@@ -1302,11 +1306,10 @@ pub(crate) enum CacheWrite {
 }
 
 impl CacheWrite {
-    /// The write of `record`, and the receiver its outcome arrives on.
-    pub(crate) fn session(record: SessionRecord) -> (Self, Receiver<WriteOutcome>) {
+    pub(crate) fn session(record: impl Into<Arc<SessionRecord>>) -> (Self, Receiver<WriteOutcome>) {
         let (reply, outcome) = std::sync::mpsc::channel();
         let write = Self::Session {
-            record: Box::new(record),
+            record: record.into(),
             reply,
         };
         (write, outcome)
@@ -1315,22 +1318,25 @@ impl CacheWrite {
 
 /// Applies every write `writes` receives to `writer`, in order, until every
 /// sender is gone or the owner's write permission is revoked, then
-/// checkpoints. Other write failures are reported under `--debug`, and the
-/// remaining records are written.
+/// checkpoints and returns `writer`. Other write failures are reported under
+/// `--debug`, and the remaining records are written.
 pub(crate) fn apply_writes(
     mut writer: CacheWriter,
     writes: Receiver<CacheWrite>,
     debug_level: Option<DebugLevel>,
-) {
+) -> CacheWriter {
     let mut reported = HashSet::new();
     for write in writes {
         if !writer.can_publish() {
             break;
         }
-        let mut write_logged = |record: &SessionRecord| {
+        // The record moves into the write and drops before `reply`, on a
+        // panic too: the sender regains sole ownership of it once the reply
+        // arrives or disconnects.
+        let mut write_logged = |record: Arc<SessionRecord>| {
             let started = std::time::Instant::now();
             let changes_before = writer.connection.total_changes();
-            let outcome = writer.write(record);
+            let outcome = writer.write(&record);
             // SQLite counts the rows each statement changed, not those a
             // cascade deleted.
             debug::debug(
@@ -1344,7 +1350,7 @@ pub(crate) fn apply_writes(
             );
             outcome
         };
-        let outcome = match &write {
+        let outcome = match write {
             CacheWrite::Session { record, reply } => {
                 let outcome = write_logged(record);
                 let _ = reply.send(outcome.as_ref().copied().map_err(ToString::to_string));
@@ -1354,7 +1360,7 @@ pub(crate) fn apply_writes(
                 storage,
                 root,
                 cache_keys,
-            } => writer.remove(*storage, root, cache_keys),
+            } => writer.remove(storage, &root, &cache_keys),
         };
         if let Err(error) = outcome {
             let message = error.to_string();
@@ -1372,6 +1378,7 @@ pub(crate) fn apply_writes(
             &format!("Failed to checkpoint the session cache database: {error}"),
         );
     }
+    writer
 }
 
 #[cfg(test)]
