@@ -2,3 +2,13 @@
 # CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER to link with another linker.
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
+
+# Windows: tests and build scripts started by cargo create their temporary
+# files in target. Antivirus real-time scanning reads every file written to
+# the system temp folder; a developer's exclusion for the project folder
+# usually covers target. Cargo creates target before it starts them.
+# `force` replaces the values Windows sets for every process. Linux and
+# macOS read TMPDIR.
+[env]
+TMP = { value = "target", relative = true, force = true }
+TEMP = { value = "target", relative = true, force = true }
