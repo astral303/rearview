@@ -717,6 +717,14 @@ enum TargetCopy {
     Missing(agent::refs::AgentConversationKey),
 }
 
+impl TargetCopy {
+    fn key(&self) -> &agent::refs::AgentConversationKey {
+        match self {
+            Self::Current(key) | Self::Older(key, _) | Self::Missing(key) => key,
+        }
+    }
+}
+
 /// A target's key, as [`AgentService::check_copy_without_reading`] checks
 /// it against its copy: an older copy is not read.
 enum CopyCheck {
@@ -734,6 +742,13 @@ type CopyCurrency = fn(
     &history::sqlite_cache::HeldCopy<'_>,
     &history::sqlite_cache::Publication,
 ) -> Result<history::sqlite_cache::Currency>;
+
+fn currency_against_transcripts(
+    copy: &history::sqlite_cache::HeldCopy<'_>,
+    publication: &history::sqlite_cache::Publication,
+) -> Result<history::sqlite_cache::Currency> {
+    copy.currency(publication)
+}
 
 /// A targeted read of one session as a command keeps it for its key and
 /// its reads: without the listed row's search texts.
@@ -849,8 +864,9 @@ impl AgentService {
     /// or before the copy's last message.
     ///
     /// While another rearview keeps the cache and a target is missing from
-    /// it, the command waits for ownership and refreshes again each target
-    /// it neither published nor parsed: only the owner parses transcripts.
+    /// it, the command waits for ownership, checks again each target it
+    /// neither published nor parsed, and refreshes those whose copy is older
+    /// or missing: only the owner parses transcripts.
     /// Once the command's own writes stop, it does not refresh again, and a
     /// missing target is reported as not in the session cache. The refresh
     /// reads below `reads`' roots and doesn't reread a target in `reads`.
@@ -899,9 +915,10 @@ impl AgentService {
     /// The keys of `targets`, each checked against its copy as
     /// [`Self::check_target_copy`] checks it. A target key discovery read
     /// keeps that read, from `keyed`, whatever the command's access now. As
-    /// `operation`'s refresh owner, the command brings each other target's
-    /// copy up to date first, reading each distinct session once whatever
-    /// the number of targets naming it. A target this command read is
+    /// `operation`'s refresh owner, the command reads each other target
+    /// whose copy is current without refreshing it, and brings the rest up
+    /// to date first, reading each distinct session once whatever the
+    /// number of targets naming it. A target this command read is
     /// checked as [`history::sqlite_cache::HeldCopy::currency_for_publisher`]
     /// checks it, as the printout checks its copy; one it reads as the
     /// cache holds it, against its transcripts.
@@ -922,19 +939,26 @@ impl AgentService {
                 None => unread.push(target),
             }
         }
-        let unchecked: Vec<&agent::refs::AgentConversationKey> = match operation.acquire_access()? {
-            history::sqlite_cache::OperationAccess::Owner(_) if !unread.is_empty() => {
-                self.perf.record_refresh_round(unread.len());
-                let refreshed = self.perf.time(Stage::Refresh, || {
-                    self.refresh_targets(&unread, operation, keyed)
-                })?;
-                for key in refreshed {
-                    held.keep(key);
+        let read_as_is: Vec<TargetCopy> = match operation.acquire_access()? {
+            history::sqlite_cache::OperationAccess::Owner(_) => {
+                let (current, to_refresh) = self.check_copies_before_refresh(operation, unread);
+                if !to_refresh.is_empty() {
+                    self.perf.record_refresh_round(to_refresh.len());
+                    let refreshed = self.perf.time(Stage::Refresh, || {
+                        self.refresh_targets(&to_refresh, operation, keyed)
+                    })?;
+                    for key in refreshed {
+                        held.keep(key);
+                    }
                 }
-                Vec::new()
+                current.into_iter().map(TargetCopy::Current).collect()
             }
-            history::sqlite_cache::OperationAccess::Owner(_) => Vec::new(),
-            history::sqlite_cache::OperationAccess::AsIs => unread,
+            history::sqlite_cache::OperationAccess::AsIs => unread
+                .into_iter()
+                .map(|target| {
+                    self.check_target_copy(operation, target.clone(), currency_against_transcripts)
+                })
+                .collect::<Result<_>>()?,
         };
         let mut checked = CheckedTargets::default();
         for key in held.into_keys() {
@@ -942,7 +966,8 @@ impl AgentService {
                 held.currency_for_publisher(publication)
             })?);
         }
-        for target in unchecked {
+        for copy in read_as_is {
+            let target = copy.key();
             let root = keyed
                 .roots
                 .get(&target.source)
@@ -950,13 +975,36 @@ impl AgentService {
             if let Some(root) = root {
                 checked.held.record_root_read_as_is(target, root.clone());
             }
-            checked.add(self.check_target_copy(
-                operation,
-                target.clone(),
-                |held, publication| held.currency(publication),
-            )?);
+            checked.add(copy);
         }
         Ok(checked)
+    }
+
+    /// The keys of `targets` whose copies are current against their
+    /// transcripts, then the targets for the owner's refresh: those whose
+    /// copies are older or missing, or whose check failed. A failed check
+    /// is dropped; the refresh reports what fails while it reads.
+    fn check_copies_before_refresh<'k>(
+        &self,
+        operation: &history::OperationScope,
+        targets: Vec<&'k agent::refs::AgentConversationKey>,
+    ) -> (
+        Vec<agent::refs::AgentConversationKey>,
+        Vec<&'k agent::refs::AgentConversationKey>,
+    ) {
+        let mut current = Vec::new();
+        let mut to_refresh = Vec::new();
+        for target in targets {
+            match self.check_copy_without_reading(
+                operation,
+                target.clone(),
+                currency_against_transcripts,
+            ) {
+                Ok(CopyCheck::Current(key)) => current.push(key),
+                Ok(CopyCheck::Older(_) | CopyCheck::Missing(_)) | Err(_) => to_refresh.push(target),
+            }
+        }
+        (current, to_refresh)
     }
 
     /// `target` checked against its copy by `currency`, without parsing:
@@ -5774,6 +5822,119 @@ mod tests {
         assert_eq!(admitted_reads::count(&locator) - before, 1);
     }
 
+    /// The reference `agent sessions --all` prints for the one session
+    /// `storage` lists. The command writes that session's copy to the
+    /// session cache under `cache`.
+    fn cache_session_and_reference_it(
+        storage: &'static dyn history::provider::SessionStorage,
+        cache: &Path,
+    ) -> String {
+        let sessions = AgentService::new(test_environment(vec![storage], Some(cache)))
+            .execute(agent_command(&["sessions", "--all"]))
+            .unwrap_or_else(crate::error_report);
+        sessions
+            .split_whitespace()
+            .find_map(|atom| atom.strip_prefix("ref="))
+            .expect("agent sessions lists the session")
+            .to_owned()
+    }
+
+    /// On a warm cache, `read`, `outline` and `within` of a session whose
+    /// copy is current list its agent's sessions once, to resolve the
+    /// reference, and read the copy as current, for every agent.
+    #[test]
+    fn targeted_commands_of_current_copy_list_its_agents_sessions_once() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            let home = tempfile::tempdir().unwrap();
+            fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            let reference = cache_session_and_reference_it(storage, cache.path());
+            let discovery_record = format!("perf discovery source={} ", source.label());
+
+            for args in [
+                &["read", &reference][..],
+                &["outline", &reference],
+                &["within", &reference, "the"],
+            ] {
+                let service =
+                    AgentService::new(test_environment(vec![storage], Some(cache.path())));
+                let output = service
+                    .execute(agent_command(args))
+                    .unwrap_or_else(crate::error_report);
+                let records = service.perf.records(None);
+                let discovery = records
+                    .lines()
+                    .find(|line| line.starts_with(&discovery_record));
+                if output.contains("agent-error")
+                    || output.contains("stale-cache")
+                    || !discovery.is_some_and(|record| record.contains(" roots=1 "))
+                {
+                    wrong.push(format!(
+                        "{source:?} {}: the command succeeds without a stale-cache warning \
+                         and lists the root once, {discovery:?}:\n{output}",
+                        args[0]
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `read` of a session that gained a turn since its copy was written
+    /// parses it in one refresh round and prints the new reply, for every
+    /// agent. The next read doesn't refresh the session.
+    #[test]
+    fn read_of_session_changed_since_its_copy_prints_new_reply_and_writes_copy() {
+        const NEW_REPLY: &str = "Quokka harbour reply";
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            let home = tempfile::tempdir().unwrap();
+            let locator = fixture.write_session(home.path(), fixture.ids().session);
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            let reference = cache_session_and_reference_it(storage, cache.path());
+            fixture.append_turn(&locator, NEW_REPLY);
+            let read = || {
+                let service =
+                    AgentService::new(test_environment(vec![storage], Some(cache.path())));
+                let output = service
+                    .execute(agent_command(&["read", &reference]))
+                    .unwrap_or_else(crate::error_report);
+                (output, refresh_rounds(&service))
+            };
+
+            let (changed, changed_rounds) = read();
+            let (current, current_rounds) = read();
+
+            for (output, rounds, expected_rounds) in [
+                (
+                    changed,
+                    changed_rounds,
+                    &["perf refresh-round sessions=1"][..],
+                ),
+                (current, current_rounds, &[][..]),
+            ] {
+                if !output.contains(NEW_REPLY)
+                    || output.contains("stale-cache")
+                    || output.contains("agent-error")
+                    || rounds != expected_rounds
+                {
+                    wrong.push(format!(
+                        "{source:?}: the new reply prints without a warning, \
+                         refresh rounds {expected_rounds:?}, got {rounds:?}:\n{output}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
     /// When the write to an empty cache fails, `agent within` titles the hits
     /// from the read's row, the title kept outside the transcript included.
     #[test]
@@ -7649,9 +7810,9 @@ mod tests {
             .collect()
     }
 
-    /// `read` of two ranges of one session refreshes the session once, in
-    /// one round of one session: on an empty cache the transcript is parsed
-    /// once, and from the cache it is not parsed.
+    /// `read` of two ranges of one session on an empty cache refreshes the
+    /// session once, in one round of one session, parsing the transcript
+    /// once. The next read doesn't refresh the session or parse it.
     #[test]
     fn read_of_two_ranges_of_one_session_refreshes_it_once() {
         use history::sqlite_cache::admitted_reads;
@@ -7691,8 +7852,8 @@ mod tests {
         );
         assert_eq!(
             warm,
-            (0, vec!["perf refresh-round sessions=1".to_owned()]),
-            "from the cache: no parse and one refresh round of one session"
+            (0, Vec::<String>::new()),
+            "from the current copy: no parse and no refresh round"
         );
     }
 

@@ -342,6 +342,28 @@ pub(crate) mod test_support {
         })
     }
 
+    /// [`canonicalised_by_opening`] after the transcript at `changed` gets a
+    /// later modification time, so its session's copy is older.
+    pub(crate) fn canonicalised_by_opening_older_copy(
+        storage: &'static dyn SessionStorage,
+        changed: &Path,
+        open: &dyn Fn(&Environment),
+    ) -> Vec<PathBuf> {
+        canonicalised_by(storage, open, |environment| {
+            load_rows_in(environment, storage);
+            set_later_modification_time(changed);
+        })
+    }
+
+    /// Moves the modification time of the file at `path` one second later.
+    /// A copy written before the move is then older than the file.
+    pub(crate) fn set_later_modification_time(path: &Path) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        file.set_modified(modified + std::time::Duration::from_secs(1))
+            .unwrap();
+    }
+
     /// The paths `open` canonicalises, in order and with repeats, on a
     /// command that starts from an admitted, empty cache.
     pub(crate) fn canonicalised_by_opening_on_empty_cache(

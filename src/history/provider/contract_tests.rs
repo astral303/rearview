@@ -1991,15 +1991,16 @@ fn reads_of_listed_row_dont_canonicalise_a_path() {
 
 /// `agent read` and the printout of a session by its path, from a cache its
 /// own load filled, canonicalise the paths `OpeningCanonicalisations` lists
-/// for each route. `agent read`'s refresh reads below the roots its key
-/// discovery canonicalised, and canonicalises again a directory beside the
-/// root that key discovery could not canonicalise. Each agent's fixture has
-/// one root. Kimi's legacy second root and Codex's archived rollouts have
-/// tests of their own in those agents' modules.
+/// for each route. `agent read` of a current copy doesn't refresh it. Its
+/// refresh of an older copy reads below the roots its key discovery
+/// canonicalised, and canonicalises again a directory beside the root that
+/// key discovery could not canonicalise. Each agent's fixture has one root.
+/// Kimi's legacy second root and Codex's archived rollouts have tests of
+/// their own in those agents' modules.
 #[test]
 fn reads_of_session_by_path_canonicalise_roots_and_recorded_and_transcript_directories() {
     use crate::history::environment::test_support::{
-        agent_read_of, canonicalised_by_opening, printout_of,
+        agent_read_of, canonicalised_by_opening, canonicalised_by_opening_older_copy, printout_of,
     };
     run_contract(Contract::RootSpelling, |fixture| {
         let home = tempfile::tempdir().unwrap();
@@ -2072,12 +2073,20 @@ fn reads_of_session_by_path_canonicalise_roots_and_recorded_and_transcript_direc
             &expected.agent_read(),
         );
         assert_canonicalised(
+            &canonicalised_by_opening_older_copy(storage, &row.path, &agent_read_of(&row.path)),
+            &expected.agent_read_of_older_copy(),
+        );
+        assert_canonicalised(
             &canonicalised_by_opening(storage, &printout_of(row.source, &row.path)),
             &expected.printout(),
         );
         assert_canonicalised(
             &canonicalised_by_opening(storage, &agent_read_of(&canonical)),
             &expected.agent_read_by_canonical_path(),
+        );
+        assert_canonicalised(
+            &canonicalised_by_opening_older_copy(storage, &row.path, &agent_read_of(&canonical)),
+            &expected.agent_read_by_canonical_path_of_older_copy(),
         );
         assert_canonicalised(
             &canonicalised_by_opening(storage, &printout_of(row.source, &canonical)),

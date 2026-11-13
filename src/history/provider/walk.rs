@@ -313,8 +313,8 @@ pub(crate) mod test_support {
         /// The canonical path's directory, compared with each key's file;
         /// `None` when the canonical path is spelled as the path typed.
         pub(crate) canonical_directory: Option<ExpectedCall<'a>>,
-        /// The roots `agent read`'s refresh canonicalises again: those key
-        /// discovery could not canonicalise.
+        /// The roots `agent read`'s refresh of an older copy canonicalises
+        /// again: those key discovery could not canonicalise.
         pub(crate) canonicalised_again: Vec<ExpectedCall<'a>>,
         /// The printout's: the roots its record of the session is placed
         /// below.
@@ -322,8 +322,14 @@ pub(crate) mod test_support {
     }
 
     impl<'a> OpeningCanonicalisations<'a> {
-        /// `agent read` of the path as typed.
+        /// `agent read` of the path as typed, its copy current.
         pub(crate) fn agent_read(&self) -> Vec<ExpectedCall<'a>> {
+            self.key_discovery.clone()
+        }
+
+        /// `agent read` of the path as typed, its copy older than its
+        /// transcript.
+        pub(crate) fn agent_read_of_older_copy(&self) -> Vec<ExpectedCall<'a>> {
             [&self.key_discovery, &self.canonicalised_again]
                 .into_iter()
                 .flatten()
@@ -331,8 +337,18 @@ pub(crate) mod test_support {
                 .collect()
         }
 
-        /// `agent read` of the canonical path.
+        /// `agent read` of the canonical path, its copy current.
         pub(crate) fn agent_read_by_canonical_path(&self) -> Vec<ExpectedCall<'a>> {
+            self.key_discovery
+                .iter()
+                .chain(&self.canonical_directory)
+                .copied()
+                .collect()
+        }
+
+        /// `agent read` of the canonical path, its copy older than its
+        /// transcript.
+        pub(crate) fn agent_read_by_canonical_path_of_older_copy(&self) -> Vec<ExpectedCall<'a>> {
             self.key_discovery
                 .iter()
                 .chain(&self.canonical_directory)

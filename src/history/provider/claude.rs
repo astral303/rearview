@@ -1577,10 +1577,11 @@ pub(crate) mod tests {
         assert!(foreign.exists());
     }
 
-    /// `agent read` of two sessions by path refreshes both through one
-    /// targeted read: the command lists the projects root and canonicalises
-    /// it once for its keys and once for the refresh, not once for each
-    /// reference.
+    /// `agent read` of two sessions by path, modified since their copies were
+    /// written, refreshes both through one targeted read, not once for each
+    /// reference. The command lists the projects root once for its keys; the
+    /// refresh lists it once to find its targets and again under the writer
+    /// lock before it parses them.
     #[test]
     fn agent_read_of_two_sessions_refreshes_both_in_one_targeted_read() {
         use crate::agent::service::AgentService;
@@ -1618,6 +1619,9 @@ pub(crate) mod tests {
         crate::history::environment::test_support::load_rows_in(&environment, storage);
         let canonicalised_by_load = canonicaliser.canonicalised().len();
         let listed_by_load = lister.times_listed(root.path());
+        for transcript in &sessions {
+            crate::history::environment::test_support::set_later_modification_time(transcript);
+        }
 
         let output = AgentService::new(environment)
             .execute(agent_command(&[
@@ -1639,8 +1643,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             lister.times_listed(root.path()) - listed_by_load,
-            2,
-            "key discovery and the refresh each list the root once"
+            3,
+            "key discovery lists the root once and the refresh twice"
         );
     }
 
