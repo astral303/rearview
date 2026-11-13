@@ -81,8 +81,7 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
         "the parse lays out the texts in block order, whitespace collapsed"
     );
 
-    let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let mut cache = TemporaryCache::admitted();
     cache.admit_storage(storage_of(Source::Claude)).unwrap();
     let mut reads = Vec::new();
     for (written, read) in [(lines.len(), "a write"), (4, "an update")] {
@@ -94,7 +93,6 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
             let session = AgentSession::new(Source::Claude, path.clone(), Vec::new(), Vec::new());
             let update = super::diff_write::resumed::update_stored(
                 &mut cache,
-                base.path(),
                 &super::diff_write::Fixture::of(session),
             );
             assert_eq!(

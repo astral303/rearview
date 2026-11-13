@@ -13,8 +13,7 @@ const SCOUT_CALL: &str = "toolu_01SCOUTAAAAAAAAAAAAAAAA";
 /// holding the last write of the session.
 struct ClaudeSession {
     home: tempfile::TempDir,
-    base: tempfile::TempDir,
-    cache: OwnedCache,
+    cache: TemporaryCache,
     own: PathBuf,
     subagents: Vec<PathBuf>,
     /// The stub's modification time, in seconds, moved on with each update.
@@ -34,12 +33,10 @@ impl ClaudeSession {
         std::fs::create_dir_all(&project).unwrap();
         let own_path = project.join(format!("{SESSION}.jsonl"));
         write_lines(&own_path, own);
-        let base = tempfile::tempdir().unwrap();
-        let cache = admitted_cache(base.path());
+        let cache = TemporaryCache::admitted();
         cache.admit_storage(storage_of(Source::Claude)).unwrap();
         let mut session = Self {
             home,
-            base,
             cache,
             own: own_path,
             subagents: Vec::new(),
@@ -134,8 +131,7 @@ impl ClaudeSession {
     fn update_unchecked(&mut self) -> (Update, Fixture, SessionRecord) {
         self.updates += 1;
         let fixture = self.fixture();
-        let (update, record) =
-            update_stored_changing_files(&mut self.cache, self.base.path(), &fixture, &|| {});
+        let (update, record) = update_stored_changing_files(&mut self.cache, &fixture, &|| {});
         (update, fixture, record)
     }
 

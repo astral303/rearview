@@ -141,6 +141,52 @@ pub(super) fn admitted_cache(base: &Path) -> super::OwnedCache {
     cache
 }
 
+/// An admitted cache in a temporary directory of its own, removed with it.
+pub(super) struct TemporaryCache {
+    // Declared before `base`, so its connection closes before the directory
+    // is removed: Windows doesn't delete an open database file.
+    cache: super::OwnedCache,
+    base: tempfile::TempDir,
+}
+
+impl TemporaryCache {
+    pub(super) fn admitted() -> Self {
+        let base = tempfile::tempdir().unwrap();
+        let cache = admitted_cache(base.path());
+        Self { cache, base }
+    }
+
+    pub(super) fn base_path(&self) -> &Path {
+        self.base.path()
+    }
+}
+
+impl std::ops::Deref for TemporaryCache {
+    type Target = super::OwnedCache;
+
+    fn deref(&self) -> &super::OwnedCache {
+        &self.cache
+    }
+}
+
+impl std::ops::DerefMut for TemporaryCache {
+    fn deref_mut(&mut self) -> &mut super::OwnedCache {
+        &mut self.cache
+    }
+}
+
+/// Checks the field order on Windows alone: elsewhere a directory is removed
+/// with the database open.
+#[test]
+fn dropped_temporary_cache_doesnt_leave_its_directory() {
+    let cache = TemporaryCache::admitted();
+    let base = cache.base_path().to_path_buf();
+
+    drop(cache);
+
+    assert!(!base.exists(), "the drop removes {}", base.display());
+}
+
 /// The record a load writes for `stub`'s session under `root`, from the
 /// provider's parse, and that parse's row.
 pub(crate) fn parsed_record_and_row(

@@ -13,8 +13,7 @@ const CHILD: &str = "ses_019f0000000bResumedChild";
 /// of the session.
 struct OpenCodeSession {
     database_directory: tempfile::TempDir,
-    base: tempfile::TempDir,
-    cache: OwnedCache,
+    cache: TemporaryCache,
     subagents: Vec<String>,
     /// The stub's modification time, in seconds, moved on with each update.
     updates: u64,
@@ -61,12 +60,10 @@ impl OpenCodeSession {
             subagents.push(CHILD.to_owned());
         }
         drop(connection);
-        let base = tempfile::tempdir().unwrap();
-        let cache = admitted_cache(base.path());
+        let cache = TemporaryCache::admitted();
         cache.admit_storage(storage_of(Source::OpenCode)).unwrap();
         let session = Self {
             database_directory,
-            base,
             cache,
             subagents,
             updates: 1,
@@ -127,7 +124,7 @@ impl OpenCodeSession {
     fn update(&mut self) -> Update {
         self.updates += 1;
         let fixture = self.fixture();
-        update_stored(&mut self.cache, self.base.path(), &fixture)
+        update_stored(&mut self.cache, &fixture)
     }
 }
 
