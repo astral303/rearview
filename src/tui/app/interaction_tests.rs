@@ -775,16 +775,38 @@ fn ctrl_o_on_loaded_list_selects_selected_session() {
     );
 }
 
-fn app_loading_with_row(path: PathBuf) -> App {
-    let mut app = App::new_loading_with_options(
+fn app_loading() -> App {
+    App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
         test_environment(Vec::new(), None),
-    );
+    )
+}
+
+fn app_loading_with_row(path: PathBuf) -> App {
+    let mut app = app_loading();
     app.append_conversations(vec![test_conversation(path, None)]);
+    assert!(app.is_loading());
+    app
+}
+
+/// A list loading the sessions `rows` names, in that order, each titled
+/// with its name and active at its minute past midnight.
+fn app_loading_rows(rows: &[(&str, u32)]) -> App {
+    let mut app = app_loading();
+    app.append_conversations(
+        rows.iter()
+            .map(|&(name, minute)| {
+                let path = PathBuf::from(format!("{name}.jsonl"));
+                let mut row = test_conversation(path, Some(name.to_owned()));
+                row.timestamp = Local.with_ymd_and_hms(2024, 1, 1, 0, minute, 0).unwrap();
+                row
+            })
+            .collect(),
+    );
     assert!(app.is_loading());
     app
 }
@@ -872,6 +894,98 @@ fn letter_o_while_list_loads_types_into_list_query() {
 
     assert_eq!(app.query(), "o");
     assert_eq!(status_text(&app), None);
+}
+
+/// The rows of sessions `a` and `b`, both recorded in `workspace`.
+fn rows_in_workspace(workspace: &std::path::Path) -> Vec<Conversation> {
+    ["a", "b"]
+        .into_iter()
+        .map(|name| {
+            let mut row = test_conversation(PathBuf::from(format!("{name}.jsonl")), None);
+            row.cwd = Some(workspace.to_path_buf());
+            row
+        })
+        .collect()
+}
+
+#[test]
+fn esc_while_list_loads_after_session_id_search_shows_every_row() {
+    let workspace = std::path::Path::new("/tmp/project");
+    let mut app = app_loading();
+    app.workspace = Some(crate::history::workspace::tests::workspace_at_home(
+        workspace,
+    ));
+    app.append_conversations(rows_in_workspace(workspace));
+    press(&mut app, KeyCode::Char('b'));
+    // The workspace filter searches the query at once, even while the list
+    // loads.
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(
+        app.filtered().len(),
+        1,
+        "the session ID search shows b alone"
+    );
+
+    press(&mut app, KeyCode::Esc);
+
+    assert_eq!(app.query(), "");
+    assert_eq!(app.filtered().len(), 2, "every row is shown again");
+}
+
+#[test]
+fn esc_on_loaded_list_after_session_id_search_shows_every_row() {
+    let mut app = app_listing(
+        rows_in_workspace(std::path::Path::new("/tmp/project")),
+        ToolDisplayMode::Hidden,
+    );
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(
+        app.filtered().len(),
+        1,
+        "the session ID search shows b alone"
+    );
+
+    press(&mut app, KeyCode::Esc);
+
+    assert_eq!(app.query(), "");
+    assert_eq!(app.filtered().len(), 2, "every row is shown again");
+}
+
+#[test]
+fn first_row_last_row_and_half_page_down_move_selection_while_list_loads() {
+    let mut app = app_loading_rows(&[
+        ("a", 0),
+        ("b", 1),
+        ("c", 2),
+        ("d", 3),
+        ("e", 4),
+        ("f", 5),
+        ("g", 6),
+        ("h", 7),
+    ]);
+
+    // `press_with` passes a ten-line viewport: half a page is five rows.
+    press_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(
+        app.selected(),
+        Some(5),
+        "half page down (`Ctrl+D`) moves half the viewport's lines"
+    );
+
+    press_with(&mut app, KeyCode::End, KeyModifiers::empty());
+    assert_eq!(
+        app.selected(),
+        Some(7),
+        "last row (`End`) selects the last row"
+    );
+
+    press_with(&mut app, KeyCode::Home, KeyModifiers::empty());
+    assert_eq!(
+        app.selected(),
+        Some(0),
+        "first row (`Home`) selects the first row"
+    );
+    assert_eq!(app.query(), "", "none of the keys types into the query");
 }
 
 #[test]
