@@ -322,6 +322,34 @@ pub enum RenamedTitle {
     OutsideTranscript(Option<SessionTitle>),
 }
 
+impl RenamedTitle {
+    /// The title and summary a session renamed to `title` shows, from
+    /// `before`, what it showed before. A rename in the transcript keeps the
+    /// summary the agent generated. A title kept beside the transcript
+    /// replaces both, because that agent's parse doesn't provide another
+    /// title or summary.
+    pub fn shown(&self, title: &str, before: &TitleAndSummary) -> TitleAndSummary {
+        match self {
+            Self::InTranscript => TitleAndSummary {
+                custom_title: Some(title.to_owned()).filter(|title| !title.is_empty()),
+                summary: before.summary.clone(),
+            },
+            Self::OutsideTranscript(outside) => {
+                TitleAndSummary::shown(&TitleAndSummary::default(), outside.as_ref())
+            }
+        }
+    }
+
+    /// The title kept beside the transcript after the rename, from `before`,
+    /// the one kept before it.
+    pub fn outside_transcript(&self, before: Option<&SessionTitle>) -> Option<SessionTitle> {
+        match self {
+            Self::InTranscript => before.cloned(),
+            Self::OutsideTranscript(outside) => outside.clone(),
+        }
+    }
+}
+
 /// Deletes a session, for a provider declaring [`SessionProvider::delete`]
 /// Capable.
 pub trait SessionDeleter: Sync {

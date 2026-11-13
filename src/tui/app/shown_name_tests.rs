@@ -4,6 +4,7 @@
 
 use super::claude_home::{admitted_cache, app_reading, serve_list_refresh};
 use super::refresh_tests::{serve_list_change, serve_session_refresh};
+use super::test_waits::finish_pending_view_reload;
 use super::*;
 use crate::agent::service::AgentService;
 use crate::agent::test_support::agent_command;
@@ -98,13 +99,23 @@ fn misses_of(fixture: &'static dyn ProviderFixture) -> Vec<String> {
 
     if fixture.provider().rename().is_capable() {
         for list in &mut lists {
+            open_the_session(&mut list.app);
             rename_in_rearview(&mut list.app, REARVIEW_NAME);
-            serve_session_refresh(&mut list.app);
         }
         places.given.push(REARVIEW_NAME);
         places.check(
             &mut lists,
-            "after a rename in rearview and its session refresh",
+            "after a rename in the viewer, before its session refresh",
+            Commands::Skip,
+        );
+        for list in &mut lists {
+            open_the_session(&mut list.app);
+            serve_session_refresh(&mut list.app);
+            finish_pending_view_reload(&mut list.app, VIEWPORT_HEIGHT);
+        }
+        places.check(
+            &mut lists,
+            "after a rename in the viewer and its session refresh",
             Commands::Run,
         );
     }
@@ -123,6 +134,8 @@ fn agent_namings(fixture: &dyn ProviderFixture) -> Vec<Naming> {
         namings.repeat(2)
     }
 }
+
+const VIEWPORT_HEIGHT: usize = 10;
 
 /// Open the list's only session in the viewer.
 fn open_the_session(app: &mut App) {

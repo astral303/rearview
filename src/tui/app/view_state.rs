@@ -3,7 +3,7 @@ use super::{
     App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, OpenSessionStatus, ViewSearchMode,
     ViewState,
 };
-use crate::history::provider::{SessionRead, SessionTitle};
+use crate::history::provider::{RenamedTitle, SessionRead, SessionTitle, TitleAndSummary};
 use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
 use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
@@ -59,28 +59,59 @@ impl ViewState {
     /// shows, or `reloaded`'s row while the view doesn't show a copy.
     fn show_reloaded_row(&mut self, reloaded: ReloadedHeader, copy_row: Option<Box<Conversation>>) {
         if let Some(row) = reloaded.row {
-            self.external_title = reloaded.external_title;
             self.header = Some(row);
         }
         self.publication = reloaded.publication;
-        self.adopt(reloaded.adopted);
-        self.show_copy_header(copy_row);
-    }
-
-    /// Read the open session's copies against `adopted`'s publication, when
-    /// the read adopted a copy.
-    fn adopt(&mut self, adopted: Option<AdoptedCopy>) {
-        if let Some(adopted) = adopted {
-            self.publication = adopted.publication;
-        }
+        self.show_copy_header_and_adopt(
+            copy_row,
+            reloaded.external_title.as_ref(),
+            reloaded.adopted,
+        );
     }
 
     /// Show `copy_row`, the catalogue row of the copy the view shows, as the
-    /// header, with the row's external title: the copy holds its parse's
-    /// title. Without a row, the header stays as it is.
-    fn show_copy_header(&mut self, copy_row: Option<Box<Conversation>>) {
-        if let Some(copy_row) = copy_row {
-            self.header = Some(HeaderRow::of_copy(*copy_row, self.external_title.as_ref()));
+    /// header, and read the open session's copies against `adopted`'s
+    /// publication. Without a row, the header stays as it is.
+    ///
+    /// The header keeps the row's title and summary: a rename in rearview
+    /// sets them before the copy has the new name. A copy the read adopted
+    /// in the row's place names the session instead, with `external_title`,
+    /// the title the row shows from beside the transcript, over its parse's
+    /// title.
+    fn show_copy_header_and_adopt(
+        &mut self,
+        copy_row: Option<Box<Conversation>>,
+        external_title: Option<&SessionTitle>,
+        adopted: Option<AdoptedCopy>,
+    ) {
+        let is_adopted = adopted.is_some();
+        if let Some(adopted) = adopted {
+            self.publication = adopted.publication;
+        }
+        let Some(copy_row) = copy_row else {
+            return;
+        };
+        let mut header = HeaderRow::of_copy(*copy_row, external_title);
+        if !is_adopted && let Some(row) = &self.header {
+            header.custom_title = row.custom_title.clone();
+            header.summary = row.summary.clone();
+        }
+        self.header = Some(header);
+    }
+
+    /// Show the open session renamed to `title`, as its row shows it.
+    /// `renamed` is the place the rename put the title.
+    pub(super) fn show_renamed(&mut self, title: &str, renamed: &RenamedTitle) {
+        if let Some(header) = &mut self.header {
+            let shown = renamed.shown(
+                title,
+                &TitleAndSummary {
+                    custom_title: header.custom_title.take(),
+                    summary: header.summary.take(),
+                },
+            );
+            header.custom_title = shown.custom_title;
+            header.summary = shown.summary;
         }
     }
 }
@@ -401,7 +432,6 @@ impl App {
             session_id: Some(session_id),
             publication,
             header: Some(header),
-            external_title,
             parsed_conversation: conversation,
             scroll_offset: 0,
             rendered_lines: rendered.lines,
@@ -423,8 +453,7 @@ impl App {
             count_highlight: None,
             is_copy_missing,
         };
-        state.adopt(adopted);
-        state.show_copy_header(copy_row);
+        state.show_copy_header_and_adopt(copy_row, external_title.as_ref(), adopted);
         self.app_mode = AppMode::View(state);
     }
 
