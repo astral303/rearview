@@ -1282,24 +1282,26 @@ impl AgentService {
     /// Once a write of the command found the cache's drive low on space,
     /// the command deletes the cache database and fails with the low-space
     /// error, whatever it returned, so its record reports the deletion's
-    /// outcome.
+    /// outcome. When the drive doesn't have room for a deleted cache, the
+    /// command fails the same way, without a deletion.
     pub fn execute(&self, command: AgentCommand) -> Result<String> {
         let output = run_reporting_progress(
             ProgressRecords::new(command.name(), &self.perf, ProgressSchedule::DEFAULT),
             std::io::stderr(),
             || {
                 let output = self.execute_inner(&command);
-                let base = self.environment.cache_base();
-                if !base.low_space().is_set() {
-                    return output;
+                let latch = self.environment.cache_base().low_space();
+                if latch.free_bytes_awaiting_deletion().is_some() {
+                    self.perf.time(Stage::CacheDeletion, || {
+                        history::sqlite_cache::low_space::run_deletion(
+                            self.environment.cache_base(),
+                        );
+                    });
                 }
-                self.perf.time(Stage::CacheDeletion, || {
-                    history::sqlite_cache::low_space::run_deletion(base);
-                });
-                Err(base
-                    .low_space()
-                    .error()
-                    .expect("the cache base's low-space latch is set"))
+                match latch.error() {
+                    Some(low_space) => Err(low_space),
+                    None => output,
+                }
             },
         );
         if command.reports_perf_stats() {
@@ -1929,8 +1931,9 @@ fn unreadable_directory_warning(
         kind: AgentWarningKind::Io,
         reference: None,
         detail: format!(
-            "failed to list {} sessions in {}: {}",
+            "failed to list {} {} in {}: {}",
             provider.labels().display,
+            directory.listed_for.noun(),
             directory.path.display(),
             directory.error
         ),
@@ -2061,9 +2064,16 @@ fn root_keys(keyed: &KeyedRoot<'_>) -> std::result::Result<RootKeys, KeyDiscover
             )
         })
         .collect();
-    if !unreadable_directories.is_empty() {
+    // Cached sessions lie under a directory of sessions alone: a sub-agent
+    // directory that cannot be listed hides no session.
+    let directories_of_sessions: Vec<_> = unreadable_directories
+        .iter()
+        .filter(|directory| directory.listed_for == history::provider::ListedFor::Sessions)
+        .cloned()
+        .collect();
+    if !directories_of_sessions.is_empty() {
         keys.extend(
-            cached_keys_under(keyed, &roots, &stubs, &unreadable_directories)
+            cached_keys_under(keyed, &roots, &stubs, &directories_of_sessions)
                 .map_err(KeyDiscoveryFailure::SessionCache)?,
         );
     }
@@ -7923,6 +7933,35 @@ mod tests {
                 "running out after {roomy_checks} checks stops parsing"
             );
         }
+    }
+
+    #[test]
+    fn command_reports_agent_error_while_drive_doesnt_have_room_for_deleted_cache() {
+        let sessions = crate::tui::claude_home::CacheOutgrowingDrive::new();
+        let first = AgentService::new(sessions.environment())
+            .execute(agent_command(&["sessions", "--all"]));
+        assert!(
+            matches!(&first, Err(AppError::AgentProtocol(record))
+                if record.contains("The%20session%20cache%20was%20deleted.")),
+            "the first command runs out of space and deletes the cache: {first:?}"
+        );
+        sessions.home.watch().mark();
+
+        let outcome = AgentService::new(sessions.environment())
+            .execute(agent_command(&["sessions", "--all"]));
+
+        let Err(AppError::AgentProtocol(record)) = outcome else {
+            panic!("the command fails with an agent-error record: {outcome:?}");
+        };
+        assert_eq!(
+            record,
+            "protocol agent-error kind=io detail=rearview:%20not%20enough%20disk%20space%20to%20rebuild%20the%20session%20cache%20%281.0%20GB%20free%2C%20needs%20at%20least%201.1%20GB%29.%20Free%20at%20least%200.1%20GB%20and%20run%20rearview%20again.\n"
+        );
+        assert_eq!(
+            sessions.home.watch().parses_after_mark(),
+            0,
+            "the command doesn't parse any session"
+        );
     }
 
     /// On a first fill of two agents' sessions, a write of the first agent's

@@ -168,6 +168,13 @@ pub enum AppError {
         outcome: CacheDeletion,
     },
 
+    /// The cache's drive has `free_bytes` free after a low-space deletion,
+    /// and writing the deleted cache again with the floor kept free needs at
+    /// least `needed_bytes`. The command stopped before it parsed anything
+    /// and didn't delete anything.
+    #[error("{}", refill_low_space_message(*.free_bytes, *.needed_bytes))]
+    SessionCacheRefillLowSpace { free_bytes: u64, needed_bytes: u64 },
+
     /// The session cache's low-space deletion refused a new connection of
     /// this rearview.
     #[error("The session cache is being deleted")]
@@ -235,10 +242,32 @@ pub(crate) fn low_space_rest(outcome: &CacheDeletion) -> String {
     )
 }
 
+/// The message of a refill refused for `free_bytes` free when it needs
+/// `needed_bytes`. The free space rounds down and the need rounds up, so
+/// freeing their difference as shown passes the check. The need is a lower
+/// bound: the record is the size the deleted cache had reached, not the
+/// size of a full cache.
+fn refill_low_space_message(free_bytes: u64, needed_bytes: u64) -> String {
+    let free_tenths = free_bytes / BYTES_PER_TENTH_OF_GIGABYTE;
+    let needed_tenths = needed_bytes.div_ceil(BYTES_PER_TENTH_OF_GIGABYTE);
+    format!(
+        "not enough disk space to rebuild the session cache ({} GB free, needs at least {} GB). \
+         Free at least {} GB and run rearview again.",
+        gigabytes_of_tenths(free_tenths),
+        gigabytes_of_tenths(needed_tenths),
+        gigabytes_of_tenths(needed_tenths.saturating_sub(free_tenths))
+    )
+}
+
+const BYTES_PER_TENTH_OF_GIGABYTE: u64 = 100_000_000;
+
 /// `bytes` in gigabytes, rounded down to one decimal place, so the message
 /// doesn't show a drive below the floor as holding it.
 fn gigabytes_down_to_a_tenth(bytes: u64) -> String {
-    let tenths = bytes / 100_000_000;
+    gigabytes_of_tenths(bytes / BYTES_PER_TENTH_OF_GIGABYTE)
+}
+
+fn gigabytes_of_tenths(tenths: u64) -> String {
     format!("{}.{}", tenths / 10, tenths % 10)
 }
 
@@ -320,6 +349,23 @@ mod tests {
             "not enough disk space for the session cache (0.9 GB free, needs at least 1 GB). \
              The session cache was not deleted: another rearview has it open. Free some space \
              and run rearview again."
+        );
+    }
+
+    /// The space to free is the difference of the amounts the message
+    /// shows, the free space rounded down and the need rounded up.
+    #[test]
+    fn refill_message_asks_to_free_difference_of_amounts_it_shows() {
+        let message = AppError::SessionCacheRefillLowSpace {
+            free_bytes: 2_150_000_000,
+            needed_bytes: 3_410_000_000,
+        }
+        .to_string();
+
+        assert_eq!(
+            message,
+            "not enough disk space to rebuild the session cache (2.1 GB free, needs at least \
+             3.5 GB). Free at least 1.4 GB and run rearview again."
         );
     }
 

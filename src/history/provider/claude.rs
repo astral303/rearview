@@ -243,7 +243,7 @@ impl SessionStorage for ClaudeStorage {
         lister: &dyn DirectoryLister,
     ) -> Result<DiscoveredSessions> {
         let discovery = DiscoveryLister::beneath(lister, &root.path);
-        let found = discover_projects(&discovery, lister, root)?;
+        let found = discover_projects(&discovery, root)?;
         Ok(DiscoveredSessions {
             unreadable_directories: discovery.into_unreadable_directories(),
             ..found
@@ -399,14 +399,14 @@ fn project_folder_name(path: &Path) -> Option<&str> {
 }
 
 /// The sessions in each project folder under `root`, the most recently
-/// modified folder first: each folder listed through `discovery`, and each
-/// session's sub-agent transcripts through `lister`.
+/// modified folder first, each folder and each session's `subagents/`
+/// listed through `discovery`.
 fn discover_projects(
     discovery: &DiscoveryLister,
-    lister: &dyn DirectoryLister,
     root: &SessionRoot,
 ) -> Result<DiscoveredSessions> {
     let mut discovered = DiscoveredSessions::complete(Vec::new());
+    let subagent_directories = discovery.of_subagent_directories();
     for project in project_directories_newest_first(discovery, &root.path)? {
         let mut sessions = Vec::new();
         for transcript in walk::jsonl_files_at_depth(discovery, &project, 0)? {
@@ -414,7 +414,7 @@ fn discover_projects(
                 discovered.skipped += 1;
                 continue;
             }
-            let subagents = subagent_transcripts(lister, &transcript, None);
+            let subagents = subagent_transcripts(&subagent_directories, &transcript, None);
             sessions.push(SessionFiles {
                 transcript,
                 subagents,
@@ -542,9 +542,10 @@ fn delete_session_under(permit: ParsePermit<'_>, root: &Path, path: &Path) -> Re
 /// The sub-agent transcripts of the session at `transcript`, listed through
 /// `lister`, as every path that starts from the session names them: the
 /// list, session-ID lookup, delete and the agent CLI. A `subagents/`
-/// directory that cannot be read is reported at warn level and leaves the
-/// session without sub-agent transcripts, so the session still lists, opens
-/// and deletes.
+/// directory that cannot be listed leaves the session without sub-agent
+/// transcripts, so the session still lists, opens and deletes. Discovery's
+/// lister records that directory. Outside discovery the failure is warned at
+/// `debug_level`, which the callers leave unset.
 pub(crate) fn subagent_transcripts(
     lister: &dyn DirectoryLister,
     transcript: &Path,
@@ -563,9 +564,11 @@ pub(crate) fn subagent_transcripts(
 }
 
 /// `<project>/<session-id>/subagents/agent-*.jsonl`, sorted so successive
-/// runs agree. An absent `subagents/` directory, the usual case, is no
-/// sub-agents; one that cannot be read is an error. A nested sub-agent's
-/// transcript sits in the same directory, so no walk descends.
+/// runs agree. A missing `subagents/` directory
+/// ([`walk::is_missing_directory`]), the usual case, reads as a session
+/// without sub-agents; a directory that cannot be listed is an error. A
+/// nested sub-agent's transcript is in the same directory: the listing
+/// doesn't descend.
 fn read_subagent_transcripts(
     lister: &dyn DirectoryLister,
     transcript: &Path,
@@ -573,7 +576,7 @@ fn read_subagent_transcripts(
     let directory = transcript.with_extension("").join(SUBAGENTS_DIR);
     let entries = match lister.list(&directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if walk::is_missing_directory(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
     let mut transcripts: Vec<PathBuf> = entries
@@ -1031,6 +1034,10 @@ pub(crate) mod tests {
             write_contract_subagent(home, session, NESTED_SUBAGENT)
         }
 
+        fn subagent_directory_of(&self, locator: &Path) -> Option<PathBuf> {
+            Some(locator.with_extension("").join(SUBAGENTS_DIR))
+        }
+
         /// The `agentId` a sub-agent transcript is named after.
         fn subagent_id(&self, _session: &str) -> String {
             SUBAGENT.to_owned()
@@ -1137,9 +1144,9 @@ pub(crate) mod tests {
     }
 
     /// `subagents/` is a file where the directory should be. The session
-    /// still resolves by ID, without sub-agents, as it lists.
+    /// resolves by ID as it lists: without sub-agents.
     #[test]
-    fn session_whose_subagents_directory_cannot_be_read_still_resolves_by_id() {
+    fn session_with_file_in_place_of_subagents_directory_resolves_by_id() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join(FIXTURE_PROJECT);
         let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));
@@ -1147,7 +1154,11 @@ pub(crate) mod tests {
         let session_dir = project.join(FIXTURE_SESSION);
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(SUBAGENTS_DIR), "not a directory").unwrap();
-        assert!(read_subagent_transcripts(&SystemLister, &transcript).is_err());
+        assert_eq!(
+            read_subagent_transcripts(&SystemLister, &transcript).unwrap(),
+            Vec::<PathBuf>::new(),
+            "the file reads as a missing directory"
+        );
 
         let resolved = resolved_session_under(&SessionRoot::new(root.path()), FIXTURE_SESSION)
             .unwrap()
@@ -1443,10 +1454,10 @@ pub(crate) mod tests {
     }
 
     /// `subagents/` is a file where the directory should be. The session
-    /// is still deleted, its directory with it, and the delete reports no
-    /// sub-agent sessions, as the list showed none.
+    /// is deleted, its directory with it, and the delete doesn't report any
+    /// sub-agent sessions.
     #[test]
-    fn deleting_session_whose_subagents_directory_cannot_be_read_still_deletes_it() {
+    fn deleting_session_with_file_in_place_of_subagents_directory_deletes_it() {
         let root = fixture_root();
         let project = root.path().join(FIXTURE_PROJECT);
         let transcript = project.join(format!("{FIXTURE_SESSION}.jsonl"));

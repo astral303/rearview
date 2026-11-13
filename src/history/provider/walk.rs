@@ -10,7 +10,7 @@
 //! can make one listing fail under any provider; other reads through
 //! [`SystemLister`].
 
-use super::storage::UnreadableDirectory;
+use super::storage::{ListedFor, UnreadableDirectory};
 use super::{DiscoveredSessions, Fingerprint, SessionRoot, SessionStub};
 use crate::error::Result;
 use crate::history::fingerprint::CachedFingerprint;
@@ -94,6 +94,14 @@ impl<'a> DiscoveryLister<'a> {
         }
     }
 
+    /// The lister for the sessions' sub-agent directories. A directory it
+    /// cannot list lists as empty and is recorded, as a directory of
+    /// sessions is. A missing directory ([`is_missing_directory`]) returns
+    /// its error unrecorded: a session without sub-agents doesn't have one.
+    pub fn of_subagent_directories(&self) -> SubagentDirectoryLister<'_, 'a> {
+        SubagentDirectoryLister { discovery: self }
+    }
+
     /// The sessions this discovery found, `stubs`, with every directory it
     /// could not list.
     pub fn discovered(self, stubs: Vec<SessionStub>) -> DiscoveredSessions {
@@ -110,24 +118,57 @@ impl<'a> DiscoveryLister<'a> {
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn record(&self, directory: &Path, error: &std::io::Error, listed_for: ListedFor) {
+        self.unreadable_directories
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(UnreadableDirectory {
+                path: directory.to_path_buf(),
+                error: error.to_string(),
+                listed_for,
+            });
+    }
 }
 
 impl DirectoryLister for DiscoveryLister<'_> {
     fn list(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
         match self.lister.list(directory) {
             Err(error) if directory != self.root => {
-                self.unreadable_directories
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(UnreadableDirectory {
-                        path: directory.to_path_buf(),
-                        error: error.to_string(),
-                    });
+                self.record(directory, &error, ListedFor::Sessions);
                 Ok(Vec::new())
             }
             listed => listed,
         }
     }
+}
+
+/// [`DiscoveryLister::of_subagent_directories`].
+pub struct SubagentDirectoryLister<'d, 'a> {
+    discovery: &'d DiscoveryLister<'a>,
+}
+
+impl DirectoryLister for SubagentDirectoryLister<'_, '_> {
+    fn list(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+        match self.discovery.lister.list(directory) {
+            Err(error) if is_missing_directory(&error) => Err(error),
+            Err(error) => {
+                self.discovery
+                    .record(directory, &error, ListedFor::SubagentTranscripts);
+                Ok(Vec::new())
+            }
+            listed => listed,
+        }
+    }
+}
+
+/// True when `error`, from listing a directory, reports that the directory
+/// isn't there: missing, or a file in its place.
+pub fn is_missing_directory(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 #[cfg(test)]
@@ -652,6 +693,49 @@ mod tests {
 
         assert!(jsonl_files_at_depth(&discovery, directory.path(), 1).is_err());
         assert!(discovery.into_unreadable_directories().is_empty());
+    }
+
+    /// A directory of sessions missing when discovery lists it is recorded,
+    /// as a directory that refuses the listing is.
+    #[test]
+    fn discovery_records_missing_directory_of_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("project");
+        let discovery = DiscoveryLister::beneath(&SystemLister, directory.path());
+
+        let listed = discovery.list(&missing).unwrap();
+
+        assert!(listed.is_empty(), "the missing directory lists as empty");
+        let recorded: Vec<(PathBuf, ListedFor)> = discovery
+            .into_unreadable_directories()
+            .into_iter()
+            .map(|unreadable| (unreadable.path, unreadable.listed_for))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![(missing, ListedFor::Sessions)],
+            "discovery records the directory"
+        );
+    }
+
+    /// A session without sub-agents doesn't have a sub-agent directory.
+    #[test]
+    fn subagent_directory_lister_doesnt_record_missing_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("session/subagents");
+        let discovery = DiscoveryLister::beneath(&SystemLister, directory.path());
+
+        let listed = discovery.of_subagent_directories().list(&missing);
+
+        assert_eq!(
+            listed.map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::NotFound),
+            "the listing reports the directory missing to its provider"
+        );
+        assert!(
+            discovery.into_unreadable_directories().is_empty(),
+            "discovery doesn't record the missing directory"
+        );
     }
 
     #[cfg(unix)]

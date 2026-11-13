@@ -54,7 +54,7 @@ pub use load::{LoadedSessions, read_resolved_session, reread_sessions};
 pub use outcome::{SessionOutcome, SessionRead, UnwrittenParse};
 pub use sessions_dir::{SessionsDirLookup, found_sessions_dir};
 pub use storage::{
-    DiscoveredSessions, Fingerprint, IgnoredSessions, ResolvedSession, SessionCache,
+    DiscoveredSessions, Fingerprint, IgnoredSessions, ListedFor, ResolvedSession, SessionCache,
     SessionStorage, SessionStub, SessionTitle, TitleAndSummary, UnreadableDirectory,
 };
 #[cfg(test)]

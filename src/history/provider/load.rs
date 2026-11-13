@@ -829,8 +829,9 @@ impl SessionLoader<'_> {
             debug::warn(
                 self.debug_level,
                 &format!(
-                    "Failed to list {} sessions in {}: {}",
+                    "Failed to list {} {} in {}: {}",
                     self.storage.source().display_label(),
+                    directory.listed_for.noun(),
                     directory.path.display(),
                     directory.error
                 ),
