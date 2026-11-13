@@ -5,6 +5,7 @@
 //! cache unless it gives one.
 
 use super::{App, ToolDisplayMode, TuiSearchOptions};
+use crate::cache_file::test_support::TemporaryCacheDirectory;
 use crate::clock::{Clock, TestClock};
 use crate::config::KeyBindings;
 use crate::history::environment::test_support::waiting_operation;
@@ -292,7 +293,7 @@ impl ChangedSessionsTemplate {
 pub(crate) struct ChangedSessionsInTwoRoots {
     _homes: Arc<[ClaudeHome; 2]>,
     pub(crate) transcripts: Vec<PathBuf>,
-    pub(crate) cache: tempfile::TempDir,
+    pub(crate) cache: TemporaryCacheDirectory,
     pub(crate) watch: ParseWatch,
     storage: &'static dyn SessionStorage,
 }
@@ -306,7 +307,7 @@ impl ChangedSessionsInTwoRoots {
     fn over(
         homes: Arc<[ClaudeHome; 2]>,
         transcripts: Vec<PathBuf>,
-        cache: tempfile::TempDir,
+        cache: TemporaryCacheDirectory,
     ) -> Self {
         let watch = ParseWatch::default();
         let storage: &'static dyn SessionStorage = Box::leak(Box::new(WatchedStorage {
@@ -535,7 +536,8 @@ pub(crate) fn another_rearview(cache_base: &Path, clock: Arc<dyn Clock>) -> Cach
 /// Claude Code and Codex sessions over an admitted, empty session cache, as
 /// a first fill finds them, on the system clock; with the cache's directory
 /// and the agents' homes.
-pub(crate) fn two_agents_first_fill() -> (Environment, tempfile::TempDir, Vec<tempfile::TempDir>) {
+pub(crate) fn two_agents_first_fill()
+-> (Environment, TemporaryCacheDirectory, Vec<tempfile::TempDir>) {
     use crate::history::provider::contract_tests::{kept_storage_under, registered_fixtures};
     let mut homes = Vec::new();
     let mut storages = Vec::new();
@@ -572,8 +574,8 @@ pub(crate) fn held_open_by_another_rearview(cache_base: &Path) -> rusqlite::Conn
 
 /// A session cache directory holding an admitted database without sessions,
 /// as a first build admits it: a load through it caches what it reads.
-pub(crate) fn admitted_cache() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().unwrap();
+pub(crate) fn admitted_cache() -> TemporaryCacheDirectory {
+    let directory = TemporaryCacheDirectory::new();
     SqliteCache::open(&another_rearview(
         directory.path(),
         Arc::new(TestClock::default()),
@@ -586,12 +588,12 @@ pub(crate) fn admitted_cache() -> tempfile::TempDir {
 
 /// A session cache directory a sweep sets up once. Each case starts from a
 /// copy, so the setup runs once per sweep, not once per case.
-pub(crate) struct TemplateCache(tempfile::TempDir);
+pub(crate) struct TemplateCache(TemporaryCacheDirectory);
 
 impl TemplateCache {
     /// `cache` as a template. Drop every connection to it first, so no
     /// write or checkpoint changes its files while a case copies them.
-    pub(crate) fn new(cache: tempfile::TempDir) -> Self {
+    pub(crate) fn new(cache: TemporaryCacheDirectory) -> Self {
         Self(cache)
     }
 
@@ -600,8 +602,8 @@ impl TemplateCache {
     }
 
     /// A new session cache directory holding a copy of every file here.
-    pub(crate) fn copy(&self) -> tempfile::TempDir {
-        let copy = tempfile::tempdir().unwrap();
+    pub(crate) fn copy(&self) -> TemporaryCacheDirectory {
+        let copy = TemporaryCacheDirectory::new();
         copy_directory(self.0.path(), copy.path());
         copy
     }

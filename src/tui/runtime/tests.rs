@@ -2,6 +2,7 @@
 //! a test scripts.
 
 use super::*;
+use crate::cache_file::test_support::TemporaryCacheDirectory;
 use crate::clock::{Clock, SystemClock, TestClock};
 use crate::history::sqlite_cache::DATABASE_FILE_NAME;
 use crate::history::sqlite_cache::connection::test_hooks::{self, CommitGate};
@@ -245,7 +246,7 @@ fn finish_tui_command(error: AppError, base: &crate::history::CacheBase) -> Stri
 fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
-    let cache = tempfile::tempdir().unwrap();
+    let cache = TemporaryCacheDirectory::new();
     let environment = home
         .environment_with_cache(
             cache.path(),
@@ -341,7 +342,7 @@ fn launch_returning_early_on_drive_low_on_space_reports_deletion_another_rearvie
 fn quit_while_launch_finds_drive_low_on_space_reports_low_space_once_check_ends() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
-    let cache = tempfile::tempdir().unwrap();
+    let cache = TemporaryCacheDirectory::new();
     let (checking, is_checking) = std::sync::mpsc::channel::<()>();
     let (wait_begins, wait_began) = std::sync::mpsc::channel::<()>();
     // The launch's first free-space check answers only once the exit waits
@@ -438,7 +439,7 @@ impl crate::history::sqlite_cache::DiskSpace for DriveRunningOutOnCall {
 fn resume_while_refresh_finds_drive_low_on_space_reports_low_space_without_launching_agent() {
     let home = ClaudeHome::new();
     home.write("a", 5, &["a"]);
-    let cache = tempfile::tempdir().unwrap();
+    let cache = TemporaryCacheDirectory::new();
     let (checking, is_checking) = mpsc::channel();
     let (answer, answered) = mpsc::channel();
     let drive = Arc::new(DriveRunningOutOnCall::new(checking, answered));
@@ -2274,7 +2275,6 @@ fn opened_after_growth_with(
 struct FailingWrites {
     home: ClaudeHome,
     a: PathBuf,
-    _cache: tempfile::TempDir,
     clock: Arc<TestClock>,
     terminal: Terminal<TestBackend>,
     runtime: Runtime,
@@ -2282,6 +2282,9 @@ struct FailingWrites {
     /// The hook that fails the session's writes, until it is dropped with
     /// this value.
     _failure_hook: test_hooks::Installed,
+    // Declared after `runtime`. The runtime has the database open until it
+    // drops.
+    _cache: TemporaryCacheDirectory,
 }
 
 /// True while the status bar shows a refresh's failure.
@@ -2335,12 +2338,12 @@ impl FailingWrites {
         Self {
             home,
             a,
-            _cache: cache,
             clock,
             terminal,
             runtime,
             attempts,
             _failure_hook: failure_hook.expect("the failure is installed"),
+            _cache: cache,
         }
     }
 

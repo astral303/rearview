@@ -10,8 +10,7 @@ use super::*;
 struct LogSession {
     source: Source,
     home: tempfile::TempDir,
-    base: tempfile::TempDir,
-    cache: OwnedCache,
+    cache: TemporaryCache,
     own: PathBuf,
     subagents: Vec<PathBuf>,
     /// The stub's modification time, in seconds, moved on with each update.
@@ -37,13 +36,11 @@ impl LogSession {
                 path
             })
             .collect();
-        let base = tempfile::tempdir().unwrap();
-        let cache = admitted_cache(base.path());
+        let cache = TemporaryCache::admitted();
         cache.admit_storage(storage_of(source)).unwrap();
         let mut session = Self {
             source,
             home,
-            base,
             cache,
             own: own_path,
             subagents,
@@ -81,7 +78,7 @@ impl LogSession {
     fn update(&mut self) -> Update {
         self.updates += 1;
         let fixture = self.fixture();
-        update_stored(&mut self.cache, self.base.path(), &fixture)
+        update_stored(&mut self.cache, &fixture)
     }
 
     fn bytes_after_stable_cursor(&self, path: &Path) -> u64 {

@@ -16,8 +16,7 @@ const CWD_DIR: &str = "%2Ftmp%2Fgrok-project";
 /// last write of the session.
 struct GrokSession {
     home: tempfile::TempDir,
-    base: tempfile::TempDir,
-    cache: OwnedCache,
+    cache: TemporaryCache,
     own: PathBuf,
     subagents: Vec<PathBuf>,
     /// The stub's modification time, in seconds, moved on with each update.
@@ -56,12 +55,10 @@ impl GrokSession {
             })
             .into_iter()
             .collect();
-        let base = tempfile::tempdir().unwrap();
-        let cache = admitted_cache(base.path());
+        let cache = TemporaryCache::admitted();
         cache.admit_storage(storage_of(Source::Grok)).unwrap();
         let session = Self {
             home,
-            base,
             cache,
             own: own_path,
             subagents,
@@ -104,7 +101,7 @@ impl GrokSession {
     fn update(&mut self) -> Update {
         self.updates += 1;
         let fixture = self.fixture();
-        update_stored(&mut self.cache, self.base.path(), &fixture)
+        update_stored(&mut self.cache, &fixture)
     }
 
     fn bytes_after_stable_cursor(&self, path: &Path) -> u64 {

@@ -3,6 +3,7 @@ use super::claude_home::{
 };
 use super::refresh_state::AppliedChanges;
 use super::*;
+use crate::cache_file::test_support::TemporaryCacheDirectory;
 use crate::clock::TestClock;
 use crate::error::AppError;
 use crate::history::environment::test_support::test_environment;
@@ -761,7 +762,7 @@ pub(super) struct RefreshedNewSession {
     pub(super) listed_new_after_failure: bool,
     home: ClaudeHome,
     pub(super) new: PathBuf,
-    _cache: tempfile::TempDir,
+    _cache: TemporaryCacheDirectory,
 }
 
 /// A list `Ctrl+R` under a window from 12:30 whose writes fail before any

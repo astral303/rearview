@@ -25,8 +25,7 @@ const SCOUT: &str = "rollout-2026-08-01T10-05-03-019f0000-0000-7000-8000-0000000
 /// last write of the session.
 struct CodexSession {
     home: tempfile::TempDir,
-    base: tempfile::TempDir,
-    cache: OwnedCache,
+    cache: TemporaryCache,
     own: PathBuf,
     subagents: Vec<PathBuf>,
     /// The stub's modification time, in seconds, moved on with each update.
@@ -66,12 +65,10 @@ impl CodexSession {
                 path
             })
             .collect();
-        let base = tempfile::tempdir().unwrap();
-        let cache = admitted_cache(base.path());
+        let cache = TemporaryCache::admitted();
         cache.admit_storage(storage_of(Source::Codex)).unwrap();
         let session = Self {
             home,
-            base,
             cache,
             own: own_path,
             subagents,
@@ -142,7 +139,7 @@ impl CodexSession {
     fn update(&mut self) -> Update {
         self.updates += 1;
         let fixture = self.fixture();
-        update_stored(&mut self.cache, self.base.path(), &fixture)
+        update_stored(&mut self.cache, &fixture)
     }
 
     fn bytes_after_stable_cursor(&self, path: &Path) -> u64 {
@@ -150,16 +147,14 @@ impl CodexSession {
     }
 }
 
-/// Reads `fixture`'s session on from the copy `cache`, in `base`, stores and
-/// writes the read, or writes its parse when it is read whole, as a load
-/// does; asserts the listed row and the stored session match a fresh parse
-/// and write.
+/// Reads `fixture`'s session on from its copy in `cache` and writes the read
+/// to `cache`, or writes its parse when it is read whole, as a load does.
+/// Asserts that the updated row and entries match a fresh parse and write.
 pub(in crate::history::sqlite_cache::tests) fn update_stored(
-    cache: &mut OwnedCache,
-    base: &Path,
+    cache: &mut TemporaryCache,
     fixture: &Fixture,
 ) -> Update {
-    let (update, record) = update_stored_changing_files(cache, base, fixture, &|| {});
+    let (update, record) = update_stored_changing_files(cache, fixture, &|| {});
     assert_matches_fresh_write(cache, fixture, &record);
     update
 }
@@ -168,14 +163,13 @@ pub(in crate::history::sqlite_cache::tests) fn update_stored(
 /// after it stamped the session's files, and without comparing the stored
 /// session with a fresh write; also returns the record of a fresh parse.
 fn update_stored_changing_files(
-    cache: &mut OwnedCache,
-    base: &Path,
+    cache: &mut TemporaryCache,
     fixture: &Fixture,
     change: &(dyn Fn() + Sync),
 ) -> (Update, SessionRecord) {
     let source = fixture.source();
     let stored = fixture.listed(cache);
-    let reader = SqliteCache::open_waiting(&rearview_at(base))
+    let reader = SqliteCache::open_waiting(&rearview_at(cache.base_path()))
         .unwrap()
         .unwrap();
     let reads = AtomicUsize::new(0);
@@ -621,12 +615,11 @@ fn transcript_growing_during_a_resumed_read_is_stored_and_read_on_next() {
     session.updates += 1;
     let fixture = session.fixture();
 
-    let (grown, _) =
-        update_stored_changing_files(&mut session.cache, session.base.path(), &fixture, &|| {
-            if !is_appended.swap(true, Ordering::SeqCst) {
-                append_line(&own, &answer);
-            }
-        });
+    let (grown, _) = update_stored_changing_files(&mut session.cache, &fixture, &|| {
+        if !is_appended.swap(true, Ordering::SeqCst) {
+            append_line(&own, &answer);
+        }
+    });
 
     assert_eq!(
         grown.outcome,

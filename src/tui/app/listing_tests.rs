@@ -12,6 +12,7 @@ use super::refresh_tests::{
 use super::*;
 use crate::agent::service::AgentService;
 use crate::agent::test_support::agent_command;
+use crate::cache_file::test_support::TemporaryCacheDirectory;
 use crate::clock::TestClock;
 use crate::history::listing;
 use crate::history::sqlite_cache::refresh::tests::{allow_owner_commits, fail_owner_commits};
@@ -150,7 +151,7 @@ impl ListingPath {
 /// A Claude Code home with a session cache of its own, on test time.
 struct Case {
     home: ClaudeHome,
-    cache: tempfile::TempDir,
+    cache: TemporaryCacheDirectory,
     clock: Arc<TestClock>,
 }
 

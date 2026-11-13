@@ -393,7 +393,7 @@ mod tests {
     /// started a sub-agent.
     struct SessionWithNewSubAgent {
         home: crate::tui::claude_home::ClaudeHome,
-        cache: tempfile::TempDir,
+        cache: crate::cache_file::test_support::TemporaryCacheDirectory,
         transcript: std::path::PathBuf,
         /// The sub-agent transcript started after the session was cached.
         subagent: std::path::PathBuf,

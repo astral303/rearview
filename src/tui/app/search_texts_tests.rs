@@ -1,4 +1,5 @@
 use super::claude_home::{ClaudeHome, admitted_cache};
+use crate::cache_file::test_support::TemporaryCacheDirectory;
 use crate::clock::TestClock;
 use crate::history::sqlite_cache::CachedSession;
 use crate::history::{Conversation, Environment, ProcessIdentity};
@@ -37,7 +38,7 @@ fn row<'a>(rows: &'a [Conversation], name: &str) -> &'a Conversation {
 
 /// `home`'s environment over an admitted session cache: a load caches what
 /// it reads.
-fn caching_environment(home: &ClaudeHome) -> (tempfile::TempDir, Environment) {
+fn caching_environment(home: &ClaudeHome) -> (TemporaryCacheDirectory, Environment) {
     let cache = admitted_cache();
     let environment = home.environment_with_cache(
         cache.path(),
@@ -568,7 +569,7 @@ fn failed_read_counts_as_unreadable_keeps_its_cause_and_is_read_again_when_rows_
 struct ListWithTextReadsHeld {
     app: super::App,
     gate: super::test_waits::ConnectionGate,
-    _cache: tempfile::TempDir,
+    _cache: TemporaryCacheDirectory,
 }
 
 impl ListWithTextReadsHeld {
