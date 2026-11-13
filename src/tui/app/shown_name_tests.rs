@@ -428,8 +428,13 @@ impl PlaceChecker {
         }
         if let Commands::Run = commands {
             let name = crate::agent::protocol::title_for_conversation(&expected);
-            let is_named = shown.custom_title.is_some() || shown.summary.is_some();
-            misses.extend(self.agent_command_misses(lists[0].cache.path(), &name, is_named));
+            let replaced: Vec<&str> = self
+                .given
+                .iter()
+                .copied()
+                .filter(|given| !shows(&shown, given))
+                .collect();
+            misses.extend(self.agent_command_misses(lists[0].cache.path(), &name, &replaced));
         }
         for miss in misses {
             self.miss(step, miss);
@@ -437,11 +442,11 @@ impl PlaceChecker {
     }
 
     /// The misses of `agent sessions`, `agent search` and `agent within`
-    /// over `cache`: each prints `name`, the session's one-line name.
+    /// over `cache`: each prints `name`, the session's one-line name, and
+    /// none of `replaced`, the names given earlier that it no longer shows.
     /// `agent within` runs keeping the cache, and reading it as it is while
-    /// another rearview keeps it, for a session `is_named`: it names an
-    /// untitled session from other messages than the list preview.
-    fn agent_command_misses(&self, cache: &Path, name: &str, is_named: bool) -> Vec<String> {
+    /// another rearview refreshes the cache.
+    fn agent_command_misses(&self, cache: &Path, name: &str, replaced: &[&str]) -> Vec<String> {
         let (storage, body_word) = (self.storage, self.body_word.as_str());
         let run = |args: &[&str]| {
             off_the_drawing_thread(|| {
@@ -457,19 +462,32 @@ impl PlaceChecker {
             .expect("agent sessions lists the session")
             .to_owned();
         let search = run(&["search", body_word, "--all"]);
-        let mut outputs = vec![("agent sessions", sessions), ("agent search", search)];
-        if is_named {
-            let within = ["within", reference.as_str(), body_word];
-            outputs.push(("agent within keeping the cache", run(&within)));
-            let other_refresh = off_the_drawing_thread(|| another_rearviews_refresh(cache));
-            outputs.push(("agent within reading the cache as it is", run(&within)));
-            drop(other_refresh);
+        let within = ["within", reference.as_str(), body_word];
+        let within_as_owner = run(&within);
+        let other_refresh = off_the_drawing_thread(|| another_rearviews_refresh(cache));
+        let within_as_is = run(&within);
+        drop(other_refresh);
+        let mut misses = Vec::new();
+        for (command, output) in [
+            ("agent sessions", sessions),
+            ("agent search", search),
+            ("agent within keeping the cache", within_as_owner),
+            ("agent within reading the cache as it is", within_as_is),
+        ] {
+            if !prints_only_title(&output, name) {
+                misses.push(format!("{command} titles it {name:?}:\n{output}"));
+            }
+            let printed: Vec<&&str> = replaced
+                .iter()
+                .filter(|replaced| output.contains(**replaced))
+                .collect();
+            if !printed.is_empty() {
+                misses.push(format!(
+                    "{command} doesn't print the replaced names {printed:?}:\n{output}"
+                ));
+            }
         }
-        outputs
-            .into_iter()
-            .filter(|(_, output)| !prints_only_title(output, name))
-            .map(|(command, output)| format!("{command} titles it {name:?}:\n{output}"))
-            .collect()
+        misses
     }
 }
 
