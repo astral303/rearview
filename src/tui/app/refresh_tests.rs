@@ -167,6 +167,43 @@ fn selection_moves_to_first_row_when_its_session_is_removed() {
 }
 
 #[test]
+fn wheel_turn_while_search_shows_no_rows_ends_selection_kept_by_refresh() {
+    let mut app = app_listing(vec![session("c", "c", 20, 1), session("b", "b", 10, 1)]);
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
+    app.apply_session_changes(SessionChanges {
+        updated: vec![new_session(session("d", "d", 30, 1))],
+        ..Default::default()
+    });
+    assert_eq!(selected_name(&app), Some("b"));
+    let (results, search_rx) = std::sync::mpsc::channel();
+    app.search_rx = search_rx;
+    let answer = |app: &mut App, filtered: Vec<usize>| {
+        results
+            .send(SearchResponse {
+                filtered,
+                generation: app.search_generation(),
+                mode: ListSearchMode::Lexical,
+                evidence: std::collections::HashMap::new(),
+                is_exact_literal: false,
+            })
+            .unwrap();
+        assert!(app.receive_search_results());
+    };
+    answer(&mut app, Vec::new());
+    assert_eq!(selected_name(&app), None);
+
+    app.scroll_mouse(1, 10);
+    answer(&mut app, vec![0, 1, 2]);
+
+    assert_eq!(listed_names(&app), ["d", "c", "b"]);
+    assert_eq!(
+        selected_name(&app),
+        Some("d"),
+        "after the wheel turn, the results select their first row"
+    );
+}
+
+#[test]
 fn refresh_reruns_query() {
     let mut app = app_listing(vec![
         session("b", "unrelated", 10, 1),

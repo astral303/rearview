@@ -1047,8 +1047,7 @@ impl App {
         let relative_idx = relative_row / lines_per_item;
         let new_idx = offset + relative_idx;
         if relative_idx < items_per_page && new_idx < self.filtered.len() {
-            self.selected = Some(new_idx);
-            self.selection_anchor = None;
+            self.select_row(new_idx);
             true
         } else {
             false

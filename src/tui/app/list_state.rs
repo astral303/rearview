@@ -6,6 +6,8 @@ use crate::tui::list_change::{ListChange, ListChangeOutcome};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+const LIST_PAGE_ROWS: isize = 10;
+
 impl App {
     pub(super) fn filter_indices<I>(&self, indices: I) -> Vec<usize>
     where
@@ -36,56 +38,46 @@ impl App {
         self.selected = anchored.or_else(|| (!self.filtered.is_empty()).then_some(0));
     }
 
+    /// Select `row` for a key, click or wheel that moves the selection.
+    pub(super) fn select_row(&mut self, row: usize) {
+        self.selected = Some(row);
+        self.selection_anchor = None;
+    }
+
     pub(super) fn select_prev(&mut self) {
-        if let Some(selected) = self.selected
-            && selected > 0
-        {
-            self.selected = Some(selected - 1);
-        }
+        self.move_selection_by(-1);
     }
 
     pub(super) fn select_next(&mut self) {
-        if let Some(selected) = self.selected
-            && selected + 1 < self.filtered.len()
-        {
-            self.selected = Some(selected + 1);
-        }
+        self.move_selection_by(1);
     }
 
     pub(super) fn select_first(&mut self) {
         if !self.filtered.is_empty() {
-            self.selected = Some(0);
+            self.select_row(0);
         }
     }
 
     pub(super) fn select_last(&mut self) {
         if !self.filtered.is_empty() {
-            self.selected = Some(self.filtered.len() - 1);
+            self.select_row(self.filtered.len() - 1);
         }
     }
 
     pub(super) fn select_page_up(&mut self) {
-        if let Some(selected) = self.selected {
-            self.selected = Some(selected.saturating_sub(10));
-        }
+        self.move_selection_by(-LIST_PAGE_ROWS);
     }
 
     pub(super) fn select_page_down(&mut self) {
-        if let Some(selected) = self.selected {
-            let new_selected = (selected + 10).min(self.filtered.len().saturating_sub(1));
-            self.selected = Some(new_selected);
-        }
+        self.move_selection_by(LIST_PAGE_ROWS);
     }
 
     pub(super) fn select_half_page_down(&mut self, viewport_height: usize) {
-        if let Some(selected) = self.selected {
-            let half_page = viewport_height / 2;
-            let new_selected = (selected + half_page).min(self.filtered.len().saturating_sub(1));
-            self.selected = Some(new_selected);
-        }
+        self.move_selection_by((viewport_height / 2) as isize);
     }
 
-    pub(super) fn scroll_list(&mut self, delta: isize) {
+    /// Move the selection `delta` rows, stopping at the first and last row.
+    pub(super) fn move_selection_by(&mut self, delta: isize) {
         self.selection_anchor = None;
         let Some(selected) = self.selected else {
             return;
@@ -97,7 +89,7 @@ impl App {
         } else {
             selected.saturating_sub((-delta) as usize)
         };
-        self.selected = Some(new_selected);
+        self.select_row(new_selected);
     }
 
     pub(super) fn get_selected_path(&self) -> Option<PathBuf> {
