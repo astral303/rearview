@@ -226,6 +226,15 @@ fn refresh_sources(
 }
 
 impl SessionChanges {
+    /// The title `source` keeps beside the transcript of session
+    /// `session_id`, as the refresh read it.
+    pub fn external_title_of(&self, source: Source, session_id: &str) -> Option<&SessionTitle> {
+        self.external_titles
+            .iter()
+            .filter(|(titled_by, _)| *titled_by == source)
+            .find_map(|(_, titles)| titles.get(session_id))
+    }
+
     /// Take in what `source`'s discovery found now.
     fn absorb(
         &mut self,

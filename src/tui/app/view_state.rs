@@ -13,7 +13,7 @@ use crate::tui::viewer::{
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -110,6 +110,16 @@ impl ViewState {
                     summary: header.summary.take(),
                 },
             );
+            header.custom_title = shown.custom_title;
+            header.summary = shown.summary;
+        }
+    }
+
+    /// Show `title`, the title kept beside the open session's transcript, in
+    /// the header, as [`TitleAndSummary::shown`] decides.
+    fn show_retitled(&mut self, title: &SessionTitle) {
+        if let Some(header) = &mut self.header {
+            let shown = TitleAndSummary::shown(&TitleAndSummary::default(), Some(title));
             header.custom_title = shown.custom_title;
             header.summary = shown.summary;
         }
@@ -295,12 +305,17 @@ enum OpenSessionRead {
     Gone(&'static str),
     /// The read or the whole refresh failed, with the status to show.
     Failed(String),
+    /// A list refresh read the title kept beside the transcript without
+    /// reading the session again. The list's row shows the title once the
+    /// list applies the refresh.
+    Retitled(SessionTitle),
 }
 
 impl OpenSessionRead {
-    /// `finished`'s read of the session at `path`; `None` when it didn't read
-    /// that session.
-    fn in_finished(finished: &FinishedRefresh, path: &Path) -> Option<Self> {
+    /// `finished`'s read of the session `state` shows; `None` when it read
+    /// neither that session nor its title.
+    fn in_finished(finished: &FinishedRefresh, state: &ViewState) -> Option<Self> {
+        let path = state.conversation_path.as_path();
         match finished {
             FinishedRefresh::Failed(error) => Some(Self::refresh_failed(error)),
             FinishedRefresh::Reads(reads) => {
@@ -329,11 +344,20 @@ impl OpenSessionRead {
                 if changes.removed.iter().any(|removed| removed == path) {
                     return Some(Self::Gone("Session not found"));
                 }
-                let kept = changes.kept.iter().find(|kept| kept.path == path)?;
-                Some(match kept.next.write_error() {
-                    Some(error) => Self::refresh_failed(error),
-                    None => Self::read_failed(),
-                })
+                if let Some(kept) = changes.kept.iter().find(|kept| kept.path == path) {
+                    return Some(match kept.next.write_error() {
+                        Some(error) => Self::refresh_failed(error),
+                        None => Self::read_failed(),
+                    });
+                }
+                let (Some(source), Some(session_id)) =
+                    (state.conversation_source, &state.session_id)
+                else {
+                    return None;
+                };
+                changes
+                    .external_title_of(source, session_id)
+                    .map(|title| Self::Retitled(title.clone()))
             }
         }
     }
@@ -536,7 +560,7 @@ impl App {
         let read = self
             .store
             .newest_finished()
-            .and_then(|finished| OpenSessionRead::in_finished(finished, &state.conversation_path));
+            .and_then(|finished| OpenSessionRead::in_finished(finished, state));
         match read {
             Some(OpenSessionRead::Listed(reloaded)) => {
                 let cache = self.interactive_cache();
@@ -556,6 +580,11 @@ impl App {
             Some(OpenSessionRead::Failed(status)) => {
                 self.set_status(status);
                 self.run_deferred_copy();
+            }
+            Some(OpenSessionRead::Retitled(title)) => {
+                if let AppMode::View(state) = &mut self.app_mode {
+                    state.show_retitled(&title);
+                }
             }
             None => {}
         }

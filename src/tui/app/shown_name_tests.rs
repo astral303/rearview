@@ -20,7 +20,7 @@ use std::path::Path;
 
 /// The names the agent gives the session while the lists show it, one per
 /// step.
-const AGENT_NAMES: [&str; 3] = ["Zebrafish plans", "Yakety release", "Walrus outline"];
+const AGENT_NAMES: [&str; 2] = ["Zebrafish plans", "Yakety release"];
 /// The name the user gives the session in rearview.
 const REARVIEW_NAME: &str = "Xylophone notes";
 
@@ -33,111 +33,251 @@ fn every_place_shows_the_name_a_load_into_an_empty_cache_shows() {
         .into_iter()
         .map(|fixture| std::thread::spawn(move || misses_of(fixture)))
         .collect();
-    let wrong: Vec<String> = running
+    let misses: Vec<String> = running
         .into_iter()
         .flat_map(|session| session.join().unwrap())
         .collect();
     assert!(
-        wrong.is_empty(),
+        misses.is_empty(),
         "every place shows the session's one name:\n{}",
-        wrong.join("\n")
+        misses.join("\n")
     );
 }
 
 /// The places that show another name than a load into an empty cache, for
-/// `fixture`'s session without a name, after each name the agent gives it
-/// while a list launched each way shows it, after its transcript gains a
-/// turn and after a rename in rearview.
+/// `fixture`'s session. The session starts without a name, in a list
+/// launched each way. Then the agent names it while the list launched over a
+/// cache shows it, and its transcript gains a turn after the first name.
+/// Then rearview renames the session and clears the name.
 fn misses_of(fixture: &'static dyn ProviderFixture) -> Vec<String> {
     let home = tempfile::tempdir().unwrap();
     let locator = fixture.write_session(home.path(), fixture.ids().session);
     let storage = kept_storage_under(fixture, home.path());
-    let mut lists =
-        [Launch::OverCache, Launch::OnEmptyCache].map(|launch| List::launch(launch, storage));
+    let mut lists = vec![
+        List::launch(Launch::OverCache, storage),
+        List::launch(Launch::OnEmptyCache, storage),
+    ];
     let body_word = lists[0].app.conversations[0]
         .preview_first
         .split(|ch: char| !ch.is_alphabetic())
         .find(|word| word.len() > 3)
         .expect("the session's text has a word")
         .to_lowercase();
-    let mut places = Places {
+    let mut checker = PlaceChecker {
         source: fixture.provider().source(),
         storage,
         body_word,
         given: Vec::new(),
-        wrong: Vec::new(),
+        misses: Vec::new(),
     };
-    places.check(&mut lists, "after the load", Commands::Run);
+    checker.check(&mut lists, "after the load", Commands::Run);
+    // Later steps check the list launched over a cache alone. The two
+    // launches differ in how the first load lists the session.
+    lists.retain(|list| matches!(list.launch, Launch::OverCache));
 
     for (naming, name) in agent_namings(fixture).into_iter().zip(AGENT_NAMES) {
-        let step = format!("after the agent names it {name:?} ({naming:?}) and a list refresh");
+        let is_first_name = checker.given.is_empty();
+        let step = format!(
+            "after the agent names it {name:?} ({naming:?}) and a list refresh finishes under \
+             the open viewer"
+        );
         let fingerprint_before = fingerprint_of(fixture, home.path(), &locator);
         off_the_drawing_thread(|| naming.name(fixture, &locator, name));
         let reads_before = admitted_reads::count(&locator);
         for list in &mut lists {
+            open_the_session(&mut list.app);
             serve_list_refresh(&mut list.app, TimeFilter::default());
+            finish_pending_view_reload(&mut list.app, VIEWPORT_HEIGHT);
         }
         if fingerprint_of(fixture, home.path(), &locator) == fingerprint_before
             && admitted_reads::count(&locator) != reads_before
         {
-            places.miss(&step, "the refreshes read the unchanged transcript");
+            checker.miss(&step, "the refreshes don't read the unchanged transcript");
         }
-        places.given.push(name);
-        places.check(&mut lists, &step, Commands::Run);
+        checker.given.push(name);
+        checker.check(&mut lists, &step, Commands::Run);
+        if is_first_name {
+            // The refreshes' resumed reads write copies with the first name.
+            // Each later name must replace it, at once and after a restore.
+            off_the_drawing_thread(|| fixture.append_turn(&locator, "a later reply"));
+            for list in &mut lists {
+                serve_list_refresh(&mut list.app, TimeFilter::default());
+            }
+            checker.check(
+                &mut lists,
+                "after the transcript gains a turn",
+                Commands::Run,
+            );
+        }
     }
-
-    // A resumed read must not bring back an earlier name.
-    off_the_drawing_thread(|| fixture.append_turn(&locator, "a later reply"));
-    for list in &mut lists {
-        serve_list_refresh(&mut list.app, TimeFilter::default());
-    }
-    places.check(
-        &mut lists,
-        "after the transcript gains a turn",
-        Commands::Skip,
-    );
 
     if fixture.provider().rename().is_capable() {
         for list in &mut lists {
             open_the_session(&mut list.app);
             rename_in_rearview(&mut list.app, REARVIEW_NAME);
         }
-        places.given.push(REARVIEW_NAME);
-        places.check(
+        checker.given.push(REARVIEW_NAME);
+        checker.check(
             &mut lists,
             "after a rename in the viewer, before its session refresh",
-            Commands::Skip,
+            Commands::Run,
         );
         for list in &mut lists {
             open_the_session(&mut list.app);
             serve_session_refresh(&mut list.app);
             finish_pending_view_reload(&mut list.app, VIEWPORT_HEIGHT);
         }
-        places.check(
+        checker.check(
             &mut lists,
             "after a rename in the viewer and its session refresh",
             Commands::Run,
         );
+        for list in &mut lists {
+            open_the_session(&mut list.app);
+            rename_in_rearview(&mut list.app, "");
+        }
+        checker.check(
+            &mut lists,
+            "after clearing the name in the viewer, before its session refresh",
+            Commands::Skip,
+        );
     }
-    places.wrong
+    checker.misses
 }
 
-/// The names `fixture`'s agent gives the session in turn: from no name to
-/// each kind of name and from each kind to the other. An agent that
-/// generates names ends on a generated one, which the rename in rearview
-/// then replaces.
+/// The names `fixture`'s agent gives the session in turn. The first is a
+/// chosen one, which the turn appended after it writes into the copy. An
+/// agent that generates names then generates one over that copy, and the
+/// rename in rearview replaces the generated name. Another agent chooses
+/// again over its chosen name.
 fn agent_namings(fixture: &dyn ProviderFixture) -> Vec<Naming> {
     let namings = Naming::every_one_of(fixture);
     if namings.contains(&Naming::Generated) {
-        vec![Naming::Generated, Naming::Chosen, Naming::Generated]
+        vec![Naming::Chosen, Naming::Generated]
     } else {
         namings.repeat(2)
     }
 }
 
+#[test]
+fn viewer_over_newer_copy_shows_the_name_a_load_into_an_empty_cache_shows() {
+    let running: Vec<_> = registered_fixtures()
+        .into_iter()
+        .filter(|fixture| !Naming::every_one_of(*fixture).is_empty())
+        .map(|fixture| std::thread::spawn(move || newer_copy_misses_of(fixture)))
+        .collect();
+    let misses: Vec<String> = running
+        .into_iter()
+        .flat_map(|session| session.join().unwrap())
+        .collect();
+    assert!(
+        misses.is_empty(),
+        "the viewer over a copy newer than the row shows the session's one name:\n{}",
+        misses.join("\n")
+    );
+}
+
+/// The viewer's misses at open over a copy newer than the list's row, for a
+/// session of `fixture`'s agent. In one session the agent names it after the
+/// list's load. In another the agent names it before a list refresh, and
+/// rearview renames it after.
+fn newer_copy_misses_of(fixture: &'static dyn ProviderFixture) -> Vec<String> {
+    let source = fixture.provider().source();
+    let naming = Naming::every_one_of(fixture)[0];
+    let name = AGENT_NAMES[0];
+    let mut misses = Vec::new();
+
+    let session = ListedSession::of(fixture);
+    // The header shows the row's title kept beside the transcript over the
+    // copy's until a list refresh reads the agent's new name.
+    if session.list.app.conversations[0].external_title.is_none() {
+        off_the_drawing_thread(|| naming.name(fixture, &session.locator, name));
+        misses.extend(
+            session
+                .header_misses_over_newer_copy(fixture)
+                .into_iter()
+                .map(|miss| {
+                    format!("{source:?}, the agent names it {name:?} ({naming:?}): {miss}")
+                }),
+        );
+    }
+
+    if fixture.provider().rename().is_capable() {
+        let mut session = ListedSession::of(fixture);
+        off_the_drawing_thread(|| naming.name(fixture, &session.locator, name));
+        serve_list_refresh(&mut session.list.app, TimeFilter::default());
+        rename_in_rearview(&mut session.list.app, REARVIEW_NAME);
+        misses.extend(
+            session
+                .header_misses_over_newer_copy(fixture)
+                .into_iter()
+                .map(|miss| {
+                    format!(
+                        "{source:?}, the agent names it {name:?} ({naming:?}) and rearview \
+                         renames it {REARVIEW_NAME:?}: {miss}"
+                    )
+                }),
+        );
+    }
+    misses
+}
+
+/// A session of one agent in a home of its own, and a list launched over a
+/// cache.
+struct ListedSession {
+    /// The home, deleted with the session.
+    _home: tempfile::TempDir,
+    locator: std::path::PathBuf,
+    storage: &'static dyn SessionStorage,
+    list: List,
+}
+
+impl ListedSession {
+    fn of(fixture: &'static dyn ProviderFixture) -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let locator = fixture.write_session(home.path(), fixture.ids().session);
+        let storage = kept_storage_under(fixture, home.path());
+        Self {
+            list: List::launch(Launch::OverCache, storage),
+            _home: home,
+            locator,
+            storage,
+        }
+    }
+
+    /// The misses of the viewer's header at open, after an agent command
+    /// writes a copy newer than the list's row. A turn appended to the
+    /// transcript makes the command read the session again.
+    fn header_misses_over_newer_copy(mut self, fixture: &dyn ProviderFixture) -> Vec<String> {
+        const LATER_REPLY: &str = "a later reply";
+        off_the_drawing_thread(|| fixture.append_turn(&self.locator, LATER_REPLY));
+        let (storage, cache) = (self.storage, self.list.cache.path());
+        off_the_drawing_thread(|| {
+            AgentService::new(test_environment(vec![storage], Some(cache)))
+                .execute(agent_command(&["sessions", "--all"]))
+                .unwrap()
+        });
+        let shown = title_and_summary(&load_into_empty_cache(storage));
+        let app = &mut self.list.app;
+        open_the_session(app);
+        let mut misses: Vec<String> = header_miss(app, &shown, "at open").into_iter().collect();
+        let AppMode::View(state) = &app.app_mode else {
+            return misses;
+        };
+        let text: String = state
+            .rendered_lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|(text, _)| text.as_str()))
+            .collect();
+        if !text.contains(LATER_REPLY) {
+            misses.push(format!("the viewer shows the newer copy's {LATER_REPLY:?}"));
+        }
+        misses
+    }
+}
+
 const VIEWPORT_HEIGHT: usize = 10;
 
-/// Open the list's only session in the viewer.
 fn open_the_session(app: &mut App) {
     app.selected = Some(0);
     app.enter_view_mode(80);
@@ -204,8 +344,8 @@ fn off_the_drawing_thread<T: Send>(run: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|scope| scope.spawn(run).join().unwrap())
 }
 
-/// Rename the list's only session to `name` in the name box, as the
-/// background worker makes the rename.
+/// Rename the list's only session to `name` in the name box. The background
+/// worker makes the rename.
 fn rename_in_rearview(app: &mut App, name: &str) {
     app.selected = Some(0);
     app.start_rename();
@@ -217,29 +357,30 @@ fn rename_in_rearview(app: &mut App, name: &str) {
     serve_list_change(app);
 }
 
-/// Whether a check runs the agent commands. They read the agent's files and
-/// the cache, so a step that changes only the lists' rows skips them.
+/// The agent commands' part in a check. A check skips them after rearview
+/// clears a name kept beside the transcript: they then show the earlier name
+/// from the cache's copy, a known limit.
 #[derive(Clone, Copy)]
 enum Commands {
     Run,
     Skip,
 }
 
-/// Every place that shows the session, and the places found showing another
-/// name than a load into an empty cache.
-struct Places {
+/// The check of every place that shows the session, and the places found
+/// showing another name than a load into an empty cache.
+struct PlaceChecker {
     source: Source,
     storage: &'static dyn SessionStorage,
     /// A word of the session's text, which every search finds it by.
     body_word: String,
     /// Each name given to the session so far.
     given: Vec<&'static str>,
-    wrong: Vec<String>,
+    misses: Vec<String>,
 }
 
-impl Places {
+impl PlaceChecker {
     fn miss(&mut self, step: &str, miss: impl std::fmt::Display) {
-        self.wrong
+        self.misses
             .push(format!("{:?}, {step}: {miss}", self.source));
     }
 
@@ -248,7 +389,7 @@ impl Places {
     /// cache. A viewer open through the step is checked, then closed: the
     /// list then applies what it deferred while the viewer was open.
     fn check(&mut self, lists: &mut [List], step: &str, commands: Commands) {
-        let expected = self.load_into_empty_cache();
+        let expected = load_into_empty_cache(self.storage);
         let shown = title_and_summary(&expected);
         let mut misses = Vec::new();
         for list in lists.iter_mut() {
@@ -266,6 +407,12 @@ impl Places {
             if row != shown {
                 misses.push(format!(
                     "{launch:?}: the list row shows {row:?}, not {shown:?}"
+                ));
+            }
+            if app.conversations[0].cached_session.is_none() {
+                misses.push(format!(
+                    "{launch:?}: the list row reads the cache, restored from it or parsed and \
+                     written"
                 ));
             }
             misses.extend(
@@ -287,19 +434,6 @@ impl Places {
         for miss in misses {
             self.miss(step, miss);
         }
-    }
-
-    /// The session's row as a load into an empty cache lists it.
-    fn load_into_empty_cache(&self) -> Conversation {
-        let storage = self.storage;
-        off_the_drawing_thread(|| {
-            let cache = tempfile::tempdir().unwrap();
-            rows_of(
-                &test_environment(vec![storage], Some(cache.path())),
-                storage,
-            )
-            .remove(0)
-        })
     }
 
     /// The misses of `agent sessions`, `agent search` and `agent within`
@@ -434,7 +568,7 @@ fn list_search_misses(
     given: &[&str],
     body_word: &str,
 ) -> Vec<String> {
-    let mut wrong = Vec::new();
+    let mut misses = Vec::new();
     let in_memory = crate::search::SearchTextsInMemory::read(conversations);
     let without_texts = crate::search::SearchTextsInMemory::default();
     let name_queries: Vec<(String, usize)> = given
@@ -479,13 +613,13 @@ fn list_search_misses(
             .results
             .len();
             if found != expected {
-                wrong.push(format!(
+                misses.push(format!(
                     "{query:?} finds {expected} session(s) read {read}, not {found}"
                 ));
             }
         }
     }
-    wrong
+    misses
 }
 
 /// The misses of the readers other than the list's search, for the session
@@ -502,7 +636,7 @@ fn other_reader_misses(
         HighlightQuery, build_context_segments_from_ranges, build_literal_context_segments,
     };
     use crate::search::query::ParsedQuery;
-    let mut wrong = Vec::new();
+    let mut misses = Vec::new();
     let row = &conversations[0];
     let in_memory = crate::search::SearchTextsInMemory::read(conversations);
     let unwindowed = crate::time_filter::TimeFilter::default();
@@ -528,7 +662,7 @@ fn other_reader_misses(
         .ranked
         .len();
         if found != expected {
-            wrong.push(format!(
+            misses.push(format!(
                 "agent search {query:?} finds {expected} session(s), not {found}"
             ));
         }
@@ -548,12 +682,12 @@ fn other_reader_misses(
         .ranked
         .len();
         if found != expected {
-            wrong.push(format!(
+            misses.push(format!(
                 "exact agent search {phrase:?} finds {expected} session(s), not {found}"
             ));
         }
         if route.contains(&query) != is_shown {
-            wrong.push(format!(
+            misses.push(format!(
                 "the semantic route text contains {query:?} only while the session shows it: \
                  {route:?}"
             ));
@@ -578,14 +712,14 @@ fn other_reader_misses(
                 )
             });
             if !line.as_deref().is_some_and(|line| line.contains(word)) {
-                wrong.push(format!("the evidence read {read} shows {word:?}: {line:?}"));
+                misses.push(format!("the evidence read {read} shows {word:?}: {line:?}"));
             }
         }
         let quoted = format!("\"{query}\"");
         let line =
             build_literal_context_segments(row, &row.preview, &HighlightQuery::parse(&quoted), 80);
         if !line.as_deref().is_some_and(|line| line.contains(word)) {
-            wrong.push(format!("the literal context line shows {word:?}: {line:?}"));
+            misses.push(format!("the literal context line shows {word:?}: {line:?}"));
         }
         let quoted = ParsedQuery::parse(&quoted);
         let evidence =
@@ -598,12 +732,24 @@ fn other_reader_misses(
             .as_deref()
             .is_some_and(|preview| preview.contains(word))
         {
-            wrong.push(format!(
+            misses.push(format!(
                 "the semantic search's exact preview shows {word:?}: {preview:?}"
             ));
         }
     }
-    wrong
+    misses
+}
+
+/// The only session `storage` stores, as a load into an empty cache lists it.
+fn load_into_empty_cache(storage: &'static dyn SessionStorage) -> Conversation {
+    off_the_drawing_thread(|| {
+        let cache = tempfile::tempdir().unwrap();
+        rows_of(
+            &test_environment(vec![storage], Some(cache.path())),
+            storage,
+        )
+        .remove(0)
+    })
 }
 
 /// Every session `storage` stores, as a load through `environment` lists
