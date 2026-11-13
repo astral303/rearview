@@ -9,7 +9,9 @@ use crate::history::environment::test_support::test_environment;
 use crate::history::fingerprint::CachedFingerprint;
 use crate::history::provider::SessionTitle;
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
-use crate::history::sqlite_cache::refresh::tests::{allow_owner_commits, fail_owner_commits};
+use crate::history::sqlite_cache::refresh::tests::{
+    allow_owner_commits, fail_acquisitions, fail_owner_commits,
+};
 use crate::history::{
     AwaitedRefresh, FoundSession, NextStep, OtherRearview, ProcessIdentity, RefreshOutcome,
     SessionChanges, Source, UpdatedSession,
@@ -108,7 +110,9 @@ pub(super) fn status_text(app: &App) -> Option<&str> {
 }
 
 /// The outcome of a `Ctrl+R` refresh that found `changes`.
-pub(super) fn refresh_found(changes: SessionChanges) -> crate::error::Result<RefreshOutcome> {
+pub(super) fn refresh_found(
+    changes: SessionChanges,
+) -> std::result::Result<RefreshOutcome, RefreshFailure> {
     Ok(RefreshOutcome::Changes(Box::new(changes)))
 }
 
@@ -570,7 +574,8 @@ pub(super) fn serve_session_refresh(app: &mut App) {
             Arc::default(),
         );
         let outcome = refresh.refresh(&operation);
-        operation.finish().fail_if_low_space().and(outcome)
+        let ended = operation.finish().fail_if_low_space();
+        ended.map_err(RefreshFailure::from).and(outcome)
     })
     .join()
     .unwrap();
@@ -1014,6 +1019,45 @@ fn failed_refresh_waiting_for_another_rearviews_refresh_is_read_again_when_it_en
     );
 }
 
+/// A session refresh that failed as a whole is judged by the stamps its
+/// worker took, the row's sub-agent transcripts included: a sub-agent
+/// transcript written between the worker's stamp and the failure's arrival
+/// reads as a change at the next check.
+#[test]
+fn session_refresh_failed_as_a_whole_keeps_the_stamps_its_worker_took() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["a question"]);
+    let helper = home.write_subagent(&a, "helper", 5, &["a task"]);
+    let mut app = home.app();
+    home.append(&a, 6, "a later question");
+    app.record_next_step(&a, NextStep::CacheInBackground);
+    let refresh = app
+        .begin_session_refresh()
+        .expect("a session refresh begins");
+    let environment = app.environment.clone();
+    fail_acquisitions(environment.cache_base().path());
+    let outcome = std::thread::spawn(move || {
+        let operation = crate::history::OperationScope::new(
+            environment.cache_base(),
+            crate::history::Patience::UntilAcquired,
+            Arc::default(),
+        );
+        refresh.refresh(&operation)
+    })
+    .join()
+    .unwrap();
+    assert!(outcome.is_err(), "the refresh fails at taking ownership");
+    home.append(&helper, 7, "a later task");
+
+    app.finish_refresh(outcome);
+    app.check_failed_refreshes();
+
+    assert!(
+        app.store.is_refresh_pending(&a),
+        "the sub-agent transcript written after the worker's stamp reads as a change"
+    );
+}
+
 #[test]
 fn session_refresh_removes_rows_now_gone_or_empty_and_keeps_failed_reads() {
     let home = ClaudeHome::new();
@@ -1218,7 +1262,9 @@ fn failed_refresh_keeps_list_and_reports_why() {
     let mut app = app_listing(vec![session("b", "b", 10, 1), session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
 
-    app.finish_refresh(Err(AppError::ConfigError("no home directory".to_owned())));
+    app.finish_refresh(Err(
+        AppError::ConfigError("no home directory".to_owned()).into()
+    ));
 
     assert_eq!(listed_names(&app), ["b", "a"]);
     assert_eq!(
@@ -1233,7 +1279,7 @@ fn refresh_thread_that_stops_without_outcome_reports_it_once() {
     let mut app = app_listing(vec![session("a", "a", 5, 1)]);
     app.begin_refresh().unwrap();
 
-    app.finish_refresh(Err(AppError::RefreshStopped));
+    app.finish_refresh(Err(AppError::RefreshStopped.into()));
 
     assert_eq!(
         status_text(&app),

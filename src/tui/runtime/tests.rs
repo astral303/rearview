@@ -7,7 +7,8 @@ use crate::history::sqlite_cache::DATABASE_FILE_NAME;
 use crate::history::sqlite_cache::connection::test_hooks::{self, CommitGate};
 use crate::history::sqlite_cache::refresh::RefreshOwnership;
 use crate::history::sqlite_cache::refresh::tests::{
-    OtherProcessOwner, exclusive_lock, expire_last_commit, writer_lock_held,
+    OtherProcessOwner, allow_acquisitions, exclusive_lock, expire_last_commit, fail_acquisitions,
+    writer_lock_held,
 };
 use crate::history::{CacheBase, InteractiveCache, ProcessIdentity};
 use crate::tui::SessionAction;
@@ -2626,5 +2627,133 @@ fn list_refresh_whose_write_fails_each_time_doesnt_write_session_again() {
         attempts.load(Ordering::SeqCst),
         failed,
         "the session isn't written again while nothing changes"
+    );
+}
+
+/// [`fail_acquisitions`] of the cache in `base`, counting each write to its
+/// refresh state in `attempts`.
+fn fail_each_acquisition(
+    base: &Path,
+    attempts: &Arc<std::sync::atomic::AtomicUsize>,
+) -> test_hooks::Installed {
+    fail_acquisitions(base);
+    let attempts = Arc::clone(attempts);
+    test_hooks::on_every_connection(base, move |connection| {
+        let attempts = Arc::clone(&attempts);
+        connection
+            .update_hook(Some(
+                move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                    if table == "refresh_state" {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            ))
+            .unwrap();
+    })
+}
+
+/// An open session whose refresh failed as a whole, at acquiring refresh
+/// ownership, isn't refreshed again while nothing changes; once
+/// acquisitions succeed and its transcript changes, it shows the newest
+/// messages.
+#[test]
+fn open_session_whose_refresh_failed_as_a_whole_shows_newest_messages_once_it_changes() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let clock = Arc::new(TestClock::default());
+    let mut terminal = terminal();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut failing_acquisitions = None;
+    let mut runtime =
+        opened_after_growth_with(&home, cache.path(), &clock, &mut terminal, &a, || {
+            failing_acquisitions = Some(fail_each_acquisition(cache.path(), &attempts));
+        });
+    assert!(
+        tick_on_clock_until(&mut runtime, &mut terminal, &clock, |runtime, _| {
+            shows_refresh_failed(runtime)
+        }),
+        "the viewer reports the failed refresh"
+    );
+    let failed_attempts = attempts.load(Ordering::SeqCst);
+    assert!(
+        failed_attempts >= 1,
+        "the refresh tried to acquire ownership"
+    );
+    allow_acquisitions(cache.path());
+    tick_while_nothing_changes(&mut runtime, &mut terminal, &clock);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        failed_attempts,
+        "the session isn't refreshed again while nothing changes"
+    );
+
+    home.append(&a, 7, "latest question");
+
+    assert!(
+        tick_on_clock_until(&mut runtime, &mut terminal, &clock, |_, terminal| {
+            shown_text(terminal).contains("latest question")
+        }),
+        "the session is refreshed once its transcript changes"
+    );
+    drop(failing_acquisitions);
+}
+
+/// The open session's transcript changes again while its `Ctrl+R` refresh
+/// waits for another rearview's refresh, and the refresh then fails as a
+/// whole at taking ownership: the change is noticed after the failure, and
+/// the viewer shows the newest messages.
+#[test]
+fn transcript_changed_while_refresh_waits_for_ownership_is_read_again_after_its_failure() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
+    open_the_selected_session(&mut runtime, &mut terminal);
+    home.append(&a, 6, "newer question");
+    let other_rearviews_refresh = another_rearviews_refresh(cache.path());
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+    tick_until(
+        &mut runtime,
+        &mut terminal,
+        App::is_waiting_for_another_rearview,
+    );
+
+    home.append(&a, 7, "newest question");
+    fail_acquisitions(cache.path());
+    drop(other_rearviews_refresh);
+    // Hand the outcome to the app without a tick: a tick would also start
+    // the next refresh while acquisitions still fail.
+    let started = Instant::now();
+    let outcome = loop {
+        if let Some(outcome) = runtime.supervisor.finished_refresh() {
+            break outcome;
+        }
+        assert!(
+            started.elapsed() < BACKGROUND_WORK_LIMIT,
+            "the refresh ends once the other rearview's refresh ends"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    runtime.app_mut().finish_refresh(outcome);
+    assert!(
+        shows_refresh_failed(&runtime),
+        "the refresh failed at taking ownership after its wait"
+    );
+    allow_acquisitions(cache.path());
+
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            "newest question"
+        ),
+        "the message written while the refresh waited shows once that refresh failed"
     );
 }

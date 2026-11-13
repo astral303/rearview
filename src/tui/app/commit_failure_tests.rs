@@ -487,7 +487,7 @@ fn refresh_the_list(app: &mut App) {
     })
     .join()
     .unwrap();
-    app.finish_refresh(outcome);
+    app.finish_refresh(outcome.map_err(Into::into));
 }
 
 /// A session refresh of every listed row of `app`.

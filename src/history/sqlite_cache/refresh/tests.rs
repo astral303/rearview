@@ -296,6 +296,28 @@ pub(crate) fn allow_owner_commits(base: &Path) {
         .unwrap();
 }
 
+/// Fail each acquisition of refresh ownership of the cache in `base`, as a
+/// database that refuses the write to its refresh state does, until
+/// [`allow_acquisitions`].
+pub(crate) fn fail_acquisitions(base: &Path) {
+    connect(base, POLL_EVERY)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_acquisition AFTER UPDATE OF owner ON refresh_state \
+             WHEN NEW.owner IS NOT NULL AND NEW.owner IS NOT OLD.owner \
+             BEGIN SELECT RAISE(ABORT, 'injected acquisition failure'); END;",
+        )
+        .unwrap();
+}
+
+/// Undo [`fail_acquisitions`].
+pub(crate) fn allow_acquisitions(base: &Path) {
+    connect(base, POLL_EVERY)
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_acquisition")
+        .unwrap();
+}
+
 /// A connection holding SQLite's exclusive lock on the session cache
 /// database in `base`, as a rebuild holds it: no other connection reads the
 /// database until it drops.

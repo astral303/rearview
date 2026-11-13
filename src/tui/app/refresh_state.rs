@@ -5,7 +5,8 @@
 
 use super::list_state::SelectionAnchor;
 use super::session_store::{
-    AWAITED_REFRESH_CHECK_INTERVAL, FinishedRead, FinishedRefresh, SessionCopy, UnlistedSession,
+    AWAITED_REFRESH_CHECK_INTERVAL, FailedRefresh, FinishedRead, FinishedRefresh, RefreshFailure,
+    SessionCopy, UnlistedSession,
 };
 use super::view_state::{PendingReload, ReloadedSession, SESSION_READ_FAILED};
 use super::{App, AppMode, DialogMode, DirectFileJob};
@@ -111,6 +112,17 @@ impl RefreshTarget {
             listed: Some(row.clone()),
         }
     }
+
+    /// This session's transcripts as they stamp now, the listed row's
+    /// sub-agent transcripts included.
+    fn stamp_now(&self) -> (PathBuf, FailedRefresh) {
+        let subagents = self
+            .listed
+            .as_ref()
+            .map(|row| row.subagents.clone())
+            .unwrap_or_default();
+        (self.path.clone(), FailedRefresh::now(&self.path, subagents))
+    }
 }
 
 /// `targets`' sessions read with `read`, called once per agent with the
@@ -160,21 +172,27 @@ pub struct SessionRefresh {
 impl SessionRefresh {
     /// Read each session again under `operation`'s refresh ownership and
     /// cache it ([`cache_sessions`]). Run on the background worker: it waits
-    /// for ownership as a load does.
-    pub fn refresh(self, operation: &OperationScope) -> Result<RefreshOutcome> {
-        Ok(RefreshOutcome::Cached(read_by_source(
-            &self.targets,
-            |source, locators| {
-                cache_sessions(
-                    &self.environment,
-                    source,
-                    locators,
-                    self.show_last,
-                    operation,
-                    crate::history::load_meter::AgentMeter::UNMETERED,
-                )
-            },
-        )?))
+    /// for ownership as a load does. It stamps the sessions' transcripts
+    /// before that wait: after a refresh that fails as a whole, the TUI's
+    /// check of failed refreshes reads a session written during the wait as
+    /// changed.
+    pub fn refresh(
+        self,
+        operation: &OperationScope,
+    ) -> std::result::Result<RefreshOutcome, RefreshFailure> {
+        let stamped = self.targets.iter().map(RefreshTarget::stamp_now).collect();
+        read_by_source(&self.targets, |source, locators| {
+            cache_sessions(
+                &self.environment,
+                source,
+                locators,
+                self.show_last,
+                operation,
+                crate::history::load_meter::AgentMeter::UNMETERED,
+            )
+        })
+        .map(RefreshOutcome::Cached)
+        .map_err(|error| RefreshFailure::of_session_refresh(error, stamped))
     }
 }
 
@@ -280,7 +298,7 @@ impl App {
     /// session's next step at once, and the open session follows a read of
     /// it (see [`Self::follow_open_session`]); the list applies the outcome
     /// once it is on screen with nothing over it.
-    pub fn finish_refresh(&mut self, outcome: Result<RefreshOutcome>) {
+    pub fn finish_refresh(&mut self, outcome: std::result::Result<RefreshOutcome, RefreshFailure>) {
         let now = self.clock().now();
         self.store.finish(outcome, now);
         self.follow_open_session();

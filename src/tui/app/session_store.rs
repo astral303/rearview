@@ -67,7 +67,7 @@ pub(super) const FAILED_REFRESH_TRANSCRIPTS_PER_CHECK: usize = 16;
 
 /// A session whose refresh failed, waiting for its transcripts to change:
 /// their stamp at the failure.
-struct FailedRefresh {
+pub(super) struct FailedRefresh {
     /// The transcripts' stamp at the failure; `None` when unknown.
     revision: Option<CachedFingerprint>,
     /// The sub-agent transcripts `revision` spans.
@@ -77,13 +77,23 @@ struct FailedRefresh {
 impl FailedRefresh {
     /// The transcripts of the session at `path` named by `failure`, at the
     /// failure's revision or, without one, as they stamp now.
-    fn of(path: &Path, failure: WriteFailure) -> Self {
-        let revision = failure
-            .revision
-            .or_else(|| walk::session_stamp(path, &failure.subagents));
+    fn of(path: &Path, failure: &WriteFailure) -> Self {
+        let subagents = failure.subagents.clone();
+        match failure.revision {
+            Some(revision) => Self {
+                revision: Some(revision),
+                subagents,
+            },
+            None => Self::now(path, subagents),
+        }
+    }
+
+    /// The transcripts of the session at `path`, with the sub-agent
+    /// transcripts `subagents`, as they stamp now.
+    pub(super) fn now(path: &Path, subagents: Vec<PathBuf>) -> Self {
         Self {
-            revision,
-            subagents: failure.subagents,
+            revision: walk::session_stamp(path, &subagents),
+            subagents,
         }
     }
 
@@ -100,6 +110,32 @@ impl FailedRefresh {
     /// sub-agent transcript.
     fn transcript_count(&self) -> usize {
         1 + self.subagents.len()
+    }
+}
+
+/// A list or session refresh that failed as a whole: its error, and each
+/// session a session refresh was to read, its transcripts stamped on the
+/// worker before the refresh waited for ownership.
+pub struct RefreshFailure {
+    pub(crate) error: AppError,
+    sessions: Vec<(PathBuf, FailedRefresh)>,
+}
+
+impl RefreshFailure {
+    pub(super) fn of_session_refresh(
+        error: AppError,
+        sessions: Vec<(PathBuf, FailedRefresh)>,
+    ) -> Self {
+        Self { error, sessions }
+    }
+}
+
+impl From<AppError> for RefreshFailure {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            sessions: Vec::new(),
+        }
     }
 }
 
@@ -268,10 +304,8 @@ impl SessionStore {
                 self.request_session_refresh_unless_failed(path);
             }
             NextStep::RefreshOnChange(failure) if !self.refuses_session_refreshes => {
-                self.failed_refreshes.insert(
-                    path.to_path_buf(),
-                    FailedRefresh::of(path, (**failure).clone()),
-                );
+                self.failed_refreshes
+                    .insert(path.to_path_buf(), FailedRefresh::of(path, failure));
             }
             NextStep::Settled => {
                 self.failed_refreshes.remove(path);
@@ -476,10 +510,19 @@ impl SessionStore {
 
     /// The running refresh finished with `outcome`: record each session's
     /// next step at `now`, on the app's clock, and keep the rest for the list
-    /// to apply.
-    pub(super) fn finish(&mut self, outcome: Result<RefreshOutcome>, now: Moment) {
+    /// to apply. A session refresh that failed as a whole records each of its
+    /// sessions as a failed refresh, at the stamps its worker took.
+    pub(super) fn finish(
+        &mut self,
+        outcome: std::result::Result<RefreshOutcome, RefreshFailure>,
+        now: Moment,
+    ) {
         self.is_list_refresh_running = false;
         self.refreshing.clear();
+        let outcome = outcome.map_err(|failure| {
+            self.failed_refreshes.extend(failure.sessions);
+            failure.error
+        });
         self.add_launch_outcome(outcome, now);
     }
 

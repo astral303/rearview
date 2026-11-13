@@ -2,6 +2,7 @@
 //! refreshes, renames and deletes run on it one at a time, and their messages
 //! come back to the runtime through the supervisor.
 
+use super::app::RefreshFailure;
 use super::list_change::{ListChange, ListChangeOutcome};
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
@@ -29,7 +30,7 @@ pub(crate) struct TaskSupervisor {
     launch: Option<Receiver<LoaderMessage>>,
     load_meter: Arc<LoadMeter>,
     /// The running list or session refresh's outcome.
-    refresh: Option<Receiver<Result<RefreshOutcome>>>,
+    refresh: Option<Receiver<std::result::Result<RefreshOutcome, RefreshFailure>>>,
     /// The running rename or delete's outcome, and its outcome should the
     /// job stop without one.
     change: Option<(Receiver<ListChangeOutcome>, ListChangeOutcome)>,
@@ -115,7 +116,12 @@ impl TaskSupervisor {
     /// error of [`OperationScope::finish`].
     pub(crate) fn refresh(
         &mut self,
-        refresh: impl FnOnce(&Environment, &OperationScope) -> Result<RefreshOutcome> + Send + 'static,
+        refresh: impl FnOnce(
+            &Environment,
+            &OperationScope,
+        ) -> std::result::Result<RefreshOutcome, RefreshFailure>
+        + Send
+        + 'static,
     ) {
         let (outcome, received) = mpsc::channel();
         let environment = self.environment.clone();
@@ -124,7 +130,8 @@ impl TaskSupervisor {
         self.run(Box::new(move || {
             let operation = operation(&environment);
             let refreshed = refresh(&environment, &operation);
-            let _ = outcome.send(operation.finish().fail_if_low_space().and(refreshed));
+            let ended = operation.finish().fail_if_low_space();
+            let _ = outcome.send(ended.map_err(RefreshFailure::from).and(refreshed));
         }));
     }
 
@@ -189,11 +196,13 @@ impl TaskSupervisor {
 
     /// The running refresh's outcome once it has one: a refresh that stopped
     /// without one fails with [`AppError::RefreshStopped`].
-    pub(crate) fn finished_refresh(&mut self) -> Option<Result<RefreshOutcome>> {
+    pub(crate) fn finished_refresh(
+        &mut self,
+    ) -> Option<std::result::Result<RefreshOutcome, RefreshFailure>> {
         let outcome = match self.refresh.as_ref()?.try_recv() {
             Ok(outcome) => outcome,
             Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => Err(AppError::RefreshStopped),
+            Err(TryRecvError::Disconnected) => Err(AppError::RefreshStopped.into()),
         };
         self.refresh = None;
         Some(outcome)

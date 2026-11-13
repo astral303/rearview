@@ -45,6 +45,7 @@ use search_state::{SemanticSearchState, SessionIdQuery};
 use search_worker::{
     SearchCommand, SearchCommands, SearchResponse, SearchWorker, TextsHeld, spawn_search_worker,
 };
+pub(crate) use session_store::RefreshFailure;
 #[allow(unused_imports)]
 pub use types::{
     Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow, LIST_LINES_PER_ITEM,

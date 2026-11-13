@@ -448,7 +448,7 @@ pub(crate) fn serve_list_refresh(app: &mut App, window: crate::time_filter::Time
     })
     .join()
     .unwrap();
-    app.finish_refresh(outcome);
+    app.finish_refresh(outcome.map_err(Into::into));
 }
 
 /// The session cache under `cache_base` as another rearview reaches it, on
