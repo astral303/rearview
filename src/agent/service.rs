@@ -442,11 +442,12 @@ pub struct AgentService {
     >,
     bounded_transcripts:
         RefCell<HashMap<(PathBuf, usize, usize), agent::transcript::AgentTranscript>>,
-    /// The title and summary of each target the command's read listed, by
-    /// path, as the listed row shows them. A transcript's own are its last
-    /// parse's: a name kept outside the transcript can change without the
-    /// transcript.
-    target_titles_and_summaries: RefCell<HashMap<PathBuf, history::provider::TitleAndSummary>>,
+    /// The name each target's listed row shows, by path. It replaces the
+    /// title, summary and preview of the target's `AgentTranscript`, because
+    /// the transcript's title and summary are its last parse's, older than a
+    /// title kept beside the transcript, and a transcript parsed without a
+    /// row doesn't have a preview.
+    listed_target_names: RefCell<HashMap<PathBuf, ListedName>>,
     /// The stale sessions the command has met so far; the command prints
     /// them in one record when it renders.
     stale_coverage: RefCell<Option<StaleCoverage>>,
@@ -529,6 +530,7 @@ pub(crate) fn read_hit_messages(
                 malformed_lines: Vec::new(),
                 summary: None,
                 custom_title: None,
+                preview: None,
             },
             message_count: conversation.message_count,
             copy_generation: Some(hits.generation),
@@ -723,16 +725,22 @@ type CopyCurrency = fn(
     &history::sqlite_cache::Publication,
 ) -> Result<history::sqlite_cache::Currency>;
 
+struct ListedName {
+    title_and_summary: history::provider::TitleAndSummary,
+    /// The row's preview, which names a session without a title or summary.
+    preview: String,
+}
+
 /// A targeted read of one session as a command keeps it for its key and
 /// its reads: without the listed row's search texts.
 enum TargetRead {
     /// The read listed the session: the row's address, sub-agents,
-    /// publication of its copy, and title and summary.
+    /// publication of its copy, and name.
     Listed {
         address: history::sqlite_cache::SessionAddress,
         subagents: Vec<PathBuf>,
         publication: history::sqlite_cache::Publication,
-        title_and_summary: history::provider::TitleAndSummary,
+        name: ListedName,
         unwritten: history::provider::UnwrittenParse,
     },
     /// The read did not list the session.
@@ -751,9 +759,12 @@ impl TargetRead {
                     .expect("a row a targeted read lists has its cache address"),
                 subagents: row.subagents,
                 publication: row.publication,
-                title_and_summary: history::provider::TitleAndSummary {
-                    custom_title: row.custom_title,
-                    summary: row.summary,
+                name: ListedName {
+                    title_and_summary: history::provider::TitleAndSummary {
+                        custom_title: row.custom_title,
+                        summary: row.summary,
+                    },
+                    preview: row.preview,
                 },
                 unwritten,
             },
@@ -768,7 +779,7 @@ impl AgentService {
         Self {
             transcripts: RefCell::default(),
             bounded_transcripts: RefCell::default(),
-            target_titles_and_summaries: RefCell::default(),
+            listed_target_names: RefCell::default(),
             stale_coverage: RefCell::default(),
             perf: CommandPerf::new(Arc::clone(environment.clock())),
             environment,
@@ -1048,7 +1059,7 @@ impl AgentService {
                 address,
                 subagents,
                 publication,
-                title_and_summary,
+                name,
                 unwritten,
             } => {
                 let key = agent::refs::AgentConversationKey {
@@ -1057,9 +1068,9 @@ impl AgentService {
                     publication,
                     ..target.clone()
                 };
-                self.target_titles_and_summaries
+                self.listed_target_names
                     .borrow_mut()
-                    .insert(key.path.clone(), title_and_summary);
+                    .insert(key.path.clone(), name);
                 if let history::provider::UnwrittenParse::Entries(entries) = unwritten {
                     self.keep_parsed_transcript(&key, entries);
                 }
@@ -1087,15 +1098,19 @@ impl AgentService {
             .remove(&key.session_id)
     }
 
-    /// `transcript`, the transcript of `key`'s session, under the title and
-    /// summary the command's read listed for the session, when it listed it.
-    fn titled_as_listed(
+    /// `transcript`, the transcript of `key`'s session, under the name its
+    /// listed row shows; as it is when the targeted read didn't list the
+    /// session.
+    fn named_as_listed(
         &self,
         key: &agent::refs::AgentConversationKey,
         transcript: agent::transcript::AgentTranscript,
     ) -> agent::transcript::AgentTranscript {
-        match self.target_titles_and_summaries.borrow().get(&key.path) {
-            Some(shown) => transcript.titled(shown.clone()),
+        match self.listed_target_names.borrow().get(&key.path) {
+            Some(name) => agent::transcript::AgentTranscript {
+                preview: Some(name.preview.clone()),
+                ..transcript.titled(name.title_and_summary.clone())
+            },
             None => transcript,
         }
     }
@@ -1257,7 +1272,7 @@ impl AgentService {
         }
         let cache_key = (key.path.clone(), range.start, range.end);
         if let Some(transcript) = self.bounded_transcripts.borrow().get(&cache_key) {
-            return Ok(self.titled_as_listed(key, transcript.clone()));
+            return Ok(self.named_as_listed(key, transcript.clone()));
         }
         let read = self.perf.time_transcript_parse(key, || {
             self.read_copy_when_unlocked(|| {
@@ -1274,7 +1289,7 @@ impl AgentService {
         self.bounded_transcripts
             .borrow_mut()
             .insert(cache_key, transcript.clone());
-        Ok(self.titled_as_listed(key, transcript))
+        Ok(self.named_as_listed(key, transcript))
     }
 
     /// Runs `command`, writing `protocol agent-progress` records to stderr
@@ -1341,7 +1356,7 @@ impl AgentService {
             }
         };
         loaded
-            .map(|transcript| self.titled_as_listed(key, transcript))
+            .map(|transcript| self.named_as_listed(key, transcript))
             .map_err(AppError::from)
     }
 
@@ -2461,12 +2476,14 @@ fn conversation_from_agent_transcript(
         })
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
-    let preview = message_text
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ... ");
+    let preview = transcript.preview.clone().unwrap_or_else(|| {
+        message_text
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ... ")
+    });
     let preview_last = message_text
         .iter()
         .rev()
@@ -7707,7 +7724,10 @@ mod tests {
                     publication: Publication::Published {
                         generation: published,
                     },
-                    title_and_summary: history::provider::TitleAndSummary::default(),
+                    name: ListedName {
+                        title_and_summary: history::provider::TitleAndSummary::default(),
+                        preview: String::new(),
+                    },
                     unwritten: history::provider::UnwrittenParse::Nothing,
                 },
             );

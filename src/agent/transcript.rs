@@ -34,6 +34,10 @@ pub struct AgentTranscript {
     pub malformed_lines: Vec<usize>,
     pub summary: Option<String>,
     pub custom_title: Option<String>,
+    /// The preview of the session's row. `agent within` names a session
+    /// without a title or summary by it. `None` for a transcript read without
+    /// a row.
+    pub preview: Option<String>,
 }
 
 /// A session's transcript as the session cache holds it.
@@ -325,16 +329,19 @@ impl AgentTranscript {
             .iter()
             .map(|line| line.line_number)
             .collect();
-        Ok(Self::from_entries_with_numbers(
+        let transcript = Self::from_entries_with_numbers(
             path,
             stored.transcript.entries,
             malformed,
             Some(stored.numbers),
-        )?
-        .titled(TitleAndSummary {
-            custom_title: stored.custom_title,
-            summary: stored.summary,
-        }))
+        )?;
+        Ok(Self {
+            preview: stored.preview,
+            ..transcript.titled(TitleAndSummary {
+                custom_title: stored.custom_title,
+                summary: stored.summary,
+            })
+        })
     }
 
     /// This transcript under `shown`, its session row's title and summary.
@@ -513,6 +520,7 @@ impl AgentTranscript {
             malformed_lines,
             summary,
             custom_title,
+            preview: None,
         })
     }
 
