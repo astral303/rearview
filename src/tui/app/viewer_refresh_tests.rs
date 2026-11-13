@@ -1542,7 +1542,7 @@ fn rows_of(
     )
     .unwrap()
     .conversations;
-    operation.finish().unwrap();
+    operation.finish().fail_if_low_space().unwrap();
     rows
 }
 
@@ -1716,7 +1716,7 @@ fn direct_file_by_canonical_path_canonicalises_only_the_root_and_the_cache_direc
     let read =
         crate::history::provider::open_direct_file(&environment, &canonical, false, &operation);
 
-    operation.finish().unwrap();
+    operation.finish().fail_if_low_space().unwrap();
     assert!(matches!(
         read,
         Ok(crate::history::provider::DirectFileRead::Session { .. })

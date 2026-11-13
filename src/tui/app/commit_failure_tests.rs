@@ -481,7 +481,7 @@ fn refresh_the_list(app: &mut App) {
         );
         let outcome = refresh_sessions(&environment, &known, RefreshOptions::default(), &operation)
             .map(|changes| RefreshOutcome::Changes(Box::new(changes)));
-        operation.finish().and(outcome)
+        operation.finish().fail_if_low_space().and(outcome)
     })
     .join()
     .unwrap();

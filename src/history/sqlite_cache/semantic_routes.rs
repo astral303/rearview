@@ -94,8 +94,8 @@ pub(crate) enum RoutesStored {
 /// Store each of `routes` whose copy the cache under `base` still holds, as
 /// the refresh owner. Takes refresh ownership without waiting, and doesn't
 /// write anything while another refresh owns the cache. When the drive is
-/// low on space, fails with [`OperationScope::finish`]'s error, in place of
-/// any error of the write itself.
+/// low on space, fails with the low-space error, in place of any error of
+/// the write itself.
 pub(crate) fn store_routes(base: &CacheBase, routes: &[SemanticRoute]) -> Result<RoutesStored> {
     let operation = OperationScope::new(
         base,
@@ -103,7 +103,7 @@ pub(crate) fn store_routes(base: &CacheBase, routes: &[SemanticRoute]) -> Result
         Arc::new(WaitStatus::default()),
     );
     let stored = store_as_owner(&operation, routes);
-    operation.finish()?;
+    operation.finish().fail_if_low_space()?;
     stored
 }
 

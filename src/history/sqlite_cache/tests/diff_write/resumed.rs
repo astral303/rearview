@@ -859,7 +859,7 @@ fn load_after_archived_tree_is_retargeted_reads_the_session_whole_once() {
         )
         .unwrap()
         .conversations;
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         rows
     };
     load();

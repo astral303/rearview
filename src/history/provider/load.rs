@@ -2445,7 +2445,7 @@ mod tests {
             ..LoadOptions::default()
         };
         let loaded = load_sessions(&environment, storage, options, &operation, &mut |_, _| {});
-        operation.finish().and(loaded)
+        operation.finish().fail_if_low_space().and(loaded)
     }
 
     fn load_metered_with_cache(
@@ -2462,7 +2462,7 @@ mod tests {
             ..LoadOptions::default()
         };
         let loaded = load_sessions(&environment, storage, options, &operation, &mut |_, _| {});
-        operation.finish().and(loaded)
+        operation.finish().fail_if_low_space().and(loaded)
     }
 
     fn load_sessions_with_cache(
@@ -2491,7 +2491,7 @@ mod tests {
             needs_reading,
             &operation,
         );
-        operation.finish().and(rediscovered)
+        operation.finish().fail_if_low_space().and(rediscovered)
     }
 
     /// [`cache_sessions`] for one session in the environment of
@@ -2527,7 +2527,7 @@ mod tests {
             let outcomes =
                 cache_sessions_through(self, self.storage_roots().unwrap(), &named, &operation)
                     .unwrap();
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             outcomes
         }
 
@@ -2535,7 +2535,7 @@ mod tests {
         fn load_waiting(&self) -> Result<LoadedSessions> {
             let operation = waiting_operation(self.environment);
             let loaded = self.load(LeftOutRows::NONE, &operation, &mut |_, _| {});
-            operation.finish().and(loaded)
+            operation.finish().fail_if_low_space().and(loaded)
         }
     }
 
@@ -2563,7 +2563,7 @@ mod tests {
                 .outcomes
                 .pop()
                 .expect("one read");
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             outcome
         }
 
@@ -2578,7 +2578,7 @@ mod tests {
             let loaded = self
                 .load_root(root, found, LeftOutRows::NONE, &operation, read)
                 .unwrap();
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             loaded
         }
 
@@ -2758,7 +2758,7 @@ mod tests {
             let running = scope.spawn(move || {
                 let loaded =
                     loader.load_root(root_ref, captured, LeftOutRows::NONE, &operation, &read);
-                operation.finish().and(loaded).unwrap()
+                operation.finish().fail_if_low_space().and(loaded).unwrap()
             });
             wait_for_refresh(&meter);
             assert_eq!(home.watch().parses_begun(), 0);
@@ -2890,7 +2890,7 @@ mod tests {
                     &operation,
                     &mut |_, _| {},
                 );
-                operation.finish().and(loaded).unwrap()
+                operation.finish().fail_if_low_space().and(loaded).unwrap()
             });
             wait_for_refresh(&meter);
             assert_eq!(stored_keys_in(base.path(), &home), [key]);
@@ -3370,7 +3370,7 @@ mod tests {
             .load(LeftOutRows::NONE, &operation, &mut |_, _| {})
             .unwrap();
         let after_load = log_and_checkpointed_pages();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         home.write("second", 1, &["a changed question"]);
         let operation = waiting_operation(&environment);
         loader
@@ -3383,7 +3383,7 @@ mod tests {
             )
             .unwrap();
         let after_refresh = log_and_checkpointed_pages();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         assert_eq!(sessions_before, 0);
         assert_eq!(
@@ -3926,7 +3926,7 @@ mod tests {
         .unwrap()
         .pop()
         .expect("one read");
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         let (read, next) = outcome.into_parts();
         let SessionRead::Listed(row) = read else {
@@ -3973,7 +3973,7 @@ mod tests {
         .unwrap()
         .pop()
         .expect("one read");
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         let (read, next) = outcome.into_parts();
         let SessionRead::Listed(row) = read else {
@@ -4396,6 +4396,7 @@ mod tests {
             );
             operation
                 .finish()
+                .fail_if_low_space()
                 .and(reads)
                 .unwrap()
                 .outcomes
@@ -4535,7 +4536,7 @@ mod tests {
                 StubsAfterRediscovery::SameFiles,
                 &operation,
             );
-            operation.finish().and(reads).unwrap();
+            operation.finish().fail_if_low_space().and(reads).unwrap();
         } else {
             loader.load_waiting().unwrap();
         }
@@ -4830,7 +4831,7 @@ mod tests {
             &operation,
         )
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         let fresh: Vec<_> = home
             .storage()
@@ -4868,7 +4869,7 @@ mod tests {
             &operation,
         )
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         assert_eq!(
             result.ignored,
             vec![FilterTerm::new(
@@ -5371,7 +5372,7 @@ mod tests {
         .unwrap()
         .pop()
         .expect("one read");
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
 
         let (SessionRead::Listed(row), _) = outcome.into_parts() else {
             panic!("the copy is read");
@@ -6235,7 +6236,7 @@ mod tests {
         );
         let operation = waiting_operation(&environment);
         let mut outcomes = loader.rediscover(&|_| true, &operation).unwrap().outcomes;
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         assert_eq!(outcomes.len(), 1, "the rediscovery reads one session");
         outcomes.pop().unwrap().into_parts().0
     }

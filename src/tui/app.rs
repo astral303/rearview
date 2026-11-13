@@ -558,7 +558,7 @@ impl App {
                 show_last,
                 &operation,
             );
-            operation.finish().and(read)
+            operation.finish().fail_if_low_space().and(read)
         })
         .join()
         .unwrap();

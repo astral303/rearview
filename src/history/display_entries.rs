@@ -118,7 +118,7 @@ pub fn printed_log_entries(
         Arc::default(),
     );
     let printed = printed_session(environment, source, path, show_last, &operation);
-    let finished = operation.finish();
+    let finished = operation.finish().fail_if_low_space();
     let printed = printed?;
     finished?;
     if let Some(reason) = printed.older_copy_reason {

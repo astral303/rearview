@@ -1573,7 +1573,7 @@ impl AgentService {
                 &selection.unlisted_warnings,
             )
         });
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         selection.warnings.extend(skipped);
         Ok(selection)
     }
@@ -1718,7 +1718,7 @@ impl AgentService {
                 self.clock().local_wall(),
             )
         });
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         Ok(rendered)
     }
 }
@@ -3611,7 +3611,7 @@ impl AgentService {
                 Some((_, resolved)) => target_error(error, resolved),
                 None => structured_agent_error(error),
             })?;
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         Ok(output)
     }
 
@@ -3673,7 +3673,7 @@ impl AgentService {
                 )
             })
             .map_err(|error| target_error(error, &resolved))?;
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         Ok(output)
     }
 }
@@ -3875,7 +3875,7 @@ mod tests {
             &mut |_, _| {},
         )
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         loaded
     }
 
@@ -4003,7 +4003,7 @@ mod tests {
             warnings: directory_warnings,
             reads,
         } = discover_agent_keys(environment, meter, &operation).unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         assert_eq!(
             reads.roots.len(),
             environment.storages().len(),
@@ -4510,7 +4510,7 @@ mod tests {
             let perf = CommandPerf::new(Arc::clone(environment.clock()));
             let operation = command_operation(environment.cache_base(), perf.load_meter());
             let mut loaded = LoadedSessions::load(rules, &perf, &environment, &operation).unwrap();
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             loaded.current_session_ids = current_session_ids;
             let (mut selection, stale_coverage) =
                 SessionSelection::from_loaded(loaded, rules, &perf).unwrap();
@@ -4942,7 +4942,7 @@ mod tests {
             )
             .unwrap()
             .conversations;
-            operation.finish().unwrap();
+            operation.finish().fail_if_low_space().unwrap();
             let rows = locators
                 .iter()
                 .map(|locator| {
@@ -5288,7 +5288,7 @@ mod tests {
             &operation,
         )
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
     }
 
     /// The owner's load records, for each kind of session without a row

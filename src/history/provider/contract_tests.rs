@@ -702,7 +702,7 @@ fn rows_loaded_through(environment: &Environment) -> Vec<Conversation> {
     )
     .unwrap()
     .conversations;
-    operation.finish().unwrap();
+    operation.finish().fail_if_low_space().unwrap();
     rows
 }
 
@@ -1335,7 +1335,7 @@ fn uncached_subagent_id_reads_as_its_parsed_session_through_session_refresh() {
         .pop()
         .unwrap()
         .into_parts();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         assert!(
             reads_as_parsed(&refreshed, lists),
             "the sub-agent reads as its parsed session"
@@ -1388,7 +1388,7 @@ fn subagent_opened_by_id_during_refresh_is_read_again_once_it_completes() {
         .unwrap()
         .pop()
         .unwrap();
-        operation.finish().unwrap();
+        operation.finish().fail_if_low_space().unwrap();
         let reread = super::reread_sessions(&environment, source, &[locator], false)
             .pop()
             .unwrap();

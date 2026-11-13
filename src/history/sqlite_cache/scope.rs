@@ -144,7 +144,7 @@ impl OperationScope {
     /// the ownership until [`Self::finish`]. Fails
     /// on a database error other than a busy lock, when cancelled while
     /// waiting for ownership, and once a write found the cache's drive low
-    /// on space (see [`Self::finish`]).
+    /// on space (see [`OperationEnd::fail_if_low_space`]).
     pub(crate) fn acquire_access(&self) -> Result<OperationAccess<'_>> {
         let coordinator = &self.coordinator;
         if let Some(error) = coordinator.base().low_space().error() {
@@ -334,13 +334,35 @@ fn read_while_busy<T, E>(
 }
 
 impl OperationScope {
-    /// End the operation, releasing its refresh ownership. Fails once a
-    /// write to the cache found its drive with less than the floor free:
-    /// the command reporting the error deletes the cache database (see
-    /// [`super::low_space::run_deletion`]).
-    pub fn finish(self) -> Result<()> {
+    /// End the operation, releasing its refresh ownership.
+    pub fn finish(self) -> OperationEnd {
+        let lost_write_permission = self.has_lost_write_permission();
         *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Held::Nothing;
-        match self.coordinator.base().low_space().error() {
+        OperationEnd {
+            low_space: self.coordinator.base().low_space().error(),
+            lost_write_permission,
+        }
+    }
+}
+
+/// The low-space error an operation on the session cache ended with, and
+/// whether it lost its write permission.
+#[derive(Debug)]
+#[must_use = "an operation's end carries the low-space error; the command reporting it deletes the cache"]
+pub struct OperationEnd {
+    /// The low-space error, once a write to the cache found its drive with
+    /// less than the floor free.
+    low_space: Option<AppError>,
+    /// True when the operation owned the refresh and its write permission
+    /// was revoked: what it read after that is missing from the cache.
+    pub(crate) lost_write_permission: bool,
+}
+
+impl OperationEnd {
+    /// Fail with the low-space error: the command reporting it deletes the
+    /// cache database (see [`super::low_space::run_deletion`]).
+    pub fn fail_if_low_space(self) -> Result<()> {
+        match self.low_space {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -350,3 +372,112 @@ impl OperationScope {
 /// The interval between a read's attempts while the database is
 /// exclusively locked.
 const UNLOCK_POLL: Duration = Duration::from_millis(200);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::sqlite_cache::refresh::tests::{rearview, replace_owner};
+    use crate::history::sqlite_cache::{DriveRunningOut, SqliteCache};
+
+    fn operation(base: &CacheBase) -> OperationScope {
+        OperationScope::new(base, Patience::UntilAcquired, Arc::default())
+    }
+
+    /// The token of `operation`'s refresh ownership, acquired now.
+    fn owner_token(operation: &OperationScope) -> RefreshToken {
+        match operation.acquire_access().unwrap() {
+            OperationAccess::Owner(owner) => owner.token().clone(),
+            OperationAccess::AsIs => panic!("the operation owns the cache"),
+        }
+    }
+
+    #[test]
+    fn operation_without_ownership_ends_without_losing_write_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation = OperationScope::as_is(&rearview(directory.path()), Arc::default());
+        operation.acquire_access().unwrap();
+
+        let end = operation.finish();
+
+        assert!(end.low_space.is_none(), "no write found low space: {end:?}");
+        assert!(
+            !end.lost_write_permission,
+            "an operation without ownership doesn't lose a write permission it never had"
+        );
+    }
+
+    #[test]
+    fn owner_whose_batch_committed_ends_with_write_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation = operation(&rearview(directory.path()));
+        owner_token(&operation).write_batch(|| ()).unwrap();
+
+        let end = operation.finish();
+
+        assert!(
+            !end.lost_write_permission,
+            "a committed batch keeps the write permission"
+        );
+        assert!(end.fail_if_low_space().is_ok(), "the drive has room");
+    }
+
+    #[test]
+    fn owner_whose_write_permission_was_revoked_ends_without_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let operation = operation(&rearview(directory.path()));
+        owner_token(&operation).revoke();
+
+        let end = operation.finish();
+
+        assert!(
+            end.lost_write_permission,
+            "a revoked owner ends without its write permission"
+        );
+    }
+
+    #[test]
+    fn owner_whose_ownership_another_rearview_took_over_ends_without_write_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = rearview(directory.path());
+        let operation = operation(&base);
+        let token = owner_token(&operation);
+        let _replacement = replace_owner(&base);
+        token.write_batch(|| ()).unwrap_err();
+
+        let end = operation.finish();
+
+        assert!(
+            end.lost_write_permission,
+            "an owner whose ownership was taken over ends without its write permission"
+        );
+    }
+
+    #[test]
+    fn owner_whose_write_found_low_space_ends_failing_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let base =
+            rearview(directory.path()).with_disk_space(Arc::new(DriveRunningOut::after(0, || {})));
+        let operation = operation(&base);
+        let writer = SqliteCache::open_for_refresh(&owner_token(&operation)).unwrap();
+        let stored = writer.store_semantic_routes(&[]);
+        assert!(
+            matches!(stored, Err(AppError::SessionCacheLowSpace { .. })),
+            "the write finds the drive low on space: {stored:?}"
+        );
+        drop(writer);
+
+        let end = operation.finish();
+
+        assert!(
+            end.lost_write_permission,
+            "low space revokes the owner's write permission"
+        );
+        assert!(
+            matches!(
+                end.fail_if_low_space(),
+                Err(AppError::SessionCacheLowSpace { .. })
+            ),
+            "the operation ends failing with the low-space error"
+        );
+    }
+}

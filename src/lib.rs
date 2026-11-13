@@ -270,7 +270,7 @@ fn delete_session_by_id(environment: &history::Environment, session_id: &str) ->
             history::provider::delete_session(permit, source, &path)?,
         ))
     })??;
-    operation.finish()?;
+    operation.finish().fail_if_low_space()?;
     eprintln!("{}", deletion_report(source, session_id, deleted));
     Ok(())
 }
@@ -597,7 +597,7 @@ fn run_with(
         operation.wait_to_parse_as_owner(|permit| {
             dropped_records_cli::print_report(permit, &conversations)
         })?;
-        operation.finish()?;
+        operation.finish().fail_if_low_space()?;
         return Ok(());
     }
 
