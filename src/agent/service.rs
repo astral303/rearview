@@ -297,7 +297,7 @@ impl SessionSelection {
     ///
     /// The stale sessions are collected before the window applies: a session
     /// whose copy ends before the window starts doesn't have a row in it, and
-    /// the record names it. The scope, the excluded projects and the current session
+    /// the record reports it. The scope, the excluded projects and the current session
     /// leave it out.
     fn from_loaded(
         loaded: LoadedSessions,
@@ -812,12 +812,20 @@ impl AgentService {
         }
     }
 
-    /// `warnings` and the `stale-cache` record of the stale sessions the
-    /// command has met. Empties those sessions, so a second render does not
-    /// name them again.
-    fn with_stale_cache_record(&self, mut warnings: Vec<AgentWarning>) -> Vec<AgentWarning> {
+    /// `warnings` and the `stale-cache` record of the command's stale
+    /// sessions, for `output`. Empties those sessions, so a second render
+    /// does not name them again.
+    ///
+    /// The page of `agent sessions` and the hits of `agent search` decide
+    /// which sessions the output shows before the budget fits them: a
+    /// session the budget then drops stays named.
+    fn with_stale_cache_record(
+        &self,
+        mut warnings: Vec<AgentWarning>,
+        output: &dyn ShowsSessions,
+    ) -> Vec<AgentWarning> {
         let coverage = self.stale_coverage.borrow_mut().take();
-        warnings.extend(coverage.and_then(|coverage| coverage.record(self.clock().zone())));
+        warnings.extend(coverage.and_then(|coverage| coverage.record(self.clock().zone(), output)));
         warnings
     }
 
@@ -1457,7 +1465,7 @@ impl AgentService {
                 let run = search_transcripts(&request)?;
                 let mut output = run.output;
                 apply_configured_render_policy(&mut output, &agent_config);
-                let warnings = self.with_stale_cache_record(warnings.into_inner());
+                let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
                 Ok(perf.time(Stage::Render, || {
                     agent::search::format_agent_output_with_warnings(
                         &output,
@@ -1480,7 +1488,7 @@ impl AgentService {
                 apply_configured_render_policy(&mut output, &agent_config);
                 let mut warnings = warnings.into_inner();
                 warnings.extend(semantic_warnings);
-                let warnings = self.with_stale_cache_record(warnings);
+                let warnings = self.with_stale_cache_record(warnings, &output);
                 Ok(perf.time(Stage::Render, || {
                     agent::search::format_agent_output_with_warnings(
                         &output,
@@ -1541,7 +1549,7 @@ impl AgentService {
                     }
                 };
                 apply_configured_render_policy(&mut output, &agent_config);
-                let warnings = self.with_stale_cache_record(warnings.into_inner());
+                let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
                 Ok(perf.time(Stage::Render, || {
                     agent::search::format_agent_output_with_warnings(
                         &output,
@@ -1585,13 +1593,14 @@ impl AgentService {
             &agent_config,
         );
         let mut selection = self.select_sessions(&rules)?;
-        let warnings = self.with_stale_cache_record(std::mem::take(&mut selection.warnings));
         self.perf.time(Stage::Render, || {
             let listing = selection.listing(
                 &rules.window,
                 args.offset,
                 args.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT),
             )?;
+            let warnings =
+                self.with_stale_cache_record(std::mem::take(&mut selection.warnings), &listing);
             Ok(agent::sessions::format_sessions_with_warnings(
                 &listing,
                 configured_budget(args.no_budget, args.budget, agent_config.output_chars),
@@ -1707,7 +1716,7 @@ impl AgentService {
                 },
             })
         })?;
-        let warnings = self.with_stale_cache_record(warnings);
+        let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
         let rendered = perf.time(Stage::Render, || {
             agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
             apply_configured_render_policy(&mut output, &agent_config);
@@ -2284,31 +2293,82 @@ impl StaleCoverage {
         }
     }
 
-    /// The `stale-cache` record, its `cached-until` the earliest copy's end
-    /// in `zone`; `None` without a session.
-    fn record(&self, zone: Zone) -> Option<AgentWarning> {
-        let references: Vec<String> = self
+    /// The `stale-cache` record for `output`, `None` without a session. It
+    /// names the sessions `output` shows, and the sessions it leaves out
+    /// while there are at most [`LEFT_OUT_SESSIONS_NAMED_UP_TO`]; beyond
+    /// that, `omitted-sessions=` counts the ones it leaves out.
+    /// `cached-until` is the earliest end, in `zone`, of the named sessions'
+    /// copies.
+    fn record(&self, zone: Zone, output: &dyn ShowsSessions) -> Option<AgentWarning> {
+        let shown: Vec<bool> = self
             .sessions
+            .iter()
+            .map(|(reference, _)| output.shows_session(reference))
+            .collect();
+        let left_out = shown.iter().filter(|is_shown| !**is_shown).count();
+        let names_left_out = left_out <= LEFT_OUT_SESSIONS_NAMED_UP_TO;
+        let named: Vec<_> = self
+            .sessions
+            .iter()
+            .zip(&shown)
+            .filter(|(_, is_shown)| names_left_out || **is_shown)
+            .map(|(session, _)| session)
+            .collect();
+        let references: Vec<String> = named
             .iter()
             .map(|(reference, _)| reference.clone())
             .collect();
-        let earliest_end = self
-            .sessions
+        let earliest_end = named
             .iter()
             .filter_map(|(_, cached_until)| *cached_until)
             .min();
-        (!references.is_empty()).then(|| {
-            AgentWarning::stale_cache(
-                &references,
-                earliest_end.map(|end| end.with_timezone(&zone)),
-                self.cause,
-            )
-        })
+        AgentWarning::stale_cache(
+            &references,
+            earliest_end.map(|end| end.with_timezone(&zone)),
+            if names_left_out { 0 } else { left_out },
+            self.cause,
+        )
+    }
+}
+
+/// A `stale-cache` record names at most this many stale sessions the output
+/// leaves out; more refs would use the output's budget. `agent read <ref>`
+/// of a named one waits for the other refresh when the session is uncached,
+/// and reads a cached copy that is out of date at once, with its own
+/// `stale-cache` record.
+const LEFT_OUT_SESSIONS_NAMED_UP_TO: usize = 8;
+
+trait ShowsSessions {
+    fn shows_session(&self, reference: &str) -> bool;
+}
+
+impl ShowsSessions for agent::sessions::SessionListing {
+    fn shows_session(&self, reference: &str) -> bool {
+        self.sessions
+            .iter()
+            .any(|session| session.reference == reference)
+    }
+}
+
+impl ShowsSessions for agent::search::AgentSearchOutput {
+    fn shows_session(&self, reference: &str) -> bool {
+        self.every_hit()
+            .any(|hit| hit.conversation_ref == reference)
+    }
+}
+
+/// The sessions `read`, `outline` and `within` show: every one they read,
+/// each a target the command was given.
+struct CommandTargets;
+
+impl ShowsSessions for CommandTargets {
+    fn shows_session(&self, _reference: &str) -> bool {
+        true
     }
 }
 
 /// Warnings for `keys` without a row, and for rows with malformed lines. A
-/// key in `stale_paths` doesn't get one: the stale-cache record names it. A key
+/// key in `stale_paths` doesn't get one: the stale-cache record reports it. A key
 /// without a row gets its warning from `unlisted_warnings`, by transcript
 /// path; a key missing there joins the command's stale sessions, with
 /// `operation`'s cause.
@@ -3587,7 +3647,7 @@ impl AgentService {
                 transcript_warning(transcript, &resolved.reference.canonical())
             },
         ));
-        let warnings = self.with_stale_cache_record(warnings);
+        let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
         let output = perf
             .time(Stage::Render, || {
                 agent::protocol::format_read_with_warnings(
@@ -3647,7 +3707,7 @@ impl AgentService {
             &transcript,
             &resolved.reference.canonical(),
         ));
-        let warnings = self.with_stale_cache_record(warnings);
+        let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
         let request = agent::protocol::ReadRequest {
             resolved: &resolved,
             transcript: &transcript,
@@ -4391,7 +4451,7 @@ mod tests {
             )
             .unwrap();
             let mut warnings = selection.warnings.clone();
-            warnings.extend(stale_coverage.record(Zone::System));
+            warnings.extend(stale_coverage.record(Zone::System, &CommandTargets));
             agent::sessions::format_sessions_with_warnings(
                 &selection.listing(&rules.window, 0, 10).unwrap(),
                 None,
@@ -4430,10 +4490,13 @@ mod tests {
         cache_base: tempfile::TempDir,
         changed: PathBuf,
         storage: &'static dyn history::provider::SessionStorage,
+        new_sessions_written: std::cell::Cell<usize>,
     }
 
     const CHANGED_SESSION: &str = "0f000000-0000-4000-8000-000000000001";
     const OTHER_SESSION: &str = "0f000000-0000-4000-8000-000000000002";
+    /// The last group of the first new session's ID, as a number.
+    const FIRST_NEW_SESSION_NUMBER: usize = 3;
 
     impl CachedClaudeSessions {
         fn new() -> Self {
@@ -4461,23 +4524,76 @@ mod tests {
                 cache_base,
                 changed,
                 storage,
+                new_sessions_written: std::cell::Cell::new(0),
             }
         }
 
         /// Append a question at 06:40 UTC to `CHANGED_SESSION`.
         fn append_to_the_changed_session(&self) {
+            self.append_question_to(&self.changed);
+        }
+
+        /// Append a question at 06:40 UTC to the session at `transcript`.
+        fn append_question_to(&self, transcript: &Path) {
             let question = serde_json::json!({
                 "type": "user", "timestamp": "2026-07-26T06:40:00.000Z",
                 "cwd": self.directory.path(), "message": {"role": "user", "content": "one more"}
             });
-            let mut transcript = std::fs::read_to_string(&self.changed).unwrap();
-            transcript.push_str(&format!("{question}\n"));
-            std::fs::write(&self.changed, transcript).unwrap();
+            let mut text = std::fs::read_to_string(transcript).unwrap();
+            text.push_str(&format!("{question}\n"));
+            std::fs::write(transcript, text).unwrap();
+        }
+
+        /// Write `count` more sessions after the cache's load, each a
+        /// question at 06:45, and return their IDs.
+        fn write_new_sessions(&self, count: usize) -> Vec<String> {
+            let written = self.new_sessions_written.get();
+            self.new_sessions_written.set(written + count);
+            let session_ids: Vec<String> = (written..written + count)
+                .map(|index| {
+                    format!(
+                        "0f000000-0000-4000-8000-{:012}",
+                        FIRST_NEW_SESSION_NUMBER + index
+                    )
+                })
+                .collect();
+            for session_id in &session_ids {
+                let user = serde_json::json!({
+                    "type": "user", "timestamp": "2026-07-26T06:45:00.000Z",
+                    "cwd": self.directory.path(), "message": {"role": "user", "content": "new"}
+                });
+                std::fs::write(self.transcript_of(session_id), format!("{user}\n")).unwrap();
+            }
+            session_ids
+        }
+
+        /// The transcript of the session `session_id` names.
+        fn transcript_of(&self, session_id: &str) -> PathBuf {
+            self.changed.with_file_name(format!("{session_id}.jsonl"))
+        }
+
+        /// Cache every session written so far.
+        fn cache_sessions(&self) {
+            load_through(
+                self.storage,
+                self.cache_base.path(),
+                history::provider::LeftOutRows::NONE,
+            );
+        }
+
+        /// The references of the sessions `session_ids` name.
+        fn references_of(&self, session_ids: &[String]) -> Vec<String> {
+            let selection =
+                self.select_beside_another_refresh(&every_session_in(TimeFilter::default()));
+            session_ids
+                .iter()
+                .map(|session_id| reference_of(&selection, session_id))
+                .collect()
         }
 
         /// The selection `rules` make while another rearview owns the
         /// cache's refresh, its warnings ending with the `stale-cache` record
-        /// the command prints.
+        /// naming every stale session.
         fn select_beside_another_refresh(&self, rules: &SelectionRules) -> SessionSelection {
             self.select_from_sessions_beside_another_refresh(rules, Vec::new())
         }
@@ -4509,7 +4625,7 @@ mod tests {
             drop(other_refresh);
             selection
                 .warnings
-                .extend(stale_coverage.record(environment.clock().zone()));
+                .extend(stale_coverage.record(environment.clock().zone(), &CommandTargets));
             selection
         }
     }
@@ -4571,22 +4687,12 @@ mod tests {
         );
     }
 
-    /// An uncached session counts as changed, and its record leaves out
+    /// An uncached session counts as changed. A record naming it leaves out
     /// `cached-until`.
     #[test]
     fn selection_beside_another_refresh_names_uncached_session_without_cached_until() {
         let sessions = CachedClaudeSessions::new();
-        let claude_folder = sessions.changed.parent().unwrap();
-        let new_session = "0f000000-0000-4000-8000-000000000003";
-        let user = serde_json::json!({
-            "type": "user", "timestamp": "2026-07-26T06:45:00.000Z",
-            "cwd": sessions.directory.path(), "message": {"role": "user", "content": "new"}
-        });
-        std::fs::write(
-            claude_folder.join(format!("{new_session}.jsonl")),
-            format!("{user}\n"),
-        )
-        .unwrap();
+        let uncached = sessions.write_new_sessions(1);
 
         let selection =
             sessions.select_beside_another_refresh(&every_session_in(TimeFilter::default()));
@@ -4595,7 +4701,7 @@ mod tests {
             warning_records(&selection.warnings),
             [format!(
                 "protocol agent-warning stale-cache refs={} : {STALE_CACHE_SENTENCE}\n",
-                reference_of(&selection, new_session)
+                reference_of(&selection, &uncached[0])
             )]
         );
     }
@@ -4764,8 +4870,7 @@ mod tests {
 
         /// The transcript of `OTHER_SESSION`.
         fn other(&self) -> PathBuf {
-            self.changed
-                .with_file_name(format!("{OTHER_SESSION}.jsonl"))
+            self.transcript_of(OTHER_SESSION)
         }
 
         /// Start a sub-agent of the session at `transcript` after the session
@@ -4845,7 +4950,12 @@ mod tests {
                     .chain(window_args.iter().map(String::as_str))
                     .collect();
                 let output = sessions.run_beside_another_refresh(&args);
-                if output.contains(&record) != *warns {
+                let is_right = if *warns {
+                    output.contains(&record)
+                } else {
+                    !output.contains("stale-cache")
+                };
+                if !is_right {
                     wrong.push(format!(
                         "{command} with {window}: expected the record {}; got:\n{output}",
                         if *warns { "present" } else { "absent" }
@@ -4854,6 +4964,139 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// `CHANGED_SESSION`'s `stale-cache` record when it also names
+    /// `left_out`, references of stale sessions the output leaves out.
+    fn record_naming_changed_session_and(reference: &str, left_out: &[String]) -> String {
+        let references: Vec<&str> = std::iter::once(reference)
+            .chain(left_out.iter().map(String::as_str))
+            .collect();
+        changed_session_record(&references.join(","))
+    }
+
+    /// The `stale-cache` record that counts `count` sessions the output
+    /// leaves out and doesn't name any.
+    fn record_counting(count: usize) -> String {
+        format!(
+            "protocol agent-warning stale-cache omitted-sessions={count} : {STALE_CACHE_SENTENCE}\n"
+        )
+    }
+
+    /// Both commands show `CHANGED_SESSION` and leave out the new sessions,
+    /// which are uncached.
+    #[test]
+    fn sessions_and_search_name_eight_left_out_uncached_sessions_and_count_nine() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        sessions.append_to_the_changed_session();
+        let outputs_without = |record: &str| -> Vec<String> {
+            [&["sessions", "--all"][..], &["search", "question", "--all"]]
+                .into_iter()
+                .filter_map(|args| {
+                    let output = sessions.run_beside_another_refresh(args);
+                    (!output.contains(record)).then(|| format!("{}:\n{output}", args[0]))
+                })
+                .collect()
+        };
+
+        let uncached = sessions.references_of(&sessions.write_new_sessions(8));
+        let names_eight = record_naming_changed_session_and(&reference, &uncached);
+        let wrong_with_eight = outputs_without(&names_eight);
+        sessions.write_new_sessions(1);
+        let counts_nine =
+            changed_session_record(&reference).replace(" : ", " omitted-sessions=9 : ");
+        let wrong_with_nine = outputs_without(&counts_nine);
+
+        assert!(
+            wrong_with_eight.is_empty(),
+            "each command names the eight sessions it leaves out:\n{names_eight}{}",
+            wrong_with_eight.join("\n")
+        );
+        assert!(
+            wrong_with_nine.is_empty(),
+            "each command names the changed session and counts the nine it leaves out:\n{counts_nine}{}",
+            wrong_with_nine.join("\n")
+        );
+    }
+
+    /// A page of one session shows `OTHER_SESSION`, the newest by its cached
+    /// copy, and leaves out `CHANGED_SESSION` and the new sessions.
+    #[test]
+    fn page_names_eight_left_out_stale_sessions_and_counts_nine() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        sessions.append_to_the_changed_session();
+        let first_page = ["sessions", "--all", "--limit", "1"];
+        let uncached = sessions.references_of(&sessions.write_new_sessions(7));
+
+        let eight_left_out = sessions.run_beside_another_refresh(&first_page);
+        sessions.write_new_sessions(1);
+        let nine_left_out = sessions.run_beside_another_refresh(&first_page);
+
+        let named = record_naming_changed_session_and(&reference, &uncached);
+        assert!(
+            eight_left_out.contains(&named),
+            "the record names the eight sessions the page leaves out:\n{named}{eight_left_out}"
+        );
+        assert!(
+            nine_left_out.contains(&record_counting(9)),
+            "the record counts the nine sessions the page leaves out:\n{nine_left_out}"
+        );
+    }
+
+    /// Nine targets are more than a record names when the output leaves them
+    /// out.
+    #[test]
+    fn read_names_nine_stale_targets() {
+        let sessions = CachedClaudeSessions::new();
+        let session_ids: Vec<String> = [CHANGED_SESSION, OTHER_SESSION]
+            .map(String::from)
+            .into_iter()
+            .chain(sessions.write_new_sessions(7))
+            .collect();
+        sessions.cache_sessions();
+        for session_id in &session_ids {
+            sessions.append_question_to(&sessions.transcript_of(session_id));
+        }
+        let references = sessions.references_of(&session_ids);
+        let args: Vec<&str> = std::iter::once("read")
+            .chain(references.iter().map(String::as_str))
+            .collect();
+
+        let output = sessions.run_beside_another_refresh(&args);
+
+        let record = changed_session_record(&references.join(","));
+        assert!(
+            output.contains(&record),
+            "the record names every target:\n{record}{output}"
+        );
+    }
+
+    /// A `stale-cache` record naming sixty refs is longer than the budget.
+    #[test]
+    fn sessions_and_search_beside_refresh_of_sixty_uncached_sessions_fit_budget() {
+        let sessions = CachedClaudeSessions::new();
+        sessions.write_new_sessions(60);
+
+        let mut wrong = Vec::new();
+        for args in [
+            &["sessions", "--all", "--budget", "1000"][..],
+            &["search", "question", "--all", "--budget", "1000"],
+            &[
+                "search", "question", "--all", "--mode", "hybrid", "--budget", "1000",
+            ],
+        ] {
+            let output = sessions.run_beside_another_refresh(args);
+            if !output.ends_with(&record_counting(60)) {
+                wrong.push(format!("{args:?}:\n{output}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "each output is complete and ends with the count:\n{}",
+            wrong.join("\n")
+        );
     }
 
     /// The output of the agent command `args` over `storages` and the
@@ -6283,7 +6526,7 @@ mod tests {
             candidates, reads, ..
         } = semantic_candidates(&inputs).expect("the semantic stage reads the other session");
         let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
-        service.fuse_semantic_hits(
+        let (output, _) = service.fuse_semantic_hits(
             SemanticHalf {
                 ranked: RankedHits {
                     conversations: Vec::new(),
@@ -6304,7 +6547,7 @@ mod tests {
             "the other session alone is a candidate"
         );
         assert_eq!(
-            warning_records(&service.with_stale_cache_record(Vec::new())),
+            warning_records(&service.with_stale_cache_record(Vec::new(), &output)),
             [format!(
                 "protocol agent-warning stale-cache refs={reference} : {STALE_CACHE_SENTENCE}\n"
             )],
@@ -6397,7 +6640,7 @@ mod tests {
                 failed_reads.is_empty(),
                 "{case}: every anchor read succeeds: {failed_reads:?}"
             );
-            let records = warning_records(&service.with_stale_cache_record(Vec::new()));
+            let records = warning_records(&service.with_stale_cache_record(Vec::new(), &output));
 
             let changed = renumbers || lexical_reads_another_copy;
             let hits = output.every_hit().collect::<Vec<_>>();
