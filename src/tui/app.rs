@@ -191,9 +191,8 @@ pub struct App {
     /// The time window the list loaded under: a session new to the list joins
     /// it only with a message inside the window
     list_window: TimeFilter,
-    /// The session the selection stays on while search results arrive after
-    /// a refresh; any key or click clears it
-    selection_anchor: Option<PathBuf>,
+    /// The session the selection stays on while the rows change
+    selection_anchor: Option<list_state::SelectionAnchor>,
     /// The clipboard that copy keys and clipboard export write to.
     clipboard_writer: ClipboardWriter,
     /// A provider's `fork` declaration when it is known without reading:
@@ -627,6 +626,7 @@ impl App {
         self.filtered = (0..self.conversations.len())
             .filter(|&index| shown.contains(&self.conversations[index].path))
             .collect();
+        self.select_anchor_or_first();
 
         self.rebuild_conversations_snapshot();
 
@@ -1047,8 +1047,8 @@ impl App {
         let relative_idx = relative_row / lines_per_item;
         let new_idx = offset + relative_idx;
         if relative_idx < items_per_page && new_idx < self.filtered.len() {
-            self.selected = Some(new_idx);
-            self.selection_anchor = None;
+            self.clear_selection_anchor_on_loaded_list();
+            self.click_row(new_idx);
             true
         } else {
             false

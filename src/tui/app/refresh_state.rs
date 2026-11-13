@@ -3,6 +3,7 @@
 //! the sessions that asked for one, to read again and cache. Each outcome
 //! is applied through [`App::apply_finished_refresh`].
 
+use super::list_state::SelectionAnchor;
 use super::session_store::{
     AWAITED_REFRESH_CHECK_INTERVAL, FinishedRead, FinishedRefresh, SessionCopy, UnlistedSession,
 };
@@ -765,7 +766,7 @@ impl App {
             .iter()
             .filter_map(|&old| new_index_of_old.get(old).copied().flatten())
             .collect();
-        self.selection_anchor = selected_path;
+        self.selection_anchor = selected_path.map(SelectionAnchor::Kept);
         self.select_anchor_or_first();
         self.rerun_query();
     }

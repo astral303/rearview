@@ -1,3 +1,4 @@
+use super::list_state::SelectionAnchor;
 use super::session_store::SessionCopy;
 use super::view_state::DeferredCopy;
 use super::{Action, App, AppMode, DialogMode};
@@ -248,7 +249,7 @@ impl App {
         self.set_status("Session renamed".to_string());
         self.refresh_search_data();
         // The search results arrive later; they keep the renamed row selected.
-        self.selection_anchor = Some(path.clone());
+        self.selection_anchor = Some(SelectionAnchor::Kept(path.clone()));
         self.update_filter();
         if let Some(new_selected) = self
             .filtered

@@ -562,3 +562,130 @@ fn failed_read_counts_as_unreadable_keeps_its_cause_and_is_read_again_when_rows_
     );
     assert_eq!(found(&rows, &texts, "needle"), ["a"]);
 }
+
+/// A list loading a home's sessions, newest first, whose search reads no
+/// session's texts until [`Self::read_texts`].
+struct ListWithTextReadsHeld {
+    app: super::App,
+    gate: super::test_waits::ConnectionGate,
+    _cache: tempfile::TempDir,
+}
+
+impl ListWithTextReadsHeld {
+    fn loading(home: &ClaudeHome) -> Self {
+        let (cache, environment) = caching_environment(home);
+        let rows = cached_rows(home, &environment);
+        let gate =
+            super::test_waits::ConnectionGate::closed(environment.cache_base().path(), |thread| {
+                thread.name() == Some("search-text-reader")
+            });
+        let mut app = super::App::new_loading_with_options(
+            super::ToolDisplayMode::Hidden,
+            false,
+            crate::config::KeyBindings::default(),
+            super::ListScope::default(),
+            super::TuiSearchOptions::default(),
+            environment,
+        );
+        app.append_conversations(rows);
+        Self {
+            app,
+            gate,
+            _cache: cache,
+        }
+    }
+
+    fn press(&mut self, code: crossterm::event::KeyCode) {
+        self.app
+            .handle_key(code, crossterm::event::KeyModifiers::NONE, 10);
+    }
+
+    /// End the load and apply the first results after it, while no
+    /// session's texts are read.
+    fn finish_loading(&mut self) {
+        self.app.finish_loading();
+        receive_until(&mut self.app, |app| !app.has_search_work_in_flight());
+    }
+
+    /// Let the search read the sessions' texts, and apply results until
+    /// they list `rows` rows.
+    fn read_texts(&mut self, rows: usize) {
+        self.gate.open();
+        receive_until(&mut self.app, |app| app.filtered().len() == rows);
+    }
+}
+
+impl Drop for ListWithTextReadsHeld {
+    /// Opens the gate before the app drops: the app's text reader would
+    /// otherwise wait at it while a failed test drops the app.
+    fn drop(&mut self) {
+        self.gate.open();
+    }
+}
+
+#[test]
+fn selection_hidden_by_first_results_after_load_isnt_selected_when_texts_read_show_it() {
+    use super::refresh_tests::{listed_names, selected_name};
+    use crossterm::event::KeyCode;
+    let home = ClaudeHome::new();
+    home.write_in("-tmp-needle", "a", 10, &["hello"]);
+    home.write("b", 5, &["hello", "needle"]);
+    let mut list = ListWithTextReadsHeld::loading(&home);
+    list.press(KeyCode::Down);
+    assert_eq!(selected_name(&list.app), Some("b"));
+    "needle"
+        .chars()
+        .for_each(|character| list.press(KeyCode::Char(character)));
+
+    list.finish_loading();
+    assert_eq!(
+        listed_names(&list.app),
+        ["a"],
+        "the first results match a by its project alone"
+    );
+    list.read_texts(2);
+
+    assert_eq!(listed_names(&list.app), ["a", "b"]);
+    assert_eq!(
+        selected_name(&list.app),
+        Some("a"),
+        "the first row stays selected after the rerun"
+    );
+}
+
+#[test]
+fn selection_shown_by_first_results_after_load_stays_selected_when_texts_read_add_rows() {
+    use super::refresh_tests::{listed_names, selected_name};
+    use crossterm::event::KeyCode;
+    let home = ClaudeHome::new();
+    home.write("c", 20, &["hello", "needle"]);
+    home.write_in("-tmp-needle", "a", 10, &["hello"]);
+    home.write_in("-tmp-needle", "b", 5, &["hello"]);
+    let mut list = ListWithTextReadsHeld::loading(&home);
+    list.press(KeyCode::Down);
+    list.press(KeyCode::Down);
+    assert_eq!(selected_name(&list.app), Some("b"));
+    "needle"
+        .chars()
+        .for_each(|character| list.press(KeyCode::Char(character)));
+
+    list.finish_loading();
+    assert_eq!(
+        listed_names(&list.app),
+        ["a", "b"],
+        "the first results match a and b by their project alone"
+    );
+    assert_eq!(selected_name(&list.app), Some("b"));
+    list.read_texts(3);
+
+    assert_ne!(
+        listed_names(&list.app).first(),
+        Some(&"b"),
+        "b is not the first row after the rerun"
+    );
+    assert_eq!(
+        selected_name(&list.app),
+        Some("b"),
+        "the selection stays on b after the rerun"
+    );
+}

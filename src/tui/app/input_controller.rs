@@ -128,7 +128,7 @@ impl App {
         modifiers: KeyModifiers,
         viewport_height: usize,
     ) -> Option<Action> {
-        self.selection_anchor = None;
+        self.clear_selection_anchor_on_loaded_list();
         match self.dialog_mode {
             DialogMode::ConfirmDelete => return self.handle_confirm_key(code),
             DialogMode::ActionsMenu { .. } => {
@@ -426,56 +426,20 @@ impl App {
         modifiers: KeyModifiers,
         viewport_height: usize,
     ) -> Option<Action> {
-        // Ahead of the loading check: a refresh requested while the list
-        // loads runs when the load ends.
         if code == KeyCode::Char('r') && modifiers.contains(KeyModifiers::CONTROL) {
             return Some(Action::Refresh);
         }
-        // Also ahead of it, so the actions menu and the rename key show why
-        // rename and delete wait for the load.
         if let Some(action) = self.handle_session_key(code, modifiers) {
             return action;
         }
-        // Also ahead of it: open and select show that they are unavailable
-        // while the list loads.
         match code {
             KeyCode::Enter => {
                 self.request_open();
-                return None;
+                None
             }
             KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
-                return self.request_select();
+                self.request_select()
             }
-            _ => {}
-        }
-        if self.is_loading() {
-            return self.handle_common_list_key(code, modifiers, false);
-        }
-
-        match code {
-            KeyCode::Home => {
-                self.select_first();
-                None
-            }
-            KeyCode::End => {
-                self.select_last();
-                None
-            }
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_half_page_down(viewport_height);
-                None
-            }
-            _ => self.handle_common_list_key(code, modifiers, true),
-        }
-    }
-
-    fn handle_common_list_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-        dispatch_search: bool,
-    ) -> Option<Action> {
-        match code {
             KeyCode::Esc => {
                 if self.query.is_empty() {
                     Some(Action::Quit)
@@ -533,6 +497,18 @@ impl App {
                 self.select_page_down();
                 None
             }
+            KeyCode::Home => {
+                self.select_first();
+                None
+            }
+            KeyCode::End => {
+                self.select_last();
+                None
+            }
+            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_half_page_down(viewport_height);
+                None
+            }
             KeyCode::Tab => {
                 self.toggle_workspace_filter();
                 None
@@ -541,17 +517,20 @@ impl App {
                 self.dialog_mode = DialogMode::Help { scroll: 0 };
                 None
             }
-            _ if self.handle_list_query_edit_key(code, modifiers, dispatch_search) => None,
+            _ if self.handle_list_query_edit_key(code, modifiers) => None,
             _ => None,
         }
     }
 
-    fn handle_list_query_edit_key(
-        &mut self,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-        dispatch_search: bool,
-    ) -> bool {
+    /// Search the query the user edited. A query edited while the list loads
+    /// is searched when the load ends.
+    fn search_edited_query(&mut self) {
+        if !self.is_loading() {
+            self.dispatch_search();
+        }
+    }
+
+    fn handle_list_query_edit_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         let changed = match code {
             KeyCode::Char('?') => return false,
             KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -593,8 +572,8 @@ impl App {
             _ => return false,
         };
 
-        if changed && dispatch_search {
-            self.dispatch_search();
+        if changed {
+            self.search_edited_query();
         }
 
         true

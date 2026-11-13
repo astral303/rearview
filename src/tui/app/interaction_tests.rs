@@ -1,5 +1,7 @@
 use super::claude_home::{ClaudeHome, app_reading};
-use super::refresh_tests::{serve_list_change, serve_session_refresh, status_text};
+use super::refresh_tests::{
+    listed_names, selected_name, serve_list_change, serve_session_refresh, status_text,
+};
 use super::semantic_test_helpers::*;
 use super::*;
 use crate::config::KeyBinding;
@@ -775,16 +777,42 @@ fn ctrl_o_on_loaded_list_selects_selected_session() {
     );
 }
 
-fn app_loading_with_row(path: PathBuf) -> App {
-    let mut app = App::new_loading_with_options(
+fn app_loading() -> App {
+    App::new_loading_with_options(
         ToolDisplayMode::Hidden,
         false,
         KeyBindings::default(),
         ListScope::default(),
         TuiSearchOptions::default(),
         test_environment(Vec::new(), None),
-    );
+    )
+}
+
+fn app_loading_with_row(path: PathBuf) -> App {
+    let mut app = app_loading();
     app.append_conversations(vec![test_conversation(path, None)]);
+    assert!(app.is_loading());
+    app
+}
+
+/// The row of session `name`, titled with its name and active at `minute`
+/// past midnight.
+fn titled_row(name: &str, minute: u32) -> Conversation {
+    let path = PathBuf::from(format!("{name}.jsonl"));
+    let mut row = test_conversation(path, Some(name.to_owned()));
+    row.timestamp = Local.with_ymd_and_hms(2024, 1, 1, 0, minute, 0).unwrap();
+    row
+}
+
+/// A list loading the sessions `rows` names, in that order, each a
+/// [`titled_row`].
+fn app_loading_rows(rows: &[(&str, u32)]) -> App {
+    let mut app = app_loading();
+    app.append_conversations(
+        rows.iter()
+            .map(|&(name, minute)| titled_row(name, minute))
+            .collect(),
+    );
     assert!(app.is_loading());
     app
 }
@@ -872,6 +900,405 @@ fn letter_o_while_list_loads_types_into_list_query() {
 
     assert_eq!(app.query(), "o");
     assert_eq!(status_text(&app), None);
+}
+
+/// The rows of sessions `a` and `b`, both recorded in `workspace`.
+fn rows_in_workspace(workspace: &std::path::Path) -> Vec<Conversation> {
+    ["a", "b"]
+        .into_iter()
+        .map(|name| {
+            let mut row = test_conversation(PathBuf::from(format!("{name}.jsonl")), None);
+            row.cwd = Some(workspace.to_path_buf());
+            row
+        })
+        .collect()
+}
+
+#[test]
+fn esc_while_list_loads_after_session_id_search_shows_every_row() {
+    let workspace = std::path::Path::new("/tmp/project");
+    let mut app = app_loading();
+    app.workspace = Some(crate::history::workspace::tests::workspace_at_home(
+        workspace,
+    ));
+    app.append_conversations(rows_in_workspace(workspace));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('b'));
+    // The workspace filter searches the query at once, even while the list
+    // loads.
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(
+        app.filtered().len(),
+        1,
+        "the session ID search shows b alone"
+    );
+
+    press(&mut app, KeyCode::Esc);
+
+    assert_eq!(app.query(), "");
+    assert_eq!(app.filtered().len(), 2, "every row is shown again");
+    assert_eq!(
+        selected_name(&app),
+        Some("b"),
+        "the selection stays on b, the second row"
+    );
+}
+
+#[test]
+fn esc_on_loaded_list_after_session_id_search_shows_every_row() {
+    let mut app = app_listing(
+        rows_in_workspace(std::path::Path::new("/tmp/project")),
+        ToolDisplayMode::Hidden,
+    );
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(
+        app.filtered().len(),
+        1,
+        "the session ID search shows b alone"
+    );
+
+    press(&mut app, KeyCode::Esc);
+
+    assert_eq!(app.query(), "");
+    assert_eq!(app.filtered().len(), 2, "every row is shown again");
+}
+
+#[test]
+fn first_row_last_row_and_half_page_down_move_selection_while_list_loads() {
+    let mut app = app_loading_rows(&[
+        ("a", 0),
+        ("b", 1),
+        ("c", 2),
+        ("d", 3),
+        ("e", 4),
+        ("f", 5),
+        ("g", 6),
+        ("h", 7),
+    ]);
+
+    // `press_with` passes a ten-line viewport: half a page is five rows.
+    press_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(
+        app.selected(),
+        Some(5),
+        "half page down (`Ctrl+D`) moves half the viewport's lines"
+    );
+
+    press_with(&mut app, KeyCode::End, KeyModifiers::empty());
+    assert_eq!(
+        app.selected(),
+        Some(7),
+        "last row (`End`) selects the last row"
+    );
+
+    press_with(&mut app, KeyCode::Home, KeyModifiers::empty());
+    assert_eq!(
+        app.selected(),
+        Some(0),
+        "first row (`Home`) selects the first row"
+    );
+    assert_eq!(app.query(), "", "none of the keys types into the query");
+}
+
+/// Sessions in the order a load lists them, the newest (`d`) third. The
+/// tests select the first, second and last rows; none of them is first after
+/// the load's end sorts the rows.
+const LOAD_ORDER: [(&str, u32); 4] = [("a", 1), ("b", 2), ("d", 4), ("c", 3)];
+
+fn press_keys(app: &mut App, keys: &[(KeyCode, KeyModifiers)]) {
+    for &(code, modifiers) in keys {
+        press_with(app, code, modifiers);
+    }
+}
+
+fn type_query(app: &mut App, text: &str) {
+    for character in text.chars() {
+        press(app, KeyCode::Char(character));
+    }
+}
+
+#[test]
+fn row_selected_while_list_loads_stays_selected_after_load_end() {
+    const NONE: KeyModifiers = KeyModifiers::empty();
+    const CONTROL: KeyModifiers = KeyModifiers::CONTROL;
+    type Selection = fn(&mut App);
+    let cases: [(&str, Selection, &str); 11] = [
+        ("Down", |app| press_keys(app, &[(KeyCode::Down, NONE)]), "b"),
+        (
+            "Ctrl+N",
+            |app| press_keys(app, &[(KeyCode::Char('n'), CONTROL)]),
+            "b",
+        ),
+        (
+            "Up",
+            |app| {
+                press_keys(
+                    app,
+                    &[
+                        (KeyCode::Down, NONE),
+                        (KeyCode::Down, NONE),
+                        (KeyCode::Up, NONE),
+                    ],
+                )
+            },
+            "b",
+        ),
+        (
+            "Ctrl+P",
+            |app| {
+                press_keys(
+                    app,
+                    &[
+                        (KeyCode::Down, NONE),
+                        (KeyCode::Down, NONE),
+                        (KeyCode::Char('p'), CONTROL),
+                    ],
+                )
+            },
+            "b",
+        ),
+        (
+            "PgDn",
+            |app| press_keys(app, &[(KeyCode::PageDown, NONE)]),
+            "c",
+        ),
+        (
+            "PgUp",
+            |app| press_keys(app, &[(KeyCode::End, NONE), (KeyCode::PageUp, NONE)]),
+            "a",
+        ),
+        ("End", |app| press_keys(app, &[(KeyCode::End, NONE)]), "c"),
+        (
+            "Home",
+            |app| press_keys(app, &[(KeyCode::End, NONE), (KeyCode::Home, NONE)]),
+            "a",
+        ),
+        (
+            "Ctrl+D",
+            |app| press_keys(app, &[(KeyCode::Char('d'), CONTROL)]),
+            "c",
+        ),
+        ("wheel", |app| app.scroll_mouse(1, 17), "b"),
+        (
+            "click",
+            |app| {
+                let second_row = 6;
+                assert!(app.handle_list_click(second_row, Rect::new(0, 0, 80, 17)));
+            },
+            "b",
+        ),
+    ];
+    for (input, select, selected) in cases {
+        let mut app = app_loading_rows(&LOAD_ORDER);
+        select(&mut app);
+        assert_eq!(
+            selected_name(&app),
+            Some(selected),
+            "{input} selects {selected}"
+        );
+
+        app.finish_loading();
+
+        assert_eq!(listed_names(&app), ["d", "c", "b", "a"]);
+        assert_eq!(
+            selected_name(&app),
+            Some(selected),
+            "{selected}, selected by {input} while the list loads, stays selected after the load's end"
+        );
+    }
+}
+
+#[test]
+fn input_leaving_selection_on_its_row_while_list_loads_doesnt_keep_it_after_load_end() {
+    type Input = fn(&mut App);
+    // A list of one row: its first row is its last.
+    let cases: [(&str, Input); 4] = [
+        ("Up", |app| press(app, KeyCode::Up)),
+        ("wheel up", |app| app.scroll_mouse(-1, 17)),
+        ("Down", |app| press(app, KeyCode::Down)),
+        ("wheel down", |app| app.scroll_mouse(1, 17)),
+    ];
+    for (input, leave_selection) in cases {
+        let mut app = app_loading_rows(&[("a", 1)]);
+        leave_selection(&mut app);
+        app.append_conversations(vec![titled_row("d", 4)]);
+
+        app.finish_loading();
+
+        assert_eq!(
+            selected_name(&app),
+            Some("d"),
+            "after {input} on the only row while the list loads, the newest row is selected"
+        );
+    }
+}
+
+#[test]
+fn click_on_selected_row_while_list_loads_keeps_it_selected_after_load_end() {
+    let mut app = app_loading_rows(&LOAD_ORDER);
+    assert_eq!(selected_name(&app), Some("a"));
+    let first_row = 3;
+
+    assert!(app.handle_list_click(first_row, Rect::new(0, 0, 80, 17)));
+    app.finish_loading();
+
+    assert_eq!(listed_names(&app), ["d", "c", "b", "a"]);
+    assert_eq!(
+        selected_name(&app),
+        Some("a"),
+        "the click chose a, so a stays selected after the load's end"
+    );
+}
+
+#[test]
+fn untouched_loading_list_selects_newest_row_after_load_end() {
+    let mut app = app_loading_rows(&LOAD_ORDER);
+
+    app.finish_loading();
+
+    assert_eq!(selected_name(&app), Some("d"), "the newest row is selected");
+}
+
+#[test]
+fn selection_matching_query_typed_while_list_loads_stays_selected_after_its_search() {
+    let mut app = app_loading_rows(&[("a", 1), ("needle-b", 2), ("needle-d", 4), ("c", 3)]);
+    press(&mut app, KeyCode::Down);
+    type_query(&mut app, "needle");
+
+    app.finish_loading();
+    assert_eq!(
+        selected_name(&app),
+        Some("needle-b"),
+        "the selection stays while the query's search runs"
+    );
+    app.settle_search_for_test();
+
+    assert_eq!(listed_names(&app), ["needle-d", "needle-b"]);
+    assert_eq!(
+        selected_name(&app),
+        Some("needle-b"),
+        "the selection stays among the query's results"
+    );
+}
+
+#[test]
+fn selection_hidden_by_query_typed_while_list_loads_leaves_first_result_selected() {
+    let mut app = app_loading_rows(&[("needle-a", 1), ("b", 2), ("needle-d", 4), ("c", 3)]);
+    press(&mut app, KeyCode::Down);
+    type_query(&mut app, "needle");
+
+    app.finish_loading();
+    app.settle_search_for_test();
+
+    assert_eq!(listed_names(&app), ["needle-d", "needle-a"]);
+    assert_eq!(
+        selected_name(&app),
+        Some("needle-d"),
+        "the first result is selected"
+    );
+}
+
+/// A list loading `rows`, each in the workspace when named in `in_workspace`,
+/// with a workspace the user can turn the filter on for.
+fn app_loading_rows_in_workspace(rows: &[(&str, u32)], in_workspace: &[&str]) -> App {
+    let workspace = std::path::Path::new("/tmp/project");
+    let mut app = app_loading();
+    app.workspace = Some(crate::history::workspace::tests::workspace_at_home(
+        workspace,
+    ));
+    app.append_conversations(
+        rows.iter()
+            .map(|&(name, minute)| {
+                let mut row = titled_row(name, minute);
+                row.cwd = Some(if in_workspace.contains(&name) {
+                    workspace.to_path_buf()
+                } else {
+                    PathBuf::from("/tmp/elsewhere")
+                });
+                row
+            })
+            .collect(),
+    );
+    app
+}
+
+#[test]
+fn selection_hidden_by_workspace_filter_turned_on_while_list_loads_leaves_first_row_selected() {
+    let mut app = app_loading_rows_in_workspace(&LOAD_ORDER, &["a", "d", "c"]);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(selected_name(&app), Some("b"));
+
+    press(&mut app, KeyCode::Tab);
+    app.finish_loading();
+
+    assert_eq!(listed_names(&app), ["d", "c", "a"]);
+    assert_eq!(selected_name(&app), Some("d"), "the first row is selected");
+}
+
+#[test]
+fn workspace_filter_turned_on_then_off_while_list_loads_selects_hidden_selection_again() {
+    let mut app = app_loading_rows_in_workspace(&LOAD_ORDER, &["a", "d", "c"]);
+    press(&mut app, KeyCode::Down);
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(selected_name(&app), Some("a"), "b is hidden");
+    press(&mut app, KeyCode::Tab);
+
+    assert!(app.is_loading());
+    assert_eq!(
+        selected_name(&app),
+        Some("b"),
+        "the selection is on b again once the filter shows it"
+    );
+}
+
+#[test]
+fn selection_stays_when_workspace_filter_turned_on_while_list_loads_shows_it() {
+    let mut app = app_loading_rows_in_workspace(&LOAD_ORDER, &["a", "b", "d"]);
+    press(&mut app, KeyCode::Down);
+
+    press(&mut app, KeyCode::Tab);
+    app.finish_loading();
+
+    assert_eq!(listed_names(&app), ["d", "b", "a"]);
+    assert_eq!(
+        selected_name(&app),
+        Some("b"),
+        "the selection stays on b after the load's end"
+    );
+}
+
+#[test]
+fn first_result_is_selected_after_selection_moved_on_loaded_list_while_search_runs() {
+    type Selection = fn(&mut App);
+    let cases: [(&str, Selection); 3] = [
+        ("Down", |app| press(app, KeyCode::Down)),
+        ("wheel", |app| app.scroll_mouse(1, 17)),
+        ("click", |app| {
+            let second_row = 6;
+            assert!(app.handle_list_click(second_row, Rect::new(0, 0, 80, 17)));
+        }),
+    ];
+    for (input, select) in cases {
+        let mut app = app_listing(
+            vec![titled_row("c", 3), titled_row("b", 2), titled_row("a", 1)],
+            ToolDisplayMode::Hidden,
+        );
+        // Every row's project matches. The app applies the search's results
+        // only when the test settles the search.
+        type_query(&mut app, "project");
+        select(&mut app);
+        assert_eq!(selected_name(&app), Some("b"), "{input} selects b");
+
+        app.settle_search_for_test();
+
+        assert_eq!(listed_names(&app), ["c", "b", "a"]);
+        assert_eq!(
+            selected_name(&app),
+            Some("c"),
+            "after {input}, the search results select their first row"
+        );
+    }
 }
 
 #[test]
