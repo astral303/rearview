@@ -150,7 +150,7 @@ fn content_read_from_copy_lays_out_texts_in_block_order_as_parse_does() {
     let root = root_of(&session);
     let (record, parsed) = parsed_record_and_row(Source::Claude, &root, &stub_of(&session, 1));
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     cache.admit_storage(storage_of(Source::Claude)).unwrap();
     cache.write(&record).unwrap();
     let CatalogueSession::Listed(listed) = cache
@@ -209,7 +209,7 @@ fn semantic_turns_read_from_copy_keep_terminal_codes_as_parse_does() {
         parsed.semantic_turns
     );
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     cache.admit_storage(storage_of(Source::Claude)).unwrap();
     cache.write(&record).unwrap();
     let CatalogueSession::Listed(listed) = cache
@@ -308,7 +308,7 @@ fn title_and_summary(row: &Conversation) -> Vec<String> {
 /// load writes it, each trimmed, and the row its parse lists.
 fn searched_texts_and_parse(session: &AgentSession) -> (Vec<String>, Conversation) {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     let row = &session.row;
     let storage = storage_of(row.source);
     cache.admit_storage(storage).unwrap();

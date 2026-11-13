@@ -4,8 +4,9 @@
 
 use super::base::CacheBase;
 use super::coordinator::WaitStatus;
+use super::refresh::WriteBatch;
 use super::scope::{OperationAccess, OperationScope, Patience};
-use super::{CacheWriter, SqliteCache, refresh};
+use super::{CacheWriter, SqliteCache};
 use crate::error::Result;
 use crate::history::SEMANTIC_ROUTE_VERSION;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -120,9 +121,7 @@ impl CacheWriter {
     /// Store each of `routes` whose copy the cache still holds, in one batch.
     /// Fails without writing when the drive is low on space.
     pub(super) fn store_semantic_routes(&self, routes: &[SemanticRoute]) -> Result<()> {
-        self.owner.check_space()?;
-        let batch = refresh::transaction(&self.connection, &self.owner)?;
-        {
+        WriteBatch::run_checking_space(&self.connection, &self.owner, |batch| {
             let mut statement = batch.prepare_cached(
                 "INSERT OR REPLACE INTO semantic_routes \
                  (session, generation, custom_title, summary, text, version) \
@@ -138,8 +137,7 @@ impl CacheWriter {
                     SEMANTIC_ROUTE_VERSION
                 ])?;
             }
-        }
-        refresh::commit(batch, &self.owner)?;
-        Ok(())
+            Ok(())
+        })
     }
 }

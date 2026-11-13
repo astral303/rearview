@@ -48,25 +48,23 @@ const ENTRIES_PER_TRANSACTION: usize = 20_000;
 /// entries per transaction. The session row is marked writing and doesn't
 /// hold any entries yet.
 pub(super) fn insert(
-    connection: &mut Connection,
+    connection: &Connection,
     session: i64,
     places: &WrittenPlaces,
     rows: &SessionRows,
-    check_space: &dyn Fn() -> Result<()>,
     owner: &super::refresh::RefreshToken,
 ) -> Result<()> {
     let mut ids = write::RowIds::new(rows);
     for start in (0..rows.entries.len()).step_by(ENTRIES_PER_TRANSACTION) {
-        check_space()?;
-        let transaction = super::session_transaction(connection, session, owner)?;
-        {
-            let mut writer = write::RowWriter::new(&transaction, session, places)?;
+        super::refresh::WriteBatch::run_checking_space(connection, owner, |batch| {
+            super::require_writing(batch, session)?;
+            let mut writer = write::RowWriter::new(batch, session, places)?;
             let end = (start + ENTRIES_PER_TRANSACTION).min(rows.entries.len());
             for sequence in start..end {
                 writer.insert_entry(rows, &mut ids, sequence)?;
             }
-        }
-        super::refresh::commit(transaction, owner)?;
+            Ok(())
+        })?;
     }
     Ok(())
 }

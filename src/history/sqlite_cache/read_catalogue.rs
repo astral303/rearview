@@ -489,7 +489,7 @@ mod tests {
                 modified: Some(std::time::UNIX_EPOCH),
             },
         };
-        let mut cache = admitted_cache(base.path());
+        let cache = admitted_cache(base.path());
         cache.admit_storage(storage).unwrap();
         let write = parsed_record(source, &root, &stub);
         cache.write(&write).unwrap();
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn catalogue_metadata_matches_each_providers_row_without_reading_bodies() {
         let base = tempfile::tempdir().unwrap();
-        let mut cache = admitted_cache(base.path());
+        let cache = admitted_cache(base.path());
         let home = tempfile::tempdir().unwrap();
         let unshown = claude_session_with_unshown_user_messages(home.path());
         for session in every_record_sessions().into_iter().chain([unshown]) {

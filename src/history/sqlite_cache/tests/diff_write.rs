@@ -310,7 +310,7 @@ fn assert_stores_alike(actual: &[String], expected: &[String], fixture: &Fixture
 }
 
 fn cache_with(base: &Path, fixture: &Fixture, record: &SessionRecord) -> OwnedCache {
-    let mut cache = admitted_cache(base);
+    let cache = admitted_cache(base);
     cache.admit_storage(fixture.storage()).unwrap();
     cache.write(record).unwrap();
     cache
@@ -450,7 +450,7 @@ fn write_stores_read_of_every_session_file_that_resumes_through_its_agents_reade
             file.read = TranscriptRead::full_read();
         }
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
 
         let record = fixture.record();
         cache.write(&record).unwrap();
@@ -496,7 +496,7 @@ fn later_write_of_session_with_files_under_two_roots_matches_fresh_write() {
     let mut earlier = fixture.record();
     entries_of(&mut earlier).entries.pop();
     let base = tempfile::tempdir().unwrap();
-    let mut cache = cache_holding(base.path(), &fixture, &earlier);
+    let cache = cache_holding(base.path(), &fixture, &earlier);
 
     let record = fixture.record();
     cache.write(&record).unwrap();
@@ -536,7 +536,7 @@ fn parse_equal_to_stored_session_doesnt_write_entry_rows_for_every_agent() {
     for session in every_record_sessions() {
         let fixture = Fixture::of(session);
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &fixture.record());
+        let cache = cache_holding(base.path(), &fixture, &fixture.record());
         let session = fixture.session_id(&cache);
 
         let record = fixture.record();
@@ -575,9 +575,11 @@ fn session_rows_built_inside_write_batch_fail_debug_check() {
     let base = tempfile::tempdir().unwrap();
     let mut record = fixture.record();
     let cache = cache_holding(base.path(), &fixture, &record);
-    let _batch = refresh::transaction(&cache.connection, &cache.owner).unwrap();
-
-    entries::SessionRows::of(entries_of(&mut record), &HashSet::new());
+    refresh::WriteBatch::run(&cache.connection, &cache.owner, |_| {
+        entries::SessionRows::of(entries_of(&mut record), &HashSet::new());
+        Ok(())
+    })
+    .unwrap();
 }
 
 /// A title the agent keeps outside the transcript is a field of the session
@@ -599,7 +601,7 @@ fn title_outside_transcript_renamed_doesnt_write_entry_rows_for_every_agent() {
         let mut fixture = Fixture::of(copy);
         let mut original = fixture.record();
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &original);
+        let cache = cache_holding(base.path(), &fixture, &original);
         let session_id = fixture.session_id(&cache);
         let original_title = fixture.listed(&cache).custom_title;
 
@@ -684,7 +686,7 @@ fn entries_appended_to_own_transcript_are_inserted_for_every_agent() {
             fixture.label()
         );
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let stored = ids(&cache, "entries");
 
         let record = fixture.record();
@@ -748,7 +750,7 @@ fn appended_entries_parts_carry_their_session_for_every_agent() {
         let mut before = fixture.record();
         without_last_own_entries(&mut before, 2);
         let base = tempfile::tempdir().unwrap();
-        let mut cache = admitted_cache(base.path());
+        let cache = admitted_cache(base.path());
         cache.admit_storage(fixture.storage()).unwrap();
         let other = SessionStub {
             cache_key: "other".to_owned(),
@@ -785,7 +787,7 @@ fn appended_entries_parts_carry_their_session_for_every_agent() {
 fn part_on_another_sessions_entry_fails_stored_rows_comparison() {
     let fixture = Fixture::of(every_record_sessions().remove(0));
     let base = tempfile::tempdir().unwrap();
-    let mut cache = cache_with(base.path(), &fixture, &fixture.record());
+    let cache = cache_with(base.path(), &fixture, &fixture.record());
     let other = SessionStub {
         cache_key: "other".to_owned(),
         ..fixture.stub.clone()
@@ -868,7 +870,7 @@ fn removed_session_deletes_its_parts_and_result_items() {
     for session in every_record_sessions() {
         let fixture = Fixture::of(session);
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &fixture.record());
+        let cache = cache_holding(base.path(), &fixture, &fixture.record());
 
         cache
             .remove(fixture.storage(), &fixture.root, &[CACHE_KEY.to_owned()])
@@ -917,7 +919,7 @@ fn subagent_turn_spliced_mid_session_moves_later_entries_in_place() {
         let spliced = count - entries.len();
         let later = entries.len() - first;
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let stored = ids(&cache, "entries");
         let stored_messages = ids(&cache, "messages");
 
@@ -972,7 +974,7 @@ fn new_subagent_thread_is_inserted_and_removed_one_deleted() {
         let record = fixture.record();
 
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &without);
+        let cache = cache_holding(base.path(), &fixture, &without);
         let stored = ids(&cache, "entries");
         cache.write(&record).unwrap();
         let writes = take_row_writes(&cache.connection);
@@ -990,7 +992,7 @@ fn new_subagent_thread_is_inserted_and_removed_one_deleted() {
         assert_matches_fresh_write(&cache, &fixture, &record);
 
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &record);
+        let cache = cache_holding(base.path(), &fixture, &record);
         cache.write(&without).unwrap();
         let writes = take_row_writes(&cache.connection);
         assert!(
@@ -1030,7 +1032,7 @@ fn entries_that_change_order_move_in_place_for_every_agent() {
         };
         entries.swap(pair[0], pair[1]);
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let stored = ids(&cache, "entries");
 
         let record = fixture.record();
@@ -1053,7 +1055,7 @@ fn removed_entries_are_deleted_for_every_agent() {
         let mut after = fixture.record();
         let removed = without_last_own_entries(&mut after, 2);
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &fixture.record());
+        let cache = cache_holding(base.path(), &fixture, &fixture.record());
 
         cache.write(&after).unwrap();
 
@@ -1122,7 +1124,7 @@ fn changed_entry_is_updated_in_place_for_every_agent() {
             continue;
         };
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let stored = ids(&cache, "entries");
         let changed_id: i64 = cache
             .connection
@@ -1280,7 +1282,7 @@ fn entry_with_one_changed_part_updates_that_part_alone_for_every_agent() {
             continue;
         };
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let parts_before = parts_of_entry_at(&cache, changed);
 
         let record = fixture.record();
@@ -1357,7 +1359,7 @@ fn block_appended_to_entry_with_call_inserts_its_parts_alone_for_claude_codex_ki
             continue;
         };
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let parts_before = parts_of_entry_at(&cache, changed);
 
         let record = fixture.record();
@@ -1432,7 +1434,7 @@ fn text_filled_in_before_another_moves_the_later_texts_search_position_alone_for
             continue;
         };
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let parts_before = parts_of_entry_at(&cache, changed);
 
         let record = fixture.record();
@@ -1520,7 +1522,7 @@ fn block_removed_from_entry_with_call_deletes_its_parts_alone_for_every_agent() 
             continue;
         };
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let parts_before = parts_of_entry_at(&cache, changed);
 
         cache.write(&record).unwrap();
@@ -1583,7 +1585,7 @@ fn blocks_reordered_in_entry_rewrite_the_swapped_blocks_parts_alone_for_every_ag
             with_trailing_result_items(record, changed);
         }
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let parts_before = numbered_parts_of_entry_at(&cache, changed);
         let items_before = result_items_of_entry_at(&cache, changed);
         assert!(
@@ -1714,7 +1716,7 @@ fn text_appended_after_thinking_leaves_the_thinking_search_position_for_every_ag
             continue;
         }
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
 
         let record = fixture.record();
         cache.write(&record).unwrap();
@@ -1775,7 +1777,7 @@ fn message_renumbered_in_place_moves_its_texts_search_place_for_every_agent() {
             continue;
         }
         let base = tempfile::tempdir().unwrap();
-        let mut cache = cache_holding(base.path(), &fixture, &before);
+        let cache = cache_holding(base.path(), &fixture, &before);
         let stored = message_ordinals(&cache);
 
         let record = fixture.record();
@@ -1806,7 +1808,7 @@ fn reader_holding_earlier_generation_reads_the_copy_the_write_left() {
     let mut before = fixture.record();
     without_last_own_entries(&mut before, 1);
     let base = tempfile::tempdir().unwrap();
-    let mut cache = cache_holding(base.path(), &fixture, &before);
+    let cache = cache_holding(base.path(), &fixture, &before);
     let earlier_row = fixture.listed(&cache);
     let earlier = earlier_row.cached_session.clone().unwrap();
     let session = fixture.session_id(&cache);

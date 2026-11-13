@@ -59,7 +59,7 @@ impl GrokSession {
         let base = tempfile::tempdir().unwrap();
         let cache = admitted_cache(base.path());
         cache.admit_storage(storage_of(Source::Grok)).unwrap();
-        let mut session = Self {
+        let session = Self {
             home,
             base,
             cache,

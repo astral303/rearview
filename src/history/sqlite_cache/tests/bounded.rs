@@ -10,7 +10,7 @@ use crate::time_filter::TimeFilter;
 #[test]
 fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_provider() {
     let base = tempfile::tempdir().unwrap();
-    let mut cache = admitted_cache(base.path());
+    let cache = admitted_cache(base.path());
     for session in every_record_sessions() {
         let root = root_of(&session);
         let stub = stub_of(&session, 1);
@@ -100,7 +100,7 @@ fn bounded_transcript_doesnt_load_unrelated_large_call_and_result_bodies() {
     ].map(|record| record.to_string()).join("\n");
     std::fs::write(&source, records).unwrap();
     let (record, root) = source_record(Source::Claude, &source);
-    let mut cache = admitted_cache(&base.path().join("cache"));
+    let cache = admitted_cache(&base.path().join("cache"));
     let storage = storage_of(Source::Claude);
     cache.admit_storage(storage).unwrap();
     cache.write(&record).unwrap();
@@ -149,7 +149,7 @@ fn bounded_read_doesnt_read_unselected_call_inputs() {
     ].map(|record| record.to_string()).join("\n");
     std::fs::write(&source, records).unwrap();
     let (record, root) = source_record(Source::Claude, &source);
-    let mut cache = admitted_cache(&base.path().join("cache"));
+    let cache = admitted_cache(&base.path().join("cache"));
     let storage = storage_of(Source::Claude);
     cache.admit_storage(storage).unwrap();
     cache.write(&record).unwrap();
@@ -207,7 +207,7 @@ fn call_context_is_stored_for_agent_calls_alone_without_absent_fields() {
     ].map(|record| record.to_string()).join("\n");
     std::fs::write(&source, records).unwrap();
     let (record, _) = source_record(Source::Claude, &source);
-    let mut cache = admitted_cache(&base.path().join("cache"));
+    let cache = admitted_cache(&base.path().join("cache"));
     cache.admit_storage(storage_of(Source::Claude)).unwrap();
     cache.write(&record).unwrap();
 
@@ -248,7 +248,7 @@ fn calls_and_results_page_reads(body_bytes: usize) -> i32 {
     std::fs::write(&source, records).unwrap();
     let (record, _) = source_record(Source::Claude, &source);
     let cache_base = base.path().join("cache");
-    let mut cache = admitted_cache(&cache_base);
+    let cache = admitted_cache(&cache_base);
     cache.admit_storage(storage_of(Source::Claude)).unwrap();
     cache.write(&record).unwrap();
     let session: i64 = cache
@@ -311,7 +311,7 @@ fn sql_windows_keep_full_message_spans_and_final_millisecond() {
     ].map(|record| record.to_string()).join("\n");
     std::fs::write(&source, records).unwrap();
     let (record, root) = source_record(Source::Claude, &source);
-    let mut cache = admitted_cache(&base.path().join("cache"));
+    let cache = admitted_cache(&base.path().join("cache"));
     let storage = storage_of(Source::Claude);
     cache.admit_storage(storage).unwrap();
     cache.write(&record).unwrap();

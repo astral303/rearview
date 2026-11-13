@@ -88,6 +88,7 @@ use crate::history::provider::{SessionCache, SessionRoot};
 use crate::log_entry::LogEntry;
 use connection::Access;
 use files::RootKey;
+use refresh::WriteBatch;
 pub(crate) use roots::SessionRoots;
 use roots::{Places, WrittenPlaces};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -595,12 +596,11 @@ impl CacheWriter {
     /// Take SQLite's exclusive lock for the rebuild, inside `turn`, and
     /// leave WAL mode.
     fn begin_rebuild(&self, turn: &refresh::Turn<'_>) -> Result<()> {
-        refresh::take_exclusive_lock(
+        refresh::take_exclusive_lock_to_rebuild(
             &self.connection,
             &self.owner,
             turn,
             refresh::ExclusiveWait::of(WAITING_BUSY_TIMEOUT),
-            |batch| refresh::commit(batch, &self.owner),
         )?;
         refresh::leave_wal(&self.connection)
     }
@@ -613,9 +613,9 @@ impl CacheWriter {
         self.begin_rebuild(&turn)?;
         // Drop the tables only once the exclusive lock and the journal change
         // succeeded, so an interrupted rebuild can run again.
-        let batch = refresh::transaction_in_turn(&self.connection, &self.owner, &turn)?;
-        drop_session_tables(&batch)?;
-        refresh::commit(batch, &self.owner)?;
+        WriteBatch::run_in_turn(&self.connection, &self.owner, &turn, |batch| {
+            Ok(drop_session_tables(batch)?)
+        })?;
         self.connection
             .pragma_update(None, "page_size", PAGE_SIZE)?;
         self.connection.execute_batch("VACUUM")?;
@@ -627,20 +627,19 @@ impl CacheWriter {
     }
 
     fn create_schema_in_turn(&self, turn: &refresh::Turn<'_>) -> Result<()> {
-        let batch = refresh::transaction_in_turn(&self.connection, &self.owner, turn)?;
-        batch.execute_batch(schema::CREATE)?;
-        for (key, version) in schema::layout_versions() {
-            put_meta(&batch, key, &version)?;
-        }
-        refresh::commit(batch, &self.owner)?;
-        Ok(())
+        WriteBatch::run_in_turn(&self.connection, &self.owner, turn, |batch| {
+            batch.execute_batch(schema::CREATE)?;
+            for (key, version) in schema::layout_versions() {
+                put_meta(batch, key, &version)?;
+            }
+            Ok(())
+        })
     }
 
     fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        let batch = refresh::transaction(&self.connection, &self.owner)?;
-        put_meta(&batch, key, value)?;
-        refresh::commit(batch, &self.owner)?;
-        Ok(())
+        WriteBatch::run(&self.connection, &self.owner, |batch| {
+            put_meta(batch, key, value)
+        })
     }
 
     /// Deletes `storage`'s sessions when they were written under another
@@ -650,18 +649,17 @@ impl CacheWriter {
         if self.storage_is_current(storage)? {
             return Ok(());
         }
-        let batch = refresh::transaction(&self.connection, &self.owner)?;
-        batch.execute(
-            "DELETE FROM sessions WHERE storage = ?1",
-            [storage.directory],
-        )?;
-        put_meta(
-            &batch,
-            &storage_schema_key(storage),
-            &storage.schema_version.to_string(),
-        )?;
-        refresh::commit(batch, &self.owner)?;
-        Ok(())
+        WriteBatch::run(&self.connection, &self.owner, |batch| {
+            batch.execute(
+                "DELETE FROM sessions WHERE storage = ?1",
+                [storage.directory],
+            )?;
+            put_meta(
+                batch,
+                &storage_schema_key(storage),
+                &storage.schema_version.to_string(),
+            )
+        })
     }
 
     pub(crate) fn mark_admitted(&self) -> Result<()> {
@@ -669,14 +667,14 @@ impl CacheWriter {
     }
 
     fn remove_every_session(&self) -> Result<()> {
-        let batch = refresh::transaction(&self.connection, &self.owner)?;
-        batch.execute(
-            "DELETE FROM sessions WHERE NOT EXISTS \
-             (SELECT 1 FROM meta WHERE key = ?1 AND value = '1')",
-            [ADMISSION_COMPLETE],
-        )?;
-        refresh::commit(batch, &self.owner)?;
-        Ok(())
+        WriteBatch::run(&self.connection, &self.owner, |batch| {
+            batch.execute(
+                "DELETE FROM sessions WHERE NOT EXISTS \
+                 (SELECT 1 FROM meta WHERE key = ?1 AND value = '1')",
+                [ADMISSION_COMPLETE],
+            )?;
+            Ok(())
+        })
     }
 
     /// Copies the write-ahead log's pages into the database, up to the first
@@ -719,7 +717,7 @@ impl CacheWriter {
     /// again. Each step of the write checks the free space on the cache's
     /// drive, and fails once it is below the floor (see
     /// [`refresh::RefreshToken::check_space`]).
-    pub(crate) fn write(&mut self, record: &SessionRecord) -> Result<Option<i64>> {
+    pub(crate) fn write(&self, record: &SessionRecord) -> Result<Option<i64>> {
         if !self.is_admitted()? {
             return Err(AppError::SessionCacheNotReady {
                 session: record.catalogue.cache_key.clone(),
@@ -729,9 +727,7 @@ impl CacheWriter {
         if record.keeps_entries_out() && self.holds_listed_copy(&record.catalogue)? {
             return Ok(None);
         }
-        let owner = self.owner.clone();
-        self.write_checked(record, &|| owner.check_space())
-            .map(Some)
+        self.write_rows(record).map(Some)
     }
 
     /// True when the cache holds a listed copy of `row`'s session with its
@@ -748,12 +744,7 @@ impl CacheWriter {
         ))
     }
 
-    fn write_checked(
-        &mut self,
-        record: &SessionRecord,
-        check_space: &dyn Fn() -> Result<()>,
-    ) -> Result<i64> {
-        check_space()?;
+    fn write_rows(&self, record: &SessionRecord) -> Result<i64> {
         let subagents = record
             .catalogue
             .files
@@ -769,14 +760,12 @@ impl CacheWriter {
             return self.update_window(record, update, entries, &subagents);
         }
         let rows = written.map(|entries| entries::SessionRows::of(entries, &subagents));
-        // The free-space check above runs outside the transaction, because
-        // the check takes the owner's turn and the transaction holds it.
         if let (Some(rows), Some(entries)) = (&rows, written)
             && let Some(generation) = self.update_stored(record, rows, entries)?
         {
             return Ok(generation);
         }
-        self.insert_session(record, rows.as_ref(), check_space)
+        self.insert_session(record, rows.as_ref())
     }
 
     /// Writes `record`, a resumed read's `update` of its stored session
@@ -784,7 +773,7 @@ impl CacheWriter {
     /// transaction. Fails when the stored copy is not the one the read
     /// resumed from.
     fn update_window(
-        &mut self,
+        &self,
         record: &SessionRecord,
         update: &window::WindowUpdate,
         entries: &TranscriptEntries,
@@ -797,46 +786,41 @@ impl CacheWriter {
             in_place,
             stored_in_place,
         } = WindowRows::of(update, entries, &in_place_entries, subagents);
-        let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
-        let keys = &catalogue_keys(&batch, &record.catalogue)?;
-        let places = &keys.places;
-        let stored: Option<i64> = batch
-            .query_row(
-                &format!(
-                    "SELECT generation FROM sessions WHERE id = ?1 AND {}",
-                    copy_state::LISTED_COPY
-                ),
-                [update.session],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if stored != Some(update.generation) {
-            return Err(AppError::SessionCacheSuperseded(update.session));
-        }
-        let session = update.session;
-        let generation = write_catalogue_rows(
-            &batch,
-            session,
-            record,
-            keys,
-            record.catalogue.message_count,
-        )?;
-        for (path, launch_call) in &update.launch_calls {
-            let place = places.place_written(path)?;
-            batch
-                .prepare_cached(
-                    "UPDATE threads SET launch_call = ?4 WHERE session = ?1 AND transcript = \
-                     (SELECT id FROM transcripts WHERE session = ?1 AND root = ?2 AND path = ?3) \
-                     AND launch_call IS NOT ?4",
-                )?
-                .execute(params![session, place.root, place.path, launch_call])?;
-        }
-        entries::replace_leading(&batch, session, places, &leading)?;
-        entries::update_tail(&batch, session, places, &tail)?;
-        entries::rewrite_in_place(&batch, session, places, &in_place, &stored_in_place)?;
-        write_malformed_lines(&batch, session, entries)?;
-        refresh::commit(batch, &self.owner)?;
-        Ok(generation)
+        WriteBatch::run_checking_space(&self.cache.connection, &self.owner, |batch| {
+            let keys = &catalogue_keys(batch, &record.catalogue)?;
+            let places = &keys.places;
+            let stored: Option<i64> = batch
+                .query_row(
+                    &format!(
+                        "SELECT generation FROM sessions WHERE id = ?1 AND {}",
+                        copy_state::LISTED_COPY
+                    ),
+                    [update.session],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if stored != Some(update.generation) {
+                return Err(AppError::SessionCacheSuperseded(update.session));
+            }
+            let session = update.session;
+            let generation =
+                write_catalogue_rows(batch, session, record, keys, record.catalogue.message_count)?;
+            for (path, launch_call) in &update.launch_calls {
+                let place = places.place_written(path)?;
+                batch
+                    .prepare_cached(
+                        "UPDATE threads SET launch_call = ?4 WHERE session = ?1 AND transcript = \
+                         (SELECT id FROM transcripts WHERE session = ?1 AND root = ?2 AND path = ?3) \
+                         AND launch_call IS NOT ?4",
+                    )?
+                    .execute(params![session, place.root, place.path, launch_call])?;
+            }
+            entries::replace_leading(batch, session, places, &leading)?;
+            entries::update_tail(batch, session, places, &tail)?;
+            entries::rewrite_in_place(batch, session, places, &in_place, &stored_in_place)?;
+            write_malformed_lines(batch, session, entries)?;
+            Ok(generation)
+        })
     }
 
     /// Writes `record`, a listed session with `entries`, whose rows are
@@ -845,44 +829,43 @@ impl CacheWriter {
     /// row. `None`, without writing, when the cache doesn't hold a complete
     /// listed copy of the session to compare with.
     fn update_stored(
-        &mut self,
+        &self,
         record: &SessionRecord,
         rows: &entries::SessionRows,
         entries: &TranscriptEntries,
     ) -> Result<Option<i64>> {
         let row = &record.catalogue;
-        let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
-        let keys = &catalogue_keys(&batch, row)?;
-        let session: Option<i64> = batch
-            .query_row(
-                &format!(
-                    "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3 \
-                     AND {}",
-                    copy_state::LISTED_COPY
-                ),
-                params![row.storage, keys.root, row.cache_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(session) = session else {
-            return Ok(None);
-        };
-        let generation =
-            write_catalogue_rows(&batch, session, record, keys, Some(rows.message_count()))?;
-        entries::update(&batch, session, &keys.places, rows)?;
-        write_malformed_lines(&batch, session, entries)?;
-        refresh::commit(batch, &self.owner)?;
-        Ok(Some(generation))
+        WriteBatch::run_checking_space_or_roll_back(&self.cache.connection, &self.owner, |batch| {
+            let keys = &catalogue_keys(batch, row)?;
+            let session: Option<i64> = batch
+                .query_row(
+                    &format!(
+                        "SELECT id FROM sessions WHERE storage = ?1 AND root = ?2 \
+                         AND cache_key = ?3 AND {}",
+                        copy_state::LISTED_COPY
+                    ),
+                    params![row.storage, keys.root, row.cache_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(session) = session else {
+                return Ok(None);
+            };
+            let generation =
+                write_catalogue_rows(batch, session, record, keys, Some(rows.message_count()))?;
+            entries::update(batch, session, &keys.places, rows)?;
+            write_malformed_lines(batch, session, entries)?;
+            Ok(Some(generation))
+        })
     }
 
     /// Replaces the rows of `record`'s session with `record`, whose entry
     /// rows are `rows`: its catalogue row first, marked writing, then its
     /// entries a slice at a time, then the row's status.
     fn insert_session(
-        &mut self,
+        &self,
         record: &SessionRecord,
         rows: Option<&entries::SessionRows>,
-        check_space: &dyn Fn() -> Result<()>,
     ) -> Result<i64> {
         let (session, keys) = self.write_catalogue(record, rows)?;
         let generation: i64 = self.connection.query_row(
@@ -894,25 +877,17 @@ impl CacheWriter {
         let entries_error = match &record.entries {
             Some(catalogue::RecordEntries::Written(entries)) => {
                 let rows = rows.expect("listed entries have rows");
-                entries::insert(
-                    &mut self.cache.connection,
-                    session,
-                    &keys.places,
-                    rows,
-                    check_space,
-                    owner,
-                )?;
-                check_space()?;
-                let batch = session_transaction(&mut self.cache.connection, session, owner)?;
-                write_malformed_lines(&batch, session, entries)?;
-                write_subagent_metadata(&batch, session, record, &keys, &[])?;
-                refresh::commit(batch, owner)?;
+                entries::insert(&self.cache.connection, session, &keys.places, rows, owner)?;
+                WriteBatch::run_checking_space(&self.cache.connection, owner, |batch| {
+                    require_writing(batch, session)?;
+                    write_malformed_lines(batch, session, entries)?;
+                    write_subagent_metadata(batch, session, record, &keys, &[])
+                })?;
                 None
             }
             Some(catalogue::RecordEntries::Unwritten { reason, .. }) => Some(reason.as_str()),
             None => record.unlisted_reason.as_deref(),
         };
-        check_space()?;
         self.set_final_status(session, record.catalogue.status, entries_error)?;
         Ok(generation)
     }
@@ -920,47 +895,47 @@ impl CacheWriter {
     /// Inserts `record`'s catalogue row, marked writing; returns its id and
     /// where its files are stored.
     fn write_catalogue(
-        &mut self,
+        &self,
         record: &SessionRecord,
         rows: Option<&entries::SessionRows>,
     ) -> Result<(i64, catalogue::CatalogueKeys)> {
         let row = &record.catalogue;
-        let batch = refresh::transaction(&self.cache.connection, &self.owner)?;
-        let keys = catalogue_keys(&batch, row)?;
-        batch.execute(
-            "DELETE FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
-            params![row.storage, keys.root, row.cache_key],
-        )?;
-        let generation = next_generation(&batch)?;
-        let values = row.values(
-            catalogue::WRITING,
-            rows.map(entries::SessionRows::message_count)
-                .or(row.message_count),
-            None,
-            generation,
-        );
-        let mut statement = batch.prepare_cached(&catalogue::insert_sql())?;
-        statement.raw_bind_parameter(1, row.storage)?;
-        statement.raw_bind_parameter(2, keys.root)?;
-        statement.raw_bind_parameter(3, &row.cache_key)?;
-        for (offset, value) in values.iter().enumerate() {
-            statement.raw_bind_parameter(offset + 4, value)?;
-        }
-        statement.raw_execute()?;
-        drop(statement);
-        let session = batch.last_insert_rowid();
-        positional::SESSION_FILES.write(
-            &batch,
-            session,
-            &row.file_rows(&keys),
-            Vec::new(),
-            catalogue::file_key_of,
-        )?;
-        write_transcript_reads(&batch, session, row, &keys)?;
-        write_checkpoint(&batch, session, record, &keys.places)?;
-        write_parse_errors(&batch, session, row)?;
-        refresh::commit(batch, &self.owner)?;
-        Ok((session, keys))
+        WriteBatch::run_checking_space(&self.cache.connection, &self.owner, |batch| {
+            let keys = catalogue_keys(batch, row)?;
+            batch.execute(
+                "DELETE FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
+                params![row.storage, keys.root, row.cache_key],
+            )?;
+            let generation = next_generation(batch)?;
+            let values = row.values(
+                catalogue::WRITING,
+                rows.map(entries::SessionRows::message_count)
+                    .or(row.message_count),
+                None,
+                generation,
+            );
+            let mut statement = batch.prepare_cached(&catalogue::insert_sql())?;
+            statement.raw_bind_parameter(1, row.storage)?;
+            statement.raw_bind_parameter(2, keys.root)?;
+            statement.raw_bind_parameter(3, &row.cache_key)?;
+            for (offset, value) in values.iter().enumerate() {
+                statement.raw_bind_parameter(offset + 4, value)?;
+            }
+            statement.raw_execute()?;
+            drop(statement);
+            let session = batch.last_insert_rowid();
+            positional::SESSION_FILES.write(
+                batch,
+                session,
+                &row.file_rows(&keys),
+                Vec::new(),
+                catalogue::file_key_of,
+            )?;
+            write_transcript_reads(batch, session, row, &keys)?;
+            write_checkpoint(batch, session, record, &keys.places)?;
+            write_parse_errors(batch, session, row)?;
+            Ok((session, keys))
+        })
     }
 
     /// Replace the [`catalogue::WRITING`] status of `session`'s row with
@@ -971,29 +946,28 @@ impl CacheWriter {
         status: SessionStatus,
         entries_error: Option<&str>,
     ) -> Result<()> {
-        let batch = refresh::transaction(&self.connection, &self.owner)?;
-        let changed = batch.execute(
-            "UPDATE sessions SET status = ?1, entries_error = ?2 WHERE id = ?3 AND status = ?4",
-            params![status.as_str(), entries_error, session, catalogue::WRITING],
-        )?;
-        if changed != 1 {
-            return Err(AppError::SessionCacheSuperseded(session));
-        }
-        refresh::commit(batch, &self.owner)?;
-        Ok(())
+        WriteBatch::run_checking_space(&self.connection, &self.owner, |batch| {
+            let changed = batch.execute(
+                "UPDATE sessions SET status = ?1, entries_error = ?2 WHERE id = ?3 AND status = ?4",
+                params![status.as_str(), entries_error, session, catalogue::WRITING],
+            )?;
+            if changed != 1 {
+                return Err(AppError::SessionCacheSuperseded(session));
+            }
+            Ok(())
+        })
     }
 
     /// Deletes the rows of each session `storage` found at one of `cache_keys`
     /// under `root`.
     pub(crate) fn remove(
-        &mut self,
+        &self,
         storage: SessionCache,
         root: &SessionRoot,
         cache_keys: &[String],
     ) -> Result<()> {
         let roots = self.session_roots(root);
-        let batch = refresh::transaction(&self.connection, &self.owner)?;
-        {
+        WriteBatch::run(&self.connection, &self.owner, |batch| {
             let mut statement = batch.prepare_cached(
                 "DELETE FROM sessions WHERE storage = ?1 AND cache_key = ?3 \
                  AND root = (SELECT id FROM roots WHERE key = ?2)",
@@ -1005,9 +979,8 @@ impl CacheWriter {
                     cache_key
                 ])?;
             }
-        }
-        refresh::commit(batch, &self.owner)?;
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -1263,13 +1236,10 @@ fn write_subagent_metadata(
     )
 }
 
-fn session_transaction<'a>(
-    connection: &'a mut Connection,
-    session: i64,
-    owner: &'a refresh::RefreshToken,
-) -> Result<refresh::WriteBatch<'a>> {
-    let batch = refresh::transaction(connection, owner)?;
-    let is_writing: bool = batch.query_row(
+/// Fail with [`AppError::SessionCacheSuperseded`] unless `session`'s row is
+/// still marked [`catalogue::WRITING`]: a later write replaced it.
+fn require_writing(connection: &Connection, session: i64) -> Result<()> {
+    let is_writing: bool = connection.query_row(
         "SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND status = ?2)",
         params![session, catalogue::WRITING],
         |row| row.get(0),
@@ -1277,7 +1247,7 @@ fn session_transaction<'a>(
     if !is_writing {
         return Err(AppError::SessionCacheSuperseded(session));
     }
-    Ok(batch)
+    Ok(())
 }
 
 /// The result of [`CacheWriter::write`] for a session's record, or the
@@ -1321,7 +1291,7 @@ impl CacheWrite {
 /// checkpoints and returns `writer`. Other write failures are reported under
 /// `--debug`, and the remaining records are written.
 pub(crate) fn apply_writes(
-    mut writer: CacheWriter,
+    writer: CacheWriter,
     writes: Receiver<CacheWrite>,
     debug_level: Option<DebugLevel>,
 ) -> CacheWriter {
@@ -1333,7 +1303,7 @@ pub(crate) fn apply_writes(
         // The record moves into the write and drops before `reply`, on a
         // panic too: the sender regains sole ownership of it once the reply
         // arrives or disconnects.
-        let mut write_logged = |record: Arc<SessionRecord>| {
+        let write_logged = |record: Arc<SessionRecord>| {
             let started = std::time::Instant::now();
             let changes_before = writer.connection.total_changes();
             let outcome = writer.write(&record);

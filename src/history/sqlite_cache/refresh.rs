@@ -342,7 +342,7 @@ impl ExclusiveWait {
 /// Fails with a busy error once the wait ends, and with
 /// [`AppError::SessionCacheRefreshLost`] once another identity owns the
 /// cache.
-pub(super) fn take_exclusive_lock(
+fn take_exclusive_lock(
     connection: &Connection,
     owner: &RefreshToken,
     turn: &Turn<'_>,
@@ -377,6 +377,17 @@ pub(super) fn take_exclusive_lock(
     };
     connection.busy_timeout(wait.total)?;
     commit(batch)
+}
+
+/// [`take_exclusive_lock`] for `owner`'s rebuild: its first batch commits as
+/// `owner`'s write batches commit.
+pub(super) fn take_exclusive_lock_to_rebuild(
+    connection: &Connection,
+    owner: &RefreshToken,
+    turn: &Turn<'_>,
+    wait: ExclusiveWait,
+) -> Result<()> {
+    take_exclusive_lock(connection, owner, turn, wait, |batch| commit(batch, owner))
 }
 
 /// Switch `connection`'s database, held under SQLite's exclusive lock, out
@@ -705,10 +716,7 @@ impl RefreshToken {
             let connection = retry_busy(LOCK_WAIT_LIMIT, self.clock(), || {
                 connect_writable(&self.base, POLL_EVERY)
             })?;
-            let batch = transaction(&connection, self)?;
-            let result = work();
-            commit(batch, self)?;
-            Ok(result)
+            WriteBatch::run(&connection, self, |_| Ok(work()))
         })();
         if result.is_err() {
             self.revoke();
@@ -1031,14 +1039,85 @@ impl<'a> std::ops::Deref for WriteBatch<'a> {
     }
 }
 
+impl<'a> WriteBatch<'a> {
+    /// Run `body` as one write batch of `owner` on `connection`, and commit
+    /// it. A failure to begin the batch, of its ownership check or of its
+    /// commit revokes `owner`'s write permission as [`transaction`] and
+    /// [`commit`] decide. A failure of `body` rolls the batch back and
+    /// leaves the write permission as it is.
+    pub(super) fn run<T>(
+        connection: &'a Connection,
+        owner: &'a RefreshToken,
+        body: impl FnOnce(&WriteBatch<'a>) -> Result<T>,
+    ) -> Result<T> {
+        unwrap_committed(end_batch(transaction(connection, owner)?, owner, |batch| {
+            body(batch).map(Some)
+        }))
+    }
+
+    /// [`Self::run`] once `owner`'s free-space check passes (see
+    /// [`RefreshToken::check_space`]); the check runs outside the owner's
+    /// turn, which the batch holds.
+    pub(super) fn run_checking_space<T>(
+        connection: &'a Connection,
+        owner: &'a RefreshToken,
+        body: impl FnOnce(&WriteBatch<'a>) -> Result<T>,
+    ) -> Result<T> {
+        owner.check_space()?;
+        Self::run(connection, owner, body)
+    }
+
+    /// [`Self::run_checking_space`] for a body that may find nothing to
+    /// write: `None` rolls the batch back without a commit.
+    pub(super) fn run_checking_space_or_roll_back<T>(
+        connection: &'a Connection,
+        owner: &'a RefreshToken,
+        body: impl FnOnce(&WriteBatch<'a>) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        owner.check_space()?;
+        end_batch(transaction(connection, owner)?, owner, body)
+    }
+
+    /// [`Self::run`] inside `turn`, `owner`'s turn the caller holds across
+    /// several batches.
+    pub(super) fn run_in_turn<T>(
+        connection: &'a Connection,
+        owner: &'a RefreshToken,
+        turn: &Turn<'_>,
+        body: impl FnOnce(&WriteBatch<'a>) -> Result<T>,
+    ) -> Result<T> {
+        unwrap_committed(end_batch(
+            transaction_in_turn(connection, owner, turn)?,
+            owner,
+            |batch| body(batch).map(Some),
+        ))
+    }
+}
+
+/// Commit `batch` for `owner` once `body` returns a value; `None` from
+/// `body` rolls the batch back.
+fn end_batch<'a, T>(
+    batch: WriteBatch<'a>,
+    owner: &RefreshToken,
+    body: impl FnOnce(&WriteBatch<'a>) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    let Some(value) = body(&batch)? else {
+        return Ok(None);
+    };
+    commit(batch, owner)?;
+    Ok(Some(value))
+}
+
+/// The value of [`end_batch`] for a body that always returns one.
+fn unwrap_committed<T>(ended: Result<Option<T>>) -> Result<T> {
+    ended.map(|value| value.expect("a body that returns a value commits its batch"))
+}
+
 /// A write batch. Lock order: `owner`'s turn, then SQLite's writer lock,
 /// then a check that `owner` still owns the refresh. Checking before taking
 /// the writer lock would let another process take over between the check
 /// and the batch. A failure revokes `owner`'s write permission.
-pub(super) fn transaction<'a>(
-    connection: &'a Connection,
-    owner: &'a RefreshToken,
-) -> Result<WriteBatch<'a>> {
+fn transaction<'a>(connection: &'a Connection, owner: &'a RefreshToken) -> Result<WriteBatch<'a>> {
     transaction_within(connection, owner, LOCK_WAIT_LIMIT)
 }
 
@@ -1056,7 +1135,7 @@ fn transaction_within<'a>(
 }
 
 /// [`transaction`] inside `turn`, `owner`'s turn the caller holds.
-pub(super) fn transaction_in_turn<'a>(
+fn transaction_in_turn<'a>(
     connection: &'a Connection,
     owner: &'a RefreshToken,
     turn: &Turn<'_>,
@@ -1089,7 +1168,7 @@ fn transaction_during<'a>(
 
 /// A rebuild's write batch: SQLite's exclusive lock, taken inside `_turn`,
 /// the owner's turn the rebuild holds.
-pub(super) fn exclusive_transaction<'a>(
+fn exclusive_transaction<'a>(
     connection: &'a Connection,
     _turn: &Turn<'_>,
 ) -> Result<WriteBatch<'a>> {
@@ -1107,7 +1186,7 @@ pub(super) fn exclusive_transaction<'a>(
 /// permission, whatever its class. A failure of `COMMIT` revokes it when its
 /// class stops writes (see [`WriteErrorClass`]); otherwise dropping `batch`
 /// rolls that batch back alone, and the owner's later batches go on.
-pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
+fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
     owner.verify(&batch).inspect_err(|_| owner.revoke())?;
     let changed = batch
         .execute(

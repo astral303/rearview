@@ -64,7 +64,7 @@ impl OpenCodeSession {
         let base = tempfile::tempdir().unwrap();
         let cache = admitted_cache(base.path());
         cache.admit_storage(storage_of(Source::OpenCode)).unwrap();
-        let mut session = Self {
+        let session = Self {
             database_directory,
             base,
             cache,

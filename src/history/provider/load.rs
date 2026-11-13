@@ -2653,7 +2653,7 @@ mod tests {
             )
             .into_record()
             .unwrap_or_else(|| panic!("{:?}'s session has a record", row.source));
-            let mut database = SqliteCache::open_for_refresh(ownership.token()).unwrap();
+            let database = SqliteCache::open_for_refresh(ownership.token()).unwrap();
             database.admit_storage(storage.cache()).unwrap();
             database.write(&record).unwrap();
             drop(database);
@@ -2762,7 +2762,7 @@ mod tests {
             });
             wait_for_refresh(&meter);
             assert_eq!(home.watch().parses_begun(), 0);
-            let mut writer = SqliteCache::open_for_refresh(&owner.token()).unwrap();
+            let writer = SqliteCache::open_for_refresh(&owner.token()).unwrap();
             for stub in [&old, &added] {
                 writer
                     .write(
@@ -2821,7 +2821,7 @@ mod tests {
         let stub = discovered_stub(&home, &home.write("warm", 0, &["a question"]));
         let storage = home.storage();
         let root = home.root();
-        let mut database = SqliteCache::open(&rearview(base.path())).unwrap();
+        let database = SqliteCache::open(&rearview(base.path())).unwrap();
         database.mark_admitted().unwrap();
         database.admit_storage(storage.cache()).unwrap();
         database
@@ -5058,7 +5058,7 @@ mod tests {
                 .mark_admitted()
                 .unwrap();
             super::super::contract_tests::load_under(fixture, home.path(), base.path());
-            let mut database = SqliteCache::open(&rearview(base.path())).unwrap();
+            let database = SqliteCache::open(&rearview(base.path())).unwrap();
             let keys = database.stored_keys(storage, &root).unwrap();
             assert_eq!(keys.len(), 1);
             database.remove(storage, &root, &keys).unwrap();

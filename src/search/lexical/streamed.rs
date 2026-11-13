@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn cache_and_memory_preserve_scores_evidence_literals_and_windows_for_every_provider() {
         let base = tempfile::tempdir().unwrap();
-        let mut cache = SqliteCache::open(&crate::history::sqlite_cache::tests::rearview_at(
+        let cache = SqliteCache::open(&crate::history::sqlite_cache::tests::rearview_at(
             base.path(),
         ))
         .unwrap();
