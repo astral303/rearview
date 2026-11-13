@@ -12,6 +12,7 @@ use crate::history::listing::{self, SessionOrigin, SessionTimes};
 use crate::history::load_meter::{AgentMeter, LoadMeter};
 use crate::history::path::CanonicalDirectories;
 use crate::history::provider::walk::Canonicaliser;
+use crate::history::sqlite_cache::WriteErrorClass;
 use crate::search;
 use crate::search::mode::SearchMode;
 use crate::semantic;
@@ -2475,7 +2476,7 @@ fn target_error(error: AppError, resolved: &agent::refs::ResolvedConversation) -
             error.into()
         }
         // Formatted once `execute` has run its low-space deletion.
-        error @ AppError::SessionCacheLowSpace { .. } => error,
+        error if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => error,
         error => structured_agent_error(error),
     }
 }
@@ -2549,7 +2550,10 @@ fn structured_agent_error(error: AppError) -> AppError {
         AppError::TimeFilter(error) => {
             AgentError::out_of_range(Some("command"), error.to_string()).into()
         }
-        error @ (AppError::SessionCacheLowSpace { .. } | AppError::NoSessionCacheDirectory) => {
+        error
+            if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace
+                || matches!(error, AppError::NoSessionCacheDirectory) =>
+        {
             AgentError::io(None, format!("{}: {error}", crate::APP_NAME)).into()
         }
         error => AgentError::io(None, error.to_string()).into(),
@@ -2797,7 +2801,9 @@ fn run_hybrid_halves<S, L>(
     lexical: impl FnOnce(HybridLexicalPass) -> Result<L>,
 ) -> Result<(Result<S>, L)> {
     let semantic = match semantic() {
-        Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
+        Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
+            return Err(error);
+        }
         semantic => semantic,
     };
     let pass = if semantic.is_ok() {
@@ -2851,7 +2857,9 @@ impl AgentService {
             Ok(history::RoutesStored::NotOwner) => {
                 Some(agent::perf::RoutesSkipped::AnotherRearview)
             }
-            Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
+            Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
+                return Err(error);
+            }
             Err(error) => Some(agent::perf::RoutesSkipped::WriteFailed(error.to_string())),
         };
         self.perf.record_semantic_routes(routes.len(), skipped);

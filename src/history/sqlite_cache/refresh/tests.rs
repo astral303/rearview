@@ -6,7 +6,7 @@ use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
 use crate::history::sqlite_cache::low_space::run_deletion;
 use crate::history::sqlite_cache::observer::{Observation, observe};
 use crate::history::sqlite_cache::{
-    CacheWrite, CacheWriter, ProcessIdentity, SessionRecord, SessionStatus, SqliteCache,
+    CacheWrite, CacheWriter, ProcessIdentity, SessionRecord, SessionStatus, SqliteCache, is_busy,
 };
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};

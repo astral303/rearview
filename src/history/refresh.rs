@@ -9,7 +9,7 @@ use super::provider::{
     self, FoundSession, ReadError, RediscoveredSessions, SessionOutcome, SessionRead, SessionStub,
     SessionTitle, SkippedSessions,
 };
-use super::sqlite_cache::OperationScope;
+use super::sqlite_cache::{OperationScope, WriteErrorClass};
 use super::{Conversation, Environment, FilterTerm, NextStep, Source};
 use crate::cli::DebugLevel;
 use crate::debug;
@@ -193,7 +193,9 @@ fn refresh_sources(
             Ok(rediscovered) => {
                 changes.absorb(source, rediscovered, known, &mut claimed, options.time);
             }
-            Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
+            Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
+                return Err(error);
+            }
             Err(error) => {
                 changes
                     .ignored

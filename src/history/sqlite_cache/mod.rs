@@ -37,6 +37,7 @@ mod semantic_routes;
 mod semantic_scan;
 mod text_scan;
 mod window;
+mod write_error;
 
 pub use base::{CacheBase, ProcessIdentity};
 #[cfg(test)]
@@ -75,6 +76,7 @@ pub(crate) use semantic_routes::{
 pub(crate) use semantic_scan::{ScannedTurns, scan_semantic_turns};
 pub(crate) use text_scan::{ReadOrder, ScanScope, ScannedRow, TextVisitor, scan_search_texts};
 pub(crate) use window::{InPlaceRow, StoredFile, StoredResume, StoredTurn, WindowUpdate};
+pub(crate) use write_error::WriteErrorClass;
 
 use crate::cli::DebugLevel;
 use crate::debug;

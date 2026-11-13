@@ -5,6 +5,7 @@ use super::ui;
 use crate::config::KeyBindings;
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
+use crate::history::sqlite_cache::WriteErrorClass;
 use crate::history::{
     Conversation, Environment, LoaderMessage, RefreshOptions, RefreshOutcome, refresh_sessions,
 };
@@ -370,11 +371,13 @@ impl Runtime {
         let Some(outcome) = self.supervisor.finished_refresh() else {
             return Ok(());
         };
-        if let Err(error @ AppError::SessionCacheLowSpace { .. }) = outcome {
-            return Err(error);
+        match outcome {
+            Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => Err(error),
+            outcome => {
+                self.app.finish_refresh(outcome);
+                Ok(())
+            }
         }
-        self.app.finish_refresh(outcome);
-        Ok(())
     }
 
     /// Hand the worker its next job once it doesn't run one: a confirmed rename or

@@ -10,7 +10,7 @@ use super::provider::{
 };
 use super::sqlite_cache::{
     AwaitedRefresh, Cancellation, Observation, OperationScope, OtherRearview, Patience,
-    SessionAddress,
+    SessionAddress, WriteErrorClass,
 };
 use super::{
     Conversation, Environment, FilterTerm, KnownSessions, LoadProgress, LoaderMessage,
@@ -152,7 +152,9 @@ impl ProviderHistory {
                 },
             );
             match loaded {
-                Err(error @ AppError::SessionCacheLowSpace { .. }) => return Err(error),
+                Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
+                    return Err(error);
+                }
                 Ok(mut loaded) => {
                     history.usable |= root_on_disk;
                     for term in loaded.ignored {

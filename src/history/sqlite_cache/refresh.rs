@@ -1,10 +1,10 @@
 //! Refresh batches hold SQLite's writer lock through their work and timestamp
 //! their commits. A recent unfinished refresh keeps ownership between batches.
 
+use super::WriteErrorClass;
 use super::base::CacheBase;
 use super::connection::{self, Access, CacheConnection};
 use super::coordinator::WaitStatus;
-use super::is_busy;
 use super::observer::{CommitAge, OtherRearview, REBUILD_LOCK_THRESHOLD};
 use super::scope::Cancellation;
 use crate::clock::{Clock, Moment};
@@ -278,7 +278,7 @@ thread_local! {
 /// The outcome of a low-space deletion of `database` that failed with
 /// `error`: deferred when another connection kept the database busy.
 pub(super) fn deletion_failure(database: &Path, error: AppError) -> CacheDeletion {
-    if super::is_busy_error(&error) {
+    if WriteErrorClass::of(&error) == WriteErrorClass::Busy {
         return CacheDeletion::Deferred;
     }
     CacheDeletion::Failed {
@@ -366,7 +366,9 @@ pub(super) fn take_exclusive_lock(
     let batch = loop {
         match exclusive_transaction(connection, turn) {
             Ok(batch) => break batch,
-            Err(error) if super::is_busy_error(&error) && attempt < attempts => {
+            Err(error)
+                if WriteErrorClass::of(&error) == WriteErrorClass::Busy && attempt < attempts =>
+            {
                 keep_ownership(owner, wait.attempt)?;
                 attempt += 1;
             }
@@ -837,7 +839,7 @@ fn try_acquire(
         Ok(Attempt::Acquired(RefreshToken::new(base, identity)))
     })();
     match attempt {
-        Err(AppError::SessionCache(error)) if is_busy(&error) => {
+        Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::Busy => {
             Ok(Attempt::WriterBusy(ActiveOwner::Unreadable))
         }
         attempt => attempt,
@@ -866,7 +868,7 @@ fn connect_waiter(base: &CacheBase) -> Result<CacheConnection> {
 /// The writer lock, or `None` while another connection holds it.
 fn begin_without_waiting(connection: &Connection) -> Result<Option<Transaction<'_>>> {
     match Transaction::new_unchecked(connection, TransactionBehavior::Immediate) {
-        Err(error) if is_busy(&error) => Ok(None),
+        Err(error) if WriteErrorClass::of_sqlite(&error) == WriteErrorClass::Busy => Ok(None),
         transaction => Ok(Some(transaction?)),
     }
 }
@@ -945,7 +947,10 @@ fn retry_busy<T>(
     let started = clock.now();
     loop {
         match operation() {
-            Err(error) if is_busy(&error) && clock.elapsed_since(started) < limit => {
+            Err(error)
+                if WriteErrorClass::of_sqlite(&error) == WriteErrorClass::Busy
+                    && clock.elapsed_since(started) < limit =>
+            {
                 clock.sleep(POLL_EVERY);
             }
             result => return Ok(result?),
@@ -1097,10 +1102,11 @@ pub(super) fn exclusive_transaction<'a>(
     })
 }
 
-/// Commit `batch` with `owner`'s commit time. A failure revokes `owner`'s
-/// write permission, except the commit's foreign-key failure for a row left
-/// referencing a deleted one: dropping `batch` rolls that batch back alone,
-/// and the owner's later batches go on.
+/// Commit `batch` with `owner`'s commit time. A failure of the ownership
+/// check or of the `refresh_state` update revokes `owner`'s write
+/// permission, whatever its class. A failure of `COMMIT` revokes it when its
+/// class stops writes (see [`WriteErrorClass`]); otherwise dropping `batch`
+/// rolls that batch back alone, and the owner's later batches go on.
 pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
     owner.verify(&batch).inspect_err(|_| owner.revoke())?;
     let changed = batch
@@ -1114,7 +1120,7 @@ pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> 
         return Err(AppError::SessionCacheRefreshLost);
     }
     batch.execute_batch("COMMIT").map_err(|error| {
-        if is_foreign_key_failure(&error) {
+        if !WriteErrorClass::of_sqlite(&error).stops_writes() {
             return foreign_key_failure(&batch, error);
         }
         // Revoke before rollback releases the writer lock to queued writes.
@@ -1123,15 +1129,11 @@ pub(super) fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> 
     })
 }
 
-fn is_foreign_key_failure(error: &rusqlite::Error) -> bool {
-    error
-        .sqlite_error()
-        .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY)
-}
-
-/// `error`, a commit's foreign-key failure in `batch`, still open. Debug
-/// builds name the referencing and the referenced tables; SQLite's own
-/// message leaves them out.
+/// `error`, a `COMMIT` failure of the still-open `batch` that lets later
+/// writes run: a foreign-key failure for a row left referencing a deleted
+/// one. SQLite defers only foreign keys to `COMMIT`, and a commit hook's
+/// refusal is classed `Io`. Debug builds name the referencing and the
+/// referenced tables; SQLite's own message leaves them out.
 fn foreign_key_failure(batch: &WriteBatch<'_>, error: rusqlite::Error) -> AppError {
     if cfg!(debug_assertions)
         && let Ok(violations) = foreign_key_violations(batch)
