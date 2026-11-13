@@ -1211,7 +1211,10 @@ impl App {
         }
 
         match self.app_mode {
-            AppMode::List => self.move_selection_by(delta.signum()),
+            AppMode::List => {
+                self.clear_selection_anchor_on_loaded_list();
+                self.move_selection_by(delta.signum());
+            }
             AppMode::View(_) => self.scroll_view(delta, viewport_height),
         }
     }

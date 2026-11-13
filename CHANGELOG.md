@@ -90,6 +90,8 @@
   a session from the next page.
 - Fix jump to the first row (`Home`), jump to the last row (`End`) and half
   page down (`Ctrl+D`) not working while the list loads.
+- Fix the selection jumping to the first row when the list finishes
+  loading. A row selected while the list loads now stays selected.
 
 #### `rearview agent` commands
 

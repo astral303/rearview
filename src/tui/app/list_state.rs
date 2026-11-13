@@ -8,6 +8,25 @@ use std::path::{Path, PathBuf};
 
 const LIST_PAGE_ROWS: isize = 10;
 
+/// The session the list's selection stays on while the rows change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SelectionAnchor {
+    /// Kept until the user's next key, click on a row or wheel turn on the
+    /// loaded list.
+    Kept(PathBuf),
+    /// Selected by the user while the list loads, until the first results
+    /// after the load.
+    SelectedWhileLoading(PathBuf),
+}
+
+impl SelectionAnchor {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Kept(path) | Self::SelectedWhileLoading(path) => path,
+        }
+    }
+}
+
 impl App {
     pub(super) fn filter_indices<I>(&self, indices: I) -> Vec<usize>
     where
@@ -25,6 +44,7 @@ impl App {
     pub(super) fn apply_filtered(&mut self, filtered: Vec<usize>) {
         self.filtered = filtered;
         self.select_anchor_or_first();
+        self.settle_selection_made_while_loading();
     }
 
     /// Select the session the selection is anchored to, when the list shows
@@ -33,15 +53,59 @@ impl App {
         let anchored = self.selection_anchor.as_ref().and_then(|anchor| {
             self.filtered
                 .iter()
-                .position(|&index| &self.conversations[index].path == anchor)
+                .position(|&index| self.conversations[index].path == anchor.path())
         });
         self.selected = anchored.or_else(|| (!self.filtered.is_empty()).then_some(0));
     }
 
-    /// Select `row` for a key, click or wheel that moves the selection.
+    /// Drop the anchor of a selection made while the list loaded when the
+    /// first results after the load don't show its session; keep it when
+    /// they do. Once the first row is selected, a later search, such as the
+    /// rerun after the sessions' texts are read, must not move the selection
+    /// back to that session without any input.
+    fn settle_selection_made_while_loading(&mut self) {
+        if self.is_loading() {
+            return;
+        }
+        if let Some(SelectionAnchor::SelectedWhileLoading(path)) = &self.selection_anchor {
+            let is_shown = self.get_selected_path().as_ref() == Some(path);
+            self.selection_anchor = is_shown.then(|| SelectionAnchor::Kept(path.clone()));
+        }
+    }
+
+    /// A key, a click on a row or a wheel turn arrived: clear the selection
+    /// anchor on a loaded list. While the list loads, the anchor stays until
+    /// the load's end.
+    pub(super) fn clear_selection_anchor_on_loaded_list(&mut self) {
+        if !self.is_loading() {
+            self.selection_anchor = None;
+        }
+    }
+
+    /// Select `row` for a key or wheel turn. A key or wheel turn that leaves
+    /// the selection on its row doesn't choose that row.
     pub(super) fn select_row(&mut self, row: usize) {
+        let leaves_selection_on_its_row = self.selected == Some(row);
+        if !leaves_selection_on_its_row {
+            self.choose_row(row);
+        }
+    }
+
+    /// Select the row a click landed on. A click on the selected row chooses
+    /// it too: the user pointed at that session.
+    pub(super) fn click_row(&mut self, row: usize) {
+        self.choose_row(row);
+    }
+
+    /// Select `row` as the user's choice. While the list loads, anchor the
+    /// selection to the row's session, so the load's end keeps it selected.
+    fn choose_row(&mut self, row: usize) {
         self.selected = Some(row);
-        self.selection_anchor = None;
+        if self.is_loading() {
+            self.selection_anchor = self
+                .get_selected_path()
+                .map(SelectionAnchor::SelectedWhileLoading);
+        }
     }
 
     pub(super) fn select_prev(&mut self) {
@@ -78,7 +142,6 @@ impl App {
 
     /// Move the selection `delta` rows, stopping at the first and last row.
     pub(super) fn move_selection_by(&mut self, delta: isize) {
-        self.selection_anchor = None;
         let Some(selected) = self.selected else {
             return;
         };

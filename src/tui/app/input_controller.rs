@@ -128,7 +128,7 @@ impl App {
         modifiers: KeyModifiers,
         viewport_height: usize,
     ) -> Option<Action> {
-        self.selection_anchor = None;
+        self.clear_selection_anchor_on_loaded_list();
         match self.dialog_mode {
             DialogMode::ConfirmDelete => return self.handle_confirm_key(code),
             DialogMode::ActionsMenu { .. } => {

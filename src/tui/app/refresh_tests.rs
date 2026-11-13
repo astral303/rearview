@@ -49,16 +49,42 @@ fn app_listing(rows: Vec<Conversation>) -> App {
     app_reading(rows, test_environment(Vec::new(), None))
 }
 
-fn listed_names(app: &App) -> Vec<&str> {
+pub(super) fn listed_names(app: &App) -> Vec<&str> {
     app.filtered()
         .iter()
         .map(|&index| app.conversations()[index].session_id.as_str())
         .collect()
 }
 
-fn selected_name(app: &App) -> Option<&str> {
+pub(super) fn selected_name(app: &App) -> Option<&str> {
     app.get_selected_conversation_index()
         .map(|index| app.conversations()[index].session_id.as_str())
+}
+
+/// The sender of `app`'s search results, in place of its search worker's.
+fn take_over_search_results(app: &mut App) -> std::sync::mpsc::Sender<SearchResponse> {
+    let (results, search_rx) = std::sync::mpsc::channel();
+    app.search_rx = search_rx;
+    results
+}
+
+/// Answer `app`'s current search with the rows at `filtered`, through
+/// `results` from [`take_over_search_results`].
+fn answer_search(
+    app: &mut App,
+    results: &std::sync::mpsc::Sender<SearchResponse>,
+    filtered: Vec<usize>,
+) {
+    results
+        .send(SearchResponse {
+            filtered,
+            generation: app.search_generation(),
+            mode: ListSearchMode::Lexical,
+            evidence: std::collections::HashMap::new(),
+            is_exact_literal: false,
+        })
+        .unwrap();
+    assert!(app.receive_search_results(), "the app applies the results");
 }
 
 fn new_session(row: Conversation) -> UpdatedSession {
@@ -167,7 +193,7 @@ fn selection_moves_to_first_row_when_its_session_is_removed() {
 }
 
 #[test]
-fn wheel_turn_while_search_shows_no_rows_ends_selection_kept_by_refresh() {
+fn wheel_turn_while_search_doesnt_show_any_rows_stops_keeping_selection_after_refresh() {
     let mut app = app_listing(vec![session("c", "c", 20, 1), session("b", "b", 10, 1)]);
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
     app.apply_session_changes(SessionChanges {
@@ -175,25 +201,14 @@ fn wheel_turn_while_search_shows_no_rows_ends_selection_kept_by_refresh() {
         ..Default::default()
     });
     assert_eq!(selected_name(&app), Some("b"));
-    let (results, search_rx) = std::sync::mpsc::channel();
-    app.search_rx = search_rx;
-    let answer = |app: &mut App, filtered: Vec<usize>| {
-        results
-            .send(SearchResponse {
-                filtered,
-                generation: app.search_generation(),
-                mode: ListSearchMode::Lexical,
-                evidence: std::collections::HashMap::new(),
-                is_exact_literal: false,
-            })
-            .unwrap();
-        assert!(app.receive_search_results());
-    };
-    answer(&mut app, Vec::new());
+    // A stand-in for the search worker answers without any rows, then with
+    // every row.
+    let results = take_over_search_results(&mut app);
+    answer_search(&mut app, &results, Vec::new());
     assert_eq!(selected_name(&app), None);
 
     app.scroll_mouse(1, 10);
-    answer(&mut app, vec![0, 1, 2]);
+    answer_search(&mut app, &results, vec![0, 1, 2]);
 
     assert_eq!(listed_names(&app), ["d", "c", "b"]);
     assert_eq!(
