@@ -823,6 +823,15 @@ pub(super) mod tests {
             IdCase::Insensitive
         }
 
+        fn generated_title_writer(&self) -> Option<fn(&Path, &str)> {
+            Some(|locator, title| {
+                crate::history::provider::contract_tests::rewrite_json_fields(
+                    &locator.with_file_name(crate::history::format::grok::SUMMARY_FILE),
+                    serde_json::json!({"generated_title": title, "title_is_manual": false}),
+                );
+            })
+        }
+
         fn root_under(&self, home: &Path) -> SessionRoot {
             SessionRoot::new(sessions_under(home)).in_agent_tree()
         }

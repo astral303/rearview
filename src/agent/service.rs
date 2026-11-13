@@ -5732,69 +5732,6 @@ mod tests {
         assert_eq!(admitted_reads::count(&locator) - before, 1);
     }
 
-    /// `agent within` of a session renamed outside its unchanged transcript
-    /// after its copy was written shows the name the list shows, whether the
-    /// command keeps the cache or reads it while another rearview keeps it,
-    /// for each rename an agent writes.
-    #[test]
-    fn within_of_session_renamed_outside_its_transcript_shows_new_name() {
-        use history::provider::contract_tests::{EXTERNAL_TITLE_RENAMES, name_session};
-        let mut wrong = Vec::new();
-        for (source, first, second) in EXTERNAL_TITLE_RENAMES {
-            let case = format!("{source:?} {first:?} then {second:?}");
-            let fixture = history::provider::contract_tests::registered_fixtures()
-                .into_iter()
-                .find(|fixture| fixture.provider().source() == source)
-                .unwrap();
-            let home = tempfile::tempdir().unwrap();
-            fixture.write_every_record_session(home.path(), &fixture.every_record_session());
-            let [stub] = <[_; 1]>::try_from(fixture.discover_under(home.path())).unwrap();
-            let locator = stub.locator;
-            name_session(source, &locator, "Zebrafish plans", first);
-            let storage =
-                history::provider::contract_tests::kept_storage_under(fixture, home.path());
-            let cache = crate::tui::claude_home::admitted_cache();
-            let run = |args: &[&str]| {
-                AgentService::new(test_environment(vec![storage], Some(cache.path())))
-                    .execute(agent_command(args))
-                    .unwrap_or_else(crate::error_report)
-            };
-            let sessions = run(&["sessions", "--all"]);
-            let reference = sessions
-                .split_whitespace()
-                .find_map(|atom| atom.strip_prefix("ref="))
-                .expect("agent sessions lists the session")
-                .to_owned();
-            name_session(source, &locator, "Yakety release", second);
-
-            let within = ["within", &reference, "the"];
-            let kept = run(&within);
-            let other_refresh = history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
-                &history::CacheBase::new(
-                    cache.path(),
-                    history::ProcessIdentity::default(),
-                    Arc::new(TestClock::default()),
-                    SystemCanonicaliser::shared(),
-                ),
-            )
-            .unwrap();
-            let read_as_is = run(&within);
-            drop(other_refresh);
-
-            for (access, output) in [
-                ("keeping the cache", kept),
-                ("reading the cache as it is", read_as_is),
-            ] {
-                if !output.contains("Yakety release") || output.contains("Zebrafish") {
-                    wrong.push(format!(
-                        "{case}, {access}: the hits show the new name:\n{output}"
-                    ));
-                }
-            }
-        }
-        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
-    }
-
     /// When the write to an empty cache fails, `agent within` titles the hits
     /// from the read's row, the title kept outside the transcript included.
     #[test]

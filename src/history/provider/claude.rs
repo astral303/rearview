@@ -892,6 +892,15 @@ pub(crate) mod tests {
             IdCase::Insensitive
         }
 
+        fn generated_title_writer(&self) -> Option<fn(&Path, &str)> {
+            Some(|locator, title| {
+                append_lines(
+                    locator,
+                    &[json!({"type": "ai-title", "aiTitle": title}).to_string()],
+                );
+            })
+        }
+
         fn root_under(&self, home: &Path) -> SessionRoot {
             SessionRoot::new(projects_under(home))
         }

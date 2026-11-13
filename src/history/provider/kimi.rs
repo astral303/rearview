@@ -839,6 +839,21 @@ pub(super) mod tests {
             IdCase::Insensitive
         }
 
+        fn generated_title_writer(&self) -> Option<fn(&Path, &str)> {
+            Some(|locator, title| {
+                crate::history::provider::contract_tests::rewrite_json_fields(
+                    &crate::history::format::kimi::wire_location(locator)
+                        .session_dir
+                        .join("state.json"),
+                    serde_json::json!({
+                        "title": title,
+                        "titleKind": "generated",
+                        "isCustomTitle": false,
+                    }),
+                );
+            })
+        }
+
         fn root_under(&self, home: &Path) -> SessionRoot {
             SessionRoot::new(home.join("sessions")).in_agent_tree()
         }
