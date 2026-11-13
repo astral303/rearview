@@ -1080,6 +1080,7 @@ pub fn transcript(messages: Vec<AgentMessage>, path: &str) -> AgentTranscript {
         malformed_lines: Vec::new(),
         summary: None,
         custom_title: None,
+        preview: None,
     }
 }
 

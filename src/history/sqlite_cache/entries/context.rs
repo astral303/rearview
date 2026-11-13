@@ -110,10 +110,10 @@ pub(super) fn read(
             row.get::<_, i64>(0).map(|line| line as usize)
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let (summary, custom_title) = connection.query_row(
-        "SELECT summary, custom_title FROM sessions WHERE id = ?1",
+    let (summary, custom_title, preview) = connection.query_row(
+        "SELECT summary, custom_title, preview_first FROM sessions WHERE id = ?1",
         params![session],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     Ok(AgentTranscript {
         path: path.to_path_buf(),
@@ -121,6 +121,7 @@ pub(super) fn read(
         malformed_lines,
         summary,
         custom_title,
+        preview,
     })
 }
 
