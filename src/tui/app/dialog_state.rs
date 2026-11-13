@@ -4,6 +4,7 @@ use super::view_state::DeferredCopy;
 use super::{Action, App, AppMode, DialogMode};
 use crate::error::Result;
 use crate::history::DisplayEntries;
+use crate::history::provider::{RenamedTitle, TitleAndSummary};
 use crate::tui::list_change::ListChange;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::path::Path;
@@ -227,23 +228,39 @@ impl App {
 
     /// Show the session at `path` renamed to `title`, or report why the
     /// rename failed and keep the name box open.
-    pub(super) fn finish_rename(&mut self, path: &Path, title: &str, result: Result<()>) {
+    pub(super) fn finish_rename(&mut self, path: &Path, title: &str, result: Result<RenamedTitle>) {
         match result {
-            Ok(()) => {
+            Ok(renamed) => {
                 if let Some(idx) = self.conversations.iter().position(|row| row.path == path) {
-                    self.show_renamed_session(idx, title);
+                    self.show_renamed_session(idx, title, &renamed);
                 }
             }
             Err(e) => self.set_status(format!("Failed to rename: {}", e)),
         }
     }
 
-    /// Show row `idx` renamed to `title`, keeping it selected. The row shows
-    /// `title` at once and a session refresh reads the session again.
-    pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str) {
-        let path = self.conversations[idx].path.clone();
-        self.conversations[idx].custom_title =
-            Some(title.to_owned()).filter(|title| !title.is_empty());
+    /// Show row `idx` renamed to `title`, keeping it selected. `renamed` is
+    /// the place the rename put the title. The row and the open viewer's
+    /// header show the agent's new name at once, and a session refresh reads
+    /// the session again.
+    pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str, renamed: &RenamedTitle) {
+        let row = &mut self.conversations[idx];
+        let path = row.path.clone();
+        let shown = renamed.shown(
+            title,
+            &TitleAndSummary {
+                custom_title: row.custom_title.take(),
+                summary: row.summary.take(),
+            },
+        );
+        row.custom_title = shown.custom_title;
+        row.summary = shown.summary;
+        row.external_title = renamed.outside_transcript(row.external_title.as_ref());
+        if let AppMode::View(state) = &mut self.app_mode
+            && state.conversation_path == path
+        {
+            state.show_renamed(title, renamed);
+        }
         self.store.request_session_refresh(&path);
         self.dialog_mode = DialogMode::None;
         self.set_status("Session renamed".to_string());

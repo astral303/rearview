@@ -108,10 +108,6 @@ pub struct ViewState {
     /// of the copy the view shows, or the open session's row while the view
     /// doesn't show a copy. `None` shows the file name alone.
     pub header: Option<HeaderRow>,
-    /// The title stored beside the transcript that the open session's row
-    /// shows, as the list or the last refresh read it. The header shows it
-    /// over the copy's catalogue row, which holds the title from its parse.
-    pub external_title: Option<crate::history::provider::SessionTitle>,
     /// The open view's conversation as parsed; empty until a file opened
     /// directly is read.
     pub parsed_conversation: Arc<ParsedConversation>,
@@ -294,7 +290,6 @@ impl ViewState {
                 discovered: Vec::new(),
             },
             header: None,
-            external_title: None,
             parsed_conversation: Arc::new(ParsedConversation::empty()),
             scroll_offset: 0,
             rendered_lines: Vec::new(),

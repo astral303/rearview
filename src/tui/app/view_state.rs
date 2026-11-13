@@ -3,7 +3,7 @@ use super::{
     App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, OpenSessionStatus, ViewSearchMode,
     ViewState,
 };
-use crate::history::provider::{SessionRead, SessionTitle};
+use crate::history::provider::{RenamedTitle, SessionRead, SessionTitle, TitleAndSummary};
 use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
 use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
@@ -13,7 +13,7 @@ use crate::tui::viewer::{
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -59,28 +59,69 @@ impl ViewState {
     /// shows, or `reloaded`'s row while the view doesn't show a copy.
     fn show_reloaded_row(&mut self, reloaded: ReloadedHeader, copy_row: Option<Box<Conversation>>) {
         if let Some(row) = reloaded.row {
-            self.external_title = reloaded.external_title;
             self.header = Some(row);
         }
         self.publication = reloaded.publication;
-        self.adopt(reloaded.adopted);
-        self.show_copy_header(copy_row);
-    }
-
-    /// Read the open session's copies against `adopted`'s publication, when
-    /// the read adopted a copy.
-    fn adopt(&mut self, adopted: Option<AdoptedCopy>) {
-        if let Some(adopted) = adopted {
-            self.publication = adopted.publication;
-        }
+        self.show_copy_header_and_adopt(
+            copy_row,
+            reloaded.external_title.as_ref(),
+            reloaded.adopted,
+        );
     }
 
     /// Show `copy_row`, the catalogue row of the copy the view shows, as the
-    /// header, with the row's external title: the copy holds its parse's
-    /// title. Without a row, the header stays as it is.
-    fn show_copy_header(&mut self, copy_row: Option<Box<Conversation>>) {
-        if let Some(copy_row) = copy_row {
-            self.header = Some(HeaderRow::of_copy(*copy_row, self.external_title.as_ref()));
+    /// header, and read the open session's copies against `adopted`'s
+    /// publication. Without a row, the header stays as it is.
+    ///
+    /// The header keeps the row's title and summary: a rename in rearview
+    /// sets them before the copy has the new name. A copy the read adopted
+    /// in the row's place names the session instead, with `external_title`,
+    /// the title the row shows from beside the transcript, over its parse's
+    /// title.
+    fn show_copy_header_and_adopt(
+        &mut self,
+        copy_row: Option<Box<Conversation>>,
+        external_title: Option<&SessionTitle>,
+        adopted: Option<AdoptedCopy>,
+    ) {
+        let is_adopted = adopted.is_some();
+        if let Some(adopted) = adopted {
+            self.publication = adopted.publication;
+        }
+        let Some(copy_row) = copy_row else {
+            return;
+        };
+        let mut header = HeaderRow::of_copy(*copy_row, external_title);
+        if !is_adopted && let Some(row) = &self.header {
+            header.custom_title = row.custom_title.clone();
+            header.summary = row.summary.clone();
+        }
+        self.header = Some(header);
+    }
+
+    /// Show the open session renamed to `title`, as its row shows it.
+    /// `renamed` is the place the rename put the title.
+    pub(super) fn show_renamed(&mut self, title: &str, renamed: &RenamedTitle) {
+        if let Some(header) = &mut self.header {
+            let shown = renamed.shown(
+                title,
+                &TitleAndSummary {
+                    custom_title: header.custom_title.take(),
+                    summary: header.summary.take(),
+                },
+            );
+            header.custom_title = shown.custom_title;
+            header.summary = shown.summary;
+        }
+    }
+
+    /// Show `title`, the title kept beside the open session's transcript, in
+    /// the header, as [`TitleAndSummary::shown`] decides.
+    fn show_retitled(&mut self, title: &SessionTitle) {
+        if let Some(header) = &mut self.header {
+            let shown = TitleAndSummary::shown(&TitleAndSummary::default(), Some(title));
+            header.custom_title = shown.custom_title;
+            header.summary = shown.summary;
         }
     }
 }
@@ -264,12 +305,17 @@ enum OpenSessionRead {
     Gone(&'static str),
     /// The read or the whole refresh failed, with the status to show.
     Failed(String),
+    /// A list refresh read the title kept beside the transcript without
+    /// reading the session again. The list's row shows the title once the
+    /// list applies the refresh.
+    Retitled(SessionTitle),
 }
 
 impl OpenSessionRead {
-    /// `finished`'s read of the session at `path`; `None` when it didn't read
-    /// that session.
-    fn in_finished(finished: &FinishedRefresh, path: &Path) -> Option<Self> {
+    /// `finished`'s read of the session `state` shows; `None` when it read
+    /// neither that session nor its title.
+    fn in_finished(finished: &FinishedRefresh, state: &ViewState) -> Option<Self> {
+        let path = state.conversation_path.as_path();
         match finished {
             FinishedRefresh::Failed(error) => Some(Self::refresh_failed(error)),
             FinishedRefresh::Reads(reads) => {
@@ -298,11 +344,20 @@ impl OpenSessionRead {
                 if changes.removed.iter().any(|removed| removed == path) {
                     return Some(Self::Gone("Session not found"));
                 }
-                let kept = changes.kept.iter().find(|kept| kept.path == path)?;
-                Some(match kept.next.write_error() {
-                    Some(error) => Self::refresh_failed(error),
-                    None => Self::read_failed(),
-                })
+                if let Some(kept) = changes.kept.iter().find(|kept| kept.path == path) {
+                    return Some(match kept.next.write_error() {
+                        Some(error) => Self::refresh_failed(error),
+                        None => Self::read_failed(),
+                    });
+                }
+                let (Some(source), Some(session_id)) =
+                    (state.conversation_source, &state.session_id)
+                else {
+                    return None;
+                };
+                changes
+                    .external_title_of(source, session_id)
+                    .map(|title| Self::Retitled(title.clone()))
             }
         }
     }
@@ -401,7 +456,6 @@ impl App {
             session_id: Some(session_id),
             publication,
             header: Some(header),
-            external_title,
             parsed_conversation: conversation,
             scroll_offset: 0,
             rendered_lines: rendered.lines,
@@ -423,8 +477,7 @@ impl App {
             count_highlight: None,
             is_copy_missing,
         };
-        state.adopt(adopted);
-        state.show_copy_header(copy_row);
+        state.show_copy_header_and_adopt(copy_row, external_title.as_ref(), adopted);
         self.app_mode = AppMode::View(state);
     }
 
@@ -507,7 +560,7 @@ impl App {
         let read = self
             .store
             .newest_finished()
-            .and_then(|finished| OpenSessionRead::in_finished(finished, &state.conversation_path));
+            .and_then(|finished| OpenSessionRead::in_finished(finished, state));
         match read {
             Some(OpenSessionRead::Listed(reloaded)) => {
                 let cache = self.interactive_cache();
@@ -527,6 +580,11 @@ impl App {
             Some(OpenSessionRead::Failed(status)) => {
                 self.set_status(status);
                 self.run_deferred_copy();
+            }
+            Some(OpenSessionRead::Retitled(title)) => {
+                if let AppMode::View(state) = &mut self.app_mode {
+                    state.show_retitled(&title);
+                }
             }
             None => {}
         }

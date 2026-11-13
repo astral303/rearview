@@ -4,11 +4,11 @@
 
 use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
-    Capability, Deleted, DenialDetail, DiscoveredSessions, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
-    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder, TranscriptReader,
-    resolved_session_paths, retain_index_records, walk, write_atomically,
+    Capability, Deleted, DenialDetail, DiscoveredSessions, RefNamespaces, RenamedTitle,
+    ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
+    SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
+    SessionStorage, SessionStub, SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder,
+    TranscriptReader, resolved_session_paths, retain_index_records, walk, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -119,7 +119,7 @@ impl SessionRenamer for KimiProvider {
         path: &Path,
         title: &str,
         _renamed_at: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<RenamedTitle> {
         format::require_owned_transcript(permit, Source::Kimi, path)?;
         let session_dir = owned_session_dir(path).ok_or_else(|| {
             AppError::ConfigError(format!(
@@ -127,7 +127,8 @@ impl SessionRenamer for KimiProvider {
                 path.display()
             ))
         })?;
-        rewrite_state_title(&session_dir.join("state.json"), title)
+        let title = rewrite_state_title(&session_dir.join("state.json"), title)?;
+        Ok(RenamedTitle::OutsideTranscript(title))
     }
 }
 
@@ -297,8 +298,9 @@ fn remove_wire(session_dir: &Path, wire: &Path) -> Result<()> {
 /// Set the session's title in `state.json`, preserving every field this
 /// browser does not understand. `isCustomTitle` is the legacy spelling of
 /// "the user chose this name", `titleKind` the current one; both are written
-/// so either Kimi version reads the rename.
-fn rewrite_state_title(state_path: &Path, title: &str) -> Result<()> {
+/// so either Kimi version reads the rename. Returns the title in the
+/// rewritten file.
+fn rewrite_state_title(state_path: &Path, title: &str) -> Result<Option<SessionTitle>> {
     let contents = std::fs::read_to_string(state_path).map_err(|error| {
         AppError::Io(std::io::Error::new(
             error.kind(),
@@ -316,7 +318,8 @@ fn rewrite_state_title(state_path: &Path, title: &str) -> Result<()> {
     object.insert("title".to_owned(), json!(cleaned));
     object.insert("isCustomTitle".to_owned(), json!(true));
     object.insert("titleKind".to_owned(), json!("custom"));
-    write_atomically(state_path, serde_json::to_string(&value)?.as_bytes())
+    write_atomically(state_path, serde_json::to_string(&value)?.as_bytes())?;
+    Ok(kimi::parse_state(&value).session_title())
 }
 
 /// Drop the session's record from `session_index.jsonl`, atomically. A stale
@@ -429,13 +432,8 @@ impl SessionStorage for KimiStorage {
             };
             for session in sessions {
                 let state = kimi::session_state(&session);
-                let (Some(title), Some(name)) = (state.title, session.file_name()) else {
+                let (Some(title), Some(name)) = (state.session_title(), session.file_name()) else {
                     continue;
-                };
-                let title = if state.title_is_custom {
-                    SessionTitle::Custom(title)
-                } else {
-                    SessionTitle::Generated(title)
                 };
                 titles.insert(name.to_string_lossy().into_owned(), title);
             }
@@ -839,6 +837,21 @@ pub(super) mod tests {
 
         fn id_case(&self) -> IdCase {
             IdCase::Insensitive
+        }
+
+        fn generated_title_writer(&self) -> Option<fn(&Path, &str)> {
+            Some(|locator, title| {
+                crate::history::provider::contract_tests::rewrite_json_fields(
+                    &crate::history::format::kimi::wire_location(locator)
+                        .session_dir
+                        .join("state.json"),
+                    serde_json::json!({
+                        "title": title,
+                        "titleKind": "generated",
+                        "isCustomTitle": false,
+                    }),
+                );
+            })
         }
 
         fn root_under(&self, home: &Path) -> SessionRoot {

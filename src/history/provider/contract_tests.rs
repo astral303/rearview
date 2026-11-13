@@ -25,7 +25,7 @@ use super::walk::test_support::{
 use super::walk::{DirectoryLister, SystemLister};
 use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, ListedFor, Operation,
-    ResolvedSession, RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch,
+    RenamedTitle, ResolvedSession, RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch,
     SessionProvider, SessionRead, SessionRenamer, SessionRoot, SessionStorage, SessionStub,
     SessionTitle, Stored, SubagentFinder, ThreadLinker, TitleAndSummary, TranscriptReader,
 };
@@ -55,6 +55,7 @@ enum Contract {
     SubagentDeleteCount,
     SubagentsNotCapable,
     WarmCacheRename,
+    RenameReturnsTitle,
     SessionIdLookup,
     SessionIdLookupMatchesDiscovery,
     UnknownIdLookup,
@@ -105,7 +106,7 @@ impl Contract {
             Self::ForkCommand => fork,
             Self::ForkNotCapable => !fork,
             Self::WorkspaceSessionsDir => provider.workspace_sessions_dir().is_capable(),
-            Self::WarmCacheRename => rename,
+            Self::WarmCacheRename | Self::RenameReturnsTitle => rename,
             Self::ForeignFileDelete => delete,
             Self::RootOverride
             | Self::StorageEnvVars
@@ -477,6 +478,12 @@ pub(crate) trait ProviderFixture: Sync {
             Capability::Capable(resolver) => resolver,
             Capability::NotCapable(_) => self.cannot_run("resolve a session id"),
         }
+    }
+
+    /// Writes a title where the agent writes the name it generates for the
+    /// session at a locator; `None` for an agent that doesn't generate one.
+    fn generated_title_writer(&self) -> Option<fn(&Path, &str)> {
+        None
     }
 
     fn renamer(&self) -> &'static dyn SessionRenamer {
@@ -1128,8 +1135,61 @@ fn session_titled_outside_its_transcript_parses_that_title_alone() {
     );
 }
 
-/// The origin of a session's name kept outside its transcript.
-#[derive(Clone, Copy, Debug)]
+/// A rename returns the title the next read of the session shows: the
+/// title kept beside the transcript as `external_titles` reads it, or a
+/// title in the transcript as the next parse reads it. After an empty
+/// rename, an agent can name its generated title. The empty rename clears
+/// the name the first rename chose.
+#[test]
+fn rename_returns_title_next_read_shows() {
+    run_contract(Contract::RenameReturnsTitle, |fixture| {
+        let source = fixture.provider().source();
+        let home = tempfile::tempdir().unwrap();
+        fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+        let [stub] = <[_; 1]>::try_from(fixture.discover_under(home.path()))
+            .unwrap_or_else(|stubs| panic!("one session in the home: {stubs:?}"));
+        let root = fixture.root_under(home.path());
+        for title in ["Chosen name", ""] {
+            let renamed = fixture
+                .renamer()
+                .rename_session(
+                    crate::history::FOR_FIXTURES,
+                    &stub.locator,
+                    title,
+                    TestClock::default().wall(),
+                )
+                .unwrap();
+
+            let (_, row) =
+                crate::history::sqlite_cache::tests::parsed_record_and_row(source, &root, &stub);
+            let outside = fixture
+                .storage()
+                .external_titles(&root)
+                .remove(&row.session_id);
+            match renamed {
+                RenamedTitle::OutsideTranscript(returned) => assert_eq!(
+                    returned, outside,
+                    "{title:?}: the rename returns the title kept beside the transcript"
+                ),
+                RenamedTitle::InTranscript => {
+                    assert_eq!(
+                        outside, None,
+                        "{title:?}: the agent doesn't keep a title beside the transcript"
+                    );
+                    assert_eq!(
+                        row.custom_title.as_deref(),
+                        Some(title).filter(|title| !title.is_empty()),
+                        "{title:?}: the next parse reads the title, and none after an empty \
+                         rename"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// The origin of a session's name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Naming {
     /// The user chose it, through the agent's renamer.
     Chosen,
@@ -1137,55 +1197,51 @@ pub(crate) enum Naming {
     Generated,
 }
 
-/// Each rename of a name kept outside the transcript that an agent writes:
-/// the agent, how it names the session first, then how it renames it.
-pub(crate) const EXTERNAL_TITLE_RENAMES: [(Source, Naming, Naming); 7] = [
-    (Source::Codex, Naming::Chosen, Naming::Chosen),
-    (Source::Kimi, Naming::Chosen, Naming::Chosen),
-    (Source::Kimi, Naming::Generated, Naming::Chosen),
-    (Source::Kimi, Naming::Chosen, Naming::Generated),
-    (Source::Grok, Naming::Chosen, Naming::Chosen),
-    (Source::Grok, Naming::Generated, Naming::Chosen),
-    (Source::Grok, Naming::Chosen, Naming::Generated),
-];
-
-/// Writes `title` where the agent does: a chosen one through its renamer, a
-/// generated one into the file beside the transcript.
-pub(crate) fn name_session(source: Source, locator: &Path, title: &str, naming: Naming) {
-    let rewrite = |file: &Path, fields: serde_json::Value| {
-        let mut value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
-        for (field, text) in fields.as_object().unwrap() {
-            value[field] = text.clone();
-        }
-        std::fs::write(file, value.to_string()).unwrap();
-    };
-    match (naming, source) {
-        (Naming::Chosen, _) => {
-            let Capability::Capable(renamer) = source.provider().rename() else {
-                panic!("{source:?} renames a session");
-            };
-            renamer
-                .rename_session(
-                    crate::history::FOR_FIXTURES,
-                    locator,
-                    title,
-                    chrono::Utc::now(),
-                )
-                .unwrap();
-        }
-        (Naming::Generated, Source::Kimi) => rewrite(
-            &crate::history::format::kimi::wire_location(locator)
-                .session_dir
-                .join("state.json"),
-            serde_json::json!({"title": title, "titleKind": "generated", "isCustomTitle": false}),
-        ),
-        (Naming::Generated, Source::Grok) => rewrite(
-            &locator.with_file_name(crate::history::format::grok::SUMMARY_FILE),
-            serde_json::json!({"generated_title": title, "title_is_manual": false}),
-        ),
-        (Naming::Generated, source) => panic!("{source:?} doesn't generate a title"),
+impl Naming {
+    /// Each way `fixture`'s agent names a session.
+    pub(crate) fn every_one_of(fixture: &dyn ProviderFixture) -> Vec<Self> {
+        let chosen = fixture
+            .provider()
+            .rename()
+            .is_capable()
+            .then_some(Self::Chosen);
+        let generated = fixture.generated_title_writer().map(|_| Self::Generated);
+        chosen.into_iter().chain(generated).collect()
     }
+
+    /// Writes `title` as `fixture`'s agent writes a name of this origin for
+    /// the session at `locator`.
+    pub(crate) fn name(self, fixture: &dyn ProviderFixture, locator: &Path, title: &str) {
+        match self {
+            Self::Chosen => {
+                fixture
+                    .renamer()
+                    .rename_session(
+                        crate::history::FOR_FIXTURES,
+                        locator,
+                        title,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap();
+            }
+            Self::Generated => {
+                let write = fixture
+                    .generated_title_writer()
+                    .expect("the agent generates names");
+                write(locator, title);
+            }
+        }
+    }
+}
+
+/// Sets each of `fields` in the JSON object in the file at `path`.
+pub(crate) fn rewrite_json_fields(path: &Path, fields: serde_json::Value) {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    for (field, text) in fields.as_object().unwrap() {
+        value[field] = text.clone();
+    }
+    std::fs::write(path, value.to_string()).unwrap();
 }
 
 #[test]

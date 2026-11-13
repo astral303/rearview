@@ -106,7 +106,11 @@ fn rename_with_active_query_doesnt_wait_for_another_processs_rebuild() {
     let rebuild = AnotherRearviewsOwner::start(base.path(), OwnerActivity::InsideRebuild);
 
     let started = Instant::now();
-    app.show_renamed_session(0, "Renamed");
+    app.show_renamed_session(
+        0,
+        "Renamed",
+        &crate::history::provider::RenamedTitle::InTranscript,
+    );
 
     assert!(
         started.elapsed() < WITHOUT_WAITING,
@@ -264,7 +268,11 @@ fn rename_the_selected_session(app: &mut App, _session_id: &str) {
         matches!(app.begin_list_change(), Some(ListChange::Rename { .. })),
         "the rename confirmation requests a rename"
     );
-    app.show_renamed_session(0, "Renamed");
+    app.show_renamed_session(
+        0,
+        "Renamed",
+        &crate::history::provider::RenamedTitle::InTranscript,
+    );
 }
 
 /// The actions menu's Delete and its confirmation, handed on as the runtime

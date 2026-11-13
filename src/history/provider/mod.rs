@@ -305,7 +305,49 @@ pub trait SessionRenamer: Sync {
         path: &Path,
         title: &str,
         renamed_at: DateTime<Utc>,
-    ) -> Result<()>;
+    ) -> Result<RenamedTitle>;
+}
+
+/// The place a rename put a session's title, for a caller that shows the
+/// title before reading the session again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RenamedTitle {
+    /// In the transcript: the next parse reads the title as typed, or with
+    /// line breaks replaced by spaces and its ends trimmed.
+    InTranscript,
+    /// Beside the transcript: the title
+    /// [`external_titles`](SessionStorage::external_titles) now reads for
+    /// the session, as the agent stores it; `None` when it doesn't read a
+    /// title.
+    OutsideTranscript(Option<SessionTitle>),
+}
+
+impl RenamedTitle {
+    /// The title and summary a session renamed to `title` shows, from
+    /// `before`, what it showed before. A rename in the transcript keeps the
+    /// summary the agent generated. A title kept beside the transcript
+    /// replaces both, because that agent's parse doesn't provide another
+    /// title or summary.
+    pub fn shown(&self, title: &str, before: &TitleAndSummary) -> TitleAndSummary {
+        match self {
+            Self::InTranscript => TitleAndSummary {
+                custom_title: Some(title.to_owned()).filter(|title| !title.is_empty()),
+                summary: before.summary.clone(),
+            },
+            Self::OutsideTranscript(outside) => {
+                TitleAndSummary::shown(&TitleAndSummary::default(), outside.as_ref())
+            }
+        }
+    }
+
+    /// The title kept beside the transcript after the rename, from `before`,
+    /// the one kept before it.
+    pub fn outside_transcript(&self, before: Option<&SessionTitle>) -> Option<SessionTitle> {
+        match self {
+            Self::InTranscript => before.cloned(),
+            Self::OutsideTranscript(outside) => outside.clone(),
+        }
+    }
 }
 
 /// Deletes a session, for a provider declaring [`SessionProvider::delete`]

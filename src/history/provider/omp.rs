@@ -3,10 +3,10 @@
 
 use super::walk::{DirectoryLister, DiscoveryLister, FileRoot, SessionFiles, SystemLister};
 use super::{
-    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
-    RootOrigin, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
-    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
-    SourceLabels, SubagentFinder, TranscriptReader, walk,
+    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RenamedTitle,
+    RootEnvironment, RootOrigin, SessionCache, SessionDeleter, SessionForker, SessionIdResolver,
+    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
+    SessionsDirLookup, SourceLabels, SubagentFinder, TranscriptReader, walk,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -108,8 +108,9 @@ impl SessionRenamer for OmpProvider {
         path: &Path,
         title: &str,
         renamed_at: DateTime<Utc>,
-    ) -> Result<()> {
-        pi_log::append_omp_session_rename(permit, path, title, renamed_at)
+    ) -> Result<RenamedTitle> {
+        pi_log::append_omp_session_rename(permit, path, title, renamed_at)?;
+        Ok(RenamedTitle::InTranscript)
     }
 }
 

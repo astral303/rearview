@@ -86,6 +86,10 @@
   session's old name after a rename, and missing the new one, until its
   transcript changed. A Grok Build or Kimi Code session renamed from its
   generated title no longer shows that title beside its new name.
+- Fix the viewer's header showing a session's old name after a rename. It
+  now shows the new name as soon as a rename (`F2`) is done, and when a list
+  refresh (`Ctrl+R`) finds a Codex, Grok Build or Kimi Code session renamed
+  in its agent.
 - Fix an unassigned Ctrl key combination typing its letter into the list's
   query or the viewer's search.
 - Fix open (`Enter` or a click on a row) giving no feedback while the list

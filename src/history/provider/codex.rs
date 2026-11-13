@@ -6,7 +6,7 @@ use super::subagents::SubagentForest;
 use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister, Transcripts};
 use super::{
     Capability, Deleted, DiscoveredSessions, IgnoredSessions, ReadError, RefNamespaces,
-    ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
+    RenamedTitle, ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
     SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
     SessionStorage, SessionStub, SessionTitle, SessionsDirLookup, SourceLabels, Stored,
     SubagentFinder, ThreadLinker, TranscriptReader, resolved_session_paths, walk,
@@ -119,9 +119,18 @@ impl SessionRenamer for CodexProvider {
         path: &Path,
         title: &str,
         renamed_at: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<RenamedTitle> {
         format::require_owned_transcript(permit, Source::Codex, path)?;
-        append_index_record(path, &thread_id_of(path)?, title, renamed_at)
+        let name = codex::thread_name(title);
+        append_index_record(
+            path,
+            &thread_id_of(path)?,
+            name.as_deref().unwrap_or_default(),
+            renamed_at,
+        )?;
+        Ok(RenamedTitle::OutsideTranscript(
+            name.map(SessionTitle::Custom),
+        ))
     }
 }
 
@@ -748,7 +757,7 @@ fn thread_id_of(path: &Path) -> Result<String> {
 fn append_index_record(
     path: &Path,
     thread_id: &str,
-    title: &str,
+    thread_name: &str,
     updated_at: DateTime<Utc>,
 ) -> Result<()> {
     let index = codex::session_index_path(path).ok_or_else(|| {
@@ -759,7 +768,7 @@ fn append_index_record(
     })?;
     let record = json!({
         "id": thread_id,
-        "thread_name": title.replace(['\r', '\n'], " ").trim(),
+        "thread_name": thread_name,
         "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
     });
     let mut file = std::fs::OpenOptions::new()

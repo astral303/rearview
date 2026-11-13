@@ -1109,3 +1109,6 @@ mod listing_tests;
 
 #[cfg(test)]
 mod viewer_refresh_tests;
+
+#[cfg(test)]
+mod shown_name_tests;

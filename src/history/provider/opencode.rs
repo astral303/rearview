@@ -6,7 +6,7 @@ use super::sqlite::{self, SchemaPin, database_error};
 use super::subagents::SubagentForest;
 use super::{
     Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, RefNamespaces,
-    ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
+    RenamedTitle, ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
     SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
     SessionStorage, SessionStub, SessionsDirLookup, SourceLabels, Stored, SubagentFinder,
     TranscriptReader, resolved_session_paths,
@@ -127,7 +127,7 @@ impl SessionRenamer for OpenCodeProvider {
         path: &Path,
         title: &str,
         renamed_at: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<RenamedTitle> {
         format::require_owned_transcript(permit, Source::OpenCode, path)?;
         let reference = owned_ref(path)?;
         let database = &reference.database;
@@ -147,7 +147,7 @@ impl SessionRenamer for OpenCodeProvider {
                 )
                 .map_err(fail)?;
         }
-        Ok(())
+        Ok(RenamedTitle::InTranscript)
     }
 }
 

@@ -369,7 +369,11 @@ fn renamed_session_keeps_lists_last_message_preview() {
     let mut app = home.app();
     app.set_show_last(true);
 
-    app.show_renamed_session(0, "Renamed");
+    app.show_renamed_session(
+        0,
+        "Renamed",
+        &crate::history::provider::RenamedTitle::InTranscript,
+    );
     serve_session_refresh(&mut app);
 
     assert_shows_the_last_message_preview(&app.conversations()[0]);
@@ -422,7 +426,11 @@ fn rename_reads_unreadable_session() {
     find_first_row_unreadable(&mut app);
     app.set_show_last(true);
 
-    app.show_renamed_session(0, "Renamed");
+    app.show_renamed_session(
+        0,
+        "Renamed",
+        &crate::history::provider::RenamedTitle::InTranscript,
+    );
     serve_session_refresh(&mut app);
 
     assert_shows_the_last_message_preview(&app.conversations()[0]);
@@ -443,7 +451,11 @@ fn rename_whose_read_fails_shows_saved_title() {
     home.refuse_project();
     renaming(&mut app);
 
-    app.show_renamed_session(0, "Renamed");
+    app.show_renamed_session(
+        0,
+        "Renamed",
+        &crate::history::provider::RenamedTitle::InTranscript,
+    );
 
     assert_eq!(app.dialog_mode, DialogMode::None);
     assert_eq!(
