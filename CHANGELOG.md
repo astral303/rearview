@@ -105,6 +105,9 @@
   such as a second agent's `failed to list <agent> sessions` warning or a
   second `ignored` term.
   Each now prints its own record, and `warnings=` counts it.
+- Fix `agent` commands dropping their warnings when `--budget` is too
+  small for any complete output. They now print on stderr before
+  `budget-too-small`.
 
 ### Changes
 

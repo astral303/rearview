@@ -144,7 +144,8 @@ Sliced output numbers content lines, each below its message's or call's
 record. A `>` marks a matching line, and `...` marks omitted lines between
 match windows. Both options require one single-message ref.
 
-Failures exit nonzero and write one typed compact line to stderr:
+Failures exit nonzero and write one typed compact line to stderr, after any
+warning records:
 
 ```text
 protocol agent-error kind=not-found ref=ch_1234abcd5678 detail=...

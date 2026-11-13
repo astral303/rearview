@@ -1480,13 +1480,14 @@ fn assert_shows_user_question_and_agent_answer(output: &str) {
     );
 }
 
-#[test]
-fn selected_partial_transcript_recovers_records_and_reports_warning() {
-    let config = tempfile::tempdir().expect("config");
-    let transcript = project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl");
+/// Writes a session under `config` and returns its ref. The transcript is
+/// the question `partial transcript needle`, a malformed line, then the
+/// answer.
+fn partial_transcript_reference(config: &Path) -> String {
+    let transcript = project(config).join("12345678-1234-4234-9234-123456789abc.jsonl");
     write_transcript(&transcript, "partial transcript needle");
     let search_text = stdout_of(&run(
-        config.path(),
+        config,
         &["agent", "search", "--lexical", "partial transcript needle"],
     ));
     let reference = first_ref(&search_text);
@@ -1494,6 +1495,13 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
     let (first, second) = content.split_once('\n').expect("two records");
     std::fs::write(&transcript, format!("{first}\n{{malformed\n{second}"))
         .expect("write partial transcript");
+    reference
+}
+
+#[test]
+fn selected_partial_transcript_recovers_records_and_reports_warning() {
+    let config = tempfile::tempdir().expect("config");
+    let reference = partial_transcript_reference(config.path());
 
     let search_stdout = stdout_of(&run(
         config.path(),
@@ -1541,6 +1549,44 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
     assert_shows(&bounded_stdout, "continue read");
     assert!(bounded_stdout.ends_with(&format!("\n{warning_record}\n")));
     assert_eq!(bounded_stdout.lines().count(), 3);
+}
+
+/// The budget is shorter than the warning record alone.
+#[test]
+fn budget_too_small_for_outline_prints_its_warning_before_error() {
+    let config = tempfile::tempdir().expect("config");
+    let reference = partial_transcript_reference(config.path());
+
+    let outline = run(
+        config.path(),
+        &["agent", "outline", &reference, "--budget", "100"],
+    );
+
+    assert!(!outline.status.success(), "the outline fails");
+    assert!(
+        outline.stdout.is_empty(),
+        "the outline prints nothing on stdout"
+    );
+    let stderr = String::from_utf8_lossy(&outline.stderr);
+    let records = stderr
+        .lines()
+        .filter(|line| !line.starts_with("protocol agent-progress "))
+        .map(|line| {
+            line.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records,
+        [
+            "protocol agent-warning kind=malformed-transcript",
+            "protocol agent-error kind=budget-too-small",
+        ],
+        "stderr is the warning record, then the error:\n{stderr}"
+    );
+    assert_shows(&stderr, &format!(" ref={reference} "));
 }
 
 #[test]

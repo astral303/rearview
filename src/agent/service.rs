@@ -1306,7 +1306,7 @@ impl AgentService {
             eprint!("{}", self.perf.records(agent::peak_memory::peak_bytes()));
         }
         output
-            .and_then(CommandOutput::complete)
+            .and_then(CommandOutput::records_if_complete)
             .map_err(protocol_error)
     }
 
@@ -1556,7 +1556,7 @@ impl AgentService {
                 self.clock().local_wall(),
             )
         });
-        CommandOutput { records }
+        CommandOutput { records, warnings }
     }
 
     /// Loads the history and the environment, applies `rules`, adds the
@@ -1591,7 +1591,7 @@ impl AgentService {
             &agent_config,
         );
         let mut selection = self.select_sessions(&rules)?;
-        let records = self.perf.time(Stage::Render, || -> Result<String> {
+        self.perf.time(Stage::Render, || {
             let listing = selection.listing(
                 &rules.window,
                 args.offset,
@@ -1599,14 +1599,14 @@ impl AgentService {
             )?;
             let warnings =
                 self.with_stale_cache_record(std::mem::take(&mut selection.warnings), &listing);
-            Ok(agent::sessions::format_sessions_with_warnings(
+            let records = agent::sessions::format_sessions_with_warnings(
                 &listing,
                 configured_budget(args.no_budget, args.budget, agent_config.output_chars),
                 &warnings,
                 self.clock().local_wall(),
-            ))
-        })?;
-        Ok(CommandOutput { records })
+            );
+            Ok(CommandOutput { records, warnings })
+        })
     }
 
     fn run_within(&self, args: &cli::AgentWithinArgs) -> Result<CommandOutput> {
@@ -1726,7 +1726,7 @@ impl AgentService {
             )
         });
         operation.finish().fail_if_low_space()?;
-        Ok(CommandOutput { records })
+        Ok(CommandOutput { records, warnings })
     }
 }
 
@@ -2539,25 +2539,27 @@ fn target_error(error: AppError, resolved: &agent::refs::ResolvedConversation) -
     }
 }
 
-/// The records a command prints on success.
+/// The records a command prints on success, and the command's warnings, for
+/// its failure when the budget cut the records short.
 #[derive(Debug)]
 pub(crate) struct CommandOutput {
     records: String,
+    warnings: Vec<AgentWarning>,
 }
 
 impl CommandOutput {
-    /// The records; or the `budget-too-small` error when the budget cut them
-    /// short.
-    fn complete(self) -> Result<String> {
+    /// The records; or, when the budget cut them short, the
+    /// `budget-too-small` error printed after the warning records.
+    fn records_if_complete(self) -> Result<String> {
         if self.records.ends_with('\n') {
             return Ok(self.records);
         }
-        Err(AgentError::new(
+        let error = AgentError::new(
             AgentErrorKind::BudgetTooSmall,
             None,
             "output budget cannot fit a complete compact record; increase --budget",
-        )
-        .into())
+        );
+        Err(failure_after_warnings(error.into(), &self.warnings))
     }
 }
 
@@ -2580,18 +2582,17 @@ pub fn protocol_error(error: AppError) -> AppError {
     }
 }
 
-/// `error` printed after `warnings`, the warnings the command met before it
-/// failed, such as the listing failure that explains a reference not found.
+/// `error` printed after the records of the command's `warnings`, as a
+/// successful output prints them. A reference not found follows the
+/// listing failure that explains it.
 fn failure_after_warnings(error: AppError, warnings: &[AgentWarning]) -> AppError {
     if warnings.is_empty() {
         return error;
     }
     match structured_agent_error(error) {
         AppError::Agent(error) => {
-            let mut output: String = warnings
-                .iter()
-                .map(agent::diagnostic::format_warning)
-                .collect();
+            let (_, warning_records) = agent::diagnostic::format_warning_records(warnings);
+            let mut output = warning_records.concat();
             output.push_str(&agent::diagnostic::format_error(&error));
             AppError::AgentProtocol(output)
         }
@@ -3679,7 +3680,7 @@ impl AgentService {
                 None => structured_agent_error(error),
             })?;
         operation.finish().fail_if_low_space()?;
-        Ok(CommandOutput { records })
+        Ok(CommandOutput { records, warnings })
     }
 
     pub(crate) fn run_outline(
@@ -3741,7 +3742,7 @@ impl AgentService {
             })
             .map_err(|error| target_error(error, &resolved))?;
         operation.finish().fail_if_low_space()?;
-        Ok(CommandOutput { records })
+        Ok(CommandOutput { records, warnings })
     }
 }
 
@@ -5115,6 +5116,112 @@ mod tests {
             wrong.is_empty(),
             "each output is complete and ends with the count:\n{}",
             wrong.join("\n")
+        );
+    }
+
+    const BUDGET_TOO_SMALL_RECORD: &str = "protocol agent-error kind=budget-too-small detail=output%20budget%20cannot%20fit%20a%20complete%20compact%20record%3B%20increase%20--budget\n";
+
+    impl CachedClaudeSessions {
+        /// The commands among `sessions`, `search`, `within`, `read` and
+        /// `outline` that, at `budget` and beside another refresh, don't fail
+        /// with the `stale-cache` record of the changed session at
+        /// `reference`, then the `budget-too-small` error; each with what it
+        /// printed.
+        fn commands_not_failing_after_stale_record(
+            &self,
+            reference: &str,
+            budget: usize,
+        ) -> Vec<String> {
+            let expected = format!(
+                "{}{BUDGET_TOO_SMALL_RECORD}",
+                changed_session_record(reference)
+            );
+            let budget = budget.to_string();
+            let commands: [Vec<&str>; 5] = [
+                vec!["sessions", "--all"],
+                vec!["search", "question", "--all"],
+                vec!["within", reference, "question"],
+                vec!["read", reference],
+                vec!["outline", reference],
+            ];
+            commands
+                .iter()
+                .filter_map(|command_args| {
+                    let args: Vec<&str> = command_args
+                        .iter()
+                        .copied()
+                        .chain(["--budget", &budget])
+                        .collect();
+                    match self.execute_beside_another_refresh(&args) {
+                        Ok(output) => Some(format!("{} succeeded:\n{output}", command_args[0])),
+                        Err(error) => {
+                            let failure = crate::error_report(error);
+                            (failure != expected)
+                                .then(|| format!("{} failed with:\n{failure}", command_args[0]))
+                        }
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// The budget is 40 characters longer than the `stale-cache` record: too
+    /// short for the record beside any command's header and first records.
+    #[test]
+    fn every_command_at_budget_below_its_shortest_output_prints_its_warning_before_error() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        sessions.append_to_the_changed_session();
+        let record = changed_session_record(&reference);
+
+        let wrong = sessions
+            .commands_not_failing_after_stale_record(&reference, record.chars().count() + 40);
+
+        assert!(
+            wrong.is_empty(),
+            "each command prints the warning record, then the error:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_command_at_budget_shorter_than_its_warning_prints_warning_whole_before_error() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        sessions.append_to_the_changed_session();
+        let record = changed_session_record(&reference);
+
+        let wrong = sessions
+            .commands_not_failing_after_stale_record(&reference, record.chars().count() / 2);
+
+        assert!(
+            wrong.is_empty(),
+            "each command prints the whole warning record, then the error:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// The budget is shorter than any command's header.
+    #[test]
+    fn budget_failure_prints_warnings_of_one_kind_for_two_sessions_as_one_count_record() {
+        let sessions = CachedClaudeSessions::new();
+        for transcript in [sessions.changed.clone(), sessions.other()] {
+            let mut text = std::fs::read_to_string(&transcript).unwrap();
+            text.push_str("{malformed\n");
+            std::fs::write(&transcript, text).unwrap();
+        }
+        let environment =
+            test_environment(vec![sessions.storage], Some(sessions.cache_base.path()));
+
+        let failure = AgentService::new(environment)
+            .execute(agent_command(&["sessions", "--all", "--budget", "60"]))
+            .unwrap_or_else(crate::error_report);
+
+        assert_eq!(
+            failure,
+            format!(
+                "protocol agent-warning kind=malformed-transcript count=2\n{BUDGET_TOO_SMALL_RECORD}"
+            )
         );
     }
 
@@ -7037,6 +7144,31 @@ mod tests {
                 .unwrap()
                 .ends_with(" warnings=2 warning-records=2"),
             "the header counts both warnings:\n{output}"
+        );
+    }
+
+    #[test]
+    fn ref_not_found_prints_io_warning_for_each_unreadable_directory_before_error() {
+        let sessions = CachedClaudeSessions::new();
+        let other_directory = tempfile::tempdir().unwrap();
+        let (environment, folder_names) =
+            sessions.environment_refusing_two_folders(other_directory.path());
+
+        let failure = AgentService::new(environment)
+            .execute(agent_command(&["read", "ch_000000000000"]))
+            .unwrap_or_else(crate::error_report);
+
+        let lines: Vec<&str> = failure.lines().collect();
+        assert!(
+            lines.len() == 3
+                && lines[..2]
+                    .iter()
+                    .all(|line| line.starts_with("protocol agent-warning kind=io "))
+                && folder_names
+                    .iter()
+                    .all(|name| lines[..2].iter().any(|line| line.contains(name)))
+                && lines[2].starts_with("protocol agent-error kind=not-found "),
+            "an io record for each unreadable directory, then the error:\n{failure}"
         );
     }
 
