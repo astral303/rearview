@@ -150,7 +150,8 @@ impl From<AppError> for CopyMiss {
 
 /// `read` as the viewer, the printout and the agent commands take it: `None`
 /// for a copy that is not there or not ready, and a failed read as its
-/// error. An agent command names a `None` copy in its `stale-cache` record.
+/// error. An agent command reports a `None` copy in its `stale-cache`
+/// record.
 pub(crate) fn found<T>(read: CopyRead<T>) -> Result<Option<T>> {
     match read {
         Ok(data) => Ok(Some(data)),

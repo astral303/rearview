@@ -101,8 +101,8 @@ pub enum AgentWarningKind {
     PartialIndex,
     /// Sessions whose cached copy is out of date or missing, because another
     /// rearview was refreshing the cache or this rearview's writes stopped;
-    /// the detail holds the record's `refs=` and `cached-until=` atoms and
-    /// the sentence for its cause.
+    /// the detail holds the record's `refs=`, `cached-until=` and
+    /// `omitted-sessions=` atoms and the sentence for its cause.
     StaleCache,
 }
 
@@ -219,29 +219,45 @@ impl AgentWarning {
         }
     }
 
-    /// The sessions at `refs`, read from the cache as it was for `cause`.
-    /// `cached_until` is the earliest end of their cached messages; `None`
-    /// when none of them is in the session cache.
+    /// The record of stale sessions, read from the cache as it was for
+    /// `cause`: it names the sessions at `refs` and counts
+    /// `omitted_sessions` more. `cached_until` is the earliest end of the
+    /// cached messages of the sessions at `refs`; `None` when none of them
+    /// is in the session cache. The record is `None` without a ref or an
+    /// omitted session.
     pub fn stale_cache(
         refs: &[String],
         cached_until: Option<chrono::DateTime<crate::clock::Zone>>,
+        omitted_sessions: usize,
         cause: crate::history::StaleCause,
-    ) -> Self {
-        let mut detail = format!("refs={}", refs.join(","));
-        if let Some(cached_until) = cached_until {
-            detail.push_str(" cached-until=");
-            detail.push_str(&cached_until.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+    ) -> Option<Self> {
+        if refs.is_empty() && omitted_sessions == 0 {
+            return None;
         }
+        let mut atoms = Vec::new();
+        if !refs.is_empty() {
+            atoms.push(format!("refs={}", refs.join(",")));
+        }
+        if let Some(cached_until) = cached_until {
+            atoms.push(format!(
+                "cached-until={}",
+                cached_until.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+            ));
+        }
+        if omitted_sessions > 0 {
+            atoms.push(format!("omitted-sessions={omitted_sessions}"));
+        }
+        let mut detail = atoms.join(" ");
         detail.push_str(" : ");
         detail.push_str(match cause {
             crate::history::StaleCause::AnotherRearview => STALE_CACHE_SENTENCE,
             crate::history::StaleCause::WritesStopped => WRITES_STOPPED_SENTENCE,
         });
-        Self {
+        Some(Self {
             kind: AgentWarningKind::StaleCache,
             reference: None,
             detail,
-        }
+        })
     }
 }
 

@@ -51,13 +51,15 @@
     `Refresh failed: the session could not be read`.
 - Warn when an agent command may miss messages because a session's cached copy
   is out of date or missing: a `protocol agent-warning stale-cache` record
-  names those sessions' refs and, in `cached-until=`, the earliest time their
-  copies end.
+  names those sessions' refs and, in `cached-until=`, the earliest time the
+  named sessions' copies end. With more than eight of them left out of the
+  output, it names the ones the output shows and counts the others in
+  `omitted-sessions=`.
 - Parse new and changed sessions in one rearview at a time: while one refreshes
   the session cache, the others read the cache as it is or wait for that
   refresh.
   - A search leaves out a session another rearview is writing. `agent search`
-    names it in its `stale-cache` warning, `--semantic-search` prints
+    reports it in its `stale-cache` warning, `--semantic-search` prints
     `Skipped session <id>: its cached copy is not ready yet.`, and the list's
     search bar counts it as loading.
 - Add `--perf-stats` to every agent command, such as
