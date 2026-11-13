@@ -26,7 +26,7 @@ pub(crate) fn rearview(directory: &Path) -> CacheBase {
 }
 
 /// The cache in `directory` as one rearview reaches it, on `clock`.
-fn rearview_on(directory: &Path, clock: Arc<TestClock>) -> CacheBase {
+pub(crate) fn rearview_on(directory: &Path, clock: Arc<TestClock>) -> CacheBase {
     CacheBase::new(
         directory,
         ProcessIdentity::default(),
@@ -1246,8 +1246,8 @@ fn low_space_deletion_keeps_ownership_past_takeover_window_and_empties_database_
 
     assert_eq!(
         table_names(base.path()),
-        ["refresh_state"],
-        "the database keeps the refresh's state alone"
+        ["low_space_deletion", "refresh_state"],
+        "the database keeps only `refresh_state` and `low_space_deletion`"
     );
     for file in side_files(base.path()) {
         assert!(!file.exists(), "{} is removed", file.display());
@@ -1853,7 +1853,10 @@ fn low_space_deletion_refuses_this_rearviews_new_connections_and_empties_databas
         opened_after_deletion,
         "the reader's next open finds the emptied cache"
     );
-    assert_eq!(table_names(base.path()), ["refresh_state"]);
+    assert_eq!(
+        table_names(base.path()),
+        ["low_space_deletion", "refresh_state"]
+    );
 }
 
 /// Wait until `base`'s low-space deletion refuses this rearview's new
@@ -1903,7 +1906,10 @@ fn low_space_deletion_waiting_for_reader_past_takeover_window_empties_database_c
     });
 
     assert_eq!(outcome, Some(CacheDeletion::Deleted));
-    assert_eq!(table_names(base.path()), ["refresh_state"]);
+    assert_eq!(
+        table_names(base.path()),
+        ["low_space_deletion", "refresh_state"]
+    );
     assert!(
         matches!(
             RefreshOwnership::try_acquire_now(&competing).unwrap(),

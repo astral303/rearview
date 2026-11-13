@@ -272,6 +272,36 @@ fn launch_whose_cache_write_finds_less_than_gigabyte_free_stops_with_free_space(
     );
 }
 
+#[test]
+fn launch_after_low_space_deletion_stops_while_drive_doesnt_have_room_for_deleted_cache() {
+    let sessions = crate::tui::app::claude_home::CacheOutgrowingDrive::new();
+    let first = sessions.environment();
+    let first_run = crate::history::load_all_conversations(&first, false, None).map(|_| ());
+    crate::finish_command(first_run, Some(first.cache_base()), &mut Vec::new())
+        .1
+        .unwrap();
+    sessions.home.watch().mark();
+    let environment = sessions.environment_on(Arc::new(SystemClock::new()));
+    let base = environment.cache_base().clone();
+    let mut runtime = launched_in(environment);
+    let mut terminal = terminal();
+
+    let error = tick_until_error(&mut runtime, &mut terminal);
+    drop(runtime);
+    let report = finish_tui_command(error, &base);
+
+    assert_eq!(
+        report,
+        "rearview: not enough disk space to rebuild the session cache (1.0 GB free, needs at \
+         least 1.1 GB). Free at least 0.1 GB and run rearview again.\n"
+    );
+    assert_eq!(
+        sessions.home.watch().parses_after_mark(),
+        0,
+        "the launch doesn't parse any session"
+    );
+}
+
 /// On a first fill of two agents' sessions, a write of the first agent's
 /// load finds the drive low on space, and the launch returns early at the
 /// second agent's. Once the TUI stops, the report runs the deletion and

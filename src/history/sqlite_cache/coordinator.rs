@@ -4,6 +4,7 @@
 
 use super::base::CacheBase;
 use super::observer::{self, Observation, OtherRearview};
+use super::refill::{self, DeletionRecord};
 use super::refresh::{self, RefreshOwnership, Release};
 use super::scope::Cancellation;
 use crate::error::{AppError, Result};
@@ -56,36 +57,53 @@ impl Coordinator {
     /// `cancellation` is set. Fails with the low-space error, without
     /// waiting, when the cache's drive is low on space (see
     /// [`refresh::check_space_of`]), and when the ownership's write finds
-    /// the disk full.
+    /// the disk full. Fails with the refill's refusal, without waiting for
+    /// ownership, when the drive doesn't have room for the cache deleted by
+    /// a low-space deletion (see [`refill::check`]).
     pub(crate) fn acquire(
         &self,
         status: &WaitStatus,
         cancellation: &Cancellation,
     ) -> Result<RefreshOwnership> {
-        self.check_space(cancellation)?;
+        let deletion_record = self.check_space(status, cancellation)?;
         let acquired = RefreshOwnership::acquire(&self.base, status, cancellation)
+            .map(|ownership| ownership.with_deletion_record(deletion_record))
             .map_err(|error| self.set_low_space_on_full_disk(error, cancellation));
         status.set(None);
         acquired
     }
 
     /// [`Self::acquire`], giving up after `limit` on the base's clock: `None`
-    /// while another refresh still owns the cache then.
+    /// while another refresh still owns the cache then. The limit includes
+    /// the refill check's wait for another rearview's exclusive lock.
     pub(crate) fn acquire_within(
         &self,
         limit: Duration,
         status: &WaitStatus,
         cancellation: &Cancellation,
     ) -> Result<Option<RefreshOwnership>> {
-        self.check_space(cancellation)?;
-        let acquired = RefreshOwnership::acquire_within(&self.base, limit, status, cancellation)
+        let clock = self.base.clock();
+        let started = clock.now();
+        let deletion_record = self.check_space(status, cancellation)?;
+        let rest = limit.saturating_sub(clock.elapsed_since(started));
+        let acquired = RefreshOwnership::acquire_within(&self.base, rest, status, cancellation)
+            .map(|ownership| {
+                ownership.map(|ownership| ownership.with_deletion_record(deletion_record))
+            })
             .map_err(|error| self.set_low_space_on_full_disk(error, cancellation));
         status.set(None);
         acquired
     }
 
-    fn check_space(&self, cancellation: &Cancellation) -> Result<()> {
-        refresh::check_space_of(&self.base, || !cancellation.is_cancelled())
+    /// The refill check, then the floor check.
+    fn check_space(
+        &self,
+        status: &WaitStatus,
+        cancellation: &Cancellation,
+    ) -> Result<DeletionRecord> {
+        let deletion_record = refill::check(&self.base, status, cancellation)?;
+        refresh::check_space_of(&self.base, || !cancellation.is_cancelled())?;
+        Ok(deletion_record)
     }
 
     fn set_low_space_on_full_disk(&self, error: AppError, cancellation: &Cancellation) -> AppError {

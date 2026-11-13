@@ -236,6 +236,62 @@ impl DiskSpace for DriveRunningOut {
     }
 }
 
+/// A drive of `capacity` bytes with the session cache on it and nothing else:
+/// its free space falls as a load writes the cache's files and rises when
+/// the cache is deleted.
+#[cfg(test)]
+pub(crate) struct DriveFilledByCache {
+    capacity: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl DriveFilledByCache {
+    pub(crate) fn new(capacity: u64) -> Self {
+        Self {
+            capacity: std::sync::atomic::AtomicU64::new(capacity),
+        }
+    }
+
+    /// Give the drive `capacity` bytes, as the user freeing space or
+    /// another program filling the drive does.
+    pub(crate) fn set_capacity(&self, capacity: u64) {
+        self.capacity
+            .store(capacity, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The bytes of the session cache database in the cache base `base` and
+    /// of every side file SQLite keeps beside it.
+    pub(crate) fn database_and_side_file_bytes(base: &Path) -> u64 {
+        let database = super::database_path(base);
+        std::iter::once("")
+            .chain(super::DATABASE_SIDE_FILE_SUFFIXES)
+            .map(|suffix| {
+                let mut path = database.clone().into_os_string();
+                path.push(suffix);
+                std::fs::metadata(path).map_or(0, |metadata| metadata.len())
+            })
+            .sum()
+    }
+}
+
+#[cfg(test)]
+impl DiskSpace for DriveFilledByCache {
+    fn available_bytes(&self, path: &Path) -> Option<u64> {
+        let capacity = self.capacity.load(std::sync::atomic::Ordering::SeqCst);
+        Some(capacity.saturating_sub(Self::database_and_side_file_bytes(path)))
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct UnreportedFreeSpace;
+
+#[cfg(test)]
+impl DiskSpace for UnreportedFreeSpace {
+    fn available_bytes(&self, _path: &Path) -> Option<u64> {
+        None
+    }
+}
+
 impl ProcessIdentity {
     fn held(&self) -> MutexGuard<'_, Held> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
@@ -404,7 +460,8 @@ impl CacheBase {
     }
 
     /// This base's low-space latch: set once a write of the base found its
-    /// drive low on space (see [`low_space::run_deletion`]).
+    /// drive low on space (see [`low_space::run_deletion`]), or an
+    /// acquisition refused a refill (see [`super::refill::check`]).
     pub(crate) fn low_space(&self) -> &low_space::Latch {
         &self.state.low_space
     }

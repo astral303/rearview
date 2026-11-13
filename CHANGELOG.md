@@ -134,6 +134,8 @@
   the same in a `protocol agent-error` record.
   - A cache another rearview has open is left in place, and the message
     reports it.
+  - Until the drive has room for the deleted cache and 1 GB, later runs stop
+    before parsing any transcript and report how much space to free.
 
 ### Internal: development
 

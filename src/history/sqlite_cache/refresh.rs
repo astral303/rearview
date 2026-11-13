@@ -6,6 +6,7 @@ use super::base::CacheBase;
 use super::connection::{self, Access, CacheConnection};
 use super::coordinator::WaitStatus;
 use super::observer::{CommitAge, OtherRearview, REBUILD_LOCK_THRESHOLD};
+use super::refill::DeletionRecord;
 use super::scope::Cancellation;
 use crate::clock::{Clock, Moment};
 use crate::error::{AppError, CacheDeletion, Result};
@@ -109,6 +110,9 @@ INSERT OR IGNORE INTO refresh_state VALUES (1, NULL, 0);";
 /// This process's refresh ownership of a cache base, released on drop.
 pub(crate) struct RefreshOwnership {
     token: RefreshToken,
+    /// The low-space deletion's record as the acquisition found it, until a
+    /// write of this ownership clears it (see [`super::refill`]).
+    deletion_record: DeletionRecord,
 }
 
 impl RefreshOwnership {
@@ -195,20 +199,41 @@ impl RefreshOwnership {
             &token.identity,
             Arc::clone(&token.access),
         );
-        Self { token }
+        Self {
+            token,
+            deletion_record: DeletionRecord::Absent,
+        }
     }
 
     pub(crate) fn token(&self) -> &RefreshToken {
         &self.token
     }
 
+    pub(super) fn with_deletion_record(mut self, deletion_record: DeletionRecord) -> Self {
+        self.deletion_record = deletion_record;
+        self
+    }
+
+    /// Clear the low-space deletion's record the acquisition found, in one
+    /// write batch; nothing to write without one. Call once this
+    /// ownership's load cached every session it read.
+    pub(super) fn clear_deletion_record(&mut self) -> Result<()> {
+        if self.deletion_record == DeletionRecord::Absent {
+            return Ok(());
+        }
+        self.token
+            .write_statements(|connection| Ok(super::refill::clear(connection)?))?;
+        self.deletion_record = DeletionRecord::Absent;
+        Ok(())
+    }
+
     /// Delete the cache database's contents under SQLite's exclusive lock
     /// (see [`take_exclusive_lock`]), waiting as `wait` allows: drop every
-    /// table but `refresh_state`, shrink the file and leave WAL mode, then
-    /// remove the files SQLite keeps beside it. Keep the database file: a
-    /// reader opening it meanwhile is then neither unlinked under nor a
-    /// cause of a failed removal. Other rearviews cannot write the emptied
-    /// cache until the ownership drops.
+    /// table but `refresh_state` and `low_space_deletion`, shrink the file
+    /// and leave WAL mode, then remove the files SQLite keeps beside it.
+    /// Keep the database file: a reader opening it meanwhile is then neither
+    /// unlinked under nor a cause of a failed removal. Other rearviews
+    /// cannot write the emptied cache until the ownership drops.
     pub(super) fn delete_database(&mut self, wait: ExclusiveWait) -> CacheDeletion {
         let turn = self.token.take_turn();
         let database = super::database_path(self.token.base.path());
@@ -225,17 +250,20 @@ impl RefreshOwnership {
         deletion
     }
 
-    /// Drop every table of `database` but `refresh_state`, shrink its file,
-    /// leave WAL mode and remove the files SQLite keeps beside it, under
-    /// SQLite's exclusive lock. The connection holds the lock until it
-    /// closes on return: once the lock ends, another rearview may own the
-    /// cache and write those files again.
+    /// Drop every table of `database` but `refresh_state` and
+    /// `low_space_deletion`, record the size the cache had reached in
+    /// `low_space_deletion` in the same commit (see [`super::refill`]),
+    /// shrink the file, leave WAL mode and remove the files SQLite keeps
+    /// beside it, under SQLite's exclusive lock. The connection holds the
+    /// lock until it closes on return: once the lock ends, another rearview
+    /// may own the cache and write those files again.
     fn empty_database(
         &self,
         turn: &Turn<'_>,
         database: &Path,
         wait: ExclusiveWait,
     ) -> Result<CacheDeletion> {
+        let cache_bytes = super::refill::cache_bytes(database);
         let connection = connect_writable(&self.token.base, wait.total)?;
         take_exclusive_lock(&connection, &self.token, turn, wait, |batch| {
             record_commit(&batch, &self.token)?;
@@ -247,6 +275,7 @@ impl RefreshOwnership {
         // commit, so none of a load's pages in the log grow the file.
         let batch = connection.unchecked_transaction()?;
         super::drop_session_tables(&batch)?;
+        super::refill::record(&batch, cache_bytes)?;
         batch.commit()?;
         connection.execute_batch("VACUUM")?;
         // Commit the ownership again before the lock ends, so a waiter
@@ -590,7 +619,10 @@ pub(super) fn set_low_space_on_full_disk(
     can_publish: impl FnOnce() -> bool,
 ) -> AppError {
     if WriteErrorClass::of(&error) != WriteErrorClass::LowSpace
-        || matches!(error, AppError::SessionCacheLowSpace { .. })
+        || matches!(
+            error,
+            AppError::SessionCacheLowSpace { .. } | AppError::SessionCacheRefillLowSpace { .. }
+        )
     {
         return error;
     }

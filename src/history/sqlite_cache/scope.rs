@@ -143,8 +143,9 @@ impl OperationScope {
     /// once its write permission is revoked or it is cancelled, and keeps
     /// the ownership until [`Self::finish`]. Fails
     /// on a database error other than a busy lock, when cancelled while
-    /// waiting for ownership, and once a write found the cache's drive low
-    /// on space (see [`OperationEnd::fail_if_low_space`]).
+    /// waiting for ownership, once a write found the cache's drive low on
+    /// space (see [`OperationEnd::fail_if_low_space`]), and while the drive
+    /// doesn't have room for a deleted cache (see [`super::refill::check`]).
     pub(crate) fn acquire_access(&self) -> Result<OperationAccess<'_>> {
         let coordinator = &self.coordinator;
         if let Some(error) = coordinator.base().low_space().error() {
@@ -251,6 +252,22 @@ impl OperationScope {
         );
         self.parse_as_owner(parse)?
             .ok_or(AppError::SessionCacheRefreshLost)
+    }
+
+    /// Clear the low-space deletion's record this operation's acquisition
+    /// found, once the operation's load of every agent's sessions ended: a
+    /// live owner wrote every session it read. Does nothing for an operation
+    /// that isn't the live owner, and once a write found the drive low on
+    /// space. Fails as a write batch fails.
+    pub(crate) fn clear_deletion_record_after_full_load(&self) -> Result<()> {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let Held::Ownership(ownership) = &mut *held else {
+            return Ok(());
+        };
+        if !self.is_live(ownership.token()) || self.coordinator.base().low_space().is_set() {
+            return Ok(());
+        }
+        ownership.clear_deletion_record()
     }
 
     /// True once a failed write batch revoked the write permission of this
@@ -376,9 +393,10 @@ const UNLOCK_POLL: Duration = Duration::from_millis(200);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::{Clock, TestClock};
     use crate::history::sqlite_cache::connection::test_hooks;
     use crate::history::sqlite_cache::refresh::tests::{
-        rearview, record_of, record_with_reason, replace_owner,
+        exclusive_lock, rearview, rearview_on, record_of, record_with_reason, replace_owner,
     };
     use crate::history::sqlite_cache::{CacheWrite, DriveRunningOut, SqliteCache, apply_writes};
 
@@ -469,6 +487,39 @@ mod tests {
             "taking refresh ownership finds the drive low on space"
         );
         assert!(base.low_space().is_set(), "the low-space latch is set");
+    }
+
+    #[test]
+    fn limited_wait_for_ownership_includes_wait_for_exclusive_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let _owner = RefreshOwnership::acquire_for_test(&rearview(directory.path())).unwrap();
+        let clock = Arc::new(TestClock::default());
+        let base = rearview_on(directory.path(), Arc::clone(&clock))
+            .with_free_space(5 * super::super::FREE_SPACE_FLOOR);
+        let limit = 5 * UNLOCK_POLL;
+        let operation = OperationScope::new(&base, Patience::AtMost(limit), Arc::default());
+        let rebuild = exclusive_lock(directory.path());
+        let started = clock.now();
+
+        let access = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while clock.elapsed_since(started) < 2 * UNLOCK_POLL {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                drop(rebuild);
+            });
+            operation.acquire_access()
+        });
+
+        assert!(
+            matches!(access, Ok(OperationAccess::AsIs)),
+            "the operation reads the cache as it is"
+        );
+        let waited = clock.elapsed_since(started);
+        assert!(
+            waited >= 2 * UNLOCK_POLL && waited <= limit,
+            "the operation waits for the lock, within its limit: {waited:?}"
+        );
     }
 
     /// A session write whose read before its batch fails on a missing table,

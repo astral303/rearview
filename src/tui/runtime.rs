@@ -327,7 +327,9 @@ impl Runtime {
     /// once the supervisor's drop waited for the free-space checks begun
     /// before the exit. Fails with the low-space error once a write found
     /// the cache's drive low on space, whatever the exit: rearview then
-    /// deletes the cache and stops (see [`crate::finish_command`]).
+    /// deletes the cache and stops (see [`crate::finish_command`]). Fails
+    /// the same way, without a deletion, once the drive didn't have room
+    /// for a deleted cache.
     pub(crate) fn finish(self, exit: Result<Action>) -> Result<(Action, Vec<Conversation>)> {
         let Self {
             app, supervisor, ..
