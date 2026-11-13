@@ -32,6 +32,10 @@ one alone with `mise run <task>`.
 | `test-compare-perf`   | `scripts/compare-perf.sh` misreports two stub binaries' medians, speedups, counts or per-run figures |
 | `build`               | a package does not build                                                                             |
 
+On Windows, tests started by `cargo` create their temporary files in `target`
+(see `.cargo/config.toml`). Exclude the project folder from antivirus
+real-time scanning: it otherwise reads every file the tests write.
+
 ## Versions and dependencies
 
 rearview is an application, not a library. Every version change is a

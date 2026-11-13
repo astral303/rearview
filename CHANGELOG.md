@@ -141,6 +141,9 @@
 - Compare two rearview binaries' search-stage medians and process CPU time
   with `scripts/compare-perf.sh`. Its per-run table also shows other
   processes' CPU time and the machine's disk use.
+- Fix tests on Windows writing their temporary files to the system temp
+  folder when started with `cargo test`. They now use `target`, as they
+  did under `mise run test`.
 
 ## v0.6.1 (2026-10-26)
 
