@@ -267,8 +267,12 @@ impl SessionChanges {
             let (read, next) = outcome.into_parts();
             match read {
                 SessionRead::Listed(row) => {
-                    if listing::is_listed(origin, SessionTimes::Messages(&row.message_times), &time)
-                    {
+                    let times = next
+                        .write_failure()
+                        .map_or(SessionTimes::Messages(&row.message_times), |failure| {
+                            failure.times(&row)
+                        });
+                    if listing::is_listed(origin, times, &time) {
                         self.updated.push(UpdatedSession {
                             row: *row,
                             replaces_listed_row: is_listed,

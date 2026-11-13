@@ -19,9 +19,10 @@ use crate::history::resumed::{ResumeContext, ResumedSession, WholeRead, read_res
 use crate::history::shard_files;
 use crate::history::sqlite_cache::refresh::RefreshToken;
 use crate::history::sqlite_cache::{
-    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, CopyHandles, InteractiveCache,
-    ListedRecord, LiveOwner, NextStep, OperationAccess, OperationScope, Publication, RecordPlace,
-    SessionAddress, SessionRecord, SessionStatus, SqliteCache, StubStamps, WriteOutcome,
+    self, CacheBase, CacheWrite, CacheWriter, CatalogueSession, CopyHandles, FoundMessages,
+    InteractiveCache, ListedRecord, LiveOwner, NextStep, OperationAccess, OperationScope,
+    Publication, RecordPlace, SessionAddress, SessionRecord, SessionStatus, SqliteCache,
+    StubStamps, WriteFailure, WriteOutcome,
 };
 use crate::history::{
     Conversation, Environment, FilterTerm, ParsePermit, Source, TranscriptEntries,
@@ -160,6 +161,15 @@ impl FoundSession {
             source: row.source,
             fingerprint: row.fingerprint,
             has_transient_read_error: row.has_transient_read_error,
+        }
+    }
+
+    /// This session, read again by the next refresh whatever fingerprint
+    /// discovery finds for it.
+    pub fn read_again(self) -> Self {
+        Self {
+            fingerprint: None,
+            ..self
         }
     }
 
@@ -1785,6 +1795,39 @@ fn with_writer_thread<T>(
 /// The writes a body of [`with_writer_thread`] sends to its writer thread.
 struct WriteQueue(mpsc::SyncSender<CacheWrite>);
 
+/// The error of a session write dropped unwritten, or never sent, once the
+/// operation's writes stopped.
+const WRITES_STOPPED: &str = "writes to the session cache stopped";
+
+/// The result of a queued session cache write.
+enum SessionWrite {
+    /// The write gave the session's copy this generation.
+    Written(i64),
+    /// The write kept the earlier copy: a file changed after its stamp.
+    KeptEarlierCopy,
+    /// Another rearview took over refresh ownership before the write was
+    /// committed; its refresh caches the session.
+    OwnerReplaced,
+    /// The write failed with this error, or was dropped unwritten.
+    Failed(String),
+}
+
+impl SessionWrite {
+    fn generation(&self) -> Option<i64> {
+        match self {
+            Self::Written(generation) => Some(*generation),
+            Self::KeptEarlierCopy | Self::OwnerReplaced | Self::Failed(_) => None,
+        }
+    }
+
+    fn into_error(self) -> Option<String> {
+        match self {
+            Self::Failed(error) => Some(error),
+            Self::Written(_) | Self::KeptEarlierCopy | Self::OwnerReplaced => None,
+        }
+    }
+}
+
 impl WriteQueue {
     fn queue(&self, record: impl Into<Arc<SessionRecord>>) -> QueuedWrite {
         let record = record.into();
@@ -1801,7 +1844,16 @@ impl WriteQueue {
     /// session's copy; `None` when it failed, kept the earlier copy, or was
     /// dropped unwritten.
     fn write_and_wait(&self, record: impl Into<Arc<SessionRecord>>) -> Option<i64> {
-        self.queue(record).outcome.recv().ok()?.ok()?
+        self.write_and_wait_for_outcome(record).generation()
+    }
+
+    fn write_and_wait_for_outcome(&self, record: impl Into<Arc<SessionRecord>>) -> SessionWrite {
+        match self.queue(record).outcome.recv() {
+            Ok(Ok(Some(generation))) => SessionWrite::Written(generation),
+            Ok(Ok(None)) => SessionWrite::KeptEarlierCopy,
+            Ok(Err(error)) => SessionWrite::Failed(error),
+            Err(_) => SessionWrite::Failed(WRITES_STOPPED.to_owned()),
+        }
     }
 
     /// Queues the removal of the sessions `storage` no longer finds at
@@ -3945,6 +3997,58 @@ mod tests {
         );
     }
 
+    /// A read whose session write finds another rearview owning the cache
+    /// isn't a failed write: it reads the copy and waits for that
+    /// rearview's refresh.
+    #[test]
+    fn read_whose_write_finds_another_rearview_owning_cache_waits_for_its_refresh() {
+        let sessions = crate::tui::claude_home::ChangedSessionsInTwoRoots::new();
+        let environment = sessions.environment();
+        let operation = waiting_operation(&environment);
+        assert!(
+            matches!(
+                operation.acquire_access().unwrap(),
+                OperationAccess::Owner(_)
+            ),
+            "the operation owns the cache before its write"
+        );
+        // The session row's write sets the refresh state's owner to another
+        // identity inside the write's batch, as a takeover between the parse
+        // and the write leaves it.
+        rusqlite::Connection::open(sessions.cache.path().join(sqlite_cache::DATABASE_FILE_NAME))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER take_over_at_session_write AFTER UPDATE ON sessions \
+                 BEGIN UPDATE refresh_state SET owner = 'another rearview' \
+                 WHERE singleton = 1; END;",
+            )
+            .unwrap();
+
+        let outcome = cache_sessions(
+            &environment,
+            Source::Claude,
+            &[sessions.transcripts[0].as_path()],
+            false,
+            &operation,
+            AgentMeter::UNMETERED,
+        )
+        .unwrap()
+        .pop()
+        .expect("one read");
+        operation.finish().fail_if_low_space().unwrap();
+
+        let (read, next) = outcome.into_parts();
+        let SessionRead::Listed(row) = read else {
+            panic!("the cached copy is read");
+        };
+        assert_eq!(row.message_count, 1, "the row is the cached copy");
+        assert_eq!(
+            next,
+            NextStep::AwaitRefresh(AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing)),
+            "the copy waits for the replacement refresh"
+        );
+    }
+
     /// A read whose ownership another rearview took over and released
     /// before the read ended requests a session refresh: no refresh is left
     /// to bring the copy up to date.
@@ -3993,10 +4097,11 @@ mod tests {
     }
 
     /// When the writes fail and no other rearview took over refresh
-    /// ownership, the read waits for this rearview's own refresh, not
-    /// another's.
+    /// ownership, the read doesn't wait for another rearview's refresh: its
+    /// next step is a refresh once the transcripts change from the revision
+    /// discovery found.
     #[test]
-    fn read_revoked_without_replacement_waits_for_this_rearviews_refresh() {
+    fn read_revoked_without_replacement_waits_for_change_from_discovered_revision() {
         let base = tempfile::tempdir().unwrap();
         admit_database(base.path());
         let home = ClaudeHome::new();
@@ -4005,6 +4110,7 @@ mod tests {
         fail_every_commit_after_acquisition(base.path());
         home.append(&transcript, 1, "a later question");
         let changed = discovered_stub(&home, &transcript);
+        let revision = changed.fingerprint.stamp();
         let environment = environment_of(base.path());
         let loader = SessionLoader::new(
             &environment,
@@ -4016,10 +4122,12 @@ mod tests {
 
         let (_, next) = loader.cache_one(&home.root(), changed).into_parts();
 
+        let NextStep::RefreshOnChange(failure) = next else {
+            panic!("the read refreshes the session once it changes: {next:?}");
+        };
         assert_eq!(
-            next,
-            NextStep::AwaitRefresh(AwaitedRefresh::ThisProcess),
-            "this rearview's refresh is reported as its own"
+            failure.revision, revision,
+            "the failure keeps the revision discovery found"
         );
     }
 

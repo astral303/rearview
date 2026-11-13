@@ -13,6 +13,7 @@
 use super::storage::UnreadableDirectory;
 use super::{DiscoveredSessions, Fingerprint, SessionRoot, SessionStub};
 use crate::error::Result;
+use crate::history::fingerprint::CachedFingerprint;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::{Mutex, PoisonError};
@@ -449,15 +450,8 @@ pub fn session_stubs(root: &SessionRoot, sessions: Vec<SessionFiles>) -> Vec<Ses
     sessions
         .into_iter()
         .filter_map(|session| {
-            let transcript = fingerprint_of(&session.transcript)?;
-            let (subagents, subagent_fingerprints): (Vec<_>, Vec<_>) = session
-                .subagents
-                .into_iter()
-                .filter_map(|path| {
-                    let fingerprint = fingerprint_of(&path)?;
-                    Some((path, fingerprint))
-                })
-                .unzip();
+            let (fingerprint, subagents) =
+                spanning_fingerprint(&session.transcript, session.subagents)?;
             // Keys are relative to the root, so a root that moves misses
             // cleanly rather than colliding with its old contents.
             let cache_key = session
@@ -467,13 +461,43 @@ pub fn session_stubs(root: &SessionRoot, sessions: Vec<SessionFiles>) -> Vec<Ses
                 .to_string_lossy()
                 .into_owned();
             Some(SessionStub {
-                fingerprint: Fingerprint::spanning(transcript, subagent_fingerprints),
+                fingerprint,
                 locator: session.transcript,
                 subagents,
                 cache_key,
             })
         })
         .collect()
+}
+
+/// The stamp [`session_stubs`] gives the session at `transcript` with the
+/// sub-agent transcripts `subagents`, computed without listing a directory.
+/// New content in one of `subagents` changes the stamp; a sub-agent
+/// transcript created since doesn't. `None` when `transcript` doesn't have
+/// file metadata to read, as for a locator inside a database file.
+pub fn session_stamp(transcript: &Path, subagents: &[PathBuf]) -> Option<CachedFingerprint> {
+    spanning_fingerprint(transcript, subagents)?.0.stamp()
+}
+
+/// The fingerprint spanning `transcript` and `subagents`, with the sub-agent
+/// transcripts it spans. A sub-agent transcript without readable file
+/// metadata is left out. `None` when `transcript` has none.
+fn spanning_fingerprint<P: AsRef<Path>>(
+    transcript: &Path,
+    subagents: impl IntoIterator<Item = P>,
+) -> Option<(Fingerprint, Vec<P>)> {
+    let transcript = fingerprint_of(transcript)?;
+    let (subagents, subagent_fingerprints): (Vec<_>, Vec<_>) = subagents
+        .into_iter()
+        .filter_map(|path| {
+            let fingerprint = fingerprint_of(path.as_ref())?;
+            Some((path, fingerprint))
+        })
+        .unzip();
+    Some((
+        Fingerprint::spanning(transcript, subagent_fingerprints),
+        subagents,
+    ))
 }
 
 fn fingerprint_of(path: &Path) -> Option<Fingerprint> {

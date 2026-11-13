@@ -297,6 +297,7 @@ impl Runtime {
         self.app.apply_finished_refresh();
         self.app.set_cache_wait(self.supervisor.waiting_for());
         self.app.check_awaited_refresh();
+        self.app.check_failed_refreshes();
         self.start_next_job();
 
         let frame_state = prepare_frame(&mut self.app, terminal);

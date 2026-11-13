@@ -1018,6 +1018,43 @@ fn rename_reaches_next_load_through_warm_cache() {
     });
 }
 
+/// [`super::walk::session_stamp`] of an unchanged session equals
+/// discovery's stamp, sub-agent transcripts included, when its locator is a
+/// file, for every agent; it is `None` for a locator inside a database file.
+/// The TUI compares the two to find a changed session after a failed
+/// refresh.
+#[test]
+fn session_stamp_of_unchanged_session_matches_discovery() {
+    let mut stamped_with_subagents = Vec::new();
+    for fixture in registered_fixtures() {
+        let source = fixture.provider().source();
+        let home = tempfile::tempdir().unwrap();
+        fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+        for stub in fixture.discover_under(home.path()) {
+            let stamp = super::walk::session_stamp(&stub.locator, &stub.subagents);
+            let expected = if stub.locator.is_file() {
+                stub.fingerprint.stamp()
+            } else {
+                None
+            };
+            assert_eq!(
+                stamp,
+                expected,
+                "{source:?}: {} stamps as discovery found it, or not at all for a locator \
+                 that isn't a file",
+                stub.locator.display()
+            );
+            if expected.is_some() && !stub.subagents.is_empty() {
+                stamped_with_subagents.push(source);
+            }
+        }
+    }
+    assert!(
+        !stamped_with_subagents.is_empty(),
+        "some agent's session is stamped with its sub-agent transcripts"
+    );
+}
+
 /// An agent that keeps a session's title outside the transcript doesn't
 /// write any other title or summary, before a rename and after one: the
 /// parse names that title alone. `apply_external_title` relies on it to

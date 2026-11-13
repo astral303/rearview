@@ -45,10 +45,88 @@ enum Probe {
 struct AttemptRead {
     /// Settled.
     outcome: SessionOutcome,
-    /// True when the database holds the session as the read returned it, as
-    /// its transcripts are now. False for a session parsed and not written,
-    /// an older copy, and a session missing from the database.
-    is_current: bool,
+    currency: ReadCurrency,
+}
+
+/// The database's copy of a session, against what one read returned.
+enum ReadCurrency {
+    /// The database has the session as the read returned it, as its
+    /// transcripts are now.
+    Current,
+    /// An older copy, a session missing from the database, or a parse the
+    /// database doesn't record.
+    NotCurrent,
+    /// The read's write of the session failed: the write itself, the
+    /// record's build, the writer's opening, or the operation's writes
+    /// stopping before the session was parsed or written.
+    WriteFailed(Box<WriteFailure>),
+}
+
+impl ReadCurrency {
+    /// A parse of the session at `stub` that wasn't written:
+    /// [`Self::WriteFailed`] with `error` when one is known, otherwise
+    /// [`Self::NotCurrent`].
+    fn unwritten(stub: &SessionStub, error: Option<String>) -> Self {
+        error.map_or(Self::NotCurrent, |error| {
+            Self::WriteFailed(write_failure(stub, FoundMessages::InRow, error))
+        })
+    }
+}
+
+/// True once another rearview took over `access`'s refresh ownership.
+fn is_owner_replaced(access: CacheAccess<'_>) -> bool {
+    match access {
+        CacheAccess::Refresh(owner) => owner.token().is_replaced(),
+        CacheAccess::AsIs => false,
+    }
+}
+
+fn write_failure(stub: &SessionStub, found: FoundMessages, error: String) -> Box<WriteFailure> {
+    Box::new(WriteFailure {
+        revision: stub.fingerprint.stamp(),
+        subagents: stub.subagents.clone(),
+        found,
+        error,
+    })
+}
+
+/// A session [`SessionLoader::read_stubs_attempt`] parsed.
+struct TargetedParse {
+    parse: SessionParse,
+    /// The error that keeps the parse's record from being written: its
+    /// build failed, or the writer didn't open ([`WRITER_UNOPENED`]).
+    write_error: Option<String>,
+}
+
+/// The error of a parse without a writer: the writer's opening failed
+/// without stopping the operation's writes.
+const WRITER_UNOPENED: &str = "the session cache could not be opened for writing";
+
+/// The end of the write of a whole parse's record.
+struct WholeParseWrite {
+    /// The generation the write gave the session's copy; `None` when the
+    /// record wasn't written.
+    generation: Option<i64>,
+    /// True when the record was written with its entries.
+    is_written_with_entries: bool,
+    /// The parsed entries that were not written to the cache.
+    unwritten_entries: Option<TranscriptEntries>,
+    /// The error the write failed with, or the error that kept the record
+    /// from being written.
+    error: Option<String>,
+}
+
+impl WholeParseWrite {
+    /// A parse whose record wasn't written, keeping `unwritten_entries`,
+    /// for `error` when one is known.
+    fn unwritten(unwritten_entries: Option<TranscriptEntries>, error: Option<String>) -> Self {
+        Self {
+            generation: None,
+            is_written_with_entries: false,
+            unwritten_entries,
+            error,
+        }
+    }
 }
 
 /// A session [`SessionLoader::read_stubs_attempt`] parsed, kept in its place
@@ -56,24 +134,37 @@ struct AttemptRead {
 enum PlacedRead<'s> {
     /// Settled once its write replied.
     Read(AttemptRead),
-    /// A resumed read whose write failed. It reads as the stored copy once
-    /// the read's writes end and the writer returns.
-    CopyAfterWrites(&'s SessionStub),
+    /// A resumed read whose write wasn't committed, with its `failure` when
+    /// the write failed. It reads as the stored copy once the read's writes
+    /// end and the writer returns.
+    CopyAfterWrites {
+        stub: &'s SessionStub,
+        failure: Option<Box<WriteFailure>>,
+    },
 }
 
 /// `reads` as outcomes. Each read that is not current gets the step
-/// `next_step` returns. `next_step` runs once, and only when such a read
-/// exists.
+/// `next_step` returns; `next_step` runs once, and only when such a read
+/// exists. A read whose write failed gets [`NextStep::RefreshOnChange`].
 fn with_next_steps(
     reads: Vec<AttemptRead>,
     next_step: impl FnOnce() -> NextStep,
 ) -> Vec<SessionOutcome> {
-    let next = reads.iter().any(|read| !read.is_current).then(next_step);
+    let next = reads
+        .iter()
+        .any(|read| matches!(read.currency, ReadCurrency::NotCurrent))
+        .then(next_step);
     reads
         .into_iter()
-        .map(|read| match next {
-            Some(next) if !read.is_current => read.outcome.with_next_step(next),
-            _ => read.outcome,
+        .map(|read| match read.currency {
+            ReadCurrency::Current => read.outcome,
+            ReadCurrency::NotCurrent => match &next {
+                Some(next) => read.outcome.with_next_step(next.clone()),
+                None => read.outcome,
+            },
+            ReadCurrency::WriteFailed(failure) => read
+                .outcome
+                .with_next_step(NextStep::RefreshOnChange(failure)),
         })
         .collect()
 }
@@ -346,11 +437,11 @@ impl SessionLoader<'_> {
         match current {
             Some(read) => AttemptRead {
                 outcome: SessionOutcome::settled(stub, read),
-                is_current: true,
+                currency: ReadCurrency::Current,
             },
             None => AttemptRead {
                 outcome: self.cached_copy(database, root, place, external_titles, stub),
-                is_current: false,
+                currency: ReadCurrency::NotCurrent,
             },
         }
     }
@@ -365,8 +456,10 @@ impl SessionLoader<'_> {
     /// without ownership it reads the cache as it is. Stubs missing from the
     /// database are read from their transcripts and written to it; once the
     /// owner is no longer live, the rest read as their cached copies,
-    /// without parsing. Each session not in the database as read gets its
-    /// [`NextStep::after_read_without_writing`] as the read ends. Fails on a database error other than a busy lock.
+    /// without parsing. Each session whose write failed gets
+    /// [`NextStep::RefreshOnChange`]; each other session not in the database
+    /// as read gets its [`NextStep::after_read_without_writing`] as the read
+    /// ends. Fails on a database error other than a busy lock.
     pub(super) fn read_stubs(
         &self,
         root: &SessionRoot,
@@ -690,7 +783,7 @@ impl SessionLoader<'_> {
             match cached {
                 Some(read) => reads.push(AttemptRead {
                     outcome: SessionOutcome::settled(stub, read),
-                    is_current: true,
+                    currency: ReadCurrency::Current,
                 }),
                 None => to_parse.push(stub),
             }
@@ -698,7 +791,7 @@ impl SessionLoader<'_> {
         if let CacheAccess::AsIs = access {
             reads.extend(to_parse.into_iter().map(|stub| AttemptRead {
                 outcome: self.cached_copy(database.as_ref(), root, &place, external_titles, stub),
-                is_current: false,
+                currency: ReadCurrency::NotCurrent,
             }));
             return reads;
         }
@@ -726,9 +819,18 @@ impl SessionLoader<'_> {
             }
         };
         let ((placed, unparsed), writer) = with_writer_thread(writer, self.debug_level, |writes| {
-            let write = |record: Arc<SessionRecord>| -> Option<i64> {
-                access.owner()?;
-                writes.write_and_wait(record)
+            let write = |record: Arc<SessionRecord>| -> SessionWrite {
+                let written = if access.owner().is_none() {
+                    SessionWrite::Failed(WRITES_STOPPED.to_owned())
+                } else {
+                    writes.write_and_wait_for_outcome(record)
+                };
+                match written {
+                    SessionWrite::Failed(_) if is_owner_replaced(access) => {
+                        SessionWrite::OwnerReplaced
+                    }
+                    written => written,
+                }
             };
             let mut placed = Vec::with_capacity(to_parse.len());
             let unparsed = self.parse_in_groups(
@@ -741,19 +843,30 @@ impl SessionLoader<'_> {
                         .as_ref()
                         .and_then(|stored| self.read_resumed(permit, root, stub, stored, &|| {}));
                     if let Some(resumed) = resumed {
-                        return SessionParse::Resumed(Box::new(resumed));
+                        return TargetedParse {
+                            parse: SessionParse::Resumed(Box::new(resumed)),
+                            write_error: None,
+                        };
                     }
                     let stamps = writes_database.then(|| StubStamps::current(stub));
                     let (raw, transcripts) = self.parse(permit, root, stub, &|| {});
+                    let build_error = std::cell::OnceCell::new();
                     let record = match stamps {
                         Some(stamps) => {
                             cache_record(&place, stub, stamps, &raw, transcripts, &|error| {
-                                self.report_unbuilt_record(stub, error)
+                                self.report_unbuilt_record(stub, error);
+                                let _ = build_error.set(error.to_string());
                             })
                         }
                         None => ParseRecord::without_database(&raw, transcripts),
                     };
-                    SessionParse::Whole(Box::new(raw), record)
+                    let unopened = !writes_database && matches!(record, ParseRecord::Unbuilt(_));
+                    TargetedParse {
+                        parse: SessionParse::Whole(Box::new(raw), record),
+                        write_error: build_error
+                            .into_inner()
+                            .or_else(|| unopened.then(|| WRITER_UNOPENED.to_owned())),
+                    }
                 },
                 |group, parsed, _| {
                     for (&(stub, _), parsed) in group.iter().zip(parsed) {
@@ -774,14 +887,30 @@ impl SessionLoader<'_> {
         }
         reads.extend(placed.into_iter().map(|placed| match placed {
             PlacedRead::Read(read) => read,
-            PlacedRead::CopyAfterWrites(stub) => AttemptRead {
+            PlacedRead::CopyAfterWrites { stub, failure } => AttemptRead {
                 outcome: self.cached_copy(database.as_ref(), root, &place, external_titles, stub),
-                is_current: false,
+                currency: failure.map_or(ReadCurrency::NotCurrent, ReadCurrency::WriteFailed),
             },
         }));
+        // A session left unparsed after another rearview's takeover isn't a
+        // failed write: it waits for that rearview's refresh.
+        let writes_stopped = match access {
+            CacheAccess::Refresh(owner) => {
+                !owner.token().can_publish() && !is_owner_replaced(access)
+            }
+            CacheAccess::AsIs => false,
+        };
         reads.extend(unparsed.iter().map(|(stub, _)| AttemptRead {
             outcome: self.cached_copy(database.as_ref(), root, &place, external_titles, stub),
-            is_current: false,
+            currency: if writes_stopped {
+                ReadCurrency::WriteFailed(write_failure(
+                    stub,
+                    FoundMessages::Unparsed,
+                    WRITES_STOPPED.to_owned(),
+                ))
+            } else {
+                ReadCurrency::NotCurrent
+            },
         }));
         reads
     }
@@ -791,34 +920,50 @@ impl SessionLoader<'_> {
     /// generation the write gave its copy; `copies` makes the copy's
     /// handles. A whole parse whose record was not written with its entries
     /// keeps them. A resumed read whose write failed reads as the stored copy
-    /// once the writes end.
+    /// once the writes end; its failure keeps the parsed messages' times, for
+    /// listing the session.
+    /// A read whose write failed, or whose record failed to build, is
+    /// [`ReadCurrency::WriteFailed`].
     fn write_and_publish_parse<'s>(
         &self,
         place: &RecordPlace<'_>,
         stub: &'s SessionStub,
-        parsed: SessionParse,
+        parsed: TargetedParse,
         copies: Option<&CopyHandles>,
-        write: &dyn Fn(Arc<SessionRecord>) -> Option<i64>,
+        write: &dyn Fn(Arc<SessionRecord>) -> SessionWrite,
     ) -> PlacedRead<'s> {
-        match parsed {
+        match parsed.parse {
             SessionParse::Whole(raw, record) => {
-                let (generation, is_written, unwritten_entries) = match record {
+                let written = match record {
                     ParseRecord::Record(record) => {
                         let record = Arc::<SessionRecord>::from(record);
-                        let generation = write(Arc::clone(&record));
-                        let is_written = generation.is_some() && record.writes_its_entries();
-                        let unwritten = (!is_written).then(|| {
+                        let written = write(Arc::clone(&record));
+                        let generation = written.generation();
+                        let is_written_with_entries =
+                            generation.is_some() && record.writes_its_entries();
+                        let unwritten_entries = (!is_written_with_entries).then(|| {
                             Arc::into_inner(record)
                                 .expect("the writer drops a record before replying")
                                 .into_parsed_entries()
                         });
-                        (generation, is_written, unwritten.flatten())
+                        WholeParseWrite {
+                            generation,
+                            is_written_with_entries,
+                            unwritten_entries: unwritten_entries.flatten(),
+                            error: written.into_error(),
+                        }
                     }
-                    ParseRecord::NotRecorded => (None, false, None),
-                    ParseRecord::Unbuilt(entries) => (None, false, Some(entries)),
+                    ParseRecord::NotRecorded => {
+                        WholeParseWrite::unwritten(None, parsed.write_error)
+                    }
+                    ParseRecord::Unbuilt(entries) => {
+                        WholeParseWrite::unwritten(Some(entries), parsed.write_error)
+                    }
                 };
-                let mut raw = match (*raw, generation, copies) {
-                    (RawRead::Parsed(mut row), Some(generation), Some(copies)) if is_written => {
+                let mut raw = match (*raw, written.generation, copies) {
+                    (RawRead::Parsed(mut row), Some(generation), Some(copies))
+                        if written.is_written_with_entries =>
+                    {
                         row.publish_as(copies.at(place.address_of(stub), generation));
                         RawRead::Parsed(row)
                     }
@@ -827,7 +972,7 @@ impl SessionLoader<'_> {
                     }
                     (raw, ..) => raw,
                 };
-                let unwritten = match unwritten_entries {
+                let unwritten = match written.unwritten_entries {
                     Some(entries) => UnwrittenParse::Entries(entries),
                     None => raw.take_unlisted_parse(),
                 };
@@ -837,21 +982,32 @@ impl SessionLoader<'_> {
                         self.session_read(place, stub, raw),
                         unwritten,
                     ),
-                    is_current: generation.is_some(),
+                    currency: match written.generation {
+                        Some(_) => ReadCurrency::Current,
+                        None => ReadCurrency::unwritten(stub, written.error),
+                    },
                 })
             }
             SessionParse::Resumed(resumed) => match write(Arc::new(resumed.record)) {
-                Some(generation) => {
+                SessionWrite::Written(generation) => {
                     let row = published_at(resumed.row, generation);
                     PlacedRead::Read(AttemptRead {
                         outcome: SessionOutcome::settled(
                             stub,
                             self.session_read(place, stub, RawRead::Parsed(row)),
                         ),
-                        is_current: true,
+                        currency: ReadCurrency::Current,
                     })
                 }
-                None => PlacedRead::CopyAfterWrites(stub),
+                written => {
+                    let found = FoundMessages::Parsed(resumed.row.message_times);
+                    PlacedRead::CopyAfterWrites {
+                        stub,
+                        failure: written
+                            .into_error()
+                            .map(|error| write_failure(stub, found, error)),
+                    }
+                }
             },
         }
     }

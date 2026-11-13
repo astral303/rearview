@@ -59,7 +59,7 @@ pub use interactive::{
     AdoptedCopy, CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead,
 };
 pub(crate) use interactive::{CachedCopy, refuse_the_drawing_thread};
-pub use next_step::NextStep;
+pub use next_step::{FoundMessages, NextStep, WriteFailure};
 pub use observer::{AwaitedRefresh, Observation, OtherRearview};
 pub use permit::{Admitted, ParsePermit};
 #[cfg(test)]

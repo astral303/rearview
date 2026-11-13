@@ -5,14 +5,16 @@
 
 use crate::clock::{Clock, Moment};
 use crate::error::{AppError, Result};
+use crate::history::fingerprint::CachedFingerprint;
 use crate::history::listing::SessionOrigin;
+use crate::history::provider::walk;
 use crate::history::provider::{SessionOutcome, SessionRead};
-use crate::history::sqlite_cache::AdoptedCopy;
+use crate::history::sqlite_cache::{AdoptedCopy, WriteFailure};
 use crate::history::{
     AwaitedRefresh, CachedRead, CurrentCopy, InteractiveRead, NextStep, OtherRearview,
     RefreshOutcome, SessionChanges, Source,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -40,6 +42,65 @@ pub(super) struct SessionStore {
     /// True for a file opened directly until the worker finds it inside a
     /// provider's session roots: no provider reads a file outside them.
     refuses_session_refreshes: bool,
+    /// Sessions whose last refresh failed, by path, in path order. Each is
+    /// refreshed again only once its transcripts change, when the user acts
+    /// on it, or when another rearview's refresh it waited for ends. The
+    /// records last until the TUI exits.
+    failed_refreshes: BTreeMap<PathBuf, FailedRefresh>,
+    /// When to check the transcripts of `failed_refreshes` next, on the
+    /// app's clock.
+    next_failed_refresh_check: Option<Moment>,
+    /// The last session the latest check of `failed_refreshes` checked; the
+    /// next check starts after it.
+    last_checked_failed_refresh: Option<PathBuf>,
+}
+
+/// The interval between checks of the transcripts of sessions whose refresh
+/// failed.
+const FAILED_REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The limit on the transcripts one check of failed refreshes stats,
+/// sub-agent transcripts included: more would delay the next frame on a
+/// large set or a slow drive. A check stats at least one session's
+/// transcripts, however many it has.
+pub(super) const FAILED_REFRESH_TRANSCRIPTS_PER_CHECK: usize = 16;
+
+/// A session whose refresh failed, waiting for its transcripts to change:
+/// their stamp at the failure.
+struct FailedRefresh {
+    /// The transcripts' stamp at the failure; `None` when unknown.
+    revision: Option<CachedFingerprint>,
+    /// The sub-agent transcripts `revision` spans.
+    subagents: Vec<PathBuf>,
+}
+
+impl FailedRefresh {
+    /// The transcripts of the session at `path` named by `failure`, at the
+    /// failure's revision or, without one, as they stamp now.
+    fn of(path: &Path, failure: WriteFailure) -> Self {
+        let revision = failure
+            .revision
+            .or_else(|| walk::session_stamp(path, &failure.subagents));
+        Self {
+            revision,
+            subagents: failure.subagents,
+        }
+    }
+
+    /// True when the transcripts of the session at `path` no longer match
+    /// `revision`. False while its transcript doesn't have file metadata to
+    /// read, as for a locator inside a database file: such a session is
+    /// refreshed again only when the user acts on it or another rearview's
+    /// refresh it waited for ends.
+    fn has_changed(&self, path: &Path) -> bool {
+        walk::session_stamp(path, &self.subagents).is_some_and(|stamp| Some(stamp) != self.revision)
+    }
+
+    /// The transcripts a check of this session stats: its own and each
+    /// sub-agent transcript.
+    fn transcript_count(&self) -> usize {
+        1 + self.subagents.len()
+    }
 }
 
 /// A finished refresh, each session's next step recorded, until the list
@@ -52,11 +113,12 @@ pub(super) enum FinishedRefresh {
     Failed(AppError),
 }
 
-/// One session a session refresh read: the path it answers for, and the
-/// read's result.
+/// One session a session refresh read: the path it answers for, the read's
+/// result, and the failure of its write when it failed.
 pub(super) struct FinishedRead {
     pub(super) path: PathBuf,
     pub(super) read: SessionRead,
+    pub(super) write_failure: Option<WriteFailure>,
 }
 
 impl FinishedRefresh {
@@ -75,6 +137,19 @@ impl FinishedRefresh {
             Self::Failed(_) => false,
         }
     }
+}
+
+/// The cause of an interactive read of a session. It decides whether a
+/// session whose refresh failed is refreshed again while its transcripts
+/// are unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReadCause {
+    /// The user opened or exported the session: the read is the user's
+    /// refresh, and its next step runs as recorded.
+    UserAction,
+    /// The viewer follows a finished refresh: a session whose refresh
+    /// failed waits for its transcripts to change.
+    FinishedRefresh,
 }
 
 /// An interactive read's copy of a session, its next step recorded.
@@ -161,50 +236,157 @@ impl SessionStore {
         true
     }
 
-    /// Ask for a session refresh of the session at `path`.
+    /// Ask for a session refresh of the session at `path`, as the user or a
+    /// change of the session asks: whether or not its last refresh failed.
     pub(super) fn request_session_refresh(&mut self, path: &Path) {
+        self.failed_refreshes.remove(path);
         self.requested.insert(path.to_path_buf());
+    }
+
+    /// Ask for a session refresh of the session at `path`, as an automatic
+    /// request asks: unless its last refresh failed and its transcripts
+    /// haven't changed since.
+    pub(super) fn request_session_refresh_unless_failed(&mut self, path: &Path) {
+        let has_unchanged_failure = self
+            .failed_refreshes
+            .get(path)
+            .is_some_and(|failed| !failed.has_changed(path));
+        if !has_unchanged_failure {
+            self.request_session_refresh(path);
+        }
     }
 
     /// Record `next`, the next step for the session at `path`, at `now` on
     /// the app's clock: read it again once the refresh it names completes,
-    /// or request a session refresh of it.
-    pub(super) fn record_next_step(&mut self, path: &Path, next: NextStep, now: Moment) {
+    /// request a session refresh of it, or record its failed refresh.
+    pub(super) fn record_next_step(&mut self, path: &Path, next: &NextStep, now: Moment) {
         match next {
             NextStep::AwaitRefresh(awaited) => {
-                self.await_refresh([path.to_path_buf()], awaited, now);
+                self.await_refresh([path.to_path_buf()], *awaited, now);
             }
             NextStep::CacheInBackground if !self.refuses_session_refreshes => {
-                self.request_session_refresh(path);
+                self.request_session_refresh_unless_failed(path);
             }
-            NextStep::CacheInBackground | NextStep::Settled => {}
+            NextStep::RefreshOnChange(failure) if !self.refuses_session_refreshes => {
+                self.failed_refreshes.insert(
+                    path.to_path_buf(),
+                    FailedRefresh::of(path, (**failure).clone()),
+                );
+            }
+            NextStep::Settled => {
+                self.failed_refreshes.remove(path);
+            }
+            NextStep::CacheInBackground | NextStep::RefreshOnChange(_) => {}
         }
+    }
+
+    /// Ask for a session refresh of each session whose refresh failed and
+    /// whose transcripts changed since, checking at most once per
+    /// [`FAILED_REFRESH_CHECK_INTERVAL`] of the app's clock, `now` on it.
+    pub(super) fn request_changed_failed_refreshes(&mut self, now: Moment) {
+        if self.failed_refreshes.is_empty()
+            || self
+                .next_failed_refresh_check
+                .is_some_and(|next| now < next)
+        {
+            return;
+        }
+        self.next_failed_refresh_check = Some(now + FAILED_REFRESH_CHECK_INTERVAL);
+        let checked = self.failed_refreshes_to_check();
+        self.last_checked_failed_refresh = checked.last().cloned();
+        for path in checked {
+            if self.failed_refreshes[&path].has_changed(&path) {
+                self.request_session_refresh(&path);
+            }
+        }
+    }
+
+    /// The sessions the next check of failed refreshes stats, in path order
+    /// from the one after the last session checked, wrapping to the first:
+    /// at least one, and as many more as fit within
+    /// [`FAILED_REFRESH_TRANSCRIPTS_PER_CHECK`] transcripts.
+    fn failed_refreshes_to_check(&self) -> Vec<PathBuf> {
+        let last = self.last_checked_failed_refresh.as_ref();
+        let is_up_to_last_checked = |path: &&PathBuf| last.is_some_and(|last| *path <= last);
+        let after_last = self
+            .failed_refreshes
+            .keys()
+            .skip_while(is_up_to_last_checked);
+        let from_start = self
+            .failed_refreshes
+            .keys()
+            .take_while(is_up_to_last_checked);
+        let mut checked = Vec::new();
+        let mut transcripts = 0;
+        for path in after_last.chain(from_start) {
+            transcripts += self.failed_refreshes[path].transcript_count();
+            if !checked.is_empty() && transcripts > FAILED_REFRESH_TRANSCRIPTS_PER_CHECK {
+                break;
+            }
+            checked.push(path.clone());
+        }
+        checked
+    }
+
+    /// The time from `now` until the next check of failed refreshes is due;
+    /// `None` while no refresh failed.
+    pub(super) fn until_failed_refresh_check(&self, now: Moment) -> Option<Duration> {
+        if self.failed_refreshes.is_empty() {
+            return None;
+        }
+        Some(
+            self.next_failed_refresh_check
+                .map_or(Duration::ZERO, |next| next.saturating_duration_since(now)),
+        )
+    }
+
+    /// True while the session at `path` waits for its transcripts to change
+    /// after a failed refresh.
+    pub(super) fn has_failed_refresh(&self, path: &Path) -> bool {
+        self.failed_refreshes.contains_key(path)
     }
 
     /// Record `outcome`'s next step at `now`, and return its read.
     pub(super) fn take_read(&mut self, outcome: SessionOutcome, now: Moment) -> SessionRead {
+        self.take_finished_read(outcome, now).read
+    }
+
+    /// Record `outcome`'s next step at `now`, and return its read with the
+    /// failure of its write.
+    fn take_finished_read(&mut self, outcome: SessionOutcome, now: Moment) -> FinishedRead {
         let path = outcome.locator().to_path_buf();
         let (read, next) = outcome.into_parts();
-        self.record_next_step(&path, next, now);
-        read
+        self.record_next_step(&path, &next, now);
+        FinishedRead {
+            path,
+            read,
+            write_failure: next.into_write_failure(),
+        }
     }
 
     /// Record the next step of `read`, an interactive read of the session at
-    /// `path`, at `now`, and return its copy.
+    /// `path` for `cause`, at `now`, and return its copy. A user's action
+    /// forgets the session's failed refresh first: an out-of-date or missing
+    /// copy then requests a refresh, at once or once the refresh it awaits
+    /// completes.
     pub(super) fn take_interactive<T>(
         &mut self,
         path: &Path,
         read: InteractiveRead<T>,
+        cause: ReadCause,
         now: Moment,
     ) -> SessionCopy<T> {
+        if cause == ReadCause::UserAction {
+            self.failed_refreshes.remove(path);
+        }
         match read.into_read() {
             CachedRead::Current(copy) => SessionCopy::Current(copy),
             CachedRead::Older { copy, next } => {
-                self.record_next_step(path, next, now);
+                self.record_next_step(path, &next, now);
                 SessionCopy::Older(copy)
             }
             CachedRead::Missing { next } => {
-                self.record_next_step(path, next, now);
+                self.record_next_step(path, &next, now);
                 SessionCopy::Missing
             }
         }
@@ -308,11 +490,7 @@ impl SessionStore {
             Ok(RefreshOutcome::Cached(outcomes)) => FinishedRefresh::Reads(
                 outcomes
                     .into_iter()
-                    .map(|outcome| {
-                        let path = outcome.locator().to_path_buf();
-                        let read = self.take_read(outcome, now);
-                        FinishedRead { path, read }
-                    })
+                    .map(|outcome| self.take_finished_read(outcome, now))
                     .collect(),
             ),
             Ok(RefreshOutcome::Changes(changes)) => {
@@ -332,14 +510,14 @@ impl SessionStore {
             if !updated.replaces_listed_row && updated.next != NextStep::Settled {
                 self.track_new_session(updated.row.source, &updated.row.path);
             }
-            self.record_next_step(&updated.row.path, updated.next, now);
+            self.record_next_step(&updated.row.path, &updated.next, now);
         }
         for kept in &changes.kept {
-            self.record_next_step(&kept.path, kept.next, now);
+            self.record_next_step(&kept.path, &kept.next, now);
         }
         for pending in &changes.pending {
             self.track_new_session(pending.source, &pending.path);
-            self.record_next_step(&pending.path, pending.next, now);
+            self.record_next_step(&pending.path, &pending.next, now);
         }
     }
 

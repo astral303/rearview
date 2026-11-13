@@ -740,16 +740,18 @@ pub(super) fn window_from_half_past_noon() -> TimeFilter {
 /// sessions and their cache.
 pub(super) struct RefreshedNewSession {
     pub(super) app: App,
+    /// True when the list showed `new` after the refresh whose writes failed.
+    pub(super) listed_new_after_failure: bool,
     home: ClaudeHome,
     pub(super) new: PathBuf,
     _cache: tempfile::TempDir,
 }
 
-/// A list `Ctrl+R` under a window from 12:30 whose writes fail, while the
-/// cache holds a copy from before the window of `new`, a session the list
-/// does not show, and `new`'s transcript gained a message at `minute`.
-/// Then commits succeed again and the session refresh `new` waits for is
-/// served.
+/// A list `Ctrl+R` under a window from 12:30 whose writes fail before any
+/// session is parsed, while the cache has a copy from before the window of
+/// `new`, a session the list does not show, and `new`'s transcript gained a
+/// message at `minute`, when it was last written. Then commits succeed again
+/// and the user presses `Ctrl+R` again.
 pub(super) fn refresh_a_new_session_with_an_old_copy(minute: u32) -> RefreshedNewSession {
     let home = ClaudeHome::new();
     let cache = admitted_cache();
@@ -760,24 +762,32 @@ pub(super) fn refresh_a_new_session_with_an_old_copy(minute: u32) -> RefreshedNe
     let new = home.write("new", 10, &["before the window"]);
     home.rows(&environment);
     home.append(&new, minute, "added since the copy");
+    let added = chrono::Utc
+        .with_ymd_and_hms(2026, 10, 1, 12, minute, 0)
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&new)
+        .unwrap()
+        .set_modified(added.into())
+        .unwrap();
     let mut app = app_reading(rows, environment);
     let window = window_from_half_past_noon();
     app.set_list_window(window);
 
     fail_owner_commits(cache.path());
     serve_list_refresh(&mut app, window);
-    assert_eq!(listed_names(&app), ["listed"]);
+    let listed_new_after_failure = app.conversations().iter().any(|row| row.path == new);
     assert!(
-        app.store.is_refresh_pending(&new),
-        "a new session read from its old copy outside the window keeps its pending refresh"
+        !app.store.is_refresh_pending(&new),
+        "the new session whose write failed waits for a change or the user's refresh"
     );
 
     allow_owner_commits(cache.path());
-    app.expire_awaited_refresh_check_for_test();
-    app.check_awaited_refresh();
-    serve_session_refresh(&mut app);
+    serve_list_refresh(&mut app, window);
     RefreshedNewSession {
         app,
+        listed_new_after_failure,
         home,
         new,
         _cache: cache,
@@ -788,6 +798,10 @@ pub(super) fn refresh_a_new_session_with_an_old_copy(minute: u32) -> RefreshedNe
 fn new_session_with_old_copy_outside_window_is_listed_once_refreshed_with_message_inside_it() {
     let refreshed = refresh_a_new_session_with_an_old_copy(50);
 
+    assert!(
+        refreshed.listed_new_after_failure,
+        "the refresh whose writes failed lists the session by its transcript's last write"
+    );
     assert_eq!(listed_names(&refreshed.app), ["new", "listed"]);
 }
 
@@ -795,10 +809,15 @@ fn new_session_with_old_copy_outside_window_is_listed_once_refreshed_with_messag
 fn new_session_still_outside_window_once_refreshed_is_skipped_until_it_changes() {
     let RefreshedNewSession {
         mut app,
+        listed_new_after_failure,
         home,
         new,
         _cache,
     } = refresh_a_new_session_with_an_old_copy(20);
+    assert!(
+        !listed_new_after_failure,
+        "the refresh whose writes failed doesn't list the session"
+    );
     assert_eq!(listed_names(&app), ["listed"]);
     let known = app.begin_refresh().expect("a list refresh begins");
     drop(app);
@@ -816,6 +835,182 @@ fn new_session_still_outside_window_once_refreshed_is_skipped_until_it_changes()
             .and_then(|found| found.fingerprint),
         current,
         "the session is recorded as unlisted at the revision its refresh read"
+    );
+}
+
+/// A list `Ctrl+R` under a window from 12:30 whose write of `new`'s resumed
+/// read fails, while the cache has a copy from before the window of `new`,
+/// a session the list does not show, and its transcript gained a message at
+/// `minute`: the list shows the older copy exactly when that message falls
+/// inside the window.
+#[test]
+fn new_session_whose_resumed_write_fails_is_listed_by_messages_it_parsed() {
+    for (minute, is_inside) in [(50, true), (20, false)] {
+        let home = ClaudeHome::new();
+        let cache = admitted_cache();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(TestClock::default());
+        let environment =
+            home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock);
+        home.write("listed", 40, &["inside the window"]);
+        let rows = home.rows(&environment);
+        let new = home.write("new", 10, &["before the window"]);
+        home.rows(&environment);
+        home.append(&new, minute, "added since the copy");
+        let mut app = app_reading(rows, environment);
+        let window = window_from_half_past_noon();
+        app.set_list_window(window);
+        crate::history::sqlite_cache::refresh::tests::fail_session_row_writes(cache.path());
+
+        serve_list_refresh(&mut app, window);
+
+        assert_eq!(
+            app.conversations().iter().any(|row| row.path == new),
+            is_inside,
+            "the session whose write failed is listed exactly when its message at \
+             12:{minute} falls inside the window"
+        );
+        assert!(
+            app.store.has_failed_refresh(&new),
+            "the session with its message at 12:{minute} waits for a change after its \
+             failed refresh"
+        );
+    }
+}
+
+/// The next step of `row`'s failed refresh, at its transcripts' stamp now.
+fn failed_refresh_of(row: &Conversation) -> NextStep {
+    use crate::history::sqlite_cache::{FoundMessages, WriteFailure};
+    NextStep::RefreshOnChange(Box::new(WriteFailure {
+        revision: crate::history::provider::walk::session_stamp(&row.path, &row.subagents),
+        subagents: row.subagents.clone(),
+        found: FoundMessages::InRow,
+        error: "injected write failure".to_owned(),
+    }))
+}
+
+/// The list over `sessions` written in `home`, through an environment on
+/// `clock`, each session recorded as a failed refresh.
+fn app_with_failed_refreshes(
+    home: &ClaudeHome,
+    clock: &Arc<TestClock>,
+    sessions: &[PathBuf],
+) -> App {
+    let environment = home.environment_on(Arc::clone(clock) as Arc<dyn crate::clock::Clock>);
+    let rows = home.rows(&environment);
+    let mut app = app_reading(rows.clone(), environment);
+    for row in rows.iter().filter(|row| sessions.contains(&row.path)) {
+        app.record_next_step(&row.path, failed_refresh_of(row));
+    }
+    app
+}
+
+/// After a failed refresh, the TUI waits for input at most until the next
+/// check of the failed session's transcripts.
+#[test]
+fn idle_wait_after_a_failed_refresh_lasts_until_the_next_check() {
+    let home = ClaudeHome::new();
+    let clock = Arc::new(TestClock::default());
+    let session = home.write("a", 5, &["a"]);
+    let mut app = app_with_failed_refreshes(&home, &clock, &[session]);
+
+    app.check_failed_refreshes();
+
+    assert!(
+        app.idle_wait() <= Duration::from_secs(1),
+        "the wait ends by the next check: {:?}",
+        app.idle_wait()
+    );
+}
+
+/// One check of failed refreshes stops at its limit; the next check resumes
+/// after the last session the first one checked, and wraps to the first
+/// session.
+#[test]
+fn failed_refresh_check_resumes_after_last_session_checked_and_wraps_to_first() {
+    use super::session_store::FAILED_REFRESH_TRANSCRIPTS_PER_CHECK as LIMIT;
+    let home = ClaudeHome::new();
+    let clock = Arc::new(TestClock::default());
+    let sessions: Vec<PathBuf> = (0..LIMIT + 3)
+        .map(|index| home.write(&format!("s{index:02}"), 5, &["a"]))
+        .collect();
+    let mut app = app_with_failed_refreshes(&home, &clock, &sessions);
+    let (first, past_limit) = (&sessions[0], &sessions[LIMIT]);
+    home.append(past_limit, 6, "a change");
+
+    app.check_failed_refreshes();
+    assert!(
+        !app.store.is_refresh_pending(past_limit),
+        "the first check stops at its limit, before the changed session"
+    );
+    home.append(first, 6, "a change");
+    clock.advance(Duration::from_secs(1));
+    app.check_failed_refreshes();
+
+    assert!(
+        app.store.is_refresh_pending(past_limit),
+        "the next check resumes after the last session the first one checked"
+    );
+    assert!(
+        app.store.is_refresh_pending(first),
+        "the next check wraps to the first session"
+    );
+}
+
+/// One check of failed refreshes counts each sub-agent transcript toward its
+/// limit, and checks at least one session whose transcripts pass it.
+#[test]
+fn failed_refresh_check_counts_subagent_transcripts_toward_its_limit() {
+    use super::session_store::FAILED_REFRESH_TRANSCRIPTS_PER_CHECK as LIMIT;
+    let home = ClaudeHome::new();
+    let clock = Arc::new(TestClock::default());
+    let sessions: Vec<PathBuf> = ["s0", "s1"]
+        .into_iter()
+        .map(|name| {
+            let session = home.write(name, 5, &["a"]);
+            for agent in 0..LIMIT {
+                home.write_subagent(&session, &format!("a{agent:02}"), 5, &["a task"]);
+            }
+            session
+        })
+        .collect();
+    let mut app = app_with_failed_refreshes(&home, &clock, &sessions);
+    for session in &sessions {
+        home.append(session, 6, "a change");
+    }
+
+    app.check_failed_refreshes();
+
+    assert_eq!(
+        (
+            app.store.is_refresh_pending(&sessions[0]),
+            app.store.is_refresh_pending(&sessions[1]),
+        ),
+        (true, false),
+        "the check stops after the first session, whose {} transcripts pass the limit",
+        LIMIT + 1
+    );
+}
+
+/// A session whose refresh failed, waiting for another rearview's refresh,
+/// is read again once that refresh ends, though its transcripts didn't
+/// change.
+#[test]
+fn failed_refresh_waiting_for_another_rearviews_refresh_is_read_again_when_it_ends() {
+    let home = ClaudeHome::new();
+    let clock = Arc::new(TestClock::default());
+    let session = home.write("a", 5, &["a"]);
+    let mut app = app_with_failed_refreshes(&home, &clock, std::slice::from_ref(&session));
+    app.await_refresh_for_test(
+        [session.clone()],
+        AwaitedRefresh::AnotherRearview(OtherRearview::Refreshing),
+    );
+
+    app.expire_awaited_refresh_check_for_test();
+    app.check_awaited_refresh();
+
+    assert!(
+        app.store.is_refresh_pending(&session),
+        "the session is read again once the other rearview's refresh ends"
     );
 }
 

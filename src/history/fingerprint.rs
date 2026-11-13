@@ -60,6 +60,10 @@ impl CachedFingerprint {
         }
     }
 
+    pub fn modified(&self) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::new(self.mtime_secs, self.mtime_nsecs)
+    }
+
     /// True when the file is larger than it was at `before`. A change that
     /// does not grow a transcript counts as a rewrite: a reader's rewrite
     /// check sees only the bytes just before its cursor.

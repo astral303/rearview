@@ -18,7 +18,7 @@ use crate::tui::app::claude_home::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::Instant;
@@ -1065,10 +1065,11 @@ fn ctrl_r_pressed_while_session_caches_in_background_runs_after_it() {
     );
 }
 
-/// A list `Ctrl+R` whose cache writes fail keeps each row's cached copy with
-/// a pending refresh.
+/// A list `Ctrl+R` whose cache writes fail keeps each row's cached copy
+/// without a pending refresh; the user's next `Ctrl+R` lists the newest
+/// messages once writes succeed again.
 #[test]
-fn list_refresh_whose_cache_write_fails_keeps_its_rows_pending_refresh() {
+fn list_refresh_whose_cache_write_fails_keeps_cached_copy_until_user_refreshes_again() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["a"]);
     let cache = admitted_cache();
@@ -1081,7 +1082,7 @@ fn list_refresh_whose_cache_write_fails_keeps_its_rows_pending_refresh() {
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
     home.append(&a, 6, "written after the launch");
     let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let _every_commit_after_the_first_fails =
+    let every_commit_after_the_first_fails =
         test_hooks::on_every_connection(cache.path(), move |connection| {
             let commits = Arc::clone(&commits);
             connection
@@ -1100,8 +1101,15 @@ fn list_refresh_whose_cache_write_fails_keeps_its_rows_pending_refresh() {
         "the row is the cached copy"
     );
     assert!(
-        app.is_session_refresh_requested() || app.is_awaiting_refresh(),
-        "the row read from its older copy has a pending refresh"
+        !app.is_session_refresh_requested() && !app.is_awaiting_refresh(),
+        "the row whose write failed doesn't have a pending refresh"
+    );
+    drop(every_commit_after_the_first_fails);
+    refresh_the_list(&mut runtime, &mut terminal);
+    assert_eq!(
+        runtime.app().conversations()[0].message_count,
+        2,
+        "the user's next refresh lists the newest message"
     );
 }
 
@@ -1316,27 +1324,7 @@ fn opening_changed_session_after_another_rearview_died_mid_refresh_shows_its_new
 /// Fail every commit that changes a session in the cache in `base` until
 /// the result drops, as a failing disk or a rebuild that cannot start does.
 fn fail_session_writes(base: &Path) -> test_hooks::Installed {
-    test_hooks::on_every_connection(base, |connection| {
-        if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
-            return;
-        }
-        let changes_a_session = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let changed = Arc::clone(&changes_a_session);
-        connection
-            .update_hook(Some(
-                move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
-                    if table != "refresh_state" {
-                        changed.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                },
-            ))
-            .unwrap();
-        connection
-            .commit_hook(Some(move || {
-                changes_a_session.swap(false, std::sync::atomic::Ordering::SeqCst)
-            }))
-            .unwrap();
-    })
+    fail_and_count_session_commits(base, &Arc::default())
 }
 
 /// Typing text only the transcript holds, since the session was cached,
@@ -1398,11 +1386,10 @@ fn list_refresh_whose_writes_fail_doesnt_report_another_rearview() {
     );
 }
 
-/// A viewer `Ctrl+R` whose writes fail keeps the session's refresh pending:
-/// the copy stays under `Updating…`, and the newest messages show once
-/// writes succeed again.
+/// A viewer `Ctrl+R` whose writes fail ends `Updating…` over the copy; the
+/// newest messages show once writes succeed again and the user refreshes.
 #[test]
-fn viewer_refresh_whose_writes_fail_stays_pending_until_refresh_succeeds() {
+fn viewer_refresh_whose_writes_fail_shows_newest_messages_once_user_refreshes_again() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["first question"]);
     let cache = admitted_cache();
@@ -1418,12 +1405,17 @@ fn viewer_refresh_whose_writes_fail_stays_pending_until_refresh_succeeds() {
     );
 
     assert!(
-        !ticks_reach(&mut runtime, &mut terminal, Duration::from_secs(3), |app| {
+        ticks_reach(&mut runtime, &mut terminal, BACKGROUND_WORK_LIMIT, |app| {
             !app.is_open_session_updating()
         }),
-        "the session keeps a pending refresh after the failed refresh"
+        "the viewer stops updating after the failed refresh"
     );
     drop(failing);
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
     assert!(
         ticks_show(
             &mut runtime,
@@ -1431,7 +1423,7 @@ fn viewer_refresh_whose_writes_fail_stays_pending_until_refresh_succeeds() {
             BACKGROUND_WORK_LIMIT,
             "newest question"
         ),
-        "the newest messages show after writes succeed again"
+        "the newest messages show after writes succeed again and the user refreshes"
     );
 }
 
@@ -2134,4 +2126,505 @@ fn another_rearviews_refresh_doesnt_block_rename_or_delete() {
     assert!(runtime.app().is_action_available(SessionAction::Rename));
     assert!(runtime.app().is_action_available(SessionAction::Delete));
     drop(other_refresh);
+}
+
+/// Fail each write of a session's catalogue row to the cache in `base`, as
+/// `fail_session_row_writes` does, counting each attempt in `attempts`.
+fn fail_each_session_row_write(
+    base: &Path,
+    attempts: &Arc<std::sync::atomic::AtomicUsize>,
+) -> test_hooks::Installed {
+    crate::history::sqlite_cache::refresh::tests::fail_session_row_writes(base);
+    let attempts = Arc::clone(attempts);
+    test_hooks::on_every_connection(base, move |connection| {
+        let attempts = Arc::clone(&attempts);
+        connection
+            .update_hook(Some(
+                move |action: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                    if table == "sessions"
+                        && matches!(
+                            action,
+                            rusqlite::hooks::Action::SQLITE_INSERT
+                                | rusqlite::hooks::Action::SQLITE_UPDATE
+                        )
+                    {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            ))
+            .unwrap();
+    })
+}
+
+/// Tick `runtime` without terminal input until `done` returns true, advancing
+/// `clock`, the app's, by each whole wait the runtime asks for, and sleeping
+/// at most 5 ms of real time per tick for background work. False when `done`
+/// still returns false after [`BACKGROUND_WORK_LIMIT`] of real time. Each
+/// tick advances the clock by at least 1 ms: a status expires once its
+/// lifetime has passed, not at the instant it ends.
+fn tick_on_clock_until(
+    runtime: &mut Runtime,
+    terminal: &mut Terminal<TestBackend>,
+    clock: &TestClock,
+    mut done: impl FnMut(&Runtime, &Terminal<TestBackend>) -> bool,
+) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < BACKGROUND_WORK_LIMIT {
+        if done(runtime, terminal) {
+            return true;
+        }
+        runtime
+            .tick(terminal, &mut |wait| {
+                std::thread::sleep(wait.min(Duration::from_millis(5)));
+                clock.advance(wait.max(Duration::from_millis(1)));
+                Ok(Vec::new())
+            })
+            .unwrap();
+    }
+    done(runtime, terminal)
+}
+
+/// True while no job runs, no session refresh is requested or awaited, and
+/// the viewer doesn't read the open session.
+fn is_settled(runtime: &Runtime) -> bool {
+    let app = runtime.app();
+    !runtime.supervisor.is_running_a_job()
+        && !app.is_session_refresh_requested()
+        && !app.is_awaiting_refresh()
+        && !app.is_reading_open_session()
+}
+
+/// The app's time a test lets pass to see that nothing refreshes a failed
+/// session: past the status's lifetime and several checks of its transcripts.
+const NOTHING_CHANGES_FOR: Duration = Duration::from_secs(10);
+
+/// Tick `runtime` on `clock` for [`NOTHING_CHANGES_FOR`] of the app's time,
+/// then until no refresh is pending.
+fn tick_while_nothing_changes(
+    runtime: &mut Runtime,
+    terminal: &mut Terminal<TestBackend>,
+    clock: &TestClock,
+) {
+    let start = clock.now();
+    assert!(
+        tick_on_clock_until(runtime, terminal, clock, |runtime, _| {
+            clock.elapsed_since(start) >= NOTHING_CHANGES_FOR && is_settled(runtime)
+        }),
+        "the TUI settles while nothing changes"
+    );
+}
+
+/// The TUI launched over `home`'s one session `a` with its cache in `cache`
+/// on `clock`, `a` grown since its launch and opened in the viewer once
+/// `fail` is installed.
+fn opened_after_growth_with(
+    home: &ClaudeHome,
+    cache: &Path,
+    clock: &Arc<TestClock>,
+    terminal: &mut Terminal<TestBackend>,
+    a: &Path,
+    fail: impl FnOnce(),
+) -> Runtime {
+    let mut runtime = launched_in(home.environment_with_cache(
+        cache,
+        ProcessIdentity::default(),
+        Arc::clone(clock) as Arc<dyn Clock>,
+    ));
+    tick_until(&mut runtime, terminal, |app| !app.is_loading());
+    home.append(a, 6, "newest question");
+    fail();
+    open_the_selected_session(&mut runtime, terminal);
+    runtime
+}
+
+/// The TUI with session `a` open, grown since the launch, once `fail` failed
+/// an attempt to write it and the TUI recorded the failure; and the attempts
+/// so far.
+struct FailingWrites {
+    home: ClaudeHome,
+    a: PathBuf,
+    _cache: tempfile::TempDir,
+    clock: Arc<TestClock>,
+    terminal: Terminal<TestBackend>,
+    runtime: Runtime,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+    /// The hook that fails the session's writes, until it is dropped with
+    /// this value.
+    _failure_hook: test_hooks::Installed,
+}
+
+/// True while the status bar shows a refresh's failure.
+fn shows_refresh_failed(runtime: &Runtime) -> bool {
+    shows_status(runtime, |message| message.starts_with("Refresh failed: "))
+}
+
+/// True while the status bar shows a status that `is_shown` accepts: an
+/// expired status stays recorded but isn't shown.
+fn shows_status(runtime: &Runtime, is_shown: impl Fn(&str) -> bool) -> bool {
+    let app = runtime.app();
+    app.status_message_remaining().is_some()
+        && app
+            .status_message()
+            .is_some_and(|(message, _)| is_shown(message))
+}
+
+impl FailingWrites {
+    fn start(
+        fail: impl FnOnce(&Path, &Arc<std::sync::atomic::AtomicUsize>) -> test_hooks::Installed,
+    ) -> Self {
+        Self::start_over(|home| home.write("a", 5, &["first question"]), fail)
+    }
+
+    /// [`Self::start`] over the session `write` writes in its home.
+    fn start_over(
+        write: impl FnOnce(&ClaudeHome) -> PathBuf,
+        fail: impl FnOnce(&Path, &Arc<std::sync::atomic::AtomicUsize>) -> test_hooks::Installed,
+    ) -> Self {
+        let home = ClaudeHome::new();
+        let a = write(&home);
+        let cache = admitted_cache();
+        let clock = Arc::new(TestClock::default());
+        let mut terminal = terminal();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut failure_hook = None;
+        let mut runtime =
+            opened_after_growth_with(&home, cache.path(), &clock, &mut terminal, &a, || {
+                failure_hook = Some(fail(cache.path(), &attempts));
+            });
+        assert!(
+            tick_on_clock_until(&mut runtime, &mut terminal, &clock, |runtime, _| {
+                shows_refresh_failed(runtime)
+            }),
+            "the viewer reports the failed refresh"
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 1,
+            "the session's write was attempted"
+        );
+        Self {
+            home,
+            a,
+            _cache: cache,
+            clock,
+            terminal,
+            runtime,
+            attempts,
+            _failure_hook: failure_hook.expect("the failure is installed"),
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+
+    /// The attempts to write the session while nothing changes for
+    /// [`NOTHING_CHANGES_FOR`] of the app's time.
+    fn attempts_while_nothing_changes(&mut self) -> usize {
+        let before = self.attempts();
+        tick_while_nothing_changes(&mut self.runtime, &mut self.terminal, &self.clock);
+        self.attempts() - before
+    }
+
+    /// Tick until the viewer reports a failed refresh.
+    fn tick_until_refresh_failed(&mut self) -> bool {
+        tick_on_clock_until(
+            &mut self.runtime,
+            &mut self.terminal,
+            &self.clock,
+            |runtime, _| shows_refresh_failed(runtime),
+        )
+    }
+}
+
+/// An open session whose write fails mid-batch each time isn't written again
+/// while nothing changes.
+#[test]
+fn open_session_whose_write_fails_each_time_doesnt_refresh_again_while_nothing_changes() {
+    let mut failing = FailingWrites::start(fail_each_session_row_write);
+
+    assert_eq!(
+        failing.attempts_while_nothing_changes(),
+        0,
+        "the session isn't written again while nothing changes"
+    );
+}
+
+/// An open session with a sub-agent transcript, whose write fails each
+/// time, isn't written again while nothing changes: the check of its
+/// transcripts stamps the sub-agent transcript as discovery does.
+#[test]
+fn open_session_with_subagent_whose_write_fails_doesnt_refresh_again_while_nothing_changes() {
+    let mut failing = FailingWrites::start_over(
+        |home| {
+            let a = home.write("a", 5, &["first question"]);
+            home.write_subagent(&a, "helper", 5, &["a task"]);
+            a
+        },
+        fail_each_session_row_write,
+    );
+
+    assert_eq!(
+        failing.attempts_while_nothing_changes(),
+        0,
+        "the session isn't written again while its transcripts don't change"
+    );
+}
+
+/// [`fail_session_writes`], counting each failed commit in `attempts`.
+fn fail_and_count_session_commits(
+    base: &Path,
+    attempts: &Arc<std::sync::atomic::AtomicUsize>,
+) -> test_hooks::Installed {
+    let attempts = Arc::clone(attempts);
+    test_hooks::on_every_connection(base, move |connection| {
+        if connection.is_readonly(rusqlite::MAIN_DB).unwrap() {
+            return;
+        }
+        let changes_a_session = Arc::new(AtomicBool::new(false));
+        let changed = Arc::clone(&changes_a_session);
+        connection
+            .update_hook(Some(
+                move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                    if table != "refresh_state" {
+                        changed.store(true, Ordering::SeqCst);
+                    }
+                },
+            ))
+            .unwrap();
+        let attempts = Arc::clone(&attempts);
+        connection
+            .commit_hook(Some(move || {
+                let fails = changes_a_session.swap(false, Ordering::SeqCst);
+                if fails {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                }
+                fails
+            }))
+            .unwrap();
+    })
+}
+
+/// An open session whose commit fails each time, revoking the owner's write
+/// permission, isn't written again while nothing changes.
+#[test]
+fn open_session_whose_commit_fails_each_time_doesnt_refresh_again_while_nothing_changes() {
+    let mut failing = FailingWrites::start(fail_and_count_session_commits);
+
+    assert_eq!(
+        failing.attempts_while_nothing_changes(),
+        0,
+        "the session's commit isn't attempted again while nothing changes"
+    );
+}
+
+#[test]
+fn open_session_whose_write_fails_shows_refresh_failed_without_updating() {
+    let mut failing = FailingWrites::start(fail_each_session_row_write);
+
+    assert!(
+        !failing.runtime.app().is_open_session_updating(),
+        "the viewer doesn't show the session as updating"
+    );
+    let status = failing
+        .runtime
+        .app()
+        .status_message()
+        .map(|(message, _)| message.clone())
+        .unwrap_or_default();
+    assert!(
+        status.starts_with("Refresh failed: ") && status.contains("injected session write failure"),
+        "the status names the failed write: {status}"
+    );
+    tick_while_nothing_changes(&mut failing.runtime, &mut failing.terminal, &failing.clock);
+    assert!(
+        !shown_text(&failing.terminal).contains("Refresh failed"),
+        "the status shows once and clears"
+    );
+}
+
+/// An open session whose write failed is written once more after its
+/// transcript changes while the TUI waits for input, at the next check of
+/// its transcripts, without the user's refresh.
+#[test]
+fn open_session_whose_write_failed_is_written_again_once_its_transcript_changes() {
+    let mut failing = FailingWrites::start(fail_each_session_row_write);
+    tick_while_nothing_changes(&mut failing.runtime, &mut failing.terminal, &failing.clock);
+    let before = failing.attempts();
+
+    let changed = failing.clock.now();
+    let (home, a, clock) = (&failing.home, &failing.a, &failing.clock);
+    failing
+        .runtime
+        .tick(&mut failing.terminal, &mut |wait| {
+            // The transcript changes as the TUI begins to wait for input.
+            home.append(a, 7, "latest question");
+            clock.advance(wait.max(Duration::from_millis(1)));
+            Ok(Vec::new())
+        })
+        .unwrap();
+    assert!(
+        tick_on_clock_until(
+            &mut failing.runtime,
+            &mut failing.terminal,
+            &failing.clock,
+            |runtime, _| !is_settled(runtime)
+        ),
+        "the change starts a refresh"
+    );
+    let noticed_after = failing.clock.elapsed_since(changed);
+    let clock = Arc::clone(&failing.clock);
+    assert!(
+        tick_on_clock_until(
+            &mut failing.runtime,
+            &mut failing.terminal,
+            &clock,
+            |runtime, _| is_settled(runtime)
+        ),
+        "the refresh ends"
+    );
+
+    assert!(
+        noticed_after <= Duration::from_secs(2),
+        "the next check, a second apart, notices the change, not the end of an \
+         idle wait: {noticed_after:?}"
+    );
+    assert_eq!(
+        failing.attempts() - before,
+        1,
+        "the session is written once more after its transcript changes"
+    );
+}
+
+/// Reopening a session whose write failed, while its transcripts are
+/// unchanged, refreshes it once more. That refresh fails too: the viewer
+/// shows `Refresh failed:` again, and nothing refreshes the session while
+/// nothing changes.
+#[test]
+fn reopened_session_whose_write_failed_is_refreshed_once_more() {
+    let mut failing = FailingWrites::start(fail_each_session_row_write);
+    let first_open = failing.attempts();
+    tick_while_nothing_changes(&mut failing.runtime, &mut failing.terminal, &failing.clock);
+    let before = failing.attempts();
+
+    tick_with(
+        &mut failing.runtime,
+        &mut failing.terminal,
+        vec![key(KeyCode::Char('q'), KeyModifiers::NONE)],
+    );
+    open_the_selected_session(&mut failing.runtime, &mut failing.terminal);
+
+    assert!(
+        failing.tick_until_refresh_failed(),
+        "the viewer reports the reopen's failed refresh"
+    );
+    assert_eq!(
+        failing.attempts() - before,
+        first_open,
+        "the reopen refreshes the session once, as the first open did"
+    );
+    assert_eq!(
+        failing.attempts_while_nothing_changes(),
+        0,
+        "the session isn't written again while nothing changes"
+    );
+}
+
+/// The text the export in
+/// [`export_asked_for_after_failed_write_reports_failed_read_once_its_refresh_fails`]
+/// put on the clipboard.
+static EXPORTED_AFTER_FAILED_WRITE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// A plain-text export asked for after the open session's write failed,
+/// while its transcripts are unchanged, refreshes the session once more.
+/// Once that refresh fails too, the export reports the failed read without
+/// copying the older copy, as an export asked for before the failure does.
+#[test]
+fn export_asked_for_after_failed_write_reports_failed_read_once_its_refresh_fails() {
+    let mut failing = FailingWrites::start(fail_each_session_row_write);
+    tick_while_nothing_changes(&mut failing.runtime, &mut failing.terminal, &failing.clock);
+    failing
+        .runtime
+        .app_mut()
+        .set_clipboard_writer_for_test(|text| {
+            *EXPORTED_AFTER_FAILED_WRITE.lock().unwrap() = text.to_owned();
+            Ok(crate::tui::export::ClipboardDestination::System)
+        });
+    let before = failing.attempts();
+
+    tick_with(
+        &mut failing.runtime,
+        &mut failing.terminal,
+        vec![
+            key(KeyCode::Char('y'), KeyModifiers::NONE),
+            key(KeyCode::Char('2'), KeyModifiers::NONE),
+        ],
+    );
+
+    assert!(
+        tick_on_clock_until(
+            &mut failing.runtime,
+            &mut failing.terminal,
+            &failing.clock,
+            |runtime, _| shows_status(runtime, |message| {
+                message == "Refresh failed: the session could not be read"
+            })
+        ),
+        "the export reports the failed read once its refresh fails"
+    );
+    assert!(
+        EXPORTED_AFTER_FAILED_WRITE.lock().unwrap().is_empty(),
+        "the export doesn't copy the older copy"
+    );
+    assert!(
+        failing.attempts() > before,
+        "the export refreshes the session"
+    );
+    assert_eq!(
+        failing.attempts_while_nothing_changes(),
+        0,
+        "the session isn't written again while nothing changes"
+    );
+}
+
+/// A list `Ctrl+R` whose write of a changed session fails each time doesn't
+/// write that session again while nothing changes.
+#[test]
+fn list_refresh_whose_write_fails_each_time_doesnt_write_session_again() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let clock = Arc::new(TestClock::default());
+    let mut terminal = terminal();
+    let mut runtime = launched_in(home.environment_with_cache(
+        cache.path(),
+        ProcessIdentity::default(),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    ));
+    tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
+    home.append(&a, 6, "newest question");
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failure_hook = fail_each_session_row_write(cache.path(), &attempts);
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+    );
+    assert!(
+        tick_on_clock_until(&mut runtime, &mut terminal, &clock, |runtime, _| {
+            attempts.load(Ordering::SeqCst) >= 1
+                && !runtime.app().is_refreshing()
+                && is_settled(runtime)
+        }),
+        "the list refresh attempts the session's write and ends"
+    );
+    let failed = attempts.load(Ordering::SeqCst);
+
+    tick_while_nothing_changes(&mut runtime, &mut terminal, &clock);
+    drop(failure_hook);
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        failed,
+        "the session isn't written again while nothing changes"
+    );
 }

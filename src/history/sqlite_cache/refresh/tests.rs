@@ -258,6 +258,22 @@ fn run_owner(base: &Path, activity: OwnerActivity, wait_for_release: impl FnOnce
     }
 }
 
+/// Fail each write of a session's catalogue row to the cache in `base`, as a
+/// database that refuses the same statement each time does. The failed
+/// statement rolls its batch back without revoking the owner's write
+/// permission.
+pub(crate) fn fail_session_row_writes(base: &Path) {
+    connect(base, POLL_EVERY)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_session_update AFTER UPDATE ON sessions \
+             BEGIN SELECT RAISE(ABORT, 'injected session write failure'); END; \
+             CREATE TRIGGER fail_session_insert AFTER INSERT ON sessions \
+             BEGIN SELECT RAISE(ABORT, 'injected session write failure'); END;",
+        )
+        .unwrap();
+}
+
 /// Fail every later commit of the refresh owner of the cache in `base`, as a
 /// database that cannot record a commit fails it, until
 /// [`allow_owner_commits`].

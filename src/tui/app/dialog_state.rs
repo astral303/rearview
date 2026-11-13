@@ -1,5 +1,5 @@
 use super::list_state::SelectionAnchor;
-use super::session_store::SessionCopy;
+use super::session_store::{ReadCause, SessionCopy};
 use super::view_state::DeferredCopy;
 use super::{Action, App, AppMode, DialogMode};
 use crate::error::Result;
@@ -276,7 +276,7 @@ impl App {
         let entries = if self.defers_copy() {
             None
         } else {
-            self.current_export_entries()
+            self.current_export_entries(ReadCause::UserAction)
         };
         match entries {
             Some(entries) => self.export_now(option, to_clipboard, Some(entries)),
@@ -293,8 +293,8 @@ impl App {
     /// directly outside every provider's session roots as the background
     /// worker last parsed it, or the session's copy in the cache when it is
     /// current. `None` for an out-of-date or missing copy, after recording
-    /// the copy's next step.
-    pub(super) fn current_export_entries(&mut self) -> Option<DisplayEntries> {
+    /// the copy's next step for `cause`.
+    pub(super) fn current_export_entries(&mut self, cause: ReadCause) -> Option<DisplayEntries> {
         if let Some(entries) = &self.opened_file_entries {
             return Some(entries.clone());
         }
@@ -307,7 +307,7 @@ impl App {
             state.cache_address.as_ref()?,
             &state.publication,
         );
-        match self.take_interactive(&path, read) {
+        match self.take_interactive(&path, read, cause) {
             SessionCopy::Current(copy) => Some(copy.into_value()),
             SessionCopy::Older(_) | SessionCopy::Missing => None,
         }
