@@ -338,6 +338,8 @@ pub(crate) struct StoredEntries {
     /// the transcript doesn't have an entry.
     pub(crate) custom_title: Option<String>,
     pub(crate) summary: Option<String>,
+    /// The session row's preview of its first messages.
+    pub(crate) preview: Option<String>,
 }
 
 /// The stored text in column `text` of `row`, with the terminal codes in
@@ -483,9 +485,9 @@ pub(super) fn read_selected(
         entries.push((record, entry_of(row, thread, entry_text, blocks)?));
     }
     let malformed_lines = read_malformed_lines(connection, session)?;
-    let (custom_title, summary) = connection
-        .prepare_cached("SELECT custom_title, summary FROM sessions WHERE id = ?1")?
-        .query_row([session], |row| Ok((row.get(0)?, row.get(1)?)))
+    let (custom_title, summary, preview) = connection
+        .prepare_cached("SELECT custom_title, summary, preview_first FROM sessions WHERE id = ?1")?
+        .query_row([session], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .optional()?
         .ok_or_else(|| AppError::SessionCacheNotReady {
             session: format!("session row {session}"),
@@ -499,6 +501,7 @@ pub(super) fn read_selected(
         numbers,
         custom_title,
         summary,
+        preview,
     })
 }
 

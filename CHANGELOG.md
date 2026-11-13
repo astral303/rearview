@@ -108,6 +108,8 @@
 
 - Fix `agent within` showing a Codex, Grok Build or Kimi Code session's
   old name after a rename until its transcript changed.
+- Fix `agent within` naming a session without a title or summary differently
+  from `agent sessions` and `agent search`.
 - Fix `agent read` merging two Claude sub-agents' replies into one message
   when they share a reply ID. Every later message was numbered one lower.
 - Fix `agent` commands dropping a second warning of one kind without a ref,

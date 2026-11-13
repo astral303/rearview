@@ -58,7 +58,7 @@ $ rearview agent within ch_74aec3f6df49 answer
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=3 tz=-04:00 warnings=1 warning-records=1
 query text=answer hits=3
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
-title project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 : active codex question ... child task question ... child answer searchable
+title project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 : active codex question ... codex answer searchable ... follow-up question
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_7100872509cb233e source=lexical score=4.071429 focus=m18..m18 at=2026-08-01T06:02:30 | closing answer
 read ref=ch_74aec3f6df49:m17..m19 focus=m18..m18 tools=false tool-results=false thinking=false subagents=false
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4f60426316166883 source=lexical score=4.043478 focus=m3..m3 at=2026-08-01T06:00:03 | child answer searchable
@@ -71,7 +71,7 @@ $ rearview agent within ch_74aec3f6df49 searchable --top 2
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=2 tz=-04:00 warnings=1 warning-records=1
 query text=searchable hits=2
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
-title project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 : active codex question ... child task question ... child answer searchable
+title project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 : active codex question ... codex answer searchable ... follow-up question
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_ffbdafd528064364 source=tool score=4.045455 focus=m7..m7 at=2026-08-01T06:00:08 | tool output searchable
 read ref=ch_74aec3f6df49:m6..m8 focus=m7..m7 tools=false tool-results=true thinking=false subagents=false
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4f60426316166883 source=lexical score=4.043478 focus=m3..m3 at=2026-08-01T06:00:03 | child answer searchable
@@ -209,7 +209,7 @@ $ rearview agent within ch_581699c40efc the --after 2026-09-01T06:00:30 --before
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=4 tz=-04:00
 query text=the hits=4
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
-title project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... THINKING_SENTINEL: start by listing the files. ASSISTANT_TEXT_SENTINEL: listing the files first. Bash: ls TOOL_CALL_SENTINEL ... TOOL_RESULT_SENTINEL plugin.json
+title project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ... Agent "Background check" finished
 hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_9b62236225d2c363 source=lexical score=4.024390 focus=m16..m16 at=2026-09-01T06:02:02 | QUEUED_PROMPT_SENTINEL: and run the tests
 read ref=ch_581699c40efc:m15..m17 focus=m16..m16 tools=false tool-results=false thinking=false subagents=false
 hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_95f885354e3a3b80 source=lexical score=4.015385 focus=m10..m10 at=2026-09-01T06:00:30 | FORKED_SUBAGENT_SENTINEL: the plugin's tests cover how it starts.
