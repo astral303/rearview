@@ -24,10 +24,10 @@ use super::walk::test_support::{
 };
 use super::walk::{DirectoryLister, SystemLister};
 use super::{
-    Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
-    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionProvider, SessionRead,
-    SessionRenamer, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored, SubagentFinder,
-    ThreadLinker, TitleAndSummary, TranscriptReader,
+    Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, ListedFor, Operation,
+    ResolvedSession, RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch,
+    SessionProvider, SessionRead, SessionRenamer, SessionRoot, SessionStorage, SessionStub,
+    SessionTitle, Stored, SubagentFinder, ThreadLinker, TitleAndSummary, TranscriptReader,
 };
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
@@ -72,6 +72,7 @@ enum Contract {
     RootSpelling,
     ViewerReadConnections,
     UnreadableDirectory,
+    UnreadableSubagentDirectory,
     ForeignFileDelete,
 }
 
@@ -85,7 +86,9 @@ impl Contract {
         let rename = provider.rename().is_capable();
         let delete = provider.delete().is_capable();
         match self {
-            Self::SubagentDiscovery | Self::SubagentTranscripts => subagents,
+            Self::SubagentDiscovery
+            | Self::SubagentTranscripts
+            | Self::UnreadableSubagentDirectory => subagents,
             Self::SubagentDelete | Self::SubagentDeleteCount => subagents && delete,
             Self::SubagentsNotCapable => !subagents,
             Self::SessionIdLookup
@@ -451,6 +454,14 @@ pub(crate) trait ProviderFixture: Sync {
     /// `None` for an agent whose discovery doesn't list a directory.
     fn listed_directory_of(&self, locator: &Path) -> Option<PathBuf> {
         locator.parent().map(Path::to_path_buf)
+    }
+
+    /// The directory that discovery lists for the sub-agent transcripts of
+    /// the session at `locator` and for nothing else. `None` when the agent
+    /// keeps sub-agent transcripts in a directory it also lists for
+    /// sessions, or outside the file system.
+    fn subagent_directory_of(&self, _locator: &Path) -> Option<PathBuf> {
+        None
     }
 
     /// The session `id` names under `home`, as the provider's
@@ -2280,7 +2291,8 @@ fn stored_session_count(cache_base: &Path) -> usize {
 /// A directory discovery cannot list doesn't hide any session: the other
 /// directories still list, discovery reports the directory, and the cached
 /// sessions under it stay listed from the session cache, by the list and by
-/// agent `sessions`. Agent `sessions` names the directory in one `io` warning.
+/// agent `sessions`. Agent `sessions` reports the directory in one `io`
+/// warning.
 #[test]
 fn unreadable_directory_keeps_its_cached_sessions_listed() {
     run_contract(Contract::UnreadableDirectory, |fixture| {
@@ -2338,6 +2350,7 @@ fn unreadable_directory_keeps_its_cached_sessions_listed() {
             .lines()
             .filter(|line| {
                 line.starts_with("protocol agent-warning kind=io ")
+                    && line.contains(&crate::agent::protocol::escape_atom(" sessions in "))
                     && refused.as_ref().is_some_and(|refused| {
                         line.contains(&crate::agent::protocol::escape_atom(
                             &refused.file_name().unwrap().to_string_lossy(),
@@ -2348,7 +2361,7 @@ fn unreadable_directory_keeps_its_cached_sessions_listed() {
         assert_eq!(
             directory_warnings,
             usize::from(refused.is_some()),
-            "agent sessions names each unreadable directory in one io warning:\n{output}"
+            "agent sessions reports each unreadable directory of sessions in one io warning:\n{output}"
         );
         assert!(
             output
@@ -2357,6 +2370,115 @@ fn unreadable_directory_keeps_its_cached_sessions_listed() {
             "agent sessions lists the cached sessions under the unreadable directory:\n{output}"
         );
     });
+}
+
+/// A sub-agent directory that discovery cannot list is reported once, by
+/// discovery for `--debug` and in one `io` warning of agent `sessions`. Its
+/// session lists without those sub-agents until a load lists the directory
+/// again. A session without a sub-agent directory isn't reported.
+#[test]
+fn unreadable_subagent_directory_is_reported_and_its_session_lists_without_its_subagents() {
+    run_contract(Contract::UnreadableSubagentDirectory, |fixture| {
+        let home = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let family = SessionFamily::write(fixture, home.path());
+        // An agent without such a directory: see `ProviderFixture::subagent_directory_of`.
+        let Some(directory) = fixture.subagent_directory_of(&family.session) else {
+            return;
+        };
+        let lister = Arc::new(ScriptedLister::default());
+        let environment =
+            fixture_environment_listed_by(fixture, home.path(), cache.path(), lister.clone());
+        assert_eq!(
+            subagents_listed_for(&rows_loaded_through(&environment), &family.session),
+            Some(sorted(family.subagents.clone())),
+            "the first load lists the session with its sub-agents"
+        );
+        assert_eq!(
+            unreadable_directories(fixture, home.path(), lister.as_ref()),
+            Vec::new(),
+            "discovery doesn't report the other session's missing sub-agent directory"
+        );
+        lister.refuse(&directory);
+
+        let rows = rows_loaded_through(&environment);
+        let sessions = crate::agent::service::execute(
+            crate::agent::test_support::agent_command(&["sessions", "--all"]),
+            fixture_environment_listed_by(fixture, home.path(), cache.path(), lister.clone()),
+        )
+        .unwrap_or_else(crate::error_report);
+
+        assert_eq!(
+            subagents_listed_for(&rows, &family.session),
+            Some(Vec::new()),
+            "the load lists the session without its sub-agents"
+        );
+        assert_eq!(
+            unreadable_directories(fixture, home.path(), lister.as_ref()),
+            vec![(directory.clone(), ListedFor::SubagentTranscripts)],
+            "discovery reports the directory once, as a sub-agent directory"
+        );
+        let directory_warnings: Vec<&str> = sessions
+            .lines()
+            .filter(|line| {
+                line.starts_with("protocol agent-warning kind=io ")
+                    && line.contains(&crate::agent::protocol::escape_atom(
+                        &directory.to_string_lossy(),
+                    ))
+            })
+            .collect();
+        assert_eq!(
+            directory_warnings.len(),
+            1,
+            "agent sessions reports the directory in one io warning:\n{sessions}"
+        );
+        assert!(
+            directory_warnings[0].contains(&crate::agent::protocol::escape_atom(
+                "sub-agent transcripts in"
+            )),
+            "the warning shows \"sub-agent transcripts\": {}",
+            directory_warnings[0]
+        );
+
+        let environment_listing_again = fixture_environment_listed_by(
+            fixture,
+            home.path(),
+            cache.path(),
+            Arc::new(ScriptedLister::default()),
+        );
+        assert_eq!(
+            subagents_listed_for(
+                &rows_loaded_through(&environment_listing_again),
+                &family.session
+            ),
+            Some(sorted(family.subagents.clone())),
+            "the next load that lists the directory lists the sub-agents"
+        );
+    });
+}
+
+/// The sub-agents of the session at `session` in `rows`, sorted; `None`
+/// when `rows` doesn't list the session.
+fn subagents_listed_for(rows: &[Conversation], session: &Path) -> Option<Vec<PathBuf>> {
+    rows.iter()
+        .find(|row| row.path == session)
+        .map(|row| sorted(row.subagents.clone()))
+}
+
+/// Each directory that `fixture`'s discovery under `home` could not list
+/// through `lister`, with the transcripts it was listed for.
+fn unreadable_directories(
+    fixture: &dyn ProviderFixture,
+    home: &Path,
+    lister: &dyn DirectoryLister,
+) -> Vec<(PathBuf, ListedFor)> {
+    fixture
+        .discover_listed_by(home, lister)
+        .unwrap()
+        .unreadable_directories
+        .into_iter()
+        .map(|directory| (directory.path, directory.listed_for))
+        .collect()
 }
 
 /// The path of every session a load through `environment`'s one storage

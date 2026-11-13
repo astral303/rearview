@@ -394,8 +394,8 @@ impl<'a> SessionDirectories<'a> {
 }
 
 /// The `child_session_id` of each `subagents/*/meta.json` in `session_dir`,
-/// listed through `lister`, in directory order. A `meta.json` that cannot be
-/// read is skipped.
+/// listed through `lister`, in sorted order; none when the listing fails.
+/// A `meta.json` that cannot be read is skipped.
 fn child_session_ids(lister: &dyn DirectoryLister, session_dir: &Path) -> Vec<String> {
     let Ok(mut entries) = walk::subdirectories(lister, &session_dir.join("subagents")) else {
         return Vec::new();
@@ -534,9 +534,15 @@ impl SessionStorage for GrokStorage {
         let discovery = DiscoveryLister::beneath(lister, &root.path);
         let directories = SessionDirectories::walk(&discovery, &root.path)?;
         let walked = directories.walked.as_deref().unwrap_or_default();
+        let subagent_directories = discovery.of_subagent_directories();
         let subagent_ids_by_directory: HashMap<&Path, Vec<String>> = walked
             .iter()
-            .map(|directory| (directory.as_path(), child_session_ids(lister, directory)))
+            .map(|directory| {
+                (
+                    directory.as_path(),
+                    child_session_ids(&subagent_directories, directory),
+                )
+            })
             .collect();
         let subagent_ids_of = |directory: &Path| {
             subagent_ids_by_directory
@@ -743,12 +749,12 @@ pub(super) mod tests {
         agent_chunk, call, reply, summary, turn_completed, user,
         write_session as write_grok_session, write_subagent_meta,
     };
-    use crate::history::provider::RootOrigin;
     use crate::history::provider::contract_tests::{
         AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, append_lines,
         copy_tree, load_under,
     };
     use crate::history::provider::walk::test_support::ScriptedLister;
+    use crate::history::provider::{ListedFor, RootOrigin};
     use std::ffi::{OsStr as StdOsStr, OsString};
 
     const SESSION: &str = "019a0000-0000-7000-8000-000000000001";
@@ -847,6 +853,49 @@ pub(super) mod tests {
         }
     }
 
+    /// A sub-agent's own `subagents/`, naming its nested sub-agents, is
+    /// reported as its parent session's is.
+    #[test]
+    fn each_unreadable_nested_subagents_directory_is_reported() {
+        const SECOND_CHILD: &str = "019a0000-0000-7000-8000-0000000000c3";
+        const SECOND_NESTED: &str = "019a0000-0000-7000-8000-0000000000c4";
+        let home = tempfile::tempdir().unwrap();
+        write_session(home.path(), SESSION);
+        for (parent, child) in [
+            (SESSION, CHILD),
+            (SESSION, SECOND_CHILD),
+            (CHILD, NESTED),
+            (SECOND_CHILD, SECOND_NESTED),
+        ] {
+            write_subagent(home.path(), parent, child, PROJECT_DIR);
+        }
+        let refused: Vec<PathBuf> = [CHILD, SECOND_CHILD]
+            .map(|child| session_dir_under(home.path(), child).join("subagents"))
+            .into();
+        let lister = ScriptedLister::default();
+        for directory in &refused {
+            lister.refuse(directory);
+        }
+
+        let found = GrokFixture
+            .discover_listed_by(home.path(), &lister)
+            .unwrap();
+
+        let reported: Vec<(PathBuf, ListedFor)> = found
+            .unreadable_directories
+            .into_iter()
+            .map(|directory| (directory.path, directory.listed_for))
+            .collect();
+        assert_eq!(
+            reported,
+            refused
+                .into_iter()
+                .map(|directory| (directory, ListedFor::SubagentTranscripts))
+                .collect::<Vec<_>>(),
+            "discovery reports each directory once, as a sub-agent directory"
+        );
+    }
+
     /// Grok's sessions for the provider contracts in `contract_tests`.
     pub(crate) struct GrokFixture;
 
@@ -905,6 +954,10 @@ pub(super) mod tests {
                 .ok()?
                 .parent()
                 .map(Path::to_path_buf)
+        }
+
+        fn subagent_directory_of(&self, locator: &Path) -> Option<PathBuf> {
+            Some(session_dir_of(locator).ok()?.join("subagents"))
         }
 
         fn session_working_dir(&self) -> PathBuf {

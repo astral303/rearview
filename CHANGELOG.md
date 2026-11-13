@@ -75,8 +75,10 @@
 
 - Fix one unreadable directory hiding all of an agent's sessions from the list
   and agent commands (Codex, Grok Build, Kimi Code, OMP and Pi). Its cached
-  sessions now stay listed and readable, agent commands name the directory in
-  an `io` warning, and `--debug` names it.
+  sessions now stay listed and readable, agent commands report the directory
+  in an `io` warning, and `--debug` prints it.
+  - Agent commands and `--debug` also report a session's unreadable sub-agent
+    directory (Claude Code, Grok Build and OMP).
 - Fix session paths shown with both `/` and `\` on Windows when an agent's
   directory variable, such as `CODEX_HOME`, is spelled with `/`. Those paths
   now show with `\` alone.

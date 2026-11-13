@@ -195,19 +195,35 @@ fn artifacts_directory(transcript: &Path) -> PathBuf {
 /// files directly inside it, sorted. OMP names each after the sub-agent's
 /// output id, a nested one dot-qualified (`Parent.Child.jsonl`) in the same
 /// directory, and writes a `.md` report beside it that is not a transcript.
-/// A missing artifacts directory yields none; an unreadable one is an error.
+/// A missing artifacts directory, or a file in its place
+/// ([`walk::is_missing_directory`]), yields none; a directory that cannot be
+/// listed is an error.
 ///
 /// Layout per OMP's `docs/blob-artifact-architecture.md` at `d17c270`.
 fn read_subagent_transcripts(
     lister: &dyn DirectoryLister,
     artifacts: &Path,
 ) -> Result<Vec<PathBuf>> {
-    walk::jsonl_files_at_depth(lister, artifacts, 0)
+    let entries = match lister.list(artifacts) {
+        Ok(entries) => entries,
+        Err(error) if walk::is_missing_directory(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut transcripts: Vec<PathBuf> = entries
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    transcripts.sort();
+    Ok(transcripts)
 }
 
-/// [`read_subagent_transcripts`] for discovery and delete: an unreadable
-/// artifacts directory yields none and is reported at warn level, so the
-/// session still lists and deletes.
+/// [`read_subagent_transcripts`] for discovery and delete: an artifacts
+/// directory that cannot be listed yields none, so the session still lists
+/// and deletes. Discovery's lister records that directory. Outside discovery
+/// the failure is warned at `debug_level`, which the callers leave unset.
 fn subagent_transcripts_in(
     lister: &dyn DirectoryLister,
     artifacts: &Path,
@@ -233,10 +249,15 @@ fn discover_sessions(
     depth: usize,
 ) -> Result<DiscoveredSessions> {
     let discovery = DiscoveryLister::beneath(lister, &root.path);
+    let subagent_directories = discovery.of_subagent_directories();
     let sessions = walk::jsonl_files_at_depth(&discovery, &root.path, depth)?
         .into_iter()
         .map(|transcript| SessionFiles {
-            subagents: subagent_transcripts_in(lister, &artifacts_directory(&transcript), None),
+            subagents: subagent_transcripts_in(
+                &subagent_directories,
+                &artifacts_directory(&transcript),
+                None,
+            ),
             transcript,
         })
         .collect();
@@ -469,6 +490,10 @@ pub(super) mod tests {
                 &project_dir_under(home).join(format!("{session}.jsonl")),
                 &format!("{SUBAGENT}.{NESTED_SUBAGENT}"),
             )
+        }
+
+        fn subagent_directory_of(&self, locator: &Path) -> Option<PathBuf> {
+            Some(artifacts_directory(locator))
         }
 
         /// At the depth `write_session` writes: OMP's own discovery takes its
@@ -708,11 +733,11 @@ pub(super) mod tests {
         assert!(!merged.agent_search_text.contains("CLAUDE_SHAPED_SENTINEL"));
     }
 
-    /// The artifacts path can be a file, or a directory the user cannot
-    /// read. Failing the root would delist every OMP session for one
-    /// directory, and failing the delete would leave the session in place.
+    /// A file where the artifacts directory would be isn't OMP's: the
+    /// session lists without sub-agents, discovery doesn't report the file,
+    /// and delete removes the session and leaves the file.
     #[test]
-    fn session_whose_artifacts_directory_cannot_be_read_still_lists_and_deletes() {
+    fn discovery_doesnt_report_file_in_place_of_artifacts_directory_and_delete_leaves_it() {
         let directory = tempfile::tempdir().unwrap();
         let session = write_session(directory.path(), "session");
         let artifacts = artifacts_directory(&session);
@@ -722,6 +747,11 @@ pub(super) mod tests {
         let discovered = discover_sessions(&SystemLister, &root, 0).unwrap();
         assert_eq!(discovered.stubs.len(), 1);
         assert!(discovered.stubs[0].subagents.is_empty());
+        assert!(
+            discovered.unreadable_directories.is_empty(),
+            "discovery doesn't report the file: {:?}",
+            discovered.unreadable_directories
+        );
 
         let deleted = OmpProvider
             .delete_session(crate::history::FOR_FIXTURES, &session)

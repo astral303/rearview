@@ -73,8 +73,9 @@ pub struct DiscoveredSessions {
     /// not sessions the user started; the load reports the count under
     /// `--debug`.
     pub skipped: usize,
-    /// Directories under the root that could not be listed. Their sessions
-    /// are missing from `stubs`; the load reports each under `--debug`.
+    /// Directories under the root that could not be listed;
+    /// [`ListedFor`] states what each leaves out of `stubs`. The load
+    /// reports each under `--debug`.
     pub unreadable_directories: Vec<UnreadableDirectory>,
 }
 
@@ -95,6 +96,28 @@ impl DiscoveredSessions {
 pub struct UnreadableDirectory {
     pub path: PathBuf,
     pub error: String,
+    pub listed_for: ListedFor,
+}
+
+/// The transcripts discovery lists a directory to find.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListedFor {
+    /// Sessions: the sessions in a directory that cannot be listed are
+    /// missing from the stubs.
+    Sessions,
+    /// One session's sub-agent transcripts: while the directory cannot be
+    /// listed, the session's stub doesn't include them.
+    SubagentTranscripts,
+}
+
+impl ListedFor {
+    /// The words a warning prints for the transcripts.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::SubagentTranscripts => "sub-agent transcripts",
+        }
+    }
 }
 
 /// Sessions a root holds that the provider ignores, with the reason in the

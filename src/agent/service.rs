@@ -1929,8 +1929,9 @@ fn unreadable_directory_warning(
         kind: AgentWarningKind::Io,
         reference: None,
         detail: format!(
-            "failed to list {} sessions in {}: {}",
+            "failed to list {} {} in {}: {}",
             provider.labels().display,
+            directory.listed_for.noun(),
             directory.path.display(),
             directory.error
         ),
@@ -2061,9 +2062,16 @@ fn root_keys(keyed: &KeyedRoot<'_>) -> std::result::Result<RootKeys, KeyDiscover
             )
         })
         .collect();
-    if !unreadable_directories.is_empty() {
+    // Cached sessions lie under a directory of sessions alone: a sub-agent
+    // directory that cannot be listed hides no session.
+    let directories_of_sessions: Vec<_> = unreadable_directories
+        .iter()
+        .filter(|directory| directory.listed_for == history::provider::ListedFor::Sessions)
+        .cloned()
+        .collect();
+    if !directories_of_sessions.is_empty() {
         keys.extend(
-            cached_keys_under(keyed, &roots, &stubs, &unreadable_directories)
+            cached_keys_under(keyed, &roots, &stubs, &directories_of_sessions)
                 .map_err(KeyDiscoveryFailure::SessionCache)?,
         );
     }
