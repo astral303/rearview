@@ -43,6 +43,9 @@
   shows its cached copy under `Updating…`, or `Loading…` for a session not
   yet cached, and shows its newest messages when its refresh completes.
   - Viewer `Ctrl+R` and a session found by its ID refresh the same way.
+  - When the refresh fails, the viewer shows `Refresh failed: <error>` over
+    the cached copy. The session is read again when its transcripts change,
+    or when the user opens it again or refreshes it (`Ctrl+R`).
   - While another rearview refreshes or rebuilds the session cache, the viewer
     shows `Another rearview is refreshing…` or
     `Another rearview is rebuilding the session cache…` instead.
@@ -126,9 +129,9 @@
   (`F2`) shows the reason. Both stay available while that work waits for
   another rearview's refresh.
 - rearview deletes its session cache and stops when a cache write finds less
-  than 1 GB free on its drive. The message names the free space and reports
-  `The session cache was deleted.` Agent commands report the same in a
-  `protocol agent-error` record.
+  than 1 GB free on its drive, or the drive full. The message names the free
+  space and reports `The session cache was deleted.` Agent commands report
+  the same in a `protocol agent-error` record.
   - A cache another rearview has open is left in place, and the message
     reports it.
 

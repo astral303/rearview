@@ -376,8 +376,11 @@ const UNLOCK_POLL: Duration = Duration::from_millis(200);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::sqlite_cache::refresh::tests::{rearview, replace_owner};
-    use crate::history::sqlite_cache::{DriveRunningOut, SqliteCache};
+    use crate::history::sqlite_cache::connection::test_hooks;
+    use crate::history::sqlite_cache::refresh::tests::{
+        rearview, record_of, record_with_reason, replace_owner,
+    };
+    use crate::history::sqlite_cache::{CacheWrite, DriveRunningOut, SqliteCache, apply_writes};
 
     fn operation(base: &CacheBase) -> OperationScope {
         OperationScope::new(base, Patience::UntilAcquired, Arc::default())
@@ -453,18 +456,92 @@ mod tests {
     }
 
     #[test]
-    fn owner_whose_write_found_low_space_ends_failing_with_it() {
+    fn acquisition_on_drive_low_on_space_fails_with_low_space() {
         let directory = tempfile::tempdir().unwrap();
         let base =
             rearview(directory.path()).with_disk_space(Arc::new(DriveRunningOut::after(0, || {})));
         let operation = operation(&base);
-        let writer = SqliteCache::open_for_refresh(&owner_token(&operation)).unwrap();
-        let stored = writer.store_semantic_routes(&[]);
+
+        let acquired = operation.acquire_access();
+
         assert!(
-            matches!(stored, Err(AppError::SessionCacheLowSpace { .. })),
-            "the write finds the drive low on space: {stored:?}"
+            matches!(acquired, Err(AppError::SessionCacheLowSpace { .. })),
+            "taking refresh ownership finds the drive low on space"
         );
+        assert!(base.low_space().is_set(), "the low-space latch is set");
+    }
+
+    /// A session write whose read before its batch fails on a missing table,
+    /// a failure of the database classed `Io`, revokes the owner's write
+    /// permission.
+    #[test]
+    fn session_write_whose_admission_read_fails_revokes_write_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = rearview(directory.path());
+        let operation = operation(&base);
+        let writer = SqliteCache::open_for_refresh(&owner_token(&operation)).unwrap();
+        writer
+            .connection
+            .execute_batch("ALTER TABLE meta RENAME TO moved_meta")
+            .unwrap();
+
+        let written = writer.write(&record_with_reason("unread", "a reason"));
+
+        assert!(written.is_err(), "the admission read fails: {written:?}");
         drop(writer);
+        assert!(
+            operation.finish().lost_write_permission,
+            "the failed read revokes the owner's write permission"
+        );
+    }
+
+    /// SQLite's full-disk error at taking refresh ownership is the low-space
+    /// error, on a drive that reports more than the floor free.
+    #[test]
+    fn sqlite_disk_full_error_at_acquisition_is_low_space() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = rearview(directory.path()).with_free_space(5 * super::super::FREE_SPACE_FLOOR);
+        drop(SqliteCache::open(&base).unwrap());
+        rusqlite::Connection::open(directory.path().join(super::super::DATABASE_FILE_NAME))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE filler (data BLOB); \
+                 CREATE TRIGGER fill_at_acquisition_update AFTER UPDATE ON refresh_state \
+                 BEGIN INSERT INTO filler VALUES (randomblob(200000)); END; \
+                 CREATE TRIGGER fill_at_acquisition_insert AFTER INSERT ON refresh_state \
+                 BEGIN INSERT INTO filler VALUES (randomblob(200000)); END;",
+            )
+            .unwrap();
+        let _full = test_hooks::on_every_connection(directory.path(), |connection| {
+            let pages: i64 = connection
+                .query_row("PRAGMA page_count", [], |row| row.get(0))
+                .unwrap();
+            connection
+                .query_row(&format!("PRAGMA max_page_count = {pages}"), [], |_| Ok(()))
+                .unwrap();
+        });
+        let operation = operation(&base);
+
+        let acquired = operation.acquire_access();
+
+        assert!(
+            matches!(acquired, Err(AppError::SessionCacheLowSpace { .. })),
+            "taking refresh ownership finds the disk full"
+        );
+        assert!(base.low_space().is_set(), "the low-space latch is set");
+    }
+
+    #[test]
+    fn owner_whose_writer_opening_found_low_space_ends_failing_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let base =
+            rearview(directory.path()).with_disk_space(Arc::new(DriveRunningOut::after(1, || {})));
+        let operation = operation(&base);
+        let opened = SqliteCache::open_for_refresh(&owner_token(&operation));
+        assert!(
+            matches!(opened, Err(AppError::SessionCacheLowSpace { .. })),
+            "the writer's opening finds the drive low on space"
+        );
 
         let end = operation.finish();
 
@@ -478,6 +555,95 @@ mod tests {
                 Err(AppError::SessionCacheLowSpace { .. })
             ),
             "the operation ends failing with the low-space error"
+        );
+    }
+
+    /// Interrupt the statement that first changes the `sessions` table of
+    /// the cache in `base`, as a database failing part way through a write
+    /// does: SQLite reports `SQLITE_INTERRUPT`, a failure of the database
+    /// rather than of the write's rows.
+    fn interrupt_first_session_change(base: &std::path::Path) -> test_hooks::Installed {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        test_hooks::on_every_connection(base, move |connection| {
+            let changed = Arc::new(AtomicBool::new(false));
+            let marked = Arc::clone(&changed);
+            connection
+                .update_hook(Some(
+                    move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                        if table == "sessions" {
+                            marked.store(true, Ordering::SeqCst);
+                        }
+                    },
+                ))
+                .unwrap();
+            let interrupted = Arc::clone(&interrupted);
+            connection
+                .progress_handler(
+                    1,
+                    Some(move || {
+                        changed.load(Ordering::SeqCst) && !interrupted.swap(true, Ordering::SeqCst)
+                    }),
+                )
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn session_write_failing_part_way_stops_later_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = rearview(directory.path());
+        let operation = operation(&base);
+        let _interrupting = interrupt_first_session_change(base.path());
+        let writer = SqliteCache::open_for_refresh(&owner_token(&operation)).unwrap();
+        let (writes, received) = std::sync::mpsc::channel();
+        let (first, first_outcome) = CacheWrite::session(record_of("first"));
+        let (second, second_outcome) = CacheWrite::session(record_of("second"));
+        writes.send(first).unwrap();
+        writes.send(second).unwrap();
+        drop(writes);
+
+        drop(apply_writes(writer, received, None));
+
+        assert!(
+            matches!(first_outcome.recv(), Ok(Err(_))),
+            "the interrupted write fails"
+        );
+        assert!(
+            second_outcome.recv().is_err(),
+            "the later write is dropped unwritten"
+        );
+        assert!(
+            operation.finish().lost_write_permission,
+            "the operation ends without its write permission"
+        );
+    }
+
+    #[test]
+    fn sqlite_disk_full_error_in_session_write_is_low_space() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = rearview(directory.path());
+        let operation = operation(&base);
+        let writer = SqliteCache::open_for_refresh(&owner_token(&operation)).unwrap();
+        let pages: i64 = writer
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        writer
+            .connection
+            .query_row(&format!("PRAGMA max_page_count = {pages}"), [], |_| Ok(()))
+            .unwrap();
+
+        let written = writer.write(&record_with_reason("large", &"x".repeat(200_000)));
+
+        assert!(
+            matches!(written, Err(AppError::SessionCacheLowSpace { .. })),
+            "SQLite's full-disk error is the low-space error: {written:?}"
+        );
+        assert!(base.low_space().is_set(), "the low-space latch is set");
+        drop(writer);
+        assert!(
+            operation.finish().lost_write_permission,
+            "a full disk revokes the owner's write permission"
         );
     }
 }

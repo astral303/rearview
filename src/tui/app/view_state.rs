@@ -1,4 +1,4 @@
-use super::session_store::FinishedRefresh;
+use super::session_store::{FinishedRefresh, ReadCause};
 use super::{
     App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, OpenSessionStatus, ViewSearchMode,
     ViewState,
@@ -271,11 +271,12 @@ impl OpenSessionRead {
     /// that session.
     fn in_finished(finished: &FinishedRefresh, path: &Path) -> Option<Self> {
         match finished {
-            FinishedRefresh::Failed(error) => {
-                Some(Self::Failed(format!("Refresh failed: {error}")))
-            }
+            FinishedRefresh::Failed(error) => Some(Self::refresh_failed(error)),
             FinishedRefresh::Reads(reads) => {
                 let read = reads.iter().find(|read| read.path == path)?;
+                if let Some(failure) = &read.write_failure {
+                    return Some(Self::refresh_failed(&failure.error));
+                }
                 Some(match &read.read {
                     SessionRead::Listed(row) => Self::listed(row),
                     SessionRead::Missing => Self::Gone("Session not found"),
@@ -289,18 +290,27 @@ impl OpenSessionRead {
                     .iter()
                     .find(|updated| updated.row.path == path)
                 {
-                    return Some(Self::listed(&updated.row));
+                    return Some(match updated.next.write_error() {
+                        Some(error) => Self::refresh_failed(error),
+                        None => Self::listed(&updated.row),
+                    });
                 }
                 if changes.removed.iter().any(|removed| removed == path) {
                     return Some(Self::Gone("Session not found"));
                 }
-                changes
-                    .kept
-                    .iter()
-                    .any(|kept| kept.path == path)
-                    .then(Self::read_failed)
+                let kept = changes.kept.iter().find(|kept| kept.path == path)?;
+                Some(match kept.next.write_error() {
+                    Some(error) => Self::refresh_failed(error),
+                    None => Self::read_failed(),
+                })
             }
         }
+    }
+
+    /// A refresh that failed with `error`, as a whole or at its write to the
+    /// cache: the viewer keeps the copy it shows.
+    fn refresh_failed(error: impl std::fmt::Display) -> Self {
+        Self::Failed(format!("Refresh failed: {error}"))
     }
 
     fn listed(row: &Conversation) -> Self {
@@ -358,7 +368,7 @@ impl App {
         } = row;
         let (copy, adopted) = match read {
             Some(read) => self
-                .take_interactive(&path, read)
+                .take_interactive(&path, read, ReadCause::UserAction)
                 .current_or_older_with_adopted(),
             None => (None, None),
         };
@@ -542,7 +552,7 @@ impl App {
             (Some(conversation), _) => (Some(conversation), None, None),
             (None, Some(read)) => {
                 match self
-                    .take_interactive(&path, read)
+                    .take_interactive(&path, read, ReadCause::FinishedRefresh)
                     .current_or_older_with_adopted()
                 {
                     (Some(copy), adopted) => (Some(Arc::new(copy.conversation)), copy.row, adopted),
@@ -607,7 +617,7 @@ impl App {
             Some(DeferredCopy::Export {
                 option,
                 to_clipboard,
-            }) => match self.current_export_entries() {
+            }) => match self.current_export_entries(ReadCause::FinishedRefresh) {
                 Some(entries) => self.export_now(option, to_clipboard, Some(entries)),
                 None => self.set_status(SESSION_READ_FAILED.to_owned()),
             },

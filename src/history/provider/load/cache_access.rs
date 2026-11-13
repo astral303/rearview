@@ -132,9 +132,9 @@ impl SessionLoader<'_> {
 
     /// The admitted database for `owner`'s refresh, when this release's
     /// layout holds it; `None` once `owner`'s write permission is revoked.
-    /// A write that fails while opening it revokes the write permission, as
-    /// a failed write batch does, and the caller reads the database as it
-    /// is.
+    /// A failure to open it revokes the write permission when its class
+    /// stops writes, as a failed write batch does, and the caller reads the
+    /// database as it is.
     pub(super) fn open_database_writer(&self, owner: &RefreshToken) -> Option<CacheDatabase> {
         let owner = publishing(Some(owner))?;
         let opened = SqliteCache::open_for_refresh(owner).and_then(|writer| {
@@ -144,7 +144,7 @@ impl SessionLoader<'_> {
         match opened {
             Ok(writer) => Some(CacheDatabase::Writer(writer)),
             Err(error) => {
-                owner.revoke();
+                let error = owner.fail_with(error);
                 debug::warn(
                     self.debug_level,
                     &format!("Failed to open the session cache for writing: {error}"),

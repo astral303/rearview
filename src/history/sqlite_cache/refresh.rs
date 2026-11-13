@@ -555,6 +555,71 @@ pub(crate) struct RefreshToken {
 /// The least free space a write leaves on the cache's drive: 1 GB.
 pub(crate) const FREE_SPACE_FLOOR: u64 = 1_000_000_000;
 
+/// Fail when `base`'s drive has less than [`FREE_SPACE_FLOOR`] free, with
+/// the low-space error once the base's low-space latch is set. A drive
+/// whose free space the system does not report passes. Fail with
+/// [`AppError::SessionCacheRefreshLost`], without checking, once
+/// `can_publish` is false or the TUI's exit gave up waiting for checks (see
+/// [`super::low_space::Latch::wait_for_checks`]).
+pub(super) fn check_space_of(base: &CacheBase, can_publish: impl FnOnce() -> bool) -> Result<()> {
+    let Some(check) = base.low_space().begin_check(can_publish) else {
+        return Err(AppError::SessionCacheRefreshLost);
+    };
+    match base
+        .disk()
+        .available_bytes(base.path())
+        .filter(|&free| free < FREE_SPACE_FLOOR)
+    {
+        Some(free_bytes) => Err(publish_low_space(base, &check, free_bytes)),
+        None => Ok(()),
+    }
+}
+
+/// Set `base`'s low-space latch when `error` reports the disk full (SQLite's
+/// `SQLITE_FULL`, the system's `StorageFull`), as [`check_space_of`] does,
+/// and return the low-space error; return any other error as it is. The
+/// latch makes the command reporting the error delete the cache database.
+/// The latch records the free bytes the system reports, kept under
+/// [`FREE_SPACE_FLOOR`]: the drive can report more than the floor free by
+/// the time it is asked, after other files were deleted, and the message
+/// still reads as low space. Returns [`AppError::SessionCacheRefreshLost`]
+/// instead when `can_publish` refuses the check.
+pub(super) fn set_low_space_on_full_disk(
+    base: &CacheBase,
+    error: AppError,
+    can_publish: impl FnOnce() -> bool,
+) -> AppError {
+    if WriteErrorClass::of(&error) != WriteErrorClass::LowSpace
+        || matches!(error, AppError::SessionCacheLowSpace { .. })
+    {
+        return error;
+    }
+    let Some(check) = base.low_space().begin_check(can_publish) else {
+        return AppError::SessionCacheRefreshLost;
+    };
+    let free_bytes = base
+        .disk()
+        .available_bytes(base.path())
+        .map_or(0, |free| free.min(FREE_SPACE_FLOOR - 1));
+    publish_low_space(base, &check, free_bytes)
+}
+
+/// Set `base`'s low-space latch through `check` with `free_bytes` free, and
+/// return its error; [`AppError::SessionCacheRefreshLost`] once the latch is
+/// sealed.
+fn publish_low_space(
+    base: &CacheBase,
+    check: &super::low_space::SpaceCheck<'_>,
+    free_bytes: u64,
+) -> AppError {
+    if !check.publish(free_bytes) {
+        return AppError::SessionCacheRefreshLost;
+    }
+    base.low_space()
+        .error()
+        .expect("the low-space latch was just set")
+}
+
 impl RefreshToken {
     /// `identity`'s ownership of `base`, a canonical cache base.
     fn new(base: &CacheBase, identity: String) -> Self {
@@ -636,26 +701,7 @@ impl RefreshToken {
             return Err(AppError::SessionCacheRefreshLost);
         }
         let _turn = self.take_turn();
-        let Some(check) = self.base.low_space().begin_check(|| self.can_publish()) else {
-            return Err(AppError::SessionCacheRefreshLost);
-        };
-        let Some(free_bytes) = self
-            .base
-            .disk()
-            .available_bytes(self.base.path())
-            .filter(|&free| free < FREE_SPACE_FLOOR)
-        else {
-            return Ok(());
-        };
-        if !check.publish(free_bytes) {
-            return Err(AppError::SessionCacheRefreshLost);
-        }
-        self.revoke();
-        Err(self
-            .base
-            .low_space()
-            .error()
-            .expect("the low-space latch was just set"))
+        check_space_of(&self.base, || self.can_publish()).map_err(|error| self.fail_with(error))
     }
 
     /// True once a write of this owner's base found its drive low on
@@ -669,6 +715,29 @@ impl RefreshToken {
     /// the stored owner still names it.
     pub(crate) fn revoke(&self) {
         self.access.revoke();
+    }
+
+    /// `error`, a failure of this owner's write, after revoking write
+    /// permission for every copy of this token when its class stops writes
+    /// (see [`WriteErrorClass::stops_writes`]). A full disk is returned as
+    /// the low-space error, its latch set (see
+    /// [`set_low_space_on_full_disk`]).
+    pub(crate) fn fail_with(&self, error: AppError) -> AppError {
+        let error = set_low_space_on_full_disk(&self.base, error, || self.can_publish());
+        if WriteErrorClass::of(&error).stops_writes() {
+            self.revoke();
+        }
+        error
+    }
+
+    /// `error`, a failure that leaves this owner's ownership unconfirmed or
+    /// unrecorded, after revoking write permission for every copy of this
+    /// token whatever its class. A full disk is returned as the low-space
+    /// error, its latch set first: setting it needs the write permission.
+    pub(crate) fn fail_unconfirmed(&self, error: AppError) -> AppError {
+        let error = set_low_space_on_full_disk(&self.base, error, || self.can_publish());
+        self.revoke();
+        error
     }
 
     /// Revoke write permission, as a write that found another identity
@@ -706,10 +775,10 @@ impl RefreshToken {
     /// writer lock, then committing with the batch's end as
     /// `last_commit_ms`. Put reads and parsing inside `work` too: elapsed
     /// wall time cannot permit a takeover while the batch holds the writer
-    /// lock. A failure revokes write permission for every copy of this
-    /// token.
+    /// lock. A failure whose class stops writes revokes write permission for
+    /// every copy of this token.
     pub(crate) fn write_batch<T>(&self, work: impl FnOnce() -> T) -> Result<T> {
-        let result = (|| {
+        (|| {
             if !self.can_publish() {
                 return Err(AppError::SessionCacheRefreshLost);
             }
@@ -717,11 +786,8 @@ impl RefreshToken {
                 connect_writable(&self.base, POLL_EVERY)
             })?;
             WriteBatch::run(&connection, self, |_| Ok(work()))
-        })();
-        if result.is_err() {
-            self.revoke();
-        }
-        result
+        })()
+        .map_err(|error| self.fail_with(error))
     }
 
     /// Run `work` as one write batch, as [`Self::write_batch`] does, and
@@ -753,9 +819,9 @@ impl RefreshToken {
 
     /// Run `read` holding the writer lock, and return its result even when
     /// cache coordination fails. A read that could not start under the lock
-    /// runs without it. Failure revokes write permission for every copy of
-    /// this token, including the one [`apply_writes`](super::apply_writes)
-    /// holds.
+    /// runs without it. A failure revokes write permission as
+    /// [`Self::write_batch`] does, for every copy of this token, including
+    /// the copy [`apply_writes`](super::apply_writes) has.
     pub(crate) fn read<T>(&self, read: impl FnOnce() -> T) -> (T, Result<()>) {
         let mut read = Some(read);
         let mut result = None;
@@ -1041,35 +1107,25 @@ impl<'a> std::ops::Deref for WriteBatch<'a> {
 
 impl<'a> WriteBatch<'a> {
     /// Run `body` as one write batch of `owner` on `connection`, and commit
-    /// it. A failure to begin the batch, of its ownership check or of its
-    /// commit revokes `owner`'s write permission as [`transaction`] and
-    /// [`commit`] decide. A failure of `body` rolls the batch back and
-    /// leaves the write permission as it is.
+    /// it, once `owner`'s free-space check passes (see
+    /// [`RefreshToken::check_space`]); the check runs before the batch takes
+    /// the owner's turn. A failure revokes `owner`'s write
+    /// permission as [`transaction`] and [`commit`] decide; a failure of
+    /// `body` revokes it when its class stops writes, and rolls the batch
+    /// back.
     pub(super) fn run<T>(
         connection: &'a Connection,
         owner: &'a RefreshToken,
         body: impl FnOnce(&WriteBatch<'a>) -> Result<T>,
     ) -> Result<T> {
-        unwrap_committed(end_batch(transaction(connection, owner)?, owner, |batch| {
+        unwrap_committed(Self::run_or_roll_back(connection, owner, |batch| {
             body(batch).map(Some)
         }))
     }
 
-    /// [`Self::run`] once `owner`'s free-space check passes (see
-    /// [`RefreshToken::check_space`]); the check runs outside the owner's
-    /// turn, which the batch holds.
-    pub(super) fn run_checking_space<T>(
-        connection: &'a Connection,
-        owner: &'a RefreshToken,
-        body: impl FnOnce(&WriteBatch<'a>) -> Result<T>,
-    ) -> Result<T> {
-        owner.check_space()?;
-        Self::run(connection, owner, body)
-    }
-
-    /// [`Self::run_checking_space`] for a body that may find nothing to
-    /// write: `None` rolls the batch back without a commit.
-    pub(super) fn run_checking_space_or_roll_back<T>(
+    /// [`Self::run`] for a body that may find nothing to write: `None` rolls
+    /// the batch back without a commit.
+    pub(super) fn run_or_roll_back<T>(
         connection: &'a Connection,
         owner: &'a RefreshToken,
         body: impl FnOnce(&WriteBatch<'a>) -> Result<Option<T>>,
@@ -1079,7 +1135,8 @@ impl<'a> WriteBatch<'a> {
     }
 
     /// [`Self::run`] inside `turn`, `owner`'s turn the caller holds across
-    /// several batches.
+    /// several batches, without a free-space check. Check free space before
+    /// taking `turn`: the check takes the turn itself.
     pub(super) fn run_in_turn<T>(
         connection: &'a Connection,
         owner: &'a RefreshToken,
@@ -1101,7 +1158,8 @@ fn end_batch<'a, T>(
     owner: &RefreshToken,
     body: impl FnOnce(&WriteBatch<'a>) -> Result<Option<T>>,
 ) -> Result<Option<T>> {
-    let Some(value) = body(&batch)? else {
+    // Revoke before the rollback releases the writer lock to queued writes.
+    let Some(value) = body(&batch).map_err(|error| owner.fail_with(error))? else {
         return Ok(None);
     };
     commit(batch, owner)?;
@@ -1116,7 +1174,9 @@ fn unwrap_committed<T>(ended: Result<Option<T>>) -> Result<T> {
 /// A write batch. Lock order: `owner`'s turn, then SQLite's writer lock,
 /// then a check that `owner` still owns the refresh. Checking before taking
 /// the writer lock would let another process take over between the check
-/// and the batch. A failure revokes `owner`'s write permission.
+/// and the batch. A failure of the ownership check revokes `owner`'s write
+/// permission; a failure to take the lock revokes it when its class stops
+/// writes.
 fn transaction<'a>(connection: &'a Connection, owner: &'a RefreshToken) -> Result<WriteBatch<'a>> {
     transaction_within(connection, owner, LOCK_WAIT_LIMIT)
 }
@@ -1156,8 +1216,10 @@ fn transaction_during<'a>(
     let transaction = retry_busy(lock_wait_limit, owner.clock(), || {
         Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
     })
-    .inspect_err(|_| owner.revoke())?;
-    owner.verify(&transaction).inspect_err(|_| owner.revoke())?;
+    .map_err(|error| owner.fail_with(error))?;
+    owner
+        .verify(&transaction)
+        .map_err(|error| owner.fail_unconfirmed(error))?;
     Ok(WriteBatch {
         transaction,
         _turn: None,
@@ -1183,17 +1245,20 @@ fn exclusive_transaction<'a>(
 
 /// Commit `batch` with `owner`'s commit time. A failure of the ownership
 /// check or of the `refresh_state` update revokes `owner`'s write
-/// permission, whatever its class. A failure of `COMMIT` revokes it when its
-/// class stops writes (see [`WriteErrorClass`]); otherwise dropping `batch`
-/// rolls that batch back alone, and the owner's later batches go on.
+/// permission, whatever its class: the ownership can't be confirmed or kept
+/// then. A failure of `COMMIT` revokes it when its class stops writes (see
+/// [`WriteErrorClass`]); otherwise dropping `batch` rolls that batch back
+/// alone, and the owner's later batches go on.
 fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
-    owner.verify(&batch).inspect_err(|_| owner.revoke())?;
+    owner
+        .verify(&batch)
+        .map_err(|error| owner.fail_unconfirmed(error))?;
     let changed = batch
         .execute(
             "UPDATE refresh_state SET last_commit_ms = ?1 WHERE singleton = 1 AND owner = ?2",
             params![now_ms(owner.clock()), owner.identity],
         )
-        .inspect_err(|_| owner.revoke())?;
+        .map_err(|error| owner.fail_unconfirmed(error.into()))?;
     if changed != 1 {
         owner.replaced();
         return Err(AppError::SessionCacheRefreshLost);
@@ -1203,8 +1268,7 @@ fn commit(batch: WriteBatch<'_>, owner: &RefreshToken) -> Result<()> {
             return foreign_key_failure(&batch, error);
         }
         // Revoke before rollback releases the writer lock to queued writes.
-        owner.revoke();
-        error.into()
+        owner.fail_with(error.into())
     })
 }
 

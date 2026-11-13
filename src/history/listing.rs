@@ -21,7 +21,8 @@ pub enum SessionOrigin {
 pub enum SessionTimes<'a> {
     /// Its row's messages.
     Messages(&'a MessageTimes),
-    /// Without a row: its transcript's last write, `None` when unknown.
+    /// Without a row, or after a read that failed to write the session
+    /// without parsing it: its transcript's last write, `None` when unknown.
     LastWrite(Option<DateTime<Local>>),
 }
 

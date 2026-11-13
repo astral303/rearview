@@ -2,9 +2,11 @@
 //! refresh, swept over every data commit of the first and the last session
 //! each writes, over two agents reading two roots each, with the viewer
 //! closed and open. No parse begins after the failure; every listed row is
-//! current in the cache or keeps a pending refresh, and a session left
-//! unlisted keeps one that lists it; no row waits for another rearview.
-//! Once commits succeed again, ticking lists every session from a current
+//! current in the cache, keeps a pending refresh, or waits for its
+//! transcripts to change after its failed refresh, and a session left
+//! unlisted is tracked for a refresh that lists it; no row waits for another
+//! rearview. Once commits succeed again, ticking, and the user's list
+//! `Ctrl+R` while a failed refresh waits, list every session from a current
 //! copy.
 
 use super::claude_home::{ClaudeHome, TemplateCache, admitted_cache, another_rearview};
@@ -485,7 +487,7 @@ fn refresh_the_list(app: &mut App) {
     })
     .join()
     .unwrap();
-    app.finish_refresh(outcome);
+    app.finish_refresh(outcome.map_err(Into::into));
 }
 
 /// A session refresh of every listed row of `app`.
@@ -520,11 +522,11 @@ pub(super) fn tick_until_no_refresh_is_pending(app: &mut App, clock: &TestClock)
 
 /// Behind another rearview's refresh, the launch lists the cache as it is,
 /// then refreshes under its own ownership once that refresh ends. When those
-/// writes stop, the launch requests a session refresh of the changed session
-/// it read from its old copy; once commits succeed again, that refresh lists
-/// the newest messages.
+/// writes stop, the changed session it read from its old copy isn't
+/// refreshed again until its transcript changes; once commits succeed and
+/// it changes, its session refresh lists the newest messages.
 #[test]
-fn launch_behind_another_refresh_whose_writes_stop_requests_refresh_of_stale_session() {
+fn launch_behind_another_refresh_whose_writes_stop_refreshes_stale_session_once_it_changes() {
     let home = ClaudeHome::new();
     home.write("unchanged", 10, &["unchanged"]);
     let changed = home.write("changed", 5, &["cached"]);
@@ -570,12 +572,12 @@ fn launch_behind_another_refresh_whose_writes_stop_requests_refresh_of_stale_ses
     let mut app = app_applying(&environment, messages);
 
     assert!(
-        app.store.is_refresh_pending(&changed),
-        "the changed session's refresh is pending after the launch's writes stop"
+        app.store.has_failed_refresh(&changed) && !app.store.is_refresh_pending(&changed),
+        "the changed session waits for a change after the launch's writes stop"
     );
     allow_owner_commits(cache.path());
-    app.expire_awaited_refresh_check_for_test();
-    app.check_awaited_refresh();
+    home.append(&changed, 7, "written after the failure");
+    app.check_failed_refreshes();
     serve_session_refresh(&mut app);
     let changed_row = app
         .conversations()
@@ -583,7 +585,7 @@ fn launch_behind_another_refresh_whose_writes_stop_requests_refresh_of_stale_ses
         .find(|row| row.path == changed)
         .expect("the changed session is listed");
     assert_eq!(
-        changed_row.message_count, 2,
+        changed_row.message_count, 3,
         "the session refresh lists the changed session's newest message"
     );
 }
@@ -681,8 +683,10 @@ fn while_the_viewer_is(is_open: bool, app: &mut App, operation: fn(&mut App)) {
 }
 
 /// Check the state `operation`, started from `setup`, left after failing
-/// data commit `failing`, of `kind` in the clean run, then tick until every
-/// session is listed from a current copy.
+/// data commit `failing`, of `kind` in the clean run: each session current,
+/// pending a refresh, or waiting for a change after its failed refresh.
+/// Then tick, with the user's list `Ctrl+R` while a failed refresh waits,
+/// until every session is listed from a current copy.
 fn check_failed_operation(setup: &Setup, operation: Operation, failing: usize, kind: &CommitKind) {
     let case = Case::of(setup);
     let (mut app, commits) = operation.run(setup, &case, Some(failing));
@@ -709,10 +713,12 @@ fn check_failed_operation(setup: &Setup, operation: Operation, failing: usize, k
         .map(|row| row.path.clone())
         .collect();
     let current = case.current_paths(app.conversations());
+    let is_refreshed_later =
+        |path: &Path| app.store.is_refresh_pending(path) || app.store.has_failed_refresh(path);
     for row in app.conversations() {
         assert!(
-            current.contains(&row.path) || app.store.is_refresh_pending(&row.path),
-            "{label}: {} is current or pending a refresh",
+            current.contains(&row.path) || is_refreshed_later(&row.path),
+            "{label}: {} is current, pending a refresh, or waiting after a failed refresh",
             row.path.display()
         );
     }
@@ -722,9 +728,8 @@ fn check_failed_operation(setup: &Setup, operation: Operation, failing: usize, k
             .any(|path| path.file_name() == session.file_name());
         assert!(
             is_listed
-                || (app.store.is_refresh_pending(session)
-                    && app.store.unlisted_source(session).is_some()),
-            "{label}: {} is listed or has a pending refresh that lists it",
+                || (is_refreshed_later(session) && app.store.unlisted_source(session).is_some()),
+            "{label}: {} is listed, or tracked for a refresh that lists it",
             session.display()
         );
     }
@@ -738,24 +743,32 @@ fn check_failed_operation(setup: &Setup, operation: Operation, failing: usize, k
 
     drop(commits);
     tick_until_no_refresh_is_pending(&mut app, &case.clock);
+    if case
+        .corpus
+        .sessions
+        .iter()
+        .any(|session| app.store.has_failed_refresh(session))
+    {
+        refresh_the_list(&mut app);
+        tick_until_no_refresh_is_pending(&mut app, &case.clock);
+    }
     assert_eq!(
         sorted_names(app.conversations().iter().map(|row| row.path.as_path())),
         case.corpus.session_names(),
-        "{label}: every session is listed once commits succeed"
+        "{label}: every session is listed once commits succeed and the user refreshes"
     );
     let current = case.current_paths(app.conversations());
     for row in app.conversations() {
         assert!(
             current.contains(&row.path),
-            "{label}: {} is current once commits succeed",
+            "{label}: {} is current once commits succeed and the user refreshes",
             row.path.display()
         );
     }
 }
 
 #[test]
-fn failed_data_commit_of_each_kind_stops_parsing_and_keeps_every_session_pending_until_it_is_current()
- {
+fn failed_data_commit_of_each_kind_stops_parsing_and_lists_every_session_current_once_refreshed() {
     let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
     let (cold, warm) = (Setup::cold(), Setup::launched_then_changed());
     for operation in [

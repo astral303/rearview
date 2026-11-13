@@ -4,6 +4,7 @@
 use super::claude_home::{ClaudeHome, app_reading, serve_list_refresh};
 use super::commit_failure_tests::launched_app;
 use super::refresh_tests::{refresh_found, serve_session_refresh};
+use super::session_store::ReadCause;
 use super::test_waits::ConnectionGate;
 use super::*;
 use crate::clock::TestClock;
@@ -1182,7 +1183,7 @@ fn viewer_and_export_over_copy_newer_than_the_row_read_it_as_current() {
         header_line(&app)
     );
     assert!(
-        app.current_export_entries().is_some(),
+        app.current_export_entries(ReadCause::UserAction).is_some(),
         "the export reads the newer copy as current"
     );
 }
@@ -1586,8 +1587,9 @@ fn viewer_refresh_that_adds_a_long_summary_lays_out_its_header_line() {
 }
 
 /// `Ctrl+R` over session `a`, whose transcript was rewritten, so the
-/// refresh reads it whole, and whose write fails: the viewer shows the
-/// older copy, and its header counts that copy's messages, not the parse's.
+/// refresh reads it whole, and whose write fails: the viewer keeps the
+/// older copy, its header counts that copy's messages, not the parse's, and
+/// the status names the failure.
 #[test]
 fn viewer_refresh_whose_whole_write_fails_shows_older_copys_header() {
     let home = ClaudeHome::new();
@@ -1599,8 +1601,17 @@ fn viewer_refresh_whose_whole_write_fails_shows_older_copys_header() {
         || {},
     );
 
-    press_refresh(&mut app);
+    request_refresh(&mut app);
 
+    assert!(
+        !test_waits::finish_pending_view_reload(&mut app, VIEWPORT),
+        "the viewer doesn't reload a refresh whose write failed"
+    );
+    assert!(
+        status_text(&app).is_some_and(|status| status.starts_with("Refresh failed: ")),
+        "the status names the failed refresh: {:?}",
+        status_text(&app)
+    );
     assert!(
         view_text(&app).contains("first question"),
         "the viewer shows the older copy: {}",
@@ -1644,7 +1655,7 @@ fn export_over_copy_lacking_the_rows_sub_agent_is_not_current() {
     let mut app = viewer_over_unwritten_subagent(&home);
 
     assert!(
-        app.current_export_entries().is_none(),
+        app.current_export_entries(ReadCause::UserAction).is_none(),
         "the export doesn't present the older copy as current"
     );
 }

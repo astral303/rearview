@@ -6,8 +6,9 @@ use crate::error::AppError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WriteErrorClass {
-    /// A write found less than the floor free on the cache's drive, and set
-    /// the base's low-space latch.
+    /// A write found less than the floor free on the cache's drive, or
+    /// SQLite or the system reported the disk full. The write returns the
+    /// low-space error once the base's low-space latch is set.
     LowSpace,
     /// Another rearview owns the cache, or this owner's write permission was
     /// revoked.
@@ -18,7 +19,7 @@ pub(crate) enum WriteErrorClass {
     /// (`SQLITE_LOCKED`).
     Busy,
     /// A failure of the database, its file or a statement, not of the
-    /// write's own rows: an I/O error, a full or read-only file, corruption,
+    /// write's own rows: an I/O error, a read-only file, corruption,
     /// a refused commit, a database that is not admitted or being deleted,
     /// or a statement SQLite rejects whatever its values.
     Io,
@@ -36,6 +37,9 @@ impl WriteErrorClass {
             AppError::SessionCacheLowSpace { .. } => Self::LowSpace,
             AppError::SessionCacheRefreshLost => Self::LostOwnership,
             AppError::SessionCache(error) => Self::of_sqlite(error),
+            AppError::Io(error) if error.kind() == std::io::ErrorKind::StorageFull => {
+                Self::LowSpace
+            }
             AppError::Io(_)
             | AppError::SessionCacheBeingDeleted
             | AppError::SessionCacheStuckInWal { .. }
@@ -86,6 +90,7 @@ impl WriteErrorClass {
                 }
             }
             rusqlite::ErrorCode::TooBig | rusqlite::ErrorCode::TypeMismatch => Self::Other,
+            rusqlite::ErrorCode::DiskFull => Self::LowSpace,
             _ => Self::Io,
         }
     }
@@ -161,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn write_past_database_size_limit_is_io() {
+    fn write_past_database_size_limit_is_low_space() {
         let connection = connection_with_table();
         let pages: i64 = connection
             .query_row("PRAGMA page_count", [], |row| row.get(0))
@@ -184,8 +189,8 @@ mod tests {
         );
         assert_eq!(
             sqlite_class(error),
-            WriteErrorClass::Io,
-            "a full database is an I/O failure"
+            WriteErrorClass::LowSpace,
+            "a full database is classed low space"
         );
     }
 
@@ -364,6 +369,14 @@ mod tests {
             ),
             (
                 AppError::Io(std::io::Error::other("disk failed")),
+                WriteErrorClass::Io,
+            ),
+            (
+                AppError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+                WriteErrorClass::LowSpace,
+            ),
+            (
+                AppError::Io(std::io::Error::from(std::io::ErrorKind::QuotaExceeded)),
                 WriteErrorClass::Io,
             ),
             (AppError::SessionCacheBeingDeleted, WriteErrorClass::Io),

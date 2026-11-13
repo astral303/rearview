@@ -770,7 +770,8 @@ fn session_refresh_caches_session_ctrl_r_read_and_updates_its_row() {
             Arc::default(),
         );
         let outcome = sessions.refresh(&operation);
-        operation.finish().fail_if_low_space().and(outcome)
+        let ended = operation.finish().fail_if_low_space();
+        ended.map_err(super::RefreshFailure::from).and(outcome)
     })
     .join()
     .unwrap();

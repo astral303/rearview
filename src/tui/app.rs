@@ -45,6 +45,7 @@ use search_state::{SemanticSearchState, SessionIdQuery};
 use search_worker::{
     SearchCommand, SearchCommands, SearchResponse, SearchWorker, TextsHeld, spawn_search_worker,
 };
+pub(crate) use session_store::RefreshFailure;
 #[allow(unused_imports)]
 pub use types::{
     Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow, LIST_LINES_PER_ITEM,
@@ -830,8 +831,9 @@ impl App {
     }
 
     /// The time until something timed on screen changes by itself: a status
-    /// message expiring, the count highlight ending, or the next check for
-    /// the completion of the cache refresh rows wait for.
+    /// message expiring, the count highlight ending, the next check for the
+    /// completion of the cache refresh rows wait for, or the next check of
+    /// the transcripts of sessions whose refresh failed.
     pub fn next_timed_redraw(&self) -> Option<Duration> {
         [
             self.status_message_remaining(),
@@ -840,6 +842,7 @@ impl App {
                 .awaiting
                 .as_ref()
                 .map(|awaiting| awaiting.until_next_check(self.clock())),
+            self.store.until_failed_refresh_check(self.clock().now()),
         ]
         .into_iter()
         .flatten()
@@ -848,8 +851,9 @@ impl App {
 
     /// The time an event loop without work in flight waits for input: until
     /// the next timed redraw, or an hour when nothing on screen is timed.
-    /// Call [`Self::check_awaited_refresh`] first: a check that is due and
-    /// not run leaves the wait at zero.
+    /// Call [`Self::check_awaited_refresh`] and
+    /// [`Self::check_failed_refreshes`] first: a check that is due and not
+    /// run leaves the wait at zero.
     pub fn idle_wait(&self) -> Duration {
         const NOTHING_TIMED: Duration = Duration::from_secs(3600);
         self.next_timed_redraw().unwrap_or(NOTHING_TIMED)

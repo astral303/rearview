@@ -1,4 +1,4 @@
-use super::app::{Action, App, AppMode, DirectFile, ListScope, TuiSearchOptions};
+use super::app::{Action, App, AppMode, DirectFile, ListScope, RefreshFailure, TuiSearchOptions};
 use super::backend::ShowAfterMove;
 use super::supervisor::TaskSupervisor;
 use super::ui;
@@ -297,6 +297,7 @@ impl Runtime {
         self.app.apply_finished_refresh();
         self.app.set_cache_wait(self.supervisor.waiting_for());
         self.app.check_awaited_refresh();
+        self.app.check_failed_refreshes();
         self.start_next_job();
 
         let frame_state = prepare_frame(&mut self.app, terminal);
@@ -372,7 +373,9 @@ impl Runtime {
             return Ok(());
         };
         match outcome {
-            Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => Err(error),
+            Err(failure) if WriteErrorClass::of(&failure.error) == WriteErrorClass::LowSpace => {
+                Err(failure.error)
+            }
             outcome => {
                 self.app.finish_refresh(outcome);
                 Ok(())
@@ -400,6 +403,7 @@ impl Runtime {
             self.supervisor.refresh(move |environment, operation| {
                 refresh_sessions(environment, &known, options, operation)
                     .map(|changes| RefreshOutcome::Changes(Box::new(changes)))
+                    .map_err(RefreshFailure::from)
             });
         } else if let Some(sessions) = self.app.begin_session_refresh() {
             self.supervisor

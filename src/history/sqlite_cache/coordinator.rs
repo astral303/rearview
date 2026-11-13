@@ -6,7 +6,7 @@ use super::base::CacheBase;
 use super::observer::{self, Observation, OtherRearview};
 use super::refresh::{self, RefreshOwnership, Release};
 use super::scope::Cancellation;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -53,13 +53,18 @@ impl Coordinator {
     /// `status` names what each blocked attempt waits for, and clears when
     /// this returns. Fails on a database error other than a busy lock, and
     /// with [`crate::error::AppError::SessionCacheRefreshLost`] once
-    /// `cancellation` is set.
+    /// `cancellation` is set. Fails with the low-space error, without
+    /// waiting, when the cache's drive is low on space (see
+    /// [`refresh::check_space_of`]), and when the ownership's write finds
+    /// the disk full.
     pub(crate) fn acquire(
         &self,
         status: &WaitStatus,
         cancellation: &Cancellation,
     ) -> Result<RefreshOwnership> {
-        let acquired = RefreshOwnership::acquire(&self.base, status, cancellation);
+        self.check_space(cancellation)?;
+        let acquired = RefreshOwnership::acquire(&self.base, status, cancellation)
+            .map_err(|error| self.set_low_space_on_full_disk(error, cancellation));
         status.set(None);
         acquired
     }
@@ -72,9 +77,19 @@ impl Coordinator {
         status: &WaitStatus,
         cancellation: &Cancellation,
     ) -> Result<Option<RefreshOwnership>> {
-        let acquired = RefreshOwnership::acquire_within(&self.base, limit, status, cancellation);
+        self.check_space(cancellation)?;
+        let acquired = RefreshOwnership::acquire_within(&self.base, limit, status, cancellation)
+            .map_err(|error| self.set_low_space_on_full_disk(error, cancellation));
         status.set(None);
         acquired
+    }
+
+    fn check_space(&self, cancellation: &Cancellation) -> Result<()> {
+        refresh::check_space_of(&self.base, || !cancellation.is_cancelled())
+    }
+
+    fn set_low_space_on_full_disk(&self, error: AppError, cancellation: &Cancellation) -> AppError {
+        refresh::set_low_space_on_full_disk(&self.base, error, || !cancellation.is_cancelled())
     }
 
     /// End this rearview's use of the cache: revoke the write permission of

@@ -71,8 +71,8 @@ enum ListingPath {
     Launch,
     /// A list `Ctrl+R`.
     ListRefresh,
-    /// The session refresh of a new session a list `Ctrl+R` read from an
-    /// out-of-date copy.
+    /// A list `Ctrl+R` whose writes fail for a new session it reads from an
+    /// out-of-date copy, then the user's second list `Ctrl+R`.
     RefreshAfterListRefresh,
     /// The session refresh of the sessions a launch left unlisted once its
     /// cache writes stopped.
@@ -250,7 +250,10 @@ fn list_refresh(case: Case, origin: Origin, messages: Messages) -> Vec<bool> {
 
 fn refresh_after_list_refresh(messages: Messages) -> Vec<bool> {
     let refreshed = refresh_a_new_session_with_an_old_copy(messages.change_minute());
-    vec![lists(&refreshed.app, &refreshed.new)]
+    vec![
+        refreshed.listed_new_after_failure,
+        lists(&refreshed.app, &refreshed.new),
+    ]
 }
 
 fn refresh_after_stopped_launch(case: Case, messages: Messages) -> Vec<bool> {

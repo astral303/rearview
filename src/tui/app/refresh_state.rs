@@ -5,7 +5,8 @@
 
 use super::list_state::SelectionAnchor;
 use super::session_store::{
-    AWAITED_REFRESH_CHECK_INTERVAL, FinishedRead, FinishedRefresh, SessionCopy, UnlistedSession,
+    AWAITED_REFRESH_CHECK_INTERVAL, FailedRefresh, FinishedRead, FinishedRefresh, RefreshFailure,
+    SessionCopy, UnlistedSession,
 };
 use super::view_state::{PendingReload, ReloadedSession, SESSION_READ_FAILED};
 use super::{App, AppMode, DialogMode, DirectFileJob};
@@ -14,6 +15,7 @@ use crate::history::listing::{self, SessionOrigin, SessionTimes};
 use crate::history::provider::{
     DirectFileRead, SessionOutcome, SessionRead, apply_external_title, cache_sessions,
 };
+use crate::history::sqlite_cache::WriteFailure;
 use crate::history::{
     AwaitedRefresh, Conversation, Environment, FoundSession, InteractiveRead, KnownSessions,
     OperationScope, OtherRearview, RefreshOutcome, SessionChanges, SkippedSessions, Source,
@@ -110,6 +112,17 @@ impl RefreshTarget {
             listed: Some(row.clone()),
         }
     }
+
+    /// This session's transcripts as they stamp now, the listed row's
+    /// sub-agent transcripts included.
+    fn stamp_now(&self) -> (PathBuf, FailedRefresh) {
+        let subagents = self
+            .listed
+            .as_ref()
+            .map(|row| row.subagents.clone())
+            .unwrap_or_default();
+        (self.path.clone(), FailedRefresh::now(&self.path, subagents))
+    }
 }
 
 /// `targets`' sessions read with `read`, called once per agent with the
@@ -159,21 +172,27 @@ pub struct SessionRefresh {
 impl SessionRefresh {
     /// Read each session again under `operation`'s refresh ownership and
     /// cache it ([`cache_sessions`]). Run on the background worker: it waits
-    /// for ownership as a load does.
-    pub fn refresh(self, operation: &OperationScope) -> Result<RefreshOutcome> {
-        Ok(RefreshOutcome::Cached(read_by_source(
-            &self.targets,
-            |source, locators| {
-                cache_sessions(
-                    &self.environment,
-                    source,
-                    locators,
-                    self.show_last,
-                    operation,
-                    crate::history::load_meter::AgentMeter::UNMETERED,
-                )
-            },
-        )?))
+    /// for ownership as a load does. It stamps the sessions' transcripts
+    /// before that wait: after a refresh that fails as a whole, the TUI's
+    /// check of failed refreshes reads a session written during the wait as
+    /// changed.
+    pub fn refresh(
+        self,
+        operation: &OperationScope,
+    ) -> std::result::Result<RefreshOutcome, RefreshFailure> {
+        let stamped = self.targets.iter().map(RefreshTarget::stamp_now).collect();
+        read_by_source(&self.targets, |source, locators| {
+            cache_sessions(
+                &self.environment,
+                source,
+                locators,
+                self.show_last,
+                operation,
+                crate::history::load_meter::AgentMeter::UNMETERED,
+            )
+        })
+        .map(RefreshOutcome::Cached)
+        .map_err(|error| RefreshFailure::of_session_refresh(error, stamped))
     }
 }
 
@@ -208,7 +227,15 @@ impl App {
             listed: self
                 .conversations
                 .iter()
-                .map(|conversation| (conversation.path.clone(), FoundSession::of(conversation)))
+                .map(|conversation| {
+                    let found = FoundSession::of(conversation);
+                    let found = if self.store.has_failed_refresh(&conversation.path) {
+                        found.read_again()
+                    } else {
+                        found
+                    };
+                    (conversation.path.clone(), found)
+                })
                 .collect(),
             skipped: self.skipped_sessions.clone(),
         })
@@ -271,7 +298,7 @@ impl App {
     /// session's next step at once, and the open session follows a read of
     /// it (see [`Self::follow_open_session`]); the list applies the outcome
     /// once it is on screen with nothing over it.
-    pub fn finish_refresh(&mut self, outcome: Result<RefreshOutcome>) {
+    pub fn finish_refresh(&mut self, outcome: std::result::Result<RefreshOutcome, RefreshFailure>) {
         let now = self.clock().now();
         self.store.finish(outcome, now);
         self.follow_open_session();
@@ -291,8 +318,9 @@ impl App {
     /// The launch's cache writes stopped part way: ask for a session refresh
     /// of every row without a copy, parsed by the launch with a write that
     /// failed, and of each of `stale`, the sessions it read from older
-    /// copies or left unlisted. Each of `stale` the list does not hold is
-    /// tracked as found by discovery.
+    /// copies or left unlisted. A session whose refresh failed is skipped
+    /// while its transcripts haven't changed since. Each of `stale` that is
+    /// not in the list is tracked as found by discovery.
     pub fn refresh_what_the_launch_could_not_cache(&mut self, stale: Vec<StaleSession>) {
         let listed: HashSet<PathBuf> = self
             .conversations
@@ -306,13 +334,14 @@ impl App {
             .map(|row| row.path.clone())
             .collect();
         for path in unwritten {
-            self.store.request_session_refresh(&path);
+            self.store.request_session_refresh_unless_failed(&path);
         }
         for session in stale {
             if !listed.contains(&session.path) {
                 self.store.track_new_session(session.source, &session.path);
             }
-            self.store.request_session_refresh(&session.path);
+            self.store
+                .request_session_refresh_unless_failed(&session.path);
         }
     }
 
@@ -465,7 +494,12 @@ impl App {
             .map(|(index, row)| (row.path.clone(), index))
             .collect();
         let mut edit = ListEdit::default();
-        for FinishedRead { path, mut read } in reads {
+        for FinishedRead {
+            path,
+            mut read,
+            write_failure,
+        } in reads
+        {
             if self.is_opened_file(&path)
                 && let SessionRead::Listed(row) = &mut read
             {
@@ -478,7 +512,8 @@ impl App {
             match (index_of.get(&path), read) {
                 (Some(&index), read) => edit.apply_reread(index, read),
                 (None, SessionRead::Listed(row))
-                    if self.admits(unlisted, &row) || self.is_opened_file(&path) =>
+                    if self.admits(unlisted, &row, write_failure.as_ref())
+                        || self.is_opened_file(&path) =>
                 {
                     edit.inserted.push(*row);
                 }
@@ -495,9 +530,19 @@ impl App {
     }
 
     /// True when the list shows `row`, the refreshed row of `unlisted`, a
-    /// tracked session; false for an untracked session.
-    fn admits(&self, unlisted: Option<UnlistedSession>, row: &Conversation) -> bool {
-        unlisted.is_some_and(|session| self.lists(session.origin(), row))
+    /// tracked session; false for an untracked session. A read whose write
+    /// failed is judged by what it found (see [`WriteFailure::times`]).
+    fn admits(
+        &self,
+        unlisted: Option<UnlistedSession>,
+        row: &Conversation,
+        write_failure: Option<&WriteFailure>,
+    ) -> bool {
+        let times = write_failure.map_or(SessionTimes::Messages(&row.message_times), |failure| {
+            failure.times(row)
+        });
+        unlisted
+            .is_some_and(|session| listing::is_listed(session.origin(), times, &self.list_window))
     }
 
     /// True when the list shows `row`, a session of `origin`, under its
@@ -595,7 +640,7 @@ impl App {
     #[cfg(test)]
     pub(super) fn record_next_step(&mut self, path: &Path, next: crate::history::NextStep) {
         let now = self.clock().now();
-        self.store.record_next_step(path, next, now);
+        self.store.record_next_step(path, &next, now);
     }
 
     /// Record `outcome`'s next step now, and return its read.
@@ -605,14 +650,15 @@ impl App {
     }
 
     /// Record the next step of `read`, an interactive read of the session at
-    /// `path`, now, and return its copy.
+    /// `path` for `cause`, now, and return its copy.
     pub(super) fn take_interactive<T>(
         &mut self,
         path: &Path,
         read: InteractiveRead<T>,
+        cause: super::session_store::ReadCause,
     ) -> SessionCopy<T> {
         let now = self.clock().now();
-        self.store.take_interactive(path, read, now)
+        self.store.take_interactive(path, read, cause, now)
     }
 
     /// The other rearview's work the list waits for: the wait the
@@ -693,10 +739,25 @@ impl App {
             return;
         }
         let paths = std::mem::take(&mut awaiting.paths);
+        let awaited = awaiting.awaited;
         self.store.awaiting = None;
         for path in &paths {
-            self.store.request_session_refresh(path);
+            // Read a failed refresh's session again after another rearview's
+            // refresh: that refresh may have cached it.
+            match awaited {
+                AwaitedRefresh::AnotherRearview(_) => self.store.request_session_refresh(path),
+                AwaitedRefresh::ThisProcess => {
+                    self.store.request_session_refresh_unless_failed(path);
+                }
+            }
         }
+    }
+
+    /// Ask for a session refresh of each session whose refresh failed once
+    /// its transcripts change, checking at most once a second.
+    pub fn check_failed_refreshes(&mut self) {
+        let now = self.clock().now();
+        self.store.request_changed_failed_refreshes(now);
     }
 
     /// Apply `edit` in one pass: the list stays newest first, the selection
