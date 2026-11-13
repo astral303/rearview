@@ -101,6 +101,10 @@
   old name after a rename until its transcript changed.
 - Fix `agent read` merging two Claude sub-agents' replies into one message
   when they share a reply ID. Every later message was numbered one lower.
+- Fix `agent` commands dropping a second warning of one kind without a ref,
+  such as a second agent's `failed to list <agent> sessions` warning or a
+  second `ignored` term.
+  Each now prints its own record, and `warnings=` counts it.
 
 ### Changes
 

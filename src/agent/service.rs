@@ -4504,7 +4504,7 @@ mod tests {
     /// Two Claude Code sessions recorded in one directory, `CHANGED_SESSION`
     /// at 06:30 and another at 06:31, cached by a load, and their storage.
     struct CachedClaudeSessions {
-        _claude: history::provider::claude::tests::ConfigDir,
+        claude: history::provider::claude::tests::ConfigDir,
         directory: tempfile::TempDir,
         cache_base: tempfile::TempDir,
         changed: PathBuf,
@@ -4538,7 +4538,7 @@ mod tests {
                 history::provider::LeftOutRows::NONE,
             );
             Self {
-                _claude: claude,
+                claude,
                 directory,
                 cache_base,
                 changed,
@@ -6970,6 +6970,73 @@ mod tests {
         assert!(
             output.contains("\nsessions matched=2 "),
             "the cached sessions under the unreadable directory are listed:\n{output}"
+        );
+    }
+
+    impl CachedClaudeSessions {
+        /// An environment over these sessions whose directory listing
+        /// refuses two Claude project folders, and the two folders' names
+        /// as an `io` warning prints them. The first folder contains these
+        /// sessions. The second is the project folder of a session recorded
+        /// in `other_directory`.
+        fn environment_refusing_two_folders(
+            &self,
+            other_directory: &Path,
+        ) -> (history::Environment, [String; 2]) {
+            let other = claude_session_in(
+                &self.claude,
+                other_directory,
+                "0f000000-0000-4000-8000-000000000003",
+                32,
+            );
+            let folders = [self.changed.parent().unwrap(), other.parent().unwrap()];
+            let lister = Arc::new(history::provider::walk::test_support::ScriptedLister::default());
+            for folder in folders {
+                lister.refuse(folder);
+            }
+            let environment = history::Environment::new(
+                vec![self.storage],
+                self.cache_base.path().to_path_buf(),
+                history::ProcessIdentity::default(),
+                Arc::new(TestClock::default()),
+                lister,
+            );
+            let folder_names = folders.map(|folder| {
+                agent::protocol::escape_atom(&folder.file_name().unwrap().to_string_lossy())
+            });
+            (environment, folder_names)
+        }
+    }
+
+    #[test]
+    fn listing_prints_io_warning_for_each_unreadable_directory() {
+        let sessions = CachedClaudeSessions::new();
+        let other_directory = tempfile::tempdir().unwrap();
+        let (environment, folder_names) =
+            sessions.environment_refusing_two_folders(other_directory.path());
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&["sessions", "--all"]))
+            .unwrap_or_else(crate::error_report);
+
+        let io_records: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("protocol agent-warning kind=io "))
+            .collect();
+        assert!(
+            io_records.len() == 2
+                && folder_names
+                    .iter()
+                    .all(|name| io_records.iter().any(|record| record.contains(name))),
+            "each unreadable directory has an io record of its own:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with(" warnings=2 warning-records=2"),
+            "the header counts both warnings:\n{output}"
         );
     }
 

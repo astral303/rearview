@@ -159,9 +159,10 @@ running; wait for it to exit.
 
 Successful output can contain `protocol agent-warning` records. Treat
 `malformed-transcript`, `io`, `skipped`, `ignored`, `partial-index`, and
-`stale-cache` as partial coverage. Repeated warnings are summarized by `kind=`
-and `count=`; a budget never cuts them. A `semantic-unavailable` warning on
-hybrid output means lexical fallback. Mention reduced coverage when it matters.
+`stale-cache` as partial coverage. Warnings of one kind for several refs
+print as one `kind=` `count=` record; a budget never cuts them. A
+`semantic-unavailable` warning on hybrid output means lexical fallback.
+Mention reduced coverage when it matters.
 
 Agent defaults can come from `[agent]`: scope, mode, output budget, result depth,
 project exclusions, and visibility policy. Command flags override config;

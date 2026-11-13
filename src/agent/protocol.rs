@@ -5709,7 +5709,7 @@ mod tests {
         );
     }
 
-    /// Two warnings of one kind print as one record.
+    /// Two warnings of one kind for two refs print as one record.
     #[test]
     fn truncated_outline_counts_its_warning_records_as_other_headers_do() {
         let resolved = resolved("session.jsonl");
