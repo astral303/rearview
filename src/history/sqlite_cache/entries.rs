@@ -56,7 +56,7 @@ pub(super) fn insert(
 ) -> Result<()> {
     let mut ids = write::RowIds::new(rows);
     for start in (0..rows.entries.len()).step_by(ENTRIES_PER_TRANSACTION) {
-        super::refresh::WriteBatch::run_checking_space(connection, owner, |batch| {
+        super::refresh::WriteBatch::run(connection, owner, |batch| {
             super::require_writing(batch, session)?;
             let mut writer = write::RowWriter::new(batch, session, places)?;
             let end = (start + ENTRIES_PER_TRANSACTION).min(rows.entries.len());

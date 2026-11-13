@@ -139,9 +139,8 @@ impl TaskSupervisor {
         self.run(Box::new(move || {
             let operation = operation(&environment);
             let changed = change.make(&operation);
-            // Ignore the operation's end: a rename or delete doesn't check
-            // free space, and its own outcome carries the error of a write
-            // that stopped it.
+            // Ignore the operation's end: the change's own outcome carries
+            // the error of a write that stopped it, low space included.
             let _ = operation.finish();
             let _ = outcome.send(changed);
         }));

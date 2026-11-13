@@ -376,6 +376,12 @@ fn record() -> SessionRecord {
 
 /// The record of an empty Pi session stored at `cache_key`.
 pub(crate) fn record_of(cache_key: &str) -> SessionRecord {
+    record_with_reason(cache_key, "skipped transcript has no visible messages")
+}
+
+/// [`record_of`], with `reason` as the warning the cache stores for the
+/// session.
+pub(crate) fn record_with_reason(cache_key: &str, reason: &str) -> SessionRecord {
     let root = record_root();
     let stub = SessionStub {
         locator: root.path.join(format!("{cache_key}.jsonl")),
@@ -397,7 +403,7 @@ pub(crate) fn record_of(cache_key: &str) -> SessionRecord {
         },
         &stub,
         SessionStatus::Empty,
-        "skipped transcript has no visible messages".to_owned(),
+        reason.to_owned(),
     )
     .unwrap()
     .unwrap()
@@ -854,6 +860,46 @@ fn rebuild_blocked_at_begin_exclusive_preserves_existing_tables() {
     );
 }
 
+/// A drive that reports five times the floor free until `is_full` is set,
+/// then nothing.
+#[derive(Default)]
+struct DriveFilledLater {
+    is_full: std::sync::atomic::AtomicBool,
+}
+
+impl super::super::DiskSpace for DriveFilledLater {
+    fn available_bytes(&self, _path: &Path) -> Option<u64> {
+        Some(if self.is_full.load(Ordering::SeqCst) {
+            0
+        } else {
+            5 * FREE_SPACE_FLOOR
+        })
+    }
+}
+
+#[test]
+fn rebuild_on_drive_low_on_space_fails_with_low_space_and_keeps_tables() {
+    let directory = tempfile::tempdir().unwrap();
+    let drive = Arc::new(DriveFilledLater::default());
+    let base = rearview(directory.path()).with_disk_space(drive.clone());
+    let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
+    let cache = SqliteCache::open_for_refresh(owner.token()).unwrap();
+    cache.set_meta("sentinel", "keep").unwrap();
+    drive.is_full.store(true, Ordering::SeqCst);
+
+    let rebuilt = cache.rebuild();
+
+    assert!(
+        matches!(rebuilt, Err(AppError::SessionCacheLowSpace { .. })),
+        "the rebuild finds the drive low on space: {rebuilt:?}"
+    );
+    assert_eq!(
+        cache.meta("sentinel").unwrap().as_deref(),
+        Some("keep"),
+        "the rebuild keeps the tables"
+    );
+}
+
 #[test]
 fn previous_owner_cannot_start_rebuild_maintenance() {
     let directory = tempfile::tempdir().unwrap();
@@ -1078,11 +1124,11 @@ fn wait_for_commit_at(base: &Path, expected: i64) {
     }
 }
 
-/// Ownership of a cache in `base` holding this release's tables.
+/// Ownership of a cache in `base` with this release's tables, written
+/// while the drive had room: the writer's opening checks free space.
 fn owner_of_written_cache(base: &CacheBase) -> RefreshOwnership {
-    let owner = RefreshOwnership::acquire_for_test(base).unwrap();
-    SqliteCache::open_for_refresh(owner.token()).unwrap();
-    owner
+    drop(SqliteCache::open(&base.clone().with_free_space(10 * FREE_SPACE_FLOOR)).unwrap());
+    RefreshOwnership::acquire_for_test(base).unwrap()
 }
 
 #[test]
@@ -1272,7 +1318,10 @@ fn file_size(path: &Path) -> u64 {
 #[test]
 fn checkpoints_after_drive_found_low_on_space_leave_log_uncopied() {
     let directory = tempfile::tempdir().unwrap();
-    let base = rearview(directory.path()).with_free_space(900_000_000);
+    // The writer's opening checks free space once, for its schema batch,
+    // and passes; the next check finds the drive low on space.
+    let base = rearview(directory.path())
+        .with_disk_space(Arc::new(super::super::DriveRunningOut::after(1, || {})));
     let owner = owner_of_written_cache(&base);
     let database = super::super::database_path(base.path());
     let writer = SqliteCache::open_for_refresh(owner.token()).unwrap();
@@ -2068,8 +2117,12 @@ fn batch_whose_body_fails_rolls_back_and_revokes_write_permission_by_class() {
         assert_eq!(
             owner.token().can_publish(),
             keeps_write_permission,
-            "a {class:?} failure in the body keeps the owner's write permission: \
-             {keeps_write_permission}"
+            "a failure of class {class:?} in the body {} the owner's write permission",
+            if keeps_write_permission {
+                "keeps"
+            } else {
+                "revokes"
+            }
         );
     }
 }
@@ -2123,6 +2176,42 @@ fn batch_whose_commit_time_isnt_recorded_rolls_back_and_revokes_write_permission
     );
 }
 
+/// SQLite's full-disk error at the commit time's update is the low-space
+/// error, its latch set before the write permission is revoked. The drive
+/// reports more than the floor free; the error reports less.
+#[test]
+fn batch_whose_commit_time_finds_disk_full_fails_with_low_space() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = rearview(directory.path()).with_free_space(5 * FREE_SPACE_FLOOR);
+    let (owner, connection) = owner_and_sentinel(&base);
+    connection
+        .execute_batch(
+            "CREATE TABLE filler (data BLOB); \
+             CREATE TRIGGER fill_at_commit_time AFTER UPDATE ON refresh_state \
+             BEGIN INSERT INTO filler VALUES (randomblob(200000)); END;",
+        )
+        .unwrap();
+
+    let ran = WriteBatch::run(&connection, owner.token(), |batch| {
+        let pages: i64 = batch.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        batch.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |_| Ok(()))?;
+        Ok(())
+    });
+
+    let Err(AppError::SessionCacheLowSpace { free_bytes, .. }) = ran else {
+        panic!("the full disk at the commit time's update is low space: {ran:?}");
+    };
+    assert!(
+        free_bytes < FREE_SPACE_FLOOR,
+        "the error reports less than the floor free: {free_bytes}"
+    );
+    assert!(base.low_space().is_set(), "the low-space latch is set");
+    assert!(
+        !owner.token().can_publish(),
+        "the full disk revokes the owner's write permission"
+    );
+}
+
 #[test]
 fn batch_whose_commit_fails_foreign_key_rolls_back_and_keeps_write_permission() {
     let directory = tempfile::tempdir().unwrap();
@@ -2154,14 +2243,14 @@ fn batch_whose_commit_fails_foreign_key_rolls_back_and_keeps_write_permission() 
 }
 
 #[test]
-fn checked_batch_on_drive_low_on_space_doesnt_begin() {
+fn batch_on_drive_low_on_space_doesnt_begin() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path())
         .with_disk_space(Arc::new(super::super::DriveRunningOut::after(0, || {})));
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
     let connection = connect(base.path(), Duration::ZERO).unwrap();
 
-    let ran = WriteBatch::run_checking_space(&connection, owner.token(), |_| -> Result<()> {
+    let ran = WriteBatch::run(&connection, owner.token(), |_| -> Result<()> {
         panic!("a batch on a drive low on space doesn't run its body")
     });
 
@@ -2192,7 +2281,7 @@ fn batch_whose_body_doesnt_find_anything_rolls_back_without_commit() {
     let committed_before = last_commit();
     clock.advance(Duration::from_secs(1));
 
-    let ran = WriteBatch::run_checking_space_or_roll_back(&connection, owner.token(), |batch| {
+    let ran = WriteBatch::run_or_roll_back(&connection, owner.token(), |batch| {
         batch.execute("UPDATE sentinel SET value = 2", [])?;
         Ok(None::<()>)
     });

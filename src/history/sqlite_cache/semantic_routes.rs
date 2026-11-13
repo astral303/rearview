@@ -121,7 +121,7 @@ impl CacheWriter {
     /// Store each of `routes` whose copy the cache still holds, in one batch.
     /// Fails without writing when the drive is low on space.
     pub(super) fn store_semantic_routes(&self, routes: &[SemanticRoute]) -> Result<()> {
-        WriteBatch::run_checking_space(&self.connection, &self.owner, |batch| {
+        WriteBatch::run(&self.connection, &self.owner, |batch| {
             let mut statement = batch.prepare_cached(
                 "INSERT OR REPLACE INTO semantic_routes \
                  (session, generation, custom_title, summary, text, version) \

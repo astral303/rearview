@@ -126,9 +126,9 @@
   (`F2`) shows the reason. Both stay available while that work waits for
   another rearview's refresh.
 - rearview deletes its session cache and stops when a cache write finds less
-  than 1 GB free on its drive. The message names the free space and reports
-  `The session cache was deleted.` Agent commands report the same in a
-  `protocol agent-error` record.
+  than 1 GB free on its drive, or the drive full. The message names the free
+  space and reports `The session cache was deleted.` Agent commands report
+  the same in a `protocol agent-error` record.
   - A cache another rearview has open is left in place, and the message
     reports it.
 

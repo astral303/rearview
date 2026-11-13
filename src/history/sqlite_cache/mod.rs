@@ -607,8 +607,11 @@ impl CacheWriter {
 
     /// Empty the database into this release's layout, holding the owner's
     /// turn throughout, so the writer lock's 30-second wait limit measures
-    /// only other connections here too.
+    /// only other connections here too. Check free space once, before taking
+    /// the turn, because the check takes the turn itself; the rebuild
+    /// deletes data before it writes any.
     fn rebuild(&self) -> Result<()> {
+        self.owner.check_space()?;
         let turn = self.owner.take_turn();
         self.begin_rebuild(&turn)?;
         // Drop the tables only once the exclusive lock and the journal change
@@ -623,6 +626,7 @@ impl CacheWriter {
     }
 
     fn create_schema(&self) -> Result<()> {
+        self.owner.check_space()?;
         self.create_schema_in_turn(&self.owner.take_turn())
     }
 
@@ -792,7 +796,7 @@ impl CacheWriter {
             in_place,
             stored_in_place,
         } = WindowRows::of(update, entries, &in_place_entries, subagents);
-        WriteBatch::run_checking_space(&self.cache.connection, &self.owner, |batch| {
+        WriteBatch::run(&self.cache.connection, &self.owner, |batch| {
             let keys = &catalogue_keys(batch, &record.catalogue)?;
             let places = &keys.places;
             let stored: Option<i64> = batch
@@ -841,7 +845,7 @@ impl CacheWriter {
         entries: &TranscriptEntries,
     ) -> Result<Option<i64>> {
         let row = &record.catalogue;
-        WriteBatch::run_checking_space_or_roll_back(&self.cache.connection, &self.owner, |batch| {
+        WriteBatch::run_or_roll_back(&self.cache.connection, &self.owner, |batch| {
             let keys = &catalogue_keys(batch, row)?;
             let session: Option<i64> = batch
                 .query_row(
@@ -884,7 +888,7 @@ impl CacheWriter {
             Some(catalogue::RecordEntries::Written(entries)) => {
                 let rows = rows.expect("listed entries have rows");
                 entries::insert(&self.cache.connection, session, &keys.places, rows, owner)?;
-                WriteBatch::run_checking_space(&self.cache.connection, owner, |batch| {
+                WriteBatch::run(&self.cache.connection, owner, |batch| {
                     require_writing(batch, session)?;
                     write_malformed_lines(batch, session, entries)?;
                     write_subagent_metadata(batch, session, record, &keys, &[])
@@ -906,7 +910,7 @@ impl CacheWriter {
         rows: Option<&entries::SessionRows>,
     ) -> Result<(i64, catalogue::CatalogueKeys)> {
         let row = &record.catalogue;
-        WriteBatch::run_checking_space(&self.cache.connection, &self.owner, |batch| {
+        WriteBatch::run(&self.cache.connection, &self.owner, |batch| {
             let keys = catalogue_keys(batch, row)?;
             batch.execute(
                 "DELETE FROM sessions WHERE storage = ?1 AND root = ?2 AND cache_key = ?3",
@@ -952,7 +956,7 @@ impl CacheWriter {
         status: SessionStatus,
         entries_error: Option<&str>,
     ) -> Result<()> {
-        WriteBatch::run_checking_space(&self.connection, &self.owner, |batch| {
+        WriteBatch::run(&self.connection, &self.owner, |batch| {
             let changed = batch.execute(
                 "UPDATE sessions SET status = ?1, entries_error = ?2 WHERE id = ?3 AND status = ?4",
                 params![status.as_str(), entries_error, session, catalogue::WRITING],
