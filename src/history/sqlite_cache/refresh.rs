@@ -778,6 +778,16 @@ impl RefreshToken {
     /// lock. A failure whose class stops writes revokes write permission for
     /// every copy of this token.
     pub(crate) fn write_batch<T>(&self, work: impl FnOnce() -> T) -> Result<T> {
+        self.write_statements(|_| Ok(work()))
+    }
+
+    /// Run `statements` on the batch's connection as one write batch, as
+    /// [`Self::write_batch`] does; a failure of `statements` rolls the batch
+    /// back.
+    pub(super) fn write_statements<T>(
+        &self,
+        statements: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
         (|| {
             if !self.can_publish() {
                 return Err(AppError::SessionCacheRefreshLost);
@@ -785,7 +795,7 @@ impl RefreshToken {
             let connection = retry_busy(LOCK_WAIT_LIMIT, self.clock(), || {
                 connect_writable(&self.base, POLL_EVERY)
             })?;
-            WriteBatch::run(&connection, self, |_| Ok(work()))
+            WriteBatch::run(&connection, self, |batch| statements(batch))
         })()
         .map_err(|error| self.fail_with(error))
     }
