@@ -8,11 +8,11 @@
 
 use super::walk::{self, DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
-    Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
-    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
-    SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder, TranscriptReader,
-    resolved_session_paths, write_atomically,
+    Capability, Deleted, DiscoveredSessions, Fingerprint, RefNamespaces, RenamedTitle,
+    ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
+    SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
+    SessionStorage, SessionStub, SessionTitle, SessionsDirLookup, SourceLabels, SubagentFinder,
+    TranscriptReader, resolved_session_paths, write_atomically,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -134,14 +134,15 @@ impl SessionRenamer for GrokProvider {
         path: &Path,
         title: &str,
         _renamed_at: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<RenamedTitle> {
         format::require_owned_transcript(permit, Source::Grok, path)?;
         let session_dir = session_dir_of(path)?;
-        rewrite_summary_title(&session_dir.join(SUMMARY_FILE), title)?;
+        let title = rewrite_summary_title(&session_dir.join(SUMMARY_FILE), title)?;
         write_atomically(
             &session_dir.join(TITLE_REFRESH_WATERMARK_FILE),
             TITLE_REFRESH_CHECKPOINTS.to_string().as_bytes(),
-        )
+        )?;
+        Ok(RenamedTitle::OutsideTranscript(title))
     }
 }
 
@@ -276,8 +277,9 @@ fn removal_order<'a>(session_dir: &'a Path, subagent_dirs: &'a [PathBuf]) -> Vec
 }
 
 /// Set the title in `summary.json`, keeping every field rearview does not
-/// read.
-fn rewrite_summary_title(summary_path: &Path, title: &str) -> Result<()> {
+/// read. Returns the title the rewritten file names: its `session_summary`
+/// after an empty rename.
+fn rewrite_summary_title(summary_path: &Path, title: &str) -> Result<Option<SessionTitle>> {
     let contents = std::fs::read_to_string(summary_path).map_err(|error| {
         AppError::Io(std::io::Error::new(
             error.kind(),
@@ -294,7 +296,8 @@ fn rewrite_summary_title(summary_path: &Path, title: &str) -> Result<()> {
     let cleaned = title.replace(['\r', '\n'], " ").trim().to_owned();
     object.insert("generated_title".to_owned(), json!(cleaned));
     object.insert("title_is_manual".to_owned(), json!(true));
-    write_atomically(summary_path, serde_json::to_string(&value)?.as_bytes())
+    write_atomically(summary_path, serde_json::to_string(&value)?.as_bytes())?;
+    Ok(grok::summary_of(&value).and_then(|summary| summary.title()))
 }
 
 /// Drop each removed session's row from Grok's search index; its FTS

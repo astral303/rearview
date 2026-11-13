@@ -2512,15 +2512,20 @@ pub(crate) fn index_titles(index: &Path) -> HashMap<String, String> {
         let Some(name) = value.get("thread_name").and_then(Value::as_str) else {
             continue;
         };
-        let name = name.replace(['\r', '\n'], " ").trim().to_owned();
-        if name.is_empty() {
+        match thread_name(name) {
+            Some(name) => titles.insert(id.to_owned(), name),
             // The newest record has no usable name, so the thread has none.
-            titles.remove(id);
-        } else {
-            titles.insert(id.to_owned(), name);
-        }
+            None => titles.remove(id),
+        };
     }
     titles
+}
+
+/// `name`, a session index record's thread name, as the title lookup reads
+/// it: line breaks replaced by spaces and trimmed. `None` when nothing
+/// remains.
+pub(crate) fn thread_name(name: &str) -> Option<String> {
+    Some(name.replace(['\r', '\n'], " ").trim().to_owned()).filter(|name| !name.is_empty())
 }
 
 /// Rollouts written by hand for the tests here and in the provider: the

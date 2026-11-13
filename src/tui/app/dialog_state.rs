@@ -4,6 +4,7 @@ use super::view_state::DeferredCopy;
 use super::{Action, App, AppMode, DialogMode};
 use crate::error::Result;
 use crate::history::DisplayEntries;
+use crate::history::provider::RenamedTitle;
 use crate::tui::list_change::ListChange;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::path::Path;
@@ -227,9 +228,9 @@ impl App {
 
     /// Show the session at `path` renamed to `title`, or report why the
     /// rename failed and keep the name box open.
-    pub(super) fn finish_rename(&mut self, path: &Path, title: &str, result: Result<()>) {
+    pub(super) fn finish_rename(&mut self, path: &Path, title: &str, result: Result<RenamedTitle>) {
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 if let Some(idx) = self.conversations.iter().position(|row| row.path == path) {
                     self.show_renamed_session(idx, title);
                 }

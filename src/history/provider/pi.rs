@@ -2,10 +2,10 @@
 
 use super::walk::{DirectoryLister, DiscoveryLister, FileRoot};
 use super::{
-    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RootEnvironment,
-    SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionProvider,
-    SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub, SessionsDirLookup,
-    SourceLabels, SubagentFinder, TranscriptReader, walk,
+    Capability, Deleted, DiscoveredSessions, PathResumeLauncher, RefNamespaces, RenamedTitle,
+    RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver,
+    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
+    SessionsDirLookup, SourceLabels, SubagentFinder, TranscriptReader, walk,
 };
 use crate::cli::DebugLevel;
 use crate::clock::Clock;
@@ -107,8 +107,9 @@ impl SessionRenamer for PiProvider {
         path: &Path,
         title: &str,
         renamed_at: DateTime<Utc>,
-    ) -> Result<()> {
-        pi_log::append_session_rename(permit, path, title, renamed_at)
+    ) -> Result<RenamedTitle> {
+        pi_log::append_session_rename(permit, path, title, renamed_at)?;
+        Ok(RenamedTitle::InTranscript)
     }
 }
 

@@ -24,10 +24,10 @@ use super::walk::test_support::{
 };
 use super::walk::{DirectoryLister, SystemLister};
 use super::{
-    Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, ResolvedSession,
-    RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch, SessionProvider, SessionRead,
-    SessionRenamer, SessionRoot, SessionStorage, SessionStub, SessionTitle, Stored, SubagentFinder,
-    ThreadLinker, TitleAndSummary, TranscriptReader,
+    Capability, Deleted, DenialDetail, DiscoveredSessions, Fingerprint, Operation, RenamedTitle,
+    ResolvedSession, RootEnvironment, SessionCache, SessionIdResolver, SessionLaunch,
+    SessionProvider, SessionRead, SessionRenamer, SessionRoot, SessionStorage, SessionStub,
+    SessionTitle, Stored, SubagentFinder, ThreadLinker, TitleAndSummary, TranscriptReader,
 };
 use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
@@ -55,6 +55,7 @@ enum Contract {
     SubagentDeleteCount,
     SubagentsNotCapable,
     WarmCacheRename,
+    RenameReturnsTitle,
     SessionIdLookup,
     SessionIdLookupMatchesDiscovery,
     UnknownIdLookup,
@@ -102,7 +103,7 @@ impl Contract {
             Self::ForkCommand => fork,
             Self::ForkNotCapable => !fork,
             Self::WorkspaceSessionsDir => provider.workspace_sessions_dir().is_capable(),
-            Self::WarmCacheRename => rename,
+            Self::WarmCacheRename | Self::RenameReturnsTitle => rename,
             Self::ForeignFileDelete => delete,
             Self::RootOverride
             | Self::StorageEnvVars
@@ -1115,6 +1116,59 @@ fn session_titled_outside_its_transcript_parses_that_title_alone() {
             .any(|(_, title)| matches!(title, SessionTitle::Custom(_))),
         "some fixture keeps a chosen title outside its transcript: {titled_outside:?}"
     );
+}
+
+/// A rename returns the title the next read of the session shows: the
+/// title kept beside the transcript as `external_titles` reads it, or a
+/// title in the transcript as the next parse reads it. After an empty
+/// rename, an agent can name its generated title. The empty rename clears
+/// the name the first rename chose.
+#[test]
+fn rename_returns_title_next_read_shows() {
+    run_contract(Contract::RenameReturnsTitle, |fixture| {
+        let source = fixture.provider().source();
+        let home = tempfile::tempdir().unwrap();
+        fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+        let [stub] = <[_; 1]>::try_from(fixture.discover_under(home.path()))
+            .unwrap_or_else(|stubs| panic!("one session in the home: {stubs:?}"));
+        let root = fixture.root_under(home.path());
+        for title in ["Chosen name", ""] {
+            let renamed = fixture
+                .renamer()
+                .rename_session(
+                    crate::history::FOR_FIXTURES,
+                    &stub.locator,
+                    title,
+                    TestClock::default().wall(),
+                )
+                .unwrap();
+
+            let (_, row) =
+                crate::history::sqlite_cache::tests::parsed_record_and_row(source, &root, &stub);
+            let outside = fixture
+                .storage()
+                .external_titles(&root)
+                .remove(&row.session_id);
+            match renamed {
+                RenamedTitle::OutsideTranscript(returned) => assert_eq!(
+                    returned, outside,
+                    "{title:?}: the rename returns the title kept beside the transcript"
+                ),
+                RenamedTitle::InTranscript => {
+                    assert_eq!(
+                        outside, None,
+                        "{title:?}: the agent doesn't keep a title beside the transcript"
+                    );
+                    assert_eq!(
+                        row.custom_title.as_deref(),
+                        Some(title).filter(|title| !title.is_empty()),
+                        "{title:?}: the next parse reads the title, and none after an empty \
+                         rename"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// The origin of a session's name kept outside its transcript.

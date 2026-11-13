@@ -263,7 +263,12 @@ impl SessionSummary {
 /// names no session id.
 pub(crate) fn session_summary(session_dir: &Path) -> Option<SessionSummary> {
     let contents = std::fs::read_to_string(session_dir.join(SUMMARY_FILE)).ok()?;
-    let value = serde_json::from_str::<Value>(&contents).ok()?;
+    summary_of(&serde_json::from_str::<Value>(&contents).ok()?)
+}
+
+/// The summary in `value`, the contents of a `summary.json`; `None` when
+/// it doesn't name a session ID.
+pub(crate) fn summary_of(value: &Value) -> Option<SessionSummary> {
     let id = value
         .pointer("/info/id")
         .and_then(Value::as_str)

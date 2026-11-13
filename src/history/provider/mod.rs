@@ -305,7 +305,21 @@ pub trait SessionRenamer: Sync {
         path: &Path,
         title: &str,
         renamed_at: DateTime<Utc>,
-    ) -> Result<()>;
+    ) -> Result<RenamedTitle>;
+}
+
+/// The place a rename put a session's title, for a caller that shows the
+/// title before reading the session again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RenamedTitle {
+    /// In the transcript: the next parse reads the title as typed, or with
+    /// line breaks replaced by spaces and its ends trimmed.
+    InTranscript,
+    /// Beside the transcript: the title
+    /// [`external_titles`](SessionStorage::external_titles) now reads for
+    /// the session, as the agent stores it; `None` when it doesn't read a
+    /// title.
+    OutsideTranscript(Option<SessionTitle>),
 }
 
 /// Deletes a session, for a provider declaring [`SessionProvider::delete`]

@@ -7,11 +7,11 @@ use project_folder::{decode_project_dir_name_to_path, is_project_folder_of};
 
 use super::walk::{DirectoryLister, DiscoveryLister, SessionFiles, SystemLister};
 use super::{
-    Capability, Deleted, DiscoveredSessions, RecordedDirectory, RefNamespaces, ResolvedSession,
-    RootEnvironment, SessionCache, SessionDeleter, SessionForker, SessionIdResolver, SessionLaunch,
-    SessionProvider, SessionRenamer, SessionResumer, SessionRoot, SessionStorage, SessionStub,
-    SessionsDirLookup, SourceLabels, Stored, SubagentFinder, ThreadLinker, TranscriptReader,
-    resolved_session_paths, walk,
+    Capability, Deleted, DiscoveredSessions, RecordedDirectory, RefNamespaces, RenamedTitle,
+    ResolvedSession, RootEnvironment, SessionCache, SessionDeleter, SessionForker,
+    SessionIdResolver, SessionLaunch, SessionProvider, SessionRenamer, SessionResumer, SessionRoot,
+    SessionStorage, SessionStub, SessionsDirLookup, SourceLabels, Stored, SubagentFinder,
+    ThreadLinker, TranscriptReader, resolved_session_paths, walk,
 };
 use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
 use crate::cli::DebugLevel;
@@ -172,8 +172,9 @@ impl SessionRenamer for ClaudeProvider {
         path: &Path,
         title: &str,
         _renamed_at: DateTime<Utc>,
-    ) -> Result<()> {
-        rename::append_session_rename(path, title)
+    ) -> Result<RenamedTitle> {
+        rename::append_session_rename(path, title)?;
+        Ok(RenamedTitle::InTranscript)
     }
 }
 

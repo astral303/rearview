@@ -3,7 +3,7 @@
 //! transcripts they check before they rename or delete them.
 
 use crate::error::{AppError, Result};
-use crate::history::provider::{Deleted, Operation};
+use crate::history::provider::{Deleted, Operation, RenamedTitle};
 use crate::history::{OperationScope, Source};
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ pub(crate) enum ListChangeOutcome {
     Renamed {
         path: PathBuf,
         title: String,
-        result: Result<()>,
+        result: Result<RenamedTitle>,
     },
     Deleted {
         path: PathBuf,
