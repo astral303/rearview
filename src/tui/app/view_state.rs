@@ -1,7 +1,7 @@
 use super::session_store::{FinishedRefresh, ReadCause};
 use super::{
-    App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, OpenSessionStatus, ViewSearchMode,
-    ViewState,
+    App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, MatchesArrival, OpenSessionStatus,
+    PendingViewSearch, ViewSearchMode, ViewSpot, ViewState,
 };
 use crate::history::provider::{RenamedTitle, SessionRead, SessionTitle, TitleAndSummary};
 use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
@@ -9,13 +9,18 @@ use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
 use crate::tui::viewer::{
     CallArea, CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderOptions,
-    ToolOutputId, ViewedConversation, find_matches, parse_conversation_file_interactively,
+    SearchMatch, ToolOutputId, ViewedConversation, parse_conversation_file_interactively,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
+
+/// The pause after the last edit of the viewer's query before its search is
+/// sent. The keys of a paste arrive less than the pause apart and run one
+/// search.
+pub(crate) const VIEW_SEARCH_PAUSE: Duration = Duration::from_millis(100);
 
 /// The open session's row as its finished refresh read it, for the viewer's
 /// read of the session from the cache.
@@ -468,6 +473,7 @@ impl App {
             search_query: String::new(),
             search_matches: Vec::new(),
             current_match_index: 0,
+            pending_search: None,
             message_ranges: rendered.messages,
             call_ranges: rendered.calls,
             focus: first_msg,
@@ -687,12 +693,14 @@ impl App {
     }
 
     pub fn exit_view_mode(&mut self) {
+        self.stop_view_search();
         self.app_mode = AppMode::List;
         self.pending_view_reload = None;
         self.deferred_copy = None;
     }
 
     pub(super) fn start_view_search(&mut self) {
+        self.stop_view_search();
         if let AppMode::View(ref mut state) = self.app_mode {
             state.search_mode = ViewSearchMode::Typing;
             state.search_query.clear();
@@ -702,10 +710,21 @@ impl App {
     }
 
     pub(super) fn clear_view_search(&mut self) {
+        self.stop_view_search();
         if let AppMode::View(ref mut state) = self.app_mode {
             state.search_mode = ViewSearchMode::Off;
             state.search_query.clear();
             state.search_matches.clear();
+        }
+    }
+
+    /// Stop the viewer's running or paused search; its matches aren't shown.
+    fn stop_view_search(&mut self) {
+        if let Some(worker) = &self.viewer_search {
+            worker.stop();
+        }
+        if let AppMode::View(ref mut state) = self.app_mode {
+            state.pending_search = None;
         }
     }
 
@@ -714,7 +733,7 @@ impl App {
             && !state.search_query.is_empty()
         {
             state.search_query.clear();
-            self.update_search_results();
+            self.schedule_view_search();
             return true;
         }
         false
@@ -729,48 +748,166 @@ impl App {
                 state.search_query.clear();
             }
         }
-        self.update_search_results();
+        self.schedule_view_search();
     }
 
     pub(super) fn push_view_search_char(&mut self, c: char) {
         if let AppMode::View(ref mut state) = self.app_mode {
             state.search_query.push(c);
         }
-        self.update_search_results();
+        self.schedule_view_search();
     }
 
     pub(super) fn backspace_view_search(&mut self) {
         if let AppMode::View(ref mut state) = self.app_mode {
             state.search_query.pop();
         }
-        self.update_search_results();
+        self.schedule_view_search();
     }
 
+    /// Confirm (`Enter`) in the search line: the search stays on its
+    /// matches, or closes when it didn't find any. A paused search starts at
+    /// once; once a running search returns, the search stays on its matches,
+    /// or closes when it didn't find any.
     pub(super) fn commit_view_search(&mut self) {
-        if let AppMode::View(ref mut state) = self.app_mode {
-            if !state.search_matches.is_empty() {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        match &mut state.pending_search {
+            None if state.search_matches.is_empty() => state.search_mode = ViewSearchMode::Off,
+            None => state.search_mode = ViewSearchMode::Active,
+            Some(PendingViewSearch::Running {
+                closes_without_matches,
+                ..
+            }) => {
+                *closes_without_matches = true;
                 state.search_mode = ViewSearchMode::Active;
-            } else {
-                state.search_mode = ViewSearchMode::Off;
+            }
+            Some(PendingViewSearch::Paused { .. }) => {
+                state.search_mode = ViewSearchMode::Active;
+                self.send_query_search(true);
             }
         }
     }
 
-    pub(super) fn update_search_results(&mut self) {
-        if let AppMode::View(ref mut state) = self.app_mode {
-            if state.search_query.is_empty() {
-                state.search_matches.clear();
-                return;
-            }
+    /// Clear the edited query's matches, and schedule its search for the end
+    /// of the pause after typing (`VIEW_SEARCH_PAUSE`). An empty query isn't
+    /// searched.
+    fn schedule_view_search(&mut self) {
+        let due = self.clock().now() + VIEW_SEARCH_PAUSE;
+        self.stop_view_search();
+        if let AppMode::View(state) = &mut self.app_mode {
+            state.search_matches.clear();
+            state.current_match_index = 0;
+            state.pending_search =
+                (!state.search_query.is_empty()).then_some(PendingViewSearch::Paused { due });
+        }
+    }
 
-            state.search_matches = find_matches(&state.rendered_lines, &state.search_query);
+    /// Send the viewer's paused search once the pause after typing has
+    /// passed.
+    pub(crate) fn send_due_view_search(&mut self) {
+        let now = self.clock().now();
+        if let AppMode::View(state) = &self.app_mode
+            && let Some(PendingViewSearch::Paused { due }) = state.pending_search
+            && now >= due
+        {
+            self.send_query_search(false);
+        }
+    }
 
-            if let Some(first) = state.search_matches.first() {
-                let match_line = first.first_row();
+    /// Send the search of the edited query: when its matches arrive, the view
+    /// scrolls to the first, unless the view moved while the search ran.
+    fn send_query_search(&mut self, closes_without_matches: bool) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        let from = ViewSpot::of(state);
+        self.send_view_search(
+            MatchesArrival::AtFirstMatch { from },
+            closes_without_matches,
+        );
+    }
+
+    /// Send the search of a re-render's rows: the view stays where it is when
+    /// its matches arrive.
+    fn send_rerender_search(&mut self, closes_without_matches: bool) {
+        self.send_view_search(MatchesArrival::InPlace, closes_without_matches);
+    }
+
+    /// Send the search of the view's rows for its query to the viewer's
+    /// search thread, superseding the running search.
+    fn send_view_search(&mut self, arrival: MatchesArrival, closes_without_matches: bool) {
+        let started = self.clock().now();
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let worker = self
+            .viewer_search
+            .get_or_insert_with(super::viewer_search::ViewerSearchWorker::spawn);
+        let generation = worker.search(
+            Arc::clone(&state.rendered_lines),
+            state.search_query.clone(),
+        );
+        state.pending_search = Some(PendingViewSearch::Running {
+            generation,
+            started,
+            arrival,
+            closes_without_matches,
+        });
+    }
+
+    /// True while the viewer's search is paused or running.
+    pub fn is_view_search_pending(&self) -> bool {
+        matches!(&self.app_mode, AppMode::View(state) if state.pending_search.is_some())
+    }
+
+    /// Show the matches of the viewer's running search once they arrive,
+    /// waiting up to `wait` for them. Matches of an older search, or of a
+    /// search the view stopped, are dropped. A panic on the search's thread
+    /// resumes here.
+    pub(crate) fn receive_view_search_results(&mut self, wait: Duration) {
+        let Some(found) = self
+            .viewer_search
+            .as_mut()
+            .and_then(|worker| worker.newest_found(wait))
+        else {
+            return;
+        };
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(PendingViewSearch::Running {
+            generation,
+            arrival,
+            closes_without_matches,
+            ..
+        }) = state.pending_search
+        else {
+            return;
+        };
+        if found.generation != generation {
+            return;
+        }
+        state.pending_search = None;
+        state.search_matches = found.matches;
+        let first_row = state.search_matches.first().map(SearchMatch::first_row);
+        match (arrival, first_row) {
+            (MatchesArrival::AtFirstMatch { from }, Some(first_row))
+                if from == ViewSpot::of(state) =>
+            {
                 state.current_match_index = 0;
-                state.scroll_offset = match_line;
-                Self::focus_message_at_line(state, match_line);
+                state.scroll_offset = first_row;
+                Self::focus_message_at_line(state, first_row);
             }
+            _ => {
+                state.current_match_index = state
+                    .current_match_index
+                    .min(state.search_matches.len().saturating_sub(1));
+            }
+        }
+        if closes_without_matches && state.search_matches.is_empty() {
+            state.search_mode = ViewSearchMode::Off;
         }
     }
 
@@ -977,15 +1114,24 @@ impl App {
                 }
             }
 
+            // Search the query again over the new rows, without the pause: the
+            // old matches point at rows that moved. A paused search reads the
+            // new rows when it is sent.
             if state.search_mode != ViewSearchMode::Off && !state.search_query.is_empty() {
-                state.search_matches = find_matches(&state.rendered_lines, &state.search_query);
-
-                if state.search_matches.is_empty() {
-                    state.current_match_index = 0;
-                } else {
-                    state.current_match_index = state
-                        .current_match_index
-                        .min(state.search_matches.len() - 1);
+                state.search_matches.clear();
+                match state.pending_search {
+                    Some(PendingViewSearch::Paused { .. }) => {}
+                    Some(PendingViewSearch::Running {
+                        arrival: MatchesArrival::AtFirstMatch { .. },
+                        closes_without_matches,
+                        ..
+                    }) => self.send_query_search(closes_without_matches),
+                    Some(PendingViewSearch::Running {
+                        arrival: MatchesArrival::InPlace,
+                        closes_without_matches,
+                        ..
+                    }) => self.send_rerender_search(closes_without_matches),
+                    None => self.send_rerender_search(false),
                 }
             }
         }

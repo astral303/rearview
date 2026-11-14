@@ -637,7 +637,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
     render_view_content(frame, state, layout.content, app.clock().now());
 
     if state.search_mode == ViewSearchMode::Typing {
-        render_search_input(frame, state, layout.status);
+        render_search_input(frame, app, state, layout.status);
     } else {
         render_view_status_bar(frame, app, state, layout.status);
     }
@@ -1095,20 +1095,25 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
         Span::raw("  "),
     ];
 
-    if state.search_mode == ViewSearchMode::Active && !state.search_matches.is_empty() {
+    let shows_search = !state.search_matches.is_empty() || state.pending_search.is_some();
+    if state.search_mode == ViewSearchMode::Active && shows_search {
+        let match_count = if state.search_matches.is_empty() {
+            app.view_search_status_text()
+                .map(|status| format!("{status}  "))
+                .unwrap_or_default()
+        } else {
+            format!(
+                "{}/{}  ",
+                state.current_match_index + 1,
+                state.search_matches.len()
+            )
+        };
         spans.extend([
             Span::styled("n", key_style),
             Span::styled("ext  ", label_style),
             Span::styled("N", key_style),
             Span::styled("prev  ", label_style),
-            Span::styled(
-                format!(
-                    "{}/{}  ",
-                    state.current_match_index + 1,
-                    state.search_matches.len()
-                ),
-                Style::default().fg(rgb(th().text_secondary)),
-            ),
+            Span::styled(match_count, Style::default().fg(rgb(th().text_secondary))),
             Span::styled("Esc", key_style),
             Span::styled(" clear", label_style),
         ]);
@@ -1136,19 +1141,21 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
     frame.render_widget(status, area);
 }
 
-fn render_search_input(frame: &mut Frame, state: &ViewState, area: Rect) {
-    let match_info = if state.search_matches.is_empty() {
-        if state.search_query.is_empty() {
-            String::new()
-        } else {
-            " (no matches)".to_string()
-        }
-    } else {
+fn render_search_input(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
+    let match_info = if !state.search_matches.is_empty() {
         format!(
             " ({}/{})",
             state.current_match_index + 1,
             state.search_matches.len()
         )
+    } else if state.pending_search.is_some() {
+        app.view_search_status_text()
+            .map(|status| format!(" {status}"))
+            .unwrap_or_default()
+    } else if state.search_query.is_empty() {
+        String::new()
+    } else {
+        " (no matches)".to_string()
     };
 
     let input_line = Line::from(vec![
@@ -2705,6 +2712,7 @@ mod tests {
         let frame_width = (40..=100)
             .find(|&width| {
                 app.check_view_resize(width, 17);
+                crate::tui::app::test_waits::finish_view_search(&mut app);
                 let AppMode::View(state) = app.app_mode() else {
                     unreachable!()
                 };

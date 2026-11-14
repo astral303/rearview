@@ -3,6 +3,7 @@ use super::refresh_tests::{
     listed_names, selected_name, serve_list_change, serve_session_refresh, status_text,
 };
 use super::semantic_test_helpers::*;
+use super::test_waits::finish_view_search;
 use super::*;
 use crate::config::KeyBinding;
 use crate::history::environment::test_support::{cache_rows, test_environment};
@@ -88,7 +89,7 @@ fn write_conversation(path: &std::path::Path, title: Option<&str>) {
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
-fn write_named_conversation(path: &std::path::Path, text: &str) {
+pub(super) fn write_named_conversation(path: &std::path::Path, text: &str) {
     let line = serde_json::json!({
         "type": "user",
         "timestamp": "2024-01-01T00:00:00Z",
@@ -259,7 +260,7 @@ fn scroll_to(app: &mut App, row: usize, viewport_height: usize) {
     }
 }
 
-fn app_with_tool_conversation(path: PathBuf, tool_display: ToolDisplayMode) -> App {
+pub(super) fn app_with_tool_conversation(path: PathBuf, tool_display: ToolDisplayMode) -> App {
     let mut app = app_over_cached_sessions(vec![test_conversation(path, None)], tool_display);
     app.selected = Some(0);
     app.enter_view_mode(80);
@@ -300,7 +301,7 @@ fn write_codex_rollout(directory: &std::path::Path) -> PathBuf {
     path
 }
 
-fn press(app: &mut App, code: KeyCode) {
+pub(super) fn press(app: &mut App, code: KeyCode) {
     app.handle_key(code, KeyModifiers::empty(), 17);
 }
 
@@ -1483,6 +1484,7 @@ fn enter_while_typing_search_commits_it() {
     }
 
     press(&mut app, KeyCode::Enter);
+    finish_view_search(&mut app);
 
     if let AppMode::View(state) = app.app_mode() {
         assert_eq!(state.search_mode, ViewSearchMode::Active);
@@ -1496,9 +1498,17 @@ fn search_view_for(app: &mut App, query: &str) {
         press(app, KeyCode::Char(c));
     }
     press(app, KeyCode::Enter);
+    finish_view_search(app);
 }
 
-fn view_state(app: &App) -> &ViewState {
+/// Resize the open view to `frame_width`, and show the matches of the
+/// search the resize starts.
+fn resize_view_and_search(app: &mut App, frame_width: usize) {
+    app.check_view_resize(frame_width, 17);
+    finish_view_search(app);
+}
+
+pub(super) fn view_state(app: &App) -> &ViewState {
     match app.app_mode() {
         AppMode::View(state) => state,
         _ => unreachable!(),
@@ -1550,7 +1560,7 @@ fn resize_that_moves_break_keeps_match() {
 
     let mut crossed_rows = false;
     for frame_width in 40..=100 {
-        app.check_view_resize(frame_width, 17);
+        resize_view_and_search(&mut app, frame_width);
         let state = view_state(&app);
         assert_eq!(state.search_matches.len(), 1, "frame width {frame_width}");
         assert_eq!(current_match_words(&app), ["cache", "rebuild"]);
@@ -1563,7 +1573,7 @@ fn resize_that_moves_break_keeps_match() {
 fn width_breaking_the_match(app: &mut App) -> usize {
     (40..=100)
         .find(|&frame_width| {
-            app.check_view_resize(frame_width, 17);
+            resize_view_and_search(app, frame_width);
             view_state(app).search_matches[0].rows().len() == 2
         })
         .expect("a width that breaks the phrase")
@@ -1605,7 +1615,7 @@ fn resize_while_typing_search_keeps_match() {
     assert_eq!(view_state(&app).search_mode, ViewSearchMode::Typing);
 
     let frame_width = width_breaking_the_match(&mut app);
-    app.check_view_resize(frame_width + 20, 17);
+    resize_view_and_search(&mut app, frame_width + 20);
 
     let state = view_state(&app);
     assert_eq!(state.search_mode, ViewSearchMode::Typing);

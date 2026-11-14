@@ -134,6 +134,8 @@ pub struct ViewState {
     pub search_matches: Vec<SearchMatch>,
     /// Index into `search_matches` of the match `n`/`N` are sitting on
     pub current_match_index: usize,
+    /// The search of `search_query` whose matches haven't arrived yet
+    pub pending_search: Option<PendingViewSearch>,
     /// Message boundary ranges from rendering
     pub message_ranges: Vec<MessageRange>,
     /// The calls inside expanded tool runs, in line order
@@ -204,6 +206,51 @@ pub struct CountHighlight {
     /// stays at the bottom, a `↓ N new` badge covers the start of the last
     /// content row.
     pub arrived_below: Option<usize>,
+}
+
+/// The viewer's search of its query, until its matches arrive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingViewSearch {
+    /// The query changed; the search starts at `due`, after the pause, unless
+    /// the query changes again.
+    Paused { due: crate::clock::Moment },
+    /// The search runs on the viewer's search thread since `started`.
+    Running {
+        /// The number marking the newest search: matches of any other search
+        /// aren't shown.
+        generation: u64,
+        started: crate::clock::Moment,
+        arrival: MatchesArrival,
+        /// True after confirm (`Enter`) while the search was paused or
+        /// running: the search closes when it doesn't find any match.
+        closes_without_matches: bool,
+    },
+}
+
+/// Where the view goes when a search's matches arrive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchesArrival {
+    /// The view stays where it is, as for the search of a re-render's rows.
+    InPlace,
+    /// The view scrolls to the first match, unless it moved from `from` while
+    /// the search ran.
+    AtFirstMatch { from: ViewSpot },
+}
+
+/// The view's scroll position and focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewSpot {
+    pub scroll_offset: usize,
+    pub focus: Option<Focus>,
+}
+
+impl ViewSpot {
+    pub fn of(state: &ViewState) -> Self {
+        Self {
+            scroll_offset: state.scroll_offset,
+            focus: state.focus,
+        }
+    }
 }
 
 /// Search mode within view
@@ -302,6 +349,7 @@ impl ViewState {
             search_query: String::new(),
             search_matches: Vec::new(),
             current_match_index: 0,
+            pending_search: None,
             message_ranges: Vec::new(),
             call_ranges: Vec::new(),
             focus: None,

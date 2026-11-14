@@ -105,6 +105,13 @@
   loading. A row selected while the list loads now stays selected.
 - Fix rearview crashing (`Segmentation fault: 11` on macOS) when the user
   quits while semantic search loads its model.
+- Fix the viewer not responding to keys after a paste into its search (`/`)
+  in a large session: each pasted character searched the whole session. A
+  paste now runs one search, in the background, and an edit of the query
+  during a search shows at once and stops that search.
+  - While a search runs, the search line, or the status bar after confirm
+    (`Enter`), shows `⠋ searching` and, from one second on, the seconds it
+    has run (`⠋ searching 1s`).
 
 #### `rearview agent` commands
 
