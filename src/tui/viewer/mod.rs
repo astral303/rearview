@@ -40,7 +40,7 @@ pub use search_rows::find_matches;
 pub use search_rows::{SearchMatch, find_matches_while};
 pub(crate) use summary::format_coarse_duration;
 
-use calls::{CallRanges, top_level_tool_blocks};
+use calls::{CallRanges, Lanes, top_level_tool_blocks};
 use days::DayLabels;
 use entry::render_entry;
 use summary::{
@@ -250,6 +250,8 @@ pub struct ParsedConversation {
     /// Where each displayed entry was read, by its `entry_index`.
     origins: Vec<EntryOrigin>,
     roster: SubagentRoster,
+    /// The lanes of the top-level calls, which the detail modes draw.
+    lanes: Lanes,
     /// The earliest and latest message timestamps, for the header's dates.
     activity_span: Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)>,
 }
@@ -262,6 +264,7 @@ impl ParsedConversation {
             entries: Vec::new(),
             origins: Vec::new(),
             roster: SubagentRoster::from_identities(Vec::new()),
+            lanes: Lanes::default(),
             activity_span: None,
         }
     }
@@ -356,11 +359,13 @@ pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversati
     for parsed in &entries {
         roster.record_agent_calls(&parsed.entry);
     }
+    let lanes = Lanes::of(top_level_tool_blocks(&entries));
     let activity_span = activity_span(&entries);
     ParsedConversation {
         entries,
         origins,
         roster,
+        lanes,
         activity_span,
     }
 }
@@ -402,14 +407,17 @@ pub fn render_parsed_conversation_while(
     render_entries(
         &conversation.entries,
         &conversation.roster,
+        &conversation.lanes,
         options,
         keep_going,
     )
 }
 
+/// `lanes` are the lanes of `entries`' top-level calls.
 fn render_entries(
     entries: &[RenderableEntry],
     roster: &SubagentRoster,
+    lanes: &Lanes,
     options: &RenderOptions,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<RenderedConversation> {
@@ -419,13 +427,10 @@ fn render_entries(
         calls: Vec::new(),
     };
     let mut pending_tool_summary: Option<PendingToolSummary> = None;
-    // Summary mode pairs the calls of each expanded run as the run renders;
-    // the detail modes pair every top-level call of the conversation.
-    let mut call_ranges = if options.tool_display.shows_details() {
-        CallRanges::new(top_level_tool_blocks(entries))
-    } else {
-        CallRanges::default()
-    };
+    // The detail modes pair every top-level call of the conversation here.
+    // Summary mode pairs the calls of each expanded run as the run renders,
+    // and its entries return no tool blocks.
+    let mut call_ranges = CallRanges::new(lanes);
 
     // Only a collapsed run needs the session's agent.
     let session_agent = options

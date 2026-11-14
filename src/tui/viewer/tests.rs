@@ -52,7 +52,9 @@ fn render_to_end(
     roster: &SubagentRoster,
     options: &RenderOptions,
 ) -> RenderedConversation {
-    render_entries(entries, roster, options, &|| true).expect("a render that keeps going finishes")
+    let lanes = Lanes::of(top_level_tool_blocks(entries));
+    render_entries(entries, roster, &lanes, options, &|| true)
+        .expect("a render that keeps going finishes")
 }
 
 /// A render of `entries` user messages whose `keep_going` returns each of
@@ -71,6 +73,7 @@ fn render_stop_checks(entries: usize, answers: &[bool]) -> (usize, bool) {
     let finished = render_entries(
         &entries,
         &SubagentRoster::default(),
+        &Lanes::default(),
         &test_render_options(ToolDisplayMode::Full),
         &|| {
             let call = calls.get();

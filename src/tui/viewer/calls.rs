@@ -169,29 +169,51 @@ impl RenderedToolBlock<'_> {
     }
 }
 
+/// The lane of each call of one sequence of tool blocks that is open beside
+/// another, by `tool_use_id`: see [`lanes`].
+#[derive(Debug, Default)]
+pub(super) struct Lanes(HashMap<String, usize>);
+
+impl Lanes {
+    pub(super) fn of<'a>(blocks: impl Iterator<Item = ToolBlock<'a>>) -> Self {
+        let blocks: Vec<_> = blocks.collect();
+        Self(
+            lanes(&blocks)
+                .into_iter()
+                .map(|(tool_use_id, lane)| (tool_use_id.to_owned(), lane))
+                .collect(),
+        )
+    }
+
+    /// `None` for a call open alone, or never answered.
+    pub(super) fn get(&self, tool_use_id: &str) -> Option<usize> {
+        self.0.get(tool_use_id).copied()
+    }
+}
+
 /// The `CallRange`s of one sequence of tool blocks — an expanded run, or
 /// every top-level block of the conversation in the detail modes — built as
 /// the blocks render. A call opens a range; the result carrying its
 /// `tool_use_id` closes it.
-#[derive(Default)]
 pub(super) struct CallRanges<'a> {
-    lanes: HashMap<&'a str, usize>,
+    lanes: &'a Lanes,
     call_by_tool_use_id: HashMap<&'a str, usize>,
     calls: Vec<CallRange>,
 }
 
 impl<'a> CallRanges<'a> {
-    pub(super) fn new(blocks: impl Iterator<Item = ToolBlock<'a>>) -> Self {
-        let blocks: Vec<_> = blocks.collect();
+    /// Ranges for blocks whose lanes are `lanes`.
+    pub(super) fn new(lanes: &'a Lanes) -> Self {
         Self {
-            lanes: lanes(&blocks),
-            ..Default::default()
+            lanes,
+            call_by_tool_use_id: HashMap::new(),
+            calls: Vec::new(),
         }
     }
 
     /// `None` for a call open alone, or never answered.
     pub(super) fn lane(&self, tool_use_id: &str) -> Option<usize> {
-        self.lanes.get(tool_use_id).copied()
+        self.lanes.get(tool_use_id)
     }
 
     pub(super) fn record(&mut self, block: RenderedToolBlock<'a>) {

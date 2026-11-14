@@ -5,7 +5,8 @@ use crate::log_entry::{ContentBlock, LogEntry, Tool, ToolSummaryPhrase, UserCont
 use crate::tui::theme::Rgb;
 
 use super::calls::{
-    CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks, later_results,
+    CallRanges, EntryToolBlock, Lanes, RenderedToolBlock, ToolBlock, entry_tool_blocks,
+    later_results,
 };
 use super::connectors::lane_color;
 use super::ledger::{LedgerRow, NameCol, RowContent, push_row, wrap_row};
@@ -395,8 +396,8 @@ fn render_summary_group_details(
     options: &RenderOptions,
 ) {
     let mut rendered_any = false;
-    let mut call_ranges =
-        CallRanges::new(run_tool_blocks(entries, pending).map(|entry_block| entry_block.block));
+    let lanes = Lanes::of(run_tool_blocks(entries, pending).map(|entry_block| entry_block.block));
+    let mut call_ranges = CallRanges::new(&lanes);
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
     let parent_id = pending.parent_id.as_deref();
     let label = pending.label(roster);
