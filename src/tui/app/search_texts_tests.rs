@@ -239,7 +239,7 @@ fn rows_whose_text_reader_is_gone_count_as_unreadable_not_loading() {
     let rows = cached_rows(&home, &environment);
     let (copies_to_read, reader) = std::sync::mpsc::channel();
     drop(reader);
-    let (_generation, awaited) = super::search_generation::SearchGeneration::start();
+    let (_generation, awaited) = super::request_generation::RequestGeneration::start();
     let (texts_reply, _) = std::sync::mpsc::channel();
     let mut worker = SearchWorkerState::new(copies_to_read, texts_reply, awaited);
 
@@ -407,7 +407,7 @@ fn texts_read_run_last_search_again_only_while_the_app_awaits_it() {
     use super::ListSearchMode;
     use super::search_worker::{PendingWork, SearchCommand, SearchWorkerState, WorkerInput};
     let (copies_to_read, _reader) = std::sync::mpsc::channel();
-    let (mut generation, awaited) = super::search_generation::SearchGeneration::start();
+    let (mut generation, awaited) = super::request_generation::RequestGeneration::start();
     let (texts_reply, _) = std::sync::mpsc::channel();
     let mut worker = SearchWorkerState::new(copies_to_read, texts_reply, awaited);
     let mut searched = PendingWork::default();

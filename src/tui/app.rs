@@ -33,7 +33,7 @@ mod exact_literal;
 mod input_controller;
 mod list_state;
 mod refresh_state;
-mod search_generation;
+mod request_generation;
 mod search_state;
 mod search_worker;
 mod session_store;
@@ -128,7 +128,7 @@ pub struct App {
     texts_held: TextsHeld,
     /// The `UpdateData` commands sent to the search worker
     search_data_sent: u64,
-    search_generation: search_generation::SearchGeneration,
+    search_generation: request_generation::RequestGeneration,
     /// When the search in flight on the worker thread was dispatched; `None`
     /// once its results are on screen
     search_started_at: Option<Moment>,

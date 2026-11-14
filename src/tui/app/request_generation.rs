@@ -1,29 +1,28 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The atomic's value while the app isn't awaiting any search. Generations
+/// The atomic's value while the app isn't awaiting any request. Generations
 /// start at 1.
 const NONE_AWAITED: u64 = 0;
 
-/// The app's search generation: responses to an earlier one are stale. The
-/// search worker reads the generation the app awaits through
-/// [`AwaitedSearch`], and reruns its last search over texts read only for
-/// that generation.
-pub(super) struct SearchGeneration {
+/// The generation of the app's newest request to a worker thread: responses
+/// to an earlier one are stale. The worker reads the generation the app
+/// awaits through [`AwaitedRequest`], and stops work for any other.
+pub(super) struct RequestGeneration {
     current: u64,
     awaited: Arc<AtomicU64>,
 }
 
-impl SearchGeneration {
-    /// Generation 0, not awaiting any search, and the worker's view of the
+impl RequestGeneration {
+    /// Generation 0, not awaiting any request, and the worker's view of the
     /// generation the app awaits.
-    pub(super) fn start() -> (Self, AwaitedSearch) {
+    pub(super) fn start() -> (Self, AwaitedRequest) {
         let awaited = Arc::new(AtomicU64::new(NONE_AWAITED));
         let generation = Self {
             current: 0,
             awaited: Arc::clone(&awaited),
         };
-        (generation, AwaitedSearch(awaited))
+        (generation, AwaitedRequest(awaited))
     }
 
     pub(super) fn current(&self) -> u64 {
@@ -37,13 +36,12 @@ impl SearchGeneration {
         self.current
     }
 
-    /// Keeps the current generation and stops awaiting its search: texts
-    /// read no longer run it again.
+    /// Keeps the current generation and stops awaiting its response.
     pub(super) fn stop_awaiting(&self) {
         self.awaited.store(NONE_AWAITED, Ordering::Release);
     }
 
-    /// Advances to `generation`, a later one, as that many searches would.
+    /// Advances to `generation`, a later one, as that many requests would.
     #[cfg(test)]
     pub(super) fn advance_to(&mut self, generation: u64) {
         assert!(
@@ -57,10 +55,10 @@ impl SearchGeneration {
     }
 }
 
-/// The search worker's read of the generation the app awaits.
-pub(super) struct AwaitedSearch(Arc<AtomicU64>);
+/// A worker's read of the generation the app awaits.
+pub(super) struct AwaitedRequest(Arc<AtomicU64>);
 
-impl AwaitedSearch {
+impl AwaitedRequest {
     pub(super) fn is_awaited(&self, generation: u64) -> bool {
         generation != NONE_AWAITED && self.0.load(Ordering::Acquire) == generation
     }
@@ -72,7 +70,7 @@ mod tests {
 
     #[test]
     fn each_advance_awaits_the_new_generation_alone() {
-        let (mut generation, awaited) = SearchGeneration::start();
+        let (mut generation, awaited) = RequestGeneration::start();
         let first = generation.advance();
         let second = generation.advance();
 
@@ -85,7 +83,7 @@ mod tests {
 
     #[test]
     fn stop_awaiting_keeps_the_generation_and_doesnt_await_any() {
-        let (mut generation, awaited) = SearchGeneration::start();
+        let (mut generation, awaited) = RequestGeneration::start();
         let current = generation.advance();
 
         generation.stop_awaiting();
@@ -93,14 +91,14 @@ mod tests {
         assert_eq!(generation.current(), current, "the generation stays");
         assert!(
             !awaited.is_awaited(current),
-            "its search is no longer awaited"
+            "its response is no longer awaited"
         );
     }
 
     #[test]
     fn generation_zero_is_never_awaited() {
-        let (_generation, awaited) = SearchGeneration::start();
+        let (_generation, awaited) = RequestGeneration::start();
 
-        assert!(!awaited.is_awaited(0), "no search has generation 0");
+        assert!(!awaited.is_awaited(0), "no request has generation 0");
     }
 }
