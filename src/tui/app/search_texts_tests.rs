@@ -578,7 +578,7 @@ impl ListWithTextReadsHeld {
         let rows = cached_rows(home, &environment);
         let gate =
             super::test_waits::ConnectionGate::closed(environment.cache_base().path(), |thread| {
-                thread.name() == Some("search-text-reader")
+                thread.name() == Some("text-reader")
             });
         let mut app = super::App::new_loading_with_options(
             super::ToolDisplayMode::Hidden,

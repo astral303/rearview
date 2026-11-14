@@ -162,6 +162,9 @@
   directories.
 - CI now uploads macOS crash reports as the `macos-crash-reports` artifact
   when the macOS check fails.
+- Crash reports, debuggers and profilers now show a name for each thread
+  rearview's own code starts. Threads that a dependency starts, such as
+  ONNX Runtime's, stay unnamed.
 - Compare two rearview binaries' search-stage medians and process CPU time
   with `scripts/compare-perf.sh`. Its per-run table also shows other
   processes' CPU time and the machine's disk use.

@@ -84,19 +84,22 @@ pub fn run_reporting_progress<T>(
     let perf = records.perf;
     let (finished, finish) = mpsc::channel::<()>();
     std::thread::scope(|scope| {
-        scope.spawn(move || {
-            loop {
-                match finish.recv_timeout(records.wait_after(perf.elapsed())) {
-                    Err(RecvTimeoutError::Timeout) => {
-                        if let Some(record) = records.due_at(perf.elapsed()) {
-                            let _ = out.write_all(record.as_bytes());
-                            let _ = out.flush();
+        std::thread::Builder::new()
+            .name("agent-progress".into())
+            .spawn_scoped(scope, move || {
+                loop {
+                    match finish.recv_timeout(records.wait_after(perf.elapsed())) {
+                        Err(RecvTimeoutError::Timeout) => {
+                            if let Some(record) = records.due_at(perf.elapsed()) {
+                                let _ = out.write_all(record.as_bytes());
+                                let _ = out.flush();
+                            }
                         }
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
                     }
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
                 }
-            }
-        });
+            })
+            .expect("failed to spawn the agent progress thread");
         let result = command();
         drop(finished);
         result

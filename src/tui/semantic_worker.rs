@@ -96,7 +96,7 @@ fn spawn_semantic_worker_with(
     // sees the worker.
     let counted = MODEL_THREADS.count_thread();
     std::thread::Builder::new()
-        .name("semantic-search-worker".into())
+        .name("semantic-worker".into())
         .spawn(move || {
             run_semantic_worker(
                 counted,
@@ -362,7 +362,7 @@ impl Model {
         let counted = self.threads.count_thread();
         let (end, ended) = mpsc::channel();
         let load = std::thread::Builder::new()
-            .name("semantic-model-load".into())
+            .name("model-load".into())
             .spawn(move || {
                 let model = loader();
                 drop(counted);

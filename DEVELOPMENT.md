@@ -101,6 +101,11 @@ Dependency policy:
   (`SessionStub`, `ListedSessionEntry`, `Conversation`) and read it from
   there. Do not add a lookup that computes it again, and do not read or
   parse a transcript again to recover a fact an earlier step dropped.
+- **Name every thread.** Start a thread in product code through
+  `std::thread::Builder`, and a rayon pool through
+  `ThreadPoolBuilder::thread_name`, with a name of at most 15 characters,
+  the length Linux keeps. Crash reports, debuggers and profilers show the
+  name.
 
 ## Tests
 
