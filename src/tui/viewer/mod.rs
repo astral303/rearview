@@ -188,6 +188,14 @@ impl CallRange {
         self.areas().any(|area| area.contains_line(line_idx))
     }
 
+    pub fn rows(&self) -> ConnectorRows {
+        ConnectorRows {
+            input: self.input.rows(),
+            result: self.result.as_ref().map(CallArea::rows),
+            lane: self.lane,
+        }
+    }
+
     /// Whether any of the call's rows fall inside `rows`. Input and result are
     /// separate areas, with other calls' rows possibly between them.
     pub fn overlaps(&self, rows: &std::ops::Range<usize>) -> bool {
@@ -215,7 +223,52 @@ pub struct BlockLocation {
 
 impl CallArea {
     pub fn contains_line(&self, line_idx: usize) -> bool {
-        (self.start_line..self.end_line).contains(&line_idx)
+        self.rows().contains(&line_idx)
+    }
+
+    pub fn rows(&self) -> std::ops::Range<usize> {
+        self.start_line..self.end_line
+    }
+}
+
+/// A call's input rows, result rows and lane: what its connector and the
+/// colour of its rule are drawn from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorRows {
+    pub input: std::ops::Range<usize>,
+    pub result: Option<std::ops::Range<usize>>,
+    pub lane: Option<usize>,
+}
+
+impl ConnectorRows {
+    /// The rows the call's connector and rule colours draw on: from the
+    /// input's first row to the end of the input or the result, whichever
+    /// is later. A result without rows still covers its first row.
+    pub fn touched_rows(&self) -> std::ops::Range<usize> {
+        let end = self.result.as_ref().map_or(self.input.end, |result| {
+            self.input.end.max(result.end).max(result.start + 1)
+        });
+        self.input.start..end
+    }
+}
+
+/// A top-level call the detail modes drew: its rows, and the blocks of its
+/// input and result. A render of one entry finds the call again by those
+/// blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailCall {
+    pub rows: ConnectorRows,
+    pub input: BlockLocation,
+    pub result: Option<BlockLocation>,
+}
+
+impl DetailCall {
+    fn of(call: &CallRange) -> Self {
+        Self {
+            rows: call.rows(),
+            input: call.input.location,
+            result: call.result.as_ref().map(|result| result.location),
+        }
     }
 }
 
@@ -226,6 +279,9 @@ pub struct RenderedConversation {
     /// The calls of expanded runs, which `]` steps through; empty in the
     /// detail modes.
     pub calls: Vec<CallRange>,
+    /// The top-level calls of the detail modes, in the order they were
+    /// issued; empty in summary mode.
+    pub detail_calls: Vec<DetailCall>,
 }
 
 /// Format an ISO 8601 timestamp to HH:MM in `zone`
@@ -425,6 +481,7 @@ fn render_entries(
         lines: Vec::new(),
         messages: Vec::new(),
         calls: Vec::new(),
+        detail_calls: Vec::new(),
     };
     let mut pending_tool_summary: Option<PendingToolSummary> = None;
     // The detail modes pair every top-level call of the conversation here.
@@ -515,17 +572,27 @@ fn render_entries(
         options,
     );
     day_labels.drop_unfollowed(&mut rendered.lines);
-    // `]` steps through the calls of an expanded run; in the detail modes it
-    // steps through messages, so their calls are drawn but not returned.
-    let detail_calls = call_ranges.into_calls();
+    // `]` steps through the calls of an expanded run. Keep the detail modes'
+    // calls apart, without ids: `]` steps through their messages.
+    rendered.detail_calls = call_ranges
+        .into_calls()
+        .iter()
+        .map(DetailCall::of)
+        .collect();
 
     if !keep_going() {
         return None;
     }
+    let all_rows = 0..rendered.lines.len();
     connectors::draw_connectors(
         &mut rendered.lines,
-        rendered.calls.iter().chain(&detail_calls),
+        rendered
+            .calls
+            .iter()
+            .map(CallRange::rows)
+            .chain(rendered.detail_calls.iter().map(|call| call.rows.clone())),
         options.show_timing,
+        all_rows,
     );
 
     Some(rendered)

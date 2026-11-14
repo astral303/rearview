@@ -2715,6 +2715,44 @@ fn detail_modes_join_each_call_to_its_result() {
 }
 
 #[test]
+fn detail_modes_keep_each_calls_rows_blocks_and_lane() {
+    let block = |entry_index| BlockLocation {
+        entry_index,
+        block_index: 0,
+    };
+    let rendered = render_parsed_entries(
+        &interleaved_batch_entries(),
+        &test_render_options(ToolDisplayMode::Truncated),
+    );
+
+    let kept: Vec<_> = rendered
+        .detail_calls
+        .iter()
+        .map(|call| (call.input, call.result, call.rows.lane))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (block(0), Some(block(2)), Some(0)),
+            (block(1), Some(block(3)), Some(1))
+        ],
+        "each call keeps its blocks and lane, in the order they were issued"
+    );
+    let a = &rendered.detail_calls[0].rows;
+    assert_eq!(a.input.end - 1, row_containing(&rendered, "+y"));
+    assert_eq!(
+        a.result.as_ref().map(|result| result.start),
+        Some(row_containing(&rendered, "done a"))
+    );
+
+    let summary = render_parsed_entries(
+        &interleaved_batch_entries(),
+        &test_render_options(ToolDisplayMode::Hidden),
+    );
+    assert!(summary.detail_calls.is_empty(), "summary mode keeps none");
+}
+
+#[test]
 fn interleaved_calls_in_detail_modes_take_their_lane_colours() {
     for mode in [ToolDisplayMode::Truncated, ToolDisplayMode::Full] {
         let rendered =
