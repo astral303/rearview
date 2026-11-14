@@ -377,18 +377,42 @@ fn activity_span(
     }))
 }
 
+/// The entries a render covers between two calls of its `keep_going`.
+const ENTRIES_BETWEEN_STOP_CHECKS: usize = 256;
+
+/// [`render_parsed_conversation_while`] to its end.
 pub fn render_parsed_conversation(
     conversation: &ParsedConversation,
     options: &RenderOptions,
 ) -> RenderedConversation {
-    render_entries(&conversation.entries, &conversation.roster, options)
+    render_parsed_conversation_while(conversation, options, &|| true)
+        .expect("a render that keeps going finishes")
+}
+
+/// `conversation` rendered with `options`.
+///
+/// Calls `keep_going` before the first entry and every
+/// [`ENTRIES_BETWEEN_STOP_CHECKS`] entries after it, then before each of the
+/// two passes over the finished rows; `None` once it returns false.
+pub fn render_parsed_conversation_while(
+    conversation: &ParsedConversation,
+    options: &RenderOptions,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<RenderedConversation> {
+    render_entries(
+        &conversation.entries,
+        &conversation.roster,
+        options,
+        keep_going,
+    )
 }
 
 fn render_entries(
     entries: &[RenderableEntry],
     roster: &SubagentRoster,
     options: &RenderOptions,
-) -> RenderedConversation {
+    keep_going: &dyn Fn() -> bool,
+) -> Option<RenderedConversation> {
     let mut rendered = RenderedConversation {
         lines: Vec::new(),
         messages: Vec::new(),
@@ -411,6 +435,9 @@ fn render_entries(
         .flatten();
     let mut day_labels = DayLabels::new(options.show_timing, options.today, options.zone);
     for (parsed_idx, parsed) in entries.iter().enumerate() {
+        if parsed_idx % ENTRIES_BETWEEN_STOP_CHECKS == 0 && !keep_going() {
+            return None;
+        }
         if let Some(day) = day_labels.new_day_at(&parsed.entry) {
             // A run ends at midnight: the label sits between its rows and the
             // next day's.
@@ -486,18 +513,24 @@ fn render_entries(
     // steps through messages, so their calls are drawn but not returned.
     let mut detail_calls = call_ranges.into_calls();
 
+    if !keep_going() {
+        return None;
+    }
     postprocess_blank_lines(
         &mut rendered.lines,
         &mut rendered.messages,
         rendered.calls.iter_mut().chain(&mut detail_calls),
     );
+    if !keep_going() {
+        return None;
+    }
     connectors::draw_connectors(
         &mut rendered.lines,
         rendered.calls.iter().chain(&detail_calls),
         options.show_timing,
     );
 
-    rendered
+    Some(rendered)
 }
 
 /// The agent whose session this is, named by the first top-level reply that
