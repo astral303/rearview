@@ -43,6 +43,11 @@ impl RenderedLine {
     pub fn text(&self) -> String {
         self.spans.iter().map(|(text, _)| text.as_str()).collect()
     }
+
+    /// The length in bytes of [`Self::text`].
+    pub fn text_len(&self) -> usize {
+        self.spans.iter().map(|(text, _)| text.len()).sum()
+    }
 }
 
 /// How a row continues the row above it.
