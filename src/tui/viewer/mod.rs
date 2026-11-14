@@ -479,108 +479,14 @@ fn render_entries(
     options: &RenderOptions,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<RenderedConversation> {
-    let mut rendered = RenderedConversation {
-        lines: Vec::new(),
-        messages: Vec::new(),
-        calls: Vec::new(),
-        detail_calls: Vec::new(),
-    };
-    let mut pending_tool_summary: Option<PendingToolSummary> = None;
-    // The detail modes pair every top-level call of the conversation here.
-    // Summary mode pairs the calls of each expanded run as the run renders,
-    // and its entries return no tool blocks.
-    let mut call_ranges = CallRanges::new(lanes);
-
-    // Only a collapsed run needs the session's agent.
-    let session_agent = options
-        .tool_display
-        .is_summary()
-        .then(|| session_agent(entries))
-        .flatten();
-    let mut day_labels = DayLabels::new(options.show_timing, options.today, options.zone);
-    for (parsed_idx, parsed) in entries.iter().enumerate() {
+    let mut stepper = RenderStepper::new(entries, roster, lanes, options);
+    for parsed_idx in 0..entries.len() {
         if parsed_idx % ENTRIES_BETWEEN_STOP_CHECKS == 0 && !keep_going() {
             return None;
         }
-        if let Some(day) = day_labels.new_day_at(&parsed.entry) {
-            // A run ends at midnight: the label sits between its rows and the
-            // next day's.
-            flush_tool_summary(
-                &mut rendered,
-                &mut pending_tool_summary,
-                entries,
-                roster,
-                options,
-            );
-            day_labels.mark(&mut rendered.lines, day);
-        }
-        if options.tool_display.is_summary()
-            && try_extend_or_start_pending_summary(
-                &mut rendered,
-                &mut pending_tool_summary,
-                entries,
-                roster,
-                parsed_idx,
-                options,
-                session_agent,
-            )
-        {
-            continue;
-        }
-
-        // Rendering before the flush keeps a tool run open across entries
-        // that produce no output under the current options (Codex usage
-        // metadata, thinking-only entries with thinking off); otherwise each
-        // such entry would split the run into one summary row per call.
-        let mut entry_lines = Vec::new();
-        let tool_blocks = render_entry(
-            &mut entry_lines,
-            parsed.entry_index,
-            &parsed.entry,
-            options,
-            roster,
-            &call_ranges,
-        );
-        // A tool block without rows still closes its call.
-        if entry_lines.is_empty() && tool_blocks.is_empty() {
-            continue;
-        }
-
-        flush_tool_summary(
-            &mut rendered,
-            &mut pending_tool_summary,
-            entries,
-            roster,
-            options,
-        );
-
-        let first_row = rendered.lines.len();
-        append_entry_with_range(
-            &mut rendered.lines,
-            &mut rendered.messages,
-            parsed,
-            entry_lines,
-        );
-        for block in tool_blocks {
-            call_ranges.record(block.offset_by(first_row));
-        }
+        stepper.step(parsed_idx);
     }
-
-    flush_tool_summary(
-        &mut rendered,
-        &mut pending_tool_summary,
-        entries,
-        roster,
-        options,
-    );
-    day_labels.drop_unfollowed(&mut rendered.lines);
-    // `]` steps through the calls of an expanded run. Keep the detail modes'
-    // calls apart, without ids: `]` steps through their messages.
-    rendered.detail_calls = call_ranges
-        .into_calls()
-        .iter()
-        .map(DetailCall::of)
-        .collect();
+    let mut rendered = stepper.finish();
 
     if !keep_going() {
         return None;
@@ -598,6 +504,139 @@ fn render_entries(
     );
 
     Some(rendered)
+}
+
+/// A render of `entries` that steps through them one at a time, in file
+/// order: the rows so far, and the state the rows of a later entry depend
+/// on.
+struct RenderStepper<'a> {
+    entries: &'a [RenderableEntry],
+    roster: &'a SubagentRoster,
+    options: &'a RenderOptions,
+    /// The agent a collapsed run of received results borrows; `None`
+    /// outside summary mode.
+    session_agent: Option<&'a str>,
+    rendered: RenderedConversation,
+    pending_tool_summary: Option<PendingToolSummary>,
+    /// The detail modes pair every top-level call of the conversation here.
+    /// Summary mode pairs the calls of each expanded run as the run renders,
+    /// and its entries return no tool blocks.
+    call_ranges: CallRanges<'a>,
+    day_labels: DayLabels,
+}
+
+impl<'a> RenderStepper<'a> {
+    /// `lanes` are the lanes of `entries`' top-level calls.
+    fn new(
+        entries: &'a [RenderableEntry],
+        roster: &'a SubagentRoster,
+        lanes: &'a Lanes,
+        options: &'a RenderOptions,
+    ) -> Self {
+        Self {
+            entries,
+            roster,
+            options,
+            session_agent: options
+                .tool_display
+                .is_summary()
+                .then(|| session_agent(entries))
+                .flatten(),
+            rendered: RenderedConversation {
+                lines: Vec::new(),
+                messages: Vec::new(),
+                calls: Vec::new(),
+                detail_calls: Vec::new(),
+            },
+            pending_tool_summary: None,
+            call_ranges: CallRanges::new(lanes),
+            day_labels: DayLabels::new(options.show_timing, options.today, options.zone),
+        }
+    }
+
+    /// Render the entry at `parsed_idx`, the one after the entry stepped
+    /// last.
+    fn step(&mut self, parsed_idx: usize) {
+        let entries = self.entries;
+        let parsed = &entries[parsed_idx];
+        if let Some(day) = self.day_labels.new_day_at(&parsed.entry) {
+            // A run ends at midnight: the label sits between its rows and the
+            // next day's.
+            self.flush_tool_summary();
+            self.day_labels.mark(&mut self.rendered.lines, day);
+        }
+        if self.options.tool_display.is_summary()
+            && try_extend_or_start_pending_summary(
+                &mut self.rendered,
+                &mut self.pending_tool_summary,
+                entries,
+                self.roster,
+                parsed_idx,
+                self.options,
+                self.session_agent,
+            )
+        {
+            return;
+        }
+
+        // Rendering before the flush keeps a tool run open across entries
+        // that produce no output under the current options (Codex usage
+        // metadata, thinking-only entries with thinking off); otherwise each
+        // such entry would split the run into one summary row per call.
+        let mut entry_lines = Vec::new();
+        let tool_blocks = render_entry(
+            &mut entry_lines,
+            parsed.entry_index,
+            &parsed.entry,
+            self.options,
+            self.roster,
+            &self.call_ranges,
+        );
+        // A tool block without rows still closes its call.
+        if entry_lines.is_empty() && tool_blocks.is_empty() {
+            return;
+        }
+
+        self.flush_tool_summary();
+
+        let first_row = self.rendered.lines.len();
+        append_entry_with_range(
+            &mut self.rendered.lines,
+            &mut self.rendered.messages,
+            parsed,
+            entry_lines,
+        );
+        for block in tool_blocks {
+            self.call_ranges.record(block.offset_by(first_row));
+        }
+    }
+
+    fn flush_tool_summary(&mut self) {
+        flush_tool_summary(
+            &mut self.rendered,
+            &mut self.pending_tool_summary,
+            self.entries,
+            self.roster,
+            self.options,
+        );
+    }
+
+    /// The rows of every entry stepped, once the open run renders and a last
+    /// day label without rows after it is removed. The connectors aren't
+    /// drawn yet.
+    fn finish(mut self) -> RenderedConversation {
+        self.flush_tool_summary();
+        self.day_labels.drop_unfollowed(&mut self.rendered.lines);
+        // `]` steps through the calls of an expanded run. Keep the detail
+        // modes' calls apart, without ids: `]` steps through their messages.
+        self.rendered.detail_calls = self
+            .call_ranges
+            .into_calls()
+            .iter()
+            .map(DetailCall::of)
+            .collect();
+        self.rendered
+    }
 }
 
 /// The agent whose session this is, named by the first top-level reply that
