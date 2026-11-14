@@ -303,6 +303,7 @@ impl Runtime {
         self.app.send_due_view_search();
         self.app.receive_view_search_results(Duration::ZERO);
         self.app.receive_fork_read();
+        self.app.note_open_session_update();
         draw_frame(&self.app, terminal)?;
         if self
             .app

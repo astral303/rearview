@@ -309,9 +309,155 @@ fn dropping_app_while_finished_render_waits_to_be_taken_returns() {
     drop(app);
 }
 
+/// The rows of the frame the app draws, without trailing spaces.
+fn frame_rows(app: &App) -> Vec<String> {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::ui::render(frame, app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The status bar's row of the frame the app draws: the last row showing
+/// the scroll position's `[` and the bar's `│`.
+pub(super) fn bottom_row(app: &App) -> String {
+    frame_rows(app)
+        .into_iter()
+        .rfind(|row| row.contains('│') && row.contains('['))
+        .unwrap_or_default()
+}
+
+/// The mode cell of `row`, a status bar: the text between the scroll
+/// position's `]` and `│`, trimmed.
+pub(super) fn mode_cell(row: &str) -> &str {
+    let after_position = &row[row.find(']').map_or(0, |end| end + 1)..];
+    let cell_end = after_position.find('│').unwrap_or(after_position.len());
+    after_position[..cell_end].trim()
+}
+
+/// The column, counted in characters, of the status bar's `│`.
+fn bar_column(row: &str) -> usize {
+    row.chars()
+        .position(|c| c == '│')
+        .unwrap_or_else(|| panic!("the status bar shows `│`: {row:?}"))
+}
+
+#[test]
+fn status_bar_shows_rendering_in_mode_cell_from_100_ms_and_seconds_from_1_s() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = viewer_through(worker);
+    let before = bottom_row(&app);
+
+    press_now(&mut app, KeyCode::Char('t'));
+    gate.next_render();
+    app.clock().sleep(Duration::from_millis(99));
+    let under_delay = bottom_row(&app);
+    app.clock().sleep(Duration::from_millis(1));
+    let at_delay = bottom_row(&app);
+    app.clock().sleep(Duration::from_millis(900));
+    let at_second = bottom_row(&app);
+    gate.let_one_through();
+    finish_view_render(&mut app, VIEWPORT);
+    let after = bottom_row(&app);
+
+    assert!(
+        under_delay.contains("tools·trn") && !under_delay.contains("rendering"),
+        "nothing new before 100 ms: {under_delay:?}"
+    );
+    assert!(
+        at_delay.contains("⠙ rendering") && !at_delay.contains("tools·"),
+        "the render's cell takes the mode cell's place: {at_delay:?}"
+    );
+    assert!(
+        at_second.contains("rendering 1s"),
+        "the seconds show from 1 s: {at_second:?}"
+    );
+    assert_eq!(
+        [bar_column(&at_delay), bar_column(&at_second)],
+        [bar_column(&before); 2],
+        "`│` and the keys keep their columns"
+    );
+    assert!(
+        after.contains("tools·trn") && !after.contains("rendering"),
+        "the modes show again once the rows arrive: {after:?}"
+    );
+}
+
+#[test]
+fn rendering_seconds_count_from_first_request_not_yet_shown() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = viewer_through(worker);
+    press_now(&mut app, KeyCode::Char('t'));
+    gate.next_render();
+    app.clock().sleep(Duration::from_secs(1));
+
+    press_now(&mut app, KeyCode::Char('t'));
+
+    let row = bottom_row(&app);
+    assert!(
+        row.contains("rendering 1s"),
+        "the second press keeps the first's seconds: {row:?}"
+    );
+    gate.let_one_through();
+    assert!(!gate.next_return().finished);
+    gate.next_render();
+    gate.let_one_through();
+    finish_view_render(&mut app, VIEWPORT);
+}
+
+#[test]
+fn search_line_replaces_status_bar_while_render_runs() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = viewer_through(worker);
+    press_now(&mut app, KeyCode::Char('/'));
+    press_now(&mut app, KeyCode::Char('x'));
+
+    app.check_view_resize(100);
+    gate.next_render();
+    app.clock().sleep(Duration::from_millis(100));
+
+    let rows = frame_rows(&app);
+    assert!(
+        rows.iter().any(|row| row.starts_with("  /x"))
+            && !rows.iter().any(|row| row.contains("rendering")),
+        "the search line shows in place of the status bar: {rows:#?}"
+    );
+    gate.let_one_through();
+    finish_view_render(&mut app, VIEWPORT);
+}
+
+#[test]
+fn mode_cell_shows_updating_while_refresh_and_display_keys_render_are_pending() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = viewer_through(worker);
+    press_now(&mut app, KeyCode::Char('t'));
+    gate.next_render();
+
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
+    app.note_open_session_update();
+    app.clock().sleep(Duration::from_millis(100));
+
+    let row = bottom_row(&app);
+    assert!(
+        mode_cell(&row).ends_with(" updating"),
+        "the refresh's status shows in place of the render's: {row:?}"
+    );
+    gate.let_one_through();
+    finish_view_render(&mut app, VIEWPORT);
+}
+
 #[test]
 #[should_panic(expected = "the render panicked")]
-fn render_thread_panic_resumes_where_renders_are_taken() {
+fn viewer_render_thread_panic_resumes_where_renders_are_taken() {
     let worker = ViewerRenderWorker::spawn_with(Box::new(|_, _, _| panic!("the render panicked")));
     let (_dir, mut app) = viewer_through(worker);
 

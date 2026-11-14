@@ -28,8 +28,8 @@
   - Reading those texts takes about 3–4x as long as before. The list loads
     faster, and becomes searchable about 1.5x sooner after launch.
 - Open a large session about 2.5x faster (on one example corpus), and keep the
-  list and its search drawing while it opens. Reloading an open session after
-  a refresh no longer freezes the viewer.
+  list and its search drawing while it opens. Reading an open session again
+  after a refresh no longer freezes the viewer.
 - Speed up the viewer's search (`/`) about 3–3.7x in full mode (`tools·all`)
   and about 2.3–2.9x in summary mode (on one example session).
 - Speed up semantic search (on one example corpus): a TUI query of quoted
@@ -48,8 +48,9 @@
   - While another rearview rebuilds the session cache, the list waits under
     `Another rearview is rebuilding the session cache…`.
 - Open a changed session without waiting for it to be read again: the viewer
-  shows its cached copy under `Updating…`, or `Loading…` for a session not
-  yet cached, and shows its newest messages when its refresh completes.
+  shows its cached copy with `⠋ updating` in the status bar, or `Loading…`
+  for a session not yet cached, and shows its newest messages when its
+  refresh completes.
   - Viewer `Ctrl+R` and a session found by its ID refresh the same way.
   - When the refresh fails, the viewer shows `Refresh failed: <error>` over
     the cached copy. The session is read again when its transcripts change,
@@ -120,6 +121,19 @@
   - While a search runs, the search line, or the status bar after confirm
     (`Enter`), shows `⠋ searching` and, from one second on, the seconds it
     has run (`⠋ searching 1s`).
+- Fix the viewer not responding to keys while a large session is rendered
+  again after a display key (`t`, `T` or `i`), resizing the terminal window,
+  expanding or collapsing a tool output, or a refresh. The user can now
+  scroll the rows on screen until the new ones show, and the status bar
+  shows `⠋ rendering 2s` in place of the modes.
+  - During a refresh, the status bar now keeps the scroll position and the
+    keys, and shows `⠋ updating 3s` in place of the modes, or
+    `⠋ refreshing 3s` for a file opened directly. The seconds start again
+    each time a refresh's new rows show.
+  - Once the new rows show, the viewer's search (`/`) now selects the first
+    match at or below the top row, where it used to keep the match's number.
+  - During a display key's render, message copy (`y`) and export (`e`) run at
+    once; during a refresh's, they wait for the new rows.
 
 #### `rearview agent` commands
 

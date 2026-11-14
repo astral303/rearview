@@ -1609,6 +1609,43 @@ fn leaving_viewer_during_reloads_render_drops_reload_queued_behind_it() {
     );
 }
 
+/// The viewer's mode cell, as the event loop's next pass draws it.
+fn mode_cell_on_next_pass(app: &mut App) -> String {
+    app.note_open_session_update();
+    super::viewer_render_tests::mode_cell(&super::viewer_render_tests::bottom_row(app)).to_owned()
+}
+
+#[test]
+fn updating_seconds_restart_once_reloads_rows_show_while_next_refresh_runs() {
+    let home = ClaudeHome::new();
+    let (mut app, gate) = viewer_with_reload_render_at_gate(&home);
+    app.note_open_session_update();
+    finish_second_refresh(&home, &mut app);
+
+    app.clock().sleep(Duration::from_secs(3));
+    let during_render = mode_cell_on_next_pass(&mut app);
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+    let rows_shown = mode_cell_on_next_pass(&mut app);
+    app.clock().sleep(Duration::from_secs(1));
+    let second_later = mode_cell_on_next_pass(&mut app);
+    gate.let_one_through();
+    test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
+
+    assert!(
+        during_render.ends_with(" updating 3s"),
+        "the seconds count from the refresh: {during_render:?}"
+    );
+    assert!(
+        rows_shown.ends_with(" updating"),
+        "the spinner stays and the seconds start again: {rows_shown:?}"
+    );
+    assert!(
+        second_later.ends_with(" updating 1s"),
+        "the seconds count from the rows shown: {second_later:?}"
+    );
+}
+
 #[test]
 fn click_on_output_during_reloads_render_expands_it_in_new_read() {
     let home = ClaudeHome::new();

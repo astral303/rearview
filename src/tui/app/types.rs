@@ -156,9 +156,16 @@ pub struct ViewState {
     pub is_copy_missing: bool,
     /// The read of the conversation the rows were rendered from.
     pub rows_read: RowsRead,
-    /// The render on the viewer's render thread whose rows haven't arrived
+    /// The render on the `viewer-render` thread whose rows haven't arrived
     /// yet; the shown rows stay until they do.
     pub pending_render: Option<PendingRender>,
+    /// When the open session started showing as updating, for the spinner
+    /// of the `updating` and `refreshing` status; `None` while it doesn't.
+    pub updating_since: Option<crate::clock::Moment>,
+    /// When a reload's rows last showed: the seconds of the `updating` and
+    /// `refreshing` status count from then while the session keeps
+    /// updating, so they report the current refresh.
+    pub reload_rows_shown_at: Option<crate::clock::Moment>,
 }
 
 /// The viewer's newest render request, until its rows arrive.
@@ -394,6 +401,8 @@ impl ViewState {
             is_copy_missing: false,
             rows_read: RowsRead::Current,
             pending_render: None,
+            updating_since: None,
+            reload_rows_shown_at: None,
         }
     }
 

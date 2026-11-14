@@ -492,6 +492,8 @@ impl App {
             is_copy_missing,
             rows_read: RowsRead::Current,
             pending_render: None,
+            updating_since: None,
+            reload_rows_shown_at: None,
         };
         state.show_copy_header_and_adopt(copy_row, external_title.as_ref(), adopted);
         self.app_mode = AppMode::View(state);
@@ -1213,6 +1215,7 @@ impl App {
         state.call_ranges = rendered.calls;
         if !matches!(rows_read, RowsRead::Current) {
             state.is_copy_missing = false;
+            state.reload_rows_shown_at = Some(now);
         }
         if is_reload {
             state.hovered_tool_output = None;

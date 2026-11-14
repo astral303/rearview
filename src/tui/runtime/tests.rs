@@ -1221,10 +1221,11 @@ impl Hold {
 }
 
 /// The label the viewer shows over a cached copy while `hold` keeps the
-/// session's refresh from finishing.
+/// session's refresh from finishing: in the status bar's mode cell, or in
+/// place of the bar.
 fn updating_label(hold: &Hold) -> &'static str {
     match hold {
-        Hold::ThisRearviewsCommit { .. } => "Updating…",
+        Hold::ThisRearviewsCommit { .. } => "updating",
         Hold::AnotherRearviewsRefresh { .. } => "Another rearview is refreshing…",
     }
 }
@@ -1275,8 +1276,8 @@ fn assert_an_opened_changed_session_shows_its_copy_under(
 }
 
 /// Opening a session whose transcript changed since it was cached shows the
-/// cached copy under `Updating…`, then the newest messages once its refresh
-/// finishes.
+/// cached copy with `updating` in the status bar, then the newest messages
+/// once its refresh finishes.
 #[test]
 fn opening_changed_session_shows_cached_copy_under_updating_until_its_refresh_lands() {
     assert_an_opened_changed_session_shows_its_copy_under(
@@ -1418,7 +1419,7 @@ fn list_refresh_whose_writes_fail_doesnt_report_another_rearview() {
     );
 }
 
-/// A viewer `Ctrl+R` whose writes fail ends `Updating…` over the copy; the
+/// A viewer `Ctrl+R` whose writes fail ends `updating` over the copy; the
 /// newest messages show once writes succeed again and the user refreshes.
 #[test]
 fn viewer_refresh_whose_writes_fail_shows_newest_messages_once_user_refreshes_again() {
@@ -1672,7 +1673,7 @@ fn assert_ctrl_r_in_the_viewer_shows_the_newest_messages(hold: impl FnOnce(&Path
 }
 
 /// `Ctrl+R` in the viewer requests the session's refresh: the copy on screen
-/// stays under `Updating…`, then the newest messages show once it finishes.
+/// stays under `updating`, then the newest messages show once it finishes.
 #[test]
 fn ctrl_r_in_viewer_shows_newest_messages_once_sessions_refresh_lands() {
     assert_ctrl_r_in_the_viewer_shows_the_newest_messages(Hold::this_rearviews_commit);
