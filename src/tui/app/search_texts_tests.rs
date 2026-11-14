@@ -352,7 +352,7 @@ const TEXTS_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(10)
 
 /// Receives the search worker's counts until `is_done`, failing after
 /// [`TEXTS_READ_LIMIT`].
-fn receive_until(app: &mut super::App, is_done: impl Fn(&super::App) -> bool) {
+pub(super) fn receive_until(app: &mut super::App, is_done: impl Fn(&super::App) -> bool) {
     let deadline = std::time::Instant::now() + TEXTS_READ_LIMIT;
     loop {
         app.receive_search_results();
