@@ -42,6 +42,27 @@ pub(crate) fn finish_pending_open(app: &mut App, frame_width: usize) -> bool {
     advanced
 }
 
+/// The viewer's pending search to its end, as the event loop runs it: the
+/// pause after typing passes on the app's clock, then the matches arrive and
+/// are shown, within [`VIEWER_READ_LANDS`]. Does nothing without a pending search.
+pub(crate) fn finish_view_search(app: &mut App) {
+    if let super::AppMode::View(state) = &app.app_mode
+        && let Some(super::PendingViewSearch::Paused { due }) = state.pending_search
+    {
+        app.clock()
+            .sleep(due.saturating_duration_since(app.clock().now()));
+    }
+    app.send_due_view_search();
+    let deadline = std::time::Instant::now() + VIEWER_READ_LANDS;
+    while app.is_view_search_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the viewer's search returns its matches within {VIEWER_READ_LANDS:?}"
+        );
+        app.receive_view_search_results(Duration::from_millis(10));
+    }
+}
+
 /// Holds every session cache connection opened in a cache on a thread
 /// `holds` picks, until [`Self::open`].
 pub(crate) struct ConnectionGate {

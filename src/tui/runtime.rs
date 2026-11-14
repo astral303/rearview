@@ -302,6 +302,8 @@ impl Runtime {
 
         let frame_state = prepare_frame(&mut self.app, terminal);
         self.app.receive_search_results();
+        self.app.send_due_view_search();
+        self.app.receive_view_search_results(Duration::ZERO);
         self.app.receive_fork_read();
         draw_frame(&self.app, terminal)?;
         if self
@@ -423,7 +425,7 @@ impl Runtime {
             || self.app.is_reading_open_session()
         {
             Duration::from_millis(50)
-        } else if self.app.has_search_work_in_flight() {
+        } else if self.app.has_search_work_in_flight() || self.app.is_view_search_pending() {
             Duration::from_millis(8)
         } else {
             self.app.idle_wait()

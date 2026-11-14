@@ -39,15 +39,39 @@ impl SearchMatch {
     }
 }
 
+/// The rows a search covers between two calls of its `keep_going`.
+const ROWS_BETWEEN_STOP_CHECKS: usize = 1024;
+
+/// [`find_matches_while`] to its end.
+#[cfg(test)]
+pub fn find_matches(lines: &[RenderedLine], query: &str) -> Vec<SearchMatch> {
+    find_matches_while(lines, query, &|| true).expect("a search that keeps going finishes")
+}
+
 /// Every match of `query` in `lines`, top to bottom. The rows of a wrapped
 /// line are searched as the line they were cut from, so one match can cover
 /// several rows. Case is ignored, and a run of whitespace in `query` matches
 /// any run of whitespace in the text.
-pub fn find_matches(lines: &[RenderedLine], query: &str) -> Vec<SearchMatch> {
+///
+/// Calls `keep_going` before the first row, then at the first wrapped line
+/// starting [`ROWS_BETWEEN_STOP_CHECKS`] rows or more after the last call;
+/// `None` once it returns false.
+pub fn find_matches_while(
+    lines: &[RenderedLine],
+    query: &str,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Vec<SearchMatch>> {
     let literal = Literal::ignoring_case(query.to_string());
     let mut matches = Vec::new();
     let mut start = 0;
+    let mut next_check = 0;
     while start < lines.len() {
+        if start >= next_check {
+            if !keep_going() {
+                return None;
+            }
+            next_check = start + ROWS_BETWEEN_STOP_CHECKS;
+        }
         let end = wrapped_line_end(lines, start);
         let line = WrappedLine::join(lines, start..end);
         matches.extend(
@@ -58,7 +82,7 @@ pub fn find_matches(lines: &[RenderedLine], query: &str) -> Vec<SearchMatch> {
         );
         start = end;
     }
-    matches
+    Some(matches)
 }
 
 /// The row after the wrapped line that starts at row `start`.
@@ -211,6 +235,44 @@ mod tests {
             continued("> ", "rebuild", RowContinuation::Unbroken),
         ];
         assert_eq!(covered(&lines, "cache rebuild").len(), 1);
+    }
+
+    /// A search over `rows` lines of one row each, whose `keep_going` returns
+    /// each of `answers` in turn and then true: the count of `keep_going`
+    /// calls, and whether the search finished.
+    fn stop_checks(rows: usize, answers: &[bool]) -> (usize, bool) {
+        let lines = vec![row("cache"); rows];
+        let calls = std::cell::Cell::new(0);
+        let finished = find_matches_while(&lines, "cache", &|| {
+            let call = calls.get();
+            calls.set(call + 1);
+            answers.get(call).copied().unwrap_or(true)
+        })
+        .is_some();
+        (calls.get(), finished)
+    }
+
+    #[test]
+    fn search_checks_whether_to_keep_going_before_each_interval_of_rows() {
+        assert_eq!(
+            stop_checks(3 * ROWS_BETWEEN_STOP_CHECKS + 1, &[]),
+            (4, true),
+            "one check before the first row, then one per interval"
+        );
+    }
+
+    #[test]
+    fn stopped_search_doesnt_search_past_next_interval() {
+        assert_eq!(
+            stop_checks(3 * ROWS_BETWEEN_STOP_CHECKS + 1, &[true, false]),
+            (2, false),
+            "the search ends at the check that answers false"
+        );
+        assert_eq!(
+            stop_checks(1, &[false]),
+            (1, false),
+            "a search whose first check answers false ends before its first row"
+        );
     }
 
     #[test]

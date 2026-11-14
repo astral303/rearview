@@ -158,7 +158,7 @@ fn viewer_text(app: &mut App, heading: &str) -> String {
             "=== viewer, {heading}: {}\n",
             listed_name(&app.conversations()[app.filtered()[row]])
         ));
-        for line in &state.rendered_lines {
+        for line in state.rendered_lines.iter() {
             let line = line
                 .spans
                 .iter()

@@ -35,7 +35,9 @@ pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
 pub use relocation::EntryRelocation;
 pub(crate) use roster::SubagentRoster;
-pub use search_rows::{SearchMatch, find_matches};
+#[cfg(test)]
+pub use search_rows::find_matches;
+pub use search_rows::{SearchMatch, find_matches_while};
 pub(crate) use summary::format_coarse_duration;
 
 use calls::{CallRanges, top_level_tool_blocks};

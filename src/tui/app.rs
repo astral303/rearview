@@ -39,6 +39,7 @@ mod search_worker;
 mod session_store;
 mod types;
 mod view_state;
+mod viewer_search;
 #[allow(unused_imports)]
 use search_state::{SemanticSearchState, SessionIdQuery};
 #[allow(unused_imports)]
@@ -49,8 +50,9 @@ pub(crate) use session_store::RefreshFailure;
 #[allow(unused_imports)]
 pub use types::{
     Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow, LIST_LINES_PER_ITEM,
-    ListScope, ListSearchMode, LoadingState, OpenSessionStatus, SemanticProgress,
-    SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewState, list_lines_per_item,
+    ListScope, ListSearchMode, LoadingState, MatchesArrival, OpenSessionStatus, PendingViewSearch,
+    SemanticProgress, SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewSpot,
+    ViewState, list_lines_per_item,
 };
 
 /// App state
@@ -147,6 +149,8 @@ pub struct App {
     semantic_search: SemanticSearchState,
     /// Cached lexical evidence produced outside the render path
     lexical_evidence: HashMap<usize, search::LexicalEvidence>,
+    /// The viewer's search thread, started by the first viewer search
+    viewer_search: Option<viewer_search::ViewerSearchWorker>,
     /// `None` while the query is ordinary text
     session_id_query: Option<SessionIdQuery>,
     /// The session open (`Enter`) or a row click named, until the load runs
@@ -243,6 +247,23 @@ const SEARCH_SPINNER_DELAY: Duration = Duration::from_millis(100);
 const SEARCH_SPINNER_FRAME: Duration = Duration::from_millis(80);
 const SEARCH_SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// The status of a search running for `elapsed`: none before
+/// `SEARCH_SPINNER_DELAY`, then a spinner glyph and `searching` and, from one
+/// second on, the whole seconds it has run (`⠋ searching 1s`).
+fn searching_status(elapsed: Duration) -> Option<String> {
+    if elapsed < SEARCH_SPINNER_DELAY {
+        return None;
+    }
+    let frame = (elapsed.as_millis() / SEARCH_SPINNER_FRAME.as_millis()) as usize;
+    let glyph = SEARCH_SPINNER_GLYPHS[frame % SEARCH_SPINNER_GLYPHS.len()];
+    let seconds = elapsed.as_secs();
+    Some(if seconds == 0 {
+        format!("{glyph} searching")
+    } else {
+        format!("{glyph} searching {seconds}s")
+    })
+}
+
 struct AppParts {
     conversations: Vec<Conversation>,
     conversations_snapshot: Arc<Vec<Arc<Conversation>>>,
@@ -312,6 +333,7 @@ impl App {
             list_search_mode: parts.list_search_mode,
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
+            viewer_search: None,
             session_id_query: None,
             pending_open: None,
             pending_view_reload: None,
@@ -777,18 +799,20 @@ impl App {
     /// shows nothing, so a fast keystroke does not flicker. A new keystroke
     /// restarts the seconds, so the drop to none shows the restart.
     pub fn search_status_text(&self) -> Option<String> {
-        let elapsed = self.clock().elapsed_since(self.search_started_at?);
-        if elapsed < SEARCH_SPINNER_DELAY {
+        searching_status(self.clock().elapsed_since(self.search_started_at?))
+    }
+
+    /// The status of the viewer's running search, in the list's form
+    /// (`searching_status`), counted from when the search was sent; `None`
+    /// while the search is paused or none runs.
+    pub fn view_search_status_text(&self) -> Option<String> {
+        let AppMode::View(state) = &self.app_mode else {
             return None;
-        }
-        let frame = (elapsed.as_millis() / SEARCH_SPINNER_FRAME.as_millis()) as usize;
-        let glyph = SEARCH_SPINNER_GLYPHS[frame % SEARCH_SPINNER_GLYPHS.len()];
-        let seconds = elapsed.as_secs();
-        Some(if seconds == 0 {
-            format!("{glyph} searching")
-        } else {
-            format!("{glyph} searching {seconds}s")
-        })
+        };
+        let Some(PendingViewSearch::Running { started, .. }) = state.pending_search else {
+            return None;
+        };
+        searching_status(self.clock().elapsed_since(started))
     }
 
     /// The search bar's text after the result count while the list's search
@@ -1109,6 +1133,9 @@ mod listing_tests;
 
 #[cfg(test)]
 mod viewer_refresh_tests;
+
+#[cfg(test)]
+mod viewer_search_tests;
 
 #[cfg(test)]
 mod shown_name_tests;
