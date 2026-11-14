@@ -5525,3 +5525,56 @@ fn search_doesnt_find_phrase_across_line_break() {
     assert!(find_matches(&rendered.lines, "cache rebuild").is_empty());
     assert_eq!(find_matches(&rendered.lines, "cache").len(), 1);
 }
+
+#[test]
+fn search_matches_equal_row_text_join_over_wrapped_interleaved_output() {
+    use super::output::RowContinuation;
+    use super::search_rows::find_matches_by_row_text;
+
+    let words = format!("naïve café … {COUNTED_WORDS}");
+    let command = format!(r#"{{"command":"echo {words}"}}"#);
+    let entries = [
+        tool_use_entry(0, "toolu_a", "Bash", &command),
+        tool_use_entry(1, "toolu_b", "Bash", &command),
+        tool_result_entry_holding(2, "toolu_a", &words),
+        tool_result_entry_holding(3, "toolu_b", &words),
+    ];
+    let queries = [
+        "e",
+        "é",
+        "…",
+        " ",
+        "│",
+        "café",
+        "naïve café",
+        "seven eight",
+        "Result",
+    ];
+    for show_timing in [false, true] {
+        for content_width in 8..60 {
+            let options = RenderOptions {
+                content_width,
+                show_timing,
+                ..test_render_options(ToolDisplayMode::Full)
+            };
+            let rendered = render_parsed_entries(&entries, &options);
+            let label_offset = if show_timing { TIMESTAMP_WIDTH } else { 0 };
+            assert!(
+                rendered.lines.iter().any(|line| {
+                    line.continuation != RowContinuation::None
+                        && label_column(line, label_offset).contains('│')
+                }),
+                "a continued row shows an interleaved call's lane in its label column at width {content_width}:\n{}",
+                rendered_text(&rendered)
+            );
+            for query in queries {
+                assert_eq!(
+                    find_matches(&rendered.lines, query),
+                    find_matches_by_row_text(&rendered.lines, query),
+                    "the same matches of {query:?} at width {content_width}, timing {show_timing}:\n{}",
+                    rendered_text(&rendered)
+                );
+            }
+        }
+    }
+}

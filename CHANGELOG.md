@@ -24,6 +24,8 @@
 - Open a large session about 2.5x faster (on one example corpus), and keep the
   list and its search drawing while it opens. Reloading an open session after
   a refresh no longer freezes the viewer.
+- Speed up the viewer's search (`/`) about 3–3.7x in full mode (`tools·all`)
+  and about 2.3–2.9x in summary mode (on one example session).
 - Speed up semantic search (on one example corpus): a TUI query of quoted
   phrases alone about 5.5x, and `--semantic-search` and
   `--debug-semantic-search` about 1.5x.

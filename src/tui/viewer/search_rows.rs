@@ -63,6 +63,7 @@ pub fn find_matches_while(
 ) -> Option<Vec<SearchMatch>> {
     let literal = Literal::ignoring_case(query.to_string());
     let mut matches = Vec::new();
+    let mut line = WrappedLine::default();
     let mut start = 0;
     let mut next_check = 0;
     while start < lines.len() {
@@ -73,7 +74,7 @@ pub fn find_matches_while(
             next_check = start + ROWS_BETWEEN_STOP_CHECKS;
         }
         let end = wrapped_line_end(lines, start);
-        let line = WrappedLine::join(lines, start..end);
+        line.join(lines, start..end);
         matches.extend(
             literal
                 .match_ranges(&line.text)
@@ -93,6 +94,7 @@ fn wrapped_line_end(lines: &[RenderedLine], start: usize) -> usize {
 }
 
 /// The rows of one wrapped line joined back into its text.
+#[derive(Default)]
 struct WrappedLine {
     text: String,
     pieces: Vec<Piece>,
@@ -108,34 +110,31 @@ struct Piece {
 }
 
 impl WrappedLine {
-    /// The first row whole, then each later row's continued text, after a
-    /// space where the line broke at one.
-    fn join(lines: &[RenderedLine], rows: Range<usize>) -> Self {
-        let mut text = String::new();
-        let mut pieces = Vec::new();
+    /// Replaces the line with `rows` of `lines` joined: the first row whole,
+    /// then each later row's continued text, after a space where the line
+    /// broke at one.
+    fn join(&mut self, lines: &[RenderedLine], rows: Range<usize>) {
+        self.text.clear();
+        self.pieces.clear();
         for row in rows.clone() {
             let line = &lines[row];
-            let row_text = line.text();
-            let row_start = if row == rows.start {
+            let continued_from = if row == rows.start {
                 0
             } else {
                 if line.continuation == RowContinuation::AfterSpace {
-                    text.push(' ');
+                    self.text.push(' ');
                 }
-                char_boundary_at_or_before(
-                    &row_text,
-                    row_text.len().saturating_sub(line.continued_text_len),
-                )
+                line.text_len().saturating_sub(line.continued_text_len)
             };
-            pieces.push(Piece {
+            let start = self.text.len();
+            let row_start = push_row_text_from(&mut self.text, line, continued_from);
+            self.pieces.push(Piece {
                 row,
-                start: text.len(),
+                start,
                 row_start,
-                len: row_text.len() - row_start,
+                len: self.text.len() - start,
             });
-            text.push_str(&row_text[row_start..]);
         }
-        Self { text, pieces }
     }
 
     /// The match covering `bytes` of the line's text, by row. `None` when
@@ -158,11 +157,68 @@ impl WrappedLine {
     }
 }
 
-fn char_boundary_at_or_before(text: &str, mut index: usize) -> usize {
-    while !text.is_char_boundary(index) {
-        index -= 1;
+/// Appends `row`'s text to `text` from byte `from`, or from the start of
+/// the character `from` falls inside. Returns the byte offset in the row's
+/// text that the appended text starts at.
+fn push_row_text_from(text: &mut String, row: &RenderedLine, from: usize) -> usize {
+    let mut span_start = 0;
+    let mut row_start = None;
+    for (span, _) in &row.spans {
+        let span_end = span_start + span.len();
+        if span_end > from {
+            let skipped = span.floor_char_boundary(from.saturating_sub(span_start));
+            row_start.get_or_insert(span_start + skipped);
+            text.push_str(&span[skipped..]);
+        }
+        span_start = span_end;
     }
-    index
+    row_start.unwrap_or(span_start)
+}
+
+/// The matches of `query` with each wrapped line joined from its rows'
+/// [`RenderedLine::text`], for tests to compare [`find_matches`] with.
+#[cfg(test)]
+pub(super) fn find_matches_by_row_text(lines: &[RenderedLine], query: &str) -> Vec<SearchMatch> {
+    let literal = Literal::ignoring_case(query.to_string());
+    let mut matches = Vec::new();
+    let mut start = 0;
+    while start < lines.len() {
+        let end = wrapped_line_end(lines, start);
+        let line = join_row_texts(lines, start..end);
+        matches.extend(
+            literal
+                .match_ranges(&line.text)
+                .into_iter()
+                .filter_map(|(match_start, match_end)| line.match_rows(match_start..match_end)),
+        );
+        start = end;
+    }
+    matches
+}
+
+#[cfg(test)]
+fn join_row_texts(lines: &[RenderedLine], rows: Range<usize>) -> WrappedLine {
+    let mut joined = WrappedLine::default();
+    for row in rows.clone() {
+        let line = &lines[row];
+        let row_text = line.text();
+        let row_start = if row == rows.start {
+            0
+        } else {
+            if line.continuation == RowContinuation::AfterSpace {
+                joined.text.push(' ');
+            }
+            row_text.floor_char_boundary(row_text.len().saturating_sub(line.continued_text_len))
+        };
+        joined.pieces.push(Piece {
+            row,
+            start: joined.text.len(),
+            row_start,
+            len: row_text.len() - row_start,
+        });
+        joined.text.push_str(&row_text[row_start..]);
+    }
+    joined
 }
 
 #[cfg(test)]
@@ -183,6 +239,28 @@ mod tests {
         ]);
         line.continuation = continuation;
         line.continued_text_len = text.len();
+        line
+    }
+
+    fn row_of_spans(texts: &[&str]) -> RenderedLine {
+        RenderedLine::new(
+            texts
+                .iter()
+                .map(|text| (text.to_string(), LineStyle::default()))
+                .collect(),
+        )
+    }
+
+    /// A row of `texts` continuing the row above: its last
+    /// `continued_text_len` bytes continue it.
+    fn continued_spans(
+        texts: &[&str],
+        continued_text_len: usize,
+        continuation: RowContinuation,
+    ) -> RenderedLine {
+        let mut line = row_of_spans(texts);
+        line.continuation = continuation;
+        line.continued_text_len = continued_text_len;
         line
     }
 
@@ -235,6 +313,56 @@ mod tests {
             continued("> ", "rebuild", RowContinuation::Unbroken),
         ];
         assert_eq!(covered(&lines, "cache rebuild").len(), 1);
+    }
+
+    #[test]
+    fn next_line_doesnt_continue_line_above() {
+        assert!(find_matches(&[row("cach"), row("e")], "cache").is_empty());
+    }
+
+    #[test]
+    fn phrase_matches_across_rows_of_several_spans_each() {
+        let lines = [
+            row_of_spans(&[" You ", "│ ", "run the ", "cac", "he"]),
+            continued_spans(
+                &["     ", "│ re", "bui", "ld now"],
+                "rebuild now".len(),
+                RowContinuation::AfterSpace,
+            ),
+            continued_spans(
+                &["     │ ", "and ", "again"],
+                "and again".len(),
+                RowContinuation::AfterSpace,
+            ),
+        ];
+        assert_eq!(
+            covered(&lines, "cache rebuild now and"),
+            [vec![
+                (0, "cache".to_string()),
+                (1, "rebuild now".to_string()),
+                (2, "and".to_string()),
+            ]]
+        );
+        assert!(
+            find_matches(&lines, "│ re").is_empty(),
+            "the columns sharing a span with the continued text are not searched"
+        );
+    }
+
+    #[test]
+    fn continued_row_cut_inside_character_continues_from_its_start() {
+        let continued_text = "ébc";
+        for spans in [&["│ ", continued_text][..], &["│ ébc"], &["│", " é", "bc"]] {
+            let lines = [
+                row("caf"),
+                continued_spans(spans, continued_text.len() - 1, RowContinuation::Unbroken),
+            ];
+            assert_eq!(
+                covered(&lines, "café"),
+                [vec![(0, "caf".to_string()), (1, "é".to_string())]],
+                "the continued text starts at the cut character: {spans:?}"
+            );
+        }
     }
 
     /// A search over `rows` lines of one row each, whose `keep_going` returns
