@@ -849,11 +849,12 @@ impl AgentService {
     }
 
     /// Every agent's keys, discovered under `operation` as
-    /// [`discover_agent_keys`] discovers them, and timed as the command's
-    /// key stage.
+    /// [`AgentKeySearch::discover_every_agent`] discovers them, and timed as
+    /// the command's key stage.
     fn discover_keys(&self, operation: &history::OperationScope) -> Result<DiscoveredKeys> {
         self.perf.time(Stage::Keys, || {
-            discover_agent_keys(&self.environment, self.perf.load_meter(), operation)
+            AgentKeySearch::new(&self.environment, self.perf.load_meter(), operation)
+                .discover_every_agent()
         })
     }
 
@@ -1943,71 +1944,102 @@ impl TargetedArgs for CheckedWithin {
     }
 }
 
-/// Keys for every provider's sessions, sorted by path.
-///
-/// A sub-agent transcript doesn't get a key: discovery names it on its session's
-/// stub, its content is reachable through that session, and a key of its own
-/// would resolve to a row that does not exist.
-///
-/// A provider whose sessions cannot be listed, or whose keys the session
-/// cache fails to give, does not contribute any keys or roots, and gets a
-/// warning naming that step: the other providers' sessions stay readable.
-/// Each directory discovery could not list gets a warning, and the cached
-/// sessions under it keep their keys.
-///
-/// `meter` records what each provider's discovery and cache read. Under
-/// `operation`, the cache is read, and a root without a session in the
-/// session cache is cached.
-fn discover_agent_keys(
-    environment: &history::Environment,
-    meter: &LoadMeter,
-    operation: &history::OperationScope,
-) -> Result<DiscoveredKeys> {
-    let mut keys = Vec::new();
-    let mut warnings = Vec::new();
-    let mut reads = KeyedReads::default();
-    let project_directories = environment.canonical_directories();
-    for &storage in environment.storages() {
-        let provider = storage.source().provider();
-        let found = match provider_keys(
+/// One agent's key discovery: its keys, or the step that failed.
+type AgentDiscovery = std::result::Result<ProviderKeys, KeyDiscoveryFailure>;
+
+/// One agent's keys in a command's key search.
+enum AgentKeys {
+    /// The agent's roots, its sessions not listed yet.
+    Unlisted(Vec<history::provider::SessionRoot>),
+    /// The agent's sessions listed, or the step of its discovery that
+    /// failed. An agent whose roots cannot be found starts here with a
+    /// listing failure, though its sessions are not listed.
+    Listed(AgentDiscovery),
+}
+
+/// A command's key discovery: each agent's roots, then the keys of the
+/// agents it lists. [`Self::discover_every_agent`] doesn't list an agent
+/// listed before it again.
+struct AgentKeySearch<'e> {
+    environment: &'e history::Environment,
+    meter: &'e LoadMeter,
+    operation: &'e history::OperationScope,
+    project_directories: Arc<CanonicalDirectories>,
+    /// Every agent's storage and keys, in agent order.
+    agents: Vec<(&'static dyn history::provider::SessionStorage, AgentKeys)>,
+}
+
+impl<'e> AgentKeySearch<'e> {
+    /// Every agent's roots under `environment`, the cache read under
+    /// `operation`, and `meter` recording each agent's discovery and cache
+    /// reads. An agent whose roots cannot be found starts with that failure.
+    fn new(
+        environment: &'e history::Environment,
+        meter: &'e LoadMeter,
+        operation: &'e history::OperationScope,
+    ) -> Self {
+        let agents = environment
+            .storages()
+            .iter()
+            .map(|&storage| {
+                let keys = match storage.roots_in(&environment.root_environment()) {
+                    Ok(roots) => AgentKeys::Unlisted(roots),
+                    Err(error) => AgentKeys::Listed(Err(KeyDiscoveryFailure::Listing(error))),
+                };
+                (storage, keys)
+            })
+            .collect();
+        Self {
             environment,
-            storage,
-            meter.agent(storage.source()),
+            meter,
             operation,
-            &project_directories,
-        ) {
-            Ok(found) => found,
-            Err(failure) => {
-                warnings.push(failure.warning(provider));
-                continue;
-            }
-        };
-        keys.extend(found.keys);
-        warnings.extend(
-            found
-                .unreadable_directories
-                .iter()
-                .map(|directory| unreadable_directory_warning(provider, directory)),
-        );
-        reads.roots.insert(storage.source(), found.roots);
-        reads.sessions.extend(found.sessions);
+            project_directories: environment.canonical_directories(),
+            agents,
+        }
     }
-    if keys.is_empty() && !any_history_root_exists(environment) {
-        return Err(AgentError::io(
-            None,
-            format!(
-                "no {} history storage is available",
-                history::provider::display_names_in_prose()
-            ),
+
+    /// `storage`'s keys under `roots`, its sessions listed.
+    fn list(
+        &self,
+        storage: &dyn history::provider::SessionStorage,
+        roots: Vec<history::provider::SessionRoot>,
+    ) -> AgentDiscovery {
+        provider_keys(
+            self.environment,
+            storage,
+            roots,
+            self.meter.agent(storage.source()),
+            self.operation,
+            &self.project_directories,
         )
-        .into());
     }
-    keys.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(DiscoveredKeys {
-        keys,
-        warnings,
-        reads,
-    })
+
+    /// Keys for every agent's sessions, sorted by path, listing each agent
+    /// the search has not listed.
+    ///
+    /// A sub-agent transcript doesn't get a key: discovery records it on its
+    /// session's stub, its content is reachable through that session, and a
+    /// key of its own would resolve to a row that does not exist.
+    ///
+    /// An agent whose sessions cannot be listed, or whose keys the session
+    /// cache fails to give, does not contribute any keys or roots, and gets
+    /// a warning that reports that step: the other agents' sessions stay
+    /// readable. Each directory discovery could not list gets a warning, and
+    /// the cached sessions under it keep their keys. A root without a
+    /// session in the session cache is cached.
+    fn discover_every_agent(mut self) -> Result<DiscoveredKeys> {
+        let agents = std::mem::take(&mut self.agents)
+            .into_iter()
+            .map(|(storage, keys)| {
+                let discovery = match keys {
+                    AgentKeys::Unlisted(roots) => self.list(storage, roots),
+                    AgentKeys::Listed(discovery) => discovery,
+                };
+                (storage.source(), discovery)
+            })
+            .collect();
+        DiscoveredKeys::of(self.environment, agents)
+    }
 }
 
 struct DiscoveredKeys {
@@ -2016,6 +2048,54 @@ struct DiscoveredKeys {
     /// each directory discovery could not list, in agent order.
     warnings: Vec<AgentWarning>,
     reads: KeyedReads,
+}
+
+impl DiscoveredKeys {
+    /// The keys, warnings and reads of `discoveries`, in agent order. Fails
+    /// when no agent gave a key and none of `environment`'s roots exists.
+    fn of(
+        environment: &history::Environment,
+        discoveries: Vec<(history::Source, AgentDiscovery)>,
+    ) -> Result<Self> {
+        let mut keys = Vec::new();
+        let mut warnings = Vec::new();
+        let mut reads = KeyedReads::default();
+        for (source, discovery) in discoveries {
+            let provider = source.provider();
+            let found = match discovery {
+                Ok(found) => found,
+                Err(failure) => {
+                    warnings.push(failure.warning(provider));
+                    continue;
+                }
+            };
+            keys.extend(found.keys);
+            warnings.extend(
+                found
+                    .unreadable_directories
+                    .iter()
+                    .map(|directory| unreadable_directory_warning(provider, directory)),
+            );
+            reads.roots.insert(source, found.roots);
+            reads.sessions.extend(found.sessions);
+        }
+        if keys.is_empty() && !any_history_root_exists(environment) {
+            return Err(AgentError::io(
+                None,
+                format!(
+                    "no {} history storage is available",
+                    history::provider::display_names_in_prose()
+                ),
+            )
+            .into());
+        }
+        keys.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(Self {
+            keys,
+            warnings,
+            reads,
+        })
+    }
 }
 
 /// The step of an agent's key discovery that failed.
@@ -2058,12 +2138,12 @@ struct KeyedReads {
     sessions: HashMap<PathBuf, TargetRead>,
 }
 
-/// [`discover_agent_keys`] from the sessions a load discovered and the
-/// directory and session ID it recorded of each, so a search after a load
-/// neither discovers the sessions nor reads the cache again. With a
-/// `workspace`, only
-/// the sessions each agent's own rule places in it, by the directory the load
-/// recorded, as [`history::Workspace::contains`] places their rows. The
+/// [`AgentKeySearch::discover_every_agent`] from the sessions a load
+/// discovered and the directory and session ID it recorded of each, so a
+/// search after a load neither discovers the sessions nor reads the cache
+/// again. With a `workspace`, only the sessions each agent's own rule places
+/// in it, by the directory the load recorded, as
+/// [`history::Workspace::contains`] places their rows. The
 /// warnings name each agent in `failures`, then each directory in
 /// `unreadable_directories`.
 fn loaded_agent_keys(
@@ -2160,21 +2240,20 @@ struct ProviderKeys {
     sessions: Vec<(PathBuf, TargetRead)>,
 }
 
-/// Every key under every root `storage` stores sessions in, the cache read
-/// under `operation`, and the directories discovery could not list.
+/// Every key under `roots`, the roots `storage` stores sessions in, the cache
+/// read under `operation`, and the directories discovery could not list.
 fn provider_keys(
     environment: &history::Environment,
     storage: &dyn history::provider::SessionStorage,
+    roots: Vec<history::provider::SessionRoot>,
     meter: AgentMeter,
     operation: &history::OperationScope,
     project_directories: &CanonicalDirectories,
-) -> std::result::Result<ProviderKeys, KeyDiscoveryFailure> {
+) -> AgentDiscovery {
     let mut found = ProviderKeys {
         keys: Vec::new(),
         unreadable_directories: Vec::new(),
-        roots: storage
-            .roots_in(&environment.root_environment())
-            .map_err(KeyDiscoveryFailure::Listing)?,
+        roots,
         sessions: Vec::new(),
     };
     for root in &found.roots {
@@ -2314,7 +2393,6 @@ fn cached_keys_under(
         operation,
         project_directories,
     } = *keyed;
-    let provider = storage.source().provider();
     let directories: Vec<&Path> = directories
         .iter()
         .map(|directory| directory.path.as_path())
@@ -2335,22 +2413,32 @@ fn cached_keys_under(
     Ok(listed
         .into_iter()
         .filter(|session| !discovered.contains(session.cache_key.as_str()))
-        .filter_map(|session| {
-            let stub = history::provider::SessionStub {
-                locator: session.locator,
-                subagents: session.subagents,
-                cache_key: session.cache_key,
-                fingerprint: history::provider::Fingerprint::UNKNOWN,
-            };
-            agent::refs::loaded_session_key(
-                provider,
-                &stub,
-                Some(&session.recorded),
-                project_directories,
-                address_in(storage, roots, &stub.cache_key),
-            )
-        })
+        .filter_map(|session| cached_session_key(storage, roots, session, project_directories))
         .collect())
+}
+
+/// The key of `session`, a listed row of `storage`'s sessions, from what it
+/// recorded of itself, as a load keys it, kept at the address `roots` gives
+/// it.
+fn cached_session_key(
+    storage: &dyn history::provider::SessionStorage,
+    roots: &history::sqlite_cache::SessionRoots,
+    session: history::sqlite_cache::ListedSession,
+    project_directories: &CanonicalDirectories,
+) -> Option<agent::refs::AgentConversationKey> {
+    let stub = history::provider::SessionStub {
+        locator: session.locator,
+        subagents: session.subagents,
+        cache_key: session.cache_key,
+        fingerprint: history::provider::Fingerprint::UNKNOWN,
+    };
+    agent::refs::loaded_session_key(
+        storage.source().provider(),
+        &stub,
+        Some(&session.recorded),
+        project_directories,
+        address_in(storage, roots, &stub.cache_key),
+    )
 }
 
 fn address_in(
@@ -4372,7 +4460,9 @@ mod tests {
             keys,
             warnings: directory_warnings,
             reads,
-        } = discover_agent_keys(environment, meter, &operation).unwrap();
+        } = AgentKeySearch::new(environment, meter, &operation)
+            .discover_every_agent()
+            .unwrap();
         operation.finish().fail_if_low_space().unwrap();
         assert_eq!(
             reads.roots.len(),

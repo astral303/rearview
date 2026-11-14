@@ -91,6 +91,21 @@ impl SqliteCache {
         root: &SessionRoot,
         directories: &[&Path],
     ) -> Result<Vec<ListedSession>> {
+        self.listed_sessions_where(storage, root, |locator| {
+            directories
+                .iter()
+                .any(|directory| locator.starts_with(directory))
+        })
+    }
+
+    /// The listed sessions under `root` whose transcript path `keeps`, in
+    /// path order, with their paths in `root`'s spelling.
+    fn listed_sessions_where(
+        &self,
+        storage: SessionCache,
+        root: &SessionRoot,
+        keeps: impl Fn(&Path) -> bool,
+    ) -> Result<Vec<ListedSession>> {
         let roots = self.session_roots(root);
         self.with_read_snapshot(|connection| {
             let places = Places::stored(connection, &roots)?;
@@ -112,10 +127,7 @@ impl SqliteCache {
                     Err(error) if error.is_changed_source() => continue,
                     Err(error) => return Err(error),
                 };
-                if !directories
-                    .iter()
-                    .any(|directory| locator.starts_with(directory))
-                {
+                if !keeps(&locator) {
                     continue;
                 }
                 let Some(files) = transcripts_of(connection, &places, row.get(0)?)? else {
