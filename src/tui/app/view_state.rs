@@ -1,7 +1,7 @@
 use super::session_store::{FinishedRefresh, ReadCause};
 use super::{
     App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, MatchesArrival, OpenSessionStatus,
-    PendingViewSearch, RowsRead, ViewSearchMode, ViewSpot, ViewState,
+    PendingRender, PendingViewSearch, RowsRead, ViewSearchMode, ViewSpot, ViewState,
 };
 use crate::history::provider::{RenamedTitle, SessionRead, SessionTitle, TitleAndSummary};
 use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
@@ -240,25 +240,31 @@ impl<T: Send + 'static> ViewerRead<T> {
 }
 
 /// The open session's reload, once its refresh finished: the viewer shows it
-/// on the next frame, or once the read of its copy lands.
+/// on the next frame, or once the read of its copy arrives. One reload runs
+/// at a time, from its read until its rows show: a newer read would stop the
+/// render of a reload's rows.
 pub(super) enum PendingReload {
+    /// A refresh's reload whose read starts once the previous reload's rows
+    /// show ([`App::start_queued_reload`]).
+    Queued(Box<ReloadedSession>),
     /// A file opened directly, already parsed, or a row without an address in
     /// the cache.
     Ready(Box<ReloadedSession>),
     /// At most one read runs: a newer refresh finishing meanwhile is
-    /// `queued`, and its read starts once this one lands.
+    /// `queued`, and its read starts once this one's rows show.
     Reading {
         read: ViewerRead<ReloadRead>,
         queued: Option<Box<ReloadedSession>>,
     },
 }
 
-/// A landed reload, and the newer refresh's row to read next.
+/// A reload whose read arrived, and the newer refresh's row to read once its
+/// rows show.
 pub(super) type LandedReload = (ReloadRead, Option<Box<ReloadedSession>>);
 
 impl PendingReload {
     /// `reloaded`, reading its copy in `cache` when it has one.
-    pub(super) fn start(reloaded: Box<ReloadedSession>, cache: InteractiveCache) -> Self {
+    fn start(reloaded: Box<ReloadedSession>, cache: InteractiveCache) -> Self {
         if reloaded.parsed.is_some() {
             return Self::Ready(reloaded);
         }
@@ -277,9 +283,9 @@ impl PendingReload {
 
     /// This reload followed by `newer`, a later refresh's: a read running
     /// keeps running with `newer` queued; otherwise `newer` replaces it.
-    fn followed_by(self, newer: Box<ReloadedSession>, cache: InteractiveCache) -> Self {
+    fn followed_by(self, newer: Box<ReloadedSession>) -> Self {
         match self {
-            Self::Ready(_) => Self::start(newer, cache),
+            Self::Queued(_) | Self::Ready(_) => Self::Queued(newer),
             Self::Reading { read, .. } => Self::Reading {
                 read,
                 queued: Some(newer),
@@ -287,10 +293,11 @@ impl PendingReload {
         }
     }
 
-    /// The reload and the row queued behind it, once its read lands within
-    /// `wait`; `Err(self)` while it runs.
+    /// The reload and the row queued behind it, once its read arrives within
+    /// `wait`; `Err(self)` while it runs or is queued.
     pub(super) fn finish(self, wait: Duration) -> Result<LandedReload, Self> {
         match self {
+            Self::Queued(_) => Err(self),
             Self::Ready(reloaded) => Ok(((*reloaded, None), None)),
             Self::Reading { read, queued } => match read.finish(wait) {
                 Ok(read) => Ok((read, queued)),
@@ -484,6 +491,7 @@ impl App {
             count_highlight: None,
             is_copy_missing,
             rows_read: RowsRead::Current,
+            pending_render: None,
         };
         state.show_copy_header_and_adopt(copy_row, external_title.as_ref(), adopted);
         self.app_mode = AppMode::View(state);
@@ -519,17 +527,23 @@ impl App {
     }
 
     /// True while the open session's refresh waits, runs or awaits another
-    /// refresh, until the viewer shows its reload, and while the background
-    /// worker reads the file opened directly.
+    /// refresh, until the viewer shows its reload's rows, and while the
+    /// background worker reads the file opened directly.
     pub fn is_open_session_updating(&self) -> bool {
         match &self.app_mode {
             AppMode::View(state) => {
-                self.direct_file_read.is_some()
-                    || self.pending_view_reload.is_some()
-                    || self.store.is_refresh_pending(&state.conversation_path)
+                self.direct_file_read.is_some() || self.is_reload_pending(state)
             }
             AppMode::List => false,
         }
+    }
+
+    /// True while the open session's refresh waits, runs or awaits another
+    /// refresh, until the viewer shows its reload's rows.
+    fn is_reload_pending(&self, state: &ViewState) -> bool {
+        self.store.is_refresh_pending(&state.conversation_path)
+            || self.pending_view_reload.is_some()
+            || state.awaits_reload_rows()
     }
 
     /// The open session's pending refresh as the viewer labels it; `None`
@@ -555,10 +569,10 @@ impl App {
         })
     }
 
-    /// When the newest finished refresh read the open session: start reading
-    /// it again from the cache, or queue that read behind one still running;
-    /// leave the viewer for a session that is gone or empty, or report the
-    /// failed read.
+    /// When the newest finished refresh read the open session: queue reading
+    /// it again from the cache ([`Self::queue_open_session_reload`]); leave
+    /// the viewer for a session that is gone or empty, or report the failed
+    /// read.
     /// The list applies the refresh itself once the viewer closes. A file
     /// opened directly keeps the viewer when it is gone or empty.
     pub(super) fn follow_open_session(&mut self) {
@@ -570,14 +584,7 @@ impl App {
             .newest_finished()
             .and_then(|finished| OpenSessionRead::in_finished(finished, state));
         match read {
-            Some(OpenSessionRead::Listed(reloaded)) => {
-                let cache = self.interactive_cache();
-                let reload = match self.pending_view_reload.take() {
-                    Some(pending) => pending.followed_by(reloaded, cache),
-                    None => PendingReload::start(reloaded, cache),
-                };
-                self.pending_view_reload = Some(reload);
-            }
+            Some(OpenSessionRead::Listed(reloaded)) => self.queue_open_session_reload(reloaded),
             Some(OpenSessionRead::Gone(status)) => {
                 self.deferred_copy = None;
                 if !self.single_file_mode {
@@ -598,14 +605,41 @@ impl App {
         }
     }
 
+    /// Queue `reloaded`, a finished refresh's reload of the open session,
+    /// behind the pending reload, which it replaces unless that one's read
+    /// runs, and start it once the viewer awaits no reload's rows.
+    pub(super) fn queue_open_session_reload(&mut self, reloaded: Box<ReloadedSession>) {
+        self.pending_view_reload = Some(match self.pending_view_reload.take() {
+            Some(pending) => pending.followed_by(reloaded),
+            None => PendingReload::Queued(reloaded),
+        });
+        self.start_queued_reload();
+    }
+
+    /// Start the queued reload's read once the viewer awaits no reload's
+    /// rows. A read arriving during their render would stop it, and on a
+    /// live session the next refresh can finish before a large render does,
+    /// so the rows would never show.
+    pub(super) fn start_queued_reload(&mut self) {
+        if matches!(&self.app_mode, AppMode::View(state) if state.awaits_reload_rows()) {
+            return;
+        }
+        self.pending_view_reload = match self.pending_view_reload.take() {
+            Some(PendingReload::Queued(reloaded)) => {
+                Some(PendingReload::start(reloaded, self.interactive_cache()))
+            }
+            pending => pending,
+        };
+    }
+
     /// Show the open session again after its refresh finished, as `reloaded`
     /// lists it, from `read`, the viewer's read of its copy, or the file
-    /// opened directly as parsed, keeping the reader's place. The first read
-    /// of a file opened directly shows from the top, as an open does. A copy
-    /// asked for meanwhile runs once nothing more is pending.
+    /// opened directly as parsed, keeping the reader's place, once its rows
+    /// arrive. The first read of a file opened directly shows from the top,
+    /// as an open does. A copy asked for meanwhile runs once nothing more is
+    /// pending.
     pub(super) fn reload_open_session(
         &mut self,
-        viewport_height: usize,
         reloaded: ReloadedSession,
         read: Option<InteractiveRead<ViewedConversation>>,
     ) {
@@ -644,37 +678,35 @@ impl App {
                     state.session_id = reloaded.session_id;
                     state.rows_read = RowsRead::BeforeFirstRead;
                 }
-                self.render_view(viewport_height);
+                self.request_view_render();
             } else {
-                self.show_reread_conversation(
-                    viewport_height,
-                    conversation,
-                    header,
-                    copy_row,
-                    reloaded.session_id,
-                );
+                self.show_reread_conversation(conversation, header, copy_row, reloaded.session_id);
             }
         }
         self.run_deferred_copy();
     }
 
     /// True when a copy or export of the open session waits for its
-    /// pending refresh.
+    /// pending refresh, or, for a file opened directly outside every
+    /// session root, for a reload's rows: the copy reads the newest read,
+    /// and until then the rows show an earlier one.
     pub(super) fn defers_copy(&self) -> bool {
-        !self.store.refuses_session_refreshes() && self.is_open_session_updating()
+        let AppMode::View(state) = &self.app_mode else {
+            return false;
+        };
+        state.awaits_reload_rows()
+            || (!self.store.refuses_session_refreshes() && self.is_open_session_updating())
     }
 
     /// Run the copy or export asked for while the open session's refresh
     /// was pending, once no refresh or reload of the open session is
-    /// pending. An export whose copy is still out of date or missing reports
-    /// the failed read.
+    /// pending and a reload's rows show. An export whose copy is still out
+    /// of date or missing reports the failed read.
     fn run_deferred_copy(&mut self) {
         let AppMode::View(state) = &self.app_mode else {
             return;
         };
-        if self.store.is_refresh_pending(&state.conversation_path)
-            || self.pending_view_reload.is_some()
-        {
+        if self.is_reload_pending(state) {
             return;
         }
         match self.deferred_copy.take() {
@@ -694,6 +726,9 @@ impl App {
 
     pub fn exit_view_mode(&mut self) {
         self.stop_view_search();
+        if let Some(worker) = &self.viewer_render {
+            worker.stop();
+        }
         self.app_mode = AppMode::List;
         self.pending_view_reload = None;
         self.deferred_copy = None;
@@ -954,41 +989,39 @@ impl App {
         Self::focus_message_at_line(state, first_row);
     }
 
-    pub(super) fn toggle_view_tools(&mut self, viewport_height: usize) {
+    pub(super) fn toggle_view_tools(&mut self) {
         if let AppMode::View(ref mut state) = self.app_mode {
             state.tool_display = state.tool_display.next();
             self.tool_display = state.tool_display;
-            self.re_render_view(viewport_height);
+            self.request_view_render();
         }
     }
 
-    pub(super) fn toggle_view_thinking(&mut self, viewport_height: usize) {
+    pub(super) fn toggle_view_thinking(&mut self) {
         if let AppMode::View(ref mut state) = self.app_mode {
             state.show_thinking = !state.show_thinking;
             self.show_thinking = state.show_thinking;
-            self.re_render_view(viewport_height);
+            self.request_view_render();
         }
     }
 
-    pub(super) fn toggle_view_timing(&mut self, viewport_height: usize) {
+    pub(super) fn toggle_view_timing(&mut self) {
         if let AppMode::View(ref mut state) = self.app_mode {
             state.show_timing = !state.show_timing;
             self.show_timing = state.show_timing;
-            self.re_render_view(viewport_height);
+            self.request_view_render();
         }
     }
 
-    pub(super) fn re_render_view(&mut self, viewport_height: usize) {
-        self.render_view(viewport_height);
-    }
-
     /// Show `conversation`, the open session read again, where the reader
-    /// was (see [`Self::show_render`]). Expanded rows stay expanded where
-    /// their entry is still there. The header shows `copy_row`, the
-    /// conversation's copy's catalogue row, or `header`'s row without it.
+    /// was, once its rows arrive (see [`Self::show_render`]). Expanded rows
+    /// stay expanded where their entry is still there. The header shows
+    /// `copy_row`, the conversation's copy's catalogue row, or `header`'s row
+    /// without it, at once. The previous reload's rows have shown
+    /// ([`Self::start_queued_reload`]), so the shown rows are
+    /// `parsed_conversation`'s.
     fn show_reread_conversation(
         &mut self,
-        viewport_height: usize,
         conversation: Arc<crate::tui::viewer::ParsedConversation>,
         header: ReloadedHeader,
         copy_row: Option<Box<Conversation>>,
@@ -997,29 +1030,102 @@ impl App {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let relocation = EntryRelocation::between(&state.parsed_conversation, &conversation);
+        let into_new_read = EntryRelocation::between(&state.parsed_conversation, &conversation);
         state.expanded_tool_outputs = state
             .expanded_tool_outputs
             .iter()
-            .filter_map(|id| relocation.tool_output_id(id))
+            .filter_map(|id| into_new_read.tool_output_id(id))
             .collect();
+        if let Some(pending) = &mut state.pending_render {
+            pending.focus_first_call_of = pending
+                .focus_first_call_of
+                .and_then(|entry| into_new_read.get(entry));
+        }
+        state.rows_read = RowsRead::Earlier(into_new_read);
         state.show_reloaded_row(header, copy_row);
         state.session_id = session_id;
         state.parsed_conversation = conversation;
-        state.rows_read = RowsRead::Earlier(relocation);
-        self.render_view(viewport_height);
+        self.request_view_render();
     }
 
-    /// Render the open conversation with the view's current options and show
-    /// the rows.
-    fn render_view(&mut self, viewport_height: usize) {
+    /// Ask the `viewer-render` thread for a render of the open conversation
+    /// with the view's current options, superseding the running render. The
+    /// shown rows stay until [`Self::receive_view_render`] shows the new
+    /// ones.
+    pub(super) fn request_view_render(&mut self) {
+        let now = self.clock().now();
         let AppMode::View(state) = &self.app_mode else {
             return;
         };
         let options = self.view_render_options(state);
-        let rendered =
-            crate::tui::viewer::render_parsed_conversation(&state.parsed_conversation, &options);
-        self.show_render(viewport_height, rendered);
+        let conversation = Arc::clone(&state.parsed_conversation);
+        let generation = self
+            .viewer_render
+            .get_or_insert_with(super::viewer_render::ViewerRenderWorker::spawn)
+            .render(conversation, options);
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        match &mut state.pending_render {
+            Some(pending) => pending.generation = generation,
+            None => {
+                state.pending_render = Some(PendingRender {
+                    generation,
+                    since: now,
+                    focus_first_call_of: None,
+                });
+            }
+        }
+    }
+
+    /// True while a render of the open conversation runs and its rows
+    /// haven't shown.
+    pub fn is_view_render_pending(&self) -> bool {
+        matches!(&self.app_mode, AppMode::View(state) if state.pending_render.is_some())
+    }
+
+    /// Show the newest render's rows once they arrive, waiting up to `wait`
+    /// for a finished render. A render finished for an earlier request or a
+    /// closed viewer is dropped; the render thread starts the next only once
+    /// the finished one is taken, so every pass takes it. A panic on the
+    /// render's thread resumes here.
+    pub(crate) fn receive_view_render(&mut self, viewport_height: usize, wait: Duration) {
+        let Some(rendered) = self
+            .viewer_render
+            .as_mut()
+            .and_then(|worker| worker.take_rendered(wait))
+        else {
+            return;
+        };
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let Some(pending) = state.pending_render else {
+            return;
+        };
+        if pending.generation != rendered.generation {
+            return;
+        }
+        state.pending_render = None;
+        self.show_render(viewport_height, rendered.conversation);
+        if let Some(entry) = pending.focus_first_call_of {
+            self.focus_first_call_of(entry, viewport_height);
+        }
+        self.start_queued_reload();
+        self.run_deferred_copy();
+    }
+
+    /// Focus the first call of the focused message when that message is
+    /// `entry`'s.
+    fn focus_first_call_of(&mut self, entry: usize, viewport_height: usize) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        let is_focused = Self::focused_message_range(state)
+            .is_some_and(|(_, message)| message.entry_index == entry);
+        if is_focused {
+            self.focus_first_call(viewport_height);
+        }
     }
 
     /// The options `state`'s conversation renders with: the view's modes,
@@ -1057,7 +1163,13 @@ impl App {
         };
         let is_reload = relocation.is_some();
         let stick_to_bottom = is_reload && state.is_at_bottom(viewport_height);
-        let messages_before = state.message_ranges.len();
+        let gone_messages = relocation.map_or(0, |relocation| {
+            state
+                .message_ranges
+                .iter()
+                .filter(|message| relocation.get(message.entry_index).is_none())
+                .count()
+        });
         let anchor = capture_anchor(
             &state.message_ranges,
             state.scroll_offset,
@@ -1128,13 +1240,22 @@ impl App {
             }
         }
 
-        let messages_after = state.message_ranges.len();
-        if is_reload && messages_after != messages_before {
-            state.count_highlight = Some(CountHighlight {
-                until: now + COUNT_HIGHLIGHT,
-                arrived_below: (stick_to_bottom && messages_after > messages_before)
-                    .then(|| messages_after - messages_before),
-            });
+        // Messages are counted by entry, not by range: a display key pressed
+        // during the reload's render changes how many ranges the same
+        // messages make.
+        if let Some(relocation) = relocation {
+            let earlier_entries = relocation.later_indices_of_earlier_entries();
+            let new_messages = state
+                .message_ranges
+                .iter()
+                .filter(|message| !earlier_entries.contains(&message.entry_index))
+                .count();
+            if new_messages + gone_messages > 0 {
+                state.count_highlight = Some(CountHighlight {
+                    until: now + COUNT_HIGHLIGHT,
+                    arrived_below: (stick_to_bottom && new_messages > 0).then_some(new_messages),
+                });
+            }
         }
 
         // Search the query again over the new rows, without the pause: the
@@ -1331,22 +1452,36 @@ impl App {
         if ids.is_empty() {
             return;
         }
-        let is_at_message_stop = state.focused_call().is_none();
-        if Self::expand_all(state, ids) {
-            self.re_render_view(viewport_height);
+        let message_stop_entry = match state.focused_call() {
+            Some(_) => None,
+            None => Self::focused_message_range(state).map(|(_, message)| message.entry_index),
+        };
+        if !Self::expand_all(state, ids) {
+            if message_stop_entry.is_some() {
+                self.focus_first_call(viewport_height);
+            }
+            return;
         }
-        if is_at_message_stop {
-            self.focus_first_call(viewport_height);
+        self.request_view_render();
+        if let Some(entry) = message_stop_entry
+            && let AppMode::View(state) = &mut self.app_mode
+        {
+            // The run's calls show in the new rows; the first is focused
+            // once they arrive.
+            let entry_in_newest_read = state.entry_in_newest_read(entry);
+            if let Some(pending) = &mut state.pending_render {
+                pending.focus_first_call_of = entry_in_newest_read;
+            }
         }
     }
 
-    pub(super) fn collapse_focused(&mut self, viewport_height: usize) {
+    pub(super) fn collapse_focused(&mut self) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
         let ids = Self::focused_tool_output_ids(state);
         if Self::collapse_all(state, ids) {
-            self.re_render_view(viewport_height);
+            self.request_view_render();
             return;
         }
         if let Some(focus) = &mut state.focus
@@ -1356,7 +1491,7 @@ impl App {
         }
     }
 
-    pub(super) fn toggle_focused(&mut self, viewport_height: usize) {
+    pub(super) fn toggle_focused(&mut self) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
@@ -1372,7 +1507,7 @@ impl App {
         } else {
             Self::expand_all(state, ids);
         }
-        self.re_render_view(viewport_height);
+        self.request_view_render();
     }
 
     /// True when at least one id was collapsed before.
@@ -1394,16 +1529,20 @@ impl App {
     }
 
     /// The ids the focused stop toggles: a focused call's expandable areas,
-    /// otherwise the focused message's own rows.
+    /// otherwise the focused message's own rows, in `parsed_conversation`.
     fn focused_tool_output_ids(state: &ViewState) -> BTreeSet<ToolOutputId> {
-        match Self::focused_call_range(state) {
+        let shown_ids = match Self::focused_call_range(state) {
             Some(call) => call
                 .areas()
                 .filter(|area| Self::is_expandable(state, area))
                 .map(|area| area.id.clone())
                 .collect(),
             None => Self::focused_message_tool_output_ids(state),
-        }
+        };
+        shown_ids
+            .into_iter()
+            .filter_map(|id| state.id_in_newest_read(id))
+            .collect()
     }
 
     /// The renderer marks a row clickable only where a click toggles it: a
@@ -1504,12 +1643,7 @@ impl App {
         true
     }
 
-    pub fn handle_view_click(
-        &mut self,
-        row: u16,
-        frame_area: Rect,
-        viewport_height: usize,
-    ) -> bool {
+    pub fn handle_view_click(&mut self, row: u16, frame_area: Rect) -> bool {
         let Some(line_idx) = self.view_line_at_row(row, frame_area) else {
             return false;
         };
@@ -1543,13 +1677,19 @@ impl App {
             });
             changed = true;
         }
+        let mut toggled_output = false;
         if let Some(id) = tool_output {
-            Self::toggle_expanded_tool_output(state, id.clone());
+            if let Some(id_in_newest_read) = state.id_in_newest_read(id.clone()) {
+                Self::toggle_expanded_tool_output(state, id_in_newest_read);
+                toggled_output = true;
+            }
             state.hovered_tool_output = Some(id);
             changed = true;
         }
-        if changed {
-            self.re_render_view(viewport_height);
+        // The rows don't depend on the focus: only a tool output expanded or
+        // collapsed renders them again.
+        if toggled_output {
+            self.request_view_render();
         }
         changed
     }
@@ -1752,12 +1892,12 @@ impl App {
         )
     }
 
-    pub fn check_view_resize(&mut self, frame_width: usize, viewport_height: usize) {
+    pub fn check_view_resize(&mut self, frame_width: usize) {
         if let AppMode::View(ref mut state) = self.app_mode
             && state.frame_width != frame_width
         {
             state.frame_width = frame_width;
-            self.re_render_view(viewport_height);
+            self.request_view_render();
         }
     }
 }

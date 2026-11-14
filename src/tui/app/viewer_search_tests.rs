@@ -4,7 +4,7 @@
 use super::interaction_tests::{
     app_with_tool_conversation, press, view_state, write_named_conversation,
 };
-use super::test_waits::{VIEWER_READ_LANDS, finish_view_search};
+use super::test_waits::{VIEWER_READ_LANDS, finish_view_render, finish_view_search};
 use super::view_state::VIEW_SEARCH_PAUSE;
 use super::viewer_search::ViewerSearchWorker;
 use super::*;
@@ -411,7 +411,8 @@ fn rerender_while_matches_show_searches_again_without_pause() {
     press(&mut app, KeyCode::Enter);
     finish_view_search(&mut app);
 
-    app.check_view_resize(60, 17);
+    app.check_view_resize(60);
+    finish_view_render(&mut app, 17);
 
     assert!(is_running(&app), "the search is sent without the pause");
     assert!(
@@ -445,7 +446,8 @@ fn viewer_showing_matches() -> (tempfile::TempDir, App) {
 /// The view rendered again at another width, and the search of its new rows
 /// run to its end. Returns the top row before the matches arrived.
 fn rendered_again_at_new_width(app: &mut App) -> usize {
-    app.check_view_resize(60, 17);
+    app.check_view_resize(60);
+    finish_view_render(app, 17);
     let top_row = view_state(app).scroll_offset;
     finish_view_search(app);
     top_row

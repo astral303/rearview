@@ -115,7 +115,7 @@ fn prepare_frame<B: Backend>(app: &mut App, terminal: &mut Terminal<B>) -> Frame
     let frame_area = terminal.get_frame().area();
     let viewport_height = frame_area.height.saturating_sub(3) as usize;
 
-    app.check_view_resize(frame_area.width as usize, viewport_height);
+    app.check_view_resize(frame_area.width as usize);
     let viewport_height = match app.app_mode() {
         AppMode::View(state) => {
             ui::view_layout_rects(frame_area, app, state).content.height as usize
@@ -171,11 +171,7 @@ where
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        if app.handle_view_click(
-                            m.row,
-                            frame_state.frame_area,
-                            frame_state.viewport_height,
-                        ) {
+                        if app.handle_view_click(m.row, frame_state.frame_area) {
                             return EventLoopResult::Break;
                         }
                         if allow_list_click_enter
@@ -301,6 +297,8 @@ impl Runtime {
         self.start_next_job();
 
         let frame_state = prepare_frame(&mut self.app, terminal);
+        self.app
+            .receive_view_render(frame_state.viewport_height, Duration::ZERO);
         self.app.receive_search_results();
         self.app.send_due_view_search();
         self.app.receive_view_search_results(Duration::ZERO);
@@ -309,9 +307,7 @@ impl Runtime {
         if self
             .app
             .complete_pending_open(frame_state.frame_width(), OPENING_REDRAW_INTERVAL)
-            || self
-                .app
-                .complete_pending_view_refresh(frame_state.viewport_height, Duration::ZERO)
+            || self.app.complete_pending_view_refresh(Duration::ZERO)
         {
             return Ok(Tick::Continue);
         }
@@ -425,7 +421,10 @@ impl Runtime {
             || self.app.is_reading_open_session()
         {
             Duration::from_millis(50)
-        } else if self.app.has_search_work_in_flight() || self.app.is_view_search_pending() {
+        } else if self.app.has_search_work_in_flight()
+            || self.app.is_view_search_pending()
+            || self.app.is_view_render_pending()
+        {
             Duration::from_millis(8)
         } else {
             self.app.idle_wait()

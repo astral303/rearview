@@ -3,7 +3,7 @@ use super::refresh_tests::{
     listed_names, selected_name, serve_list_change, serve_session_refresh, status_text,
 };
 use super::semantic_test_helpers::*;
-use super::test_waits::finish_view_search;
+use super::test_waits::{finish_view_render, finish_view_search};
 use super::*;
 use crate::config::KeyBinding;
 use crate::history::environment::test_support::{cache_rows, test_environment};
@@ -301,8 +301,17 @@ fn write_codex_rollout(directory: &std::path::Path) -> PathBuf {
     path
 }
 
+/// `code`, then the render it requested, once its rows show.
 pub(super) fn press(app: &mut App, code: KeyCode) {
     app.handle_key(code, KeyModifiers::empty(), 17);
+    finish_view_render(app, 17);
+}
+
+/// A click on screen row `row`, then the render it requested.
+fn click(app: &mut App, row: u16, frame: Rect) -> bool {
+    let changed = app.handle_view_click(row, frame);
+    finish_view_render(app, 17);
+    changed
 }
 
 thread_local! {
@@ -385,7 +394,7 @@ fn assert_cached_tool_output_survives_file_removal(
     let frame = Rect::new(0, 0, 120, 20);
     let row = tool_click_row(app, frame);
 
-    assert!(app.handle_view_click(row, frame, 17));
+    assert!(click(app, row, frame));
     let expanded_id = if expect_hovered_tool_output_retained {
         Some(view_expanded_tool_id(app))
     } else {
@@ -393,7 +402,7 @@ fn assert_cached_tool_output_survives_file_removal(
     };
     assert!(view_text(app).contains("five"));
 
-    assert!(app.handle_view_click(row, frame, 17));
+    assert!(click(app, row, frame));
     if let AppMode::View(state) = app.app_mode() {
         assert!(state.expanded_tool_outputs.is_empty());
         if expect_hovered_tool_output_retained {
@@ -559,11 +568,11 @@ fn view_click_toggles_clickable_output() {
     let frame = Rect::new(0, 0, 120, 20);
     let row = tool_click_row(&app, frame);
 
-    assert!(app.handle_view_click(row, frame, 17));
+    assert!(click(&mut app, row, frame));
     let expanded_id = view_expanded_tool_id(&app);
     assert!(view_text(&app).contains("five"));
 
-    assert!(app.handle_view_click(row, frame, 17));
+    assert!(click(&mut app, row, frame));
     if let AppMode::View(state) = app.app_mode() {
         assert!(state.expanded_tool_outputs.is_empty());
         assert_eq!(state.hovered_tool_output, Some(expanded_id));
@@ -592,7 +601,8 @@ fn single_file_view_click_uses_cached_entries_after_file_removed() {
         KeyBindings::default(),
         test_environment(Vec::new(), None),
     );
-    app.check_view_resize(80, 17);
+    app.check_view_resize(80);
+    finish_view_render(&mut app, 17);
     std::fs::remove_file(&path).unwrap();
     assert_cached_tool_output_survives_file_removal(&mut app, false);
 }
@@ -1463,7 +1473,8 @@ fn enter_in_truncated_mode_expands_bodies_still_collapsed_before_collapsing_any(
     write_two_truncated_calls_conversation(&path);
     let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
     let frame = Rect::new(0, 0, 120, 20);
-    assert!(app.handle_view_click(tool_click_row(&app, frame), frame, 17));
+    let row = tool_click_row(&app, frame);
+    assert!(click(&mut app, row, frame));
     assert_eq!(expanded_tool_count(&app), 1);
 
     press(&mut app, KeyCode::Enter);
@@ -1504,7 +1515,8 @@ fn search_view_for(app: &mut App, query: &str) {
 /// Resize the open view to `frame_width`, and show the matches of the
 /// search the resize starts.
 fn resize_view_and_search(app: &mut App, frame_width: usize) {
-    app.check_view_resize(frame_width, 17);
+    app.check_view_resize(frame_width);
+    finish_view_render(app, 17);
     finish_view_search(app);
 }
 
@@ -1800,7 +1812,8 @@ fn enter_on_call_expands_body_still_collapsed_before_collapsing_any() {
     } else {
         unreachable!()
     };
-    assert!(app.handle_view_click(click_row_in(&app, frame, input_rows), frame, 17));
+    let row = click_row_in(&app, frame, input_rows);
+    assert!(click(&mut app, row, frame));
     assert!(view_text(&app).contains("five"));
     assert!(!view_text(&app).contains("r6"));
     press(&mut app, KeyCode::Right);
@@ -1962,7 +1975,7 @@ fn click_clears_call_focus() {
     let frame = Rect::new(0, 0, 120, 20);
     let row = tool_click_row(&app, frame);
 
-    assert!(app.handle_view_click(row, frame, 17));
+    assert!(click(&mut app, row, frame));
 
     assert_eq!(focused_call(&app), None);
 }
@@ -2759,15 +2772,18 @@ fn click_in_truncated_mode_toggles_clicked_body_alone() {
     let frame = Rect::new(0, 0, 120, 20);
     let row = tool_click_row(&app, frame);
 
-    assert!(app.handle_view_click(row, frame, 17));
+    assert!(click(&mut app, row, frame));
 
     assert_eq!(expanded_tool_count(&app), 1);
     assert!(view_text(&app).contains("five"));
     assert!(!view_text(&app).contains("ten"));
 }
 
+/// `code` with `modifiers`, then the render it requested.
 fn press_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
-    app.handle_key(code, modifiers, 10)
+    let action = app.handle_key(code, modifiers, 10);
+    finish_view_render(app, 10);
+    action
 }
 
 fn actions_menu_selection(app: &App) -> Option<SessionAction> {

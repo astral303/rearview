@@ -249,7 +249,7 @@ impl App {
                 None
             }
             KeyCode::Enter => {
-                self.toggle_focused(viewport_height);
+                self.toggle_focused();
                 None
             }
             KeyCode::Right => {
@@ -257,7 +257,7 @@ impl App {
                 None
             }
             KeyCode::Left => {
-                self.collapse_focused(viewport_height);
+                self.collapse_focused();
                 None
             }
             KeyCode::Char('d') if !modifiers.contains(KeyModifiers::CONTROL) => {
@@ -312,15 +312,15 @@ impl App {
                 None
             }
             KeyCode::Char('t') => {
-                self.toggle_view_tools(viewport_height);
+                self.toggle_view_tools();
                 None
             }
             KeyCode::Char('T') => {
-                self.toggle_view_thinking(viewport_height);
+                self.toggle_view_thinking();
                 None
             }
             KeyCode::Char('i') => {
-                self.toggle_view_timing(viewport_height);
+                self.toggle_view_timing();
                 None
             }
             KeyCode::Char('p') => {

@@ -8,7 +8,7 @@ use super::session_store::{
     AWAITED_REFRESH_CHECK_INTERVAL, FailedRefresh, FinishedRead, FinishedRefresh, RefreshFailure,
     SessionCopy, UnlistedSession,
 };
-use super::view_state::{PendingReload, ReloadedSession, SESSION_READ_FAILED};
+use super::view_state::{ReloadedSession, SESSION_READ_FAILED};
 use super::{App, AppMode, DialogMode, DirectFileJob};
 use crate::error::Result;
 use crate::history::listing::{self, SessionOrigin, SessionTimes};
@@ -409,7 +409,8 @@ impl App {
     }
 
     /// Hand the background worker the read of the file opened directly,
-    /// returning its path; `None` while none is asked for.
+    /// returning its path; `None` while none is asked for, and until the
+    /// previous read's rows show, as a session reload's read waits.
     pub fn begin_direct_file_read(&mut self) -> Option<PathBuf> {
         if self.direct_file_read != Some(DirectFileJob::Requested) {
             return None;
@@ -417,6 +418,9 @@ impl App {
         let AppMode::View(state) = &self.app_mode else {
             return None;
         };
+        if state.awaits_reload_rows() {
+            return None;
+        }
         self.direct_file_read = Some(DirectFileJob::Running);
         Some(state.conversation_path.clone())
     }
@@ -449,11 +453,10 @@ impl App {
                 entries,
             }) => {
                 state.conversation_source = Some(source);
-                self.pending_view_reload =
-                    Some(PendingReload::Ready(Box::new(ReloadedSession::parsed(
-                        crate::tui::viewer::parsed_conversation(entries.clone()),
-                        row.as_deref(),
-                    ))));
+                self.queue_open_session_reload(Box::new(ReloadedSession::parsed(
+                    crate::tui::viewer::parsed_conversation(entries.clone()),
+                    row.as_deref(),
+                )));
                 self.show_opened_file_row(row.map(|row| *row), is_first_read);
                 self.opened_file_entries = Some(entries);
             }

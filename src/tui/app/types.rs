@@ -156,6 +156,23 @@ pub struct ViewState {
     pub is_copy_missing: bool,
     /// The read of the conversation the rows were rendered from.
     pub rows_read: RowsRead,
+    /// The render on the viewer's render thread whose rows haven't arrived
+    /// yet; the shown rows stay until they do.
+    pub pending_render: Option<PendingRender>,
+}
+
+/// The viewer's newest render request, until its rows arrive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingRender {
+    /// The number marking the newest render: rows of any other aren't shown.
+    pub generation: u64,
+    /// When the first request whose rows haven't shown was made: a newer
+    /// request superseding it keeps this moment.
+    pub since: crate::clock::Moment,
+    /// An entry: once the rows arrive, the first call of its message is
+    /// focused if that message is. Expanding a tool run at its message stop
+    /// focuses its first call, which only the new rows show.
+    pub focus_first_call_of: Option<usize>,
 }
 
 /// The read of the open conversation that the viewer's rows show.
@@ -376,6 +393,7 @@ impl ViewState {
             count_highlight: None,
             is_copy_missing: false,
             rows_read: RowsRead::Current,
+            pending_render: None,
         }
     }
 
@@ -397,6 +415,30 @@ impl ViewState {
 
     pub fn focused_call(&self) -> Option<usize> {
         self.focus.and_then(|focus| focus.call_index)
+    }
+
+    /// True from the arrival of a reload's read, the first read of a file
+    /// opened directly included, until its rows show.
+    pub fn awaits_reload_rows(&self) -> bool {
+        !matches!(self.rows_read, RowsRead::Current)
+    }
+
+    /// `id`, taken from the shown rows, in `parsed_conversation`; `None`
+    /// when its entry is gone from a reload's read.
+    pub fn id_in_newest_read(&self, id: ToolOutputId) -> Option<ToolOutputId> {
+        match &self.rows_read {
+            RowsRead::Earlier(relocation) => relocation.tool_output_id(&id),
+            RowsRead::Current | RowsRead::BeforeFirstRead => Some(id),
+        }
+    }
+
+    /// `entry_index`, a shown row's entry, in `parsed_conversation`; `None`
+    /// when the entry is gone from a reload's read.
+    pub fn entry_in_newest_read(&self, entry_index: usize) -> Option<usize> {
+        match &self.rows_read {
+            RowsRead::Earlier(relocation) => relocation.get(entry_index),
+            RowsRead::Current | RowsRead::BeforeFirstRead => Some(entry_index),
+        }
     }
 }
 

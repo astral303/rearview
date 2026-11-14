@@ -2518,6 +2518,7 @@ mod tests {
         let mut app = viewer_on_cached_session(&path, 80);
         app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), 17);
         app.handle_key(KeyCode::Right, KeyModifiers::empty(), 17);
+        crate::tui::app::test_waits::finish_view_render(&mut app, 17);
         let AppMode::View(state) = app.app_mode() else {
             unreachable!()
         };
@@ -2681,6 +2682,7 @@ mod tests {
         assert!(!untimed.contains(&first_day), "{untimed}");
 
         app.handle_key(KeyCode::Char('i'), KeyModifiers::empty(), 4);
+        crate::tui::app::test_waits::finish_view_render(&mut app, 4);
         let top = scroll_position(view_state(&app), today, Zone::System).to_string();
         assert!(top.contains(&format!(" {first_day}]")), "{top}");
 
@@ -2711,7 +2713,8 @@ mod tests {
         }
         let frame_width = (40..=100)
             .find(|&width| {
-                app.check_view_resize(width, 17);
+                app.check_view_resize(width);
+                crate::tui::app::test_waits::finish_view_render(&mut app, 17);
                 crate::tui::app::test_waits::finish_view_search(&mut app);
                 let AppMode::View(state) = app.app_mode() else {
                     unreachable!()
@@ -3731,7 +3734,8 @@ mod tests {
             KeyBindings::default(),
             test_environment(Vec::new(), None),
         );
-        app.check_view_resize(160, 10);
+        app.check_view_resize(160);
+        crate::tui::app::test_waits::finish_view_render(&mut app, 10);
         app
     }
 

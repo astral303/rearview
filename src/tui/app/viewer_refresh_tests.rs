@@ -6,6 +6,7 @@ use super::commit_failure_tests::launched_app;
 use super::refresh_tests::{refresh_found, serve_session_refresh};
 use super::session_store::ReadCause;
 use super::test_waits::ConnectionGate;
+use super::viewer_render_tests::{Gate, Seen, gated_worker, press_now};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
@@ -176,7 +177,7 @@ fn reload_keeps_old_copy_under_updating_until_its_read_lands() {
     });
 
     request_refresh(&mut app);
-    let waits_for_the_read = !app.complete_pending_view_refresh(VIEWPORT, Duration::ZERO);
+    let waits_for_the_read = !app.complete_pending_view_refresh(Duration::ZERO);
     let old_copy_on_screen = !view_text(&app).contains("message 30");
     let status = app.open_session_status();
     app.handle_key(KeyCode::Char('j'), KeyModifiers::empty(), VIEWPORT);
@@ -219,7 +220,7 @@ fn refresh_finishing_during_gated_read_queues_one_read_after_it() {
     request_refresh(&mut app);
     write_messages(&path, &numbered(0..32));
     request_refresh(&mut app);
-    let waits_for_the_first_read = !app.complete_pending_view_refresh(VIEWPORT, Duration::ZERO);
+    let waits_for_the_first_read = !app.complete_pending_view_refresh(Duration::ZERO);
     gate.open();
     let first_landed = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
     let reads_again = app.is_reading_open_session();
@@ -468,7 +469,7 @@ fn message_copy_during_read_waits_for_it_though_newer_refresh_fails() {
     write_messages(&path, &numbered(0..5));
     request_refresh(&mut app);
     assert!(
-        !app.complete_pending_view_refresh(VIEWPORT, Duration::ZERO),
+        !app.complete_pending_view_refresh(Duration::ZERO),
         "the first refresh's read runs"
     );
     write_messages(&path, &numbered(0..7));
@@ -550,6 +551,7 @@ fn expanded_run_stays_expanded_when_sub_agent_turns_splice_in_above_it() {
     let mut app = viewer_on(&home);
     app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), VIEWPORT);
     app.handle_key(KeyCode::Enter, KeyModifiers::empty(), VIEWPORT);
+    test_waits::finish_view_render(&mut app, VIEWPORT);
     let expanded = view(&app).expanded_tool_outputs.clone();
     assert!(!expanded.is_empty());
     assert!(view_text(&app).contains("src/lib.rs"));
@@ -908,7 +910,8 @@ fn opened_outside_every_root(path: &Path) -> App {
         KeyBindings::default(),
         test_environment(Vec::new(), None),
     );
-    app.check_view_resize(80, VIEWPORT);
+    app.check_view_resize(80);
+    test_waits::finish_view_render(&mut app, VIEWPORT);
     app
 }
 
@@ -953,7 +956,8 @@ fn directly_opened_file_holding_only_its_header_shows_its_sub_agents_after_refre
         KeyBindings::default(),
         test_environment(vec![omp], None),
     );
-    app.check_view_resize(80, VIEWPORT);
+    app.check_view_resize(80);
+    test_waits::finish_view_render(&mut app, VIEWPORT);
 
     std::fs::write(&path, session).unwrap();
     press_refresh(&mut app);
@@ -1030,7 +1034,8 @@ fn opened_directly_as(typed: &Path, environment: Environment) -> App {
     );
     app.serve_direct_file_read();
     test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
-    app.check_view_resize(80, VIEWPORT);
+    app.check_view_resize(80);
+    test_waits::finish_view_render(&mut app, VIEWPORT);
     app
 }
 
@@ -1410,4 +1415,410 @@ fn direct_file_by_canonical_path_canonicalises_only_the_root_and_the_cache_direc
         [projects, cache_directory],
         "the root and the cache directory canonicalise once each"
     );
+}
+
+/// The viewer of `home`'s first session, rendering through a gated worker.
+fn gated_viewer_on(home: &ClaudeHome) -> (App, Gate) {
+    let mut app = viewer_on(home);
+    let (worker, gate) = gated_worker();
+    app.viewer_render = Some(worker);
+    (app, gate)
+}
+
+/// `Ctrl+R`, the session refresh it asks for, and the read of the refreshed
+/// copy, without waiting for the render the read requests.
+fn refresh_and_receive_read(app: &mut App) {
+    request_refresh(app);
+    assert!(
+        app.complete_pending_view_refresh(test_waits::VIEWER_READ_LANDS),
+        "the reload's read arrives"
+    );
+}
+
+/// The render stopped at the gate returns stopped, and the newer render
+/// reaches the gate with timing shown.
+fn stop_first_render_and_reach_timed_one(gate: &Gate) {
+    gate.let_one_through();
+    assert!(
+        !gate.next_return().finished,
+        "the newer request stops the running render"
+    );
+    assert_eq!(gate.next_render(), (ToolDisplayMode::Hidden, true));
+}
+
+/// The render with timing shown, let through the gate, finishes and its
+/// rows show.
+fn finish_timed_render(app: &mut App, gate: &Gate) {
+    gate.let_one_through();
+    test_waits::finish_view_render(app, VIEWPORT);
+    assert_eq!(
+        gate.next_return(),
+        Seen {
+            tool_display: ToolDisplayMode::Hidden,
+            show_timing: true,
+            finished: true,
+        },
+        "the render with timing shown finishes"
+    );
+}
+
+#[test]
+fn refresh_during_display_key_render_shows_new_messages_in_new_mode() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..30));
+    let (mut app, gate) = gated_viewer_on(&home);
+    press_now(&mut app, KeyCode::Char('i'));
+    assert_eq!(gate.next_render(), (ToolDisplayMode::Hidden, true));
+
+    write_messages(&path, &numbered(0..32));
+    refresh_and_receive_read(&mut app);
+    stop_first_render_and_reach_timed_one(&gate);
+    finish_timed_render(&mut app, &gate);
+
+    assert!(view_text(&app).contains("message 31"));
+}
+
+#[test]
+fn reader_at_bottom_during_display_key_render_stays_at_bottom_of_reload() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..30));
+    let (mut app, gate) = gated_viewer_on(&home);
+    app.handle_key(KeyCode::End, KeyModifiers::empty(), VIEWPORT);
+    press_now(&mut app, KeyCode::Char('i'));
+    gate.next_render();
+
+    write_messages(&path, &numbered(0..32));
+    refresh_and_receive_read(&mut app);
+    stop_first_render_and_reach_timed_one(&gate);
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+
+    let state = view(&app);
+    assert_eq!(
+        state.scroll_offset,
+        state.total_lines - VIEWPORT,
+        "the view stays at the bottom"
+    );
+    assert_eq!(arrived_below(&app), Some(2));
+}
+
+#[test]
+fn reader_who_scrolled_during_render_keeps_message_at_top() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_timed_messages(&path, 30);
+    let (mut app, gate) = gated_viewer_on(&home);
+    press_now(&mut app, KeyCode::Char('i'));
+    gate.next_render();
+
+    scroll_to_message(&mut app, "message 10");
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+
+    assert!(
+        top_row_text(&app).contains("message 10"),
+        "the message scrolled to during the render stays at the top: {}",
+        top_row_text(&app)
+    );
+}
+
+/// The viewer of `home`'s session of 30 messages, rendering through a gated
+/// worker, after a refresh's read of 31 messages arrived: that reload's
+/// render waits at the gate.
+fn viewer_with_reload_render_at_gate(home: &ClaudeHome) -> (App, Gate) {
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..30));
+    let (mut app, gate) = gated_viewer_on(home);
+    write_messages(&path, &numbered(0..31));
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+    (app, gate)
+}
+
+/// A second `Ctrl+R` and its session refresh, after the transcript grew to
+/// 32 messages.
+fn finish_second_refresh(home: &ClaudeHome, app: &mut App) {
+    write_messages(&home.transcript("session"), &numbered(0..32));
+    request_refresh(app);
+}
+
+#[test]
+fn refresh_finishing_during_reloads_render_reads_once_its_rows_show() {
+    let home = ClaudeHome::new();
+    let (mut app, gate) = viewer_with_reload_render_at_gate(&home);
+
+    finish_second_refresh(&home, &mut app);
+    let read_during_render =
+        app.is_reading_open_session() || app.complete_pending_view_refresh(Duration::ZERO);
+    gate.let_one_through();
+    let first_render = gate.next_return();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+    let first_rows = view_text(&app);
+    let reads_once_rows_show = app.is_reading_open_session();
+    gate.let_one_through();
+    let second_arrived = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
+
+    assert!(
+        !read_during_render,
+        "the second refresh's read doesn't start during the first reload's render"
+    );
+    assert!(
+        first_render.finished
+            && first_rows.contains("message 30")
+            && !first_rows.contains("message 31"),
+        "the first reload's rows show: {first_rows:?}"
+    );
+    assert!(
+        reads_once_rows_show,
+        "the second refresh's read starts once they show"
+    );
+    assert!(
+        second_arrived && view_text(&app).contains("message 31"),
+        "the second read's rows show"
+    );
+}
+
+#[test]
+fn display_key_during_reloads_render_stops_it_and_shows_reload_in_new_mode() {
+    let home = ClaudeHome::new();
+    let (mut app, gate) = viewer_with_reload_render_at_gate(&home);
+
+    press_now(&mut app, KeyCode::Char('i'));
+    stop_first_render_and_reach_timed_one(&gate);
+    finish_timed_render(&mut app, &gate);
+
+    assert!(view_text(&app).contains("message 30"));
+}
+
+#[test]
+fn leaving_viewer_during_reloads_render_drops_reload_queued_behind_it() {
+    let home = ClaudeHome::new();
+    let (mut app, gate) = viewer_with_reload_render_at_gate(&home);
+    finish_second_refresh(&home, &mut app);
+
+    press_now(&mut app, KeyCode::Char('q'));
+    gate.let_one_through();
+
+    assert!(matches!(app.app_mode(), AppMode::List));
+    assert!(
+        !app.is_reading_open_session()
+            && !test_waits::finish_pending_view_reload(&mut app, VIEWPORT),
+        "the queued reload is dropped with the viewer"
+    );
+}
+
+#[test]
+fn click_on_output_during_reloads_render_expands_it_in_new_read() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    let subagent = home.project().join("session/subagents/agent-x.jsonl");
+    let mut lines = vec![user_line("intro")];
+    lines.extend(tool_run_lines());
+    lines.push(user_line("outro"));
+    write_lines(&path, lines);
+    write_subagent_turns(&subagent, 1, 0);
+    let (mut app, gate) = gated_viewer_on(&home);
+    assert!(!view_text(&app).contains("src/lib.rs"));
+
+    // The new turns splice in above the run, so its entries move.
+    write_subagent_turns(&subagent, 3, 0);
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+    let frame = Rect::new(0, 0, 80, 30);
+    let row = {
+        let state = view(&app);
+        let layout = crate::tui::ui::view_layout_rects(frame, &app, state);
+        let line = state
+            .rendered_lines
+            .iter()
+            .position(|line| line.clickable)
+            .expect("the run's row is clickable");
+        layout.content.y + (line - state.scroll_offset) as u16
+    };
+    assert!(app.handle_view_click(row, frame));
+    gate.let_one_through();
+    assert!(
+        !gate.next_return().finished,
+        "the click stops the reload's render"
+    );
+    gate.next_render();
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+
+    assert!(
+        view_text(&app).contains("src/lib.rs"),
+        "the run clicked in the earlier read's rows expands in the new read"
+    );
+}
+
+/// Focus the message showing `text`, as message navigation would.
+fn focus_message(app: &mut App, text: &str) {
+    let message_index = scroll_to_message(app, text);
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.message_nav_active = true;
+        state.focus = Some(Focus {
+            message_index,
+            call_index: None,
+        });
+    }
+}
+
+#[test]
+fn message_copy_during_reloads_render_copies_new_read_once_rows_arrive() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let (mut app, gate) = gated_viewer_on(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    focus_message(&mut app, "message 1");
+    write_messages(
+        &path,
+        &["message 0", "message 1, edited", "message 2"].map(str::to_owned),
+    );
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+    COPIED.with(|copied| copied.borrow_mut().clear());
+
+    press_now(&mut app, KeyCode::Char('y'));
+    let copied_during_render = COPIED.with(|copied| copied.borrow().clone());
+    let is_updating = app.is_open_session_updating();
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+
+    assert!(
+        copied_during_render.is_empty(),
+        "the copy waits for the reload's rows: {copied_during_render:?}"
+    );
+    assert!(
+        is_updating,
+        "the viewer shows the session as updating until the rows arrive"
+    );
+    assert!(
+        copied.len() == 1 && copied[0].contains("message 1, edited"),
+        "the copy runs on the new read once its rows arrive: {copied:?}"
+    );
+}
+
+#[test]
+fn message_copy_during_display_key_render_copies_at_once() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let (mut app, gate) = gated_viewer_on(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    focus_message(&mut app, "message 1");
+    press_now(&mut app, KeyCode::Char('i'));
+    gate.next_render();
+    COPIED.with(|copied| copied.borrow_mut().clear());
+
+    press_now(&mut app, KeyCode::Char('y'));
+
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+    assert!(
+        copied.len() == 1 && copied[0].contains("message 1"),
+        "the copy runs while the render runs: {copied:?}"
+    );
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+}
+
+#[test]
+fn message_copy_during_reloads_render_of_file_outside_every_root_waits_for_its_rows() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let mut app = opened_outside_every_root(&path);
+    let (worker, gate) = gated_worker();
+    app.viewer_render = Some(worker);
+    app.set_clipboard_writer_for_test(record_copy);
+    focus_message(&mut app, "message 1");
+    write_messages(
+        &path,
+        &["message 0", "message 1, edited", "message 2"].map(str::to_owned),
+    );
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
+    app.serve_direct_file_read();
+    assert!(app.complete_pending_view_refresh(test_waits::VIEWER_READ_LANDS));
+    gate.next_render();
+    COPIED.with(|copied| copied.borrow_mut().clear());
+
+    press_now(&mut app, KeyCode::Char('y'));
+    let copied_during_render = COPIED.with(|copied| copied.borrow().clone());
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+
+    assert!(
+        copied_during_render.is_empty(),
+        "the copy waits for the reload's rows: {copied_during_render:?}"
+    );
+    assert!(
+        copied.len() == 1 && copied[0].contains("message 1, edited"),
+        "the copy runs on the new read once its rows arrive: {copied:?}"
+    );
+}
+
+/// A user message, a run of two calls, then `texts` as user messages.
+fn write_run_then_messages(path: &Path, texts: &[String]) {
+    let mut lines = vec![user_line("intro")];
+    lines.extend(tool_run_lines());
+    lines.extend(texts.iter().map(|text| user_line(text)));
+    write_lines(path, lines);
+}
+
+/// The viewer of a run and `message 0` to `message 19`, the reader at the
+/// bottom, after the tools display key (`t`) was pressed during the render
+/// of a reload that reads `texts` after the run, and that render in the new
+/// mode showed; and the message ranges shown before.
+fn press_tools_key_during_reload_of(home: &ClaudeHome, texts: &[String]) -> (App, usize) {
+    let path = home.transcript("session");
+    write_run_then_messages(&path, &numbered(0..20));
+    let (mut app, gate) = gated_viewer_on(home);
+    app.handle_key(KeyCode::End, KeyModifiers::empty(), VIEWPORT);
+    let ranges_before = view(&app).message_ranges.len();
+    write_run_then_messages(&path, texts);
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+
+    press_now(&mut app, KeyCode::Char('t'));
+    gate.let_one_through();
+    assert!(
+        !gate.next_return().finished,
+        "the display key stops the reload's render"
+    );
+    gate.next_render();
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+    (app, ranges_before)
+}
+
+#[test]
+fn tools_key_during_reload_without_new_messages_doesnt_highlight_count() {
+    let home = ClaudeHome::new();
+    let mut texts = numbered(0..20);
+    texts[19] = "message 19, edited".to_owned();
+
+    let (app, ranges_before) = press_tools_key_during_reload_of(&home, &texts);
+
+    assert_ne!(
+        view(&app).message_ranges.len(),
+        ranges_before,
+        "the tools mode changes how many ranges the messages make"
+    );
+    assert!(
+        view(&app).count_highlight.is_none(),
+        "neither the total nor `↓ N new` is highlighted without a new message"
+    );
+}
+
+#[test]
+fn tools_key_during_reload_counts_new_messages_for_badge() {
+    let home = ClaudeHome::new();
+
+    let (app, _) = press_tools_key_during_reload_of(&home, &numbered(0..22));
+
+    assert_eq!(arrived_below(&app), Some(2), "`↓ 2 new` shows");
 }

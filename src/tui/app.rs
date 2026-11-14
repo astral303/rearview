@@ -39,6 +39,7 @@ mod search_worker;
 mod session_store;
 mod types;
 mod view_state;
+mod viewer_render;
 mod viewer_search;
 #[allow(unused_imports)]
 use search_state::{SemanticSearchState, SessionIdQuery};
@@ -50,9 +51,9 @@ pub(crate) use session_store::RefreshFailure;
 #[allow(unused_imports)]
 pub use types::{
     Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow, LIST_LINES_PER_ITEM,
-    ListScope, ListSearchMode, LoadingState, MatchesArrival, OpenSessionStatus, PendingViewSearch,
-    RowsRead, SemanticProgress, SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewSpot,
-    ViewState, list_lines_per_item,
+    ListScope, ListSearchMode, LoadingState, MatchesArrival, OpenSessionStatus, PendingRender,
+    PendingViewSearch, RowsRead, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
+    ViewSearchMode, ViewSpot, ViewState, list_lines_per_item,
 };
 
 /// App state
@@ -151,6 +152,9 @@ pub struct App {
     lexical_evidence: HashMap<usize, search::LexicalEvidence>,
     /// The viewer's search thread, started by the first viewer search
     viewer_search: Option<viewer_search::ViewerSearchWorker>,
+    /// The `viewer-render` thread, started by the first render request of
+    /// any kind; it serves every session opened later
+    viewer_render: Option<viewer_render::ViewerRenderWorker>,
     /// `None` while the query is ordinary text
     session_id_query: Option<SessionIdQuery>,
     /// The session open (`Enter`) or a row click named, until the load runs
@@ -334,6 +338,7 @@ impl App {
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
             viewer_search: None,
+            viewer_render: None,
             session_id_query: None,
             pending_open: None,
             pending_view_reload: None,
@@ -999,24 +1004,20 @@ impl App {
             && matches!(&self.app_mode, AppMode::View(state) if !state.is_copy_missing)
     }
 
-    /// Show the open session again once its refresh finished: once the read
-    /// of its copy lands within `wait`, or the file opened directly as
-    /// parsed. A newer refresh's row queued behind the read starts its own
-    /// read then. True when it showed, so the caller draws the result next.
-    pub fn complete_pending_view_refresh(
-        &mut self,
-        viewport_height: usize,
-        wait: Duration,
-    ) -> bool {
+    /// Show the open session again once its refresh finished: render it once
+    /// the read of its copy arrives within `wait`, or the file opened
+    /// directly as parsed. A newer refresh's row queued behind the read
+    /// starts its own read once the rows of this one show. True when the read
+    /// arrived, so the caller draws next.
+    pub fn complete_pending_view_refresh(&mut self, wait: Duration) -> bool {
         let Some(reload) = self.pending_view_reload.take() else {
             return false;
         };
         match reload.finish(wait) {
             Ok(((reloaded, read), queued)) => {
-                self.pending_view_reload = queued.map(|queued| {
-                    view_state::PendingReload::start(queued, self.interactive_cache())
-                });
-                self.reload_open_session(viewport_height, reloaded, read);
+                self.pending_view_reload = queued.map(view_state::PendingReload::Queued);
+                self.reload_open_session(reloaded, read);
+                self.start_queued_reload();
                 true
             }
             Err(reload) => {
@@ -1133,6 +1134,9 @@ mod listing_tests;
 
 #[cfg(test)]
 mod viewer_refresh_tests;
+
+#[cfg(test)]
+mod viewer_render_tests;
 
 #[cfg(test)]
 mod viewer_search_tests;

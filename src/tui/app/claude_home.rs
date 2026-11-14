@@ -456,7 +456,8 @@ pub(crate) fn text_of_file_opened_directly(typed: &Path, environment: &Environme
         KeyBindings::default(),
         environment.clone(),
     );
-    app.check_view_resize(80, VIEWPORT);
+    app.check_view_resize(80);
+    super::test_waits::finish_view_render(&mut app, VIEWPORT);
     app.serve_direct_file_read();
     super::test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
     viewer_text(&app)
