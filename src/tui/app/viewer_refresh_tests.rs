@@ -3,7 +3,7 @@
 
 use super::claude_home::{ClaudeHome, app_reading, serve_list_refresh};
 use super::commit_failure_tests::launched_app;
-use super::refresh_tests::{refresh_found, serve_session_refresh};
+use super::refresh_tests::{refresh_found, run_session_refresh, serve_session_refresh};
 use super::session_store::ReadCause;
 use super::test_waits::ConnectionGate;
 use super::viewer_render_tests::{Gate, Seen, focused_call_id, gated_worker, press_now};
@@ -206,8 +206,11 @@ fn reload_keeps_old_copy_under_updating_until_its_read_lands() {
     );
 }
 
+/// The first refresh's read opens the cache after the second refresh wrote
+/// its copy, and reads that copy: the second refresh's row is the copy the
+/// first read shows.
 #[test]
-fn refresh_finishing_during_gated_read_queues_one_read_after_it() {
+fn refresh_finishing_during_a_read_that_returned_its_copy_doesnt_start_another_read() {
     let home = ClaudeHome::new();
     let path = home.transcript("session");
     write_messages(&path, &numbered(0..30));
@@ -222,32 +225,24 @@ fn refresh_finishing_during_gated_read_queues_one_read_after_it() {
     request_refresh(&mut app);
     let waits_for_the_first_read = !app.complete_pending_view_refresh(Duration::ZERO);
     gate.open();
-    let first_landed = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
-    let reads_again = app.is_reading_open_session();
-    let status_between = app.open_session_status();
-    let second_landed = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
+    let first_shown = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
 
     assert!(
         waits_for_the_first_read,
         "the second refresh doesn't replace the read running"
     );
-    assert!(first_landed, "the first read lands and shows");
     assert!(
-        reads_again,
-        "the newer refresh's read starts once the first lands"
+        first_shown && view_text(&app).contains("message 31"),
+        "the first read shows the newest messages"
+    );
+    assert!(
+        reads_and_renders_nothing(&app),
+        "the second refresh's row shows without another read or render"
     );
     assert_eq!(
-        status_between,
-        Some(OpenSessionStatus::Updating),
-        "the viewer shows the session as updating until the newer read lands"
-    );
-    assert!(
-        second_landed && view_text(&app).contains("message 31"),
-        "the newer refresh's read shows the newest messages"
-    );
-    assert!(
-        !test_waits::finish_pending_view_reload(&mut app, VIEWPORT),
-        "no further read follows"
+        app.open_session_status(),
+        None,
+        "the viewer stops showing the session as updating"
     );
 }
 
@@ -304,6 +299,220 @@ fn leaving_viewer_with_q_drops_its_pending_reload() {
     );
 }
 
+/// True when neither a read of the open session for a reload nor a render
+/// of its rows is pending.
+fn reads_and_renders_nothing(app: &App) -> bool {
+    app.pending_view_reload.is_none() && !app.is_view_render_pending()
+}
+
+#[test]
+fn viewer_doesnt_read_or_render_after_refresh_of_unchanged_session() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    let mut lines = vec![user_line("intro")];
+    lines.extend(tool_run_lines());
+    lines.extend(numbered(0..30).iter().map(|text| user_line(text)));
+    write_lines(&path, lines);
+    let clock = Arc::new(TestClock::default());
+    let mut app = viewer_on_clock(&home, clock.clone());
+    app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), VIEWPORT);
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty(), VIEWPORT);
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+    app.handle_key(KeyCode::Char('/'), KeyModifiers::empty(), VIEWPORT);
+    for typed in "message 2".chars() {
+        app.handle_key(KeyCode::Char(typed), KeyModifiers::empty(), VIEWPORT);
+    }
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty(), VIEWPORT);
+    test_waits::finish_view_search(&mut app);
+    let (worker, gate) = gated_worker();
+    app.viewer_render = Some(worker);
+    let before = view(&app).clone();
+    let header_before = header_line(&app);
+    assert!(
+        !before.expanded_tool_outputs.is_empty() && !before.search_matches.is_empty(),
+        "the view has an expanded output and search matches"
+    );
+    clock.advance(Duration::from_secs(2));
+
+    request_refresh(&mut app);
+
+    assert!(
+        reads_and_renders_nothing(&app) && !gate.took_waiting_render(),
+        "the refresh doesn't read the session or render its rows again"
+    );
+    let after = view(&app);
+    assert!(
+        Arc::ptr_eq(&after.rendered_lines, &before.rendered_lines),
+        "the rows on screen stay"
+    );
+    assert_eq!(
+        (after.scroll_offset, after.focus),
+        (before.scroll_offset, before.focus),
+        "the scroll position and the focus stay"
+    );
+    assert_eq!(
+        after.expanded_tool_outputs, before.expanded_tool_outputs,
+        "the expanded outputs stay"
+    );
+    assert_eq!(
+        (&after.search_matches, after.current_match_index),
+        (&before.search_matches, before.current_match_index),
+        "the search matches and the selected match stay"
+    );
+    assert_eq!(header_line(&app), header_before, "the header stays");
+    assert_eq!(
+        view(&app).reload_rows_shown_at,
+        Some(app.clock().now()),
+        "the seconds of the updating status count from the refresh's end"
+    );
+    assert_eq!(
+        app.open_session_status(),
+        None,
+        "the viewer stops showing the session as updating"
+    );
+    assert!(
+        !app.is_session_refresh_requested(),
+        "the refresh doesn't request another"
+    );
+}
+
+/// Set the generation the cache gave its last write to `generation`, as a
+/// rebuild numbering generations from 1 again leaves it.
+fn set_last_generation(app: &App, generation: i64) {
+    let database = app
+        .environment
+        .cache_base()
+        .path()
+        .join(crate::history::sqlite_cache::DATABASE_FILE_NAME);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'last_generation'",
+            [generation.to_string()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn refresh_whose_write_reuses_shown_generation_reads_and_shows_new_messages() {
+    use crate::history::sqlite_cache::Publication;
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..30));
+    let mut app = viewer_on(&home);
+    let Publication::Published { generation } = view(&app).publication else {
+        panic!("the open session's row is published");
+    };
+    set_last_generation(&app, generation - 1);
+    write_messages(&path, &numbered(0..31));
+
+    request_refresh(&mut app);
+    let reloads = test_waits::finish_pending_view_reload(&mut app, VIEWPORT);
+
+    assert_eq!(
+        view(&app).publication,
+        Publication::Published { generation },
+        "the refresh's write reuses the shown copy's generation"
+    );
+    assert!(
+        reloads && view_text(&app).contains("message 30"),
+        "the viewer reads and shows the new message"
+    );
+}
+
+#[test]
+fn refresh_with_new_messages_after_unchanged_one_reads_and_shows_them() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..30));
+    let mut app = viewer_on(&home);
+    request_refresh(&mut app);
+    assert!(
+        reads_and_renders_nothing(&app),
+        "the viewer doesn't read or render after a refresh of the unchanged session"
+    );
+
+    write_messages(&path, &numbered(0..31));
+    press_refresh(&mut app);
+
+    assert!(
+        view_text(&app).contains("message 30"),
+        "the refresh after an unchanged one shows the new message"
+    );
+}
+
+#[test]
+fn message_copy_asked_for_during_unchanged_refresh_runs_once_it_finishes() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..30));
+    let mut app = viewer_on(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    let message_index = scroll_to_message(&mut app, "message 10");
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.message_nav_active = true;
+        state.focus = Some(Focus {
+            message_index,
+            call_index: None,
+        });
+    }
+    COPIED.with(|copied| copied.borrow_mut().clear());
+
+    app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
+    app.handle_key(KeyCode::Char('y'), KeyModifiers::empty(), VIEWPORT);
+    let copied_before_refresh = COPIED.with(|copied| copied.borrow().clone());
+    serve_session_refresh(&mut app);
+    app.receive_view_render(VIEWPORT, Duration::ZERO);
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+
+    assert!(
+        copied_before_refresh.is_empty(),
+        "the copy waits for the refresh: {copied_before_refresh:?}"
+    );
+    assert!(
+        copied.len() == 1 && copied[0].contains("message 10"),
+        "the copy runs on the next pass after a refresh of the unchanged session: {copied:?}"
+    );
+}
+
+/// A session refresh writes the session's new messages while the list shows
+/// it, and the open reads the copy that refresh wrote before the refresh's
+/// outcome arrives.
+#[test]
+fn open_of_session_whose_pending_refresh_wrote_its_copy_renders_once() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let environment = home.environment_on(Arc::new(TestClock::default()));
+    let mut app = app_reading(home.rows(&environment), environment);
+    write_messages(&path, &numbered(0..5));
+    app.record_next_step(&path, crate::history::NextStep::CacheInBackground);
+    let outcome = run_session_refresh(&mut app);
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    let opened_rows = Arc::clone(&view(&app).rendered_lines);
+
+    app.finish_refresh(outcome);
+
+    assert!(
+        view_text(&app).contains("message 4"),
+        "the open shows the copy the refresh wrote"
+    );
+    assert!(
+        reads_and_renders_nothing(&app),
+        "the refresh's outcome doesn't read or render that copy again"
+    );
+    assert!(
+        Arc::ptr_eq(&view(&app).rendered_lines, &opened_rows),
+        "the open's rows stay"
+    );
+    assert_eq!(
+        app.open_session_status(),
+        None,
+        "the viewer stops showing the session as updating"
+    );
+}
+
 /// The messages the last refresh added below a reader at the bottom, as the
 /// new-messages badge shows them.
 fn arrived_below(app: &App) -> Option<usize> {
@@ -336,10 +545,19 @@ fn at_bottom_refresh_that_finds_nothing_new_reports_nothing() {
     let mut app = viewer_on(&home);
     app.handle_key(KeyCode::End, KeyModifiers::empty(), VIEWPORT);
 
+    append_blank_line(&path);
     press_refresh(&mut app);
 
     assert_eq!(view(&app).count_highlight, None);
+    assert_eq!(arrived_below(&app), None);
     assert_eq!(status_text(&app), None);
+}
+
+/// Append a blank line to the transcript at `path`: the session keeps its
+/// messages, and a refresh writes a new copy of it.
+fn append_blank_line(path: &Path) {
+    let mut transcript = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    std::io::Write::write_all(&mut transcript, b"\n").unwrap();
 }
 
 #[test]
@@ -733,6 +951,7 @@ fn refresh_that_adds_nothing_doesnt_highlight_count() {
     write_messages(&path, &numbered(0..30));
     let mut app = viewer_on(&home);
 
+    append_blank_line(&path);
     press_refresh(&mut app);
 
     assert_eq!(app.count_highlight_remaining(), None);

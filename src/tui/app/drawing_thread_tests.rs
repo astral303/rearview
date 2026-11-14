@@ -525,7 +525,9 @@ fn app_actions_dont_parse_write_or_wait_beside_another_rearviews_activity() {
 /// Behind another rearview's commit, the viewer's reload and opening a
 /// session read each provider's every-record session without a parse, a
 /// writable connection or a wait past the drawing thread's busy timeout.
-/// Each provider runs on a thread of its own, its drawing thread.
+/// Each provider runs on a thread of its own, its drawing thread. A refresh
+/// of the unchanged session doesn't give the viewer a reload; a refresh
+/// after the session gains a turn does.
 #[test]
 fn every_providers_session_opens_and_reloads_behind_another_rearviews_commit() {
     const READS: &[AppAction] = &[
@@ -542,6 +544,14 @@ fn every_providers_session_opens_and_reloads_behind_another_rearviews_commit() {
                 let (cache, environment) = session.case();
                 let mut app = session.app_listing(environment);
                 app.enter_view_mode(80);
+                press_ctrl(&mut app, KeyCode::Char('r'));
+                super::refresh_tests::serve_session_refresh(&mut app);
+                assert!(
+                    app.pending_view_reload.is_none(),
+                    "{}: the viewer doesn't reload after a refresh of an unchanged session",
+                    session.agent()
+                );
+                fixture.append_turn(&session.row.path, "a later reply");
                 refresh_the_open_session(&mut app);
 
                 assert_no_action_parses_writes_or_waits(

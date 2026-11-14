@@ -139,6 +139,9 @@
     keys, and shows `⠋ updating 3s` in place of the modes, or
     `⠋ refreshing 3s` for a file opened directly. The seconds start again
     each time a refresh's new rows show.
+  - `⠋ updating` now ends when a refresh of an unchanged session finishes;
+    the session is no longer read and rendered again. Opening a session
+    during its refresh no longer renders it twice.
   - Once the new rows show, the viewer's search (`/`) now selects the first
     match at or below the top row, where it used to keep the match's number.
   - During a display key's render, message copy (`y`) and export (`e`) run at
