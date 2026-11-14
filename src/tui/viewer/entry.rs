@@ -17,9 +17,9 @@ use super::style::USER_LABEL;
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
-    SubagentReplyRenderSpec, TaskReportRenderSpec, ToolCallRenderSpec, ToolOutputKind,
-    ToolResultRenderSpec, make_reply_output_id, make_tool_output_id, render_subagent_reply,
-    render_task_report, render_tool_call, render_tool_result,
+    SubagentReplyRenderSpec, TASK_REPORT_RAW_ID, TaskReportRenderSpec, ToolCallRenderSpec,
+    ToolOutputKind, ToolResultRenderSpec, make_reply_output_id, make_tool_output_id,
+    render_subagent_reply, render_task_report, render_tool_call, render_tool_result,
 };
 use super::*;
 
@@ -345,7 +345,7 @@ fn step_user_text(
             ctx.parent_id,
             0,
             ToolOutputKind::ToolResult,
-            Some("task-report"),
+            Some(TASK_REPORT_RAW_ID),
         );
         render_task_report(
             lines,

@@ -32,6 +32,12 @@
   after a refresh no longer freezes the viewer.
 - Speed up the viewer's search (`/`) about 3–3.7x in full mode (`tools·all`)
   and about 2.3–2.9x in summary mode (on one example session).
+- Show an expanded or collapsed tool output in truncated mode (`tools·trn`),
+  task report or sub-agent's reply at once on a large session, about 1,900x
+  faster (on one example session): rearview now renders that message again,
+  no longer the whole session.
+  - Expanding or collapsing a tool run in summary mode, or an output inside
+    an expanded run, renders the whole session again.
 - Speed up semantic search (on one example corpus): a TUI query of quoted
   phrases alone about 5.5x, and `--semantic-search` and
   `--debug-semantic-search` about 1.5x.
@@ -182,6 +188,9 @@
     reports it.
   - Until the drive has room for the deleted cache and 1 GB, later runs stop
     before parsing any transcript and report how much space to free.
+- A message whose first block has no rows, such as a result that is a lone
+  code fence, no longer has a blank row above it at the top of a session or
+  after a day label, in the viewer and in `--render`.
 
 ### Internal: development
 

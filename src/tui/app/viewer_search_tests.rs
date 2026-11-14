@@ -617,6 +617,57 @@ fn dropping_app_during_search_stops_it() {
 }
 
 #[test]
+fn expand_during_search_stops_it_renders_in_same_rows_and_searches_again() {
+    let (worker, gate) = gated_worker(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    super::interaction_tests::write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    app.viewer_search = Some(worker);
+    press(&mut app, KeyCode::Char('/'));
+    type_into(&mut app, "six");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(gate.next_search(), "six");
+    let shown = Arc::as_ptr(&view_state(&app).rendered_lines);
+    let frame = Rect::new(0, 0, 80, 30);
+    let text = |app: &App| super::claude_home::viewer_text(app);
+
+    app.handle_view_click(
+        super::viewer_render_tests::first_clickable_row(&app, frame),
+        frame,
+    );
+    app.receive_view_render(17, Duration::ZERO);
+    assert!(
+        !text(&app).contains("six") && app.is_view_render_pending(),
+        "the rows shown stay while the search shares them"
+    );
+    gate.let_one_through();
+    assert_eq!(
+        gate.next_return(),
+        stopped("six"),
+        "the expand stops the running search at its first check"
+    );
+    finish_view_render(&mut app, 17);
+
+    assert!(text(&app).contains("six"), "the input shows whole");
+    assert_eq!(
+        Arc::as_ptr(&view_state(&app).rendered_lines),
+        shown,
+        "the entry renders again in the same rows"
+    );
+    assert_eq!(gate.next_search(), "six", "the search is sent again");
+    gate.let_one_through();
+    finish_view_search(&mut app);
+    assert_eq!(gate.next_return(), finished("six"));
+    assert_eq!(
+        view_state(&app).search_matches,
+        crate::tui::viewer::find_matches(&view_state(&app).rendered_lines, "six"),
+        "the search's matches over the new rows arrive"
+    );
+    assert!(!view_state(&app).search_matches.is_empty());
+}
+
+#[test]
 #[should_panic(expected = "the search panicked")]
 fn search_thread_panic_resumes_where_matches_are_received() {
     let worker = ViewerSearchWorker::spawn_with(Box::new(|_, _, _| panic!("the search panicked")));

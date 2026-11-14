@@ -40,7 +40,28 @@ impl ToolOutputId {
         let (_, rest) = self.0.strip_prefix("entry:")?.split_once(':')?;
         Some(Self(format!("entry:{entry_index}:{rest}")))
     }
+
+    /// True when expanding or collapsing the output changes its entry's
+    /// rows rendered alone with `options`. A tool run renders with the rest
+    /// of the conversation.
+    pub fn toggles_alone_in(&self, options: &RenderOptions) -> bool {
+        let is_report = self.0.ends_with(":kind:reply")
+            || self
+                .0
+                .ends_with(&format!(":kind:result:id:{TASK_REPORT_RAW_ID}"));
+        if self.0.ends_with(":kind:summary") {
+            false
+        } else if is_report {
+            truncation::truncates_report(options.tool_display, options.can_expand)
+        } else {
+            truncation::truncates_tool_output(options.tool_display)
+        }
+    }
 }
+
+/// The raw id in a task report's output id: the report has no call id of
+/// its own.
+pub(super) const TASK_REPORT_RAW_ID: &str = "task-report";
 
 pub(super) fn make_tool_output_id(
     entry_index: usize,
@@ -301,6 +322,19 @@ mod truncation {
     /// limit shows whole: the cut would hide one line and add one row.
     const INDICATOR_ROWS: usize = 1;
 
+    /// True when `tool_display` truncates a tool call's input or a tool
+    /// result: only in `tools·trn`. An expanded tool run renders its calls
+    /// as `tools·trn`.
+    pub(super) fn truncates_tool_output(tool_display: ToolDisplayMode) -> bool {
+        tool_display == ToolDisplayMode::Truncated
+    }
+
+    /// True when `tool_display` truncates a task report or a sub-agent's
+    /// reply: in every mode but `tools·all`, where something can expand it.
+    pub(super) fn truncates_report(tool_display: ToolDisplayMode, can_expand: bool) -> bool {
+        can_expand && tool_display != ToolDisplayMode::Full
+    }
+
     /// The rows a block shows of its lines: `shown` rows render, `hidden`
     /// rows sit behind the `(N more lines...)` row, and `clickable` is true
     /// while a click on the block's rows toggles between the two, which is
@@ -312,23 +346,15 @@ mod truncation {
     }
 
     impl Truncation {
-        /// A tool result: truncated in `tools·trn` alone.
         pub(super) fn of_tool_result(
             total: usize,
             limit: usize,
             tool_display: ToolDisplayMode,
             expanded: bool,
         ) -> Self {
-            Self::from_line_budget(
-                tool_display == ToolDisplayMode::Truncated,
-                total,
-                limit,
-                expanded,
-            )
+            Self::from_line_budget(truncates_tool_output(tool_display), total, limit, expanded)
         }
 
-        /// A task report or a sub-agent's reply: truncated in every mode but
-        /// `tools·all`, and whole where nothing can expand it.
         pub(super) fn of_report(
             total: usize,
             limit: usize,
@@ -337,7 +363,7 @@ mod truncation {
             can_expand: bool,
         ) -> Self {
             Self::from_line_budget(
-                can_expand && tool_display != ToolDisplayMode::Full,
+                truncates_report(tool_display, can_expand),
                 total,
                 limit,
                 expanded,

@@ -42,6 +42,12 @@ impl Gate {
             .expect("a render reaches the gate")
     }
 
+    /// True when a render reached the gate that [`Self::next_render`]
+    /// hasn't taken; takes it.
+    pub(super) fn took_waiting_render(&self) -> bool {
+        self.started.try_recv().is_ok()
+    }
+
     pub(super) fn let_one_through(&self) {
         self.release.send(()).unwrap();
     }
@@ -213,6 +219,252 @@ fn click_on_message_doesnt_render_again_and_keeps_selected_match() {
         (1, 1),
         "the selected match stays"
     );
+}
+
+/// The viewer of a call whose input is truncated, in truncated mode,
+/// rendering through `worker`.
+fn truncated_call_through(worker: ViewerRenderWorker) -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    super::interaction_tests::write_tool_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    app.viewer_render = Some(worker);
+    (dir, app)
+}
+
+/// The screen row of the first row a click toggles.
+pub(super) fn first_clickable_row(app: &App, frame: Rect) -> u16 {
+    let state = view_state(app);
+    let row = state
+        .rendered_lines
+        .iter()
+        .position(|line| line.clickable)
+        .expect("a row toggles an output");
+    crate::tui::ui::view_layout_rects(frame, app, state)
+        .content
+        .y
+        + (row - state.scroll_offset) as u16
+}
+
+#[test]
+fn expanding_and_collapsing_tool_output_renders_its_entry_in_place() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = truncated_call_through(worker);
+    let frame = Rect::new(0, 0, 80, 30);
+    let rows = Arc::as_ptr(&view_state(&app).rendered_lines);
+    let text = |app: &App| super::claude_home::viewer_text(app);
+
+    app.handle_view_click(first_clickable_row(&app, frame), frame);
+    finish_view_render(&mut app, VIEWPORT);
+    assert!(text(&app).contains("six"), "the input shows whole");
+
+    app.handle_view_click(first_clickable_row(&app, frame), frame);
+    finish_view_render(&mut app, VIEWPORT);
+    assert!(!text(&app).contains("six"), "the input is truncated again");
+
+    assert!(
+        !gate.took_waiting_render(),
+        "no render runs on viewer-render"
+    );
+    assert_eq!(
+        Arc::as_ptr(&view_state(&app).rendered_lines),
+        rows,
+        "the rows change in place"
+    );
+}
+
+/// The query [`write_marked_call_conversation`] matches before, inside and
+/// after its call.
+const MARKER: &str = "marker";
+
+/// A message, a call whose input is truncated, and a message, each showing
+/// [`MARKER`], then enough messages to scroll the call to the top row.
+fn write_marked_call_conversation(path: &std::path::Path) {
+    let user = |text: &str| {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "message": {"role": "user", "content": text}
+        })
+        .to_string()
+    };
+    let command = (1..=6)
+        .map(|line| format!("echo {MARKER} {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let call = serde_json::json!({
+        "type": "assistant",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": command}}
+        ]}
+    })
+    .to_string();
+    let mut lines = vec![user(&format!("{MARKER} before")), call];
+    lines.push(user(&format!("{MARKER} after")));
+    lines.extend((0..20).map(|message| user(&format!("filler {message}"))));
+    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+/// The rows of the message of `entry` in `state`.
+fn message_rows(state: &ViewState, entry: usize) -> std::ops::Range<usize> {
+    let message = state
+        .message_ranges
+        .iter()
+        .find(|message| message.entry_index == entry)
+        .expect("the entry shows a message");
+    message.start_line..message.end_line
+}
+
+/// The first row of each shown match.
+fn match_rows(state: &ViewState) -> Vec<usize> {
+    state
+        .search_matches
+        .iter()
+        .map(crate::tui::viewer::SearchMatch::first_row)
+        .collect()
+}
+
+/// The count of shown matches that start in the call's rows.
+fn call_match_count(state: &ViewState) -> usize {
+    let call = message_rows(state, 1);
+    match_rows(state)
+        .into_iter()
+        .filter(|row| call.contains(row))
+        .count()
+}
+
+/// The shown matches equal a search of the shown rows, some above and some
+/// below the call's rows; the selected match is the first at or below the
+/// top row. Returns how many matches the call's rows show.
+fn assert_matches_follow_shown_rows(app: &App, when: &str) -> usize {
+    let state = view_state(app);
+    assert_eq!(
+        state.search_matches,
+        crate::tui::viewer::find_matches(&state.rendered_lines, MARKER),
+        "{when}: the matches are the search's over the new rows"
+    );
+    let call = message_rows(state, 1);
+    let rows = match_rows(state);
+    assert!(
+        rows.iter().any(|&row| row < call.start) && rows.iter().any(|&row| row >= call.end),
+        "{when}: matches above and below the call show: {rows:?} around {call:?}"
+    );
+    let first_at_or_below = rows
+        .iter()
+        .position(|&row| row >= state.scroll_offset)
+        .expect("a match starts at or below the top row");
+    assert_eq!(
+        state.current_match_index, first_at_or_below,
+        "{when}: the selected match is the first at or below the top row {}",
+        state.scroll_offset
+    );
+    call_match_count(state)
+}
+
+/// Select the last match, so the update after an expand or collapse
+/// changes the selection.
+fn select_last_match(app: &mut App) {
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.current_match_index = state.search_matches.len() - 1;
+    }
+}
+
+#[test]
+fn local_expand_and_collapse_update_matches_without_searching_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    write_marked_call_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    for code in "/marker".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+        press_now(&mut app, code);
+    }
+    super::test_waits::finish_view_search(&mut app);
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.scroll_offset = message_rows(state, 1).start;
+    }
+    let frame = Rect::new(0, 0, 80, 30);
+    let truncated = call_match_count(view_state(&app));
+
+    select_last_match(&mut app);
+    app.handle_view_click(first_clickable_row(&app, frame), frame);
+    finish_view_render(&mut app, VIEWPORT);
+    assert!(
+        !app.is_view_search_pending(),
+        "the expand doesn't send a search"
+    );
+    let expanded = assert_matches_follow_shown_rows(&app, "after the expand");
+
+    select_last_match(&mut app);
+    app.handle_view_click(first_clickable_row(&app, frame), frame);
+    finish_view_render(&mut app, VIEWPORT);
+    assert!(
+        !app.is_view_search_pending(),
+        "the collapse doesn't send a search"
+    );
+    let collapsed = assert_matches_follow_shown_rows(&app, "after the collapse");
+
+    assert!(
+        expanded > truncated && collapsed == truncated,
+        "the call's matches follow its rows: {truncated} truncated, {expanded} expanded, {collapsed} collapsed"
+    );
+}
+
+/// The screen row of the first row on screen a click toggles.
+fn first_clickable_row_on_screen(app: &App, frame: Rect) -> u16 {
+    let state = view_state(app);
+    let row = (state.scroll_offset..state.rendered_lines.len())
+        .find(|&row| state.rendered_lines[row].clickable)
+        .expect("a row on screen toggles an output");
+    crate::tui::ui::view_layout_rects(frame, app, state)
+        .content
+        .y
+        + (row - state.scroll_offset) as u16
+}
+
+/// Scroll the call's first row just above the top row, click its rows on
+/// screen, and leave message navigation (`Esc`) before the entry renders
+/// again. Checks that the message below the call keeps its screen row, and
+/// that the view scrolls to the new last row.
+fn assert_click_on_call_starting_above_top_row_keeps_message_below(app: &mut App, when: &str) {
+    let frame = Rect::new(0, 0, 80, 30);
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.scroll_offset = message_rows(state, 1).start + 1;
+    }
+    let state = view_state(app);
+    let below_on_screen = message_rows(state, 2).start - state.scroll_offset;
+
+    app.handle_view_click(first_clickable_row_on_screen(app, frame), frame);
+    press_now(app, KeyCode::Esc);
+    finish_view_render(app, VIEWPORT);
+
+    let state = view_state(app);
+    assert_eq!(
+        message_rows(state, 2).start - state.scroll_offset,
+        below_on_screen,
+        "{when}: the message below the call keeps its screen row"
+    );
+    app.scroll_view(isize::MAX / 2, VIEWPORT);
+    let state = view_state(app);
+    assert_eq!(
+        state.scroll_offset + VIEWPORT,
+        state.rendered_lines.len(),
+        "{when}: the view scrolls to the new last row"
+    );
+}
+
+#[test]
+fn expand_and_collapse_in_place_keep_message_below_on_its_screen_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    write_marked_call_conversation(&path);
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Truncated);
+    let text = |app: &App| super::claude_home::viewer_text(app);
+
+    assert_click_on_call_starting_above_top_row_keeps_message_below(&mut app, "expand");
+    assert!(text(&app).contains("marker 6"), "the call shows expanded");
+    assert_click_on_call_starting_above_top_row_keeps_message_below(&mut app, "collapse");
+    assert!(!text(&app).contains("marker 6"), "the call shows truncated");
 }
 
 /// The pass that takes the finished render waiting to be taken, as the

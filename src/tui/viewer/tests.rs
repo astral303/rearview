@@ -1,11 +1,14 @@
 use super::connectors::lane_color;
 use super::markdown::render_markdown_to_lines;
 use super::tools::{
-    ToolCallRenderSpec, ToolOutputKind, make_reply_output_id, make_tool_output_id, render_tool_call,
+    TASK_REPORT_RAW_ID, ToolCallRenderSpec, ToolOutputKind, make_reply_output_id,
+    make_tool_output_id, render_tool_call,
 };
 use super::*;
 use crate::log_entry::Tool;
 use std::path::PathBuf;
+
+mod rerender;
 
 /// The session at `file_path` with the sub-agent transcripts `subagents`, as
 /// the viewer reads it once a load cached it.

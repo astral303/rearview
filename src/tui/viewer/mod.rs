@@ -24,6 +24,7 @@ mod ledger;
 mod markdown;
 mod output;
 mod relocation;
+mod rerender;
 mod roster;
 mod search_rows;
 mod style;
@@ -34,10 +35,11 @@ mod tools;
 pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
 pub use relocation::EntryRelocation;
+pub use rerender::{EntryInPlace, ShownRows, entry_rendering_alone, render_entry_in_place};
 pub(crate) use roster::SubagentRoster;
 #[cfg(test)]
 pub use search_rows::find_matches;
-pub use search_rows::{SearchMatch, find_matches_while};
+pub use search_rows::{SearchMatch, find_matches_while, update_matches_in_replaced_rows};
 pub(crate) use summary::format_coarse_duration;
 
 use calls::{CallRanges, Lanes, top_level_tool_blocks};
