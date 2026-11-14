@@ -577,11 +577,20 @@ pub(super) fn serve_list_change(app: &mut App) {
 /// Run the session refresh `app` begins as the background worker runs it,
 /// on a thread of its own, and hand `app` its outcome.
 pub(super) fn serve_session_refresh(app: &mut App) {
+    let outcome = run_session_refresh(app);
+    app.finish_refresh(outcome);
+}
+
+/// The outcome of the session refresh `app` begins, run as the background
+/// worker runs it, on a thread of its own, before `app` receives it.
+pub(super) fn run_session_refresh(
+    app: &mut App,
+) -> std::result::Result<RefreshOutcome, RefreshFailure> {
     let refresh = app
         .begin_session_refresh()
         .expect("a session refresh begins");
     let environment = app.environment.clone();
-    let outcome = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let operation = crate::history::OperationScope::new(
             environment.cache_base(),
             crate::history::Patience::UntilAcquired,
@@ -592,8 +601,7 @@ pub(super) fn serve_session_refresh(app: &mut App) {
         ended.map_err(RefreshFailure::from).and(outcome)
     })
     .join()
-    .unwrap();
-    app.finish_refresh(outcome);
+    .unwrap()
 }
 
 #[test]

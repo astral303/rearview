@@ -111,6 +111,13 @@ pub struct ViewState {
     /// The open view's conversation as parsed; empty until a file opened
     /// directly is read.
     pub parsed_conversation: Arc<ParsedConversation>,
+    /// The identity of the copy `parsed_conversation` was read from, when
+    /// the read found it current. `None` when that read found the copy out
+    /// of date, when an open found it missing, and for a file opened
+    /// directly that hasn't been read from the cache. A reload whose read
+    /// finds the copy missing keeps it, as it keeps the conversation. The
+    /// refresh of an unchanged shown copy shows without a read or a render.
+    pub shown_copy: Option<CopyIdentity>,
     /// Current scroll position (line offset)
     pub scroll_offset: usize,
     /// Pre-rendered conversation lines, shared with the viewer's search
@@ -177,15 +184,17 @@ pub struct ViewState {
     /// run at its message stop focuses its first call, which only the new
     /// rows show.
     pub focus_first_call_of: Option<usize>,
-    /// True from a render's rows showing until nothing waits to show. Then
-    /// the deferred copy runs, after the first call of `focus_first_call_of`
+    /// True from a render's rows showing, or the refresh of an unchanged
+    /// shown copy, until nothing waits to show. Then the
+    /// deferred copy runs, after the first call of `focus_first_call_of`
     /// is focused, so a copy asked for at a tool run's message stop after
     /// expanding the run copies that call.
     pub runs_deferred_copy_once_shown: bool,
     /// When the open session started showing as updating, for the spinner
     /// of the `updating` and `refreshing` status; `None` while it doesn't.
     pub updating_since: Option<crate::clock::Moment>,
-    /// When a reload's rows last showed: the seconds of the `updating` and
+    /// When a reload's rows last showed, or an unchanged shown copy was
+    /// last refreshed: the seconds of the `updating` and
     /// `refreshing` status count from then while the session keeps
     /// updating, so they report the current refresh.
     pub reload_rows_shown_at: Option<crate::clock::Moment>,
@@ -199,6 +208,29 @@ pub struct PendingRender {
     /// When the first request whose rows haven't shown was made: a newer
     /// request superseding it keeps this moment.
     pub since: crate::clock::Moment,
+}
+
+/// The identity of a cached copy: the generation its write gave it and the
+/// fingerprint over its transcript and sub-agent transcripts. A rebuild of
+/// the cache numbers generations from 1 again; the fingerprint keeps a
+/// reused number from matching a copy of other transcripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CopyIdentity {
+    generation: i64,
+    fingerprint: Option<crate::history::fingerprint::CachedFingerprint>,
+}
+
+impl CopyIdentity {
+    /// The copy `row` is published at; `None` for an unpublished row.
+    pub fn of(row: &crate::history::Conversation) -> Option<Self> {
+        match row.publication {
+            crate::history::sqlite_cache::Publication::Published { generation } => Some(Self {
+                generation,
+                fingerprint: row.fingerprint,
+            }),
+            crate::history::sqlite_cache::Publication::Unpublished { .. } => None,
+        }
+    }
 }
 
 /// The read of the open conversation that the viewer's rows show.
@@ -253,6 +285,13 @@ impl HeaderRow {
             crate::history::provider::apply_external_title(&mut copy_row, title);
         }
         Self::of(&copy_row)
+    }
+
+    /// Show `row`'s title and summary in place of this header's: a rename in
+    /// rearview sets them on the row before the copy has the new name.
+    pub fn take_title_and_summary_of(&mut self, row: &HeaderRow) {
+        self.custom_title = row.custom_title.clone();
+        self.summary = row.summary.clone();
     }
 }
 
@@ -398,6 +437,7 @@ impl ViewState {
             },
             header: None,
             parsed_conversation: Arc::new(ParsedConversation::empty()),
+            shown_copy: None,
             scroll_offset: 0,
             rendered_lines: Arc::default(),
             total_lines: 0,

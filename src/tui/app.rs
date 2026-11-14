@@ -50,10 +50,11 @@ use search_worker::{
 pub(crate) use session_store::RefreshFailure;
 #[allow(unused_imports)]
 pub use types::{
-    Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow, LIST_LINES_PER_ITEM,
-    ListScope, ListSearchMode, LoadingState, MatchesArrival, OpenSessionStatus, PendingRender,
-    PendingViewSearch, RowsRead, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
-    ViewSearchMode, ViewSpot, ViewState, list_lines_per_item,
+    Action, AppMode, CopyIdentity, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow,
+    LIST_LINES_PER_ITEM, ListScope, ListSearchMode, LoadingState, MatchesArrival,
+    OpenSessionStatus, PendingRender, PendingViewSearch, RowsRead, SemanticProgress,
+    SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewSpot, ViewState,
+    list_lines_per_item,
 };
 
 /// App state
@@ -1098,7 +1099,7 @@ impl App {
             Ok(((reloaded, read), queued)) => {
                 self.pending_view_reload = queued.map(view_state::PendingReload::Queued);
                 self.reload_open_session(reloaded, read);
-                self.start_queued_reload();
+                self.start_or_show_queued_reload();
                 true
             }
             Err(reload) => {
