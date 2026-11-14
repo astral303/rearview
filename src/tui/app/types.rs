@@ -4,8 +4,8 @@ use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
 use crate::tui::viewer::{
-    CallRange, MessageRange, ParsedConversation, RenderedLine, SearchMatch, ToolDisplayMode,
-    ToolOutputId,
+    CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderedLine, SearchMatch,
+    ToolDisplayMode, ToolOutputId,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -154,6 +154,22 @@ pub struct ViewState {
     /// True while the session is missing from the session cache, so the
     /// view doesn't show any messages.
     pub is_copy_missing: bool,
+    /// The read of the conversation the rows were rendered from.
+    pub rows_read: RowsRead,
+}
+
+/// The read of the open conversation that the viewer's rows show.
+#[derive(Clone, Debug)]
+pub enum RowsRead {
+    /// `ViewState::parsed_conversation`.
+    Current,
+    /// A read before `ViewState::parsed_conversation`: a reload's read has
+    /// arrived, and its rows have not. The relocation finds the rows'
+    /// entries in the newer read.
+    Earlier(EntryRelocation),
+    /// The empty conversation of a file opened directly, before its first
+    /// read shows from the top.
+    BeforeFirstRead,
 }
 
 /// The fields of a session's row that the view's header shows. The row's
@@ -358,6 +374,7 @@ impl ViewState {
             hovered_tool_output: None,
             count_highlight: None,
             is_copy_missing: false,
+            rows_read: RowsRead::Current,
         }
     }
 

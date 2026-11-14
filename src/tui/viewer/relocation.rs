@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// read, found by the record it was read from. When a sub-agent writes more,
 /// its new turns are spliced in before later entries, shifting their indices;
 /// each entry's origin stays.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EntryRelocation {
     earlier: Vec<EntryOrigin>,
     later: HashMap<EntryOrigin, usize>,

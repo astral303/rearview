@@ -1,7 +1,7 @@
 use super::session_store::{FinishedRefresh, ReadCause};
 use super::{
     App, AppMode, CountHighlight, DialogMode, Focus, HeaderRow, MatchesArrival, OpenSessionStatus,
-    PendingViewSearch, ViewSearchMode, ViewSpot, ViewState,
+    PendingViewSearch, RowsRead, ViewSearchMode, ViewSpot, ViewState,
 };
 use crate::history::provider::{RenamedTitle, SessionRead, SessionTitle, TitleAndSummary};
 use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
@@ -9,7 +9,8 @@ use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
 use crate::tui::viewer::{
     CallArea, CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderOptions,
-    SearchMatch, ToolOutputId, ViewedConversation, parse_conversation_file_interactively,
+    RenderedConversation, SearchMatch, ToolOutputId, ViewedConversation,
+    parse_conversation_file_interactively,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
@@ -482,6 +483,7 @@ impl App {
             hovered_tool_output: None,
             count_highlight: None,
             is_copy_missing,
+            rows_read: RowsRead::Current,
         };
         state.show_copy_header_and_adopt(copy_row, external_title.as_ref(), adopted);
         self.app_mode = AppMode::View(state);
@@ -640,8 +642,9 @@ impl App {
                     state.parsed_conversation = conversation;
                     state.show_reloaded_row(header, copy_row);
                     state.session_id = reloaded.session_id;
+                    state.rows_read = RowsRead::BeforeFirstRead;
                 }
-                self.render_view(viewport_height, None, false);
+                self.render_view(viewport_height);
             } else {
                 self.show_reread_conversation(
                     viewport_height,
@@ -650,9 +653,6 @@ impl App {
                     copy_row,
                     reloaded.session_id,
                 );
-            }
-            if let AppMode::View(state) = &mut self.app_mode {
-                state.is_copy_missing = false;
             }
         }
         self.run_deferred_copy();
@@ -975,16 +975,13 @@ impl App {
     }
 
     pub(super) fn re_render_view(&mut self, viewport_height: usize) {
-        self.render_view(viewport_height, None, false);
+        self.render_view(viewport_height);
     }
 
     /// Show `conversation`, the open session read again, where the reader
-    /// was: at the bottom, the view stays at the bottom so new messages show;
-    /// otherwise the same message stays at the top. Expanded rows stay
-    /// expanded where their entry is still there. A changed message count,
-    /// counted as message navigation steps through them, sets the view's
-    /// `CountHighlight`. The header shows `copy_row`, the conversation's
-    /// copy's catalogue row, or `header`'s row without it.
+    /// was (see [`Self::show_render`]). Expanded rows stay expanded where
+    /// their entry is still there. The header shows `copy_row`, the
+    /// conversation's copy's catalogue row, or `header`'s row without it.
     fn show_reread_conversation(
         &mut self,
         viewport_height: usize,
@@ -996,143 +993,164 @@ impl App {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let is_at_bottom = state.is_at_bottom(viewport_height);
-        let messages_before = state.message_ranges.len();
         let relocation = EntryRelocation::between(&state.parsed_conversation, &conversation);
         state.expanded_tool_outputs = state
             .expanded_tool_outputs
             .iter()
             .filter_map(|id| relocation.tool_output_id(id))
             .collect();
-        state.hovered_tool_output = None;
         state.show_reloaded_row(header, copy_row);
         state.session_id = session_id;
         state.parsed_conversation = conversation;
-        self.render_view(viewport_height, Some(&relocation), is_at_bottom);
+        state.rows_read = RowsRead::Earlier(relocation);
+        self.render_view(viewport_height);
+    }
+
+    /// Render the open conversation with the view's current options and show
+    /// the rows.
+    fn render_view(&mut self, viewport_height: usize) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        let options = self.view_render_options(state);
+        let rendered =
+            crate::tui::viewer::render_parsed_conversation(&state.parsed_conversation, &options);
+        self.show_render(viewport_height, rendered);
+    }
+
+    /// The options `state`'s conversation renders with: the view's modes,
+    /// width and expanded outputs, today's date and the clock's zone.
+    fn view_render_options(&self, state: &ViewState) -> RenderOptions {
+        RenderOptions {
+            tool_display: state.tool_display,
+            show_thinking: state.show_thinking,
+            show_timing: state.show_timing,
+            content_width: state.content_width(),
+            expanded_tool_outputs: state.expanded_tool_outputs.clone(),
+            can_expand: true,
+            today: self.today(),
+            zone: self.clock().zone(),
+        }
+    }
+
+    /// Show `rendered`, a render of the open conversation, keeping the anchor
+    /// message on its row and the focused call focused.
+    ///
+    /// Rows of an earlier read (`RowsRead::Earlier`) are a reload's: the
+    /// anchor and the focused call move into the newer read through the
+    /// relocation; a reader at the bottom stays at the bottom so new
+    /// messages show; and a changed message count, counted as message
+    /// navigation steps through them, sets the view's `CountHighlight`.
+    fn show_render(&mut self, viewport_height: usize, rendered: RenderedConversation) {
         let now = self.clock().now();
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
+        let rows_read = std::mem::replace(&mut state.rows_read, RowsRead::Current);
+        let relocation = match &rows_read {
+            RowsRead::Earlier(relocation) => Some(relocation),
+            RowsRead::Current | RowsRead::BeforeFirstRead => None,
+        };
+        let is_reload = relocation.is_some();
+        let stick_to_bottom = is_reload && state.is_at_bottom(viewport_height);
+        let messages_before = state.message_ranges.len();
+        let anchor = capture_anchor(
+            &state.message_ranges,
+            state.scroll_offset,
+            state.focused_message(),
+            state.message_nav_active,
+        )
+        .and_then(|anchor| match relocation {
+            Some(relocation) => Some(ScrollAnchor {
+                entry_index: relocation.get_or_previous(anchor.entry_index)?,
+                ..anchor
+            }),
+            None => Some(anchor),
+        });
+        let focused_call_id = Self::focused_call_range(state)
+            .map(|call| call.input.id.clone())
+            .and_then(|id| match relocation {
+                Some(relocation) => relocation.tool_output_id(&id),
+                None => Some(id),
+            });
+        let old_scroll = state.scroll_offset;
+
+        state.total_lines = rendered.lines.len();
+        state.rendered_lines = Arc::new(rendered.lines);
+        state.message_ranges = rendered.messages;
+        state.call_ranges = rendered.calls;
+        if !matches!(rows_read, RowsRead::Current) {
+            state.is_copy_missing = false;
+        }
+        if is_reload {
+            state.hovered_tool_output = None;
+        }
+
+        let max_scroll = state.total_lines.saturating_sub(viewport_height);
+
+        let resolved_idx = anchor
+            .and_then(|a| find_message_idx_or_prev(&state.message_ranges, a.entry_index))
+            .or_else(|| (!state.message_ranges.is_empty()).then_some(0));
+        // The call is found again by its id, not its index, so rows opening
+        // above it do not move the focus.
+        let resolved_call = focused_call_id.and_then(|id| {
+            state
+                .call_ranges
+                .iter()
+                .position(|call| call.input.id == id)
+        });
+        state.focus = resolved_idx.map(|message_index| Focus {
+            message_index,
+            call_index: resolved_call,
+        });
+
+        state.scroll_offset = match (anchor, resolved_idx) {
+            (Some(a), Some(idx)) => {
+                let new_msg = &state.message_ranges[idx];
+                let rel = if new_msg.entry_index == a.entry_index {
+                    a.relative_row
+                } else {
+                    a.relative_row.min(0)
+                };
+                let raw = new_msg.start_line as isize - rel;
+                raw.clamp(0, max_scroll as isize) as usize
+            }
+            _ => old_scroll.min(max_scroll),
+        };
+        if stick_to_bottom {
+            state.scroll_offset = max_scroll;
+            if state.message_nav_active {
+                Self::sync_focus_to_scroll(state, viewport_height);
+            }
+        }
+
         let messages_after = state.message_ranges.len();
-        if messages_after != messages_before {
+        if is_reload && messages_after != messages_before {
             state.count_highlight = Some(CountHighlight {
                 until: now + COUNT_HIGHLIGHT,
-                arrived_below: (is_at_bottom && messages_after > messages_before)
+                arrived_below: (stick_to_bottom && messages_after > messages_before)
                     .then(|| messages_after - messages_before),
             });
         }
-    }
 
-    /// Render the open conversation with the view's current options, keeping
-    /// the anchor message on its row and the focused call focused.
-    /// `relocation` carries both into a conversation read again; `None` when
-    /// the conversation is the one last rendered. With `stick_to_bottom`, the
-    /// view ends on the last row instead.
-    fn render_view(
-        &mut self,
-        viewport_height: usize,
-        relocation: Option<&EntryRelocation>,
-        stick_to_bottom: bool,
-    ) {
-        use crate::tui::viewer::render_parsed_conversation;
-
-        let clock = Arc::clone(self.environment.clock());
-
-        if let AppMode::View(ref mut state) = self.app_mode {
-            let anchor = capture_anchor(
-                &state.message_ranges,
-                state.scroll_offset,
-                state.focused_message(),
-                state.message_nav_active,
-            )
-            .and_then(|anchor| match relocation {
-                Some(relocation) => Some(ScrollAnchor {
-                    entry_index: relocation.get_or_previous(anchor.entry_index)?,
-                    ..anchor
-                }),
-                None => Some(anchor),
-            });
-            let focused_call_id = Self::focused_call_range(state)
-                .map(|call| call.input.id.clone())
-                .and_then(|id| match relocation {
-                    Some(relocation) => relocation.tool_output_id(&id),
-                    None => Some(id),
-                });
-            let old_scroll = state.scroll_offset;
-
-            let options = RenderOptions {
-                tool_display: state.tool_display,
-                show_thinking: state.show_thinking,
-                show_timing: state.show_timing,
-                content_width: state.content_width(),
-                expanded_tool_outputs: state.expanded_tool_outputs.clone(),
-                can_expand: true,
-                today: clock.today(),
-                zone: clock.zone(),
-            };
-            let rendered = render_parsed_conversation(&state.parsed_conversation, &options);
-            state.total_lines = rendered.lines.len();
-            state.rendered_lines = Arc::new(rendered.lines);
-            state.message_ranges = rendered.messages;
-            state.call_ranges = rendered.calls;
-
-            let max_scroll = state.total_lines.saturating_sub(viewport_height);
-
-            let resolved_idx = anchor
-                .and_then(|a| find_message_idx_or_prev(&state.message_ranges, a.entry_index))
-                .or_else(|| (!state.message_ranges.is_empty()).then_some(0));
-            // The call is found again by its id, not its index, so rows opening
-            // above it do not move the focus.
-            let resolved_call = focused_call_id.and_then(|id| {
-                state
-                    .call_ranges
-                    .iter()
-                    .position(|call| call.input.id == id)
-            });
-            state.focus = resolved_idx.map(|message_index| Focus {
-                message_index,
-                call_index: resolved_call,
-            });
-
-            state.scroll_offset = match (anchor, resolved_idx) {
-                (Some(a), Some(idx)) => {
-                    let new_msg = &state.message_ranges[idx];
-                    let rel = if new_msg.entry_index == a.entry_index {
-                        a.relative_row
-                    } else {
-                        a.relative_row.min(0)
-                    };
-                    let raw = new_msg.start_line as isize - rel;
-                    raw.clamp(0, max_scroll as isize) as usize
-                }
-                _ => old_scroll.min(max_scroll),
-            };
-            if stick_to_bottom {
-                state.scroll_offset = max_scroll;
-                if state.message_nav_active {
-                    Self::sync_focus_to_scroll(state, viewport_height);
-                }
-            }
-
-            // Search the query again over the new rows, without the pause: the
-            // old matches point at rows that moved. A paused search reads the
-            // new rows when it is sent.
-            if state.search_mode != ViewSearchMode::Off && !state.search_query.is_empty() {
-                state.search_matches.clear();
-                match state.pending_search {
-                    Some(PendingViewSearch::Paused { .. }) => {}
-                    Some(PendingViewSearch::Running {
-                        arrival: MatchesArrival::AtFirstMatch { .. },
-                        closes_without_matches,
-                        ..
-                    }) => self.send_query_search(closes_without_matches),
-                    Some(PendingViewSearch::Running {
-                        arrival: MatchesArrival::InPlace,
-                        closes_without_matches,
-                        ..
-                    }) => self.send_rerender_search(closes_without_matches),
-                    None => self.send_rerender_search(false),
-                }
+        // Search the query again over the new rows, without the pause: the
+        // old matches point at rows that moved. A paused search reads the
+        // new rows when it is sent.
+        if state.search_mode != ViewSearchMode::Off && !state.search_query.is_empty() {
+            state.search_matches.clear();
+            match state.pending_search {
+                Some(PendingViewSearch::Paused { .. }) => {}
+                Some(PendingViewSearch::Running {
+                    arrival: MatchesArrival::AtFirstMatch { .. },
+                    closes_without_matches,
+                    ..
+                }) => self.send_query_search(closes_without_matches),
+                Some(PendingViewSearch::Running {
+                    arrival: MatchesArrival::InPlace,
+                    closes_without_matches,
+                    ..
+                }) => self.send_rerender_search(closes_without_matches),
+                None => self.send_rerender_search(false),
             }
         }
     }

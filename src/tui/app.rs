@@ -51,7 +51,7 @@ pub(crate) use session_store::RefreshFailure;
 pub use types::{
     Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow, LIST_LINES_PER_ITEM,
     ListScope, ListSearchMode, LoadingState, MatchesArrival, OpenSessionStatus, PendingViewSearch,
-    SemanticProgress, SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewSpot,
+    RowsRead, SemanticProgress, SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewSpot,
     ViewState, list_lines_per_item,
 };
 
