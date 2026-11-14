@@ -17,9 +17,9 @@ use super::style::USER_LABEL;
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
-    SubagentReplyRenderSpec, TaskReportRenderSpec, ToolCallRenderSpec, ToolOutputKind,
-    ToolResultRenderSpec, make_reply_output_id, make_tool_output_id, render_subagent_reply,
-    render_task_report, render_tool_call, render_tool_result,
+    SubagentReplyRenderSpec, TASK_REPORT_RAW_ID, TaskReportRenderSpec, ToolCallRenderSpec,
+    ToolOutputKind, ToolResultRenderSpec, make_reply_output_id, make_tool_output_id,
+    render_subagent_reply, render_task_report, render_tool_call, render_tool_result,
 };
 use super::*;
 
@@ -301,7 +301,7 @@ fn render_user_message<'a>(
         printed |= !tool_blocks.is_empty();
     }
     if printed {
-        lines.push(RenderedLine::new(vec![]));
+        push_separator(lines);
     }
     tool_blocks
 }
@@ -324,7 +324,7 @@ fn render_assistant_message<'a>(
     }
     printed |= step_thinking(lines, ctx, &mut timing, blocks);
     if printed {
-        lines.push(RenderedLine::new(vec![]));
+        push_separator(lines);
     }
     tool_blocks
 }
@@ -345,7 +345,7 @@ fn step_user_text(
             ctx.parent_id,
             0,
             ToolOutputKind::ToolResult,
-            Some("task-report"),
+            Some(TASK_REPORT_RAW_ID),
         );
         render_task_report(
             lines,
@@ -489,7 +489,7 @@ fn step_tool_calls<'a>(
             continue;
         };
         if !tool_blocks.is_empty() {
-            lines.push(RenderedLine::new(vec![]));
+            push_separator(lines);
         }
         let output_id = make_tool_output_id(
             ctx.entry_index,
@@ -581,7 +581,7 @@ fn step_user_tool_results<'a>(
 ) {
     for row in collect_tool_result_rows(ctx, blocks) {
         if !tool_blocks.is_empty() {
-            lines.push(RenderedLine::new(vec![]));
+            push_separator(lines);
         }
         let row_timing = if ctx.style.is_subagent {
             timing.pad()

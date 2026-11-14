@@ -106,7 +106,7 @@ const OPENING_PROMPT: &str = r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z
 
 /// The opening prompt, then one assistant message of a call whose input is
 /// long enough to be truncated.
-fn write_tool_conversation(path: &std::path::Path) {
+pub(super) fn write_tool_conversation(path: &std::path::Path) {
     let line = r#"{"type":"assistant","timestamp":"2024-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive\nsix"}}]}}"#;
     std::fs::write(path, format!("{OPENING_PROMPT}\n{line}\n")).unwrap();
 }

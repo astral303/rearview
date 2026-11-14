@@ -2,6 +2,7 @@
 
 use super::RenderedLine;
 use super::output::RowContinuation;
+use super::rerender::ReplacedRows;
 use crate::search::literal::Literal;
 use std::ops::Range;
 
@@ -37,15 +38,48 @@ impl SearchMatch {
     pub fn last_row(&self) -> usize {
         self.rows[self.rows.len() - 1].row
     }
+
+    fn move_rows(&mut self, moved: impl Fn(usize) -> usize) {
+        for range in &mut self.rows {
+            range.row = moved(range.row);
+        }
+    }
 }
 
 /// The rows a search covers between two calls of its `keep_going`.
 const ROWS_BETWEEN_STOP_CHECKS: usize = 1024;
 
 /// [`find_matches_while`] to its end.
-#[cfg(test)]
 pub fn find_matches(lines: &[RenderedLine], query: &str) -> Vec<SearchMatch> {
     find_matches_while(lines, query, &|| true).expect("a search that keeps going finishes")
+}
+
+/// Update `matches`, the matches of `query` in the rows before `replaced`,
+/// to the matches in `lines`, the rows after it: drop the matches in the
+/// old rows, move the later ones by the change in rows, and search the new
+/// rows alone. Expects a wrapped line to start at the first replaced row
+/// and at the row after the last, as at an entry's rows: a match across
+/// either edge isn't updated.
+pub fn update_matches_in_replaced_rows(
+    matches: &mut Vec<SearchMatch>,
+    lines: &[RenderedLine],
+    query: &str,
+    replaced: &ReplacedRows,
+) {
+    let old_first = matches.partition_point(|found| found.first_row() < replaced.old.start);
+    let old_end = matches.partition_point(|found| found.first_row() < replaced.old.end);
+    for found in &mut matches[old_end..] {
+        found.move_rows(|row| replaced.moved(row));
+    }
+    let new_rows = replaced.new_rows();
+    let new_first_row = new_rows.start;
+    let new_matches = find_matches(&lines[new_rows], query)
+        .into_iter()
+        .map(|mut found| {
+            found.move_rows(|row| new_first_row + row);
+            found
+        });
+    matches.splice(old_first..old_end, new_matches);
 }
 
 /// Every match of `query` in `lines`, top to bottom. The rows of a wrapped

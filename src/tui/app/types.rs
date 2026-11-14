@@ -4,8 +4,8 @@ use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
 use crate::tui::viewer::{
-    CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderedLine, SearchMatch,
-    ToolDisplayMode, ToolOutputId,
+    CallRange, DetailCall, EntryRelocation, MessageRange, ParsedConversation, RenderedLine,
+    SearchMatch, ToolDisplayMode, ToolOutputId,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -140,6 +140,9 @@ pub struct ViewState {
     pub message_ranges: Vec<MessageRange>,
     /// The calls inside expanded tool runs, in line order
     pub call_ranges: Vec<CallRange>,
+    /// The top-level calls the detail modes drew, for the connectors an
+    /// entry rendered again paints
+    pub detail_calls: Vec<DetailCall>,
     /// Where message navigation points, `None` until a message is rendered
     pub focus: Option<Focus>,
     /// Whether message navigation mode is active (shows gutter indicator)
@@ -159,6 +162,11 @@ pub struct ViewState {
     /// The render on the `viewer-render` thread whose rows haven't arrived
     /// yet; the shown rows stay until they do.
     pub pending_render: Option<PendingRender>,
+    /// Entries, in `parsed_conversation`, whose outputs were expanded or
+    /// collapsed after the newest render was requested. Each renders again
+    /// in place once the shown rows are that render's and no search shares
+    /// them.
+    pub entries_to_render_again: BTreeSet<usize>,
     /// When the open session started showing as updating, for the spinner
     /// of the `updating` and `refreshing` status; `None` while it doesn't.
     pub updating_since: Option<crate::clock::Moment>,
@@ -393,6 +401,7 @@ impl ViewState {
             pending_search: None,
             message_ranges: Vec::new(),
             call_ranges: Vec::new(),
+            detail_calls: Vec::new(),
             focus: None,
             message_nav_active: false,
             expanded_tool_outputs: BTreeSet::new(),
@@ -401,6 +410,7 @@ impl ViewState {
             is_copy_missing: false,
             rows_read: RowsRead::Current,
             pending_render: None,
+            entries_to_render_again: BTreeSet::new(),
             updating_since: None,
             reload_rows_shown_at: None,
         }
