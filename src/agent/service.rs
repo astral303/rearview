@@ -599,6 +599,41 @@ fn command_operation(base: &history::CacheBase, meter: &LoadMeter) -> history::O
     )
 }
 
+/// A targeted command's arguments, checked. [`AgentService::open_targets`]
+/// runs `check` before key discovery and `resolve` after it.
+trait TargetedArgs: Sized {
+    type CliArgs;
+    /// The sessions the arguments name, among the keys.
+    type Resolved;
+
+    /// `args` with `config`'s defaults, and the time window resolved against
+    /// `clock`. Fails on an argument the command rejects before key
+    /// discovery.
+    fn check(args: &Self::CliArgs, config: config::ConfigFile, clock: &dyn Clock) -> Result<Self>;
+
+    fn window(&self) -> &TimeFilter;
+
+    fn resolve(
+        &self,
+        keys: &[agent::refs::AgentConversationKey],
+        canonicaliser: &Arc<dyn Canonicaliser>,
+    ) -> Result<Self::Resolved>;
+
+    /// The keys of the sessions the command reads.
+    fn targets(resolved: &Self::Resolved) -> Vec<&agent::refs::AgentConversationKey>;
+}
+
+/// The checked arguments, resolved refs, operation, discovery warnings and
+/// target keys that [`AgentService::open_targets`] returns.
+struct OpenedTargets<A: TargetedArgs> {
+    checked: A,
+    resolved: A::Resolved,
+    operation: history::OperationScope,
+    /// The warnings of key discovery.
+    warnings: Vec<AgentWarning>,
+    held: HeldTargets,
+}
+
 /// The keys of the sessions a command reads, by path, as holding the cache
 /// for reading left them.
 #[derive(Default)]
@@ -819,6 +854,50 @@ impl AgentService {
     fn discover_keys(&self, operation: &history::OperationScope) -> Result<DiscoveredKeys> {
         self.perf.time(Stage::Keys, || {
             discover_agent_keys(&self.environment, self.perf.load_meter(), operation)
+        })
+    }
+
+    /// The opening steps of `read`, `outline` and `within`: checks `args`,
+    /// discovers the keys, or takes `keys` from a test, resolves the refs
+    /// among them, then refreshes and checks the targets as
+    /// [`Self::hold_cache_for_reading`] does. A failure to resolve prints
+    /// after the discovery warnings.
+    fn open_targets<A: TargetedArgs>(
+        &self,
+        args: &A::CliArgs,
+        keys: Option<&[agent::refs::AgentConversationKey]>,
+    ) -> Result<OpenedTargets<A>> {
+        let checked = A::check(args, config::load_config()?, self.clock().as_ref())?;
+        let operation = command_operation(self.environment.cache_base(), self.perf.load_meter());
+        let discovered;
+        let (keys, warnings, reads) = match keys {
+            Some(keys) => (keys, Vec::new(), KeyedReads::default()),
+            None => {
+                let DiscoveredKeys {
+                    keys,
+                    warnings,
+                    reads,
+                } = self.discover_keys(&operation)?;
+                discovered = keys;
+                (discovered.as_slice(), warnings, reads)
+            }
+        };
+        let resolved = checked
+            .resolve(keys, self.environment.shared_canonicaliser())
+            .map_err(|error| failure_after_warnings(error, &warnings))?;
+        let (operation, held) = self.hold_cache_for_reading(
+            operation,
+            &A::targets(&resolved),
+            keys,
+            checked.window(),
+            reads,
+        )?;
+        Ok(OpenedTargets {
+            checked,
+            resolved,
+            operation,
+            warnings,
+            held,
         })
     }
 
@@ -1707,25 +1786,20 @@ impl AgentService {
     }
 
     fn run_within(&self, args: &cli::AgentWithinArgs) -> Result<CommandOutput> {
-        let config = config::load_config()?;
-        let search_config = config.search.unwrap_or_default();
-        let agent_config = config.agent.unwrap_or_default();
-        let window = args.time.resolve(self.clock().as_ref())?;
         let perf = &self.perf;
-        let operation = command_operation(self.environment.cache_base(), perf.load_meter());
-        let DiscoveredKeys {
-            keys,
+        let OpenedTargets {
+            checked:
+                CheckedWithin {
+                    agent_config,
+                    config_mode,
+                    window,
+                    ..
+                },
+            resolved,
+            operation,
             mut warnings,
-            reads,
-        } = self.discover_keys(&operation)?;
-        let resolved = resolve_agent_conversation_arg(
-            &args.conversation,
-            &keys,
-            self.environment.shared_canonicaliser(),
-        )
-        .map_err(|error| failure_after_warnings(error, &warnings))?;
-        let (operation, targets) =
-            self.hold_cache_for_reading(operation, &[&resolved.key], &keys, &window, reads)?;
+            held: targets,
+        } = self.open_targets::<CheckedWithin>(args, None)?;
         let key = targets.of_target(&resolved.key);
         let transcript = perf
             .time(Stage::Transcript, || {
@@ -1745,7 +1819,7 @@ impl AgentService {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_WITHIN_TOP, agent_config.within_top),
             cli_mode: args.mode_override(),
-            config_mode: agent_config.mode.or(search_config.mode),
+            config_mode,
             tui_semantic_search: None,
             budget: configured_budget(args.no_budget, args.budget, agent_config.output_chars),
             window,
@@ -1824,6 +1898,48 @@ impl AgentService {
         });
         operation.finish().fail_if_low_space()?;
         Ok(CommandOutput { records, warnings })
+    }
+}
+
+/// `agent within`'s arguments, checked. The conversation's syntax is
+/// checked when it is resolved, after key discovery.
+struct CheckedWithin {
+    agent_config: AgentConfig,
+    config_mode: Option<SearchMode>,
+    window: TimeFilter,
+    conversation: String,
+}
+
+impl TargetedArgs for CheckedWithin {
+    type CliArgs = cli::AgentWithinArgs;
+    type Resolved = agent::refs::ResolvedConversation;
+
+    fn check(args: &Self::CliArgs, config: config::ConfigFile, clock: &dyn Clock) -> Result<Self> {
+        let search_config = config.search.unwrap_or_default();
+        let agent_config = config.agent.unwrap_or_default();
+        let window = args.time.resolve(clock)?;
+        Ok(Self {
+            config_mode: agent_config.mode.or(search_config.mode),
+            agent_config,
+            window,
+            conversation: args.conversation.clone(),
+        })
+    }
+
+    fn window(&self) -> &TimeFilter {
+        &self.window
+    }
+
+    fn resolve(
+        &self,
+        keys: &[agent::refs::AgentConversationKey],
+        canonicaliser: &Arc<dyn Canonicaliser>,
+    ) -> Result<Self::Resolved> {
+        resolve_agent_conversation_arg(&self.conversation, keys, canonicaliser)
+    }
+
+    fn targets(resolved: &Self::Resolved) -> Vec<&agent::refs::AgentConversationKey> {
+        vec![&resolved.key]
     }
 }
 
@@ -3686,31 +3802,13 @@ impl AgentService {
         keys: Option<&[agent::refs::AgentConversationKey]>,
     ) -> Result<CommandOutput> {
         let perf = &self.perf;
-        let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
-        let read_refs = ParsedReadRefs::parse(args)?;
-        let operation = command_operation(self.environment.cache_base(), perf.load_meter());
-        let discovered;
-        let (keys, discovery_warnings, reads) = match keys {
-            Some(keys) => (keys, Vec::new(), KeyedReads::default()),
-            None => {
-                discovered = self.discover_keys(&operation)?;
-                (
-                    discovered.keys.as_slice(),
-                    discovered.warnings.clone(),
-                    discovered.reads,
-                )
-            }
-        };
-        let (mut resolved_refs, focus) = read_refs
-            .resolve(keys, self.environment.shared_canonicaliser())
-            .map_err(|error| failure_after_warnings(error, &discovery_warnings))?;
-        let targets: Vec<&agent::refs::AgentConversationKey> = resolved_refs
-            .iter()
-            .map(|(_, resolved)| &resolved.key)
-            .collect();
-        let (operation, refreshed_targets) =
-            self.hold_cache_for_reading(operation, &targets, keys, &options.window, reads)?;
+        let OpenedTargets {
+            checked: CheckedRead { options, .. },
+            resolved: (mut resolved_refs, focus),
+            operation,
+            warnings: discovery_warnings,
+            held: refreshed_targets,
+        } = self.open_targets::<CheckedRead>(args, keys)?;
         let transcripts = perf.time(Stage::Transcript, || {
             resolved_refs
                 .iter()
@@ -3797,27 +3895,17 @@ impl AgentService {
         keys: Option<&[agent::refs::AgentConversationKey]>,
     ) -> Result<CommandOutput> {
         let perf = &self.perf;
-        let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
-        let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
-        let operation = command_operation(self.environment.cache_base(), perf.load_meter());
-        let discovered;
-        let (keys, discovery_warnings, reads) = match keys {
-            Some(keys) => (keys, Vec::new(), KeyedReads::default()),
-            None => {
-                discovered = self.discover_keys(&operation)?;
-                (
-                    discovered.keys.as_slice(),
-                    discovered.warnings.clone(),
-                    discovered.reads,
-                )
-            }
-        };
-        let resolved = outline_ref
-            .resolve_conversation(keys, self.environment.shared_canonicaliser())
-            .map_err(|error| failure_after_warnings(error, &discovery_warnings))?;
-        let (operation, targets) =
-            self.hold_cache_for_reading(operation, &[&resolved.key], keys, &options.window, reads)?;
+        let OpenedTargets {
+            checked:
+                CheckedOutline {
+                    options,
+                    outline_ref,
+                },
+            resolved,
+            operation,
+            warnings: discovery_warnings,
+            held: targets,
+        } = self.open_targets::<CheckedOutline>(args, keys)?;
         let transcript = perf
             .time(Stage::Transcript, || {
                 self.load_transcript_for_range(
@@ -3851,6 +3939,77 @@ impl AgentService {
             .map_err(|error| target_error(error, &resolved))?;
         operation.finish().fail_if_low_space()?;
         Ok(CommandOutput { records, warnings })
+    }
+}
+
+/// `agent read`'s arguments, checked.
+struct CheckedRead {
+    options: agent::protocol::ProtocolOptions,
+    refs: ParsedReadRefs,
+}
+
+impl TargetedArgs for CheckedRead {
+    type CliArgs = AgentReadArgs;
+    type Resolved = (ResolvedReadRefs, Option<ResolvedFocus>);
+
+    fn check(args: &Self::CliArgs, config: config::ConfigFile, clock: &dyn Clock) -> Result<Self> {
+        let agent_config = config.agent.unwrap_or_default();
+        let options = agent_protocol_options(&args.output, &agent_config, clock)?;
+        let refs = ParsedReadRefs::parse(args)?;
+        Ok(Self { options, refs })
+    }
+
+    fn window(&self) -> &TimeFilter {
+        &self.options.window
+    }
+
+    fn resolve(
+        &self,
+        keys: &[agent::refs::AgentConversationKey],
+        canonicaliser: &Arc<dyn Canonicaliser>,
+    ) -> Result<Self::Resolved> {
+        self.refs.resolve(keys, canonicaliser)
+    }
+
+    fn targets((refs, _): &Self::Resolved) -> Vec<&agent::refs::AgentConversationKey> {
+        refs.iter().map(|(_, resolved)| &resolved.key).collect()
+    }
+}
+
+/// `agent outline`'s arguments, checked.
+struct CheckedOutline {
+    options: agent::protocol::ProtocolOptions,
+    outline_ref: agent::refs::ReadRef,
+}
+
+impl TargetedArgs for CheckedOutline {
+    type CliArgs = AgentOutlineArgs;
+    type Resolved = agent::refs::ResolvedConversation;
+
+    fn check(args: &Self::CliArgs, config: config::ConfigFile, clock: &dyn Clock) -> Result<Self> {
+        let agent_config = config.agent.unwrap_or_default();
+        let options = agent_protocol_options(&args.output, &agent_config, clock)?;
+        let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
+        Ok(Self {
+            options,
+            outline_ref,
+        })
+    }
+
+    fn window(&self) -> &TimeFilter {
+        &self.options.window
+    }
+
+    fn resolve(
+        &self,
+        keys: &[agent::refs::AgentConversationKey],
+        canonicaliser: &Arc<dyn Canonicaliser>,
+    ) -> Result<Self::Resolved> {
+        self.outline_ref.resolve_conversation(keys, canonicaliser)
+    }
+
+    fn targets(resolved: &Self::Resolved) -> Vec<&agent::refs::AgentConversationKey> {
+        vec![&resolved.key]
     }
 }
 

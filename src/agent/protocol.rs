@@ -5703,6 +5703,33 @@ mod tests {
     }
 
     #[test]
+    fn read_at_each_budget_is_cut_short_or_ends_with_its_warnings() {
+        let resolved = resolved("session.jsonl");
+        let transcript = long_session(24);
+        let warnings = warnings_of_two_kinds();
+        let read_with_warnings = |options| {
+            format_read_with_warnings(
+                &[whole_session_request(&resolved, &transcript)],
+                ReadPriority::Start,
+                None,
+                options,
+                &warnings,
+                written_at(),
+            )
+            .unwrap()
+        };
+        let unbudgeted = ProtocolOptions {
+            budget: None,
+            ..options()
+        };
+        let roomy = read_with_warnings(unbudgeted).chars().count() + 10;
+
+        assert_each_budget_cuts_short_or_ends_with_warnings(roomy, &warnings, |budget| {
+            read_with_warnings(with_budget(budget))
+        });
+    }
+
+    #[test]
     fn roomy_outline_shows_its_warning() {
         let resolved = resolved("session.jsonl");
         let transcript = long_session(2_000);
