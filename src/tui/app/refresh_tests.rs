@@ -2,6 +2,7 @@ use super::claude_home::{
     ClaudeHome, admitted_cache, another_rearview, app_reading, serve_list_refresh,
 };
 use super::refresh_state::AppliedChanges;
+use super::search_texts_tests::receive_until;
 use super::*;
 use crate::cache_file::test_support::TemporaryCacheDirectory;
 use crate::clock::TestClock;
@@ -601,6 +602,10 @@ fn session_refresh_discovers_its_sessions_once() {
     let b = home.write("b", 10, &["b"]);
     let a = home.write("a", 5, &["a"]);
     let mut app = home.app();
+    // Wait for the search worker's reads of the sessions' texts from the
+    // cache: a refresh whose check of the cache meets one of their locks
+    // reads under refresh ownership, and discovers the sessions again.
+    receive_until(&mut app, |app| !app.is_reading_search_texts());
     app.record_next_step(&a, NextStep::CacheInBackground);
     app.record_next_step(&b, NextStep::CacheInBackground);
     let listings_before = home.times_project_listed();
