@@ -458,7 +458,7 @@ impl App {
             header: Some(header),
             parsed_conversation: conversation,
             scroll_offset: 0,
-            rendered_lines: rendered.lines,
+            rendered_lines: Arc::new(rendered.lines),
             total_lines,
             tool_display: self.tool_display,
             show_thinking: self.show_thinking,
@@ -935,7 +935,7 @@ impl App {
             };
             let rendered = render_parsed_conversation(&state.parsed_conversation, &options);
             state.total_lines = rendered.lines.len();
-            state.rendered_lines = rendered.lines;
+            state.rendered_lines = Arc::new(rendered.lines);
             state.message_ranges = rendered.messages;
             state.call_ranges = rendered.calls;
 

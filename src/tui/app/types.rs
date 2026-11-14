@@ -113,8 +113,8 @@ pub struct ViewState {
     pub parsed_conversation: Arc<ParsedConversation>,
     /// Current scroll position (line offset)
     pub scroll_offset: usize,
-    /// Pre-rendered conversation lines
-    pub rendered_lines: Vec<RenderedLine>,
+    /// Pre-rendered conversation lines, shared with the viewer's search
+    pub rendered_lines: Arc<Vec<RenderedLine>>,
     /// Total content height in lines
     pub total_lines: usize,
     /// Tool display mode (hidden/truncated/full)
@@ -292,7 +292,7 @@ impl ViewState {
             header: None,
             parsed_conversation: Arc::new(ParsedConversation::empty()),
             scroll_offset: 0,
-            rendered_lines: Vec::new(),
+            rendered_lines: Arc::default(),
             total_lines: 0,
             tool_display,
             show_thinking,
