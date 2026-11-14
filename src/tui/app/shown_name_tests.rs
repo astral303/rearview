@@ -314,7 +314,7 @@ enum Launch {
 struct List {
     launch: Launch,
     app: App,
-    cache: tempfile::TempDir,
+    cache: crate::cache_file::test_support::TemporaryCacheDirectory,
 }
 
 impl List {
