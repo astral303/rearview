@@ -121,6 +121,9 @@
 - Fix `agent` commands dropping their warnings when `--budget` is too
   small for any complete output. They now print on stderr before
   `budget-too-small`.
+- Fix `agent read` and `agent outline` listing every agent's sessions before
+  rejecting a malformed ref, a flag the ref does not allow or `--after` later
+  than `--before`. They now fail at once.
 
 ### Changes
 
