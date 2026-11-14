@@ -228,12 +228,6 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
 
 /// The bottom bar while the viewer's read of the session to open runs.
 const OPENING_LABEL: &str = "Opening…";
-/// The viewer's bottom bar while a file opened directly, already shown, is
-/// read again: after `Ctrl+R`, or while its session refresh runs.
-const REFRESHING_SESSION_LABEL: &str = "Refreshing…";
-/// The viewer's bottom bar while the cached copy it shows waits for the
-/// session's refresh.
-const UPDATING_SESSION_LABEL: &str = "Updating…";
 /// The viewer's bottom bar while the session is missing from the cache,
 /// until its refresh finishes.
 const LOADING_SESSION_LABEL: &str = "Loading…";
@@ -244,13 +238,14 @@ const ANOTHER_REFRESH_LABEL: &str = "Another rearview is refreshing…";
 /// cache, as another rearview's rebuild holds.
 const ANOTHER_REBUILD_LABEL: &str = "Another rearview is rebuilding the session cache…";
 
-/// The viewer's bottom bar label for `status`, the open session's.
-fn open_session_label(app: &App, status: OpenSessionStatus) -> &'static str {
+/// The label in place of the viewer's whole bottom bar for `status`, the
+/// open session's; `None` for an update, which the bar's mode cell shows
+/// ([`App::view_mode_cell_status_text`]).
+fn open_session_label(status: OpenSessionStatus) -> Option<&'static str> {
     match status {
-        OpenSessionStatus::AnotherRearview(activity) => another_rearview_label(activity),
-        OpenSessionStatus::Loading => LOADING_SESSION_LABEL,
-        OpenSessionStatus::Updating if app.is_refreshing_open_session() => REFRESHING_SESSION_LABEL,
-        OpenSessionStatus::Updating => UPDATING_SESSION_LABEL,
+        OpenSessionStatus::AnotherRearview(activity) => Some(another_rearview_label(activity)),
+        OpenSessionStatus::Loading => Some(LOADING_SESSION_LABEL),
+        OpenSessionStatus::Updating => None,
     }
 }
 
@@ -1036,8 +1031,8 @@ fn top_row_day(state: &ViewState, today: NaiveDate, zone: Zone) -> Option<String
 }
 
 fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
-    if let Some(status) = app.open_session_status() {
-        render_activity_status(frame, open_session_label(app, status), area);
+    if let Some(label) = app.open_session_status().and_then(open_session_label) {
+        render_activity_status(frame, label, area);
         return;
     }
 
@@ -1077,6 +1072,14 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
     let tools_status = state.tool_display.status_label();
     let thinking_status = if state.show_thinking { "on " } else { "off" };
     let timing_status = if state.show_timing { "on " } else { "off" };
+    let mode_cell = [
+        Span::styled("t", key_style),
+        Span::styled(format!("ools·{} ", tools_status), label_style),
+        Span::styled("T", key_style),
+        Span::styled(format!("hink·{} ", thinking_status), label_style),
+        Span::styled("i", key_style),
+        Span::styled(format!("nfo·{}", timing_status), label_style),
+    ];
 
     let mut spans = vec![
         Span::raw("  "),
@@ -1084,16 +1087,24 @@ fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area:
         Span::styled(scroll_pos.total, total_style),
         Span::styled(scroll_pos.after_total, scroll_pos_style),
         Span::raw("  "),
-        Span::styled("t", key_style),
-        Span::styled(format!("ools·{} ", tools_status), label_style),
-        Span::styled("T", key_style),
-        Span::styled(format!("hink·{} ", thinking_status), label_style),
-        Span::styled("i", key_style),
-        Span::styled(format!("nfo·{}", timing_status), label_style),
+    ];
+    match app.view_mode_cell_status_text() {
+        // The status takes the modes' columns, so `│` and the keys keep
+        // theirs.
+        Some(status) => {
+            let width = mode_cell.iter().map(Span::width).sum();
+            spans.push(Span::styled(
+                format!("{status:<width$}"),
+                Style::default().fg(rgb(th().text_secondary)),
+            ));
+        }
+        None => spans.extend(mode_cell),
+    }
+    spans.extend([
         Span::raw("  "),
         Span::styled("│", label_style),
         Span::raw("  "),
-    ];
+    ]);
 
     let shows_search = !state.search_matches.is_empty() || state.pending_search.is_some();
     if state.search_mode == ViewSearchMode::Active && shows_search {
@@ -2518,6 +2529,7 @@ mod tests {
         let mut app = viewer_on_cached_session(&path, 80);
         app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), 17);
         app.handle_key(KeyCode::Right, KeyModifiers::empty(), 17);
+        crate::tui::app::test_waits::finish_view_render(&mut app, 17);
         let AppMode::View(state) = app.app_mode() else {
             unreachable!()
         };
@@ -2681,6 +2693,7 @@ mod tests {
         assert!(!untimed.contains(&first_day), "{untimed}");
 
         app.handle_key(KeyCode::Char('i'), KeyModifiers::empty(), 4);
+        crate::tui::app::test_waits::finish_view_render(&mut app, 4);
         let top = scroll_position(view_state(&app), today, Zone::System).to_string();
         assert!(top.contains(&format!(" {first_day}]")), "{top}");
 
@@ -2711,7 +2724,8 @@ mod tests {
         }
         let frame_width = (40..=100)
             .find(|&width| {
-                app.check_view_resize(width, 17);
+                app.check_view_resize(width);
+                crate::tui::app::test_waits::finish_view_render(&mut app, 17);
                 crate::tui::app::test_waits::finish_view_search(&mut app);
                 let AppMode::View(state) = app.app_mode() else {
                     unreachable!()
@@ -3731,7 +3745,8 @@ mod tests {
             KeyBindings::default(),
             test_environment(Vec::new(), None),
         );
-        app.check_view_resize(160, 10);
+        app.check_view_resize(160);
+        crate::tui::app::test_waits::finish_view_render(&mut app, 10);
         app
     }
 
@@ -3926,20 +3941,82 @@ mod tests {
         assert!(quit < refresh, "{line:?}");
     }
 
-    #[test]
-    fn pending_viewer_refresh_labels_bottom_bar_refreshing() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = viewer_app(&dir);
+    /// The column, counted in characters, where `needle` starts in `row`.
+    fn char_column(row: &str, needle: &str) -> usize {
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {row:?}"));
+        row[..byte].chars().count()
+    }
 
+    /// The bar for `app` before `Ctrl+R`, then after it: at the request,
+    /// 100 ms after it and 1.1 s after it, as the event loop notes the update
+    /// on each pass.
+    fn bars_around_refresh(app: &mut App) -> [String; 4] {
+        let before = viewer_status_bar(app);
         app.handle_key(
             crossterm::event::KeyCode::Char('r'),
             crossterm::event::KeyModifiers::CONTROL,
             10,
         );
+        let mut bar_after = |pause_ms: u64| {
+            app.clock()
+                .sleep(std::time::Duration::from_millis(pause_ms));
+            app.note_open_session_update();
+            viewer_status_bar(app)
+        };
+        [before, bar_after(0), bar_after(100), bar_after(1000)]
+    }
 
-        let line = viewer_status_bar(&app);
-        assert!(line.contains("Refreshing…"), "{line:?}");
-        assert!(!line.contains("quit"), "{line:?}");
+    /// `label` after `Ctrl+R` in `app`: the modes until 100 ms, then the
+    /// spinner and `label` in their place, and the seconds from 1 s, with
+    /// `│` and the keys kept.
+    fn assert_refresh_status_takes_mode_cell(app: &mut App, label: &str) {
+        let [before, at_request, spinning, counting] = bars_around_refresh(app);
+
+        assert!(
+            at_request.contains("tools·") && !at_request.contains(label),
+            "nothing new before 100 ms: {at_request:?}"
+        );
+        assert!(
+            spinning.contains(&format!("⠙ {label}")) && !spinning.contains("tools·"),
+            "the status takes the modes' place: {spinning:?}"
+        );
+        assert!(
+            counting.contains(&format!("⠸ {label} 1s")),
+            "the seconds show from 1 s: {counting:?}"
+        );
+        assert_eq!(
+            [&spinning, &counting].map(|row| char_column(row, "│")),
+            [char_column(&before, "│"); 2],
+            "`│` keeps its column"
+        );
+        assert!(
+            counting.contains("quit") && counting.contains("^R refresh"),
+            "the keys stay: {counting:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_of_file_opened_directly_shows_refreshing_in_mode_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = viewer_app(&dir);
+
+        assert_refresh_status_takes_mode_cell(&mut app, "refreshing");
+    }
+
+    #[test]
+    fn refresh_of_cached_copy_shows_updating_in_mode_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","message":{"role":"user","content":"hello"}}"#.to_owned() + "\n",
+        )
+        .unwrap();
+        let mut app = viewer_on_cached_session(&path, 80);
+
+        assert_refresh_status_takes_mode_cell(&mut app, "updating");
     }
 
     #[test]

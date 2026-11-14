@@ -33,12 +33,13 @@ mod exact_literal;
 mod input_controller;
 mod list_state;
 mod refresh_state;
-mod search_generation;
+mod request_generation;
 mod search_state;
 mod search_worker;
 mod session_store;
 mod types;
 mod view_state;
+mod viewer_render;
 mod viewer_search;
 #[allow(unused_imports)]
 use search_state::{SemanticSearchState, SessionIdQuery};
@@ -50,9 +51,9 @@ pub(crate) use session_store::RefreshFailure;
 #[allow(unused_imports)]
 pub use types::{
     Action, AppMode, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow, LIST_LINES_PER_ITEM,
-    ListScope, ListSearchMode, LoadingState, MatchesArrival, OpenSessionStatus, PendingViewSearch,
-    SemanticProgress, SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewSpot,
-    ViewState, list_lines_per_item,
+    ListScope, ListSearchMode, LoadingState, MatchesArrival, OpenSessionStatus, PendingRender,
+    PendingViewSearch, RowsRead, SemanticProgress, SemanticResultMetadata, TuiSearchOptions,
+    ViewSearchMode, ViewSpot, ViewState, list_lines_per_item,
 };
 
 /// App state
@@ -128,7 +129,7 @@ pub struct App {
     texts_held: TextsHeld,
     /// The `UpdateData` commands sent to the search worker
     search_data_sent: u64,
-    search_generation: search_generation::SearchGeneration,
+    search_generation: request_generation::RequestGeneration,
     /// When the search in flight on the worker thread was dispatched; `None`
     /// once its results are on screen
     search_started_at: Option<Moment>,
@@ -151,6 +152,9 @@ pub struct App {
     lexical_evidence: HashMap<usize, search::LexicalEvidence>,
     /// The viewer's search thread, started by the first viewer search
     viewer_search: Option<viewer_search::ViewerSearchWorker>,
+    /// The `viewer-render` thread, started by the first render request of
+    /// any kind; it serves every session opened later
+    viewer_render: Option<viewer_render::ViewerRenderWorker>,
     /// `None` while the query is ordinary text
     session_id_query: Option<SessionIdQuery>,
     /// The session open (`Enter`) or a row click named, until the load runs
@@ -243,24 +247,38 @@ enum DirectFileJob {
     Running,
 }
 
-const SEARCH_SPINNER_DELAY: Duration = Duration::from_millis(100);
-const SEARCH_SPINNER_FRAME: Duration = Duration::from_millis(80);
-const SEARCH_SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_DELAY: Duration = Duration::from_millis(100);
+const SPINNER_FRAME: Duration = Duration::from_millis(80);
+const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Beside the spinner while a search runs.
+const SEARCHING_LABEL: &str = "searching";
+/// In the viewer's mode cell while the rows shown are rendered again.
+const RENDERING_LABEL: &str = "rendering";
+/// In the viewer's mode cell while the cached copy it shows waits for the
+/// session's refresh.
+const UPDATING_LABEL: &str = "updating";
+/// In the viewer's mode cell while a file opened directly, already shown, is
+/// read again: after `Ctrl+R`, or while its session refresh runs.
+const REFRESHING_LABEL: &str = "refreshing";
 
-/// The status of a search running for `elapsed`: none before
-/// `SEARCH_SPINNER_DELAY`, then a spinner glyph and `searching` and, from one
-/// second on, the whole seconds it has run (`⠋ searching 1s`).
-fn searching_status(elapsed: Duration) -> Option<String> {
-    if elapsed < SEARCH_SPINNER_DELAY {
+/// The status of work running for `elapsed`, labelled `label`: none before
+/// `SPINNER_DELAY`, then a spinner glyph and the label and, from one second
+/// on, the whole seconds it has run (`⠋ searching 1s`).
+fn spinner_status(label: &str, elapsed: Duration) -> Option<String> {
+    spinner_status_counting(label, elapsed, elapsed)
+}
+
+/// [`spinner_status`] for work running for `elapsed`, showing the whole
+/// seconds of `counted` in place of `elapsed`'s.
+fn spinner_status_counting(label: &str, elapsed: Duration, counted: Duration) -> Option<String> {
+    if elapsed < SPINNER_DELAY {
         return None;
     }
-    let frame = (elapsed.as_millis() / SEARCH_SPINNER_FRAME.as_millis()) as usize;
-    let glyph = SEARCH_SPINNER_GLYPHS[frame % SEARCH_SPINNER_GLYPHS.len()];
-    let seconds = elapsed.as_secs();
-    Some(if seconds == 0 {
-        format!("{glyph} searching")
-    } else {
-        format!("{glyph} searching {seconds}s")
+    let frame = (elapsed.as_millis() / SPINNER_FRAME.as_millis()) as usize;
+    let glyph = SPINNER_GLYPHS[frame % SPINNER_GLYPHS.len()];
+    Some(match counted.as_secs() {
+        0 => format!("{glyph} {label}"),
+        seconds => format!("{glyph} {label} {seconds}s"),
     })
 }
 
@@ -334,6 +352,7 @@ impl App {
             semantic_search: parts.semantic_search,
             lexical_evidence: HashMap::new(),
             viewer_search: None,
+            viewer_render: None,
             session_id_query: None,
             pending_open: None,
             pending_view_reload: None,
@@ -793,17 +812,20 @@ impl App {
             crate::history::missing_earlier_turns_terms(&self.conversations);
     }
 
-    /// The status text for a search still running `SEARCH_SPINNER_DELAY`
-    /// after its keystroke: a spinner glyph, `searching`, and from the first
-    /// second on the whole seconds elapsed. A search that resolves sooner
-    /// shows nothing, so a fast keystroke does not flicker. A new keystroke
+    /// The status text for a search still running `SPINNER_DELAY` after its
+    /// keystroke: a spinner glyph, `searching`, and from the first second on
+    /// the whole seconds elapsed. A search that resolves sooner shows
+    /// nothing, so a fast keystroke does not flicker. A new keystroke
     /// restarts the seconds, so the drop to none shows the restart.
     pub fn search_status_text(&self) -> Option<String> {
-        searching_status(self.clock().elapsed_since(self.search_started_at?))
+        spinner_status(
+            SEARCHING_LABEL,
+            self.clock().elapsed_since(self.search_started_at?),
+        )
     }
 
     /// The status of the viewer's running search, in the list's form
-    /// (`searching_status`), counted from when the search was sent; `None`
+    /// (`spinner_status`), counted from when the search was sent; `None`
     /// while the search is paused or none runs.
     pub fn view_search_status_text(&self) -> Option<String> {
         let AppMode::View(state) = &self.app_mode else {
@@ -812,7 +834,71 @@ impl App {
         let Some(PendingViewSearch::Running { started, .. }) = state.pending_search else {
             return None;
         };
-        searching_status(self.clock().elapsed_since(started))
+        spinner_status(SEARCHING_LABEL, self.clock().elapsed_since(started))
+    }
+
+    /// The status the viewer's mode cell shows in place of the modes: the
+    /// open session's update (`⠋ updating 3s`, or `refreshing` for a file
+    /// opened directly) over the render of its rows (`⠋ rendering 2s`);
+    /// `None` while neither has run `SPINNER_DELAY`.
+    pub fn view_mode_cell_status_text(&self) -> Option<String> {
+        self.open_session_update_status_text()
+            .or_else(|| self.view_render_status_text())
+    }
+
+    /// The status of the open session's update, in the search's form, while
+    /// the viewer shows it as updating over its rows. The spinner shows from
+    /// `SPINNER_DELAY` after the session started showing as updating; the
+    /// seconds count from then, or from when a reload's rows last showed,
+    /// whichever is later.
+    fn open_session_update_status_text(&self) -> Option<String> {
+        let AppMode::View(state) = &self.app_mode else {
+            return None;
+        };
+        if self.open_session_status() != Some(OpenSessionStatus::Updating) {
+            return None;
+        }
+        let updating_since = state.updating_since?;
+        let counted_since = state
+            .reload_rows_shown_at
+            .map_or(updating_since, |shown| shown.max(updating_since));
+        let label = if self.is_refreshing_open_session() {
+            REFRESHING_LABEL
+        } else {
+            UPDATING_LABEL
+        };
+        spinner_status_counting(
+            label,
+            self.clock().elapsed_since(updating_since),
+            self.clock().elapsed_since(counted_since),
+        )
+    }
+
+    /// The status of the viewer's render, in the search's form
+    /// (`⠋ rendering 2s`), counted from the first request whose
+    /// rows haven't shown; `None` while no render runs, or before
+    /// `SPINNER_DELAY`.
+    fn view_render_status_text(&self) -> Option<String> {
+        let AppMode::View(state) = &self.app_mode else {
+            return None;
+        };
+        let since = state.pending_render?.since;
+        spinner_status(RENDERING_LABEL, self.clock().elapsed_since(since))
+    }
+
+    /// Record when the open session started showing as updating, for the
+    /// spinner and the seconds of its update's status, and forget it once it
+    /// doesn't. The event loop calls this on every pass before drawing.
+    pub(crate) fn note_open_session_update(&mut self) {
+        let is_updating = self.is_open_session_updating();
+        let now = self.clock().now();
+        if let AppMode::View(state) = &mut self.app_mode {
+            state.updating_since = match (is_updating, state.updating_since) {
+                (true, Some(since)) => Some(since),
+                (true, None) => Some(now),
+                (false, _) => None,
+            };
+        }
     }
 
     /// The search bar's text after the result count while the list's search
@@ -999,24 +1085,20 @@ impl App {
             && matches!(&self.app_mode, AppMode::View(state) if !state.is_copy_missing)
     }
 
-    /// Show the open session again once its refresh finished: once the read
-    /// of its copy lands within `wait`, or the file opened directly as
-    /// parsed. A newer refresh's row queued behind the read starts its own
-    /// read then. True when it showed, so the caller draws the result next.
-    pub fn complete_pending_view_refresh(
-        &mut self,
-        viewport_height: usize,
-        wait: Duration,
-    ) -> bool {
+    /// Show the open session again once its refresh finished: render it once
+    /// the read of its copy arrives within `wait`, or the file opened
+    /// directly as parsed. A newer refresh's row queued behind the read
+    /// starts its own read once the rows of this one show. True when the read
+    /// arrived, so the caller draws next.
+    pub fn complete_pending_view_refresh(&mut self, wait: Duration) -> bool {
         let Some(reload) = self.pending_view_reload.take() else {
             return false;
         };
         match reload.finish(wait) {
             Ok(((reloaded, read), queued)) => {
-                self.pending_view_reload = queued.map(|queued| {
-                    view_state::PendingReload::start(queued, self.interactive_cache())
-                });
-                self.reload_open_session(viewport_height, reloaded, read);
+                self.pending_view_reload = queued.map(view_state::PendingReload::Queued);
+                self.reload_open_session(reloaded, read);
+                self.start_queued_reload();
                 true
             }
             Err(reload) => {
@@ -1133,6 +1215,9 @@ mod listing_tests;
 
 #[cfg(test)]
 mod viewer_refresh_tests;
+
+#[cfg(test)]
+mod viewer_render_tests;
 
 #[cfg(test)]
 mod viewer_search_tests;

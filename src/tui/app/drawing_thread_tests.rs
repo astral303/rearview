@@ -209,7 +209,10 @@ const VIEWER_ACTIONS: &[AppAction] = &[
     ("the viewer reload", |app, _| {
         super::test_waits::finish_pending_view_reload(app, VIEWPORT);
     }),
-    ("a frame", |app, _| app.re_render_view(VIEWPORT)),
+    ("a frame", |app, _| {
+        app.request_view_render();
+        super::test_waits::finish_view_render(app, VIEWPORT);
+    }),
     ("a viewer Ctrl+R", |app, _| {
         press_ctrl(app, KeyCode::Char('r'));
     }),
@@ -593,7 +596,8 @@ fn file_opened_directly_doesnt_read_on_drawing_thread_while_another_process_writ
     );
 
     let started = Instant::now();
-    app.re_render_view(20);
+    app.request_view_render();
+    super::test_waits::finish_view_render(&mut app, 20);
 
     assert!(started.elapsed() < WITHOUT_WAITING);
     assert!(

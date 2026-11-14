@@ -2,7 +2,7 @@
 //! session's rows can take over a second, and the drawing thread keeps
 //! reading keys while it runs.
 
-use super::search_generation::{AwaitedSearch, SearchGeneration};
+use super::request_generation::{AwaitedRequest, RequestGeneration};
 use crate::tui::viewer::{RenderedLine, SearchMatch, find_matches_while};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -30,7 +30,7 @@ pub(super) struct Found {
 pub(super) struct ViewerSearchWorker {
     requests: mpsc::Sender<Request>,
     found: mpsc::Receiver<Found>,
-    generation: SearchGeneration,
+    generation: RequestGeneration,
     /// `None` once joined after a panic.
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -47,7 +47,7 @@ impl ViewerSearchWorker {
     pub(super) fn spawn_with(search: SearchRows) -> Self {
         let (requests, waiting) = mpsc::channel::<Request>();
         let (found_tx, found) = mpsc::channel();
-        let (generation, awaited) = SearchGeneration::start();
+        let (generation, awaited) = RequestGeneration::start();
         let thread = std::thread::Builder::new()
             .name("viewer-search".into())
             .spawn(move || serve(&waiting, &found_tx, &awaited, &search))
@@ -123,7 +123,7 @@ impl Drop for ViewerSearchWorker {
 fn serve(
     waiting: &mpsc::Receiver<Request>,
     found: &mpsc::Sender<Found>,
-    awaited: &AwaitedSearch,
+    awaited: &AwaitedRequest,
     search: &SearchRows,
 ) {
     while let Ok(oldest) = waiting.recv() {

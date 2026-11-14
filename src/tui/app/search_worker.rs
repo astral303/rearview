@@ -4,7 +4,7 @@
 //! as inputs only this module builds.
 
 use super::ListSearchMode;
-use super::search_generation::{AwaitedSearch, SearchGeneration};
+use super::request_generation::{AwaitedRequest, RequestGeneration};
 use crate::clock::Clock;
 use crate::history::Conversation;
 use crate::search::query::ParsedQuery;
@@ -136,7 +136,7 @@ pub(super) struct SearchWorkerState {
     /// The search last run, run again when texts arrive while the app awaits
     /// its generation.
     last_search: Option<SearchRequest>,
-    awaited_search: AwaitedSearch,
+    awaited_search: AwaitedRequest,
     /// The `UpdateData` commands applied.
     updates_applied: u64,
 }
@@ -179,7 +179,7 @@ impl SearchWorkerState {
     pub(super) fn new(
         copies_to_read: mpsc::Sender<TextsToRead>,
         texts_reply: mpsc::Sender<WorkerInput>,
-        awaited_search: AwaitedSearch,
+        awaited_search: AwaitedRequest,
     ) -> Self {
         Self {
             conversations: Arc::new(Vec::new()),
@@ -290,7 +290,7 @@ pub(super) fn spawn_search_worker(clock: Arc<dyn Clock>) -> SearchWorker {
     let (input_tx, input_rx) = mpsc::channel::<WorkerInput>();
     let (res_tx, res_rx) = mpsc::channel::<SearchResponse>();
     let (texts_held_tx, texts_held_rx) = mpsc::channel::<TextsHeld>();
-    let (generation, awaited_search) = SearchGeneration::start();
+    let (generation, awaited_search) = RequestGeneration::start();
     let texts_reply = input_tx.clone();
 
     std::thread::Builder::new()
@@ -345,7 +345,7 @@ pub(super) struct SearchWorker {
     /// The sessions without texts held, whenever the count may have changed.
     pub(super) texts_held: mpsc::Receiver<TextsHeld>,
     /// The search generation, whose awaited search the worker reads.
-    pub(super) generation: SearchGeneration,
+    pub(super) generation: RequestGeneration,
 }
 
 /// Start the thread reading the search texts of each batch of copies sent

@@ -4,8 +4,8 @@ use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
 use crate::tui::viewer::{
-    CallRange, MessageRange, ParsedConversation, RenderedLine, SearchMatch, ToolDisplayMode,
-    ToolOutputId,
+    CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderedLine, SearchMatch,
+    ToolDisplayMode, ToolOutputId,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -154,6 +154,46 @@ pub struct ViewState {
     /// True while the session is missing from the session cache, so the
     /// view doesn't show any messages.
     pub is_copy_missing: bool,
+    /// The read of the conversation the rows were rendered from.
+    pub rows_read: RowsRead,
+    /// The render on the `viewer-render` thread whose rows haven't arrived
+    /// yet; the shown rows stay until they do.
+    pub pending_render: Option<PendingRender>,
+    /// When the open session started showing as updating, for the spinner
+    /// of the `updating` and `refreshing` status; `None` while it doesn't.
+    pub updating_since: Option<crate::clock::Moment>,
+    /// When a reload's rows last showed: the seconds of the `updating` and
+    /// `refreshing` status count from then while the session keeps
+    /// updating, so they report the current refresh.
+    pub reload_rows_shown_at: Option<crate::clock::Moment>,
+}
+
+/// The viewer's newest render request, until its rows arrive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingRender {
+    /// The number marking the newest render: rows of any other aren't shown.
+    pub generation: u64,
+    /// When the first request whose rows haven't shown was made: a newer
+    /// request superseding it keeps this moment.
+    pub since: crate::clock::Moment,
+    /// An entry: once the rows arrive, the first call of its message is
+    /// focused if that message is. Expanding a tool run at its message stop
+    /// focuses its first call, which only the new rows show.
+    pub focus_first_call_of: Option<usize>,
+}
+
+/// The read of the open conversation that the viewer's rows show.
+#[derive(Clone, Debug)]
+pub enum RowsRead {
+    /// `ViewState::parsed_conversation`.
+    Current,
+    /// A read before `ViewState::parsed_conversation`: a reload's read has
+    /// arrived, and its rows have not. The relocation finds the rows'
+    /// entries in the newer read.
+    Earlier(EntryRelocation),
+    /// The empty conversation of a file opened directly, before its first
+    /// read shows from the top.
+    BeforeFirstRead,
 }
 
 /// The fields of a session's row that the view's header shows. The row's
@@ -230,7 +270,8 @@ pub enum PendingViewSearch {
 /// Where the view goes when a search's matches arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchesArrival {
-    /// The view stays where it is, as for the search of a re-render's rows.
+    /// The view stays where it is, on the first match at or below its top
+    /// row, as for the search of rows rendered again.
     InPlace,
     /// The view scrolls to the first match, unless it moved from `from` while
     /// the search ran.
@@ -358,6 +399,10 @@ impl ViewState {
             hovered_tool_output: None,
             count_highlight: None,
             is_copy_missing: false,
+            rows_read: RowsRead::Current,
+            pending_render: None,
+            updating_since: None,
+            reload_rows_shown_at: None,
         }
     }
 
@@ -379,6 +424,30 @@ impl ViewState {
 
     pub fn focused_call(&self) -> Option<usize> {
         self.focus.and_then(|focus| focus.call_index)
+    }
+
+    /// True from the arrival of a reload's read, the first read of a file
+    /// opened directly included, until its rows show.
+    pub fn awaits_reload_rows(&self) -> bool {
+        !matches!(self.rows_read, RowsRead::Current)
+    }
+
+    /// `id`, taken from the shown rows, in `parsed_conversation`; `None`
+    /// when its entry is gone from a reload's read.
+    pub fn id_in_newest_read(&self, id: ToolOutputId) -> Option<ToolOutputId> {
+        match &self.rows_read {
+            RowsRead::Earlier(relocation) => relocation.tool_output_id(&id),
+            RowsRead::Current | RowsRead::BeforeFirstRead => Some(id),
+        }
+    }
+
+    /// `entry_index`, a shown row's entry, in `parsed_conversation`; `None`
+    /// when the entry is gone from a reload's read.
+    pub fn entry_in_newest_read(&self, entry_index: usize) -> Option<usize> {
+        match &self.rows_read {
+            RowsRead::Earlier(relocation) => relocation.get(entry_index),
+            RowsRead::Current | RowsRead::BeforeFirstRead => Some(entry_index),
+        }
     }
 }
 

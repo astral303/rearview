@@ -1,12 +1,12 @@
 use super::{ParsedConversation, ToolOutputId};
 use crate::history::EntryOrigin;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Where each entry of an earlier read of a conversation sits in a later
 /// read, found by the record it was read from. When a sub-agent writes more,
 /// its new turns are spliced in before later entries, shifting their indices;
 /// each entry's origin stays.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EntryRelocation {
     earlier: Vec<EntryOrigin>,
     later: HashMap<EntryOrigin, usize>,
@@ -24,6 +24,15 @@ impl EntryRelocation {
                 .map(|(entry_index, origin)| (origin, entry_index))
                 .collect(),
         }
+    }
+
+    /// The later indices of the earlier read's entries that the later read
+    /// still contains.
+    pub fn later_indices_of_earlier_entries(&self) -> HashSet<usize> {
+        self.earlier
+            .iter()
+            .filter_map(|origin| self.later.get(origin).copied())
+            .collect()
     }
 
     /// The later index of the entry at `old_index`; `None` when the later read

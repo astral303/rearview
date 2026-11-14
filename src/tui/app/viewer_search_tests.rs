@@ -4,7 +4,7 @@
 use super::interaction_tests::{
     app_with_tool_conversation, press, view_state, write_named_conversation,
 };
-use super::test_waits::{VIEWER_READ_LANDS, finish_view_search};
+use super::test_waits::{VIEWER_READ_LANDS, finish_view_render, finish_view_search};
 use super::view_state::VIEW_SEARCH_PAUSE;
 use super::viewer_search::ViewerSearchWorker;
 use super::*;
@@ -411,7 +411,8 @@ fn rerender_while_matches_show_searches_again_without_pause() {
     press(&mut app, KeyCode::Enter);
     finish_view_search(&mut app);
 
-    app.check_view_resize(60, 17);
+    app.check_view_resize(60);
+    finish_view_render(&mut app, 17);
 
     assert!(is_running(&app), "the search is sent without the pause");
     assert!(
@@ -421,6 +422,89 @@ fn rerender_while_matches_show_searches_again_without_pause() {
     finish_view_search(&mut app);
     assert_eq!(searched(&searches), [finished("cache"), finished("cache")]);
     assert_eq!(view_state(&app).search_matches.len(), 2);
+}
+
+/// Three matches of `cache rebuild`, each a screen or more below the one
+/// before, then four screens of other words.
+fn matches_screens_apart() -> String {
+    let screen = "word ".repeat(400);
+    let screens_after = screen.repeat(4);
+    format!("cache rebuild {screen}cache rebuild {screen}cache rebuild {screens_after}")
+}
+
+/// The viewer of [`matches_screens_apart`] showing its matches.
+fn viewer_showing_matches() -> (tempfile::TempDir, App) {
+    let (worker, _searches) = recording_worker();
+    let (dir, mut app) = viewer_of(&matches_screens_apart(), worker);
+    press(&mut app, KeyCode::Char('/'));
+    type_into(&mut app, "cache rebuild");
+    press(&mut app, KeyCode::Enter);
+    finish_view_search(&mut app);
+    (dir, app)
+}
+
+/// The view rendered again at another width, and the search of its new rows
+/// run to its end. Returns the top row before the matches arrived.
+fn rendered_again_at_new_width(app: &mut App) -> usize {
+    app.check_view_resize(60);
+    finish_view_render(app, 17);
+    let top_row = view_state(app).scroll_offset;
+    finish_view_search(app);
+    top_row
+}
+
+#[test]
+fn search_of_rows_rendered_again_selects_first_match_at_or_below_top_row() {
+    let (_dir, mut app) = viewer_showing_matches();
+    let first_match_row = view_state(&app).search_matches[0].first_row();
+    while view_state(&app).scroll_offset <= first_match_row {
+        press(&mut app, KeyCode::Down);
+    }
+
+    let top_row = rendered_again_at_new_width(&mut app);
+
+    let state = view_state(&app);
+    let rows: Vec<usize> = state
+        .search_matches
+        .iter()
+        .map(|found| found.first_row())
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows[0] < top_row && rows[1] >= top_row,
+        "the first match starts above the top row, the second at or below it: {rows:?} from {top_row}"
+    );
+    assert_eq!(
+        state.current_match_index, 1,
+        "the selected match is the first at or below the top row"
+    );
+    assert_eq!(
+        state.scroll_offset, top_row,
+        "the view doesn't scroll when the matches arrive"
+    );
+}
+
+#[test]
+fn search_of_rows_rendered_again_selects_last_match_when_every_match_is_above_top_row() {
+    let (_dir, mut app) = viewer_showing_matches();
+    press(&mut app, KeyCode::End);
+
+    let top_row = rendered_again_at_new_width(&mut app);
+
+    let state = view_state(&app);
+    assert!(
+        state
+            .search_matches
+            .iter()
+            .all(|found| found.first_row() < top_row),
+        "every match starts above the top row {top_row}"
+    );
+    assert_eq!(
+        state.current_match_index,
+        state.search_matches.len() - 1,
+        "the selected match is the last"
+    );
+    assert_eq!(state.scroll_offset, top_row);
 }
 
 #[test]

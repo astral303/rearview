@@ -43,7 +43,69 @@ fn render_parsed_entries(
     entries: &[RenderableEntry],
     options: &RenderOptions,
 ) -> RenderedConversation {
-    render_entries(entries, &SubagentRoster::default(), options)
+    render_to_end(entries, &SubagentRoster::default(), options)
+}
+
+/// `entries` rendered with `roster` and `options`, without a stop.
+fn render_to_end(
+    entries: &[RenderableEntry],
+    roster: &SubagentRoster,
+    options: &RenderOptions,
+) -> RenderedConversation {
+    render_entries(entries, roster, options, &|| true).expect("a render that keeps going finishes")
+}
+
+/// A render of `entries` user messages whose `keep_going` returns each of
+/// `answers` in turn and then true: the count of `keep_going` calls, and
+/// whether the render finished.
+fn render_stop_checks(entries: usize, answers: &[bool]) -> (usize, bool) {
+    let entries: Vec<RenderableEntry> = (0..entries)
+        .map(|entry_index| RenderableEntry {
+            entry_index,
+            entry: claude_entry(&format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"message {entry_index}"}}}}"#
+            )),
+        })
+        .collect();
+    let calls = std::cell::Cell::new(0);
+    let finished = render_entries(
+        &entries,
+        &SubagentRoster::default(),
+        &test_render_options(ToolDisplayMode::Full),
+        &|| {
+            let call = calls.get();
+            calls.set(call + 1);
+            answers.get(call).copied().unwrap_or(true)
+        },
+    )
+    .is_some();
+    (calls.get(), finished)
+}
+
+#[test]
+fn render_checks_whether_to_keep_going_per_interval_of_entries_and_before_each_pass() {
+    assert_eq!(
+        [
+            render_stop_checks(ENTRIES_BETWEEN_STOP_CHECKS, &[]),
+            render_stop_checks(ENTRIES_BETWEEN_STOP_CHECKS + 1, &[]),
+        ],
+        [(3, true), (4, true)],
+        "one check before each interval of entries, then one before each pass over the rows"
+    );
+}
+
+#[test]
+fn stopped_render_doesnt_render_past_the_check_that_answers_false() {
+    assert_eq!(
+        render_stop_checks(2 * ENTRIES_BETWEEN_STOP_CHECKS + 1, &[true, false]),
+        (2, false),
+        "the render ends at the check inside its entries that answers false"
+    );
+    assert_eq!(
+        render_stop_checks(1, &[true, true, false]),
+        (3, false),
+        "a check that answers false before the last pass ends the render"
+    );
 }
 
 /// Helper to render markdown and extract just the content text (without styling)
@@ -930,7 +992,7 @@ fn roster_of(entries: &[RenderableEntry]) -> SubagentRoster {
 }
 
 fn render_with_roster(entries: &[RenderableEntry], roster: &SubagentRoster) -> String {
-    rendered_text(&render_entries(
+    rendered_text(&render_to_end(
         entries,
         roster,
         &test_render_options(ToolDisplayMode::Full),

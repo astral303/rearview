@@ -12,18 +12,33 @@ pub(crate) const VIEWER_READ_LANDS: Duration = Duration::from_secs(60);
 
 /// Shows the open session's pending reload, as
 /// [`App::complete_pending_view_refresh`] does, waiting up to
-/// [`VIEWER_READ_LANDS`] for its read. False when no reload is pending;
-/// panics when its read doesn't land in time, so a slow run fails at the wait
-/// and not at a later assertion.
+/// [`VIEWER_READ_LANDS`] for its read, then for its render. False when no
+/// reload is pending; panics when its read doesn't arrive in time, so a slow
+/// run fails at the wait and not at a later assertion.
 pub(crate) fn finish_pending_view_reload(app: &mut App, viewport_height: usize) -> bool {
     if app.pending_view_reload.is_none() {
         return false;
     }
     assert!(
-        app.complete_pending_view_refresh(viewport_height, VIEWER_READ_LANDS),
+        app.complete_pending_view_refresh(VIEWER_READ_LANDS),
         "the open session's reload read lands within {VIEWER_READ_LANDS:?}"
     );
+    finish_view_render(app, viewport_height);
     true
+}
+
+/// Shows the viewer's pending render once it arrives, as the event loop
+/// does, failing after [`VIEWER_READ_LANDS`]. Does nothing without a pending
+/// render.
+pub(crate) fn finish_view_render(app: &mut App, viewport_height: usize) {
+    let deadline = std::time::Instant::now() + VIEWER_READ_LANDS;
+    while app.is_view_render_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the viewer's render arrives within {VIEWER_READ_LANDS:?}"
+        );
+        app.receive_view_render(viewport_height, Duration::from_millis(10));
+    }
 }
 
 /// [`App::complete_pending_open`] until the viewer shows the session, or the
