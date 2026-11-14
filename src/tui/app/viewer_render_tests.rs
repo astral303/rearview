@@ -42,16 +42,6 @@ impl Gate {
             .expect("a render reaches the gate")
     }
 
-    /// True when a render has reached the gate and not been taken by
-    /// [`Self::next_render`].
-    fn has_render_waiting(&self) -> bool {
-        match self.started.try_recv() {
-            Ok(_) => true,
-            Err(mpsc::TryRecvError::Empty) => false,
-            Err(mpsc::TryRecvError::Disconnected) => panic!("the render thread ended"),
-        }
-    }
-
     pub(super) fn let_one_through(&self) {
         self.release.send(()).unwrap();
     }
@@ -102,7 +92,7 @@ fn viewer_through(worker: ViewerRenderWorker) -> (tempfile::TempDir, App) {
 }
 
 /// A key pressed without waiting for the render it requests.
-fn press_now(app: &mut App, code: KeyCode) {
+pub(super) fn press_now(app: &mut App, code: KeyCode) {
     app.handle_key(code, KeyModifiers::empty(), VIEWPORT);
 }
 
@@ -193,16 +183,47 @@ fn leaving_viewer_during_render_stops_it() {
     );
 }
 
+#[test]
+fn click_on_message_doesnt_render_again_and_keeps_selected_match() {
+    let (worker, _gate) = gated_worker();
+    let (_dir, mut app) = viewer_through(worker);
+    for code in "/word".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+        press_now(&mut app, code);
+    }
+    super::test_waits::finish_view_search(&mut app);
+    press_now(&mut app, KeyCode::Char('n'));
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.message_nav_active = false;
+    }
+    let selected = view_state(&app).current_match_index;
+    let frame = Rect::new(0, 0, 80, 30);
+    let row = crate::tui::ui::view_layout_rects(frame, &app, view_state(&app))
+        .content
+        .y;
+
+    let changed = app.handle_view_click(row, frame);
+
+    assert!(changed, "the click focuses the message");
+    assert!(
+        !app.is_view_render_pending(),
+        "a click that only moves the focus doesn't render the rows again"
+    );
+    assert_eq!(
+        (selected, view_state(&app).current_match_index),
+        (1, 1),
+        "the selected match stays"
+    );
+}
+
 /// The pass that takes the finished render waiting to be taken, as the
-/// event loop's next pass does. It waits for the render thread to offer it:
-/// the render returns at the gate just before it is offered.
+/// event loop's next pass does. It waits for the `viewer-render` thread to
+/// send it: the render returns at the gate just before it is sent.
 fn take_finished_render(app: &mut App) {
     app.receive_view_render(VIEWPORT, VIEWER_READ_LANDS);
 }
 
-/// A display key's render finished and waiting to be taken, the app not
-/// having taken it.
-fn render_waiting_to_be_taken(app: &mut App, gate: &Gate) {
+/// Let a display key's render finish, without the app taking it.
+fn finish_render_without_taking_it(app: &mut App, gate: &Gate) {
     press_now(app, KeyCode::Char('t'));
     gate.next_render();
     gate.let_one_through();
@@ -210,34 +231,58 @@ fn render_waiting_to_be_taken(app: &mut App, gate: &Gate) {
 }
 
 #[test]
-fn finished_render_waits_for_app_to_take_it_before_next_starts() {
+fn next_render_starts_once_taken_renders_rows_are_released() {
     let (worker, gate) = gated_worker();
     let (_dir, mut app) = viewer_through(worker);
-    render_waiting_to_be_taken(&mut app, &gate);
+    finish_render_without_taking_it(&mut app, &gate);
+    let taken = app
+        .viewer_render
+        .as_mut()
+        .unwrap()
+        .take_rendered(VIEWER_READ_LANDS)
+        .expect("the finished render is taken");
+    let rows = Arc::new(taken.rendered_conversation.lines);
+    let released_rows = Arc::downgrade(&rows);
 
     press_now(&mut app, KeyCode::Char('t'));
-    let started_before_taken = gate.has_render_waiting();
-    take_finished_render(&mut app);
+    app.viewer_render.as_ref().unwrap().release(rows);
+    let next = gate.next_render();
 
+    assert_eq!(next, (ToolDisplayMode::Full, false));
     assert!(
-        !started_before_taken,
-        "the next render doesn't start while a finished one waits"
-    );
-    assert_eq!(
-        gate.next_render(),
-        (ToolDisplayMode::Full, false),
-        "the next render starts once the app takes the finished one"
+        released_rows.upgrade().is_none(),
+        "the next render starts once the taken render's rows are released and freed"
     );
     gate.let_one_through();
     finish_view_render(&mut app, VIEWPORT);
-    assert_eq!(view_state(&app).tool_display, ToolDisplayMode::Full);
+}
+
+#[test]
+fn rows_replaced_by_render_are_freed_before_next_render_starts() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = viewer_through(worker);
+    let shown = Arc::downgrade(&view_state(&app).rendered_lines);
+    press_now(&mut app, KeyCode::Char('t'));
+    gate.next_render();
+    gate.let_one_through();
+    finish_view_render(&mut app, VIEWPORT);
+
+    press_now(&mut app, KeyCode::Char('t'));
+    gate.next_render();
+
+    assert!(
+        shown.upgrade().is_none(),
+        "the replaced rows are freed before the next render starts"
+    );
+    gate.let_one_through();
+    finish_view_render(&mut app, VIEWPORT);
 }
 
 #[test]
 fn display_key_in_viewer_opened_again_renders_after_finished_render_of_closed_viewer() {
     let (worker, gate) = gated_worker();
     let (_dir, mut app) = viewer_through(worker);
-    render_waiting_to_be_taken(&mut app, &gate);
+    finish_render_without_taking_it(&mut app, &gate);
     press_now(&mut app, KeyCode::Char('q'));
     take_finished_render(&mut app);
     app.enter_view_mode(80);
@@ -259,7 +304,7 @@ fn display_key_in_viewer_opened_again_renders_after_finished_render_of_closed_vi
 fn dropping_app_while_finished_render_waits_to_be_taken_returns() {
     let (worker, gate) = gated_worker();
     let (_dir, mut app) = viewer_through(worker);
-    render_waiting_to_be_taken(&mut app, &gate);
+    finish_render_without_taking_it(&mut app, &gate);
 
     drop(app);
 }

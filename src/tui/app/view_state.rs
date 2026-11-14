@@ -9,7 +9,7 @@ use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
 use crate::tui::viewer::{
     CallArea, CallRange, EntryRelocation, MessageRange, ParsedConversation, RenderOptions,
-    RenderedConversation, SearchMatch, ToolOutputId, ViewedConversation,
+    RenderedConversation, RenderedLine, SearchMatch, ToolOutputId, ViewedConversation,
     parse_conversation_file_interactively,
 };
 use ratatui::prelude::*;
@@ -1085,29 +1085,38 @@ impl App {
     }
 
     /// Show the newest render's rows once they arrive, waiting up to `wait`
-    /// for a finished render. A render finished for an earlier request or a
-    /// closed viewer is dropped; the render thread starts the next only once
-    /// the finished one is taken, so every pass takes it. A panic on the
-    /// render's thread resumes here.
+    /// for a finished render. Call it on every pass, with the viewer open or
+    /// closed: the `viewer-render` thread starts the next render only once
+    /// the finished one is taken and its rows released. A render finished
+    /// for an earlier request or a closed viewer isn't shown. The rows no
+    /// longer shown, or the render's when it isn't shown, are sent to the
+    /// `viewer-render` thread to be freed there. Once a reload's rows show,
+    /// the reload queued behind it starts its read. A panic on the
+    /// `viewer-render` thread resumes here.
     pub(crate) fn receive_view_render(&mut self, viewport_height: usize, wait: Duration) {
-        let Some(rendered) = self
-            .viewer_render
-            .as_mut()
-            .and_then(|worker| worker.take_rendered(wait))
-        else {
+        let Some(worker) = self.viewer_render.as_mut() else {
             return;
         };
-        let AppMode::View(state) = &mut self.app_mode else {
+        let Some(rendered) = worker.take_rendered(wait) else {
             return;
         };
-        let Some(pending) = state.pending_render else {
+        let awaited = match &self.app_mode {
+            AppMode::View(state) => state
+                .pending_render
+                .filter(|pending| pending.generation == rendered.generation),
+            AppMode::List => None,
+        };
+        let Some(pending) = awaited else {
+            worker.release(Arc::new(rendered.rendered_conversation.lines));
             return;
         };
-        if pending.generation != rendered.generation {
-            return;
+        if let AppMode::View(state) = &mut self.app_mode {
+            state.pending_render = None;
         }
-        state.pending_render = None;
-        self.show_render(viewport_height, rendered.conversation);
+        let replaced = self.show_render(viewport_height, rendered.rendered_conversation);
+        if let Some(worker) = &self.viewer_render {
+            worker.release(replaced);
+        }
         if let Some(entry) = pending.focus_first_call_of {
             self.focus_first_call_of(entry, viewport_height);
         }
@@ -1149,12 +1158,19 @@ impl App {
     /// Rows of an earlier read (`RowsRead::Earlier`) are a reload's: the
     /// anchor and the focused call move into the newer read through the
     /// relocation; a reader at the bottom stays at the bottom so new
-    /// messages show; and a changed message count, counted as message
-    /// navigation steps through them, sets the view's `CountHighlight`.
-    fn show_render(&mut self, viewport_height: usize, rendered: RenderedConversation) {
+    /// messages show; and messages the newer read adds or drops set the
+    /// view's `CountHighlight`.
+    ///
+    /// Returns the rows no longer shown: the replaced ones, or `rendered`'s
+    /// without a viewer.
+    fn show_render(
+        &mut self,
+        viewport_height: usize,
+        rendered: RenderedConversation,
+    ) -> Arc<Vec<RenderedLine>> {
         let now = self.clock().now();
         let AppMode::View(state) = &mut self.app_mode else {
-            return;
+            return Arc::new(rendered.lines);
         };
         let rows_read = std::mem::replace(&mut state.rows_read, RowsRead::Current);
         let relocation = match &rows_read {
@@ -1192,7 +1208,7 @@ impl App {
         let old_scroll = state.scroll_offset;
 
         state.total_lines = rendered.lines.len();
-        state.rendered_lines = Arc::new(rendered.lines);
+        let replaced = std::mem::replace(&mut state.rendered_lines, Arc::new(rendered.lines));
         state.message_ranges = rendered.messages;
         state.call_ranges = rendered.calls;
         if !matches!(rows_read, RowsRead::Current) {
@@ -1278,6 +1294,7 @@ impl App {
                 None => self.send_rerender_search(false),
             }
         }
+        replaced
     }
 
     /// `]` and `[` walk one list of stops: a message with no expanded run, or
