@@ -900,6 +900,10 @@ impl App {
                 state.scroll_offset = first_row;
                 Self::focus_message_at_line(state, first_row);
             }
+            (MatchesArrival::InPlace, _) => {
+                state.current_match_index =
+                    first_match_at_or_below(&state.search_matches, state.scroll_offset);
+            }
             _ => {
                 state.current_match_index = state
                     .current_match_index
@@ -1828,6 +1832,15 @@ fn capture_anchor(
         entry_index: msg.entry_index,
         relative_row: msg.start_line as isize - scroll_offset as isize,
     })
+}
+
+/// The index of the first of `matches` starting at or below `top_row`; the
+/// last match when every match starts above it.
+fn first_match_at_or_below(matches: &[SearchMatch], top_row: usize) -> usize {
+    matches
+        .iter()
+        .position(|found| found.first_row() >= top_row)
+        .unwrap_or(matches.len().saturating_sub(1))
 }
 
 fn find_message_idx_or_prev(ranges: &[MessageRange], entry_index: usize) -> Option<usize> {

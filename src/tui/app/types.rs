@@ -246,7 +246,8 @@ pub enum PendingViewSearch {
 /// Where the view goes when a search's matches arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchesArrival {
-    /// The view stays where it is, as for the search of a re-render's rows.
+    /// The view stays where it is, on the first match at or below its top
+    /// row, as for the search of rows rendered again.
     InPlace,
     /// The view scrolls to the first match, unless it moved from `from` while
     /// the search ran.
