@@ -65,7 +65,7 @@ pub use observer::{AwaitedRefresh, Observation, OtherRearview};
 pub use permit::{Admitted, ParsePermit};
 #[cfg(test)]
 pub(crate) use permit::{FOR_FIXTURES, admitted_reads};
-pub(crate) use read_catalogue::CatalogueSession;
+pub(crate) use read_catalogue::{CatalogueSession, ListedSession};
 #[cfg(test)]
 pub(crate) use refill::recorded_cache_bytes;
 pub(crate) use refresh::FREE_SPACE_FLOOR;
