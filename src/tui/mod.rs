@@ -24,5 +24,6 @@ pub use app::{Action, DirectFile, ListScope, ListSearchMode, TuiSearchOptions};
 pub(crate) use command_tags::{parse_command_name, parse_command_name_and_args};
 pub(crate) use export::{ExportOptions, plain_text};
 pub use runtime::{run_single_file, run_with_loader};
+pub(crate) use semantic_worker::MODEL_THREADS;
 pub(crate) use ui::format_tokens;
 pub use viewer::{RenderOptions, ToolDisplayMode};
