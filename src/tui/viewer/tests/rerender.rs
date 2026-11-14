@@ -1,4 +1,4 @@
-//! An entry rendered again in place after expanding or collapsing one of
+//! A message rendered again in place after expanding or collapsing one of
 //! its outputs, against a whole render with the same options.
 
 use super::*;
@@ -165,73 +165,124 @@ fn clickable_ids(lines: &[RenderedLine]) -> Vec<ToolOutputId> {
 
 /// The rows `outcome` replaced; panics, reporting `case`, when it didn't
 /// replace any.
-fn replaced_rows(outcome: EntryInPlace, case: &str) -> ReplacedRows {
+fn replaced_rows(outcome: MessageInPlace, case: &str) -> ReplacedRows {
     match outcome {
-        EntryInPlace::Replaced(replaced) => replaced,
-        outcome => panic!("{case}: the entry renders again in place: {outcome:?}"),
+        MessageInPlace::Replaced(replaced) => replaced,
+        outcome => panic!("{case}: the message renders again in place: {outcome:?}"),
     }
 }
 
-/// Toggles every output of `conversation` that renders alone, one at a
-/// time, in every mode: expanded in place, then collapsed back. Each result
-/// equals a whole render with the same options. Returns how many outputs
-/// rendered alone.
-fn assert_entries_render_alone_as_whole_render(
+/// Toggles every output a click toggles in `conversation`, one at a time,
+/// in every mode, from two first renders: one with nothing expanded, and in
+/// summary mode one with every tool run expanded, whose outputs inside the
+/// runs then toggle too, and whose runs toggle above other expanded runs.
+/// Each output's message renders again in place, then again with the output
+/// toggled back. Each result equals a whole render with the same options.
+/// Returns how many outputs toggled.
+fn assert_outputs_render_in_place_as_whole_render(
     name: &str,
     conversation: &ParsedConversation,
 ) -> usize {
     let mut toggled = 0;
     for modes in Modes::every() {
-        let collapsed = modes.options(BTreeSet::new());
-        let whole = Shown::of(render_parsed_conversation(conversation, &collapsed));
-        for id in clickable_ids(&whole.lines) {
-            let Some(entry) = entry_rendering_alone(conversation, &collapsed, &id) else {
-                continue;
-            };
-            assert!(
-                id.toggles_alone_in(&collapsed),
-                "{name} {modes:?}: {id:?}, which a click toggles, toggles alone"
-            );
-            toggled += 1;
-            let expanded = modes.options(BTreeSet::from([id.clone()]));
-            let mut shown = whole.clone();
-            let mut matches = find_matches(&shown.lines, QUERY);
+        for first_expanded in first_expanded_sets(conversation, modes) {
+            let first = modes.options(first_expanded.clone());
+            let whole = Shown::of(render_parsed_conversation(conversation, &first));
+            for id in clickable_ids(&whole.lines) {
+                let case = format!("{name} {modes:?}, {} expanded", first_expanded.len());
+                let entry = message_toggling(&case, conversation, &first, &whole, &id);
+                toggled += 1;
+                let mut toggled_set = first_expanded.clone();
+                if !toggled_set.remove(&id) {
+                    toggled_set.insert(id.clone());
+                }
+                let after = modes.options(toggled_set);
+                let mut shown = whole.clone();
+                let mut matches = find_matches(&shown.lines, QUERY);
 
-            let replaced = replaced_rows(
-                render_entry_in_place(conversation, &expanded, shown.rows(), entry),
-                &format!("{name} {modes:?}: expanding {id:?}"),
-            );
-            let expected = Shown::of(render_parsed_conversation(conversation, &expanded));
-            assert_eq!(
-                shown.shape(),
-                expected.shape(),
-                "{name} {modes:?}: expanding {id:?} in place renders as a whole render"
-            );
-            update_matches_in_replaced_rows(&mut matches, &shown.lines, QUERY, &replaced);
-            assert_eq!(
-                matches,
-                find_matches(&shown.lines, QUERY),
-                "{name} {modes:?}: the matches updated after expanding {id:?} are a search's"
-            );
+                let replaced = replaced_rows(
+                    render_message_in_place(conversation, &after, shown.rows(), entry),
+                    &format!("{case}: toggling {id:?}"),
+                );
+                let expected = Shown::of(render_parsed_conversation(conversation, &after));
+                assert_eq!(
+                    shown.shape(),
+                    expected.shape(),
+                    "{case}: toggling {id:?} in place renders as a whole render"
+                );
+                update_matches_in_replaced_rows(&mut matches, &shown.lines, QUERY, &replaced);
+                assert_eq!(
+                    matches,
+                    find_matches(&shown.lines, QUERY),
+                    "{case}: the matches updated after toggling {id:?} are a search's"
+                );
 
-            let replaced = replaced_rows(
-                render_entry_in_place(conversation, &collapsed, shown.rows(), entry),
-                &format!("{name} {modes:?}: collapsing {id:?}"),
-            );
-            assert_eq!(
-                shown.shape(),
-                whole.shape(),
-                "{name} {modes:?}: collapsing {id:?} again renders as the first render"
-            );
-            update_matches_in_replaced_rows(&mut matches, &shown.lines, QUERY, &replaced);
-            assert_eq!(
-                matches,
-                find_matches(&shown.lines, QUERY),
-                "{name} {modes:?}: the matches updated after collapsing {id:?} are a search's"
-            );
+                let replaced = replaced_rows(
+                    render_message_in_place(conversation, &first, shown.rows(), entry),
+                    &format!("{case}: toggling {id:?} back"),
+                );
+                assert_eq!(
+                    shown.shape(),
+                    whole.shape(),
+                    "{case}: toggling {id:?} back renders as the first render"
+                );
+                update_matches_in_replaced_rows(&mut matches, &shown.lines, QUERY, &replaced);
+                assert_eq!(
+                    matches,
+                    find_matches(&shown.lines, QUERY),
+                    "{case}: the matches updated after toggling {id:?} back are a search's"
+                );
+            }
         }
     }
     toggled
+}
+
+/// Nothing expanded; in summary mode, also every tool run expanded.
+fn first_expanded_sets(
+    conversation: &ParsedConversation,
+    modes: Modes,
+) -> Vec<BTreeSet<ToolOutputId>> {
+    let collapsed = render_parsed_conversation(conversation, &modes.options(BTreeSet::new()));
+    let runs: BTreeSet<ToolOutputId> = clickable_ids(&collapsed.lines)
+        .into_iter()
+        .filter(|id| id.0.ends_with(":kind:summary"))
+        .collect();
+    if runs.is_empty() {
+        vec![BTreeSet::new()]
+    } else {
+        vec![BTreeSet::new(), runs]
+    }
+}
+
+/// The entry of the message that toggling `id` renders again, as the app
+/// finds it: the id's entry when it renders alone, or in summary mode the
+/// first entry of the tool run whose rows in `shown` show the id. Fails
+/// when `id` neither renders alone nor shows in a run.
+fn message_toggling(
+    case: &str,
+    conversation: &ParsedConversation,
+    options: &RenderOptions,
+    shown: &Shown,
+    id: &ToolOutputId,
+) -> usize {
+    match entry_rendering_alone(conversation, options, id) {
+        Some(entry) => {
+            assert!(
+                id.toggles_alone_in(options),
+                "{case}: {id:?}, which a click toggles, toggles alone"
+            );
+            entry
+        }
+        None => {
+            assert!(
+                options.tool_display.is_summary(),
+                "{case}: {id:?}, which a click toggles, renders alone outside summary mode"
+            );
+            message_showing(&shown.lines, &shown.messages, id)
+                .unwrap_or_else(|| panic!("{case}: a tool run's rows show {id:?}"))
+        }
+    }
 }
 
 /// `entries` with their lanes and an empty roster.
@@ -303,8 +354,8 @@ fn interleaved_calls_across_a_day() -> ParsedConversation {
 }
 
 #[test]
-fn interleaved_calls_render_alone_as_in_whole_render() {
-    let toggled = assert_entries_render_alone_as_whole_render(
+fn interleaved_calls_render_in_place_as_in_whole_render() {
+    let toggled = assert_outputs_render_in_place_as_whole_render(
         "interleaved",
         &interleaved_calls_across_a_day(),
     );
@@ -341,7 +392,7 @@ fn call_and_its_result_in_two_entries_render_in_one_pass_as_whole_render() {
 
         for entry in [1, 3] {
             replaced_rows(
-                render_entry_in_place(&conversation, &expanded, shown.rows(), entry),
+                render_message_in_place(&conversation, &expanded, shown.rows(), entry),
                 &format!("{modes:?}: entry {entry}"),
             );
         }
@@ -397,7 +448,7 @@ fn second_output_of_entry_expands_in_place_beside_first_as_whole_render() {
         let both_expanded = modes.options(ids.iter().cloned().collect());
 
         replaced_rows(
-            render_entry_in_place(&conversation, &both_expanded, shown.rows(), 1),
+            render_message_in_place(&conversation, &both_expanded, shown.rows(), 1),
             &format!("{modes:?}: expanding the second call"),
         );
 
@@ -503,7 +554,7 @@ fn matches_of_phrases_wrapped_in_and_around_entry_update_as_search() {
         );
         for (options, toggle) in [(&expanded, "expanding"), (&collapsed, "collapsing")] {
             let replaced = replaced_rows(
-                render_entry_in_place(&conversation, options, shown.rows(), 1),
+                render_message_in_place(&conversation, options, shown.rows(), 1),
                 &format!("{toggle} the call"),
             );
             update_matches_in_replaced_rows(&mut matches, &shown.lines, &phrase, &replaced);
@@ -538,7 +589,7 @@ fn two_expands_after_rows_grow_resize_them_once() {
             .expect("the output renders alone");
         expanded.insert(id.clone());
         let replaced = replaced_rows(
-            render_entry_in_place(
+            render_message_in_place(
                 &conversation,
                 &modes.options(expanded.clone()),
                 shown.rows(),
@@ -559,7 +610,7 @@ fn two_expands_after_rows_grow_resize_them_once() {
 }
 
 #[test]
-fn sub_agents_reply_and_output_render_alone_as_in_whole_render() {
+fn sub_agents_reply_and_output_render_in_place_as_in_whole_render() {
     let reply = numbered_lines("finding", 8);
     let entries = codex_session_with_sub_agent(
         &[],
@@ -578,24 +629,24 @@ fn sub_agents_reply_and_output_render_alone_as_in_whole_render() {
         activity_span: None,
     };
 
-    let toggled = assert_entries_render_alone_as_whole_render("sub-agent", &conversation);
+    let toggled = assert_outputs_render_in_place_as_whole_render("sub-agent", &conversation);
     assert!(toggled > 0, "the sub-agent's reply toggles");
 }
 
 #[test]
-fn task_report_renders_alone_as_in_whole_render() {
+fn task_report_renders_in_place_as_in_whole_render() {
     use crate::history::format::claude::test_support::IDE_DIAGNOSTICS;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     std::fs::write(&path, IDE_DIAGNOSTICS).unwrap();
 
     let toggled =
-        assert_entries_render_alone_as_whole_render("task report", &read_bare_file(&path));
+        assert_outputs_render_in_place_as_whole_render("task report", &read_bare_file(&path));
     assert!(toggled > 0, "the report toggles");
 }
 
 #[test]
-fn every_agents_outputs_render_alone_as_in_whole_render() {
+fn every_agents_outputs_render_in_place_as_in_whole_render() {
     use crate::history::provider::contract_tests::every_record_sessions;
     let toggled: Vec<(String, usize)> = every_record_sessions()
         .iter()
@@ -603,26 +654,26 @@ fn every_agents_outputs_render_alone_as_in_whole_render() {
             let row = &session.row;
             let conversation = read_as_viewer(row.source, &row.path, &row.subagents);
             let name = format!("{:?}", row.source);
-            let toggled = assert_entries_render_alone_as_whole_render(&name, &conversation);
+            let toggled = assert_outputs_render_in_place_as_whole_render(&name, &conversation);
             (name, toggled)
         })
         .collect();
 
-    // The other agents' every-record sessions don't have an output that a
-    // click toggles.
+    // Every agent's session has a tool run that a click toggles in summary
+    // mode.
     let expected = [
-        ("Claude", 4),
-        ("Codex", 10),
-        ("OpenCode", 0),
-        ("Kimi", 0),
-        ("Grok", 0),
-        ("Pi", 0),
-        ("Omp", 0),
+        ("Claude", 44),
+        ("Codex", 88),
+        ("OpenCode", 28),
+        ("Kimi", 40),
+        ("Grok", 16),
+        ("Pi", 32),
+        ("Omp", 24),
     ]
     .map(|(name, count)| (name.to_owned(), count));
     assert_eq!(
         toggled, expected,
-        "the outputs of each agent's session that render alone, over every mode"
+        "the outputs of each agent's session that render in place, over every mode"
     );
 }
 
@@ -661,18 +712,252 @@ fn outputs_toggle_alone_in_modes_that_truncate_them() {
     );
 }
 
-#[test]
-fn tool_run_in_summary_mode_doesnt_render_alone() {
-    let conversation = conversation_of(tool_summary_entries());
-    let options = test_render_options(ToolDisplayMode::Hidden);
-    let run = make_tool_summary_output_id(0, None);
+/// `prefix 1` to `prefix count`, one a line.
+fn lines_of(prefix: &str, count: usize) -> String {
+    (1..=count)
+        .map(|line| format!("{prefix} {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    assert_eq!(entry_rendering_alone(&conversation, &options, &run), None);
-    let mut shown = Shown::of(render_parsed_conversation(&conversation, &options));
-    let before = shown.shape();
+/// A Claude record of `role` with `content`, stamped `timestamp`, or
+/// unstamped for `None`.
+fn record(role: &str, timestamp: Option<&str>, content: serde_json::Value) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "type": role,
+        "message": {"role": role, "content": content}
+    });
+    if let Some(timestamp) = timestamp {
+        record["timestamp"] = timestamp.into();
+    }
+    record
+}
+
+fn text(role: &str, timestamp: Option<&str>, text: &str) -> serde_json::Value {
+    record(
+        role,
+        timestamp,
+        serde_json::json!([{"type": "text", "text": text}]),
+    )
+}
+
+/// A call with an input long enough to be truncated.
+fn long_call(timestamp: Option<&str>, id: &str) -> serde_json::Value {
+    record(
+        "assistant",
+        timestamp,
+        serde_json::json!([{
+            "type": "tool_use", "id": id, "name": "Bash",
+            "input": {"command": lines_of(&format!("echo {id}"), 6)}
+        }]),
+    )
+}
+
+/// The result of the call `id`, long enough to be truncated.
+fn long_result(timestamp: Option<&str>, id: &str) -> serde_json::Value {
+    record(
+        "user",
+        timestamp,
+        serde_json::json!([{
+            "type": "tool_result", "tool_use_id": id,
+            "content": lines_of(&format!("{id} output"), 8)
+        }]),
+    )
+}
+
+/// An entry that doesn't render any rows while thinking is hidden.
+fn thinking() -> serde_json::Value {
+    record(
+        "assistant",
+        None,
+        serde_json::json!([{"type": "thinking", "thinking": "next step", "signature": ""}]),
+    )
+}
+
+/// A usage entry, which doesn't render any rows.
+fn usage() -> serde_json::Value {
+    serde_json::json!({
+        "type": "pi-metadata", "label": "Usage", "text": "", "searchable": false,
+        "usage": {"input_tokens": 12, "output_tokens": 3}
+    })
+}
+
+/// `record` written by the sub-agent the call `parent` started.
+fn of_sub_agent(mut record: serde_json::Value, parent: &str) -> serde_json::Value {
+    record["parent_tool_use_id"] = parent.into();
+    record
+}
+
+fn conversation_of_records(records: &[serde_json::Value]) -> ParsedConversation {
+    conversation_of(
+        records
+            .iter()
+            .enumerate()
+            .map(|(entry_index, record)| RenderableEntry {
+                entry_index,
+                entry: claude_entry(&record.to_string()),
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn tool_runs_and_outputs_inside_them_render_in_place_as_in_whole_render() {
+    let day = day_one();
+    let at = Some(day.as_str());
+    let conversation = conversation_of_records(&[
+        text("user", at, "Run the tests."),
+        long_call(at, "toolu_a"),
+        long_result(at, "toolu_a"),
+        long_call(at, "toolu_b"),
+        long_result(at, "toolu_b"),
+        text("assistant", at, "Both passed."),
+        long_call(at, "toolu_c"),
+        long_result(at, "toolu_c"),
+        text("user", at, "Thanks."),
+    ]);
+
+    let toggled = assert_outputs_render_in_place_as_whole_render("runs", &conversation);
+    // In each of summary mode's four option sets: two runs, then two runs and
+    // their six outputs. In each of truncated mode's four: the six outputs.
     assert_eq!(
-        render_entry_in_place(&conversation, &options, shown.rows(), 0),
-        EntryInPlace::Unchanged
+        toggled,
+        4 * (2 + 2 + 6) + 4 * 6,
+        "the runs and their outputs toggle in summary mode, and the outputs in truncated mode"
     );
-    assert_eq!(shown.shape(), before, "the rows stay as they were");
+}
+
+#[test]
+fn run_with_results_in_later_entries_renders_in_place_as_in_whole_render() {
+    // With thinking shown, each sub-agent's call opens a run of its own,
+    // which ends the run before it; that run's result arrives later.
+    let conversation = conversation_of_records(&[
+        text("user", None, "Run both agents."),
+        long_call(None, "toolu_top"),
+        of_sub_agent(long_call(None, "toolu_a"), "toolu_agent_a"),
+        of_sub_agent(long_call(None, "toolu_b"), "toolu_agent_b"),
+        of_sub_agent(long_result(None, "toolu_a"), "toolu_agent_a"),
+        long_result(None, "toolu_top"),
+        of_sub_agent(long_result(None, "toolu_b"), "toolu_agent_b"),
+        text("assistant", None, "Both agents finished."),
+    ]);
+    let mut options = Modes {
+        tool_display: ToolDisplayMode::Hidden,
+        show_timing: false,
+        show_thinking: true,
+    }
+    .options(BTreeSet::new());
+    let collapsed = render_parsed_conversation(&conversation, &options);
+    options.expanded_tool_outputs = clickable_ids(&collapsed.lines).into_iter().collect();
+    let expanded = render_parsed_conversation(&conversation, &options);
+    let late_result =
+        make_tool_output_id(5, None, 0, ToolOutputKind::ToolResult, Some("toolu_top"));
+    assert_eq!(
+        message_showing(&expanded.lines, &expanded.messages, &late_result),
+        Some(1),
+        "the top-level run shows its result, which arrives after the sub-agents' runs"
+    );
+
+    let toggled = assert_outputs_render_in_place_as_whole_render("late results", &conversation);
+    // Summary mode, in each of two option sets with thinking hidden: the
+    // top-level run, then the run and its call and result; with thinking
+    // shown: three runs, then three runs and their six outputs. Truncated
+    // mode: the two top-level outputs, or with thinking shown all six.
+    assert_eq!(
+        toggled,
+        2 * (1 + 3) + 2 * (3 + 9) + 2 * 2 + 2 * 6,
+        "the runs and their outputs toggle in summary mode, and the outputs in truncated mode"
+    );
+}
+
+#[test]
+fn runs_around_midnight_render_in_place_as_in_whole_render() {
+    let (day_one, day_three) = (day_one(), day_three());
+    let (one, three) = (Some(day_one.as_str()), Some(day_three.as_str()));
+    let crossing_midnight = [
+        text("user", one, "Start."),
+        long_call(one, "toolu_a"),
+        long_result(three, "toolu_a"),
+        long_call(three, "toolu_b"),
+        long_result(three, "toolu_b"),
+        text("assistant", three, "Done."),
+    ];
+    let starting_on_a_new_day = [
+        text("user", one, "Start."),
+        long_call(three, "toolu_a"),
+        long_result(three, "toolu_a"),
+        text("assistant", three, "Done."),
+    ];
+    // The run starts on the day of the message before it, and ends at the
+    // call on a later day.
+    let opened_by_an_unstamped_entry = [
+        text("user", one, "Start."),
+        long_call(None, "toolu_a"),
+        long_result(None, "toolu_a"),
+        long_call(three, "toolu_b"),
+        long_result(three, "toolu_b"),
+        text("assistant", three, "Done."),
+    ];
+
+    // Summary mode, in each of two option sets with timing hidden and two
+    // with it shown: the runs, then the runs and their outputs. The run of
+    // two calls splits at the day label while timing is shown. Truncated
+    // mode, in each of four: the outputs.
+    let two_calls_split_by_day = 2 * (1 + 5) + 2 * (2 + 6) + 4 * 4;
+    for (name, records, expected) in [
+        (
+            "crossing midnight",
+            &crossing_midnight[..],
+            two_calls_split_by_day,
+        ),
+        (
+            "starting on a new day",
+            &starting_on_a_new_day[..],
+            4 * (1 + 3) + 4 * 2,
+        ),
+        (
+            "opened by an unstamped entry",
+            &opened_by_an_unstamped_entry[..],
+            two_calls_split_by_day,
+        ),
+    ] {
+        let toggled =
+            assert_outputs_render_in_place_as_whole_render(name, &conversation_of_records(records));
+        assert_eq!(
+            toggled, expected,
+            "{name}: the runs and their outputs toggle in summary mode, and the outputs in truncated mode"
+        );
+    }
+}
+
+#[test]
+fn runs_followed_by_entries_rendering_nothing_render_in_place_as_in_whole_render() {
+    let conversation = conversation_of_records(&[
+        text("user", None, "Start."),
+        long_call(None, "toolu_a"),
+        long_result(None, "toolu_a"),
+        thinking(),
+        usage(),
+        long_call(None, "toolu_b"),
+        long_result(None, "toolu_b"),
+        thinking(),
+        usage(),
+        text("assistant", None, "Done."),
+        long_call(None, "toolu_c"),
+        long_result(None, "toolu_c"),
+        usage(),
+        thinking(),
+    ]);
+
+    let toggled =
+        assert_outputs_render_in_place_as_whole_render("entries rendering nothing", &conversation);
+    // Summary mode, in each of two option sets with thinking hidden: two
+    // runs, then two runs and their six outputs; with thinking shown, each
+    // thinking entry ends a run: three runs, then three runs and their six
+    // outputs. Truncated mode, in each of four: the six outputs.
+    assert_eq!(
+        toggled,
+        2 * (2 + 8) + 2 * (3 + 9) + 4 * 6,
+        "the runs and their outputs toggle in summary mode, and the outputs in truncated mode"
+    );
 }

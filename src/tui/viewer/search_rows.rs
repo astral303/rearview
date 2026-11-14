@@ -58,7 +58,7 @@ pub fn find_matches(lines: &[RenderedLine], query: &str) -> Vec<SearchMatch> {
 /// to the matches in `lines`, the rows after it: drop the matches in the
 /// old rows, move the later ones by the change in rows, and search the new
 /// rows alone. Expects a wrapped line to start at the first replaced row
-/// and at the row after the last, as at an entry's rows: a match across
+/// and at the row after the last, as at a message's rows: a match across
 /// either edge isn't updated.
 pub fn update_matches_in_replaced_rows(
     matches: &mut Vec<SearchMatch>,

@@ -167,6 +167,21 @@ pub struct ViewState {
     /// in place once the shown rows are that render's and no search shares
     /// them.
     pub entries_to_render_again: BTreeSet<usize>,
+    /// Outputs, in `parsed_conversation`, of tool runs in summary mode,
+    /// expanded or collapsed after the newest render was requested: a run,
+    /// or a call or result inside an expanded run. The run whose rows show
+    /// each one renders again in place, as an entry does.
+    pub run_outputs_to_render_again: BTreeSet<ToolOutputId>,
+    /// An entry: once the shown rows have every expanded output, the first
+    /// call of its message is focused if that message is. Expanding a tool
+    /// run at its message stop focuses its first call, which only the new
+    /// rows show.
+    pub focus_first_call_of: Option<usize>,
+    /// True from a render's rows showing until nothing waits to show. Then
+    /// the deferred copy runs, after the first call of `focus_first_call_of`
+    /// is focused, so a copy asked for at a tool run's message stop after
+    /// expanding the run copies that call.
+    pub runs_deferred_copy_once_shown: bool,
     /// When the open session started showing as updating, for the spinner
     /// of the `updating` and `refreshing` status; `None` while it doesn't.
     pub updating_since: Option<crate::clock::Moment>,
@@ -184,10 +199,6 @@ pub struct PendingRender {
     /// When the first request whose rows haven't shown was made: a newer
     /// request superseding it keeps this moment.
     pub since: crate::clock::Moment,
-    /// An entry: once the rows arrive, the first call of its message is
-    /// focused if that message is. Expanding a tool run at its message stop
-    /// focuses its first call, which only the new rows show.
-    pub focus_first_call_of: Option<usize>,
 }
 
 /// The read of the open conversation that the viewer's rows show.
@@ -411,6 +422,9 @@ impl ViewState {
             rows_read: RowsRead::Current,
             pending_render: None,
             entries_to_render_again: BTreeSet::new(),
+            run_outputs_to_render_again: BTreeSet::new(),
+            focus_first_call_of: None,
+            runs_deferred_copy_once_shown: false,
             updating_since: None,
             reload_rows_shown_at: None,
         }

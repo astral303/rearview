@@ -8,10 +8,11 @@ use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
 use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
 use crate::tui::viewer::{
-    CallArea, CallRange, EntryInPlace, EntryRelocation, MessageRange, ParsedConversation,
+    CallArea, CallRange, EntryRelocation, MessageInPlace, MessageRange, ParsedConversation,
     RenderOptions, RenderedConversation, RenderedLine, SearchMatch, ShownRows, ToolOutputId,
-    ViewedConversation, entry_rendering_alone, parse_conversation_file_interactively,
-    render_entry_in_place, update_matches_in_replaced_rows,
+    ViewedConversation, entry_rendering_alone, message_showing,
+    parse_conversation_file_interactively, render_message_in_place,
+    update_matches_in_replaced_rows,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
@@ -495,6 +496,9 @@ impl App {
             rows_read: RowsRead::Current,
             pending_render: None,
             entries_to_render_again: BTreeSet::new(),
+            run_outputs_to_render_again: BTreeSet::new(),
+            focus_first_call_of: None,
+            runs_deferred_copy_once_shown: false,
             updating_since: None,
             reload_rows_shown_at: None,
         };
@@ -1041,11 +1045,9 @@ impl App {
             .iter()
             .filter_map(|id| into_new_read.tool_output_id(id))
             .collect();
-        if let Some(pending) = &mut state.pending_render {
-            pending.focus_first_call_of = pending
-                .focus_first_call_of
-                .and_then(|entry| into_new_read.get(entry));
-        }
+        state.focus_first_call_of = state
+            .focus_first_call_of
+            .and_then(|entry| into_new_read.get(entry));
         state.rows_read = RowsRead::Earlier(into_new_read);
         state.show_reloaded_row(header, copy_row);
         state.session_id = session_id;
@@ -1073,64 +1075,75 @@ impl App {
         };
         // The render has every expanded output in its options.
         state.entries_to_render_again.clear();
+        state.run_outputs_to_render_again.clear();
         match &mut state.pending_render {
             Some(pending) => pending.generation = generation,
             None => {
                 state.pending_render = Some(PendingRender {
                     generation,
                     since: now,
-                    focus_first_call_of: None,
                 });
             }
         }
     }
 
     /// True while a render of the open conversation runs and its rows
-    /// haven't shown, or an entry waits to render again.
+    /// haven't shown, or a message waits to render again.
     pub fn is_view_render_pending(&self) -> bool {
         matches!(&self.app_mode, AppMode::View(state)
-            if state.pending_render.is_some() || !state.entries_to_render_again.is_empty())
+            if state.pending_render.is_some()
+                || !state.entries_to_render_again.is_empty()
+                || !state.run_outputs_to_render_again.is_empty())
     }
 
     /// Schedule the rows of the outputs `ids` of `parsed_conversation` to
-    /// render as the expanded set now has them. An entry that renders alone
-    /// is recorded, and renders again in place once
-    /// the shown rows can change (see [`Self::render_entries_again`]), unless
-    /// its output doesn't toggle in the view's modes, such as a tool call in
-    /// `tools·all`. Any other output, such as a tool run in summary mode,
-    /// requests a whole render.
+    /// render as the expanded set now has them, once the shown rows can
+    /// change (see [`Self::render_messages_again`]). An entry that renders
+    /// alone is recorded and renders again in place, unless its output
+    /// doesn't toggle in the view's modes, such as a tool call in
+    /// `tools·all`. In summary mode, any other output is a tool run or an
+    /// output inside one: it is recorded, and the run renders again in
+    /// place. Outside summary mode, an output that doesn't render alone is
+    /// dropped: only a message's outputs toggle, and there a message renders
+    /// alone.
     fn schedule_toggled_outputs_render(&mut self, ids: &BTreeSet<ToolOutputId>) {
         let AppMode::View(state) = &self.app_mode else {
             return;
         };
         let options = self.view_render_options(state);
         let mut entries = Vec::new();
+        let mut run_outputs = Vec::new();
         for id in ids {
             match entry_rendering_alone(&state.parsed_conversation, &options, id) {
                 Some(entry) if id.toggles_alone_in(&options) => entries.push(entry),
                 Some(_) => {}
-                None => return self.request_view_render(),
+                None if options.tool_display.is_summary() => run_outputs.push(id.clone()),
+                None => {}
             }
         }
         if let AppMode::View(state) = &mut self.app_mode {
             state.entries_to_render_again.extend(entries);
+            state.run_outputs_to_render_again.extend(run_outputs);
         }
     }
 
-    /// Render each entry waiting to render again in place of its rows, once
-    /// no render is pending and no search shares the rows, keeping the
-    /// reader's place as a whole render does. A running search sharing the
-    /// rows is stopped, and the entries render on a pass after it frees
-    /// them. The shown matches are updated in the entries' rows alone, and
-    /// the first at or below the top row is selected, as after a whole
-    /// render's search; a running search is sent again over the new rows.
-    /// A whole render is requested when the rows don't have the extent an
-    /// entry rendered in place relies on.
-    fn render_entries_again(&mut self, viewport_height: usize) {
+    /// Render each message waiting to render again in place of its rows,
+    /// once no render is pending and no search shares the rows, keeping the
+    /// reader's place as a whole render does: each entry waiting, and the
+    /// tool run whose rows show each run output waiting. A running search
+    /// sharing the rows is stopped, and the messages render on a pass after
+    /// it frees them. The shown matches are updated in the messages' rows
+    /// alone, and the first at or below the top row is selected, as after a
+    /// whole render's search; a running search is sent again over the new
+    /// rows. A whole render is requested when the rows don't have the
+    /// extent a message rendered in place relies on.
+    fn render_messages_again(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &self.app_mode else {
             return;
         };
-        if state.entries_to_render_again.is_empty() || state.pending_render.is_some() {
+        let is_any_waiting = !state.entries_to_render_again.is_empty()
+            || !state.run_outputs_to_render_again.is_empty();
+        if !is_any_waiting || state.pending_render.is_some() {
             return;
         }
         let options = self.view_render_options(state);
@@ -1141,7 +1154,7 @@ impl App {
         let Some(lines) = Arc::get_mut(&mut state.rendered_lines) else {
             // The stopped search frees the rows at its next check. It stays
             // in `pending_search`, and is sent again over the new rows once
-            // the entries render.
+            // the messages render.
             if matches!(
                 state.pending_search,
                 Some(PendingViewSearch::Running { .. })
@@ -1155,18 +1168,26 @@ impl App {
         let updates_shown_matches = state.search_mode != ViewSearchMode::Off
             && !state.search_query.is_empty()
             && state.pending_search.is_none();
+        let mut entries = std::mem::take(&mut state.entries_to_render_again);
+        // Find each run output's run now: the shown rows are the newest
+        // render's.
+        entries.extend(
+            std::mem::take(&mut state.run_outputs_to_render_again)
+                .iter()
+                .filter_map(|id| message_showing(lines, &state.message_ranges, id)),
+        );
         let mut is_extent_broken = false;
-        for entry in std::mem::take(&mut state.entries_to_render_again) {
+        for entry in entries {
             let shown = ShownRows {
                 lines,
                 messages: &mut state.message_ranges,
                 calls: &mut state.call_ranges,
                 detail_calls: &mut state.detail_calls,
             };
-            let replaced = match render_entry_in_place(&conversation, &options, shown, entry) {
-                EntryInPlace::Replaced(replaced) => replaced,
-                EntryInPlace::Unchanged => continue,
-                EntryInPlace::ExtentBroken => {
+            let replaced = match render_message_in_place(&conversation, &options, shown, entry) {
+                MessageInPlace::Replaced(replaced) => replaced,
+                MessageInPlace::Unchanged => continue,
+                MessageInPlace::ExtentBroken => {
                     is_extent_broken = true;
                     break;
                 }
@@ -1201,11 +1222,28 @@ impl App {
     /// longer shown, or the render's when it isn't shown, are sent to the
     /// `viewer-render` thread to be freed there. Once a reload's rows show,
     /// the reload queued behind it starts its read. A panic on the
-    /// `viewer-render` thread resumes here. Then the entries waiting to
-    /// render again do, in the rows shown.
+    /// `viewer-render` thread resumes here. Then the messages waiting to
+    /// render again render in the rows shown. Once nothing waits to show,
+    /// the first call of the message of the entry in `focus_first_call_of`
+    /// is focused, and then, after a render's rows showed, the deferred copy
+    /// runs.
     pub(crate) fn receive_view_render(&mut self, viewport_height: usize, wait: Duration) {
         self.receive_whole_render(viewport_height, wait);
-        self.render_entries_again(viewport_height);
+        self.render_messages_again(viewport_height);
+        if self.is_view_render_pending() {
+            return;
+        }
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        let focus_first_call_of = state.focus_first_call_of.take();
+        let runs_deferred_copy = std::mem::take(&mut state.runs_deferred_copy_once_shown);
+        if let Some(entry) = focus_first_call_of {
+            self.focus_first_call_of(entry, viewport_height);
+        }
+        if runs_deferred_copy {
+            self.run_deferred_copy();
+        }
     }
 
     fn receive_whole_render(&mut self, viewport_height: usize, wait: Duration) {
@@ -1221,22 +1259,19 @@ impl App {
                 .filter(|pending| pending.generation == rendered.generation),
             AppMode::List => None,
         };
-        let Some(pending) = awaited else {
+        if awaited.is_none() {
             worker.release(Arc::new(rendered.rendered_conversation.lines));
             return;
-        };
+        }
         if let AppMode::View(state) = &mut self.app_mode {
             state.pending_render = None;
+            state.runs_deferred_copy_once_shown = true;
         }
         let replaced = self.show_render(viewport_height, rendered.rendered_conversation);
         if let Some(worker) = &self.viewer_render {
             worker.release(replaced);
         }
-        if let Some(entry) = pending.focus_first_call_of {
-            self.focus_first_call_of(entry, viewport_height);
-        }
         self.start_queued_reload();
-        self.run_deferred_copy();
     }
 
     /// Focus the first call of the focused message when that message is
@@ -1557,15 +1592,16 @@ impl App {
             return;
         }
         self.schedule_toggled_outputs_render(&ids);
-        if let Some(entry) = message_stop_entry
-            && let AppMode::View(state) = &mut self.app_mode
-        {
+        let Some(entry) = message_stop_entry else {
+            return;
+        };
+        if !self.is_view_render_pending() {
+            return self.focus_first_call(viewport_height);
+        }
+        if let AppMode::View(state) = &mut self.app_mode {
             // The run's calls show in the new rows; the first is focused
-            // once they arrive.
-            let entry_in_newest_read = state.entry_in_newest_read(entry);
-            if let Some(pending) = &mut state.pending_render {
-                pending.focus_first_call_of = entry_in_newest_read;
-            }
+            // once they show.
+            state.focus_first_call_of = state.entry_in_newest_read(entry);
         }
     }
 

@@ -6,7 +6,7 @@ use super::commit_failure_tests::launched_app;
 use super::refresh_tests::{refresh_found, serve_session_refresh};
 use super::session_store::ReadCause;
 use super::test_waits::ConnectionGate;
-use super::viewer_render_tests::{Gate, Seen, gated_worker, press_now};
+use super::viewer_render_tests::{Gate, Seen, focused_call_id, gated_worker, press_now};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
@@ -1675,14 +1675,7 @@ fn click_on_output_during_reloads_render_expands_it_in_new_read() {
         layout.content.y + (line - state.scroll_offset) as u16
     };
     assert!(app.handle_view_click(row, frame));
-    gate.let_one_through();
-    assert!(
-        !gate.next_return().finished,
-        "the click stops the reload's render"
-    );
-    gate.next_render();
-    gate.let_one_through();
-    test_waits::finish_view_render(&mut app, VIEWPORT);
+    finish_render_without_another(&mut app, &gate, "reload");
 
     assert!(
         view_text(&app).contains("src/lib.rs"),
@@ -2042,10 +2035,10 @@ fn two_expands_during_single_pending_render_both_show() {
     assert_shown_rows_are_whole_render(&app);
 }
 
-/// The shown rows, messages and kept calls equal a whole render of the
-/// shown conversation with the view's options.
-fn assert_shown_rows_are_whole_render(app: &App) {
-    use crate::tui::viewer::{MessageRange, RenderedLine, render_parsed_conversation};
+/// The shown rows, messages, calls of expanded runs and kept calls equal a
+/// whole render of the shown conversation with the view's options.
+pub(super) fn assert_shown_rows_are_whole_render(app: &App) {
+    use crate::tui::viewer::{CallRange, MessageRange, RenderedLine, render_parsed_conversation};
     let state = view(app);
     let whole =
         render_parsed_conversation(&state.parsed_conversation, &app.view_render_options(state));
@@ -2077,9 +2070,146 @@ fn assert_shown_rows_are_whole_render(app: &App) {
         messages(&whole.messages),
         "the messages are a whole render's"
     );
+    let calls = |calls: &[CallRange]| {
+        calls
+            .iter()
+            .map(|call| {
+                (
+                    call.input.id.clone(),
+                    call.result.as_ref().map(|result| result.id.clone()),
+                    call.rows(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        calls(&state.call_ranges),
+        calls(&whole.calls),
+        "the calls of the expanded runs are a whole render's"
+    );
     assert_eq!(
         state.detail_calls, whole.detail_calls,
         "the kept calls are a whole render's"
+    );
+}
+
+/// The text and calls of the run of [`write_two_long_calls_then`]'s calls
+/// expanded, in summary mode.
+fn assert_run_shows_expanded(app: &App, when: &str) {
+    let text = view_text(app);
+    assert!(
+        text.contains("(expanded):") && text.contains("first 1") && text.contains("second 1"),
+        "{when}: the run shows expanded: {text:?}"
+    );
+    assert_eq!(
+        view(app).call_ranges.len(),
+        2,
+        "{when}: `]` steps through the run's calls"
+    );
+}
+
+#[test]
+fn run_expand_during_reloads_render_shows_expanded_once_its_rows_show() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_two_long_calls_then(&path, &[]);
+    let (mut app, gate) = gated_viewer_on(&home);
+    write_two_long_calls_then(&path, &numbered(0..1));
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+
+    click_call(&mut app, "Ran 2 shell commands");
+    finish_render_without_another(&mut app, &gate, "reload");
+
+    assert!(
+        view_text(&app).contains("message 0"),
+        "the reload's rows show"
+    );
+    assert_run_shows_expanded(&app, "reload");
+}
+
+#[test]
+fn run_expand_during_display_keys_render_shows_expanded_once_its_rows_show() {
+    for key in ['T', 'i'] {
+        let home = ClaudeHome::new();
+        write_two_long_calls_then(&home.transcript("session"), &[]);
+        let (mut app, gate) = gated_viewer_on(&home);
+        press_now(&mut app, KeyCode::Char(key));
+        gate.next_render();
+
+        click_call(&mut app, "Ran 2 shell commands");
+        finish_render_without_another(&mut app, &gate, &format!("`{key}`"));
+
+        assert_run_shows_expanded(&app, &format!("`{key}`"));
+    }
+}
+
+/// The viewer of [`write_two_long_calls_then`]'s run, rendering through a
+/// gated worker, the run's message focused, after a refresh's read that
+/// adds `message 0`: that reload's render waits at the gate.
+fn run_focused_during_reloads_render(home: &ClaudeHome) -> (App, Gate) {
+    let path = home.transcript("session");
+    write_two_long_calls_then(&path, &[]);
+    let (mut app, gate) = gated_viewer_on(home);
+    focus_message(&mut app, "Ran 2 shell commands");
+    write_two_long_calls_then(&path, &numbered(0..1));
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+    (app, gate)
+}
+
+/// The first call of the run of [`write_two_long_calls_then`]'s calls is
+/// focused.
+fn assert_first_call_focused(app: &App) {
+    let focused = focused_call_id(app).expect("a call is focused");
+    assert!(
+        focused.0.ends_with(":id:toolu_1"),
+        "the run's first call is focused: {focused:?}"
+    );
+}
+
+#[test]
+fn run_expand_at_its_stop_during_reloads_render_focuses_first_call_after_both_renders() {
+    let home = ClaudeHome::new();
+    let (mut app, gate) = run_focused_during_reloads_render(&home);
+
+    press_now(&mut app, KeyCode::Right);
+    let focused_during_render = focused_call_id(&app);
+    finish_render_without_another(&mut app, &gate, "reload");
+
+    assert!(
+        focused_during_render.is_none(),
+        "no call is focused before the run's calls show: {focused_during_render:?}"
+    );
+    assert!(
+        view_text(&app).contains("message 0"),
+        "the reload's rows show"
+    );
+    assert_run_shows_expanded(&app, "reload");
+    assert_first_call_focused(&app);
+}
+
+#[test]
+fn message_copy_after_run_expand_at_its_stop_during_reloads_render_copies_first_call() {
+    let home = ClaudeHome::new();
+    let (mut app, gate) = run_focused_during_reloads_render(&home);
+    app.set_clipboard_writer_for_test(record_copy);
+    COPIED.with(|copied| copied.borrow_mut().clear());
+
+    press_now(&mut app, KeyCode::Right);
+    press_now(&mut app, KeyCode::Char('y'));
+    let copied_during_render = COPIED.with(|copied| copied.borrow().clone());
+    finish_render_without_another(&mut app, &gate, "reload");
+    let copied = COPIED.with(|copied| copied.borrow().clone());
+
+    assert!(
+        copied_during_render.is_empty(),
+        "the copy waits for the reload's rows: {copied_during_render:?}"
+    );
+    assert_first_call_focused(&app);
+    assert!(
+        copied.len() == 1 && copied[0].contains("first 1") && !copied[0].contains("second 1"),
+        "the copy runs once the run's first call is focused, and copies that call: {copied:?}"
     );
 }
 

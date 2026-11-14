@@ -35,7 +35,9 @@ mod tools;
 pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
 pub use relocation::EntryRelocation;
-pub use rerender::{EntryInPlace, ShownRows, entry_rendering_alone, render_entry_in_place};
+pub use rerender::{
+    MessageInPlace, ShownRows, entry_rendering_alone, message_showing, render_message_in_place,
+};
 pub(crate) use roster::SubagentRoster;
 #[cfg(test)]
 pub use search_rows::find_matches;
@@ -637,6 +639,62 @@ impl<'a> RenderStepper<'a> {
             .collect();
         self.rendered
     }
+
+    /// A stepper that replays the tool run the entry at `first` opens, as a
+    /// whole render steps through it. It counts the first entry's day as
+    /// current, because the day label a whole render adds there sits above
+    /// the run, outside its rows.
+    fn replaying_run_from(
+        entries: &'a [RenderableEntry],
+        roster: &'a SubagentRoster,
+        lanes: &'a Lanes,
+        options: &'a RenderOptions,
+        first: usize,
+    ) -> Self {
+        let mut stepper = Self::new(entries, roster, lanes, options);
+        stepper
+            .day_labels
+            .resume_after(entries[..=first].iter().map(|parsed| &parsed.entry));
+        stepper
+    }
+
+    /// True while the tool run that the entry at `first` opened is open.
+    fn is_run_open_from(&self, first: usize) -> bool {
+        self.pending_tool_summary
+            .as_ref()
+            .is_some_and(|run| run.first_parsed_idx == first)
+    }
+
+    /// End the replay of the tool run that the entry at `first` opened, and
+    /// return the run's rows. The run renders when the entries ended before
+    /// it closed. A run that the closing entry opened isn't rendered, so its
+    /// calls stay out. `None` when no message rendered.
+    fn finish_run(mut self, first: usize) -> Option<ReplayedRun> {
+        if self.is_run_open_from(first) {
+            self.flush_tool_summary();
+        }
+        let RenderedConversation {
+            mut lines,
+            messages,
+            calls,
+            ..
+        } = self.rendered;
+        let range = messages.into_iter().next()?;
+        lines.truncate(range.end_line + 1);
+        Some(ReplayedRun {
+            lines,
+            range,
+            calls,
+        })
+    }
+}
+
+/// The rows of a tool run replayed alone, and the blank row after them; its
+/// range and its calls, counted from its first row.
+struct ReplayedRun {
+    lines: Vec<RenderedLine>,
+    range: MessageRange,
+    calls: Vec<CallRange>,
 }
 
 /// The agent whose session this is, named by the first top-level reply that
@@ -812,8 +870,8 @@ fn message_range_excluding_trailing_blank(
 /// Push a blank row after `lines` unless they are empty or already end with
 /// one. A block without rows then leaves one blank row between its
 /// neighbours, and an entry's or a run's rows start with a non-blank row
-/// and end with one blank row, because an entry renders again alone,
-/// without the rows around it (see `render_entry_in_place`).
+/// and end with one blank row, because an entry or a run renders again
+/// alone, without the rows around it (see `render_message_in_place`).
 fn push_separator(lines: &mut Vec<RenderedLine>) {
     if lines.last().is_some_and(|line| !line.spans.is_empty()) {
         lines.push(RenderedLine::new(vec![]));
