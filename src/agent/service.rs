@@ -6236,6 +6236,500 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
     }
 
+    /// The registered fixture of `source`'s agent.
+    fn registered_fixture(
+        source: history::Source,
+    ) -> &'static dyn history::provider::contract_tests::ProviderFixture {
+        history::provider::contract_tests::registered_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.provider().source() == source)
+            .unwrap()
+    }
+
+    /// The reference `read` prints for the session at `locator`, one of
+    /// `storage`'s, as key discovery over a scratch cache of its own keys it.
+    fn printed_reference_of(
+        storage: &'static dyn history::provider::SessionStorage,
+        locator: &Path,
+    ) -> String {
+        let scratch = crate::tui::claude_home::admitted_cache();
+        let keys = discovered_keys(
+            &test_environment(vec![storage], Some(scratch.path())),
+            &LoadMeter::default(),
+        );
+        let key = keys
+            .iter()
+            .find(|key| key.path == locator)
+            .unwrap_or_else(|| {
+                let paths: Vec<&Path> = keys.iter().map(|key| key.path.as_path()).collect();
+                panic!("{} gets a key among {paths:?}", locator.display())
+            });
+        agent::refs::resolved_conversation_for_key(&keys, key)
+            .reference
+            .canonical()
+    }
+
+    /// `read`, `outline` and `within` of a session written after its agent's
+    /// other session was cached, by its printed reference, answer as key
+    /// discovery does, for every agent: an agent whose key comes from the
+    /// path finds the session, and an agent whose key needs the session's
+    /// record reports `not-found` until a load caches it.
+    #[test]
+    fn targeted_commands_of_session_newer_than_cache_answer_as_key_discovery_does() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            let ids = fixture.ids();
+            let home = tempfile::tempdir().unwrap();
+            fixture.write_session(home.path(), ids.other);
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            load_as_owner(storage, cache.path());
+            let locator = fixture.write_session(home.path(), ids.session);
+            let reference = printed_reference_of(storage, &locator);
+            let found = agent::refs::is_keyed_by_path(fixture.provider(), &locator);
+
+            for args in [
+                &["read", &reference][..],
+                &["outline", &reference],
+                &["within", &reference, "the"],
+            ] {
+                let output = AgentService::new(test_environment(vec![storage], Some(cache.path())))
+                    .execute(agent_command(args))
+                    .unwrap_or_else(crate::error_report);
+                let answered_as_discovery = if found {
+                    !output.contains("agent-error")
+                } else {
+                    output.starts_with("protocol agent-error kind=not-found ")
+                };
+                if !answered_as_discovery {
+                    wrong.push(format!(
+                        "{source:?} {}: found {found} as key discovery finds it:\n{output}",
+                        args[0]
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `read`, `outline` and `within` of a session deleted since it was
+    /// cached report `not-found` by its printed reference, for every agent.
+    #[test]
+    fn targeted_commands_of_session_deleted_since_cached_report_not_found() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            let home = tempfile::tempdir().unwrap();
+            let locator = fixture.write_session(home.path(), fixture.ids().session);
+            fixture.write_session(home.path(), fixture.ids().other);
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            load_as_owner(storage, cache.path());
+            let reference = printed_reference_of(storage, &locator);
+            fixture.delete_under(home.path(), &locator).unwrap();
+
+            for args in [
+                &["read", &reference][..],
+                &["outline", &reference],
+                &["within", &reference, "the"],
+            ] {
+                let output = AgentService::new(test_environment(vec![storage], Some(cache.path())))
+                    .execute(agent_command(args))
+                    .unwrap_or_else(crate::error_report);
+                if !output.starts_with("protocol agent-error kind=not-found ") {
+                    wrong.push(format!("{source:?} {}: not-found:\n{output}", args[0]));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `read` of a sub-agent its session started since it was cached, by the
+    /// sub-agent's `s1` handle, refreshes the session in one round and reads
+    /// the sub-agent, for every agent that records sub-agents. `outline` and
+    /// `within` of the session after it read the refreshed copy without a
+    /// refresh round.
+    #[test]
+    fn targeted_commands_of_session_with_subagent_started_since_cached_show_it() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            if !fixture.provider().subagents().is_capable() {
+                continue;
+            }
+            let home = tempfile::tempdir().unwrap();
+            let locator = fixture.write_session(home.path(), fixture.ids().session);
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            load_as_owner(storage, cache.path());
+            let reference = printed_reference_of(storage, &locator);
+            fixture.write_subagent(home.path(), fixture.ids().session);
+            let subagent = format!("{reference}:s1");
+
+            for (args, expected_rounds) in [
+                (
+                    &["read", &subagent][..],
+                    &["perf refresh-round sessions=1"][..],
+                ),
+                (&["outline", &reference], &[]),
+                (&["within", &reference, "the"], &[]),
+            ] {
+                let service =
+                    AgentService::new(test_environment(vec![storage], Some(cache.path())));
+                let output = service
+                    .execute(agent_command(args))
+                    .unwrap_or_else(crate::error_report);
+                let rounds = refresh_rounds(&service);
+                if output.contains("agent-error")
+                    || output.contains("stale-cache")
+                    || rounds != expected_rounds
+                {
+                    wrong.push(format!(
+                        "{source:?} {args:?}: the sub-agent reads after refresh rounds \
+                         {expected_rounds:?}, got {rounds:?}:\n{output}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `within` of a session renamed since it was cached shows the new name,
+    /// for every agent that renames: in the transcript, or in a title kept
+    /// outside it.
+    #[test]
+    fn within_of_session_renamed_since_cached_shows_new_name() {
+        const NEW_NAME: &str = "Quokkaharbour";
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            if !fixture.provider().rename().is_capable() {
+                continue;
+            }
+            let home = tempfile::tempdir().unwrap();
+            fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            let reference = cache_session_and_reference_it(storage, cache.path());
+            let [stub] = <[_; 1]>::try_from(fixture.discover_under(home.path())).unwrap();
+            fixture
+                .renamer()
+                .rename_session(
+                    crate::history::FOR_FIXTURES,
+                    &stub.locator,
+                    NEW_NAME,
+                    TestClock::default().wall(),
+                )
+                .unwrap();
+
+            let output = AgentService::new(test_environment(vec![storage], Some(cache.path())))
+                .execute(agent_command(&["within", &reference, "the"]))
+                .unwrap_or_else(crate::error_report);
+
+            if !output.contains(NEW_NAME) || output.contains("agent-error") {
+                wrong.push(format!("{source:?}: the new name shows:\n{output}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// Two Claude Code project folders whose sessions' reference digests
+    /// share their first 12 hex digits, the length rearview prints, and differ
+    /// in the 13th. Found by a search over folder names outside the
+    /// repository.
+    const FOLDERS_SHARING_TWELVE_DIGITS: [&str; 2] =
+        ["collision-9b2262009621", "collision-1c520d68323a"];
+    /// The 12 hex digits the sessions in [`FOLDERS_SHARING_TWELVE_DIGITS`]
+    /// share.
+    const SHARED_TWELVE_DIGITS: &str = "4bca44dab55f";
+
+    /// A Claude Code session `id` in the project folder `folder` under the
+    /// projects root of `home`.
+    fn claude_session_in_folder(home: &Path, folder: &str, id: &str) -> PathBuf {
+        let root = registered_fixture(history::Source::Claude).root_under(home);
+        let directory = root.path.join(folder);
+        std::fs::create_dir_all(&directory).unwrap();
+        let transcript = directory.join(format!("{id}.jsonl"));
+        let user = serde_json::json!({
+            "type": "user", "timestamp": "2026-07-26T06:00:00.000Z",
+            "cwd": "/tmp/project", "message": {"role": "user", "content": "a question"}
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant", "timestamp": "2026-07-26T06:00:05.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "an answer"}]}
+        });
+        std::fs::write(&transcript, format!("{user}\n{assistant}\n")).unwrap();
+        transcript
+    }
+
+    /// Claude Code sessions in [`FOLDERS_SHARING_TWELVE_DIGITS`], the first
+    /// cached and the second, when `second_cached` is false, written after.
+    struct SessionsSharingTwelveDigits {
+        _home: tempfile::TempDir,
+        storage: &'static dyn history::provider::SessionStorage,
+        cache: crate::cache_file::test_support::TemporaryCacheDirectory,
+        first: PathBuf,
+        second: PathBuf,
+    }
+
+    impl SessionsSharingTwelveDigits {
+        const ID: &str = "0f000000-0000-4000-8000-000000000001";
+
+        fn new(second_cached: bool) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let storage = history::provider::contract_tests::kept_storage_under(
+                registered_fixture(history::Source::Claude),
+                home.path(),
+            );
+            let cache = crate::tui::claude_home::admitted_cache();
+            let [first_folder, second_folder] = FOLDERS_SHARING_TWELVE_DIGITS;
+            let first = claude_session_in_folder(home.path(), first_folder, Self::ID);
+            let second = if second_cached {
+                let second = claude_session_in_folder(home.path(), second_folder, Self::ID);
+                load_as_owner(storage, cache.path());
+                second
+            } else {
+                load_as_owner(storage, cache.path());
+                claude_session_in_folder(home.path(), second_folder, Self::ID)
+            };
+            let sessions = Self {
+                _home: home,
+                storage,
+                cache,
+                first,
+                second,
+            };
+            let digests = [&sessions.first, &sessions.second].map(|path| {
+                agent::refs::AgentConversationKey::new(
+                    path.parent()
+                        .unwrap()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy(),
+                    format!("{}.jsonl", Self::ID),
+                    path.clone(),
+                )
+                .conversation_ref()
+                .digest_hex()
+                .to_owned()
+            });
+            assert!(
+                digests
+                    .iter()
+                    .all(|digest| digest.starts_with(SHARED_TWELVE_DIGITS))
+                    && digests[0][..13] != digests[1][..13],
+                "the sessions share 12 hex digits and differ in the 13th: {digests:?}"
+            );
+            sessions
+        }
+
+        fn run(&self, args: &[&str]) -> String {
+            AgentService::new(test_environment(
+                vec![self.storage],
+                Some(self.cache.path()),
+            ))
+            .execute(agent_command(args))
+            .unwrap_or_else(crate::error_report)
+        }
+    }
+
+    /// A handle of the 12 digits two sessions share is ambiguous, whether or
+    /// not the second session is cached yet.
+    #[test]
+    fn handle_two_sessions_share_is_ambiguous_cached_or_not() {
+        let handle = format!("ch_{SHARED_TWELVE_DIGITS}");
+        let mut wrong = Vec::new();
+        for second_cached in [true, false] {
+            let sessions = SessionsSharingTwelveDigits::new(second_cached);
+            for args in [
+                &["read", &handle][..],
+                &["outline", &handle],
+                &["within", &handle, "question"],
+            ] {
+                let output = sessions.run(args);
+                if !output.starts_with("protocol agent-error kind=ambiguous-ref ") {
+                    wrong.push(format!(
+                        "second cached {second_cached}, {}: ambiguous-ref:\n{output}",
+                        args[0]
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// The reference `read` prints for a session grows to the 13 digits that
+    /// distinguish it from a session sharing its first 12, though that
+    /// session is not cached yet.
+    #[test]
+    fn printed_reference_grows_past_digits_shared_with_uncached_session() {
+        let sessions = SessionsSharingTwelveDigits::new(false);
+        let expected = printed_reference_of(sessions.storage, &sessions.first);
+        assert_eq!(
+            expected.len(),
+            "ch_".len() + 13,
+            "key discovery prints a reference of 13 hex digits: {expected}"
+        );
+
+        let output = sessions.run(&["read", &expected]);
+
+        assert!(
+            output.contains(&format!(" ref={expected}")) && !output.contains("agent-error"),
+            "read prints the 13-digit reference {expected}:\n{output}"
+        );
+    }
+
+    /// The Codex fixture session, rewritten to record the working directory
+    /// `directory`, under `home`; returns its locator.
+    fn codex_session_recorded_in(home: &Path, directory: &str) -> PathBuf {
+        let fixture = registered_fixture(history::Source::Codex);
+        let locator = fixture.write_session(home, fixture.ids().session);
+        let rollout = std::fs::read_to_string(&locator).unwrap();
+        assert!(
+            rollout.contains(r#""cwd":"/tmp/project""#),
+            "the Codex fixture session records the working directory /tmp/project"
+        );
+        std::fs::write(
+            &locator,
+            rollout.replace(
+                r#""cwd":"/tmp/project""#,
+                &format!(r#""cwd":"{directory}""#),
+            ),
+        )
+        .unwrap();
+        locator
+    }
+
+    /// Two cached Claude Code sessions and an uncached Codex session that two
+    /// forms of reference match: the first Claude Code session's digest
+    /// shares an 8-digit handle with the Codex session's, and the second
+    /// carries the Codex session's ID.
+    struct ClaudeAndUncachedCodex {
+        _homes: [tempfile::TempDir; 2],
+        storages: Vec<&'static dyn history::provider::SessionStorage>,
+        cache: crate::cache_file::test_support::TemporaryCacheDirectory,
+    }
+
+    impl ClaudeAndUncachedCodex {
+        /// The Claude Code folder and the Codex working directory whose
+        /// sessions' digests share their first 8 hex digits and differ within
+        /// their first 12. Found by a search outside the repository.
+        const FOLDER: &str = "collision-claude-41670";
+        const DIRECTORY: &str = "collision-codex-15360";
+        const SHARED_EIGHT_DIGITS: &str = "6c0ba321";
+
+        fn new() -> Self {
+            let claude_home = tempfile::tempdir().unwrap();
+            let codex_home = tempfile::tempdir().unwrap();
+            let codex_id = registered_fixture(history::Source::Codex).ids().session;
+            let claude = history::provider::contract_tests::kept_storage_under(
+                registered_fixture(history::Source::Claude),
+                claude_home.path(),
+            );
+            let codex = history::provider::contract_tests::kept_storage_under(
+                registered_fixture(history::Source::Codex),
+                codex_home.path(),
+            );
+            let collides = claude_session_in_folder(
+                claude_home.path(),
+                Self::FOLDER,
+                SessionsSharingTwelveDigits::ID,
+            );
+            claude_session_in_folder(claude_home.path(), "same-id", codex_id);
+            let codex_locator = codex_session_recorded_in(codex_home.path(), Self::DIRECTORY);
+            let cache = crate::tui::claude_home::admitted_cache();
+            load_as_owner(claude, cache.path());
+            let references = [
+                printed_reference_of(claude, &collides),
+                printed_reference_of(codex, &codex_locator),
+            ];
+            assert!(
+                references.iter().all(|reference| {
+                    reference.starts_with(&format!("ch_{}", Self::SHARED_EIGHT_DIGITS))
+                }) && references[0][..15] != references[1][..15],
+                "the sessions share 8 hex digits and differ within their first 12: {references:?}"
+            );
+            Self {
+                _homes: [claude_home, codex_home],
+                storages: vec![claude, codex],
+                cache,
+            }
+        }
+
+        fn run(&self, args: &[&str]) -> String {
+            AgentService::new(test_environment(
+                self.storages.clone(),
+                Some(self.cache.path()),
+            ))
+            .execute(agent_command(args))
+            .unwrap_or_else(crate::error_report)
+        }
+    }
+
+    /// An 8-digit handle and a session ID that a cached Claude Code session
+    /// and an uncached Codex session both match are ambiguous.
+    #[test]
+    fn short_handle_and_session_id_another_agents_uncached_session_matches_are_ambiguous() {
+        let codex_id = registered_fixture(history::Source::Codex).ids().session;
+        let short_handle = format!("ch_{}", ClaudeAndUncachedCodex::SHARED_EIGHT_DIGITS);
+        let mut wrong = Vec::new();
+        for reference in [short_handle.as_str(), codex_id] {
+            for args in [
+                &["read", reference][..],
+                &["outline", reference],
+                &["within", reference, "question"],
+            ] {
+                let output = ClaudeAndUncachedCodex::new().run(args);
+                if !output.starts_with("protocol agent-error kind=ambiguous-ref ") {
+                    wrong.push(format!("{args:?}: ambiguous-ref:\n{output}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// A Pi session in the directory Pi and OMP both list, OMP's copy cached
+    /// and Pi's not: its path and its file name resolve to Pi's session, the
+    /// first agent's, as when both are cached.
+    #[test]
+    fn path_and_file_name_of_file_pi_and_omp_share_resolve_to_pis_session_with_only_omps_cached() {
+        let home = tempfile::tempdir().unwrap();
+        let pi_fixture = registered_fixture(history::Source::Pi);
+        let path = pi_fixture.write_session(home.path(), pi_fixture.ids().session);
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let storage = |source: history::Source| {
+            history::provider::contract_tests::kept_storage_under(
+                registered_fixture(source),
+                home.path(),
+            )
+        };
+        let (pi, omp) = (storage(history::Source::Pi), storage(history::Source::Omp));
+        let pis = printed_reference_of(pi, &path);
+        assert_ne!(
+            pis,
+            printed_reference_of(omp, &path),
+            "each agent keys the file"
+        );
+
+        let mut wrong = Vec::new();
+        for reference in [path.to_string_lossy().into_owned(), file_name] {
+            let cache = crate::tui::claude_home::admitted_cache();
+            load_as_owner(omp, cache.path());
+            let output = AgentService::new(test_environment(vec![pi, omp], Some(cache.path())))
+                .execute(agent_command(&["read", &reference]))
+                .unwrap_or_else(crate::error_report);
+            if !output.contains(&format!(" ref={pis}")) || output.contains("agent-error") {
+                wrong.push(format!("{reference}: Pi's session {pis}:\n{output}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
     /// When the write to an empty cache fails, `agent within` titles the hits
     /// from the read's row, the title kept outside the transcript included.
     #[test]
