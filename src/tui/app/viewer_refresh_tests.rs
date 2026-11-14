@@ -1851,6 +1851,264 @@ fn tools_key_during_reload_without_new_messages_doesnt_highlight_count() {
     );
 }
 
+/// An assistant message of one call, whose input of six lines, `<word> 1` to
+/// `<word> 6`, is truncated in truncated mode: `<word> 6` shows once the
+/// input is expanded.
+fn long_call_line(id: &str, word: &str) -> String {
+    let command = (1..=6)
+        .map(|line| format!("{word} {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::json!({
+        "type": "assistant",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}
+        ]}
+    })
+    .to_string()
+}
+
+/// A message, a long call of `first` lines, a long call of `second` lines
+/// (see [`long_call_line`]), then `texts` as messages.
+fn write_two_long_calls_then(path: &Path, texts: &[String]) {
+    let mut lines = vec![
+        user_line("intro"),
+        long_call_line("toolu_1", "first"),
+        long_call_line("toolu_2", "second"),
+    ];
+    lines.extend(texts.iter().map(|text| user_line(text)));
+    write_lines(path, lines);
+}
+
+/// [`gated_viewer_on`] in truncated mode (`tools·trn`), that render shown.
+fn gated_truncated_viewer_on(home: &ClaudeHome) -> (App, Gate) {
+    let (mut app, gate) = gated_viewer_on(home);
+    press_now(&mut app, KeyCode::Char('t'));
+    assert_eq!(gate.next_render(), (ToolDisplayMode::Truncated, false));
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+    assert!(gate.next_return().finished);
+    (app, gate)
+}
+
+/// A click on the shown rows of the call whose input shows `word`, which
+/// expands or collapses it.
+fn click_call(app: &mut App, word: &str) {
+    let frame = Rect::new(0, 0, 80, 30);
+    let state = view(app);
+    let row = state
+        .rendered_lines
+        .iter()
+        .position(|line| line.clickable && line.text().contains(word))
+        .unwrap_or_else(|| panic!("a click on the `{word}` call's rows toggles it"));
+    let screen_row = crate::tui::ui::view_layout_rects(frame, app, state)
+        .content
+        .y
+        + (row - state.scroll_offset) as u16;
+    assert!(app.handle_view_click(screen_row, frame));
+}
+
+/// The render at the gate, let through, finishes and its rows show; the
+/// expand before it requested no render of its own.
+fn finish_render_without_another(app: &mut App, gate: &Gate, when: &str) {
+    gate.let_one_through();
+    test_waits::finish_view_render(app, VIEWPORT);
+    assert!(
+        gate.next_return().finished,
+        "{when}: the expand doesn't stop the pending render"
+    );
+    assert!(
+        !gate.took_waiting_render(),
+        "{when}: the expand doesn't request a render"
+    );
+}
+
+#[test]
+fn expand_during_reloads_render_shows_expanded_once_its_rows_show() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_two_long_calls_then(&path, &[]);
+    let (mut app, gate) = gated_truncated_viewer_on(&home);
+    write_two_long_calls_then(&path, &numbered(0..1));
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+
+    click_call(&mut app, "first");
+    finish_render_without_another(&mut app, &gate, "reload");
+
+    let text = view_text(&app);
+    assert!(
+        text.contains("message 0") && text.contains("first 6"),
+        "the reload's rows show with the call expanded: {text:?}"
+    );
+}
+
+#[test]
+fn expand_during_display_keys_render_shows_expanded_once_its_rows_show() {
+    for key in ['T', 'i'] {
+        let home = ClaudeHome::new();
+        write_two_long_calls_then(&home.transcript("session"), &[]);
+        let (mut app, gate) = gated_truncated_viewer_on(&home);
+        press_now(&mut app, KeyCode::Char(key));
+        gate.next_render();
+
+        click_call(&mut app, "first");
+        finish_render_without_another(&mut app, &gate, &format!("`{key}`"));
+
+        assert!(
+            view_text(&app).contains("first 6"),
+            "`{key}`: the call shows expanded"
+        );
+    }
+}
+
+#[test]
+fn expand_during_tools_keys_render_into_full_mode_keeps_output_expanded_for_truncated_mode() {
+    let home = ClaudeHome::new();
+    write_two_long_calls_then(&home.transcript("session"), &[]);
+    let (mut app, gate) = gated_truncated_viewer_on(&home);
+    press_now(&mut app, KeyCode::Char('t'));
+    assert_eq!(gate.next_render(), (ToolDisplayMode::Full, false));
+
+    click_call(&mut app, "first");
+    assert!(
+        view(&app).entries_to_render_again.is_empty(),
+        "the call's entry doesn't render again: a call doesn't toggle in `tools·all`"
+    );
+    finish_render_without_another(&mut app, &gate, "`t`");
+    for mode in [ToolDisplayMode::Hidden, ToolDisplayMode::Truncated] {
+        press_now(&mut app, KeyCode::Char('t'));
+        assert_eq!(gate.next_render(), (mode, false));
+        gate.let_one_through();
+        test_waits::finish_view_render(&mut app, VIEWPORT);
+        assert!(gate.next_return().finished);
+    }
+
+    assert!(
+        view_text(&app).contains("first 6"),
+        "the call shows expanded back in truncated mode"
+    );
+}
+
+#[test]
+fn refresh_read_after_expand_keeps_expansion_shown_through_reloads_render() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_two_long_calls_then(&path, &[]);
+    let (mut app, gate) = gated_truncated_viewer_on(&home);
+    click_call(&mut app, "first");
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+    assert!(
+        view_text(&app).contains("first 6"),
+        "the call shows expanded"
+    );
+
+    write_two_long_calls_then(&path, &numbered(0..1));
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+    let during_render = view_text(&app);
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+
+    assert!(
+        during_render.contains("first 6"),
+        "the call stays expanded while the reload renders"
+    );
+    let text = view_text(&app);
+    assert!(
+        text.contains("message 0") && text.contains("first 6"),
+        "the reload's rows show with the call expanded: {text:?}"
+    );
+}
+
+#[test]
+fn two_expands_during_single_pending_render_both_show() {
+    let home = ClaudeHome::new();
+    write_two_long_calls_then(&home.transcript("session"), &[]);
+    let (mut app, gate) = gated_truncated_viewer_on(&home);
+    press_now(&mut app, KeyCode::Char('i'));
+    gate.next_render();
+
+    click_call(&mut app, "first");
+    click_call(&mut app, "second");
+    finish_render_without_another(&mut app, &gate, "`i`");
+
+    let text = view_text(&app);
+    assert!(
+        text.contains("first 6") && text.contains("second 6"),
+        "both calls show expanded: {text:?}"
+    );
+    assert_shown_rows_are_whole_render(&app);
+}
+
+/// The shown rows, messages and kept calls equal a whole render of the
+/// shown conversation with the view's options.
+fn assert_shown_rows_are_whole_render(app: &App) {
+    use crate::tui::viewer::{MessageRange, RenderedLine, render_parsed_conversation};
+    let state = view(app);
+    let whole =
+        render_parsed_conversation(&state.parsed_conversation, &app.view_render_options(state));
+    let rows = |lines: &[RenderedLine]| {
+        lines
+            .iter()
+            .map(|line| {
+                (
+                    line.spans.clone(),
+                    line.tool_output_id.clone(),
+                    line.clickable,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let messages = |messages: &[MessageRange]| {
+        messages
+            .iter()
+            .map(|message| (message.entry_index, message.start_line, message.end_line))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&state.rendered_lines),
+        rows(&whole.lines),
+        "the rows are a whole render's"
+    );
+    assert_eq!(
+        messages(&state.message_ranges),
+        messages(&whole.messages),
+        "the messages are a whole render's"
+    );
+    assert_eq!(
+        state.detail_calls, whole.detail_calls,
+        "the kept calls are a whole render's"
+    );
+}
+
+#[test]
+fn expand_of_call_gone_from_reloads_read_is_dropped_without_render() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_two_long_calls_then(&path, &[]);
+    let (mut app, gate) = gated_truncated_viewer_on(&home);
+    // The transcript is rewritten without the calls' lines.
+    write_messages(&path, &["intro".to_owned()]);
+    refresh_and_receive_read(&mut app);
+    gate.next_render();
+
+    click_call(&mut app, "first");
+    let state = view(&app);
+    assert!(
+        state.entries_to_render_again.is_empty() && state.expanded_tool_outputs.is_empty(),
+        "the call missing from the reload's read isn't expanded"
+    );
+    finish_render_without_another(&mut app, &gate, "reload");
+
+    let text = view_text(&app);
+    assert!(
+        text.contains("intro") && !text.contains("first"),
+        "the reload's rows show without the call: {text:?}"
+    );
+}
+
 #[test]
 fn tools_key_during_reload_counts_new_messages_for_badge() {
     let home = ClaudeHome::new();

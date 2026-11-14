@@ -20,7 +20,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::theme::Rgb;
 
 use super::output::spans_of_cells;
-use super::{CallArea, CallRange, LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, th};
+use super::{ConnectorRows, LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, th};
 
 /// A call open alone runs its lane under the first letter of a six-letter
 /// label; a call issued beside open calls takes the cell right of their
@@ -41,13 +41,13 @@ pub(super) fn lane_color(lane: Option<usize>) -> Option<Rgb> {
 
 /// The colour of a call's rule and connector: its lane's colour, or the
 /// rule's own grey for a call open alone.
-fn call_color(call: &CallRange) -> Rgb {
+fn call_color(call: &ConnectorRows) -> Rgb {
     lane_color(call.lane).unwrap_or(th().border)
 }
 
 /// The cell of a call's lane in the label column; the first lane cell for a
 /// call open alone.
-fn lane_cell(call: &CallRange) -> usize {
+fn lane_cell(call: &ConnectorRows) -> usize {
     FIRST_LANE_CELL + call.lane.unwrap_or(0)
 }
 
@@ -68,18 +68,18 @@ struct Connector {
 impl Connector {
     /// `None` for a call without a result, a lane past the label column, or
     /// a result with no row between it and the input.
-    fn of(call: &CallRange) -> Option<Self> {
+    fn of(call: &ConnectorRows) -> Option<Self> {
         let result = call.result.as_ref()?;
         let lane_cell = lane_cell(call);
-        let anchor = call.input.end_line - 1;
-        let tip = result.start_line.checked_sub(1)?;
+        let anchor = call.input.end - 1;
+        let tip = result.start.checked_sub(1)?;
         (lane_cell < NAME_WIDTH && tip > anchor).then_some(Self {
             lane_cell,
             color: call_color(call),
             anchor,
-            anchor_holds_label: rows(&call.input).len() == 1,
+            anchor_holds_label: call.input.len() == 1,
             tip,
-            result: result.start_line,
+            result: result.start,
         })
     }
 
@@ -100,10 +100,6 @@ impl Connector {
     }
 }
 
-fn rows(area: &CallArea) -> Range<usize> {
-    area.start_line..area.end_line
-}
-
 /// The glyphs every connector wants in one row: lane cells of the label
 /// column, and the rule's text and colour where a connector leaves, enters,
 /// or runs beside a call.
@@ -113,23 +109,32 @@ struct RowPatch {
     rule: Option<(&'static str, Rgb)>,
 }
 
-pub(super) fn draw_connectors<'a>(
+/// Draw the connectors and rule colours of `calls` on the rows inside
+/// `window`, and leave the other rows as they are. Given in the order a
+/// render records them, the calls write the same rule colour last on each
+/// row whichever window is painted.
+pub(super) fn draw_connectors(
     lines: &mut [RenderedLine],
-    calls: impl Iterator<Item = &'a CallRange>,
+    calls: impl Iterator<Item = ConnectorRows>,
     show_timing: bool,
+    window: Range<usize>,
 ) {
     let mut patches: BTreeMap<usize, RowPatch> = BTreeMap::new();
-    for call in calls {
-        color_call_rules(call, &mut patches);
-        if let Some(connector) = Connector::of(call) {
+    for call in calls.filter(|call| overlaps(&call.touched_rows(), &window)) {
+        color_call_rules(&call, &mut patches);
+        if let Some(connector) = Connector::of(&call) {
             connector.add_to(&mut patches);
         }
     }
     // A row's spans are `[timing?] [label column] [rule] [content…]`.
     let label_index = usize::from(show_timing);
-    for (row, patch) in patches {
-        paint_row(&mut lines[row], &patch, label_index);
+    for (row, patch) in patches.range(window) {
+        paint_row(&mut lines[*row], patch, label_index);
     }
+}
+
+fn overlaps(rows: &Range<usize>, window: &Range<usize>) -> bool {
+    rows.start < window.end && rows.end > window.start
 }
 
 /// Colour the rule of every row of the call; its connector, added after,
@@ -137,9 +142,12 @@ pub(super) fn draw_connectors<'a>(
 /// is recoloured too: its input rows carry the run's dimmed rule, lighter
 /// than the rule of its result and of the rows around the run, and its
 /// connector is to match all of them.
-fn color_call_rules(call: &CallRange, patches: &mut BTreeMap<usize, RowPatch>) {
+fn color_call_rules(call: &ConnectorRows, patches: &mut BTreeMap<usize, RowPatch>) {
     let color = call_color(call);
-    for row in call.areas().flat_map(rows) {
+    for row in std::iter::once(&call.input)
+        .chain(&call.result)
+        .flat_map(Clone::clone)
+    {
         patches.entry(row).or_default().rule = Some((RULE, color));
     }
 }

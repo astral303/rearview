@@ -5,7 +5,8 @@ use crate::log_entry::{ContentBlock, LogEntry, Tool, ToolSummaryPhrase, UserCont
 use crate::tui::theme::Rgb;
 
 use super::calls::{
-    CallRanges, EntryToolBlock, RenderedToolBlock, ToolBlock, entry_tool_blocks, later_results,
+    CallRanges, EntryToolBlock, Lanes, RenderedToolBlock, ToolBlock, entry_tool_blocks,
+    later_results,
 };
 use super::connectors::lane_color;
 use super::ledger::{LedgerRow, NameCol, RowContent, push_row, wrap_row};
@@ -395,8 +396,8 @@ fn render_summary_group_details(
     options: &RenderOptions,
 ) {
     let mut rendered_any = false;
-    let mut call_ranges =
-        CallRanges::new(run_tool_blocks(entries, pending).map(|entry_block| entry_block.block));
+    let lanes = Lanes::of(run_tool_blocks(entries, pending).map(|entry_block| entry_block.block));
+    let mut call_ranges = CallRanges::new(&lanes);
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
     let parent_id = pending.parent_id.as_deref();
     let label = pending.label(roster);
@@ -408,7 +409,7 @@ fn render_summary_group_details(
     } in run_tool_blocks(entries, pending)
     {
         if rendered_any {
-            lines.push(RenderedLine::new(vec![]));
+            push_separator(lines);
         }
         rendered_any = true;
         let location = BlockLocation {
@@ -631,15 +632,15 @@ pub(super) fn flush_tool_summary(
         );
     }
 
-    let end_line = rendered.lines.len();
-    if end_line > start_line {
-        rendered.messages.push(MessageRange {
-            entry_index: pending.first_entry_index,
+    push_separator(&mut rendered.lines);
+    rendered
+        .messages
+        .extend(message_range_excluding_trailing_blank(
+            &rendered.lines,
             start_line,
-            end_line,
-        });
-        rendered.lines.push(RenderedLine::new(vec![]));
-    }
+            rendered.lines.len(),
+            pending.first_entry_index,
+        ));
 }
 
 #[cfg(test)]

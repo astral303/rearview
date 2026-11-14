@@ -24,6 +24,7 @@ mod ledger;
 mod markdown;
 mod output;
 mod relocation;
+mod rerender;
 mod roster;
 mod search_rows;
 mod style;
@@ -34,13 +35,14 @@ mod tools;
 pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
 pub use relocation::EntryRelocation;
+pub use rerender::{EntryInPlace, ShownRows, entry_rendering_alone, render_entry_in_place};
 pub(crate) use roster::SubagentRoster;
 #[cfg(test)]
 pub use search_rows::find_matches;
-pub use search_rows::{SearchMatch, find_matches_while};
+pub use search_rows::{SearchMatch, find_matches_while, update_matches_in_replaced_rows};
 pub(crate) use summary::format_coarse_duration;
 
-use calls::{CallRanges, top_level_tool_blocks};
+use calls::{CallRanges, Lanes, top_level_tool_blocks};
 use days::DayLabels;
 use entry::render_entry;
 use summary::{
@@ -188,6 +190,14 @@ impl CallRange {
         self.areas().any(|area| area.contains_line(line_idx))
     }
 
+    pub fn rows(&self) -> ConnectorRows {
+        ConnectorRows {
+            input: self.input.rows(),
+            result: self.result.as_ref().map(CallArea::rows),
+            lane: self.lane,
+        }
+    }
+
     /// Whether any of the call's rows fall inside `rows`. Input and result are
     /// separate areas, with other calls' rows possibly between them.
     pub fn overlaps(&self, rows: &std::ops::Range<usize>) -> bool {
@@ -215,7 +225,52 @@ pub struct BlockLocation {
 
 impl CallArea {
     pub fn contains_line(&self, line_idx: usize) -> bool {
-        (self.start_line..self.end_line).contains(&line_idx)
+        self.rows().contains(&line_idx)
+    }
+
+    pub fn rows(&self) -> std::ops::Range<usize> {
+        self.start_line..self.end_line
+    }
+}
+
+/// A call's input rows, result rows and lane: what its connector and the
+/// colour of its rule are drawn from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorRows {
+    pub input: std::ops::Range<usize>,
+    pub result: Option<std::ops::Range<usize>>,
+    pub lane: Option<usize>,
+}
+
+impl ConnectorRows {
+    /// The rows the call's connector and rule colours draw on: from the
+    /// input's first row to the end of the input or the result, whichever
+    /// is later. A result without rows still covers its first row.
+    pub fn touched_rows(&self) -> std::ops::Range<usize> {
+        let end = self.result.as_ref().map_or(self.input.end, |result| {
+            self.input.end.max(result.end).max(result.start + 1)
+        });
+        self.input.start..end
+    }
+}
+
+/// A top-level call the detail modes drew: its rows, and the blocks of its
+/// input and result. A render of one entry finds the call again by those
+/// blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailCall {
+    pub rows: ConnectorRows,
+    pub input: BlockLocation,
+    pub result: Option<BlockLocation>,
+}
+
+impl DetailCall {
+    fn of(call: &CallRange) -> Self {
+        Self {
+            rows: call.rows(),
+            input: call.input.location,
+            result: call.result.as_ref().map(|result| result.location),
+        }
     }
 }
 
@@ -226,6 +281,9 @@ pub struct RenderedConversation {
     /// The calls of expanded runs, which `]` steps through; empty in the
     /// detail modes.
     pub calls: Vec<CallRange>,
+    /// The top-level calls of the detail modes, in the order they were
+    /// issued; empty in summary mode.
+    pub detail_calls: Vec<DetailCall>,
 }
 
 /// Format an ISO 8601 timestamp to HH:MM in `zone`
@@ -250,6 +308,8 @@ pub struct ParsedConversation {
     /// Where each displayed entry was read, by its `entry_index`.
     origins: Vec<EntryOrigin>,
     roster: SubagentRoster,
+    /// The lanes of the top-level calls, which the detail modes draw.
+    lanes: Lanes,
     /// The earliest and latest message timestamps, for the header's dates.
     activity_span: Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)>,
 }
@@ -262,6 +322,7 @@ impl ParsedConversation {
             entries: Vec::new(),
             origins: Vec::new(),
             roster: SubagentRoster::from_identities(Vec::new()),
+            lanes: Lanes::default(),
             activity_span: None,
         }
     }
@@ -356,11 +417,13 @@ pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversati
     for parsed in &entries {
         roster.record_agent_calls(&parsed.entry);
     }
+    let lanes = Lanes::of(top_level_tool_blocks(&entries));
     let activity_span = activity_span(&entries);
     ParsedConversation {
         entries,
         origins,
         roster,
+        lanes,
         activity_span,
     }
 }
@@ -392,8 +455,8 @@ pub fn render_parsed_conversation(
 /// `conversation` rendered with `options`.
 ///
 /// Calls `keep_going` before the first entry and every
-/// [`ENTRIES_BETWEEN_STOP_CHECKS`] entries after it, then before each of the
-/// two passes over the finished rows; `None` once it returns false.
+/// [`ENTRIES_BETWEEN_STOP_CHECKS`] entries after it, then before drawing the
+/// connectors over the finished rows; `None` once it returns false.
 pub fn render_parsed_conversation_while(
     conversation: &ParsedConversation,
     options: &RenderOptions,
@@ -402,14 +465,17 @@ pub fn render_parsed_conversation_while(
     render_entries(
         &conversation.entries,
         &conversation.roster,
+        &conversation.lanes,
         options,
         keep_going,
     )
 }
 
+/// `lanes` are the lanes of `entries`' top-level calls.
 fn render_entries(
     entries: &[RenderableEntry],
     roster: &SubagentRoster,
+    lanes: &Lanes,
     options: &RenderOptions,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<RenderedConversation> {
@@ -417,15 +483,13 @@ fn render_entries(
         lines: Vec::new(),
         messages: Vec::new(),
         calls: Vec::new(),
+        detail_calls: Vec::new(),
     };
     let mut pending_tool_summary: Option<PendingToolSummary> = None;
-    // Summary mode pairs the calls of each expanded run as the run renders;
-    // the detail modes pair every top-level call of the conversation.
-    let mut call_ranges = if options.tool_display.shows_details() {
-        CallRanges::new(top_level_tool_blocks(entries))
-    } else {
-        CallRanges::default()
-    };
+    // The detail modes pair every top-level call of the conversation here.
+    // Summary mode pairs the calls of each expanded run as the run renders,
+    // and its entries return no tool blocks.
+    let mut call_ranges = CallRanges::new(lanes);
 
     // Only a collapsed run needs the session's agent.
     let session_agent = options
@@ -477,7 +541,8 @@ fn render_entries(
             roster,
             &call_ranges,
         );
-        if entry_lines.is_empty() {
+        // A tool block without rows still closes its call.
+        if entry_lines.is_empty() && tool_blocks.is_empty() {
             continue;
         }
 
@@ -509,25 +574,27 @@ fn render_entries(
         options,
     );
     day_labels.drop_unfollowed(&mut rendered.lines);
-    // `]` steps through the calls of an expanded run; in the detail modes it
-    // steps through messages, so their calls are drawn but not returned.
-    let mut detail_calls = call_ranges.into_calls();
+    // `]` steps through the calls of an expanded run. Keep the detail modes'
+    // calls apart, without ids: `]` steps through their messages.
+    rendered.detail_calls = call_ranges
+        .into_calls()
+        .iter()
+        .map(DetailCall::of)
+        .collect();
 
     if !keep_going() {
         return None;
     }
-    postprocess_blank_lines(
-        &mut rendered.lines,
-        &mut rendered.messages,
-        rendered.calls.iter_mut().chain(&mut detail_calls),
-    );
-    if !keep_going() {
-        return None;
-    }
+    let all_rows = 0..rendered.lines.len();
     connectors::draw_connectors(
         &mut rendered.lines,
-        rendered.calls.iter().chain(&detail_calls),
+        rendered
+            .calls
+            .iter()
+            .map(CallRange::rows)
+            .chain(rendered.detail_calls.iter().map(|call| call.rows.clone())),
         options.show_timing,
+        all_rows,
     );
 
     Some(rendered)
@@ -703,94 +770,15 @@ fn message_range_excluding_trailing_blank(
     })
 }
 
-/// Collapse consecutive blank rendered lines and remap message and call
-/// ranges so they continue to point at their original visible content.
-///
-/// Multiple render helpers each push a trailing blank line, which can
-/// produce adjacent blanks when a tool result emits empty output. The
-/// dedup pass removes any blank line whose immediate predecessor is also
-/// blank, and the remap pass shifts every range start/end onto the new
-/// line indices, clamping ranges that ended on a removed blank.
-fn postprocess_blank_lines<'a>(
-    lines: &mut Vec<RenderedLine>,
-    messages: &mut Vec<MessageRange>,
-    calls: impl Iterator<Item = &'a mut CallRange>,
-) {
-    let mut removed = vec![false; lines.len()];
-    let mut i = 1;
-    while i < lines.len() {
-        if lines[i].spans.is_empty() && lines[i - 1].spans.is_empty() {
-            removed[i] = true;
-        }
-        i += 1;
+/// Push a blank row after `lines` unless they are empty or already end with
+/// one. A block without rows then leaves one blank row between its
+/// neighbours, and an entry's or a run's rows start with a non-blank row
+/// and end with one blank row, because an entry renders again alone,
+/// without the rows around it (see `render_entry_in_place`).
+fn push_separator(lines: &mut Vec<RenderedLine>) {
+    if lines.last().is_some_and(|line| !line.spans.is_empty()) {
+        lines.push(RenderedLine::new(vec![]));
     }
-
-    // Build index mapping: old line index -> new line index. Removed
-    // entries get the index they would collapse onto; they are never
-    // dereferenced for surviving ranges because the remap below walks
-    // backward off any removed terminator first.
-    let mut new_index = Vec::with_capacity(lines.len());
-    let mut offset = 0usize;
-    for (idx, &is_removed) in removed.iter().enumerate() {
-        if is_removed {
-            new_index.push(idx - offset);
-            offset += 1;
-        } else {
-            new_index.push(idx - offset);
-        }
-    }
-    let total_after = lines.len() - offset;
-
-    // Compact in place.
-    let mut write = 0;
-    for (read, &is_removed) in removed.iter().enumerate() {
-        if !is_removed {
-            if write != read {
-                lines.swap(write, read);
-            }
-            write += 1;
-        }
-    }
-    lines.truncate(total_after);
-
-    let remap = |start_line: usize, end_line: usize| {
-        remapped_line_range(start_line, end_line, &new_index, &removed, total_after)
-    };
-    for msg in messages.iter_mut() {
-        (msg.start_line, msg.end_line) = remap(msg.start_line, msg.end_line);
-    }
-    for area in calls.flat_map(|call| std::iter::once(&mut call.input).chain(call.result.as_mut()))
-    {
-        (area.start_line, area.end_line) = remap(area.start_line, area.end_line);
-    }
-
-    messages.retain(|m| m.start_line < m.end_line);
-}
-
-/// Where a `start_line..end_line` range lands once the lines flagged in
-/// `removed` are gone. An exclusive end that sat on a removed blank moves
-/// back to the last surviving line before it.
-fn remapped_line_range(
-    start_line: usize,
-    end_line: usize,
-    new_index: &[usize],
-    removed: &[bool],
-    total_after: usize,
-) -> (usize, usize) {
-    let new_start = new_index[start_line];
-    let new_end = if end_line > 0 && end_line <= new_index.len() {
-        let mut last = end_line - 1;
-        while last > start_line && removed[last] {
-            last -= 1;
-        }
-        new_index[last] + 1
-    } else if end_line == new_index.len() {
-        total_after
-    } else {
-        end_line
-    };
-    let new_end = new_end.min(total_after);
-    (new_start.min(new_end), new_end)
 }
 
 #[cfg(test)]
