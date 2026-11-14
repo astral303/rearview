@@ -357,7 +357,7 @@ pub(super) fn spawn_text_reader(
 ) -> mpsc::Sender<TextsToRead> {
     let (batches_tx, batches_rx) = mpsc::channel::<TextsToRead>();
     std::thread::Builder::new()
-        .name("search-text-reader".into())
+        .name("text-reader".into())
         .spawn(move || {
             while let Ok(TextsToRead { copies, reply }) = batches_rx.recv() {
                 let reads =

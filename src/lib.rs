@@ -77,6 +77,14 @@ pub fn run() -> ExitCode {
     ExitCode::from(status)
 }
 
+/// The pool otherwise starts at its first use, with unnamed threads.
+fn start_rayon_pool() {
+    rayon::ThreadPoolBuilder::new()
+        .thread_name(|index| format!("rayon-{index}"))
+        .build_global()
+        .expect("failed to start rayon's thread pool");
+}
+
 /// The session cache base a command reached. [`run`] reads its low-space
 /// latch after the command returns.
 #[derive(Default)]
@@ -332,8 +340,12 @@ fn truncate_delete_empty_preview(preview: &str) -> String {
 }
 
 fn try_run(clock: Arc<dyn Clock>, reached: &ReachedBase) -> Result<()> {
+    // `--help` and `--version` end the process in the parse, before the
+    // pool starts.
+    let args = Args::parse();
+    start_rayon_pool();
     run_with(
-        Args::parse(),
+        args,
         clock,
         cache_file::user_cache_base(),
         update::run,

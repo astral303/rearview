@@ -705,8 +705,12 @@ impl SessionLoader<'_> {
 
         let (read, transcripts_read) = mpsc::channel::<TranscriptProgress>();
         let loaded = std::thread::scope(|scope| {
-            let worker =
-                scope.spawn(move || self.load_discovered(discovered, left_out, operation, &read));
+            let worker = std::thread::Builder::new()
+                .name("session-load".into())
+                .spawn_scoped(scope, move || {
+                    self.load_discovered(discovered, left_out, operation, &read)
+                })
+                .expect("failed to spawn the session load thread");
             let mut done = 0;
             for update in transcripts_read {
                 match update {
@@ -1773,9 +1777,14 @@ fn with_writer_thread<T>(
     std::thread::scope(|scope| {
         let (writes, received) = mpsc::sync_channel(DATABASE_WRITE_QUEUE_LENGTH);
         let applying = match writer {
-            Some(writer) => {
-                Some(scope.spawn(move || sqlite_cache::apply_writes(writer, received, debug_level)))
-            }
+            Some(writer) => Some(
+                std::thread::Builder::new()
+                    .name("cache-writer".into())
+                    .spawn_scoped(scope, move || {
+                        sqlite_cache::apply_writes(writer, received, debug_level)
+                    })
+                    .expect("failed to spawn the cache writer thread"),
+            ),
             None => {
                 drop(received);
                 None

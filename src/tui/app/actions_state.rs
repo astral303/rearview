@@ -208,9 +208,12 @@ impl App {
             return;
         }
         let (send, is_capable) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = send.send(source.provider().fork().is_capable());
-        });
+        std::thread::Builder::new()
+            .name("fork-check".into())
+            .spawn(move || {
+                let _ = send.send(source.provider().fork().is_capable());
+            })
+            .expect("failed to spawn the fork check thread");
         self.fork_read = Some(ForkRead { source, is_capable });
     }
 

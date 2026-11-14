@@ -47,13 +47,17 @@ impl TaskSupervisor {
     /// what it reads in `load_meter`.
     pub(crate) fn start(environment: Environment, load_meter: Arc<LoadMeter>) -> Self {
         let (worker, jobs) = mpsc::channel::<Job>();
-        std::thread::spawn(move || {
-            for job in jobs {
-                // A job that panics drops its channel. The runtime reads a
-                // dropped channel as a job that stopped, and the next job runs.
-                let _ = catch_unwind(AssertUnwindSafe(job));
-            }
-        });
+        std::thread::Builder::new()
+            .name("tui-jobs".into())
+            .spawn(move || {
+                for job in jobs {
+                    // A job that panics drops its channel. The runtime reads a
+                    // dropped channel as a job that stopped, and the next job
+                    // runs.
+                    let _ = catch_unwind(AssertUnwindSafe(job));
+                }
+            })
+            .expect("failed to spawn the TUI job thread");
         Self {
             environment,
             worker: Some(worker),

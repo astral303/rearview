@@ -203,32 +203,38 @@ where
         let (schedule, changed, sizes) = (&schedule, &changed, &sizes);
         for _ in 0..pools.reads.min(items.len()) {
             let read = &read;
-            scope.spawn(move || {
-                let _stop = StopOnUnwind { schedule, changed };
-                while let Some(position) = claim_read(schedule, changed, sizes, pools) {
-                    let item = read(&items[position]);
-                    let mut schedule = schedule.lock().unwrap();
-                    schedule.reading -= 1;
-                    schedule.read.insert(position, item);
-                    changed.notify_all();
-                }
-            });
+            std::thread::Builder::new()
+                .name("scan-read".into())
+                .spawn_scoped(scope, move || {
+                    let _stop = StopOnUnwind { schedule, changed };
+                    while let Some(position) = claim_read(schedule, changed, sizes, pools) {
+                        let item = read(&items[position]);
+                        let mut schedule = schedule.lock().unwrap();
+                        schedule.reading -= 1;
+                        schedule.read.insert(position, item);
+                        changed.notify_all();
+                    }
+                })
+                .expect("failed to spawn a scan read thread");
         }
         for _ in 0..pools.searches.min(items.len()) {
             let (sender, search) = (sender.clone(), &search);
-            scope.spawn(move || {
-                let _stop = StopOnUnwind { schedule, changed };
-                while let Some((position, item)) = take_read(schedule, changed, items.len()) {
-                    let result = search(&items[position], item);
-                    let mut locked = schedule.lock().unwrap();
-                    locked.finish_search(position, sizes[position]);
-                    changed.notify_all();
-                    drop(locked);
-                    if sender.send((position, result)).is_err() {
-                        break;
+            std::thread::Builder::new()
+                .name("scan-search".into())
+                .spawn_scoped(scope, move || {
+                    let _stop = StopOnUnwind { schedule, changed };
+                    while let Some((position, item)) = take_read(schedule, changed, items.len()) {
+                        let result = search(&items[position], item);
+                        let mut locked = schedule.lock().unwrap();
+                        locked.finish_search(position, sizes[position]);
+                        changed.notify_all();
+                        drop(locked);
+                        if sender.send((position, result)).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                })
+                .expect("failed to spawn a scan search thread");
         }
         drop(sender);
 
