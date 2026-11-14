@@ -392,8 +392,8 @@ pub fn render_parsed_conversation(
 /// `conversation` rendered with `options`.
 ///
 /// Calls `keep_going` before the first entry and every
-/// [`ENTRIES_BETWEEN_STOP_CHECKS`] entries after it, then before each of the
-/// two passes over the finished rows; `None` once it returns false.
+/// [`ENTRIES_BETWEEN_STOP_CHECKS`] entries after it, then before drawing the
+/// connectors over the finished rows; `None` once it returns false.
 pub fn render_parsed_conversation_while(
     conversation: &ParsedConversation,
     options: &RenderOptions,
@@ -477,7 +477,8 @@ fn render_entries(
             roster,
             &call_ranges,
         );
-        if entry_lines.is_empty() {
+        // A tool block without rows still closes its call.
+        if entry_lines.is_empty() && tool_blocks.is_empty() {
             continue;
         }
 
@@ -511,16 +512,8 @@ fn render_entries(
     day_labels.drop_unfollowed(&mut rendered.lines);
     // `]` steps through the calls of an expanded run; in the detail modes it
     // steps through messages, so their calls are drawn but not returned.
-    let mut detail_calls = call_ranges.into_calls();
+    let detail_calls = call_ranges.into_calls();
 
-    if !keep_going() {
-        return None;
-    }
-    postprocess_blank_lines(
-        &mut rendered.lines,
-        &mut rendered.messages,
-        rendered.calls.iter_mut().chain(&mut detail_calls),
-    );
     if !keep_going() {
         return None;
     }
@@ -703,94 +696,15 @@ fn message_range_excluding_trailing_blank(
     })
 }
 
-/// Collapse consecutive blank rendered lines and remap message and call
-/// ranges so they continue to point at their original visible content.
-///
-/// Multiple render helpers each push a trailing blank line, which can
-/// produce adjacent blanks when a tool result emits empty output. The
-/// dedup pass removes any blank line whose immediate predecessor is also
-/// blank, and the remap pass shifts every range start/end onto the new
-/// line indices, clamping ranges that ended on a removed blank.
-fn postprocess_blank_lines<'a>(
-    lines: &mut Vec<RenderedLine>,
-    messages: &mut Vec<MessageRange>,
-    calls: impl Iterator<Item = &'a mut CallRange>,
-) {
-    let mut removed = vec![false; lines.len()];
-    let mut i = 1;
-    while i < lines.len() {
-        if lines[i].spans.is_empty() && lines[i - 1].spans.is_empty() {
-            removed[i] = true;
-        }
-        i += 1;
+/// Push a blank row after `lines` unless they are empty or already end with
+/// one. A block without rows then leaves one blank row between its
+/// neighbours, and an entry's or a run's rows start with a non-blank row
+/// and end with one blank row, because an entry renders again alone,
+/// without the rows around it (see `render_entry_in_place`).
+fn push_separator(lines: &mut Vec<RenderedLine>) {
+    if lines.last().is_some_and(|line| !line.spans.is_empty()) {
+        lines.push(RenderedLine::new(vec![]));
     }
-
-    // Build index mapping: old line index -> new line index. Removed
-    // entries get the index they would collapse onto; they are never
-    // dereferenced for surviving ranges because the remap below walks
-    // backward off any removed terminator first.
-    let mut new_index = Vec::with_capacity(lines.len());
-    let mut offset = 0usize;
-    for (idx, &is_removed) in removed.iter().enumerate() {
-        if is_removed {
-            new_index.push(idx - offset);
-            offset += 1;
-        } else {
-            new_index.push(idx - offset);
-        }
-    }
-    let total_after = lines.len() - offset;
-
-    // Compact in place.
-    let mut write = 0;
-    for (read, &is_removed) in removed.iter().enumerate() {
-        if !is_removed {
-            if write != read {
-                lines.swap(write, read);
-            }
-            write += 1;
-        }
-    }
-    lines.truncate(total_after);
-
-    let remap = |start_line: usize, end_line: usize| {
-        remapped_line_range(start_line, end_line, &new_index, &removed, total_after)
-    };
-    for msg in messages.iter_mut() {
-        (msg.start_line, msg.end_line) = remap(msg.start_line, msg.end_line);
-    }
-    for area in calls.flat_map(|call| std::iter::once(&mut call.input).chain(call.result.as_mut()))
-    {
-        (area.start_line, area.end_line) = remap(area.start_line, area.end_line);
-    }
-
-    messages.retain(|m| m.start_line < m.end_line);
-}
-
-/// Where a `start_line..end_line` range lands once the lines flagged in
-/// `removed` are gone. An exclusive end that sat on a removed blank moves
-/// back to the last surviving line before it.
-fn remapped_line_range(
-    start_line: usize,
-    end_line: usize,
-    new_index: &[usize],
-    removed: &[bool],
-    total_after: usize,
-) -> (usize, usize) {
-    let new_start = new_index[start_line];
-    let new_end = if end_line > 0 && end_line <= new_index.len() {
-        let mut last = end_line - 1;
-        while last > start_line && removed[last] {
-            last -= 1;
-        }
-        new_index[last] + 1
-    } else if end_line == new_index.len() {
-        total_after
-    } else {
-        end_line
-    };
-    let new_end = new_end.min(total_after);
-    (new_start.min(new_end), new_end)
 }
 
 #[cfg(test)]

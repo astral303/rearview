@@ -83,14 +83,14 @@ fn render_stop_checks(entries: usize, answers: &[bool]) -> (usize, bool) {
 }
 
 #[test]
-fn render_checks_whether_to_keep_going_per_interval_of_entries_and_before_each_pass() {
+fn render_checks_whether_to_keep_going_per_interval_of_entries_and_before_connectors() {
     assert_eq!(
         [
             render_stop_checks(ENTRIES_BETWEEN_STOP_CHECKS, &[]),
             render_stop_checks(ENTRIES_BETWEEN_STOP_CHECKS + 1, &[]),
         ],
-        [(3, true), (4, true)],
-        "one check before each interval of entries, then one before each pass over the rows"
+        [(2, true), (3, true)],
+        "one check before each interval of entries, then one before the connectors"
     );
 }
 
@@ -102,9 +102,9 @@ fn stopped_render_doesnt_render_past_the_check_that_answers_false() {
         "the render ends at the check inside its entries that answers false"
     );
     assert_eq!(
-        render_stop_checks(1, &[true, true, false]),
-        (3, false),
-        "a check that answers false before the last pass ends the render"
+        render_stop_checks(1, &[true, false]),
+        (2, false),
+        "a check that answers false before the connectors ends the render"
     );
 }
 
@@ -4347,188 +4347,11 @@ fn fixture_file_round_trip_renders_user_and_assistant() {
     assert_eq!(rendered.messages.len(), 2);
 }
 
-// -----------------------------------------------------------------
-// Postprocess pipeline unit tests
-//
-// These exercise the blank-line dedup and message-range remap pass
-// directly, without going through the full render pipeline. They
-// pin the exact behavior of the extracted helpers.
-// -----------------------------------------------------------------
-
 fn nonblank_line(text: &str) -> RenderedLine {
     RenderedLine::new(vec![(text.to_string(), LineStyle::default())])
 }
 fn blank_line() -> RenderedLine {
     RenderedLine::new(vec![])
-}
-
-#[test]
-fn postprocess_collapses_runs_of_blanks_to_one() {
-    let mut lines = vec![
-        nonblank_line("a"),
-        blank_line(),
-        blank_line(),
-        blank_line(),
-        nonblank_line("b"),
-    ];
-    let mut messages = Vec::new();
-    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
-
-    assert_eq!(lines.len(), 3);
-    assert!(!lines[0].spans.is_empty());
-    assert!(lines[1].spans.is_empty());
-    assert!(!lines[2].spans.is_empty());
-}
-
-#[test]
-fn postprocess_remaps_range_spanning_removed_blank() {
-    // Lines: 0=a, 1=blank, 2=blank (removed), 3=b
-    // Range covers 0..3 (a + blank), should become 0..2 in compacted output.
-    let mut lines = vec![
-        nonblank_line("a"),
-        blank_line(),
-        blank_line(),
-        nonblank_line("b"),
-    ];
-    let mut messages = vec![MessageRange {
-        entry_index: 0,
-        start_line: 0,
-        end_line: 3,
-    }];
-    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
-
-    assert_eq!(lines.len(), 3);
-    assert_eq!(messages.len(), 1);
-    // end_line walks back off the removed blank, which lands on the
-    // surviving blank at original index 1 (new index 1), so end = 2.
-    assert_eq!(messages[0].start_line, 0);
-    assert_eq!(messages[0].end_line, 2);
-}
-
-#[test]
-fn postprocess_clamps_range_ending_on_removed_blank() {
-    // Range ends exactly on a removed blank.
-    let mut lines = vec![
-        nonblank_line("a"),
-        blank_line(),
-        blank_line(),
-        nonblank_line("b"),
-    ];
-    let mut messages = vec![MessageRange {
-        entry_index: 0,
-        start_line: 0,
-        end_line: 2,
-    }];
-    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
-
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].start_line, 0);
-    // last non-removed before end_line is 1 (kept blank); new index 1 + 1 = 2.
-    // That is fine: it includes the kept blank.
-    assert!(messages[0].end_line <= lines.len());
-    assert!(messages[0].end_line > messages[0].start_line);
-}
-
-#[test]
-fn postprocess_remaps_first_message_adjacent_to_removed_blank() {
-    // Two messages back-to-back, with a doubled blank between them.
-    let mut lines = vec![
-        nonblank_line("first"),
-        blank_line(),
-        blank_line(),
-        nonblank_line("second"),
-        blank_line(),
-    ];
-    let mut messages = vec![
-        MessageRange {
-            entry_index: 0,
-            start_line: 0,
-            end_line: 1,
-        },
-        MessageRange {
-            entry_index: 1,
-            start_line: 3,
-            end_line: 4,
-        },
-    ];
-    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
-
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].start_line, 0);
-    assert_eq!(messages[0].end_line, 1);
-    // Second message should shift by 1 (one blank removed before it).
-    assert_eq!(messages[1].start_line, 2);
-    assert_eq!(messages[1].end_line, 3);
-}
-
-#[test]
-fn postprocess_handles_trailing_blanks() {
-    let mut lines = vec![nonblank_line("a"), blank_line(), blank_line(), blank_line()];
-    let mut messages = vec![MessageRange {
-        entry_index: 0,
-        start_line: 0,
-        end_line: 1,
-    }];
-    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
-
-    // Two of the three trailing blanks collapse out.
-    assert_eq!(lines.len(), 2);
-    assert_eq!(messages[0].end_line, 1);
-}
-
-#[test]
-fn postprocess_drops_empty_range_collapsed_to_zero() {
-    // start_line == end_line after clamping → range removed.
-    let mut lines = vec![nonblank_line("a"), blank_line()];
-    let mut messages = vec![MessageRange {
-        entry_index: 0,
-        start_line: 1,
-        end_line: 2,
-    }];
-    postprocess_blank_lines(&mut lines, &mut messages, std::iter::empty());
-
-    // start_line was a kept blank at original index 1 → new index 1.
-    // end_line maps to new_index[1] + 1 = 2, total_after = 2.
-    // Range survives because 1 < 2.
-    assert_eq!(messages.len(), 1);
-    assert!(messages[0].start_line < messages[0].end_line);
-}
-
-#[test]
-fn postprocess_remaps_call_areas_with_their_lines() {
-    // Lines: 0=a, 1=blank, 2=blank (removed), 3=b
-    let mut lines = vec![
-        nonblank_line("a"),
-        blank_line(),
-        blank_line(),
-        nonblank_line("b"),
-    ];
-    let id = make_tool_summary_output_id(0, None);
-    let location = BlockLocation {
-        entry_index: 0,
-        block_index: 0,
-    };
-    let mut calls = [CallRange {
-        input: CallArea {
-            id: id.clone(),
-            location,
-            start_line: 0,
-            end_line: 1,
-        },
-        result: Some(CallArea {
-            id,
-            location,
-            start_line: 3,
-            end_line: 4,
-        }),
-        lane: None,
-    }];
-    postprocess_blank_lines(&mut lines, &mut Vec::new(), calls.iter_mut());
-
-    let call = &calls[0];
-    assert_eq!((call.input.start_line, call.input.end_line), (0, 1));
-    let result = call.result.as_ref().unwrap();
-    assert_eq!((result.start_line, result.end_line), (2, 3));
 }
 
 #[test]
@@ -4722,25 +4545,130 @@ fn thinking_only_entry_splits_tool_run_only_when_thinking_is_shown() {
 }
 
 #[test]
-fn consecutive_blank_lines_collapse_and_remap_ranges() {
-    // Two adjacent user messages each emit a trailing blank; the dedup pass
-    // collapses any double-blank that would arise from this sequence.
+fn adjacent_messages_leave_one_blank_row_between_them() {
     let entries = vec![user_entry(0, "first", None), user_entry(1, "second", None)];
     let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
 
-    // No two consecutive empty lines should remain.
     for pair in rendered.lines.windows(2) {
         assert!(
             !(pair[0].spans.is_empty() && pair[1].spans.is_empty()),
-            "consecutive empty lines should be collapsed"
+            "one blank row separates the messages"
         );
     }
 
-    // Both user message ranges should still target valid, distinct lines.
     assert_eq!(rendered.messages.len(), 2);
     assert!(rendered.messages[0].end_line <= rendered.messages[1].start_line);
     assert!(rendered.messages[0].start_line < rendered.messages[0].end_line);
     assert!(rendered.messages[1].start_line < rendered.messages[1].end_line);
+}
+
+/// A result without rows: a lone code fence opens an empty code block.
+const RESULT_WITHOUT_ROWS: &str = "```";
+
+/// A user entry of one result per item of `contents`, sent at `timestamp`
+/// when there is one.
+fn results_entry(
+    entry_index: usize,
+    timestamp: Option<&str>,
+    contents: &[&str],
+) -> RenderableEntry {
+    let results: Vec<String> = contents
+        .iter()
+        .enumerate()
+        .map(|(index, content)| {
+            format!(
+                r#"{{"type":"tool_result","tool_use_id":"toolu_{index}","content":"{content}"}}"#
+            )
+        })
+        .collect();
+    let timestamp = timestamp.map_or(String::new(), |timestamp| {
+        format!(r#""timestamp":"{timestamp}","#)
+    });
+    RenderableEntry {
+        entry_index,
+        entry: claude_entry(&format!(
+            r#"{{"type":"user",{timestamp}"message":{{"role":"user","content":[{}]}}}}"#,
+            results.join(",")
+        )),
+    }
+}
+
+#[test]
+fn entry_whose_first_block_has_no_rows_starts_with_its_next_block() {
+    let entries = vec![results_entry(0, None, &[RESULT_WITHOUT_ROWS, "second"])];
+    let rendered =
+        render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Truncated));
+
+    let first_row = line_text(&rendered.lines[0]);
+    assert!(
+        first_row.contains("second"),
+        "the entry's first row is its second result's, without a blank row above: {first_row:?}"
+    );
+}
+
+#[test]
+fn entry_whose_first_block_has_no_rows_starts_right_after_day_label() {
+    let entries = vec![
+        stamped_message(0, "user", &day_one(), "first question"),
+        results_entry(1, Some(&day_three()), &[RESULT_WITHOUT_ROWS, "second"]),
+    ];
+    let rendered = render_parsed_entries(&entries, &timed_options(ToolDisplayMode::Truncated));
+
+    let label = day_label_rows(&rendered)[0];
+    let row_after_label = line_text(&rendered.lines[label + 1]);
+    assert!(
+        row_after_label.contains("second"),
+        "the row after the day label is the second result's, without a blank row between: {row_after_label:?}"
+    );
+}
+
+#[test]
+fn message_whose_last_block_has_no_rows_ends_before_its_blank_row() {
+    let entries = vec![results_entry(0, None, &["first", RESULT_WITHOUT_ROWS])];
+    let rendered =
+        render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Truncated));
+
+    let message = &rendered.messages[0];
+    assert_eq!(
+        rendered.lines.len(),
+        message.end_line + 1,
+        "one blank row follows the message"
+    );
+    assert!(rendered.lines[message.end_line].spans.is_empty());
+    assert!(
+        line_text(&rendered.lines[message.end_line - 1]).contains("first"),
+        "the message ends at the first result's last row"
+    );
+}
+
+#[test]
+fn expanded_run_whose_last_block_has_no_rows_ends_at_its_last_row_with_text() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: claude_entry(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_0","name":"Grep","input":{"pattern":"one"}},{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"two"}}]}}"#,
+            ),
+        },
+        results_entry(1, None, &["first", RESULT_WITHOUT_ROWS]),
+    ];
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+    let rendered = render_parsed_entries(&entries, &options);
+
+    let run = &rendered.messages[0];
+    assert_eq!(
+        rendered.lines.len(),
+        run.end_line + 1,
+        "one row, blank but for the connector to the result without rows, follows the run: {}",
+        rendered_text(&rendered)
+    );
+    assert!(
+        line_text(&rendered.lines[run.end_line - 1]).contains("first"),
+        "the run ends at the first result's last row"
+    );
 }
 
 // -----------------------------------------------------------------

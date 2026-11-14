@@ -301,7 +301,7 @@ fn render_user_message<'a>(
         printed |= !tool_blocks.is_empty();
     }
     if printed {
-        lines.push(RenderedLine::new(vec![]));
+        push_separator(lines);
     }
     tool_blocks
 }
@@ -324,7 +324,7 @@ fn render_assistant_message<'a>(
     }
     printed |= step_thinking(lines, ctx, &mut timing, blocks);
     if printed {
-        lines.push(RenderedLine::new(vec![]));
+        push_separator(lines);
     }
     tool_blocks
 }
@@ -489,7 +489,7 @@ fn step_tool_calls<'a>(
             continue;
         };
         if !tool_blocks.is_empty() {
-            lines.push(RenderedLine::new(vec![]));
+            push_separator(lines);
         }
         let output_id = make_tool_output_id(
             ctx.entry_index,
@@ -581,7 +581,7 @@ fn step_user_tool_results<'a>(
 ) {
     for row in collect_tool_result_rows(ctx, blocks) {
         if !tool_blocks.is_empty() {
-            lines.push(RenderedLine::new(vec![]));
+            push_separator(lines);
         }
         let row_timing = if ctx.style.is_subagent {
             timing.pad()

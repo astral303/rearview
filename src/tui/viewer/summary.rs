@@ -408,7 +408,7 @@ fn render_summary_group_details(
     } in run_tool_blocks(entries, pending)
     {
         if rendered_any {
-            lines.push(RenderedLine::new(vec![]));
+            push_separator(lines);
         }
         rendered_any = true;
         let location = BlockLocation {
@@ -631,15 +631,15 @@ pub(super) fn flush_tool_summary(
         );
     }
 
-    let end_line = rendered.lines.len();
-    if end_line > start_line {
-        rendered.messages.push(MessageRange {
-            entry_index: pending.first_entry_index,
+    push_separator(&mut rendered.lines);
+    rendered
+        .messages
+        .extend(message_range_excluding_trailing_blank(
+            &rendered.lines,
             start_line,
-            end_line,
-        });
-        rendered.lines.push(RenderedLine::new(vec![]));
-    }
+            rendered.lines.len(),
+            pending.first_entry_index,
+        ));
 }
 
 #[cfg(test)]
