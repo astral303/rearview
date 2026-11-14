@@ -15,6 +15,7 @@ use crate::semantic::types::{ChunkHits, SemanticCancellationToken};
 use crate::tui::app::{SemanticProgress, SemanticResultMetadata};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -91,15 +92,30 @@ fn spawn_semantic_worker_with(
     let cancellation = SemanticCancellationToken::new();
     let worker_cancellation = cancellation.clone();
 
+    // Counted before the thread starts, so an exit right after this call
+    // sees the worker.
+    let counted = MODEL_THREADS.count_thread();
     std::thread::Builder::new()
         .name("semantic-search-worker".into())
-        .spawn(move || run_semantic_worker(cmd_rx, res_tx, worker_cancellation, clock, load_model))
+        .spawn(move || {
+            run_semantic_worker(
+                counted,
+                cmd_rx,
+                res_tx,
+                worker_cancellation,
+                clock,
+                load_model,
+            );
+        })
         .expect("failed to spawn semantic search worker thread");
 
     (cmd_tx, res_rx, cancellation)
 }
 
+/// `_counted` is the first parameter: it drops after the worker has freed
+/// its model.
 fn run_semantic_worker(
+    _counted: CountedThread,
     cmd_rx: mpsc::Receiver<SemanticWorkerCommand>,
     res_tx: mpsc::Sender<SemanticSearchMessage>,
     cancellation_source: SemanticCancellationToken,
@@ -109,7 +125,7 @@ fn run_semantic_worker(
     let mut worker = SemanticWorker {
         corpus: WorkerCorpus::default(),
         index: SemanticIndexState::new(clock),
-        model: Model::new(load_model),
+        model: Model::new(load_model, &MODEL_THREADS),
         results: res_tx,
     };
 
@@ -266,12 +282,46 @@ fn load_fastembed() -> Result<Embedder> {
     Ok(Box::new(FastembedEmbedder::new_quiet()?))
 }
 
+/// The threads of this process that load, use or free the semantic model:
+/// each worker and each load. [`crate::run`] checks them before the process
+/// ends.
+pub static MODEL_THREADS: ModelThreads = ModelThreads::new();
+
+/// A count of running threads.
+pub struct ModelThreads(AtomicUsize);
+
+impl ModelThreads {
+    const fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    /// True while a thread counted here runs.
+    pub fn any_running(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+
+    /// Counts a thread until the returned value drops.
+    fn count_thread(&'static self) -> CountedThread {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        CountedThread(self)
+    }
+}
+
+struct CountedThread(&'static ModelThreads);
+
+impl Drop for CountedThread {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The worker's model across requests. A load runs on a thread of its own
 /// and keeps running across requests that don't wait for it: those without
 /// chunks to work on, and cancelled ones. Nothing joins a load when the
-/// worker ends.
+/// worker ends; each load counts in `threads` while it runs.
 struct Model {
     loader: ModelLoader,
+    threads: &'static ModelThreads,
     state: ModelState,
 }
 
@@ -292,9 +342,10 @@ enum ModelState {
 const CANCELLATION_CHECK_EVERY: Duration = Duration::from_millis(50);
 
 impl Model {
-    fn new(loader: ModelLoader) -> Self {
+    fn new(loader: ModelLoader, threads: &'static ModelThreads) -> Self {
         Self {
             loader,
+            threads,
             state: ModelState::Absent,
         }
     }
@@ -306,11 +357,15 @@ impl Model {
             return;
         }
         let loader = Arc::clone(&self.loader);
+        // Counted before the thread starts, so an exit right after this call
+        // sees the load.
+        let counted = self.threads.count_thread();
         let (end, ended) = mpsc::channel();
         let load = std::thread::Builder::new()
             .name("semantic-model-load".into())
             .spawn(move || {
                 let model = loader();
+                drop(counted);
                 let _ = end.send(());
                 model
             })
@@ -869,10 +924,12 @@ mod tests {
 
     #[test]
     fn empty_visible_dialogue_returns_before_embedder_initialization() {
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
         let (tx, rx, _cancellation) =
-            spawn_semantic_worker(Arc::new(crate::clock::TestClock::default()));
+            spawn_semantic_worker_with(Arc::new(crate::clock::TestClock::default()), load_model);
         send_worker_setup(&tx, vec![], "alpha", false);
         let response = recv_empty_complete(&rx);
+        loader.release();
         assert_eq!(response.progress, SemanticProgress::EmptyCorpus);
     }
 
@@ -1702,7 +1759,8 @@ mod tests {
             )),
             _ => unit_embedder(load),
         });
-        let mut model = Model::new(load_model);
+        static THREADS: ModelThreads = ModelThreads::new();
+        let mut model = Model::new(load_model, &THREADS);
         model.start_loading(1);
         loader.wait_for_start();
         loader.release();
@@ -1720,6 +1778,25 @@ mod tests {
             (loaded, waits, loader.loads()),
             (true, 1, 2),
             "the request reports one wait, for the load started again"
+        );
+    }
+
+    #[test]
+    fn model_load_counts_as_running_until_it_ends() {
+        static THREADS: ModelThreads = ModelThreads::new();
+        let (loader, load_model) = GatedLoader::new(unit_embedder);
+        let mut model = Model::new(load_model, &THREADS);
+
+        model.start_loading(1);
+        loader.wait_for_start();
+        let while_waiting = THREADS.any_running();
+        loader.release();
+        wait_until_load_ends(&model);
+
+        assert!(while_waiting, "the waiting load counts as running");
+        assert!(
+            !THREADS.any_running(),
+            "the load stops counting once it ends"
         );
     }
 

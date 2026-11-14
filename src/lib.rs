@@ -22,6 +22,7 @@ mod error;
 mod history;
 mod log_entry;
 mod markdown;
+mod native_exit;
 #[cfg(test)]
 mod output_contract;
 mod pager;
@@ -57,7 +58,11 @@ use std::process::{Command, ExitCode};
 use tui::ListSearchMode;
 
 /// Run `rearview` with the process's arguments on the system clock, print any
-/// error to stderr, and return the exit status.
+/// error to stderr, and return the exit status. End the process here
+/// without native teardown instead when a thread that loads, uses or frees
+/// the semantic model is still running, as after a quit during the model's
+/// load: ONNX Runtime's static destructors would otherwise run while that
+/// thread is inside ONNX Runtime.
 pub fn run() -> ExitCode {
     let reached = ReachedBase::default();
     let result = history::sqlite_cache::connection::turn_off_memory_statistics()
@@ -65,11 +70,11 @@ pub fn run() -> ExitCode {
         .and_then(|()| try_run(Arc::new(SystemClock::new()), &reached));
     // A failed write to stderr leaves rearview nowhere to report it.
     let (failed, _stderr_write) = finish_command(result, reached.base(), &mut std::io::stderr());
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    let status = u8::from(failed);
+    if tui::MODEL_THREADS.any_running() {
+        native_exit::exit_without_native_teardown(status);
     }
+    ExitCode::from(status)
 }
 
 /// The session cache base a command reached. [`run`] reads its low-space

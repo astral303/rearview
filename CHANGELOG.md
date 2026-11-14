@@ -103,6 +103,8 @@
   page down (`Ctrl+D`) not working while the list loads.
 - Fix the selection jumping to the first row when the list finishes
   loading. A row selected while the list loads now stays selected.
+- Fix rearview crashing (`Segmentation fault: 11` on macOS) when the user
+  quits while semantic search loads its model.
 
 #### `rearview agent` commands
 
