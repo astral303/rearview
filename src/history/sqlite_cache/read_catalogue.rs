@@ -29,8 +29,16 @@ pub(crate) enum CatalogueSession {
 pub(crate) struct ListedSession {
     pub(crate) cache_key: String,
     pub(crate) locator: PathBuf,
+    /// Empty when [`SqliteCache::listed_sessions`] read the row.
     pub(crate) subagents: Vec<PathBuf>,
     pub(crate) recorded: RecordedSession,
+}
+
+/// A read of listed sessions: with each row's sub-agent transcripts, one
+/// query per row, or without them.
+enum SubagentTranscripts {
+    Read,
+    Skipped,
 }
 
 impl SqliteCache {
@@ -91,19 +99,32 @@ impl SqliteCache {
         root: &SessionRoot,
         directories: &[&Path],
     ) -> Result<Vec<ListedSession>> {
-        self.listed_sessions_where(storage, root, |locator| {
+        self.listed_sessions_where(storage, root, SubagentTranscripts::Read, |locator| {
             directories
                 .iter()
                 .any(|directory| locator.starts_with(directory))
         })
     }
 
+    /// Every listed session under `root`, as [`Self::listed_sessions_under`]
+    /// reads them but without their sub-agent transcripts: one query reads
+    /// every row.
+    pub(crate) fn listed_sessions(
+        &self,
+        storage: SessionCache,
+        root: &SessionRoot,
+    ) -> Result<Vec<ListedSession>> {
+        self.listed_sessions_where(storage, root, SubagentTranscripts::Skipped, |_| true)
+    }
+
     /// The listed sessions under `root` whose transcript path `keeps`, in
-    /// path order, with their paths in `root`'s spelling.
+    /// path order, with their paths in `root`'s spelling, and with their
+    /// sub-agent transcripts when `subagent_transcripts` reads them.
     fn listed_sessions_where(
         &self,
         storage: SessionCache,
         root: &SessionRoot,
+        subagent_transcripts: SubagentTranscripts,
         keeps: impl Fn(&Path) -> bool,
     ) -> Result<Vec<ListedSession>> {
         let roots = self.session_roots(root);
@@ -130,13 +151,19 @@ impl SqliteCache {
                 if !keeps(&locator) {
                     continue;
                 }
-                let Some(files) = transcripts_of(connection, &places, row.get(0)?)? else {
-                    continue;
+                let (locator, subagents) = match subagent_transcripts {
+                    SubagentTranscripts::Read => {
+                        let Some(files) = transcripts_of(connection, &places, row.get(0)?)? else {
+                            continue;
+                        };
+                        (files.locator, files.subagents)
+                    }
+                    SubagentTranscripts::Skipped => (locator, Vec::new()),
                 };
                 sessions.push(ListedSession {
                     cache_key: row.get(1)?,
-                    locator: files.locator,
-                    subagents: files.subagents,
+                    locator,
+                    subagents,
                     recorded: RecordedSession {
                         session_id: row.get(2)?,
                         project_dir: row.get::<_, Option<String>>(3)?.map(PathBuf::from),

@@ -798,6 +798,16 @@ fn finish_resolution(
     }
 }
 
+/// True when `reference` is a `ch_` handle at least as long as the handles
+/// rearview prints. False for a shorter handle, a session ID, a path and a
+/// file name.
+pub(crate) fn is_handle_of_printed_length(reference: &str) -> bool {
+    matches!(
+        validate_conversation_ref(reference),
+        Ok(ConversationRefInput::Handle(prefix)) if prefix.len() >= MIN_EMITTED_DIGEST_HEX_LEN
+    )
+}
+
 fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
     if let Some(hex) = reference.strip_prefix(HANDLE_PREFIX) {
         if hex.len() < MIN_PREFIX_HEX_LEN {
@@ -1683,6 +1693,29 @@ mod tests {
             ),
             AgentErrorKind::AmbiguousRef
         );
+    }
+
+    #[test]
+    fn handle_of_printed_length_is_ch_handle_of_twelve_hex_digits_or_more() {
+        let uuid = "12345678-1234-4234-9234-123456789abc";
+        for (reference, expected) in [
+            ("ch_1234abcd5678", true),
+            ("CH_1234abcd5678", false),
+            ("ch_1234ABCD5678", true),
+            (&format!("ch_{}", "a".repeat(32)), true),
+            ("ch_1234abcd567", false),
+            ("ch_12345678", false),
+            ("ch_1234abcd567x", false),
+            (uuid, false),
+            ("/tmp/session.jsonl", false),
+            ("wire.jsonl", false),
+        ] {
+            assert_eq!(
+                is_handle_of_printed_length(reference),
+                expected,
+                "{reference} is a handle of printed length: {expected}"
+            );
+        }
     }
 
     #[test]

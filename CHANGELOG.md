@@ -6,11 +6,17 @@
   one example corpus): sessions stay in the session cache until a view or
   command needs them. Gains grow with the session store; a small one gains
   little.
-- Speed up agent commands about 2–5x (on one example corpus): `agent search`
-  about 3.6x in lexical and exact mode, 2.4x in semantic and 2x in hybrid;
-  `agent read` and `outline` of a message range about 4x; and
-  `agent sessions`, `agent within` and a whole session's `read` or `outline`
-  about 2–3x.
+- Speed up agent commands about 2–5x (on one example corpus), less on a
+  session of hundreds of megabytes:
+  - `agent search` about 3.6x in lexical and exact mode, 2.4x in semantic and
+    2x in hybrid, and `agent sessions` about 2–3x.
+  - By a handle `agent sessions` or `agent search` printed, `agent read` and
+    `outline` about 4–5x and lexical `agent within` about 2.5–5x on a session
+    under 10 MB, and all three about 1.1–1.3x on a session of hundreds of
+    megabytes.
+  - By another reference, `agent read` and `outline` of a message range about
+    4x, and `agent within` and a whole session's `read` or `outline` about
+    2–3x.
 - Speed up the first command after a large session gains messages about 6x (on
   one example session): the session is read on from where its last read
   stopped.
@@ -136,6 +142,10 @@
 
 ### Changes
 
+- `agent read`, `agent outline` and `agent within` of a handle
+  `agent sessions` or `agent search` printed no longer print other agents'
+  `io` warnings about sessions that could not be listed or directories that
+  could not be read.
 - The first run after upgrading parses every session once to build the new
   session cache, then removes the old cache's files. It takes about 1.9x as
   long as a first run did before, with about 3.4x less memory (on one example

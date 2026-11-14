@@ -600,7 +600,8 @@ fn command_operation(base: &history::CacheBase, meter: &LoadMeter) -> history::O
 }
 
 /// A targeted command's arguments, checked. [`AgentService::open_targets`]
-/// runs `check` before key discovery and `resolve` after it.
+/// runs `check` before key discovery, and `resolve` after it unless
+/// [`AgentService::resolve_from_cache`] resolved the refs during it.
 trait TargetedArgs: Sized {
     type CliArgs;
     /// The sessions the arguments name, among the keys.
@@ -612,6 +613,9 @@ trait TargetedArgs: Sized {
     fn check(args: &Self::CliArgs, config: config::ConfigFile, clock: &dyn Clock) -> Result<Self>;
 
     fn window(&self) -> &TimeFilter;
+
+    /// Each conversation `resolve` resolves, `--focus`'s included, as given.
+    fn conversations(&self) -> Vec<&str>;
 
     fn resolve(
         &self,
@@ -848,21 +852,73 @@ impl AgentService {
         }
     }
 
-    /// Every agent's keys, discovered under `operation` as
-    /// [`AgentKeySearch::discover_every_agent`] discovers them, and timed as
-    /// the command's key stage.
-    fn discover_keys(&self, operation: &history::OperationScope) -> Result<DiscoveredKeys> {
+    /// The keys `checked`'s refs resolve among, under `operation`, timed as
+    /// the command's key stage, with the refs' resolution when the keys came
+    /// from [`Self::resolve_from_cache`]. Otherwise every agent's keys, as
+    /// [`AgentKeySearch::discover_every_agent`] finds them, without listing
+    /// an agent that attempt listed again.
+    ///
+    /// The cache is tried only when every conversation is a `ch_` handle at
+    /// least as long as the handles rearview prints, because an uncached
+    /// session of another agent matches such a handle only through a
+    /// collision of its digits. A session ID, a path, a file name or a
+    /// shorter handle can match one.
+    fn targeted_keys<A: TargetedArgs>(
+        &self,
+        checked: &A,
+        operation: &history::OperationScope,
+    ) -> Result<(DiscoveredKeys, Option<A::Resolved>)> {
         self.perf.time(Stage::Keys, || {
-            AgentKeySearch::new(&self.environment, self.perf.load_meter(), operation)
-                .discover_every_agent()
+            let mut search =
+                AgentKeySearch::new(&self.environment, self.perf.load_meter(), operation);
+            if checked
+                .conversations()
+                .into_iter()
+                .all(agent::refs::is_handle_of_printed_length)
+                && let Some((keys, resolved)) = self.resolve_from_cache(checked, &mut search)
+            {
+                return Ok((search.into_discovered(keys)?, Some(resolved)));
+            }
+            Ok((search.discover_every_agent()?, None))
         })
     }
 
+    /// `checked`'s refs resolved in two steps, with the keys of the second.
+    /// The first resolves them among the keys `search` builds from the
+    /// session cache for the agents it has not listed. The second lists the
+    /// agents of the sessions found, and resolves the refs among those
+    /// agents' keys and the other agents' cached keys. `None` when the cache
+    /// read or a resolution fails, or a target is not of a listed agent,
+    /// without reporting the failure: [`Self::targeted_keys`] then runs full
+    /// discovery.
+    fn resolve_from_cache<A: TargetedArgs>(
+        &self,
+        checked: &A,
+        search: &mut AgentKeySearch<'_>,
+    ) -> Option<(Vec<agent::refs::AgentConversationKey>, A::Resolved)> {
+        let canonicaliser = self.environment.shared_canonicaliser();
+        let cached = search.cached_keys().ok()?;
+        let in_cache = checked
+            .resolve(&search.keys_with(&cached), canonicaliser)
+            .ok()?;
+        let sources: Vec<history::Source> = A::targets(&in_cache)
+            .iter()
+            .map(|target| target.source)
+            .collect();
+        search.discover(&sources);
+        let keys = search.keys_with(&cached);
+        let resolved = checked.resolve(&keys, canonicaliser).ok()?;
+        A::targets(&resolved)
+            .iter()
+            .all(|target| search.has_listed(target.source))
+            .then_some((keys, resolved))
+    }
+
     /// The opening steps of `read`, `outline` and `within`: checks `args`,
-    /// discovers the keys, or takes `keys` from a test, resolves the refs
-    /// among them, then refreshes and checks the targets as
-    /// [`Self::hold_cache_for_reading`] does. A failure to resolve prints
-    /// after the discovery warnings.
+    /// finds the keys as [`Self::targeted_keys`] does, or takes `keys` from
+    /// a test, resolves the refs among them, then refreshes and checks the
+    /// targets as [`Self::hold_cache_for_reading`] does. A failure to
+    /// resolve prints after the discovery warnings.
     fn open_targets<A: TargetedArgs>(
         &self,
         args: &A::CliArgs,
@@ -871,21 +927,27 @@ impl AgentService {
         let checked = A::check(args, config::load_config()?, self.clock().as_ref())?;
         let operation = command_operation(self.environment.cache_base(), self.perf.load_meter());
         let discovered;
-        let (keys, warnings, reads) = match keys {
-            Some(keys) => (keys, Vec::new(), KeyedReads::default()),
+        let (keys, warnings, reads, resolved) = match keys {
+            Some(keys) => (keys, Vec::new(), KeyedReads::default(), None),
             None => {
-                let DiscoveredKeys {
-                    keys,
-                    warnings,
-                    reads,
-                } = self.discover_keys(&operation)?;
+                let (
+                    DiscoveredKeys {
+                        keys,
+                        warnings,
+                        reads,
+                    },
+                    resolved,
+                ) = self.targeted_keys(&checked, &operation)?;
                 discovered = keys;
-                (discovered.as_slice(), warnings, reads)
+                (discovered.as_slice(), warnings, reads, resolved)
             }
         };
-        let resolved = checked
-            .resolve(keys, self.environment.shared_canonicaliser())
-            .map_err(|error| failure_after_warnings(error, &warnings))?;
+        let resolved = match resolved {
+            Some(resolved) => resolved,
+            None => checked
+                .resolve(keys, self.environment.shared_canonicaliser())
+                .map_err(|error| failure_after_warnings(error, &warnings))?,
+        };
         let (operation, held) = self.hold_cache_for_reading(
             operation,
             &A::targets(&resolved),
@@ -1931,6 +1993,10 @@ impl TargetedArgs for CheckedWithin {
         &self.window
     }
 
+    fn conversations(&self) -> Vec<&str> {
+        vec![&self.conversation]
+    }
+
     fn resolve(
         &self,
         keys: &[agent::refs::AgentConversationKey],
@@ -1946,6 +2012,9 @@ impl TargetedArgs for CheckedWithin {
 
 /// One agent's key discovery: its keys, or the step that failed.
 type AgentDiscovery = std::result::Result<ProviderKeys, KeyDiscoveryFailure>;
+
+/// The keys built from the session cache's listed rows, by agent.
+type CachedKeys = HashMap<history::Source, Vec<agent::refs::AgentConversationKey>>;
 
 /// One agent's keys in a command's key search.
 enum AgentKeys {
@@ -1998,6 +2067,19 @@ impl<'e> AgentKeySearch<'e> {
         }
     }
 
+    /// Lists the sessions of each agent of `sources` not listed yet.
+    fn discover(&mut self, sources: &[history::Source]) {
+        let mut agents = std::mem::take(&mut self.agents);
+        for (storage, keys) in &mut agents {
+            if let AgentKeys::Unlisted(roots) = keys
+                && sources.contains(&storage.source())
+            {
+                *keys = AgentKeys::Listed(self.list(*storage, std::mem::take(roots)));
+            }
+        }
+        self.agents = agents;
+    }
+
     /// `storage`'s keys under `roots`, its sessions listed.
     fn list(
         &self,
@@ -2014,6 +2096,127 @@ impl<'e> AgentKeySearch<'e> {
         )
     }
 
+    /// True when the search listed `source`'s sessions and found its keys.
+    fn has_listed(&self, source: history::Source) -> bool {
+        self.agents.iter().any(|(storage, keys)| {
+            storage.source() == source && matches!(keys, AgentKeys::Listed(Ok(_)))
+        })
+    }
+
+    /// The keys of the session cache's listed rows under each root of every
+    /// agent not listed yet, read with one connection, waiting through
+    /// another rearview's rebuild. Empty without a cache, and for an agent
+    /// whose cached rows are of an older layout. The keys lack their
+    /// sessions' sub-agent transcripts: a command reads a target by the key
+    /// its agent's listing gives.
+    fn cached_keys(&self) -> Result<CachedKeys> {
+        let clock = self.environment.clock();
+        let reads = self.operation.read_when_unlocked(|| {
+            let mut reads = Vec::new();
+            let Some(cache) =
+                history::sqlite_cache::SqliteCache::open_waiting(self.environment.cache_base())?
+            else {
+                return Ok(reads);
+            };
+            for (storage, keys) in &self.agents {
+                let AgentKeys::Unlisted(roots) = keys else {
+                    continue;
+                };
+                if !cache.storage_is_current(storage.cache())? {
+                    continue;
+                }
+                for root in roots {
+                    self.meter.agent(storage.source()).reading_cache();
+                    let reading = clock.now();
+                    let listed = cache.listed_sessions(storage.cache(), root)?;
+                    reads.push((*storage, root, listed, clock.elapsed_since(reading)));
+                }
+            }
+            Ok(reads)
+        })?;
+        let mut cached = CachedKeys::new();
+        for (storage, root, listed, time) in reads {
+            self.meter
+                .agent(storage.source())
+                .cache_read(listed.len(), time);
+            let roots =
+                history::sqlite_cache::SessionRoots::of(root, self.environment.canonicaliser());
+            cached
+                .entry(storage.source())
+                .or_default()
+                .extend(listed.into_iter().filter_map(|session| {
+                    cached_session_key(storage, &roots, session, &self.project_directories)
+                }));
+        }
+        Ok(cached)
+    }
+
+    /// Each agent's keys in agent order, sorted by path as key discovery
+    /// sorts them: a listed agent's own, and `cached`'s for an agent not
+    /// listed.
+    fn keys_with(&self, cached: &CachedKeys) -> Vec<agent::refs::AgentConversationKey> {
+        let mut keys: Vec<agent::refs::AgentConversationKey> = self
+            .agents
+            .iter()
+            .flat_map(|(storage, keys)| match keys {
+                AgentKeys::Unlisted(_) => {
+                    cached.get(&storage.source()).map_or(&[][..], Vec::as_slice)
+                }
+                AgentKeys::Listed(Ok(found)) => found.keys.as_slice(),
+                AgentKeys::Listed(Err(_)) => &[],
+            })
+            .cloned()
+            .collect();
+        keys.sort_by(|left, right| left.path.cmp(&right.path));
+        keys
+    }
+
+    /// `keys`, with the warnings and reads of the listed agents, in agent
+    /// order. An agent not listed doesn't get any warning: its listing
+    /// failures and unreadable directories are not looked for. Fails when
+    /// `keys` is empty and none of the environment's roots exists.
+    fn into_discovered(
+        self,
+        keys: Vec<agent::refs::AgentConversationKey>,
+    ) -> Result<DiscoveredKeys> {
+        let mut warnings = Vec::new();
+        let mut reads = KeyedReads::default();
+        for (storage, agent_keys) in self.agents {
+            let AgentKeys::Listed(discovery) = agent_keys else {
+                continue;
+            };
+            let provider = storage.source().provider();
+            match discovery {
+                Ok(found) => {
+                    warnings.extend(
+                        found
+                            .unreadable_directories
+                            .iter()
+                            .map(|directory| unreadable_directory_warning(provider, directory)),
+                    );
+                    reads.roots.insert(storage.source(), found.roots);
+                    reads.sessions.extend(found.sessions);
+                }
+                Err(failure) => warnings.push(failure.warning(provider)),
+            }
+        }
+        if keys.is_empty() && !any_history_root_exists(self.environment) {
+            return Err(AgentError::io(
+                None,
+                format!(
+                    "no {} history storage is available",
+                    history::provider::display_names_in_prose()
+                ),
+            )
+            .into());
+        }
+        Ok(DiscoveredKeys {
+            keys,
+            warnings,
+            reads,
+        })
+    }
+
     /// Keys for every agent's sessions, sorted by path, listing each agent
     /// the search has not listed.
     ///
@@ -2028,17 +2231,22 @@ impl<'e> AgentKeySearch<'e> {
     /// the cached sessions under it keep their keys. A root without a
     /// session in the session cache is cached.
     fn discover_every_agent(mut self) -> Result<DiscoveredKeys> {
-        let agents = std::mem::take(&mut self.agents)
-            .into_iter()
-            .map(|(storage, keys)| {
-                let discovery = match keys {
-                    AgentKeys::Unlisted(roots) => self.list(storage, roots),
-                    AgentKeys::Listed(discovery) => discovery,
-                };
-                (storage.source(), discovery)
-            })
+        let every_agent: Vec<history::Source> = self
+            .agents
+            .iter()
+            .map(|(storage, _)| storage.source())
             .collect();
-        DiscoveredKeys::of(self.environment, agents)
+        self.discover(&every_agent);
+        // `keys_with` of an empty cache gives these keys as copies; moving
+        // them out of the listed agents spares a copy of every key.
+        let mut keys = Vec::new();
+        for (_, agent_keys) in &mut self.agents {
+            if let AgentKeys::Listed(Ok(found)) = agent_keys {
+                keys.append(&mut found.keys);
+            }
+        }
+        keys.sort_by(|left, right| left.path.cmp(&right.path));
+        self.into_discovered(keys)
     }
 }
 
@@ -2048,54 +2256,6 @@ struct DiscoveredKeys {
     /// each directory discovery could not list, in agent order.
     warnings: Vec<AgentWarning>,
     reads: KeyedReads,
-}
-
-impl DiscoveredKeys {
-    /// The keys, warnings and reads of `discoveries`, in agent order. Fails
-    /// when no agent gave a key and none of `environment`'s roots exists.
-    fn of(
-        environment: &history::Environment,
-        discoveries: Vec<(history::Source, AgentDiscovery)>,
-    ) -> Result<Self> {
-        let mut keys = Vec::new();
-        let mut warnings = Vec::new();
-        let mut reads = KeyedReads::default();
-        for (source, discovery) in discoveries {
-            let provider = source.provider();
-            let found = match discovery {
-                Ok(found) => found,
-                Err(failure) => {
-                    warnings.push(failure.warning(provider));
-                    continue;
-                }
-            };
-            keys.extend(found.keys);
-            warnings.extend(
-                found
-                    .unreadable_directories
-                    .iter()
-                    .map(|directory| unreadable_directory_warning(provider, directory)),
-            );
-            reads.roots.insert(source, found.roots);
-            reads.sessions.extend(found.sessions);
-        }
-        if keys.is_empty() && !any_history_root_exists(environment) {
-            return Err(AgentError::io(
-                None,
-                format!(
-                    "no {} history storage is available",
-                    history::provider::display_names_in_prose()
-                ),
-            )
-            .into());
-        }
-        keys.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(Self {
-            keys,
-            warnings,
-            reads,
-        })
-    }
 }
 
 /// The step of an agent's key discovery that failed.
@@ -4051,6 +4211,20 @@ impl TargetedArgs for CheckedRead {
         &self.options.window
     }
 
+    fn conversations(&self) -> Vec<&str> {
+        self.refs
+            .refs
+            .iter()
+            .map(|reference| reference.conversation.as_str())
+            .chain(
+                self.refs
+                    .focus
+                    .as_ref()
+                    .and_then(|focus| focus.conversation.as_deref()),
+            )
+            .collect()
+    }
+
     fn resolve(
         &self,
         keys: &[agent::refs::AgentConversationKey],
@@ -4086,6 +4260,10 @@ impl TargetedArgs for CheckedOutline {
 
     fn window(&self) -> &TimeFilter {
         &self.options.window
+    }
+
+    fn conversations(&self) -> Vec<&str> {
+        vec![&self.outline_ref.conversation]
     }
 
     fn resolve(
@@ -6185,6 +6363,115 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
     }
 
+    /// On a warm cache, `read`, `outline` and `within` of a session by its
+    /// printed reference list its agent's sessions alone, beside another
+    /// agent's cached session, for every agent.
+    #[test]
+    fn targeted_commands_of_cached_session_by_handle_list_only_its_agent() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            let other_source = if source == history::Source::Claude {
+                history::Source::Codex
+            } else {
+                history::Source::Claude
+            };
+            let other_fixture = registered_fixture(other_source);
+            let (home, other_home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            fixture.write_session(home.path(), fixture.ids().session);
+            other_fixture.write_session(other_home.path(), other_fixture.ids().session);
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let other = history::provider::contract_tests::kept_storage_under(
+                other_fixture,
+                other_home.path(),
+            );
+            let cache = crate::tui::claude_home::admitted_cache();
+            load_as_owner(other, cache.path());
+            let reference = cache_session_and_reference_it(storage, cache.path());
+            let storages = if source == history::Source::Claude {
+                vec![storage, other]
+            } else {
+                vec![other, storage]
+            };
+
+            for args in [
+                &["read", &reference][..],
+                &["outline", &reference],
+                &["within", &reference, "the"],
+            ] {
+                let service =
+                    AgentService::new(test_environment(storages.clone(), Some(cache.path())));
+                let output = service
+                    .execute(agent_command(args))
+                    .unwrap_or_else(crate::error_report);
+                let records = service.perf.records(None);
+                if output.contains("agent-error")
+                    || !lists_sessions_of(&records, source)
+                    || lists_sessions_of(&records, other_source)
+                {
+                    wrong.push(format!(
+                        "{source:?} {}: lists {source:?} alone:\n{output}\n{records}",
+                        args[0]
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// True when the perf `records` of a command show that it listed the
+    /// sessions of `source`'s agent.
+    fn lists_sessions_of(records: &str, source: history::Source) -> bool {
+        records.lines().any(|line| {
+            line.starts_with(&format!("perf discovery source={} ", source.label()))
+                && !line.contains(" roots=0 ")
+        })
+    }
+
+    /// `read` of cached sessions of two agents by their printed references
+    /// lists those two agents' sessions, and not a third agent's.
+    #[test]
+    fn read_of_handles_of_two_agents_lists_those_agents_alone() {
+        let fixtures: Vec<_> = history::provider::contract_tests::registered_fixtures()
+            .into_iter()
+            .take(3)
+            .collect();
+        let homes: Vec<tempfile::TempDir> = fixtures
+            .iter()
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect();
+        let storages: Vec<&'static dyn history::provider::SessionStorage> = fixtures
+            .iter()
+            .zip(&homes)
+            .map(|(fixture, home)| {
+                fixture.write_session(home.path(), fixture.ids().session);
+                history::provider::contract_tests::kept_storage_under(*fixture, home.path())
+            })
+            .collect();
+        let cache = crate::tui::claude_home::admitted_cache();
+        load_as_owner(storages[2], cache.path());
+        let references: Vec<String> = storages[..2]
+            .iter()
+            .map(|&storage| cache_session_and_reference_it(storage, cache.path()))
+            .collect();
+
+        let service = AgentService::new(test_environment(storages.clone(), Some(cache.path())));
+        let output = service
+            .execute(agent_command(&["read", &references[0], &references[1]]))
+            .unwrap_or_else(crate::error_report);
+
+        let records = service.perf.records(None);
+        let listed: Vec<bool> = fixtures
+            .iter()
+            .map(|fixture| lists_sessions_of(&records, fixture.provider().source()))
+            .collect();
+        assert!(
+            !output.contains("agent-error") && listed == [true, true, false],
+            "read lists the first two agents alone, listed {listed:?}:\n{output}\n{records}"
+        );
+    }
+
     /// `read` of a session that gained a turn since its copy was written
     /// parses it in one refresh round and prints the new reply, for every
     /// agent. The next read doesn't refresh the session.
@@ -6316,8 +6603,10 @@ mod tests {
 
     /// `read`, `outline` and `within` of a session deleted since it was
     /// cached report `not-found` by its printed reference, for every agent.
+    /// Full discovery after the cache's rows fail to resolve the reference
+    /// doesn't list the agent again.
     #[test]
-    fn targeted_commands_of_session_deleted_since_cached_report_not_found() {
+    fn targeted_commands_of_session_deleted_since_cached_report_not_found_listing_once() {
         let mut wrong = Vec::new();
         for fixture in history::provider::contract_tests::registered_fixtures() {
             let source = fixture.provider().source();
@@ -6330,17 +6619,30 @@ mod tests {
             load_as_owner(storage, cache.path());
             let reference = printed_reference_of(storage, &locator);
             fixture.delete_under(home.path(), &locator).unwrap();
+            let discovery_record = format!("perf discovery source={} ", source.label());
 
             for args in [
                 &["read", &reference][..],
                 &["outline", &reference],
                 &["within", &reference, "the"],
             ] {
-                let output = AgentService::new(test_environment(vec![storage], Some(cache.path())))
+                let service =
+                    AgentService::new(test_environment(vec![storage], Some(cache.path())));
+                let output = service
                     .execute(agent_command(args))
                     .unwrap_or_else(crate::error_report);
-                if !output.starts_with("protocol agent-error kind=not-found ") {
-                    wrong.push(format!("{source:?} {}: not-found:\n{output}", args[0]));
+                let records = service.perf.records(None);
+                let discovery = records
+                    .lines()
+                    .find(|line| line.starts_with(&discovery_record));
+                if !output.starts_with("protocol agent-error kind=not-found ")
+                    || !discovery.is_some_and(|record| record.contains(" roots=1 "))
+                {
+                    wrong.push(format!(
+                        "{source:?} {}: not-found after listing the root once, \
+                         {discovery:?}:\n{output}",
+                        args[0]
+                    ));
                 }
             }
         }
@@ -6613,6 +6915,9 @@ mod tests {
         _homes: [tempfile::TempDir; 2],
         storages: Vec<&'static dyn history::provider::SessionStorage>,
         cache: crate::cache_file::test_support::TemporaryCacheDirectory,
+        /// The locator of the Claude Code session that carries the Codex
+        /// session's ID.
+        claude_session_with_codex_id: PathBuf,
     }
 
     impl ClaudeAndUncachedCodex {
@@ -6640,7 +6945,8 @@ mod tests {
                 Self::FOLDER,
                 SessionsSharingTwelveDigits::ID,
             );
-            claude_session_in_folder(claude_home.path(), "same-id", codex_id);
+            let claude_session_with_codex_id =
+                claude_session_in_folder(claude_home.path(), "same-id", codex_id);
             let codex_locator = codex_session_recorded_in(codex_home.path(), Self::DIRECTORY);
             let cache = crate::tui::claude_home::admitted_cache();
             load_as_owner(claude, cache.path());
@@ -6658,6 +6964,7 @@ mod tests {
                 _homes: [claude_home, codex_home],
                 storages: vec![claude, codex],
                 cache,
+                claude_session_with_codex_id,
             }
         }
 
@@ -6691,6 +6998,29 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `read` of a printed handle with a `--focus` by the session ID that a
+    /// cached Claude Code session and an uncached Codex session both carry
+    /// reports `ambiguous-ref`, as full discovery does.
+    #[test]
+    fn read_focused_by_session_id_another_agents_uncached_session_carries_is_ambiguous() {
+        let sessions = ClaudeAndUncachedCodex::new();
+        let codex_id = registered_fixture(history::Source::Codex).ids().session;
+        let handle =
+            printed_reference_of(sessions.storages[0], &sessions.claude_session_with_codex_id);
+
+        let output = sessions.run(&[
+            "read",
+            &format!("{handle}:m1..m5"),
+            "--focus",
+            &format!("{codex_id}:m2"),
+        ]);
+
+        assert!(
+            output.starts_with("protocol agent-error kind=ambiguous-ref "),
+            "the focus's session ID is ambiguous:\n{output}"
+        );
     }
 
     /// A Pi session in the directory Pi and OMP both list, OMP's copy cached
@@ -9240,9 +9570,9 @@ mod tests {
         );
     }
 
-    /// `read`, `outline` and `within` beside an agent whose sessions cannot
-    /// be listed read the other agent's session and print one warning
-    /// naming the agent that failed.
+    /// `read`, `outline` and `within` of the other agent's session by its
+    /// path, beside an agent whose sessions cannot be listed, read the
+    /// session and print one warning that reports the agent that failed.
     #[test]
     fn targeted_commands_warn_of_agent_whose_sessions_cannot_be_listed() {
         let home = HomeWithUnlistableCodex::new();
@@ -9281,21 +9611,115 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
     }
 
-    /// `read` of a Codex session whose key needs its record, when the
-    /// session cache fails to give the records, names the cache in the
-    /// warning it prints with the error, not the listing.
+    /// `read`, `outline` and `within` of a cached Claude Code session by its
+    /// printed reference don't list Codex's sessions, so they don't print the
+    /// warning that Codex's sessions could not be listed. A reference that is
+    /// not found lists every agent and prints the warning with the error.
+    #[test]
+    fn targeted_commands_by_cached_handle_dont_warn_of_other_agents_listing() {
+        let home = HomeWithUnlistableCodex::new();
+        let reference = home.cache_claude_session_and_reference_it();
+
+        let mut wrong = Vec::new();
+        for args in [
+            vec!["read", &reference],
+            vec!["outline", &reference],
+            vec!["within", &reference, "question"],
+        ] {
+            let output = home.run(&args);
+            if home.listing_warnings(&output) != 0 || output.contains("agent-error") {
+                wrong.push(format!("{}: without the Codex warning:\n{output}", args[0]));
+            }
+        }
+        let not_found = home.run(&["read", "ch_000000000000"]);
+        if home.listing_warnings(&not_found) != 1
+            || !not_found.contains("protocol agent-error kind=not-found ")
+        {
+            wrong.push(format!(
+                "not found: the Codex warning, then the error:\n{not_found}"
+            ));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `read`, `outline` and `within` of a cached Claude Code session deleted
+    /// since, by its printed reference, beside an agent whose sessions cannot
+    /// be listed, print that agent's listing warning before `not-found`.
+    #[test]
+    fn targeted_commands_of_deleted_cached_session_print_listing_warning_before_not_found() {
+        let home = HomeWithUnlistableCodex::new();
+        let reference = home.cache_claude_session_and_reference_it();
+        std::fs::remove_file(&home.claude_reference).unwrap();
+
+        let mut wrong = Vec::new();
+        for args in [
+            vec!["read", &reference],
+            vec!["outline", &reference],
+            vec!["within", &reference, "question"],
+        ] {
+            let output = home.run(&args);
+            let warning = output.find("failed%20to%20list%20Codex%20sessions");
+            let error = output.find("protocol agent-error kind=not-found ");
+            if home.listing_warnings(&output) != 1
+                || !warning
+                    .zip(error)
+                    .is_some_and(|(warning, error)| warning < error)
+            {
+                wrong.push(format!(
+                    "{}: the Codex warning, then not-found:\n{output}",
+                    args[0]
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// `read` of a Codex session whose key needs its record, by its path or
+    /// its printed handle, when the session cache fails to give the records,
+    /// names the cache in the warning it prints with the error, not the
+    /// listing. By the handle, the failed read of the cache's rows falls back
+    /// to full discovery.
     #[test]
     fn read_whose_key_records_the_cache_fails_to_give_warns_of_the_cache() {
+        let outputs = [
+            (
+                "path",
+                read_of_codex_session_whose_records_the_cache_refuses(|_, locator| {
+                    locator.to_string_lossy().into_owned()
+                }),
+            ),
+            (
+                "handle",
+                read_of_codex_session_whose_records_the_cache_refuses(printed_reference_of),
+            ),
+        ];
+
+        for (form, output) in outputs {
+            assert!(
+                output.contains(
+                    "failed%20to%20read%20or%20write%20the%20session%20cache%20for%20Codex%20sessions"
+                ) && !output.contains("failed%20to%20list")
+                    && output.contains("agent-error"),
+                "by its {form}, the error's warning names the session cache, not the \
+                 listing:\n{output}"
+            );
+        }
+    }
+
+    /// The output of `read` of a cached Codex session whose key needs its
+    /// record, by the reference `reference_of` gives for its storage and
+    /// locator, while the session cache refuses to give the records.
+    fn read_of_codex_session_whose_records_the_cache_refuses(
+        reference_of: impl FnOnce(&'static dyn history::provider::SessionStorage, &Path) -> String,
+    ) -> String {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-        let fixture = history::provider::contract_tests::registered_fixtures()
-            .into_iter()
-            .find(|fixture| fixture.provider().source() == history::Source::Codex)
-            .unwrap();
+        let fixture = registered_fixture(history::Source::Codex);
         let home = tempfile::tempdir().unwrap();
         let locator = fixture.write_session(home.path(), fixture.ids().session);
         let storage = history::provider::contract_tests::kept_storage_under(fixture, home.path());
         let cache = crate::tui::claude_home::admitted_cache();
         load_as_owner(storage, cache.path());
+        let reference = reference_of(storage, &locator);
         let _refused = history::sqlite_cache::connection::test_hooks::on_every_connection(
             cache.path(),
             |connection| {
@@ -9311,17 +9735,9 @@ mod tests {
             },
         );
 
-        let output = AgentService::new(test_environment(vec![storage], Some(cache.path())))
-            .execute(agent_command(&["read", &locator.to_string_lossy()]))
-            .unwrap_or_else(crate::error_report);
-
-        assert!(
-            output.contains(
-                "failed%20to%20read%20or%20write%20the%20session%20cache%20for%20Codex%20sessions"
-            ) && !output.contains("failed%20to%20list")
-                && output.contains("agent-error"),
-            "the error's warning names the session cache, not the listing:\n{output}"
-        );
+        AgentService::new(test_environment(vec![storage], Some(cache.path())))
+            .execute(agent_command(&["read", &reference]))
+            .unwrap_or_else(crate::error_report)
     }
 
     /// A Claude and a Codex session under one home, with an environment
@@ -9397,6 +9813,17 @@ mod tests {
             ))
             .execute(agent_command(args))
             .unwrap_or_else(crate::error_report)
+        }
+
+        /// The reference `agent sessions --all` prints for the Claude Code
+        /// session. The command writes that session's copy to the session
+        /// cache.
+        fn cache_claude_session_and_reference_it(&self) -> String {
+            self.run(&["sessions", "--all"])
+                .split_whitespace()
+                .find_map(|atom| atom.strip_prefix("ref="))
+                .expect("agent sessions lists the Claude Code session")
+                .to_owned()
         }
 
         /// The number of `output`'s warnings that Codex's sessions could not
