@@ -3686,6 +3686,9 @@ impl AgentService {
         keys: Option<&[agent::refs::AgentConversationKey]>,
     ) -> Result<CommandOutput> {
         let perf = &self.perf;
+        let agent_config = config::load_config()?.agent.unwrap_or_default();
+        let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
+        let read_refs = ParsedReadRefs::parse(args)?;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
         let (keys, discovery_warnings, reads) = match keys {
@@ -3699,11 +3702,9 @@ impl AgentService {
                 )
             }
         };
-        let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
-        let (mut resolved_refs, focus) =
-            resolve_agent_read_args(args, keys, self.environment.shared_canonicaliser())
-                .map_err(|error| failure_after_warnings(error, &discovery_warnings))?;
+        let (mut resolved_refs, focus) = read_refs
+            .resolve(keys, self.environment.shared_canonicaliser())
+            .map_err(|error| failure_after_warnings(error, &discovery_warnings))?;
         let targets: Vec<&agent::refs::AgentConversationKey> = resolved_refs
             .iter()
             .map(|(_, resolved)| &resolved.key)
@@ -3796,6 +3797,9 @@ impl AgentService {
         keys: Option<&[agent::refs::AgentConversationKey]>,
     ) -> Result<CommandOutput> {
         let perf = &self.perf;
+        let agent_config = config::load_config()?.agent.unwrap_or_default();
+        let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
+        let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
         let operation = command_operation(self.environment.cache_base(), perf.load_meter());
         let discovered;
         let (keys, discovery_warnings, reads) = match keys {
@@ -3809,9 +3813,6 @@ impl AgentService {
                 )
             }
         };
-        let agent_config = config::load_config()?.agent.unwrap_or_default();
-        let options = agent_protocol_options(&args.output, &agent_config, self.clock().as_ref())?;
-        let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
         let resolved = outline_ref
             .resolve_conversation(keys, self.environment.shared_canonicaliser())
             .map_err(|error| failure_after_warnings(error, &discovery_warnings))?;
@@ -3853,65 +3854,96 @@ impl AgentService {
     }
 }
 
+/// `agent read`'s refs and `--focus`, parsed, with the flags that depend
+/// on the refs checked against them.
+struct ParsedReadRefs {
+    refs: Vec<agent::refs::ReadRef>,
+    focus: Option<agent::refs::FocusRef>,
+}
+
+impl ParsedReadRefs {
+    fn parse(args: &AgentReadArgs) -> Result<Self> {
+        let refs = args
+            .refs
+            .iter()
+            .map(|reference| agent::refs::parse_read_ref(reference))
+            .collect::<Result<Vec<_>>>()?;
+        if args.anchor.is_some()
+            && (refs.len() != 1 || refs[0].range.is_some() || refs[0].subagent.is_some())
+        {
+            return Err(AppError::ConfigError(
+                "--anchor requires exactly one conversation ref without an mN range".to_string(),
+            ));
+        }
+        if (args.lines.is_some() || args.match_query.is_some())
+            && (refs.len() != 1
+                || refs[0].call.is_some()
+                || (!refs[0].range.is_some_and(|range| range.is_single()) && args.anchor.is_none()))
+        {
+            return Err(AppError::ConfigError(
+                "--lines and --match require exactly one single-message ref such as ch_...:m7"
+                    .to_string(),
+            ));
+        }
+        let focus = args
+            .focus
+            .as_deref()
+            .map(agent::refs::parse_focus_ref)
+            .transpose()?;
+        Ok(Self { refs, focus })
+    }
+
+    /// The sessions the refs and `--focus` name among `keys`; fails when
+    /// `--focus` is outside the refs' ranges.
+    fn resolve(
+        &self,
+        keys: &[agent::refs::AgentConversationKey],
+        canonicaliser: &Arc<dyn Canonicaliser>,
+    ) -> Result<(ResolvedReadRefs, Option<ResolvedFocus>)> {
+        let resolved_refs = self
+            .refs
+            .iter()
+            .map(|reference| {
+                reference
+                    .resolve_conversation(keys, canonicaliser)
+                    .map(|resolved| (reference.clone(), resolved))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let focus = self
+            .focus
+            .as_ref()
+            .map(|focus| -> Result<ResolvedFocus> {
+                let conversation = focus
+                    .conversation
+                    .as_ref()
+                    .map(|conversation| {
+                        agent::refs::resolve_conversation_ref(keys, conversation, canonicaliser)
+                    })
+                    .transpose()?;
+                agent::refs::validate_resolved_focus_in_ranges(
+                    &resolved_refs,
+                    focus,
+                    conversation.as_ref(),
+                )?;
+                Ok(ResolvedFocus {
+                    conversation,
+                    range: focus.range,
+                })
+            })
+            .transpose()?;
+        Ok((resolved_refs, focus))
+    }
+}
+
+/// The parse and the resolution together, for tests of both: `read` runs
+/// key discovery between them.
+#[cfg(test)]
 pub(crate) fn resolve_agent_read_args(
     args: &AgentReadArgs,
     keys: &[agent::refs::AgentConversationKey],
     canonicaliser: &Arc<dyn Canonicaliser>,
 ) -> Result<(ResolvedReadRefs, Option<ResolvedFocus>)> {
-    let refs = args
-        .refs
-        .iter()
-        .map(|reference| agent::refs::parse_read_ref(reference))
-        .collect::<Result<Vec<_>>>()?;
-    if args.anchor.is_some()
-        && (refs.len() != 1 || refs[0].range.is_some() || refs[0].subagent.is_some())
-    {
-        return Err(AppError::ConfigError(
-            "--anchor requires exactly one conversation ref without an mN range".to_string(),
-        ));
-    }
-    if (args.lines.is_some() || args.match_query.is_some())
-        && (refs.len() != 1
-            || refs[0].call.is_some()
-            || (!refs[0].range.is_some_and(|range| range.is_single()) && args.anchor.is_none()))
-    {
-        return Err(AppError::ConfigError(
-            "--lines and --match require exactly one single-message ref such as ch_...:m7"
-                .to_string(),
-        ));
-    }
-    let resolved_refs = refs
-        .iter()
-        .map(|reference| {
-            reference
-                .resolve_conversation(keys, canonicaliser)
-                .map(|resolved| (reference.clone(), resolved))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let focus = args
-        .focus
-        .as_deref()
-        .map(|focus| -> Result<ResolvedFocus> {
-            let focus = agent::refs::parse_focus_ref(focus)?;
-            let conversation = focus
-                .conversation
-                .as_ref()
-                .map(|conversation| {
-                    agent::refs::resolve_conversation_ref(keys, conversation, canonicaliser)
-                })
-                .transpose()?;
-            agent::refs::validate_resolved_focus_in_ranges(
-                &resolved_refs,
-                &focus,
-                conversation.as_ref(),
-            )?;
-            Ok(ResolvedFocus {
-                conversation,
-                range: focus.range,
-            })
-        })
-        .transpose()?;
-    Ok((resolved_refs, focus))
+    ParsedReadRefs::parse(args)?.resolve(keys, canonicaliser)
 }
 
 fn agent_protocol_options(
@@ -7329,6 +7361,100 @@ mod tests {
                     .all(|name| lines[..2].iter().any(|line| line.contains(name)))
                 && lines[2].starts_with("protocol agent-error kind=not-found "),
             "an io record for each unreadable directory, then the error:\n{failure}"
+        );
+    }
+
+    /// Each of `commands` over `sessions` that doesn't fail with an
+    /// `agent-error` record of `kind` before the `keys` stage, with what it
+    /// printed and its perf records.
+    fn commands_not_failing_before_key_discovery(
+        sessions: &CachedClaudeSessions,
+        kind: &str,
+        commands: &[&[&str]],
+    ) -> Vec<String> {
+        let error_record = format!("protocol agent-error kind={kind} ");
+        commands
+            .iter()
+            .filter_map(|args| {
+                let service = AgentService::new(test_environment(
+                    vec![sessions.storage],
+                    Some(sessions.cache_base.path()),
+                ));
+                let failure = service
+                    .execute(agent_command(args))
+                    .map_err(crate::error_report);
+                let records = service.perf.records(None);
+                let fails_before_keys = failure
+                    .as_ref()
+                    .is_err_and(|failure| failure.starts_with(&error_record))
+                    && !records.contains("perf stage=keys ");
+                (!fails_before_keys).then(|| format!("{args:?}: {failure:?}\n{records}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn read_and_outline_of_malformed_ref_dont_discover_keys() {
+        let sessions = CachedClaudeSessions::new();
+
+        let wrong = commands_not_failing_before_key_discovery(
+            &sessions,
+            "invalid-ref",
+            &[
+                &["read", "ch_12"],
+                &["read", &format!("{CHANGED_SESSION}:x9")],
+                &["read", CHANGED_SESSION, "--focus", "x9"],
+                &["outline", "ch_12"],
+                &["outline", &format!("{CHANGED_SESSION}:x9")],
+            ],
+        );
+
+        assert!(
+            wrong.is_empty(),
+            "each command fails with invalid-ref before the keys stage:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn read_with_flags_it_refuses_doesnt_discover_keys() {
+        let sessions = CachedClaudeSessions::new();
+
+        let wrong = commands_not_failing_before_key_discovery(
+            &sessions,
+            "invalid-ref",
+            &[
+                &["read", CHANGED_SESSION, OTHER_SESSION, "--anchor", "ma_1"],
+                &["read", CHANGED_SESSION, "--lines", "1..2"],
+            ],
+        );
+
+        assert!(
+            wrong.is_empty(),
+            "each command fails with invalid-ref before the keys stage:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    #[test]
+    fn read_outline_and_within_of_inverted_time_range_dont_discover_keys() {
+        let sessions = CachedClaudeSessions::new();
+        let inverted = ["--after", "2026-07-20", "--before", "2026-01-01"];
+
+        let wrong = commands_not_failing_before_key_discovery(
+            &sessions,
+            "out-of-range",
+            &[
+                &[&["read", CHANGED_SESSION][..], &inverted].concat(),
+                &[&["outline", CHANGED_SESSION][..], &inverted].concat(),
+                &[&["within", CHANGED_SESSION, "question"][..], &inverted].concat(),
+            ],
+        );
+
+        assert!(
+            wrong.is_empty(),
+            "each command fails with out-of-range before the keys stage:\n{}",
+            wrong.join("\n")
         );
     }
 
