@@ -273,6 +273,318 @@ fn expanding_and_collapsing_tool_output_renders_its_entry_in_place() {
     );
 }
 
+/// A message, a run of two calls, a message, a run of two calls and a
+/// message, in summary mode, rendering through `worker`. Each call's input
+/// is long enough to be truncated, and shows its call id.
+fn two_runs_through(worker: ViewerRenderWorker) -> (tempfile::TempDir, App) {
+    let user = |text: &str| {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "message": {"role": "user", "content": text}
+        })
+        .to_string()
+    };
+    let call = |id: &str| {
+        let command = (1..=6)
+            .map(|line| format!("echo {id} {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}}
+            ]}
+        })
+        .to_string()
+    };
+    let lines = [
+        user("intro"),
+        call("toolu_1"),
+        call("toolu_2"),
+        user("middle"),
+        call("toolu_3"),
+        call("toolu_4"),
+        user("outro"),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let mut app = app_with_tool_conversation(path, ToolDisplayMode::Hidden);
+    app.viewer_render = Some(worker);
+    (dir, app)
+}
+
+/// The id of the focused call's input.
+pub(super) fn focused_call_id(app: &App) -> Option<ToolOutputId> {
+    let state = view_state(app);
+    let call = state.call_ranges.get(state.focused_call()?)?;
+    Some(call.input.id.clone())
+}
+
+/// A key and every message it renders again in place.
+fn press_and_render(app: &mut App, code: KeyCode) {
+    press_now(app, code);
+    finish_view_render(app, VIEWPORT);
+}
+
+#[test]
+fn expanding_run_at_its_message_stop_renders_it_in_place_and_focuses_its_first_call() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = two_runs_through(worker);
+    let rows = Arc::as_ptr(&view_state(&app).rendered_lines);
+    press_and_render(&mut app, KeyCode::Char('J'));
+
+    press_and_render(&mut app, KeyCode::Right);
+
+    assert!(
+        !gate.took_waiting_render(),
+        "no render runs on viewer-render"
+    );
+    assert_eq!(
+        Arc::as_ptr(&view_state(&app).rendered_lines),
+        rows,
+        "the rows change in place"
+    );
+    assert!(
+        super::claude_home::viewer_text(&app).contains("(expanded):"),
+        "the run shows expanded"
+    );
+    let first_call = focused_call_id(&app).expect("a call is focused");
+    assert!(
+        first_call.0.ends_with(":id:toolu_1"),
+        "the run's first call is focused: {first_call:?}"
+    );
+}
+
+/// [`two_runs_through`] with the later run expanded and its second call
+/// focused.
+fn later_runs_second_call_focused(worker: ViewerRenderWorker) -> (tempfile::TempDir, App) {
+    let (dir, mut app) = two_runs_through(worker);
+    for _ in 0..3 {
+        press_and_render(&mut app, KeyCode::Char('J'));
+    }
+    press_and_render(&mut app, KeyCode::Right);
+    press_and_render(&mut app, KeyCode::Char(']'));
+    let focused = focused_call_id(&app).expect("a call is focused");
+    assert!(
+        focused.0.ends_with(":id:toolu_4"),
+        "the later run's second call is focused: {focused:?}"
+    );
+    (dir, app)
+}
+
+/// Expand or collapse the earlier run of [`two_runs_through`] without moving
+/// the focus, and render it in place. A key acts on the focused stop, and a
+/// click moves the focus: the run toggles as either would toggle it.
+fn toggle_earlier_run_keeping_focus(app: &mut App) {
+    if let AppMode::View(state) = &mut app.app_mode {
+        let first_run = state.rendered_lines[state.message_ranges[1].start_line]
+            .tool_output_id
+            .clone()
+            .expect("the first run's summary row toggles it");
+        if !state.expanded_tool_outputs.remove(&first_run) {
+            state.expanded_tool_outputs.insert(first_run.clone());
+        }
+        state.run_outputs_to_render_again.insert(first_run);
+    }
+    finish_view_render(app, VIEWPORT);
+}
+
+#[test]
+fn focused_call_in_later_run_stays_focused_after_earlier_run_expands() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = later_runs_second_call_focused(worker);
+    let focused = focused_call_id(&app);
+
+    toggle_earlier_run_keeping_focus(&mut app);
+
+    let state = view_state(&app);
+    assert_eq!(state.call_ranges.len(), 4, "both runs' calls show");
+    assert_eq!(
+        focused_call_id(&app),
+        focused,
+        "the focused call stays focused"
+    );
+    assert_eq!(
+        state.focused_call(),
+        Some(3),
+        "the focus points at the call's new index, after the earlier run's two calls"
+    );
+    assert!(
+        !gate.took_waiting_render(),
+        "no render runs on viewer-render"
+    );
+}
+
+#[test]
+fn focused_call_in_later_run_stays_focused_after_earlier_run_collapses() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = later_runs_second_call_focused(worker);
+    let focused = focused_call_id(&app);
+    toggle_earlier_run_keeping_focus(&mut app);
+
+    toggle_earlier_run_keeping_focus(&mut app);
+
+    let state = view_state(&app);
+    assert_eq!(
+        state.call_ranges.len(),
+        2,
+        "only the later run's calls show"
+    );
+    assert_eq!(
+        focused_call_id(&app),
+        focused,
+        "the focused call stays focused"
+    );
+    assert_eq!(
+        state.focused_call(),
+        Some(1),
+        "the focus points at the call's new index, the later run's second"
+    );
+    assert!(
+        !gate.took_waiting_render(),
+        "no render runs on viewer-render"
+    );
+}
+
+/// A click on `row` of the shown rows, which expands or collapses the
+/// output it shows.
+fn click_row(app: &mut App, row: usize) {
+    let frame = Rect::new(0, 0, 80, 30);
+    let state = view_state(app);
+    assert!(
+        state.rendered_lines[row].clickable,
+        "a click on row {row} toggles an output"
+    );
+    let screen_row = crate::tui::ui::view_layout_rects(frame, app, state)
+        .content
+        .y
+        + (row - state.scroll_offset) as u16;
+    assert!(
+        app.handle_view_click(screen_row, frame),
+        "the click on row {row} changes the view"
+    );
+}
+
+/// A click on the input of the second call of an expanded run, which
+/// expands or collapses it. The call's entry is not the one that opens the
+/// run.
+fn click_second_call(app: &mut App) {
+    let state = view_state(app);
+    let input = &state
+        .call_ranges
+        .get(1)
+        .expect("an expanded run shows two calls")
+        .input;
+    let row = (input.start_line..input.end_line)
+        .find(|&row| state.rendered_lines[row].clickable)
+        .expect("a click on the call's input toggles it");
+    click_row(app, row);
+}
+
+#[test]
+fn click_on_call_inside_expanded_run_renders_run_in_place_as_whole_render() {
+    let (worker, gate) = gated_worker();
+    let (_dir, mut app) = two_runs_through(worker);
+    let rows = Arc::as_ptr(&view_state(&app).rendered_lines);
+    let text = |app: &App| super::claude_home::viewer_text(app);
+    press_and_render(&mut app, KeyCode::Char('J'));
+    press_and_render(&mut app, KeyCode::Right);
+    assert!(
+        !text(&app).contains("echo toolu_2 6"),
+        "the call's input shows truncated in the expanded run"
+    );
+
+    click_second_call(&mut app);
+    finish_view_render(&mut app, VIEWPORT);
+    assert!(
+        text(&app).contains("echo toolu_2 6"),
+        "the call's input shows whole"
+    );
+    super::viewer_refresh_tests::assert_shown_rows_are_whole_render(&app);
+
+    click_second_call(&mut app);
+    finish_view_render(&mut app, VIEWPORT);
+    assert!(
+        !text(&app).contains("echo toolu_2 6"),
+        "the call's input shows truncated again"
+    );
+    super::viewer_refresh_tests::assert_shown_rows_are_whole_render(&app);
+
+    assert!(
+        !gate.took_waiting_render(),
+        "no render runs on viewer-render"
+    );
+    assert_eq!(
+        Arc::as_ptr(&view_state(&app).rendered_lines),
+        rows,
+        "the rows change in place"
+    );
+}
+
+/// The query that matches the calls' inputs of [`two_runs_through`] once
+/// their run is expanded.
+const CALL_QUERY: &str = "echo";
+
+#[test]
+fn run_rendered_in_place_updates_matches_and_selects_first_at_or_below_top_row() {
+    let (worker, _gate) = gated_worker();
+    let (_dir, mut app) = two_runs_through(worker);
+    let later_run = view_state(&app).message_ranges[3].start_line;
+    click_row(&mut app, later_run);
+    finish_view_render(&mut app, VIEWPORT);
+    for code in format!("/{CALL_QUERY}")
+        .chars()
+        .map(KeyCode::Char)
+        .chain([KeyCode::Enter])
+    {
+        press_now(&mut app, code);
+    }
+    super::test_waits::finish_view_search(&mut app);
+    let later_runs_matches = view_state(&app).search_matches.len();
+    assert!(
+        later_runs_matches > 1,
+        "the later run's calls show {CALL_QUERY:?}: {later_runs_matches}"
+    );
+    select_last_match(&mut app);
+
+    // Scroll the earlier run's summary row to the top row, where the click
+    // reaches it.
+    let earlier_run = view_state(&app).message_ranges[1].start_line;
+    if let AppMode::View(state) = &mut app.app_mode {
+        state.scroll_offset = earlier_run;
+    }
+    click_row(&mut app, earlier_run);
+    finish_view_render(&mut app, VIEWPORT);
+
+    assert!(
+        !app.is_view_search_pending(),
+        "the expand doesn't send a search"
+    );
+    let state = view_state(&app);
+    assert_eq!(
+        state.search_matches,
+        crate::tui::viewer::find_matches(&state.rendered_lines, CALL_QUERY),
+        "the matches are the search's over the new rows"
+    );
+    assert!(
+        state.search_matches.len() > later_runs_matches,
+        "the earlier run's calls add matches: {} after {later_runs_matches}",
+        state.search_matches.len()
+    );
+    let first_at_or_below = match_rows(state)
+        .iter()
+        .position(|&row| row >= state.scroll_offset)
+        .expect("a match starts at or below the top row");
+    assert_eq!(
+        state.current_match_index, first_at_or_below,
+        "the selected match is the first at or below the top row {}",
+        state.scroll_offset
+    );
+}
+
 /// The query [`write_marked_call_conversation`] matches before, inside and
 /// after its call.
 const MARKER: &str = "marker";

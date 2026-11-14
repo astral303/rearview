@@ -42,8 +42,8 @@ impl ToolOutputId {
     }
 
     /// True when expanding or collapsing the output changes its entry's
-    /// rows rendered alone with `options`. A tool run renders with the rest
-    /// of the conversation.
+    /// rows rendered alone with `options`. Expanding or collapsing a tool
+    /// run, or an output inside it, renders the run's rows again instead.
     pub fn toggles_alone_in(&self, options: &RenderOptions) -> bool {
         let is_report = self.0.ends_with(":kind:reply")
             || self

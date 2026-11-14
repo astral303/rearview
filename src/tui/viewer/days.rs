@@ -126,13 +126,26 @@ impl DayLabels {
         }
     }
 
+    /// Set the current day to that of the last entry of `earlier` that
+    /// carried a timestamp.
+    pub(super) fn resume_after<'e>(
+        &mut self,
+        earlier: impl DoubleEndedIterator<Item = &'e LogEntry>,
+    ) {
+        self.current = earlier.rev().find_map(|entry| self.day_of(entry));
+    }
+
+    fn day_of(&self, entry: &LogEntry) -> Option<NaiveDate> {
+        day_in(entry.activity_timestamp()?, &self.zone)
+    }
+
     /// The day `entry` starts, when it falls on another local day than the
     /// entry before it that carried a timestamp.
     pub(super) fn new_day_at(&mut self, entry: &LogEntry) -> Option<NaiveDate> {
         if !self.shown {
             return None;
         }
-        let day = day_in(entry.activity_timestamp()?, &self.zone)?;
+        let day = self.day_of(entry)?;
         let previous = self.current.replace(day);
         previous
             .is_some_and(|previous| previous != day)
