@@ -2625,6 +2625,61 @@ fn takeover_from_this_process_is_another_processs_refresh_until_it_completes() {
     drop(held);
 }
 
+/// Stops one thread inside each connection it opens to the session cache
+/// database in a base, until dropped. A refresh waiter stopped there doesn't
+/// have any connection to the cache open, and doesn't take SQLite's writer
+/// lock.
+struct ConnectionsStoppedOnThread {
+    is_released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    stopped: mpsc::Receiver<()>,
+    _hook: connection::test_hooks::Installed,
+}
+
+impl ConnectionsStoppedOnThread {
+    fn of(base: &Path, stopped_thread: thread::ThreadId) -> Self {
+        let is_released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::clone(&is_released);
+        let (stopping, stopped) = mpsc::channel();
+        let hook = connection::test_hooks::on_every_connection(base, move |_| {
+            if thread::current().id() != stopped_thread {
+                return;
+            }
+            let _ = stopping.send(());
+            let (is_released, released) = &*release;
+            let guard = is_released.lock().unwrap();
+            drop(
+                released
+                    .wait_while(guard, |is_released| !*is_released)
+                    .unwrap(),
+            );
+        });
+        Self {
+            is_released,
+            stopped,
+            _hook: hook,
+        }
+    }
+
+    /// Wait until the thread opens its next connection and is stopped there.
+    fn wait_until_stopped(&self) {
+        self.stopped
+            .recv_timeout(HANG_WATCHDOG)
+            .expect("the thread opens its next connection");
+    }
+}
+
+impl Drop for ConnectionsStoppedOnThread {
+    fn drop(&mut self) {
+        let (is_released, released) = &*self.is_released;
+        *is_released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        released.notify_all();
+    }
+}
+
+/// This thread clears the stored owner and takes ownership while the load is
+/// stopped between its polls. A poll between the clearing and this thread's
+/// acquisition would acquire first, and a poll holding the writer lock would
+/// fail the clearing as busy.
 #[test]
 fn this_processs_own_ownership_ends_its_wait_for_another_process() {
     let directory = tempfile::tempdir().unwrap();
@@ -2642,6 +2697,8 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
         let load =
             scope.spawn(|| RefreshOwnership::acquire(&base, &status, &Cancellation::default()));
         wait_for_a_published_wait(&status);
+        let load_stopped = ConnectionsStoppedOnThread::of(base.path(), load.thread().id());
+        load_stopped.wait_until_stopped();
 
         connection
             .execute("UPDATE refresh_state SET owner = NULL", [])
@@ -2649,6 +2706,7 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
         let Acquisition::Acquired(own) = RefreshOwnership::try_acquire_now(&base).unwrap() else {
             panic!("this thread acquires ownership before the load");
         };
+        drop(load_stopped);
 
         let deadline = Instant::now() + HANG_WATCHDOG;
         while status.current().is_some() {
