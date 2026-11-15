@@ -226,8 +226,6 @@ fn render_activity_status(frame: &mut Frame, msg: &str, area: Rect) {
     frame.render_widget(status, area);
 }
 
-/// The bottom bar while the viewer's read of the session to open runs.
-const OPENING_LABEL: &str = "Opening…";
 /// The viewer's bottom bar while the session is missing from the cache,
 /// until its refresh finishes.
 const LOADING_SESSION_LABEL: &str = "Loading…";
@@ -274,8 +272,8 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let dim_key_style = Style::default().fg(rgb(th().dim_key));
     let dim_label_style = Style::default().fg(rgb(th().dim_label));
 
-    if app.is_opening() {
-        render_activity_status(frame, OPENING_LABEL, area);
+    if let Some(status) = app.opening_status_text() {
+        render_activity_status(frame, &status, area);
         return;
     }
 
@@ -4129,6 +4127,40 @@ mod tests {
         assert!(bottom.contains("Opening…"), "{bottom:?}");
         assert!(!bottom.contains("Enter"), "{bottom:?}");
         assert_eq!(project_name_fg(&terminal), rgb(th().dim_label));
+    }
+
+    #[test]
+    fn pending_open_shows_spinner_then_seconds_since_open_was_asked_for() {
+        use std::time::Duration;
+        let mut app = lexical_list_app();
+        assert!(app.request_open());
+        let bottom_after = |app: &App, wait: Duration| {
+            app.clock().sleep(wait);
+            row_text(&draw_list_mode(app), BOTTOM_BAR_ROW)
+                .trim_matches(|c: char| c == '│' || c.is_whitespace())
+                .to_owned()
+        };
+
+        assert_eq!(
+            bottom_after(&app, Duration::from_millis(99)),
+            "Opening…",
+            "the label shows without a spinner at first"
+        );
+        assert_eq!(
+            bottom_after(&app, Duration::from_millis(1)),
+            "⠙ Opening…",
+            "the spinner shows from 100 ms on"
+        );
+        assert_eq!(
+            bottom_after(&app, Duration::from_millis(80)),
+            "⠹ Opening…",
+            "the spinner moves every 80 ms"
+        );
+        assert_eq!(
+            bottom_after(&app, Duration::from_millis(3000)),
+            "⠏ Opening… 3s",
+            "the whole seconds since the open was asked for show from the first second on"
+        );
     }
 
     #[test]

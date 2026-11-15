@@ -234,6 +234,8 @@ fn known_fork(source: crate::history::Source) -> Option<bool> {
 struct PendingOpen {
     path: PathBuf,
     source: crate::history::Source,
+    /// When the open was asked for: the status's seconds count from then.
+    since: Moment,
     /// The viewer's read of the row's copy, once started.
     read: Option<view_state::ViewerRead<view_state::RowRead>>,
 }
@@ -251,6 +253,8 @@ enum DirectFileJob {
 const SPINNER_DELAY: Duration = Duration::from_millis(100);
 const SPINNER_FRAME: Duration = Duration::from_millis(80);
 const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// In the list's bottom bar while a session opens.
+const OPENING_LABEL: &str = "Opening…";
 /// Beside the spinner while a search runs.
 const SEARCHING_LABEL: &str = "searching";
 /// In the viewer's mode cell while the rows shown are rendered again.
@@ -1018,6 +1022,7 @@ impl App {
         self.pending_open = Some(PendingOpen {
             path: row.path.clone(),
             source: row.source,
+            since: self.clock().now(),
             read: None,
         });
         true
@@ -1036,6 +1041,18 @@ impl App {
     /// True between the open request and the viewer showing the session.
     pub fn is_opening(&self) -> bool {
         self.pending_open.is_some()
+    }
+
+    /// The list's bottom bar while a session opens: `Opening…`. From
+    /// `SPINNER_DELAY` (100 ms) after the open was requested, a spinner glyph
+    /// precedes the label; from one second on, the whole seconds follow it
+    /// (`⠋ Opening… 3s`). `None` while no session opens.
+    pub fn opening_status_text(&self) -> Option<String> {
+        let since = self.pending_open.as_ref()?.since;
+        Some(
+            spinner_status(OPENING_LABEL, self.clock().elapsed_since(since))
+                .unwrap_or_else(|| OPENING_LABEL.to_owned()),
+        )
     }
 
     /// Advance a pending open: start the viewer's read of the session on a
