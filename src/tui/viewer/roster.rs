@@ -1,7 +1,7 @@
 //! Each sub-agent's label, and the sub-agent each `spawn_agent` call started,
 //! collected as the viewer loads a conversation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
@@ -13,7 +13,7 @@ use super::ledger::fitted_name;
 use super::style::subagent_label;
 use super::tools::tool_result_display_text;
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub(crate) struct SubagentRoster {
     /// The label of each sub-agent whose provider recorded a nickname, by the
     /// sub-agent's key (its `parent_tool_use_id`).
@@ -116,6 +116,97 @@ impl SubagentRoster {
         }
         text.push_str(&format!(" · {agent_path}"));
         Some(text)
+    }
+}
+
+/// The values of a [`SubagentRoster`] that differ in a newer roster of the
+/// conversation. It leaves out agent calls: a kept result's agent type
+/// changes only when a later call reuses its call id.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the viewer's reload doesn't render a tail yet")
+)]
+pub(super) struct RosterChanges {
+    /// True when a sub-agent the shown roster labels has another label, or
+    /// none, in the newer roster.
+    relabelled: bool,
+    /// The sub-agent keys only the newer roster labels.
+    new_labels: HashSet<String>,
+    agent_paths: HashSet<String>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the viewer's reload doesn't render a tail yet")
+)]
+impl RosterChanges {
+    pub(super) fn between(shown: &SubagentRoster, newer: &SubagentRoster) -> Self {
+        Self {
+            relabelled: shown
+                .labels
+                .iter()
+                .any(|(key, label)| newer.labels.get(key) != Some(label)),
+            new_labels: newer
+                .labels
+                .keys()
+                .filter(|key| !shown.labels.contains_key(*key))
+                .cloned()
+                .collect(),
+            agent_paths: Self::changed_keys(&shown.by_agent_path, &newer.by_agent_path),
+        }
+    }
+
+    /// The keys of `old` and `new` whose values differ, a key missing from
+    /// one included.
+    fn changed_keys<V: PartialEq>(
+        old: &HashMap<String, V>,
+        new: &HashMap<String, V>,
+    ) -> HashSet<String> {
+        old.keys()
+            .chain(new.keys())
+            .filter(|key| old.get(*key) != new.get(*key))
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn relabels_shown_sub_agent(&self) -> bool {
+        self.relabelled
+    }
+
+    /// True when `entry`'s rows read a new label or a changed task path: the
+    /// label of the sub-agent the entry belongs to, or the task path a
+    /// result carries.
+    pub(super) fn reaches(&self, entry: &LogEntry) -> bool {
+        let (parent, blocks): (&Option<String>, &[ContentBlock]) = match entry {
+            LogEntry::Assistant {
+                message,
+                parent_tool_use_id,
+                ..
+            } => (parent_tool_use_id, &message.content),
+            LogEntry::User {
+                message,
+                parent_tool_use_id,
+                ..
+            } => match &message.content {
+                UserContent::Blocks(blocks) => (parent_tool_use_id, blocks),
+                UserContent::String(_) => (parent_tool_use_id, &[]),
+            },
+            _ => return false,
+        };
+        parent
+            .as_deref()
+            .is_some_and(|key| self.new_labels.contains(key))
+            || blocks.iter().any(|block| match block {
+                ContentBlock::ToolResult { content, .. } => content
+                    .as_ref()
+                    .and_then(lone_task_name)
+                    .is_some_and(|path| self.agent_paths.contains(&path)),
+                _ => false,
+            })
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.new_labels.is_empty() && self.agent_paths.is_empty()
     }
 }
 

@@ -286,7 +286,7 @@ fn message_toggling(
 }
 
 /// `entries` with their lanes and an empty roster.
-fn conversation_of(entries: Vec<RenderableEntry>) -> ParsedConversation {
+pub(super) fn conversation_of(entries: Vec<RenderableEntry>) -> ParsedConversation {
     let lanes = Lanes::of(top_level_tool_blocks(&entries));
     ParsedConversation {
         entries,
@@ -733,7 +733,7 @@ fn record(role: &str, timestamp: Option<&str>, content: serde_json::Value) -> se
     record
 }
 
-fn text(role: &str, timestamp: Option<&str>, text: &str) -> serde_json::Value {
+pub(super) fn text(role: &str, timestamp: Option<&str>, text: &str) -> serde_json::Value {
     record(
         role,
         timestamp,
@@ -742,7 +742,7 @@ fn text(role: &str, timestamp: Option<&str>, text: &str) -> serde_json::Value {
 }
 
 /// A call with an input long enough to be truncated.
-fn long_call(timestamp: Option<&str>, id: &str) -> serde_json::Value {
+pub(super) fn long_call(timestamp: Option<&str>, id: &str) -> serde_json::Value {
     record(
         "assistant",
         timestamp,
@@ -754,7 +754,7 @@ fn long_call(timestamp: Option<&str>, id: &str) -> serde_json::Value {
 }
 
 /// The result of the call `id`, long enough to be truncated.
-fn long_result(timestamp: Option<&str>, id: &str) -> serde_json::Value {
+pub(super) fn long_result(timestamp: Option<&str>, id: &str) -> serde_json::Value {
     record(
         "user",
         timestamp,
@@ -788,7 +788,7 @@ fn of_sub_agent(mut record: serde_json::Value, parent: &str) -> serde_json::Valu
     record
 }
 
-fn conversation_of_records(records: &[serde_json::Value]) -> ParsedConversation {
+pub(super) fn conversation_of_records(records: &[serde_json::Value]) -> ParsedConversation {
     conversation_of(
         records
             .iter()

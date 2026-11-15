@@ -29,6 +29,7 @@ mod roster;
 mod search_rows;
 mod style;
 mod summary;
+mod tail;
 mod timing;
 mod tools;
 
@@ -128,6 +129,7 @@ impl ToolDisplayMode {
 }
 
 /// Options for rendering a conversation
+#[derive(PartialEq)]
 pub struct RenderOptions {
     pub tool_display: ToolDisplayMode,
     pub show_thinking: bool,
