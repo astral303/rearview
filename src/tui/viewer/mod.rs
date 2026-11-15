@@ -29,6 +29,7 @@ mod roster;
 mod search_rows;
 mod style;
 mod summary;
+mod tail;
 mod timing;
 mod tools;
 
@@ -36,13 +37,15 @@ pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
 pub use relocation::EntryRelocation;
 pub use rerender::{
-    MessageInPlace, ShownRows, entry_rendering_alone, message_showing, render_message_in_place,
+    MessageInPlace, ReplacedRows, ShownRows, entry_rendering_alone, message_showing,
+    render_message_in_place,
 };
 pub(crate) use roster::SubagentRoster;
 #[cfg(test)]
 pub use search_rows::find_matches;
 pub use search_rows::{SearchMatch, find_matches_while, update_matches_in_replaced_rows};
 pub(crate) use summary::format_coarse_duration;
+pub(crate) use tail::{RowsToRender, ShownRender, splice_tail, tail_after_read};
 
 use calls::{CallRanges, Lanes, top_level_tool_blocks};
 use days::DayLabels;
@@ -128,6 +131,7 @@ impl ToolDisplayMode {
 }
 
 /// Options for rendering a conversation
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderOptions {
     pub tool_display: ToolDisplayMode,
     pub show_thinking: bool,
@@ -363,10 +367,12 @@ pub fn day_at_line(
     })
 }
 
-/// A copy of a session as the viewer shows it: its conversation, and the
-/// copy's catalogue row the header shows.
+/// A copy of a session as the viewer shows it: its conversation, one hash
+/// per entry, and the copy's catalogue row the header shows.
 pub struct ViewedConversation {
     pub conversation: ParsedConversation,
+    /// By `entry_index`: two reads' hashes show the first changed entry.
+    pub entry_hashes: crate::history::sqlite_cache::EntryHashes,
     /// `None` when the cache no longer lists the copy.
     pub row: Option<Box<crate::history::Conversation>>,
 }
@@ -382,6 +388,7 @@ pub fn parse_conversation_file_interactively(
     crate::history::viewed_copy_interactively(cache, address, publication).map(|viewed| {
         ViewedConversation {
             conversation: parsed_conversation(viewed.entries),
+            entry_hashes: viewed.entry_hashes,
             row: viewed.row,
         }
     })
@@ -473,6 +480,33 @@ pub fn render_parsed_conversation_while(
     )
 }
 
+/// The rows of `conversation`'s entries from the one numbered `entry_index`
+/// on, rendered with `options` and counted from the tail's first row: the
+/// day label above the entry when the entry starts a day. They equal a
+/// whole render's rows from that entry on when no tool run is open across
+/// the entry and no call before it is answered at or after it.
+///
+/// Calls `keep_going` as [`render_parsed_conversation_while`] does; `None`
+/// once it returns false.
+pub fn render_tail_while(
+    conversation: &ParsedConversation,
+    options: &RenderOptions,
+    entry_index: usize,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<RenderedConversation> {
+    let first = conversation
+        .entries
+        .partition_point(|parsed| parsed.entry_index < entry_index);
+    render_entries_from(
+        &conversation.entries,
+        &conversation.roster,
+        &conversation.lanes,
+        options,
+        first,
+        keep_going,
+    )
+}
+
 /// `lanes` are the lanes of `entries`' top-level calls.
 fn render_entries(
     entries: &[RenderableEntry],
@@ -481,9 +515,21 @@ fn render_entries(
     options: &RenderOptions,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<RenderedConversation> {
-    let mut stepper = RenderStepper::new(entries, roster, lanes, options);
-    for parsed_idx in 0..entries.len() {
-        if parsed_idx % ENTRIES_BETWEEN_STOP_CHECKS == 0 && !keep_going() {
+    render_entries_from(entries, roster, lanes, options, 0, keep_going)
+}
+
+/// [`render_entries`] of the entries from the one at `first` on.
+fn render_entries_from(
+    entries: &[RenderableEntry],
+    roster: &SubagentRoster,
+    lanes: &Lanes,
+    options: &RenderOptions,
+    first: usize,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<RenderedConversation> {
+    let mut stepper = RenderStepper::resuming_at(entries, roster, lanes, options, first);
+    for parsed_idx in first..entries.len() {
+        if (parsed_idx - first).is_multiple_of(ENTRIES_BETWEEN_STOP_CHECKS) && !keep_going() {
             return None;
         }
         stepper.step(parsed_idx);
@@ -554,6 +600,23 @@ impl<'a> RenderStepper<'a> {
             call_ranges: CallRanges::new(lanes),
             day_labels: DayLabels::new(options.show_timing, options.today, options.zone),
         }
+    }
+
+    /// A stepper that resumes a render at the entry at `first`, without a
+    /// tool run open and without a call recorded. Its day labels start from
+    /// the day of the last stamped entry before it.
+    fn resuming_at(
+        entries: &'a [RenderableEntry],
+        roster: &'a SubagentRoster,
+        lanes: &'a Lanes,
+        options: &'a RenderOptions,
+        first: usize,
+    ) -> Self {
+        let mut stepper = Self::new(entries, roster, lanes, options);
+        stepper
+            .day_labels
+            .resume_after(entries[..first].iter().map(|parsed| &parsed.entry));
+        stepper
     }
 
     /// Render the entry at `parsed_idx`, the one after the entry stepped

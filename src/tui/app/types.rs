@@ -1,11 +1,12 @@
 use crate::history::provider::walk::Canonicaliser;
+use crate::history::sqlite_cache::EntryHashes;
 use crate::history::{LoadProgress, OtherRearview, Workspace};
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{SemanticExplanation, SemanticScoreBreakdown};
 use crate::tui::actions_menu::{MenuAvailability, SessionAction};
 use crate::tui::viewer::{
-    CallRange, DetailCall, EntryRelocation, MessageRange, ParsedConversation, RenderedLine,
-    SearchMatch, ToolDisplayMode, ToolOutputId,
+    CallRange, DetailCall, EntryRelocation, MessageRange, ParsedConversation, RenderOptions,
+    RenderedLine, SearchMatch, ToolDisplayMode, ToolOutputId,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -118,10 +119,22 @@ pub struct ViewState {
     /// finds the copy missing keeps it, as it keeps the conversation. The
     /// refresh of an unchanged shown copy shows without a read or a render.
     pub shown_copy: Option<CopyIdentity>,
+    /// One hash per entry of `parsed_conversation`, read with it: a reload
+    /// compares them with its read's to find the first changed entry.
+    /// `None` for a file outside every provider's session roots, before the
+    /// first read of a file opened directly, and while an open found the
+    /// copy missing.
+    pub entry_hashes: Option<EntryHashes>,
     /// Current scroll position (line offset)
     pub scroll_offset: usize,
     /// Pre-rendered conversation lines, shared with the viewer's search
     pub rendered_lines: Arc<Vec<RenderedLine>>,
+    /// The options the shown rows were rendered with, the expanded set
+    /// including the outputs whose messages rendered again in place since.
+    /// `None` until the first rows show, and while the shown rows mix two
+    /// expanded sets: after a message failed to render again in place, until
+    /// the whole render requested then shows.
+    pub rows_options: Option<RenderOptions>,
     /// Total content height in lines
     pub total_lines: usize,
     /// Tool display mode (hidden/truncated/full)
@@ -331,6 +344,10 @@ pub enum MatchesArrival {
     /// The view stays where it is, on the first match at or below its top
     /// row, as for the search of rows rendered again.
     InPlace,
+    /// The view stays where it is, on the match at index `selected`: the
+    /// match selected above the start of a tail, at the same index among the
+    /// matches of the shown rows.
+    KeepsSelected { selected: usize },
     /// The view scrolls to the first match, unless it moved from `from` while
     /// the search ran.
     AtFirstMatch { from: ViewSpot },
@@ -438,8 +455,10 @@ impl ViewState {
             header: None,
             parsed_conversation: Arc::new(ParsedConversation::empty()),
             shown_copy: None,
+            entry_hashes: None,
             scroll_offset: 0,
             rendered_lines: Arc::default(),
+            rows_options: None,
             total_lines: 0,
             tool_display,
             show_thinking,

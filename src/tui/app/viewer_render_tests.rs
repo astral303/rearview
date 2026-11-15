@@ -8,10 +8,10 @@ use super::interaction_tests::{app_with_tool_conversation, view_state, write_nam
 use super::test_waits::{
     ConnectionGate, VIEWER_READ_LANDS, finish_pending_open, finish_view_render,
 };
-use super::viewer_render::ViewerRenderWorker;
+use super::viewer_render::{ViewerRenderWorker, render_rows_while};
 use super::*;
 use crate::clock::TestClock;
-use crate::tui::viewer::{render_parsed_conversation, render_parsed_conversation_while};
+use crate::tui::viewer::{RowsToRender, render_parsed_conversation};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -26,11 +26,41 @@ pub(super) struct Seen {
     pub(super) finished: bool,
 }
 
+/// The rows each render a worker started selected, in the order they
+/// started.
+pub(super) struct Extents(mpsc::Receiver<RowsToRender>);
+
+impl Extents {
+    /// The extents of the renders started since the last call.
+    pub(super) fn started(&self) -> Vec<RowsToRender> {
+        self.0.try_iter().collect()
+    }
+
+    /// The extent of the last render started since the last call.
+    pub(super) fn last_started(&self) -> Option<RowsToRender> {
+        self.started().pop()
+    }
+}
+
+/// A worker that renders as the app's does, recording the rows each render
+/// selects.
+pub(super) fn recording_worker() -> (ViewerRenderWorker, Extents) {
+    let (started, extents) = mpsc::channel();
+    let worker = ViewerRenderWorker::spawn_with(Box::new(
+        move |conversation, options, rows_to_render, keep_going| {
+            let _ = started.send(rows_to_render);
+            render_rows_while(conversation, options, rows_to_render, keep_going)
+        },
+    ));
+    (worker, Extents(extents))
+}
+
 /// The gate a [`gated_worker`] stops each render at, before its first entry.
 pub(super) struct Gate {
     started: mpsc::Receiver<(ToolDisplayMode, bool, Option<String>)>,
     release: mpsc::Sender<()>,
     returned: mpsc::Receiver<Seen>,
+    pub(super) extents: Extents,
 }
 
 impl Gate {
@@ -71,23 +101,27 @@ pub(super) fn gated_worker() -> (ViewerRenderWorker, Gate) {
     let (started_tx, started) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let (returned_tx, returned) = mpsc::channel();
-    let worker =
-        ViewerRenderWorker::spawn_with(Box::new(move |conversation, options, keep_going| {
+    let (extents_tx, extents) = mpsc::channel();
+    let worker = ViewerRenderWorker::spawn_with(Box::new(
+        move |conversation, options, rows_to_render, keep_going| {
             let thread = std::thread::current().name().map(str::to_owned);
+            let _ = extents_tx.send(rows_to_render);
             let _ = started_tx.send((options.tool_display, options.show_timing, thread));
             let _ = released.recv();
-            let rendered = render_parsed_conversation_while(conversation, options, keep_going);
+            let rendered = render_rows_while(conversation, options, rows_to_render, keep_going);
             let _ = returned_tx.send(Seen {
                 tool_display: options.tool_display,
                 show_timing: options.show_timing,
                 finished: rendered.is_some(),
             });
             rendered
-        }));
+        },
+    ));
     let gate = Gate {
         started,
         release,
         returned,
+        extents: Extents(extents),
     };
     (worker, gate)
 }
@@ -1028,7 +1062,8 @@ fn mode_cell_shows_updating_while_refresh_and_display_keys_render_are_pending() 
 #[test]
 #[should_panic(expected = "the render panicked")]
 fn viewer_render_thread_panic_resumes_where_renders_are_taken() {
-    let worker = ViewerRenderWorker::spawn_with(Box::new(|_, _, _| panic!("the render panicked")));
+    let worker =
+        ViewerRenderWorker::spawn_with(Box::new(|_, _, _, _| panic!("the render panicked")));
     let (_dir, mut app) = viewer_through(worker);
 
     press_now(&mut app, KeyCode::Char('t'));

@@ -1,12 +1,12 @@
 //! Each sub-agent's label, and the sub-agent each `spawn_agent` call started,
 //! collected as the viewer loads a conversation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool, UserContent, UserMessage};
+use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool};
 
 use super::NAME_WIDTH;
 use super::ledger::fitted_name;
@@ -53,19 +53,7 @@ impl SubagentRoster {
     /// Record the agent calls `entry` makes, each with the agent type its
     /// launch settings name.
     pub(super) fn record_agent_calls(&mut self, entry: &LogEntry) {
-        let blocks: &[ContentBlock] = match entry {
-            LogEntry::Assistant { message, .. } => &message.content,
-            LogEntry::User {
-                message:
-                    UserMessage {
-                        content: UserContent::Blocks(blocks),
-                        ..
-                    },
-                ..
-            } => blocks,
-            _ => return,
-        };
-        for block in blocks {
+        for block in entry.content_blocks() {
             if let ContentBlock::ToolUse {
                 id,
                 tool: Tool::Agent,
@@ -116,6 +104,82 @@ impl SubagentRoster {
         }
         text.push_str(&format!(" · {agent_path}"));
         Some(text)
+    }
+}
+
+/// The values of a [`SubagentRoster`] that differ in a newer roster of the
+/// conversation. It leaves out agent calls: a kept result's agent type
+/// changes only when a later call reuses its call id.
+pub(super) struct RosterChanges {
+    /// True when a sub-agent the shown roster labels has another label, or
+    /// none, in the newer roster.
+    relabelled: bool,
+    /// The sub-agent keys only the newer roster labels.
+    new_labels: HashSet<String>,
+    agent_paths: HashSet<String>,
+}
+
+impl RosterChanges {
+    pub(super) fn between(shown: &SubagentRoster, newer: &SubagentRoster) -> Self {
+        Self {
+            relabelled: shown
+                .labels
+                .iter()
+                .any(|(key, label)| newer.labels.get(key) != Some(label)),
+            new_labels: newer
+                .labels
+                .keys()
+                .filter(|key| !shown.labels.contains_key(*key))
+                .cloned()
+                .collect(),
+            agent_paths: Self::changed_keys(&shown.by_agent_path, &newer.by_agent_path),
+        }
+    }
+
+    /// The keys of `old` and `new` whose values differ, a key missing from
+    /// one included.
+    fn changed_keys<V: PartialEq>(
+        old: &HashMap<String, V>,
+        new: &HashMap<String, V>,
+    ) -> HashSet<String> {
+        old.keys()
+            .chain(new.keys())
+            .filter(|key| old.get(*key) != new.get(*key))
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn relabels_shown_sub_agent(&self) -> bool {
+        self.relabelled
+    }
+
+    /// True when `entry`'s rows read a new label or a changed task path: the
+    /// label of the sub-agent the entry belongs to, or the task path a
+    /// result carries.
+    pub(super) fn reaches(&self, entry: &LogEntry) -> bool {
+        let parent = match entry {
+            LogEntry::Assistant {
+                parent_tool_use_id, ..
+            }
+            | LogEntry::User {
+                parent_tool_use_id, ..
+            } => parent_tool_use_id,
+            _ => return false,
+        };
+        parent
+            .as_deref()
+            .is_some_and(|key| self.new_labels.contains(key))
+            || entry.content_blocks().iter().any(|block| match block {
+                ContentBlock::ToolResult { content, .. } => content
+                    .as_ref()
+                    .and_then(lone_task_name)
+                    .is_some_and(|path| self.agent_paths.contains(&path)),
+                _ => false,
+            })
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.new_labels.is_empty() && self.agent_paths.is_empty()
     }
 }
 

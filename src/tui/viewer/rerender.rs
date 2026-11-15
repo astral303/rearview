@@ -17,10 +17,10 @@ use super::{
     RenderedLine, ReplayedRun, ToolOutputId, message_range_excluding_trailing_blank,
 };
 
-/// Free row records a `Vec` of rows gets when a message rendered again
-/// outgrows it: 256 KB of records. The next expands that add rows then
+/// Free row records a `Vec` of rows gets when a message rendered again, or
+/// a tail, outgrows it: 256 KB of records. The next expands that add rows then
 /// fit without copying every row record again.
-const SPARE_ROWS_AFTER_GROWTH: usize = 4096;
+pub(super) const SPARE_ROWS_AFTER_GROWTH: usize = 4096;
 
 /// The rows and indexes of a render. A message rendered again changes them
 /// in place.

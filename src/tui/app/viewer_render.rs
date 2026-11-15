@@ -4,28 +4,55 @@
 
 use super::request_generation::{AwaitedRequest, RequestGeneration};
 use crate::tui::viewer::{
-    ParsedConversation, RenderOptions, RenderedConversation, RenderedLine,
-    render_parsed_conversation_while,
+    ParsedConversation, RenderOptions, RenderedConversation, RenderedLine, RowsToRender,
+    render_parsed_conversation_while, render_tail_while,
 };
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-/// A render of the conversation that ends with `None` once `keep_going`
-/// returns false: [`render_parsed_conversation_while`] outside tests.
+/// A render of the conversation's rows that a [`RowsToRender`] selects,
+/// ending with `None` once `keep_going` returns false:
+/// [`render_rows_while`] outside tests.
 pub(super) type RenderRows = Box<
-    dyn Fn(&ParsedConversation, &RenderOptions, &dyn Fn() -> bool) -> Option<RenderedConversation>
+    dyn Fn(
+            &ParsedConversation,
+            &RenderOptions,
+            RowsToRender,
+            &dyn Fn() -> bool,
+        ) -> Option<RenderedConversation>
         + Send,
 >;
+
+/// The rows of `conversation` that `rows_to_render` selects, rendered with
+/// `options`: every entry's, or the tail's from its start. `None` once
+/// `keep_going` returns false.
+pub(super) fn render_rows_while(
+    conversation: &ParsedConversation,
+    options: &RenderOptions,
+    rows_to_render: RowsToRender,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<RenderedConversation> {
+    match rows_to_render {
+        RowsToRender::Whole => render_parsed_conversation_while(conversation, options, keep_going),
+        RowsToRender::Tail(start) => {
+            render_tail_while(conversation, options, start.entry_index, keep_going)
+        }
+    }
+}
 
 struct Request {
     parsed_conversation: Arc<ParsedConversation>,
     options: RenderOptions,
+    rows_to_render: RowsToRender,
     generation: u64,
 }
 
-/// A finished render, and the generation it ran as.
+/// A finished render, the generation it ran as, the rows it rendered and
+/// the options it rendered them with.
 pub(super) struct Rendered {
     pub(super) generation: u64,
+    pub(super) rows_to_render: RowsToRender,
+    pub(super) options: RenderOptions,
     pub(super) rendered_conversation: RenderedConversation,
 }
 
@@ -35,6 +62,8 @@ pub(super) struct Rendered {
 pub(super) struct ViewerRenderWorker {
     requests: mpsc::Sender<Request>,
     rendered: mpsc::Receiver<Rendered>,
+    /// A render taken and kept for the next take, without its rows released.
+    kept: Option<Rendered>,
     /// Rows the app no longer shows, one set for each render it took.
     released: mpsc::Sender<Arc<Vec<RenderedLine>>>,
     generation: RequestGeneration,
@@ -44,7 +73,7 @@ pub(super) struct ViewerRenderWorker {
 
 impl ViewerRenderWorker {
     pub(super) fn spawn() -> Self {
-        Self::spawn_with(Box::new(render_parsed_conversation_while))
+        Self::spawn_with(Box::new(render_rows_while))
     }
 
     /// The worker, rendering with `render`. It runs one render at a time:
@@ -68,18 +97,21 @@ impl ViewerRenderWorker {
         Self {
             requests,
             rendered,
+            kept: None,
             released,
             generation,
             thread: Some(thread),
         }
     }
 
-    /// Render `parsed_conversation` with `options`, superseding the running
-    /// render. Returns the new render's generation.
+    /// Render the rows `rows_to_render` selects of `parsed_conversation` with
+    /// `options`, superseding the running render. Returns the new render's
+    /// generation.
     pub(super) fn render(
         &mut self,
         parsed_conversation: Arc<ParsedConversation>,
         options: RenderOptions,
+        rows_to_render: RowsToRender,
     ) -> u64 {
         let generation = self.generation.advance();
         // The send fails only once the thread has panicked; the next
@@ -87,6 +119,7 @@ impl ViewerRenderWorker {
         let _ = self.requests.send(Request {
             parsed_conversation,
             options,
+            rows_to_render,
             generation,
         });
         generation
@@ -107,9 +140,19 @@ impl ViewerRenderWorker {
         let _ = self.released.send(rows);
     }
 
+    /// Keep `rendered`, taken but not shown yet, for the next take. Its rows
+    /// are released once that take shows or drops it, and the next render
+    /// waits until then.
+    pub(super) fn keep_for_next_take(&mut self, rendered: Rendered) {
+        self.kept = Some(rendered);
+    }
+
     /// The finished render waiting to be taken, waiting up to `wait` for
     /// one. A panic on the `viewer-render` thread resumes here.
     pub(super) fn take_rendered(&mut self, wait: Duration) -> Option<Rendered> {
+        if let Some(kept) = self.kept.take() {
+            return Some(kept);
+        }
         let rendered = if wait.is_zero() {
             match self.rendered.try_recv() {
                 Ok(rendered) => rendered,
@@ -156,13 +199,18 @@ fn serve(
     while let Ok(oldest) = waiting.recv() {
         let request = waiting.try_iter().last().unwrap_or(oldest);
         let keep_going = || awaited.is_awaited(request.generation);
-        let Some(rendered_conversation) =
-            render(&request.parsed_conversation, &request.options, &keep_going)
-        else {
+        let Some(rendered_conversation) = render(
+            &request.parsed_conversation,
+            &request.options,
+            request.rows_to_render,
+            &keep_going,
+        ) else {
             continue;
         };
         let sent = rendered.send(Rendered {
             generation: request.generation,
+            rows_to_render: request.rows_to_render,
+            options: request.options,
             rendered_conversation,
         });
         if sent.is_err() {

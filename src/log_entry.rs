@@ -124,6 +124,19 @@ impl LogEntry {
         }
     }
 
+    /// The content blocks of a user or assistant entry; empty for a user
+    /// entry of plain text and for any other entry.
+    pub fn content_blocks(&self) -> &[ContentBlock] {
+        match self {
+            LogEntry::Assistant { message, .. } => &message.content,
+            LogEntry::User { message, .. } => match &message.content {
+                UserContent::Blocks(blocks) => blocks,
+                UserContent::String(_) => &[],
+            },
+            _ => &[],
+        }
+    }
+
     /// The timestamp of a user or assistant entry: the ones that date a
     /// session and extend its duration. A metadata record (`Model`, `Usage`,
     /// `Compaction`) is not activity, so a session holding nothing but model

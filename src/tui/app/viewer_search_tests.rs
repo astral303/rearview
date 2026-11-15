@@ -63,7 +63,7 @@ fn recording_worker() -> (ViewerSearchWorker, Searched) {
 }
 
 /// The gate a [`gated_worker`] stops each search at, before its first row.
-struct Gate {
+pub(super) struct Gate {
     started: mpsc::Receiver<String>,
     release: mpsc::Sender<()>,
     returned: mpsc::Receiver<(String, bool)>,
@@ -71,18 +71,18 @@ struct Gate {
 
 impl Gate {
     /// The query of the next search to reach the gate.
-    fn next_search(&self) -> String {
+    pub(super) fn next_search(&self) -> String {
         self.started
             .recv_timeout(VIEWER_READ_LANDS)
             .expect("a search reaches the gate")
     }
 
-    fn let_one_through(&self) {
+    pub(super) fn let_one_through(&self) {
         self.release.send(()).unwrap();
     }
 
     /// The query of the next search to return, and whether it finished.
-    fn next_return(&self) -> (String, bool) {
+    pub(super) fn next_return(&self) -> (String, bool) {
         self.returned
             .recv_timeout(VIEWER_READ_LANDS)
             .expect("a search returns")
@@ -92,7 +92,7 @@ impl Gate {
 /// A worker that stops each search at the returned gate. With
 /// `honours_stop` false, a superseded search searches to its end and sends
 /// its matches anyway.
-fn gated_worker(honours_stop: bool) -> (ViewerSearchWorker, Gate) {
+pub(super) fn gated_worker(honours_stop: bool) -> (ViewerSearchWorker, Gate) {
     let (started_tx, started) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let (returned_tx, returned) = mpsc::channel();

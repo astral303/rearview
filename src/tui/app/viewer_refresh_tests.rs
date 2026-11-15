@@ -17,7 +17,7 @@ use std::path::Path;
 
 const VIEWPORT: usize = 10;
 
-fn user_line(text: &str) -> String {
+pub(super) fn user_line(text: &str) -> String {
     user_line_at(text, 0)
 }
 
@@ -30,11 +30,11 @@ fn user_line_at(text: &str, second: usize) -> String {
     .to_string()
 }
 
-fn numbered(range: std::ops::Range<usize>) -> Vec<String> {
+pub(super) fn numbered(range: std::ops::Range<usize>) -> Vec<String> {
     range.map(|index| format!("message {index}")).collect()
 }
 
-fn write_messages(path: &Path, texts: &[String]) {
+pub(super) fn write_messages(path: &Path, texts: &[String]) {
     write_lines(path, texts.iter().map(|text| user_line(text)).collect());
 }
 
@@ -48,14 +48,14 @@ fn write_timed_messages(path: &Path, count: usize) {
     );
 }
 
-fn write_lines(path: &Path, lines: Vec<String>) {
+pub(super) fn write_lines(path: &Path, lines: Vec<String>) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
 /// A sub-agent transcript of `turns` turns, all sent at `second`: the splice
 /// places them after the parent's message sent then.
-fn write_subagent_turns(path: &Path, turns: usize, second: usize) {
+pub(super) fn write_subagent_turns(path: &Path, turns: usize, second: usize) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let lines: Vec<String> = (0..turns)
         .map(|index| user_line_at(&format!("sub-agent turn {index}"), second))
@@ -63,8 +63,8 @@ fn write_subagent_turns(path: &Path, turns: usize, second: usize) {
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
-/// A user message, a run of three calls, and a closing user message.
-fn tool_run_lines() -> Vec<String> {
+/// A run of two calls, each followed by its result.
+pub(super) fn tool_run_lines() -> Vec<String> {
     [
         r#"{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"one\ntwo\nthree\nfour\nfive\nsix"}}]}}"#,
         r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
@@ -89,13 +89,17 @@ fn row_from_file(path: &Path) -> Conversation {
 }
 
 /// The list holding `home`'s sessions, the first open in the viewer.
-fn viewer_on(home: &ClaudeHome) -> App {
+pub(super) fn viewer_on(home: &ClaudeHome) -> App {
     viewer_on_clock(home, Arc::new(TestClock::default()))
 }
 
 /// [`viewer_on`], on a `clock` the test moves.
-fn viewer_on_clock(home: &ClaudeHome, clock: Arc<TestClock>) -> App {
-    let environment = home.environment_on(clock);
+pub(super) fn viewer_on_clock(home: &ClaudeHome, clock: Arc<TestClock>) -> App {
+    viewer_in(home, home.environment_on(clock))
+}
+
+/// [`viewer_on`], loaded through `environment`.
+pub(super) fn viewer_in(home: &ClaudeHome, environment: Environment) -> App {
     let mut app = app_reading(home.rows(&environment), environment);
     app.selected = Some(0);
     app.enter_view_mode(80);
@@ -104,26 +108,26 @@ fn viewer_on_clock(home: &ClaudeHome, clock: Arc<TestClock>) -> App {
 
 /// `Ctrl+R`, the session refresh it asks for, then the next frame's read of
 /// the refreshed copy.
-fn press_refresh(app: &mut App) {
+pub(super) fn press_refresh(app: &mut App) {
     request_refresh(app);
     assert!(test_waits::finish_pending_view_reload(app, VIEWPORT));
 }
 
 /// `Ctrl+R`, and the session refresh it asks for, run as the background
 /// worker runs it.
-fn request_refresh(app: &mut App) {
+pub(super) fn request_refresh(app: &mut App) {
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     serve_session_refresh(app);
 }
 
-fn view(app: &App) -> &ViewState {
+pub(super) fn view(app: &App) -> &ViewState {
     match app.app_mode() {
         AppMode::View(state) => state,
         AppMode::List => panic!("the viewer is closed"),
     }
 }
 
-fn view_text(app: &App) -> String {
+pub(super) fn view_text(app: &App) -> String {
     view(app)
         .rendered_lines
         .iter()
@@ -630,7 +634,7 @@ fn open_of_session_gone_during_its_render_ends_on_list_and_next_open_shows_its_s
 
 /// The messages the last refresh added below a reader at the bottom, as the
 /// new-messages badge shows them.
-fn arrived_below(app: &App) -> Option<usize> {
+pub(super) fn arrived_below(app: &App) -> Option<usize> {
     view(app).count_highlight?.arrived_below
 }
 
@@ -694,7 +698,7 @@ fn scrolled_up_refresh_with_new_messages_highlights_only_count() {
 
 /// Scroll so the message holding `text` is the top row; returns that
 /// message's index.
-fn scroll_to_message(app: &mut App, text: &str) -> usize {
+pub(super) fn scroll_to_message(app: &mut App, text: &str) -> usize {
     let AppMode::View(state) = &mut app.app_mode else {
         panic!("the viewer is closed");
     };
@@ -1228,7 +1232,7 @@ fn copy_out_of_date_again_on_next_frame_requests_another_refresh() {
 /// `Ctrl+R` on a file opened directly outside every provider's session
 /// roots, the background worker's read of it, then the next frame showing
 /// that read.
-fn press_refresh_outside_every_root(app: &mut App) {
+pub(super) fn press_refresh_outside_every_root(app: &mut App) {
     app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL, VIEWPORT);
     app.serve_direct_file_read();
     test_waits::finish_pending_view_reload(app, VIEWPORT);
@@ -1236,7 +1240,7 @@ fn press_refresh_outside_every_root(app: &mut App) {
 
 /// The file at `path` opened directly in an environment without any
 /// provider's storage, so it lies outside every session root.
-fn opened_outside_every_root(path: &Path) -> App {
+pub(super) fn opened_outside_every_root(path: &Path) -> App {
     let mut app = App::new_single_file_read(
         path.to_path_buf(),
         ToolDisplayMode::Hidden,
@@ -1323,7 +1327,7 @@ fn directly_opened_file_waits_only_until_its_count_highlight_ends() {
 
 /// Session `a` of `home`, titled `Named session`, cached by a load of its
 /// root through the returned environment. Returns its transcript.
-fn cached_titled_session(home: &ClaudeHome) -> (PathBuf, Environment) {
+pub(super) fn cached_titled_session(home: &ClaudeHome) -> (PathBuf, Environment) {
     let transcript = home.write("a", 5, &["a question"]);
     let title = r#"{"type":"custom-title","customTitle":"Named session","sessionId":"a"}"#;
     let mut file = std::fs::OpenOptions::new()
@@ -1357,7 +1361,7 @@ fn typed_spellings(transcript: &Path) -> Vec<PathBuf> {
 }
 
 /// The file at `typed` opened directly in `environment`, its read shown.
-fn opened_directly_as(typed: &Path, environment: Environment) -> App {
+pub(super) fn opened_directly_as(typed: &Path, environment: Environment) -> App {
     let file = DirectFile::canonicalise(typed.to_path_buf(), environment.canonicaliser()).unwrap();
     let mut app = App::new_single_file(
         file,
@@ -1761,7 +1765,7 @@ fn gated_viewer_on(home: &ClaudeHome) -> (App, Gate) {
 
 /// `Ctrl+R`, the session refresh it asks for, and the read of the refreshed
 /// copy, without waiting for the render the read requests.
-fn refresh_and_receive_read(app: &mut App) {
+pub(super) fn refresh_and_receive_read(app: &mut App) {
     request_refresh(app);
     assert!(
         app.complete_pending_view_refresh(test_waits::VIEWER_READ_LANDS),
@@ -2018,7 +2022,7 @@ fn click_on_output_during_reloads_render_expands_it_in_new_read() {
 }
 
 /// Focus the message showing `text`, as message navigation would.
-fn focus_message(app: &mut App, text: &str) {
+pub(super) fn focus_message(app: &mut App, text: &str) {
     let message_index = scroll_to_message(app, text);
     if let AppMode::View(state) = &mut app.app_mode {
         state.message_nav_active = true;
@@ -2181,7 +2185,7 @@ fn tools_key_during_reload_without_new_messages_doesnt_highlight_count() {
 /// An assistant message of one call, whose input of six lines, `<word> 1` to
 /// `<word> 6`, is truncated in truncated mode: `<word> 6` shows once the
 /// input is expanded.
-fn long_call_line(id: &str, word: &str) -> String {
+pub(super) fn long_call_line(id: &str, word: &str) -> String {
     let command = (1..=6)
         .map(|line| format!("{word} {line}"))
         .collect::<Vec<_>>()
@@ -2221,7 +2225,7 @@ fn gated_truncated_viewer_on(home: &ClaudeHome) -> (App, Gate) {
 
 /// A click on the shown rows of the call whose input shows `word`, which
 /// expands or collapses it.
-fn click_call(app: &mut App, word: &str) {
+pub(super) fn click_call(app: &mut App, word: &str) {
     let frame = Rect::new(0, 0, 80, 30);
     let state = view(app);
     let row = state

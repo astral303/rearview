@@ -9,6 +9,7 @@ use crate::log_entry::Tool;
 use std::path::PathBuf;
 
 mod rerender;
+mod tail;
 
 /// The session at `file_path` with the sub-agent transcripts `subagents`, as
 /// the viewer reads it once a load cached it.
@@ -17,6 +18,15 @@ fn read_as_viewer(
     file_path: &Path,
     subagents: &[PathBuf],
 ) -> ParsedConversation {
+    viewed_copy_of(source, file_path, subagents).conversation
+}
+
+/// [`read_as_viewer`] with the copy's entry hashes and row.
+fn viewed_copy_of(
+    source: crate::history::Source,
+    file_path: &Path,
+    subagents: &[PathBuf],
+) -> ViewedConversation {
     use crate::history::environment::test_support::{cache_session, current_copy, test_cache_base};
 
     let row = cache_session(source, file_path, subagents);
@@ -27,7 +37,21 @@ fn read_as_viewer(
             .expect("the load lists the row at its address"),
         &row.publication,
     ))
-    .conversation
+}
+
+#[test]
+fn viewers_read_returns_one_entry_hash_per_entry_for_every_agent() {
+    use crate::history::provider::contract_tests::every_record_sessions;
+    for session in every_record_sessions() {
+        let row = &session.row;
+        let viewed = viewed_copy_of(row.source, &row.path, &row.subagents);
+        assert_eq!(
+            viewed.entry_hashes.len(),
+            viewed.conversation.origins.len(),
+            "{:?}: the read returns one hash per entry",
+            row.source
+        );
+    }
 }
 
 /// The transcript at `file_path`, outside every agent's session roots, as
