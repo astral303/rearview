@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool, UserContent, UserMessage};
+use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool};
 
 use super::NAME_WIDTH;
 use super::ledger::fitted_name;
@@ -53,19 +53,7 @@ impl SubagentRoster {
     /// Record the agent calls `entry` makes, each with the agent type its
     /// launch settings name.
     pub(super) fn record_agent_calls(&mut self, entry: &LogEntry) {
-        let blocks: &[ContentBlock] = match entry {
-            LogEntry::Assistant { message, .. } => &message.content,
-            LogEntry::User {
-                message:
-                    UserMessage {
-                        content: UserContent::Blocks(blocks),
-                        ..
-                    },
-                ..
-            } => blocks,
-            _ => return,
-        };
-        for block in blocks {
+        for block in entry.content_blocks() {
             if let ContentBlock::ToolUse {
                 id,
                 tool: Tool::Agent,
@@ -177,26 +165,19 @@ impl RosterChanges {
     /// label of the sub-agent the entry belongs to, or the task path a
     /// result carries.
     pub(super) fn reaches(&self, entry: &LogEntry) -> bool {
-        let (parent, blocks): (&Option<String>, &[ContentBlock]) = match entry {
+        let parent = match entry {
             LogEntry::Assistant {
-                message,
-                parent_tool_use_id,
-                ..
-            } => (parent_tool_use_id, &message.content),
-            LogEntry::User {
-                message,
-                parent_tool_use_id,
-                ..
-            } => match &message.content {
-                UserContent::Blocks(blocks) => (parent_tool_use_id, blocks),
-                UserContent::String(_) => (parent_tool_use_id, &[]),
-            },
+                parent_tool_use_id, ..
+            }
+            | LogEntry::User {
+                parent_tool_use_id, ..
+            } => parent_tool_use_id,
             _ => return false,
         };
         parent
             .as_deref()
             .is_some_and(|key| self.new_labels.contains(key))
-            || blocks.iter().any(|block| match block {
+            || entry.content_blocks().iter().any(|block| match block {
                 ContentBlock::ToolResult { content, .. } => content
                     .as_ref()
                     .and_then(lone_task_name)

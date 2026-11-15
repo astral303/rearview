@@ -67,18 +67,11 @@ pub(super) fn entry_tool_blocks<'a>(
     entries.iter().flat_map(move |parsed| {
         let blocks: &[ContentBlock] = match &parsed.entry {
             LogEntry::Assistant {
-                message,
-                parent_tool_use_id,
-                ..
-            } if parent_tool_use_id.as_deref() == parent_id => &message.content,
-            LogEntry::User {
-                message,
-                parent_tool_use_id,
-                ..
-            } if parent_tool_use_id.as_deref() == parent_id => match &message.content {
-                UserContent::Blocks(blocks) => blocks,
-                UserContent::String(_) => &[],
-            },
+                parent_tool_use_id, ..
+            }
+            | LogEntry::User {
+                parent_tool_use_id, ..
+            } if parent_tool_use_id.as_deref() == parent_id => parsed.entry.content_blocks(),
             _ => &[],
         };
         blocks

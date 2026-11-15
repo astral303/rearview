@@ -580,8 +580,9 @@ fn spawn_result_shown_before_sub_agents_identity_renders_as_whole_render() {
         .entries
         .iter()
         .find(|parsed| {
-            matches!(&parsed.entry, LogEntry::Assistant { message, .. }
-                if message.content.iter().any(|block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_scout")))
+            parsed.entry.content_blocks().iter().any(
+                |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "call_scout"),
+            )
         })
         .expect("the session contains the spawn call")
         .entry_index;
@@ -723,19 +724,6 @@ fn relabelled_sub_agent_renders_whole() {
     );
 }
 
-/// The content blocks of a user or assistant entry; empty for any other
-/// entry.
-fn content_blocks(entry: &LogEntry) -> &[ContentBlock] {
-    match entry {
-        LogEntry::Assistant { message, .. } => &message.content,
-        LogEntry::User { message, .. } => match &message.content {
-            UserContent::Blocks(blocks) => blocks,
-            UserContent::String(_) => &[],
-        },
-        _ => &[],
-    }
-}
-
 /// `entry` with `blocks` in place of its content blocks.
 fn with_blocks(entry: &LogEntry, blocks: Vec<ContentBlock>) -> LogEntry {
     let mut entry = entry.clone();
@@ -751,7 +739,7 @@ fn with_blocks(entry: &LogEntry, blocks: Vec<ContentBlock>) -> LogEntry {
 /// writes them: without its last block, and with the first half of its
 /// last text alone.
 fn earlier_versions(entry: &LogEntry) -> Vec<(&'static str, LogEntry)> {
-    let blocks = content_blocks(entry);
+    let blocks = entry.content_blocks();
     let mut versions = Vec::new();
     if blocks.len() > 1 {
         let without_last_block = blocks[..blocks.len() - 1].to_vec();

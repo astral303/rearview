@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use crate::log_entry::{ContentBlock, LogEntry, UserContent};
+use crate::log_entry::{ContentBlock, LogEntry};
 
 use super::days::DayLabels;
 use super::roster::RosterChanges;
@@ -208,21 +208,16 @@ enum ToolBlockKind {
 /// contains answers, whoever's entry it is. A standalone result answers no
 /// call and is left out.
 fn tool_blocks(entry: &LogEntry) -> impl DoubleEndedIterator<Item = (&str, ToolBlockKind)> {
-    let blocks: &[ContentBlock] = match entry {
-        LogEntry::Assistant { message, .. } => &message.content,
-        LogEntry::User { message, .. } => match &message.content {
-            UserContent::Blocks(blocks) => blocks,
-            UserContent::String(_) => &[],
-        },
-        _ => &[],
-    };
-    blocks.iter().filter_map(|block| match block {
-        ContentBlock::ToolUse { id, .. } => Some((id.as_str(), ToolBlockKind::Call)),
-        ContentBlock::ToolResult {
-            tool_use_id,
-            standalone_tool_name: None,
-            ..
-        } => Some((tool_use_id.as_str(), ToolBlockKind::Result)),
-        _ => None,
-    })
+    entry
+        .content_blocks()
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some((id.as_str(), ToolBlockKind::Call)),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                standalone_tool_name: None,
+                ..
+            } => Some((tool_use_id.as_str(), ToolBlockKind::Result)),
+            _ => None,
+        })
 }
