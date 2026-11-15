@@ -110,10 +110,6 @@ impl SubagentRoster {
 /// The values of a [`SubagentRoster`] that differ in a newer roster of the
 /// conversation. It leaves out agent calls: a kept result's agent type
 /// changes only when a later call reuses its call id.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the viewer's reload doesn't render a tail yet")
-)]
 pub(super) struct RosterChanges {
     /// True when a sub-agent the shown roster labels has another label, or
     /// none, in the newer roster.
@@ -123,10 +119,6 @@ pub(super) struct RosterChanges {
     agent_paths: HashSet<String>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the viewer's reload doesn't render a tail yet")
-)]
 impl RosterChanges {
     pub(super) fn between(shown: &SubagentRoster, newer: &SubagentRoster) -> Self {
         Self {

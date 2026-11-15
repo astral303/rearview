@@ -1,19 +1,20 @@
 use super::session_store::{FinishedRefresh, ReadCause, SessionCopy};
+use super::viewer_render::Rendered;
 use super::{
     App, AppMode, CopyIdentity, CountHighlight, DialogMode, Focus, HeaderRow, MatchesArrival,
     OpenSessionStatus, PendingRender, PendingViewSearch, RowsRead, ViewSearchMode, ViewSpot,
     ViewState,
 };
 use crate::history::provider::{RenamedTitle, SessionRead, SessionTitle, TitleAndSummary};
-use crate::history::sqlite_cache::{AdoptedCopy, Publication, SessionAddress};
+use crate::history::sqlite_cache::{AdoptedCopy, EntryHashes, Publication, SessionAddress};
 use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
 use crate::tui::viewer::{
     CallArea, CallRange, EntryRelocation, MessageInPlace, MessageRange, ParsedConversation,
-    RenderOptions, RenderedConversation, RenderedLine, SearchMatch, ShownRows, ToolOutputId,
-    ViewedConversation, entry_rendering_alone, message_showing,
-    parse_conversation_file_interactively, render_message_in_place,
-    update_matches_in_replaced_rows,
+    RenderOptions, RenderedConversation, RenderedLine, ReplacedRows, RowsToRender, SearchMatch,
+    ShownRender, ShownRows, ToolOutputId, ViewedConversation, entry_rendering_alone,
+    message_showing, parse_conversation_file_interactively, render_message_in_place, splice_tail,
+    tail_after_read, update_matches_in_replaced_rows,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
@@ -25,6 +26,13 @@ use std::time::Duration;
 /// sent. The keys of a paste arrive less than the pause apart and run one
 /// search.
 pub(crate) const VIEW_SEARCH_PAUSE: Duration = Duration::from_millis(100);
+
+/// The most rows of a tail the drawing thread searches for the shown
+/// matches. That search doesn't stop, and the frame showing the tail waits
+/// for it; a tail starting early in a long session can have most of its
+/// rows. A larger tail's search runs on `viewer-search`, and the drawing
+/// thread keeps drawing.
+pub(super) const TAIL_ROWS_SEARCHED_WHILE_DRAWING: usize = 4_000;
 
 /// The open session's row as its finished refresh read it, for the viewer's
 /// read of the session from the cache.
@@ -86,6 +94,14 @@ impl ViewState {
         }
     }
 
+    /// True while the search of the query is open and its matches have
+    /// arrived: rows rendered again update those matches.
+    fn shows_finished_search(&self) -> bool {
+        self.search_mode != ViewSearchMode::Off
+            && !self.search_query.is_empty()
+            && self.pending_search.is_none()
+    }
+
     /// Replace the view's publication with `reloaded`'s, or with the
     /// publication of the copy the read adopted in the row's place. The
     /// header shows `copy_row`, the catalogue row of the copy the view
@@ -103,14 +119,78 @@ impl ViewState {
     }
 
     /// Replace the view's conversation with `conversation`, read from the
-    /// copy `copy` identifies when the read found it current.
+    /// copy `copy` identifies when the read found it current, with
+    /// `entry_hashes`, the hashes of its entries the read returned.
     fn replace_conversation(
         &mut self,
         conversation: Arc<ParsedConversation>,
         copy: Option<CopyIdentity>,
+        entry_hashes: Option<EntryHashes>,
     ) {
         self.parsed_conversation = conversation;
         self.shown_copy = copy;
+        self.entry_hashes = entry_hashes;
+    }
+
+    /// Show `arrived` in place of the shown rows, its messages and calls in
+    /// place of theirs. Returns the rows no longer shown, and for a tail the
+    /// rows it replaced.
+    fn put_arrived_rows(
+        &mut self,
+        arrived: ArrivedRows,
+    ) -> (Arc<Vec<RenderedLine>>, Option<ReplacedRows>) {
+        match arrived {
+            ArrivedRows::Whole(rendered) => {
+                let replaced =
+                    std::mem::replace(&mut self.rendered_lines, Arc::new(rendered.lines));
+                self.message_ranges = rendered.messages;
+                self.call_ranges = rendered.calls;
+                self.detail_calls = rendered.detail_calls;
+                (replaced, None)
+            }
+            ArrivedRows::Tail { row, tail } => {
+                let lines = Arc::get_mut(&mut self.rendered_lines)
+                    .expect("a tail shows once no search shares the shown rows");
+                let shown = ShownRows {
+                    lines,
+                    messages: &mut self.message_ranges,
+                    calls: &mut self.call_ranges,
+                    detail_calls: &mut self.detail_calls,
+                };
+                let spliced = splice_tail(shown, tail, row);
+                (Arc::new(spliced.removed), Some(spliced.replaced))
+            }
+        }
+    }
+
+    /// The rows to render of `conversation`, a newer read of the shown
+    /// conversation with `entry_hashes`, with `options`: the tail
+    /// [`tail_after_read`] finds after the shown rows. The whole
+    /// conversation renders again when either read lacks hashes, and while
+    /// the shown rows are not a render of the shown conversation with the
+    /// options they record: before the first rows show, while a render is
+    /// pending, and while a message waits to render again in place.
+    fn rows_after_reread(
+        &self,
+        conversation: &ParsedConversation,
+        entry_hashes: Option<&EntryHashes>,
+        options: &RenderOptions,
+    ) -> RowsToRender {
+        let are_rows_current = matches!(self.rows_read, RowsRead::Current)
+            && self.pending_render.is_none()
+            && self.entries_to_render_again.is_empty()
+            && self.run_outputs_to_render_again.is_empty();
+        match (&self.entry_hashes, entry_hashes, &self.rows_options) {
+            (Some(shown_hashes), Some(hashes), Some(rows_options)) if are_rows_current => {
+                let shown = ShownRender {
+                    conversation: &self.parsed_conversation,
+                    messages: &self.message_ranges,
+                    options: rows_options,
+                };
+                tail_after_read(shown, shown_hashes, conversation, hashes, options)
+            }
+            _ => RowsToRender::Whole,
+        }
     }
 
     /// Show `reloaded`, the refresh of an unchanged shown copy, without a
@@ -185,6 +265,33 @@ impl ViewState {
     }
 }
 
+/// Rows a render returned to show in place of the viewer's.
+enum ArrivedRows {
+    /// A render of every entry, in place of every shown row.
+    Whole(RenderedConversation),
+    /// A render of the tail, in place of the shown rows from `row` on.
+    Tail {
+        row: usize,
+        tail: RenderedConversation,
+    },
+}
+
+impl ArrivedRows {
+    fn into_lines(self) -> Vec<RenderedLine> {
+        match self {
+            Self::Whole(rendered) | Self::Tail { tail: rendered, .. } => rendered.lines,
+        }
+    }
+}
+
+/// A reload's read of the open session: the conversation, the copy it was
+/// read from when the read found it current, and its entries' hashes.
+struct Reread {
+    conversation: Arc<ParsedConversation>,
+    copy: Option<CopyIdentity>,
+    entry_hashes: Option<EntryHashes>,
+}
+
 /// The open session's refreshed row once its refresh is read again, with its
 /// `publication`, and `adopted`, the copy the read adopted in its place.
 struct ReloadedHeader {
@@ -205,6 +312,9 @@ struct ViewerCopy {
     adopted: Option<AdoptedCopy>,
     /// The copy's identity, when the read found it current.
     identity: Option<CopyIdentity>,
+    /// One hash per entry of `conversation`, as [`ViewState::entry_hashes`]
+    /// keeps them.
+    entry_hashes: Option<EntryHashes>,
 }
 
 impl ViewerCopy {
@@ -227,6 +337,7 @@ impl ViewerCopy {
             row: viewed.row,
             adopted,
             identity,
+            entry_hashes: Some(viewed.entry_hashes),
         }
     }
 
@@ -244,6 +355,7 @@ impl ViewerCopy {
             row: None,
             adopted: None,
             identity: None,
+            entry_hashes: None,
         }
     }
 }
@@ -523,13 +635,12 @@ impl App {
         let row = OpenedRow::of(&self.conversations[conv_idx]);
         let read = row.read(&self.interactive_cache());
         let state = self.take_opened_view(row, read, frame_width);
-        let rendered = crate::tui::viewer::render_parsed_conversation(
-            &state.parsed_conversation,
-            &self.view_render_options(&state),
-        );
+        let options = self.view_render_options(&state);
+        let rendered =
+            crate::tui::viewer::render_parsed_conversation(&state.parsed_conversation, &options);
         self.app_mode = AppMode::View(state);
         // A first render shows from the top whatever the viewport's height.
-        self.show_render(0, rendered);
+        self.show_render(0, ArrivedRows::Whole(rendered), options);
     }
 
     /// The viewer's state for `row`, from `read`, the viewer's read of its
@@ -544,7 +655,13 @@ impl App {
         let now = self.clock().now();
         let mut state = self.take_opened_view(row, read, frame_width);
         let options = self.view_render_options(&state);
-        request_render(&mut self.viewer_render, &mut state, options, now);
+        request_render(
+            &mut self.viewer_render,
+            &mut state,
+            options,
+            RowsToRender::Whole,
+            now,
+        );
         state
     }
 
@@ -583,7 +700,7 @@ impl App {
         state.header = Some(header);
         state.is_copy_missing = copy.conversation.is_none();
         if let Some(conversation) = copy.conversation {
-            state.replace_conversation(conversation, copy.identity);
+            state.replace_conversation(conversation, copy.identity, copy.entry_hashes);
         }
         state.show_timing = self.show_timing;
         state.frame_width = frame_width;
@@ -806,20 +923,19 @@ impl App {
             };
             if is_first_read_of_opened_file {
                 if let AppMode::View(state) = &mut self.app_mode {
-                    state.replace_conversation(conversation, copy.identity);
+                    state.replace_conversation(conversation, copy.identity, copy.entry_hashes);
                     state.show_reloaded_row(header, copy.row);
                     state.session_id = reloaded.session_id;
                     state.rows_read = RowsRead::BeforeFirstRead;
                 }
                 self.request_view_render();
             } else {
-                self.show_reread_conversation(
+                let read = Reread {
                     conversation,
-                    copy.identity,
-                    header,
-                    copy.row,
-                    reloaded.session_id,
-                );
+                    copy: copy.identity,
+                    entry_hashes: copy.entry_hashes,
+                };
+                self.show_reread_conversation(read, header, copy.row, reloaded.session_id);
             }
         }
         self.run_deferred_copy();
@@ -1078,6 +1194,9 @@ impl App {
                 state.current_match_index =
                     first_match_at_or_below(&state.search_matches, state.scroll_offset);
             }
+            (MatchesArrival::KeepsSelected { selected }, _) => {
+                state.current_match_index = selected;
+            }
             _ => {
                 state.current_match_index = state
                     .current_match_index
@@ -1152,26 +1271,28 @@ impl App {
         }
     }
 
-    /// Show `conversation`, the open session read again from the copy
-    /// `copy` identifies when the read found it current, where the reader
-    /// was, once its rows arrive (see [`Self::show_render`]). Expanded rows
-    /// stay expanded where their entry is still there. The header shows
-    /// `copy_row`, the conversation's copy's catalogue row, or `header`'s row
-    /// without it, at once. The previous reload's rows have shown
+    /// Show `read`, the open session read again, where the reader was, once
+    /// its rows arrive (see [`Self::show_render`]): the rows of its tail
+    /// after the shown rows they keep, or of the whole conversation (see
+    /// [`ViewState::rows_after_reread`]). Expanded rows stay expanded where
+    /// their entry is still there. The header shows `copy_row`, the
+    /// conversation's copy's catalogue row, or `header`'s row without it, at
+    /// once. The previous reload's rows have shown
     /// ([`Self::start_or_show_queued_reload`]), so the shown rows are
     /// `parsed_conversation`'s.
     fn show_reread_conversation(
         &mut self,
-        conversation: Arc<crate::tui::viewer::ParsedConversation>,
-        copy: Option<CopyIdentity>,
+        read: Reread,
         header: ReloadedHeader,
         copy_row: Option<Box<Conversation>>,
         session_id: Option<String>,
     ) {
+        let (now, today, zone) = (self.clock().now(), self.today(), self.clock().zone());
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        let into_new_read = EntryRelocation::between(&state.parsed_conversation, &conversation);
+        let into_new_read =
+            EntryRelocation::between(&state.parsed_conversation, &read.conversation);
         state.expanded_tool_outputs = state
             .expanded_tool_outputs
             .iter()
@@ -1180,11 +1301,14 @@ impl App {
         state.focus_first_call_of = state
             .focus_first_call_of
             .and_then(|entry| into_new_read.get(entry));
+        let options = state.render_options(today, zone);
+        let rows_to_render =
+            state.rows_after_reread(&read.conversation, read.entry_hashes.as_ref(), &options);
         state.rows_read = RowsRead::Earlier(into_new_read);
         state.show_reloaded_row(header, copy_row);
         state.session_id = session_id;
-        state.replace_conversation(conversation, copy);
-        self.request_view_render();
+        state.replace_conversation(read.conversation, read.copy, read.entry_hashes);
+        request_render(&mut self.viewer_render, state, options, rows_to_render, now);
     }
 
     /// Ask the `viewer-render` thread for a render of the open conversation
@@ -1200,7 +1324,13 @@ impl App {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        request_render(&mut self.viewer_render, state, options, now);
+        request_render(
+            &mut self.viewer_render,
+            state,
+            options,
+            RowsToRender::Whole,
+            now,
+        );
     }
 
     /// True while a render of the open conversation runs and its rows
@@ -1267,23 +1397,11 @@ impl App {
             return;
         };
         let place = ViewPlace::of(state, None);
+        let updates_shown_matches = state.shows_finished_search();
         let Some(lines) = Arc::get_mut(&mut state.rendered_lines) else {
-            // The stopped search frees the rows at its next check. It stays
-            // in `pending_search`, and is sent again over the new rows once
-            // the messages render.
-            if matches!(
-                state.pending_search,
-                Some(PendingViewSearch::Running { .. })
-            ) && let Some(worker) = &self.viewer_search
-            {
-                worker.stop();
-            }
-            return;
+            return self.stop_search_sharing_rows();
         };
         let conversation = Arc::clone(&state.parsed_conversation);
-        let updates_shown_matches = state.search_mode != ViewSearchMode::Off
-            && !state.search_query.is_empty()
-            && state.pending_search.is_none();
         let mut entries = std::mem::take(&mut state.entries_to_render_again);
         // Find each run output's run now: the shown rows are the newest
         // render's.
@@ -1320,9 +1438,13 @@ impl App {
         state.total_lines = lines.len();
         place.restore(state, viewport_height);
         if is_extent_broken {
-            // The whole render shows every output as the expanded set has it.
-            self.request_view_render();
-        } else if updates_shown_matches {
+            state.rows_options = None;
+            return self.request_view_render();
+        }
+        if let Some(rows_options) = &mut state.rows_options {
+            rows_options.expanded_tool_outputs = options.expanded_tool_outputs;
+        }
+        if updates_shown_matches {
             state.current_match_index =
                 first_match_at_or_below(&state.search_matches, state.scroll_offset);
         } else {
@@ -1337,6 +1459,8 @@ impl App {
     ///
     /// - A render finished for an earlier request or a closed viewer isn't
     ///   shown.
+    /// - A tail's rows show on a pass when no search shares the shown rows;
+    ///   a running search sharing them is stopped.
     /// - The rows no longer shown, or the render's when it isn't shown, are
     ///   sent to the `viewer-render` thread to be freed there.
     /// - Once a reload's rows show, the reload queued behind it starts its
@@ -1349,7 +1473,7 @@ impl App {
     ///   entry in `focus_first_call_of` is focused.
     /// - Then, after a render's rows showed, the deferred copy runs.
     pub(crate) fn receive_view_render(&mut self, viewport_height: usize, wait: Duration) {
-        self.receive_whole_render(viewport_height, wait);
+        self.receive_render(viewport_height, wait);
         self.render_messages_again(viewport_height);
         if self.is_view_render_pending() {
             return;
@@ -1367,7 +1491,7 @@ impl App {
         }
     }
 
-    fn receive_whole_render(&mut self, viewport_height: usize, wait: Duration) {
+    fn receive_render(&mut self, viewport_height: usize, wait: Duration) {
         let Some(rendered) = self
             .viewer_render
             .as_mut()
@@ -1382,27 +1506,74 @@ impl App {
                 .is_some_and(|pending| pending.generation == generation)
         };
         if matches!(&self.app_mode, AppMode::View(state) if awaits(state)) {
-            self.show_awaited_render(viewport_height, rendered.rendered_conversation);
+            self.show_awaited_render(viewport_height, rendered);
         } else if self.opening_view().is_some_and(awaits) {
-            self.finish_open(viewport_height, rendered.rendered_conversation);
+            self.finish_open(viewport_height, rendered);
         } else {
             self.release_rows(Arc::new(rendered.rendered_conversation.lines));
         }
     }
 
     /// Show `rendered`, the render the viewer awaits, and release the rows it
-    /// replaces. Once a reload's rows show, the reload queued behind it
-    /// starts.
-    pub(super) fn show_awaited_render(
+    /// replaces. A tail shows in place of the shown rows from its start's row
+    /// on once no search shares them: until then it is kept for the next
+    /// pass, and a running search sharing the rows is stopped. Once a
+    /// reload's rows show, the reload queued behind it starts.
+    pub(super) fn show_awaited_render(&mut self, viewport_height: usize, rendered: Rendered) {
+        let arrived = match rendered.rows_to_render {
+            RowsToRender::Whole => ArrivedRows::Whole(rendered.rendered_conversation),
+            RowsToRender::Tail(_) if self.are_shown_rows_shared() => {
+                self.stop_search_sharing_rows();
+                if let Some(worker) = &mut self.viewer_render {
+                    worker.keep_for_next_take(rendered);
+                }
+                return;
+            }
+            RowsToRender::Tail(start) => ArrivedRows::Tail {
+                row: start.row,
+                tail: rendered.rendered_conversation,
+            },
+        };
+        self.show_awaited(viewport_height, arrived, rendered.options);
+    }
+
+    /// True while the viewer is open and a search shares its shown rows.
+    fn are_shown_rows_shared(&mut self) -> bool {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return false;
+        };
+        Arc::get_mut(&mut state.rendered_lines).is_none()
+    }
+
+    /// Stop the running search, which shares the shown rows: it frees them
+    /// at its next check. It stays in `pending_search`, and is sent again
+    /// over the new rows once they show.
+    fn stop_search_sharing_rows(&self) {
+        if let AppMode::View(state) = &self.app_mode
+            && matches!(
+                state.pending_search,
+                Some(PendingViewSearch::Running { .. })
+            )
+            && let Some(worker) = &self.viewer_search
+        {
+            worker.stop();
+        }
+    }
+
+    /// Show `arrived`, the rows the viewer awaits, rendered with `options`,
+    /// and release the rows they replace. Once a reload's rows show, the
+    /// reload queued behind it starts.
+    fn show_awaited(
         &mut self,
         viewport_height: usize,
-        rendered: RenderedConversation,
+        arrived: ArrivedRows,
+        options: RenderOptions,
     ) {
         if let AppMode::View(state) = &mut self.app_mode {
             state.pending_render = None;
             state.runs_deferred_copy_once_shown = true;
         }
-        let replaced = self.show_render(viewport_height, rendered);
+        let replaced = self.show_render(viewport_height, arrived, options);
         self.release_rows(replaced);
         self.start_or_show_queued_reload();
     }
@@ -1433,8 +1604,9 @@ impl App {
         state.render_options(self.today(), self.clock().zone())
     }
 
-    /// Show `rendered`, a render of the open conversation, keeping the anchor
-    /// message on its row and the focused call focused.
+    /// Show `arrived`, rows of the open conversation rendered with
+    /// `options`, keeping the anchor message on its row and the focused call
+    /// focused.
     ///
     /// Rows of an earlier read (`RowsRead::Earlier`) are a reload's: the
     /// anchor and the focused call move into the newer read through the
@@ -1442,16 +1614,17 @@ impl App {
     /// messages show; and messages the newer read adds or drops set the
     /// view's `CountHighlight`.
     ///
-    /// Returns the rows no longer shown: the replaced ones, or `rendered`'s
+    /// Returns the rows no longer shown: the replaced ones, or `arrived`'s
     /// without a viewer.
     fn show_render(
         &mut self,
         viewport_height: usize,
-        rendered: RenderedConversation,
+        arrived: ArrivedRows,
+        options: RenderOptions,
     ) -> Arc<Vec<RenderedLine>> {
         let now = self.clock().now();
         let AppMode::View(state) = &mut self.app_mode else {
-            return Arc::new(rendered.lines);
+            return Arc::new(arrived.into_lines());
         };
         let rows_read = std::mem::replace(&mut state.rows_read, RowsRead::Current);
         let relocation = match &rows_read {
@@ -1469,11 +1642,9 @@ impl App {
         });
         let place = ViewPlace::of(state, relocation);
 
-        state.total_lines = rendered.lines.len();
-        let replaced = std::mem::replace(&mut state.rendered_lines, Arc::new(rendered.lines));
-        state.message_ranges = rendered.messages;
-        state.call_ranges = rendered.calls;
-        state.detail_calls = rendered.detail_calls;
+        let (released, tail_rows) = state.put_arrived_rows(arrived);
+        state.total_lines = state.rendered_lines.len();
+        state.rows_options = Some(options);
         if !matches!(rows_read, RowsRead::Current) {
             state.is_copy_missing = false;
             state.reload_rows_shown_at = Some(now);
@@ -1509,8 +1680,51 @@ impl App {
             }
         }
 
-        self.search_shown_rows_again();
-        replaced
+        match tail_rows {
+            Some(replaced) => self.update_matches_in_tail(&replaced),
+            None => self.search_shown_rows_again(),
+        }
+        released
+    }
+
+    /// Update the shown matches, a finished search's, in the rows a tail
+    /// `replaced`: the selected match stays when it starts above them, and
+    /// otherwise the first match at or below the top row is selected, as
+    /// after a whole render's search. A tail of more than
+    /// [`TAIL_ROWS_SEARCHED_WHILE_DRAWING`] rows sends the search of the
+    /// shown rows to `viewer-search`, and its matches arrive with the same
+    /// selection. While a search is pending, the rows are searched again.
+    fn update_matches_in_tail(&mut self, replaced: &ReplacedRows) {
+        let AppMode::View(state) = &mut self.app_mode else {
+            return;
+        };
+        if !state.shows_finished_search() {
+            return self.search_shown_rows_again();
+        }
+        let selected_above_tail = Some(state.current_match_index).filter(|&selected| {
+            state
+                .search_matches
+                .get(selected)
+                .is_some_and(|found| found.first_row() < replaced.old.start)
+        });
+        if replaced.new_len > TAIL_ROWS_SEARCHED_WHILE_DRAWING {
+            state.search_matches.clear();
+            let arrival = match selected_above_tail {
+                Some(selected) => MatchesArrival::KeepsSelected { selected },
+                None => MatchesArrival::InPlace,
+            };
+            return self.send_view_search(arrival, false);
+        }
+        update_matches_in_replaced_rows(
+            &mut state.search_matches,
+            &state.rendered_lines,
+            &state.search_query,
+            replaced,
+        );
+        if selected_above_tail.is_none() {
+            state.current_match_index =
+                first_match_at_or_below(&state.search_matches, state.scroll_offset);
+        }
     }
 
     /// Search the query again over new rows, without the pause: the old
@@ -1532,7 +1746,7 @@ impl App {
                 ..
             }) => self.send_query_search(closes_without_matches),
             Some(PendingViewSearch::Running {
-                arrival: MatchesArrival::InPlace,
+                arrival: MatchesArrival::InPlace | MatchesArrival::KeepsSelected { .. },
                 closes_without_matches,
                 ..
             }) => self.send_rerender_search(closes_without_matches),
@@ -2169,7 +2383,13 @@ impl App {
         };
         state.frame_width = frame_width;
         let options = state.render_options(today, zone);
-        request_render(&mut self.viewer_render, state, options, now);
+        request_render(
+            &mut self.viewer_render,
+            state,
+            options,
+            RowsToRender::Whole,
+            now,
+        );
     }
 }
 
@@ -2211,17 +2431,29 @@ impl FocusDrift {
 }
 
 /// Ask `worker`, the `viewer-render` thread, started by the first request,
-/// for a render of `state`'s conversation with `options`, made at `now`,
-/// superseding the running render.
+/// for a render of the rows `rows_to_render` selects of `state`'s
+/// conversation with `options`, made at `now`, superseding the running
+/// render.
 fn request_render(
     worker: &mut Option<super::viewer_render::ViewerRenderWorker>,
     state: &mut ViewState,
     options: RenderOptions,
+    rows_to_render: RowsToRender,
     now: crate::clock::Moment,
 ) {
     let generation = worker
         .get_or_insert_with(super::viewer_render::ViewerRenderWorker::spawn)
-        .render(Arc::clone(&state.parsed_conversation), options);
+        .render(
+            Arc::clone(&state.parsed_conversation),
+            options,
+            rows_to_render,
+        );
+    debug_assert!(
+        rows_to_render == RowsToRender::Whole
+            || (state.entries_to_render_again.is_empty()
+                && state.run_outputs_to_render_again.is_empty()),
+        "a tail is requested while no message waits to render again"
+    );
     // The render has every expanded output in its options.
     state.entries_to_render_again.clear();
     state.run_outputs_to_render_again.clear();

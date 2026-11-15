@@ -1145,11 +1145,7 @@ impl App {
     /// End the pending open with `rendered`, its rows: show its viewer with
     /// them, `viewport_height` rows high, then follow the finished refreshes
     /// the list has not applied yet.
-    fn finish_open(
-        &mut self,
-        viewport_height: usize,
-        rendered: crate::tui::viewer::RenderedConversation,
-    ) {
+    fn finish_open(&mut self, viewport_height: usize, rendered: viewer_render::Rendered) {
         if let Some(state) = self.take_opening_view() {
             self.app_mode = AppMode::View(*state);
         }
@@ -1316,6 +1312,9 @@ mod viewer_render_tests;
 
 #[cfg(test)]
 mod viewer_search_tests;
+
+#[cfg(test)]
+mod viewer_tail_tests;
 
 #[cfg(test)]
 mod shown_name_tests;

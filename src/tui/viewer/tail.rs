@@ -1,44 +1,143 @@
-//! The start of a render of a conversation's tail after a refresh of a
-//! session with new messages: the first entry of a message the shown rows
-//! contain before the change, early enough that no row before it changes.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the viewer's reload doesn't render a tail yet")
-)]
+//! A render of a conversation's tail after a refresh of the open session.
+//! The tail starts at the first entry of a message the shown rows contain
+//! before the first changed entry, early enough that no row before it
+//! changes. Its rows replace the shown rows from the start on.
 
 use std::collections::HashSet;
 
+use crate::history::sqlite_cache::EntryHashes;
 use crate::log_entry::{ContentBlock, LogEntry};
 
 use super::days::DayLabels;
+use super::rerender::{ReplacedRows, SPARE_ROWS_AFTER_GROWTH, ShownRows};
 use super::roster::RosterChanges;
-use super::{MessageRange, ParsedConversation, RenderOptions, RenderableEntry, session_agent};
+use super::{
+    CallRange, MessageRange, ParsedConversation, RenderOptions, RenderableEntry,
+    RenderedConversation, RenderedLine, session_agent,
+};
 
 /// The rows the viewer shows of a conversation: the conversation, the
 /// message ranges of its render, and the options the render drew them with.
-pub(super) struct ShownRender<'a> {
-    pub(super) conversation: &'a ParsedConversation,
-    pub(super) messages: &'a [MessageRange],
-    pub(super) options: &'a RenderOptions,
+pub(crate) struct ShownRender<'a> {
+    pub(crate) conversation: &'a ParsedConversation,
+    pub(crate) messages: &'a [MessageRange],
+    pub(crate) options: &'a RenderOptions,
 }
 
 /// The first entry a render of a conversation's tail renders, and the row
 /// of the shown rows its first row replaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct TailStart {
-    pub(super) entry_index: usize,
-    pub(super) row: usize,
+pub(crate) struct TailStart {
+    pub(crate) entry_index: usize,
+    pub(crate) row: usize,
 }
 
-/// The render of a changed conversation after the shown rows of an earlier
-/// copy.
+/// The rows a render of a conversation draws for the viewer: its tail after
+/// the shown rows of an earlier copy, or every entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TailRender {
+pub(crate) enum RowsToRender {
     /// Render the entries from the start's entry on, in place of the shown
     /// rows from its row on.
     Tail(TailStart),
     /// Render the whole conversation again.
     Whole,
+}
+
+/// [`tail_render_start`] for `conversation`, a newer read of the shown
+/// conversation, from the first entry whose hash in `hashes` differs from
+/// the shown copy's `shown_hashes`. A read whose entries are equal renders
+/// the last shown message again. The whole conversation renders again when
+/// either read has another count of hashes than of entries.
+pub(crate) fn tail_after_read(
+    shown: ShownRender<'_>,
+    shown_hashes: &EntryHashes,
+    conversation: &ParsedConversation,
+    hashes: &EntryHashes,
+    options: &RenderOptions,
+) -> RowsToRender {
+    if shown_hashes.len() != shown.conversation.origins.len()
+        || hashes.len() != conversation.origins.len()
+    {
+        return RowsToRender::Whole;
+    }
+    let first_changed = shown_hashes.first_change_in(hashes).unwrap_or(hashes.len());
+    tail_render_start(shown, conversation, first_changed, options)
+}
+
+/// The shown rows a tail replaced: their range with the tail's row count,
+/// and the rows themselves.
+pub(crate) struct SplicedTail {
+    pub(crate) replaced: ReplacedRows,
+    pub(crate) removed: Vec<RenderedLine>,
+}
+
+/// Put `tail`, a tail's render counted from its first row, in place of
+/// `shown`'s rows from `row` on, and its messages and calls, moved down by
+/// `row`, in place of those starting at or after `row`.
+///
+/// The row records before `row` stay where they are while the capacity
+/// allows, and gain spare room when it doesn't, as a message rendered again
+/// in place does. The tail's connectors are drawn over its own rows: no kept
+/// call reaches `row` (see [`tail_render_start`]).
+pub(crate) fn splice_tail(
+    shown: ShownRows<'_>,
+    tail: RenderedConversation,
+    row: usize,
+) -> SplicedTail {
+    let removed = shown.lines.split_off(row);
+    let replaced = ReplacedRows {
+        old: row..row + removed.len(),
+        new_len: tail.lines.len(),
+    };
+    if shown.lines.capacity() - shown.lines.len() < tail.lines.len() {
+        shown
+            .lines
+            .reserve_exact(tail.lines.len() + SPARE_ROWS_AFTER_GROWTH);
+    }
+    shown.lines.extend(tail.lines);
+
+    let kept = shown
+        .messages
+        .partition_point(|message| message.start_line < row);
+    shown.messages.truncate(kept);
+    shown
+        .messages
+        .extend(tail.messages.into_iter().map(|message| MessageRange {
+            start_line: message.start_line + row,
+            end_line: message.end_line + row,
+            ..message
+        }));
+
+    let kept = shown
+        .calls
+        .partition_point(|call| call.input.start_line < row);
+    shown.calls.truncate(kept);
+    shown.calls.extend(tail.calls.into_iter().map(|mut call| {
+        move_call_down(&mut call, row);
+        call
+    }));
+
+    let kept = shown
+        .detail_calls
+        .partition_point(|call| call.rows.input.start < row);
+    shown.detail_calls.truncate(kept);
+    shown
+        .detail_calls
+        .extend(tail.detail_calls.into_iter().map(|mut call| {
+            call.rows.input = call.rows.input.start + row..call.rows.input.end + row;
+            if let Some(result) = call.rows.result.as_mut() {
+                *result = result.start + row..result.end + row;
+            }
+            call
+        }));
+    SplicedTail { replaced, removed }
+}
+
+fn move_call_down(call: &mut CallRange, rows: usize) {
+    for area in std::iter::once(&mut call.input).chain(call.result.as_mut()) {
+        area.start_line += rows;
+        area.end_line += rows;
+    }
 }
 
 /// The render of `conversation` with `options` after `shown`, the rows of a
@@ -61,14 +160,14 @@ pub(super) fn tail_render_start(
     conversation: &ParsedConversation,
     first_changed: usize,
     options: &RenderOptions,
-) -> TailRender {
+) -> RowsToRender {
     let roster_changes = RosterChanges::between(&shown.conversation.roster, &conversation.roster);
     if shown.options != options
         || (options.tool_display.is_summary()
             && session_agent(&shown.conversation.entries) != session_agent(&conversation.entries))
         || roster_changes.relabels_shown_sub_agent()
     {
-        return TailRender::Whole;
+        return RowsToRender::Whole;
     }
     let entries = &conversation.entries;
     let kept = entries.partition_point(|parsed| parsed.entry_index < first_changed);
@@ -77,9 +176,9 @@ pub(super) fn tail_render_start(
     let Some((message, first)) =
         start_answering_every_call(&shown, conversation, first_changed, start_before)
     else {
-        return TailRender::Whole;
+        return RowsToRender::Whole;
     };
-    TailRender::Tail(TailStart {
+    RowsToRender::Tail(TailStart {
         entry_index: message.entry_index,
         row: message.start_line - day_label_rows_at(entries, first, options),
     })

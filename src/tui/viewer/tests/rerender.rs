@@ -56,7 +56,7 @@ impl Shown {
         }
     }
 
-    fn rows(&mut self) -> ShownRows<'_> {
+    pub(super) fn rows(&mut self) -> ShownRows<'_> {
         ShownRows {
             lines: &mut self.lines,
             messages: &mut self.messages,

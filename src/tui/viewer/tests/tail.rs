@@ -11,8 +11,11 @@ use super::rerender::{
 use super::*;
 use crate::history::Source;
 use crate::history::format::RecordLine;
+use crate::history::sqlite_cache::EntryHashes;
 use crate::log_entry::{ContentBlock, SubagentIdentity, UserContent};
-use crate::tui::viewer::tail::{ShownRender, TailRender, TailStart, tail_render_start};
+use crate::tui::viewer::tail::{
+    RowsToRender, ShownRender, TailStart, splice_tail, tail_after_read, tail_render_start,
+};
 
 /// The entries of `source`'s session at `file_path`, with the sub-agent
 /// transcripts `subagents`, as the viewer reads them from the cache once a
@@ -54,46 +57,21 @@ fn numbered_entries(conversation: &ParsedConversation) -> Vec<(usize, LogEntry)>
         .collect()
 }
 
-/// `shown`'s rows before `row`, then `tail`'s rows, ranges and calls moved
-/// down to follow them.
+/// `shown` with `tail` put in place of its rows from `row` on, as the
+/// viewer puts a tail in place.
 fn spliced(mut shown: Shown, tail: RenderedConversation, row: usize) -> Shown {
-    shown.lines.truncate(row);
-    shown.lines.extend(tail.lines);
-    let kept = shown
-        .messages
-        .partition_point(|message| message.start_line < row);
-    shown.messages.truncate(kept);
-    shown
-        .messages
-        .extend(tail.messages.into_iter().map(|message| MessageRange {
-            start_line: message.start_line + row,
-            end_line: message.end_line + row,
-            ..message
-        }));
-    let kept = shown
-        .calls
-        .partition_point(|call| call.input.start_line < row);
-    shown.calls.truncate(kept);
-    shown.calls.extend(tail.calls.into_iter().map(|mut call| {
-        for area in std::iter::once(&mut call.input).chain(call.result.as_mut()) {
-            area.start_line += row;
-            area.end_line += row;
-        }
-        call
-    }));
-    let kept = shown
-        .detail_calls
-        .partition_point(|call| call.rows.input.start < row);
-    shown.detail_calls.truncate(kept);
-    shown
-        .detail_calls
-        .extend(tail.detail_calls.into_iter().map(|mut call| {
-            call.rows.input = call.rows.input.start + row..call.rows.input.end + row;
-            if let Some(result) = call.rows.result.as_mut() {
-                *result = result.start + row..result.end + row;
-            }
-            call
-        }));
+    let old_len = shown.lines.len();
+    let tail_len = tail.lines.len();
+    let spliced = splice_tail(shown.rows(), tail, row);
+    assert_eq!(
+        (
+            spliced.replaced.old,
+            spliced.replaced.new_len,
+            spliced.removed.len()
+        ),
+        (row..old_len, tail_len, old_len - row),
+        "the tail replaces the shown rows from row {row} on"
+    );
     shown
 }
 
@@ -160,8 +138,8 @@ fn assert_change_renders_as_whole_render(
         };
         let start =
             match tail_render_start(shown_render, whole.conversation, first_changed, options) {
-                TailRender::Tail(start) => start,
-                TailRender::Whole => {
+                RowsToRender::Tail(start) => start,
+                RowsToRender::Whole => {
                     starts.wholes += 1;
                     continue;
                 }
@@ -246,7 +224,7 @@ fn assert_truncated_mode_tail_starts_at(
     );
     assert_eq!(
         start,
-        TailRender::Tail(TailStart {
+        RowsToRender::Tail(TailStart {
             entry_index,
             row: message.start_line,
         }),
@@ -899,6 +877,61 @@ fn transcript_cut_back_before_result_or_day_renders_as_whole_render() {
     }
 }
 
+/// The rows shown of the first three messages of four, and the tail of
+/// all four from the third message, in truncated mode.
+fn shown_rows_and_tail() -> (Shown, RenderedConversation, usize) {
+    let at = Some("2026-09-26T12:00:00Z");
+    let entries = numbered_entries(&conversation_of_records(&[
+        text("user", at, "Start the build."),
+        text("assistant", at, "The build runs."),
+        text("user", at, "Did it pass?"),
+        text("assistant", at, "It passed."),
+    ]));
+    let options = test_render_options(ToolDisplayMode::Truncated);
+    let shown = Shown::of(render_parsed_conversation(
+        &conversation_of_first(&entries, 3),
+        &options,
+    ));
+    let row = shown.messages[2].start_line;
+    let tail = render_tail_while(
+        &conversation_of_first(&entries, entries.len()),
+        &options,
+        2,
+        &|| true,
+    )
+    .expect("a render that keeps going finishes");
+    (shown, tail, row)
+}
+
+#[test]
+fn tail_put_in_place_keeps_kept_rows_where_they_are_while_capacity_allows() {
+    let (mut shown, tail, row) = shown_rows_and_tail();
+    shown.lines.reserve(tail.lines.len());
+    let kept_rows = shown.lines.as_ptr();
+
+    splice_tail(shown.rows(), tail, row);
+
+    assert_eq!(
+        shown.lines.as_ptr(),
+        kept_rows,
+        "the kept row records aren't copied while the rows have room for the tail"
+    );
+}
+
+#[test]
+fn tail_outgrowing_shown_rows_capacity_leaves_spare_rows() {
+    let (mut shown, tail, row) = shown_rows_and_tail();
+    shown.lines.shrink_to_fit();
+
+    splice_tail(shown.rows(), tail, row);
+
+    let spare = shown.lines.capacity() - shown.lines.len();
+    assert!(
+        spare >= crate::tui::viewer::rerender::SPARE_ROWS_AFTER_GROWTH,
+        "the rows the tail outgrew gain spare room for later growth: {spare}"
+    );
+}
+
 #[test]
 fn other_options_than_shown_rows_render_whole() {
     let conversation = interleaved_calls_across_a_day();
@@ -917,7 +950,7 @@ fn other_options_than_shown_rows_render_whole() {
         )
     };
     assert!(
-        matches!(start(&shown_options), TailRender::Tail(_)),
+        matches!(start(&shown_options), RowsToRender::Tail(_)),
         "the shown rows' options render a tail"
     );
 
@@ -989,8 +1022,73 @@ fn other_options_than_shown_rows_render_whole() {
     for (field, options) in &other_options {
         assert_eq!(
             start(options),
-            TailRender::Whole,
+            RowsToRender::Whole,
             "another {field} than the shown rows' renders whole"
         );
     }
+}
+
+/// A Claude Code session of three prompts read, then read again with a
+/// fourth: the shown copy paired with the later read's hashes has one hash
+/// more than its entries, and the later read paired with the shown copy's
+/// has one fewer.
+#[test]
+fn read_with_other_count_of_hashes_than_entries_renders_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let write_prompts = |count: usize| {
+        let prompts: String = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": format!("2026-09-26T12:00:0{index}Z"),
+                    "message": {"role": "user", "content": format!("prompt {index}")}
+                })
+                .to_string()
+                    + "\n"
+            })
+            .collect();
+        std::fs::write(&path, prompts).unwrap();
+    };
+    write_prompts(3);
+    let (shown, changed, _) = copies_around(Source::Claude, &path, &[], || write_prompts(4));
+    assert_eq!(
+        (shown.entry_hashes.len(), changed.entry_hashes.len()),
+        (3, 4),
+        "each read holds one hash per prompt"
+    );
+    let options = test_render_options(ToolDisplayMode::Truncated);
+    let shown_rows = render_parsed_conversation(&shown.conversation, &options);
+    let rows_after = |shown_hashes: &EntryHashes, hashes: &EntryHashes| {
+        let shown_render = ShownRender {
+            conversation: &shown.conversation,
+            messages: &shown_rows.messages,
+            options: &options,
+        };
+        tail_after_read(
+            shown_render,
+            shown_hashes,
+            &changed.conversation,
+            hashes,
+            &options,
+        )
+    };
+
+    assert!(
+        matches!(
+            rows_after(&shown.entry_hashes, &changed.entry_hashes),
+            RowsToRender::Tail(_)
+        ),
+        "the reads with their own hashes render a tail"
+    );
+    assert_eq!(
+        rows_after(&changed.entry_hashes, &changed.entry_hashes),
+        RowsToRender::Whole,
+        "the shown copy with one hash more than its entries renders whole"
+    );
+    assert_eq!(
+        rows_after(&shown.entry_hashes, &shown.entry_hashes),
+        RowsToRender::Whole,
+        "the later read with one hash fewer than its entries renders whole"
+    );
 }

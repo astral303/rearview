@@ -33,6 +33,10 @@
   - While a session opens, the list's bottom bar now shows a spinner and,
     from one second on, the seconds since open (`Enter`) or the click
     (`⠋ Opening… 3s`).
+- Show new messages about 3x sooner after a refresh (`Ctrl+R`) or an
+  automatic refresh of the open session in full mode (`tools·all`) (on one
+  large example session). A long session in full mode gains the most; a
+  short session, or summary mode (`tools·sum`), gains little.
 - Speed up the viewer's search (`/`) about 3–3.7x in full mode (`tools·all`)
   and about 2.3–2.9x in summary mode (on one example session).
 - Show an expanded or collapsed tool output, task report, sub-agent's reply

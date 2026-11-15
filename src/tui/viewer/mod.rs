@@ -37,13 +37,15 @@ pub(crate) use days::{session_dates, short_date};
 pub use output::{LineStyle, RenderedLine};
 pub use relocation::EntryRelocation;
 pub use rerender::{
-    MessageInPlace, ShownRows, entry_rendering_alone, message_showing, render_message_in_place,
+    MessageInPlace, ReplacedRows, ShownRows, entry_rendering_alone, message_showing,
+    render_message_in_place,
 };
 pub(crate) use roster::SubagentRoster;
 #[cfg(test)]
 pub use search_rows::find_matches;
 pub use search_rows::{SearchMatch, find_matches_while, update_matches_in_replaced_rows};
 pub(crate) use summary::format_coarse_duration;
+pub(crate) use tail::{RowsToRender, ShownRender, splice_tail, tail_after_read};
 
 use calls::{CallRanges, Lanes, top_level_tool_blocks};
 use days::DayLabels;
@@ -129,7 +131,7 @@ impl ToolDisplayMode {
 }
 
 /// Options for rendering a conversation
-#[derive(PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderOptions {
     pub tool_display: ToolDisplayMode,
     pub show_thinking: bool,
@@ -370,10 +372,6 @@ pub fn day_at_line(
 pub struct ViewedConversation {
     pub conversation: ParsedConversation,
     /// By `entry_index`: two reads' hashes show the first changed entry.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the viewer's reload doesn't compare copies yet")
-    )]
     pub entry_hashes: crate::history::sqlite_cache::EntryHashes,
     /// `None` when the cache no longer lists the copy.
     pub row: Option<Box<crate::history::Conversation>>,
@@ -490,10 +488,6 @@ pub fn render_parsed_conversation_while(
 ///
 /// Calls `keep_going` as [`render_parsed_conversation_while`] does; `None`
 /// once it returns false.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the viewer's reload doesn't render a tail yet")
-)]
 pub fn render_tail_while(
     conversation: &ParsedConversation,
     options: &RenderOptions,

@@ -18,10 +18,6 @@ use std::collections::HashMap;
 pub(crate) struct EntryHashes(Vec<i64>);
 
 impl EntryHashes {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the viewer's reload doesn't compare copies yet")
-    )]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
@@ -29,10 +25,6 @@ impl EntryHashes {
     /// The index of the first entry that differs in `newer`: the shorter
     /// list's length when one list extends the other, `None` when the lists
     /// are equal.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the viewer's reload doesn't compare copies yet")
-    )]
     pub(crate) fn first_change_in(&self, newer: &Self) -> Option<usize> {
         self.0
             .iter()
