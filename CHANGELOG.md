@@ -30,6 +30,9 @@
 - Open a large session about 2.5x faster (on one example corpus), and keep the
   list and its search drawing while it opens. Reading an open session again
   after a refresh no longer freezes the viewer.
+  - While a session opens, the list's bottom bar now shows a spinner and,
+    from one second on, the seconds since open (`Enter`) or the click
+    (`⠋ Opening… 3s`).
 - Speed up the viewer's search (`/`) about 3–3.7x in full mode (`tools·all`)
   and about 2.3–2.9x in summary mode (on one example session).
 - Show an expanded or collapsed tool output, task report, sub-agent's reply

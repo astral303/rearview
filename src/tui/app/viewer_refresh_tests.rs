@@ -6,7 +6,9 @@ use super::commit_failure_tests::launched_app;
 use super::refresh_tests::{refresh_found, run_session_refresh, serve_session_refresh};
 use super::session_store::ReadCause;
 use super::test_waits::ConnectionGate;
-use super::viewer_render_tests::{Gate, Seen, focused_call_id, gated_worker, press_now};
+use super::viewer_render_tests::{
+    Gate, Seen, advance_open_to_its_render, focused_call_id, gated_list, gated_worker, press_now,
+};
 use super::*;
 use crate::clock::TestClock;
 use crate::history::environment::test_support::test_environment;
@@ -510,6 +512,119 @@ fn open_of_session_whose_pending_refresh_wrote_its_copy_renders_once() {
         app.open_session_status(),
         None,
         "the viewer stops showing the session as updating"
+    );
+}
+
+/// The open's render let through `gate`, then the viewer once it shows.
+fn finish_open_through(app: &mut App, gate: &Gate) {
+    gate.let_one_through();
+    assert!(test_waits::finish_pending_open(app, 80));
+}
+
+#[test]
+fn refresh_of_unchanged_session_finishing_during_opens_render_doesnt_render_again() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let (mut app, gate) = gated_list(&home, Arc::new(TestClock::default()));
+    write_messages(&path, &numbered(0..5));
+    app.record_next_step(&path, crate::history::NextStep::CacheInBackground);
+    let outcome = run_session_refresh(&mut app);
+    assert!(app.request_open());
+    advance_open_to_its_render(&mut app);
+    gate.next_render();
+
+    app.finish_refresh(outcome);
+    finish_open_through(&mut app, &gate);
+
+    assert!(
+        view_text(&app).contains("message 4"),
+        "the open shows the copy the refresh wrote"
+    );
+    assert!(
+        reads_and_renders_nothing(&app) && !gate.took_waiting_render(),
+        "the refresh's outcome doesn't read or render that copy again"
+    );
+    assert_eq!(
+        app.open_session_status(),
+        None,
+        "the viewer doesn't show the session as updating"
+    );
+}
+
+#[test]
+fn refresh_of_session_with_new_messages_finishing_during_opens_render_shows_them_after() {
+    let home = ClaudeHome::new();
+    let path = home.transcript("session");
+    write_messages(&path, &numbered(0..3));
+    let (mut app, gate) = gated_list(&home, Arc::new(TestClock::default()));
+    assert!(app.request_open());
+    advance_open_to_its_render(&mut app);
+    gate.next_render();
+
+    write_messages(&path, &numbered(0..5));
+    app.record_next_step(&path, crate::history::NextStep::CacheInBackground);
+    serve_session_refresh(&mut app);
+    finish_open_through(&mut app, &gate);
+    let opened = view_text(&app);
+    assert!(
+        app.complete_pending_view_refresh(test_waits::VIEWER_READ_LANDS),
+        "the viewer reads the refreshed copy once the open shows"
+    );
+    gate.next_render();
+    gate.let_one_through();
+    test_waits::finish_view_render(&mut app, VIEWPORT);
+
+    assert!(
+        opened.contains("message 2") && !opened.contains("message 4"),
+        "the open shows the copy it read: {opened}"
+    );
+    assert!(
+        view_text(&app).contains("message 4"),
+        "the newest messages show after the open"
+    );
+}
+
+#[test]
+fn open_of_session_gone_during_its_render_ends_on_list_and_next_open_shows_its_session() {
+    let home = ClaudeHome::new();
+    let gone = home.transcript("gone");
+    write_messages(&gone, &numbered(0..3));
+    let kept = home.transcript("kept");
+    write_messages(&kept, &numbered(10..12));
+    let (mut app, gate) = gated_list(&home, Arc::new(TestClock::default()));
+    app.selected = app
+        .filtered()
+        .iter()
+        .position(|&index| app.conversations()[index].path == gone);
+    assert!(app.request_open());
+    advance_open_to_its_render(&mut app);
+    gate.next_render();
+
+    std::fs::remove_file(&gone).unwrap();
+    app.record_next_step(&gone, crate::history::NextStep::CacheInBackground);
+    serve_session_refresh(&mut app);
+    finish_open_through(&mut app, &gate);
+
+    assert!(
+        matches!(app.app_mode(), AppMode::List),
+        "the open of the gone session ends on the list"
+    );
+    assert_eq!(status_text(&app), Some("Session not found"));
+    app.apply_finished_refresh();
+    app.selected = Some(0);
+    assert!(app.request_open());
+    advance_open_to_its_render(&mut app);
+    gate.next_render();
+    finish_open_through(&mut app, &gate);
+    assert_eq!(
+        view(&app).conversation_path,
+        kept,
+        "the next open shows its own session"
+    );
+    assert!(
+        view_text(&app).contains("message 10"),
+        "the next open shows its session's messages"
     );
 }
 
