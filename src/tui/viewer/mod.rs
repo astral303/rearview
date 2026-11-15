@@ -45,7 +45,7 @@ pub(crate) use roster::SubagentRoster;
 pub use search_rows::find_matches;
 pub use search_rows::{SearchMatch, find_matches_while, update_matches_in_replaced_rows};
 pub(crate) use summary::format_coarse_duration;
-pub(crate) use tail::{RowsToRender, ShownRender, splice_tail, tail_after_read};
+pub(crate) use tail::{RowsToRender, ShownCopy, splice_tail, tail_after_read};
 
 use calls::{CallRanges, Lanes, top_level_tool_blocks};
 use days::DayLabels;

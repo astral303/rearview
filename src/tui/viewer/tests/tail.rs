@@ -14,7 +14,7 @@ use crate::history::format::RecordLine;
 use crate::history::sqlite_cache::EntryHashes;
 use crate::log_entry::{ContentBlock, SubagentIdentity, UserContent};
 use crate::tui::viewer::tail::{
-    RowsToRender, ShownRender, TailStart, splice_tail, tail_after_read, tail_render_start,
+    RowsToRender, ShownCopy, TailStart, splice_tail, tail_after_read, tail_render_start,
 };
 
 /// The entries of `source`'s session at `file_path`, with the sub-agent
@@ -131,11 +131,12 @@ fn assert_change_renders_as_whole_render(
     let mut starts = Starts::default();
     for (modes, options, whole_render) in &whole.renders {
         let shown = Shown::of(render_parsed_conversation(shown_conversation, options));
-        let shown_render = ShownRender {
+        let shown_render = ShownCopy {
             conversation: shown_conversation,
             messages: &shown.messages,
             options,
-        };
+        }
+        .changed_from(first_changed);
         let start =
             match tail_render_start(shown_render, whole.conversation, first_changed, options) {
                 RowsToRender::Tail(start) => start,
@@ -213,11 +214,12 @@ fn assert_truncated_mode_tail_starts_at(
         .find(|message| message.entry_index == entry_index)
         .unwrap_or_else(|| panic!("a shown message starts at entry {entry_index}"));
     let start = tail_render_start(
-        ShownRender {
+        ShownCopy {
             conversation: shown_conversation,
             messages: &shown.messages,
             options: &options,
-        },
+        }
+        .changed_from(first_changed),
         conversation,
         first_changed,
         &options,
@@ -937,15 +939,17 @@ fn other_options_than_shown_rows_render_whole() {
     let conversation = interleaved_calls_across_a_day();
     let shown_options = test_render_options(ToolDisplayMode::Truncated);
     let shown = render_parsed_conversation(&conversation, &shown_options);
+    let first_changed = conversation.entries.len() - 1;
     let start = |options: &RenderOptions| {
         tail_render_start(
-            ShownRender {
+            ShownCopy {
                 conversation: &conversation,
                 messages: &shown.messages,
                 options: &shown_options,
-            },
+            }
+            .changed_from(first_changed),
             &conversation,
-            conversation.entries.len() - 1,
+            first_changed,
             options,
         )
     };
@@ -1060,7 +1064,7 @@ fn read_with_other_count_of_hashes_than_entries_renders_whole() {
     let options = test_render_options(ToolDisplayMode::Truncated);
     let shown_rows = render_parsed_conversation(&shown.conversation, &options);
     let rows_after = |shown_hashes: &EntryHashes, hashes: &EntryHashes| {
-        let shown_render = ShownRender {
+        let shown_render = ShownCopy {
             conversation: &shown.conversation,
             messages: &shown_rows.messages,
             options: &options,

@@ -12,9 +12,9 @@ use crate::tui::ui;
 use crate::tui::viewer::{
     CallArea, CallRange, EntryRelocation, MessageInPlace, MessageRange, ParsedConversation,
     RenderOptions, RenderedConversation, RenderedLine, ReplacedRows, RowsToRender, SearchMatch,
-    ShownRender, ShownRows, ToolOutputId, ViewedConversation, entry_rendering_alone,
-    message_showing, parse_conversation_file_interactively, render_message_in_place, splice_tail,
-    tail_after_read, update_matches_in_replaced_rows,
+    ShownCopy, ShownRows, ToolOutputId, ViewedConversation, entry_rendering_alone, message_showing,
+    parse_conversation_file_interactively, render_message_in_place, splice_tail, tail_after_read,
+    update_matches_in_replaced_rows,
 };
 use ratatui::prelude::*;
 use std::collections::BTreeSet;
@@ -182,7 +182,7 @@ impl ViewState {
             && self.run_outputs_to_render_again.is_empty();
         match (&self.entry_hashes, entry_hashes, &self.rows_options) {
             (Some(shown_hashes), Some(hashes), Some(rows_options)) if are_rows_current => {
-                let shown = ShownRender {
+                let shown = ShownCopy {
                     conversation: &self.parsed_conversation,
                     messages: &self.message_ranges,
                     options: rows_options,

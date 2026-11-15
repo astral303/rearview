@@ -14,10 +14,16 @@ pub struct EntryRelocation {
 
 impl EntryRelocation {
     pub fn between(earlier: &ParsedConversation, later: &ParsedConversation) -> Self {
+        Self::of_origins(earlier.origins.clone(), &later.origins)
+    }
+
+    /// The relocation from a read whose entries have the origins `earlier`
+    /// into a read whose entries have the origins `later`, each list in
+    /// entry order.
+    fn of_origins(earlier: Vec<EntryOrigin>, later: &[EntryOrigin]) -> Self {
         Self {
-            earlier: earlier.origins.clone(),
+            earlier,
             later: later
-                .origins
                 .iter()
                 .cloned()
                 .enumerate()

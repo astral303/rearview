@@ -10,7 +10,7 @@ use crate::log_entry::{ContentBlock, LogEntry};
 
 use super::days::DayLabels;
 use super::rerender::{ReplacedRows, SPARE_ROWS_AFTER_GROWTH, ShownRows};
-use super::roster::RosterChanges;
+use super::roster::{RosterChanges, SubagentRoster};
 use super::{
     CallRange, MessageRange, ParsedConversation, RenderOptions, RenderableEntry,
     RenderedConversation, RenderedLine, session_agent,
@@ -18,10 +18,38 @@ use super::{
 
 /// The rows the viewer shows of a conversation: the conversation, the
 /// message ranges of its render, and the options the render drew them with.
-pub(crate) struct ShownRender<'a> {
+pub(crate) struct ShownCopy<'a> {
     pub(crate) conversation: &'a ParsedConversation,
     pub(crate) messages: &'a [MessageRange],
     pub(crate) options: &'a RenderOptions,
+}
+
+impl<'a> ShownCopy<'a> {
+    /// The shown rows before a newer copy, changed from the entry numbered
+    /// `first_changed` on.
+    pub(super) fn changed_from(&self, first_changed: usize) -> ShownRender<'a> {
+        let entries = &self.conversation.entries;
+        let kept = entries.partition_point(|parsed| parsed.entry_index < first_changed);
+        ShownRender {
+            replaced: &entries[kept..],
+            roster: &self.conversation.roster,
+            messages: self.messages,
+            options: self.options,
+        }
+    }
+}
+
+/// The rows the viewer shows of an earlier copy of a conversation, and the
+/// values of that copy the newer copy doesn't have: its entries from the
+/// first changed entry on, and its roster. The entries before the first
+/// changed entry are the newer copy's.
+pub(crate) struct ShownRender<'a> {
+    pub(super) replaced: &'a [RenderableEntry],
+    pub(super) roster: &'a SubagentRoster,
+    /// The message ranges of the shown rows.
+    pub(super) messages: &'a [MessageRange],
+    /// The options the shown rows were rendered with.
+    pub(super) options: &'a RenderOptions,
 }
 
 /// The first entry a render of a conversation's tail renders, and the row
@@ -49,7 +77,7 @@ pub(crate) enum RowsToRender {
 /// the last shown message again. The whole conversation renders again when
 /// either read has another count of hashes than of entries.
 pub(crate) fn tail_after_read(
-    shown: ShownRender<'_>,
+    shown: ShownCopy<'_>,
     shown_hashes: &EntryHashes,
     conversation: &ParsedConversation,
     hashes: &EntryHashes,
@@ -61,7 +89,12 @@ pub(crate) fn tail_after_read(
         return RowsToRender::Whole;
     }
     let first_changed = shown_hashes.first_change_in(hashes).unwrap_or(hashes.len());
-    tail_render_start(shown, conversation, first_changed, options)
+    tail_render_start(
+        shown.changed_from(first_changed),
+        conversation,
+        first_changed,
+        options,
+    )
 }
 
 /// The shown rows a tail replaced: their range with the tail's row count,
@@ -141,7 +174,9 @@ fn move_call_down(call: &mut CallRange, rows: usize) {
 }
 
 /// The render of `conversation` with `options` after `shown`, the rows of a
-/// copy with the same entries before the one numbered `first_changed`.
+/// copy with the same entries before the one numbered `first_changed`. The
+/// session agent the shown rows borrowed is the first that the entries before
+/// the first changed entry name, or else the first of the replaced entries.
 ///
 /// The start is the first entry of the last message shown before the first
 /// changed entry, then of an earlier message while a row before it reads a
@@ -161,16 +196,17 @@ pub(super) fn tail_render_start(
     first_changed: usize,
     options: &RenderOptions,
 ) -> RowsToRender {
-    let roster_changes = RosterChanges::between(&shown.conversation.roster, &conversation.roster);
+    let roster_changes = RosterChanges::between(shown.roster, &conversation.roster);
+    let entries = &conversation.entries;
+    let kept = entries.partition_point(|parsed| parsed.entry_index < first_changed);
+    let shown_session_agent =
+        session_agent(&entries[..kept]).or_else(|| session_agent(shown.replaced));
     if shown.options != options
-        || (options.tool_display.is_summary()
-            && session_agent(&shown.conversation.entries) != session_agent(&conversation.entries))
+        || (options.tool_display.is_summary() && shown_session_agent != session_agent(entries))
         || roster_changes.relabels_shown_sub_agent()
     {
         return RowsToRender::Whole;
     }
-    let entries = &conversation.entries;
-    let kept = entries.partition_point(|parsed| parsed.entry_index < first_changed);
     let start_before = first_roster_reader(&roster_changes, &entries[..kept])
         .map_or(first_changed, |reader| reader.entry_index + 1);
     let Some((message, first)) =
@@ -207,10 +243,8 @@ fn start_answering_every_call<'a>(
     mut start_before: usize,
 ) -> Option<(&'a MessageRange, usize)> {
     let entries = &conversation.entries;
-    let shown_entries = &shown.conversation.entries;
     let kept = entries.partition_point(|parsed| parsed.entry_index < first_changed);
-    let shown_kept = shown_entries.partition_point(|parsed| parsed.entry_index < first_changed);
-    let mut later_results = LaterResults::of(&shown_entries[shown_kept..], &entries[kept..]);
+    let mut later_results = LaterResults::of(shown.replaced, &entries[kept..]);
     let mut results_from = kept;
     loop {
         let message = shown
