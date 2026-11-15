@@ -1179,18 +1179,29 @@ impl App {
     /// Show the open session again once its refresh finished: render it once
     /// the read of its copy arrives within `wait`, or the file opened
     /// directly as parsed. A newer refresh's row queued behind the read
-    /// starts its own read once the rows of this one show. True when the read
-    /// arrived, so the caller draws next.
+    /// starts its own read once the rows of this one show. A tail waiting
+    /// for a render to free the shown conversation is put in place once the
+    /// conversation is free. True when the read arrived or the waiting tail
+    /// was put in place, so the caller draws next.
     pub fn complete_pending_view_refresh(&mut self, wait: Duration) -> bool {
         let Some(reload) = self.pending_view_reload.take() else {
             return false;
         };
         match reload.finish(wait) {
-            Ok(((reloaded, read), queued)) => {
-                self.pending_view_reload = queued.map(view_state::PendingReload::Queued);
-                self.reload_open_session(reloaded, read);
+            Ok(ready) => {
+                self.pending_view_reload = ready.queued.map(view_state::PendingReload::Queued);
+                let draws_next = match ready.arrived {
+                    view_state::ArrivedReload::Read(read) => {
+                        let (reloaded, read) = *read;
+                        self.reload_open_session(reloaded, read);
+                        true
+                    }
+                    view_state::ArrivedReload::WaitingTail(tail) => {
+                        self.show_reloaded_conversation(tail)
+                    }
+                };
                 self.start_or_show_queued_reload();
-                true
+                draws_next
             }
             Err(reload) => {
                 self.pending_view_reload = Some(reload);
@@ -1204,6 +1215,14 @@ impl App {
         self.pending_view_reload
             .as_ref()
             .is_some_and(view_state::PendingReload::is_reading)
+    }
+
+    /// True while a tail of the open session's reload waits for a render to
+    /// free the shown conversation.
+    pub fn is_tail_waiting_for_conversation(&self) -> bool {
+        self.pending_view_reload
+            .as_ref()
+            .is_some_and(view_state::PendingReload::is_waiting_to_extend)
     }
 
     /// Select the row a left-click landed on and ask to open it, as open

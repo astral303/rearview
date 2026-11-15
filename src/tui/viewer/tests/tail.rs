@@ -11,11 +11,34 @@ use super::rerender::{
 use super::*;
 use crate::history::Source;
 use crate::history::format::RecordLine;
-use crate::history::sqlite_cache::EntryHashes;
 use crate::log_entry::{ContentBlock, SubagentIdentity, UserContent};
 use crate::tui::viewer::tail::{
-    RowsToRender, ShownCopy, TailStart, splice_tail, tail_after_read, tail_render_start,
+    RowsToRender, ShownRender, TailStart, splice_tail, tail_render_start,
 };
+
+/// The rows of a whole render of a copy of a conversation: the copy, the
+/// render's message ranges and its options.
+struct ShownCopy<'a> {
+    conversation: &'a ParsedConversation,
+    messages: &'a [MessageRange],
+    options: &'a RenderOptions,
+}
+
+impl<'a> ShownCopy<'a> {
+    /// The shown rows before a newer copy, changed from the entry numbered
+    /// `first_changed` on, as an extension of the shown conversation leaves
+    /// them.
+    fn changed_from(&self, first_changed: usize) -> ShownRender<'a> {
+        let entries = &self.conversation.entries;
+        let kept = entries.partition_point(|parsed| parsed.entry_index < first_changed);
+        ShownRender {
+            replaced: &entries[kept..],
+            roster: &self.conversation.roster,
+            messages: self.messages,
+            options: self.options,
+        }
+    }
+}
 
 /// The entries of `source`'s session at `file_path`, with the sub-agent
 /// transcripts `subagents`, as the viewer reads them from the cache once a
@@ -1030,69 +1053,4 @@ fn other_options_than_shown_rows_render_whole() {
             "another {field} than the shown rows' renders whole"
         );
     }
-}
-
-/// A Claude Code session of three prompts read, then read again with a
-/// fourth: the shown copy paired with the later read's hashes has one hash
-/// more than its entries, and the later read paired with the shown copy's
-/// has one fewer.
-#[test]
-fn read_with_other_count_of_hashes_than_entries_renders_whole() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("session.jsonl");
-    let write_prompts = |count: usize| {
-        let prompts: String = (0..count)
-            .map(|index| {
-                serde_json::json!({
-                    "type": "user",
-                    "timestamp": format!("2026-09-26T12:00:0{index}Z"),
-                    "message": {"role": "user", "content": format!("prompt {index}")}
-                })
-                .to_string()
-                    + "\n"
-            })
-            .collect();
-        std::fs::write(&path, prompts).unwrap();
-    };
-    write_prompts(3);
-    let (shown, changed, _) = copies_around(Source::Claude, &path, &[], || write_prompts(4));
-    assert_eq!(
-        (shown.entry_hashes.len(), changed.entry_hashes.len()),
-        (3, 4),
-        "each read holds one hash per prompt"
-    );
-    let options = test_render_options(ToolDisplayMode::Truncated);
-    let shown_rows = render_parsed_conversation(&shown.conversation, &options);
-    let rows_after = |shown_hashes: &EntryHashes, hashes: &EntryHashes| {
-        let shown_render = ShownCopy {
-            conversation: &shown.conversation,
-            messages: &shown_rows.messages,
-            options: &options,
-        };
-        tail_after_read(
-            shown_render,
-            shown_hashes,
-            &changed.conversation,
-            hashes,
-            &options,
-        )
-    };
-
-    assert!(
-        matches!(
-            rows_after(&shown.entry_hashes, &changed.entry_hashes),
-            RowsToRender::Tail(_)
-        ),
-        "the reads with their own hashes render a tail"
-    );
-    assert_eq!(
-        rows_after(&changed.entry_hashes, &changed.entry_hashes),
-        RowsToRender::Whole,
-        "the shown copy with one hash more than its entries renders whole"
-    );
-    assert_eq!(
-        rows_after(&shown.entry_hashes, &shown.entry_hashes),
-        RowsToRender::Whole,
-        "the later read with one hash fewer than its entries renders whole"
-    );
 }

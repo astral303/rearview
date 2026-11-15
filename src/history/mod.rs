@@ -45,7 +45,7 @@ use std::path::PathBuf;
 // Re-export public API
 pub(crate) use content::SemanticContent;
 pub use display_entries::{
-    CopyTail, DisplayEntries, EntryOrigin, RecordedIdentity, RereadCopy,
+    DisplayEntries, EntryOrigin, RecordedIdentity, RereadCopy, ViewedCopy,
     display_log_entries_interactively, printed_log_entries, reread_copy_interactively,
     sniffed_display_log_entries, viewed_copy_interactively,
 };

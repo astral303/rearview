@@ -10,10 +10,12 @@ use crate::history::sqlite_cache::{AdoptedCopy, EntryHashes, Publication, Sessio
 use crate::history::{Conversation, InteractiveCache, InteractiveRead, Source};
 use crate::tui::ui;
 use crate::tui::viewer::{
-    CallArea, CallRange, EntryRelocation, MessageInPlace, MessageRange, ParsedConversation,
-    RenderOptions, RenderedConversation, RenderedLine, ReplacedRows, RowsToRender, SearchMatch,
-    ShownCopy, ShownRows, ToolOutputId, ViewedConversation, entry_rendering_alone, message_showing,
-    parse_conversation_file_interactively, render_message_in_place, splice_tail, tail_after_read,
+    CallArea, CallRange, ConversationTail, EntryRelocation, MessageInPlace, MessageRange,
+    ParsedConversation, RenderOptions, RenderedConversation, RenderedLine, ReplacedEntries,
+    ReplacedRows, RereadConversation, RowsToRender, SearchMatch, ShownRender, ShownRows,
+    ToolOutputId, ViewedConversation, entry_rendering_alone, message_showing,
+    parse_conversation_file_interactively, render_message_in_place,
+    reread_conversation_interactively, splice_tail, tail_render_start,
     update_matches_in_replaced_rows,
 };
 use ratatui::prelude::*;
@@ -129,7 +131,16 @@ impl ViewState {
     ) {
         self.parsed_conversation = conversation;
         self.shown_copy = copy;
-        self.entry_hashes = entry_hashes;
+        self.entry_hashes = entry_hashes.map(Arc::new);
+    }
+
+    /// The shown copy's entry hashes for a reload's read to compare with its
+    /// copy's; `None` when the view doesn't have them, or has another count
+    /// of them than of entries. The reload then reads the whole copy.
+    fn hashes_for_tail_read(&self) -> Option<Arc<EntryHashes>> {
+        self.entry_hashes
+            .clone()
+            .filter(|hashes| hashes.len() == self.parsed_conversation.entry_count())
     }
 
     /// Show `arrived` in place of the shown rows, its messages and calls in
@@ -163,32 +174,30 @@ impl ViewState {
         }
     }
 
-    /// The rows to render of `conversation`, a newer read of the shown
-    /// conversation with `entry_hashes`, with `options`: the tail
-    /// [`tail_after_read`] finds after the shown rows. The whole
-    /// conversation renders again when either read lacks hashes, and while
-    /// the shown rows are not a render of the shown conversation with the
-    /// options they record: before the first rows show, while a render is
-    /// pending, and while a message waits to render again in place.
-    fn rows_after_reread(
-        &self,
-        conversation: &ParsedConversation,
-        entry_hashes: Option<&EntryHashes>,
-        options: &RenderOptions,
-    ) -> RowsToRender {
+    /// The rows to render with `options` once a tail is put after the kept
+    /// entries of the conversation, in place of `replaced`: the tail
+    /// [`tail_render_start`] finds after the shown rows. The whole
+    /// conversation renders again while the shown rows are not a render of
+    /// the conversation before the tail with the options they record:
+    /// before the first rows show, while a render is pending, and while a
+    /// message waits to render again in place.
+    fn rows_after_tail(&self, replaced: &ReplacedEntries, options: &RenderOptions) -> RowsToRender {
         let are_rows_current = matches!(self.rows_read, RowsRead::Current)
             && self.pending_render.is_none()
             && self.entries_to_render_again.is_empty()
             && self.run_outputs_to_render_again.is_empty();
-        match (&self.entry_hashes, entry_hashes, &self.rows_options) {
-            (Some(shown_hashes), Some(hashes), Some(rows_options)) if are_rows_current => {
-                let shown = ShownCopy {
-                    conversation: &self.parsed_conversation,
-                    messages: &self.message_ranges,
-                    options: rows_options,
-                };
-                tail_after_read(shown, shown_hashes, conversation, hashes, options)
-            }
+        match &self.rows_options {
+            Some(rows_options) if are_rows_current => tail_render_start(
+                ShownRender::before(
+                    replaced,
+                    &self.parsed_conversation,
+                    &self.message_ranges,
+                    rows_options,
+                ),
+                &self.parsed_conversation,
+                replaced.first_changed(),
+                options,
+            ),
             _ => RowsToRender::Whole,
         }
     }
@@ -284,12 +293,30 @@ impl ArrivedRows {
     }
 }
 
-/// A reload's read of the open session: the conversation, the copy it was
-/// read from when the read found it current, and its entries' hashes.
-struct Reread {
-    conversation: Arc<ParsedConversation>,
+/// The entries of a [`RereadConversation`] as the view takes them, without
+/// the copy's entry hashes and catalogue row.
+enum ReloadedEntries {
+    /// Every entry, as a conversation that replaces the shown one.
+    Whole(Arc<ParsedConversation>),
+    /// The entries from the first changed entry on. The view puts them
+    /// after the entries it keeps of the shown conversation.
+    Tail(ConversationTail),
+}
+
+/// [`ReloadedEntries`] with the values the view shows with them: the
+/// identity and the entry hashes of the copy read, the header, and the
+/// session's id.
+pub(super) struct ReloadedConversation {
+    entries: ReloadedEntries,
+    /// The copy the entries were read from, when the read found it current.
     copy: Option<CopyIdentity>,
+    /// One hash per entry of that copy.
     entry_hashes: Option<EntryHashes>,
+    /// The refreshed row.
+    header: ReloadedHeader,
+    /// The catalogue row of the copy read.
+    copy_row: Option<Box<Conversation>>,
+    session_id: Option<String>,
 }
 
 /// The open session's refreshed row once its refresh is read again, with its
@@ -303,22 +330,29 @@ struct ReloadedHeader {
 
 /// The viewer's read of the open session, its next step recorded, or the
 /// file opened directly as parsed.
-struct ViewerCopy {
-    /// `None` when the copy is missing.
-    conversation: Option<Arc<ParsedConversation>>,
+struct ViewerCopy<C> {
+    /// The copy's entries as the read returned them: a conversation for an
+    /// open, [`ReloadedEntries`] for a reload. `None` when the copy is
+    /// missing.
+    entries: Option<C>,
     /// The catalogue row of the copy.
     row: Option<Box<Conversation>>,
     /// The copy the read adopted in the row's place.
     adopted: Option<AdoptedCopy>,
     /// The copy's identity, when the read found it current.
     identity: Option<CopyIdentity>,
-    /// One hash per entry of `conversation`, as [`ViewState::entry_hashes`]
+    /// One hash per entry of the copy, as [`ViewState::entry_hashes`]
     /// keeps them.
     entry_hashes: Option<EntryHashes>,
 }
 
-impl ViewerCopy {
-    fn of(copy: SessionCopy<ViewedConversation>) -> Self {
+impl<C> ViewerCopy<C> {
+    /// `copy`, a read's copy. `parts` separates it into its entries, one
+    /// hash per entry and its catalogue row.
+    fn of<V>(
+        copy: SessionCopy<V>,
+        parts: impl FnOnce(V) -> (C, EntryHashes, Option<Box<Conversation>>),
+    ) -> Self {
         let (viewed, adopted, is_current) = match copy {
             SessionCopy::Current(current) => {
                 let (viewed, adopted) = current.into_parts();
@@ -327,35 +361,38 @@ impl ViewerCopy {
             SessionCopy::Older(viewed) => (viewed, None, false),
             SessionCopy::Missing => return Self::missing(),
         };
+        let (conversation, entry_hashes, row) = parts(viewed);
         let identity = if is_current {
-            viewed.row.as_deref().and_then(CopyIdentity::of)
+            row.as_deref().and_then(CopyIdentity::of)
         } else {
             None
         };
         Self {
-            conversation: Some(Arc::new(viewed.conversation)),
-            row: viewed.row,
+            entries: Some(conversation),
+            row,
             adopted,
             identity,
-            entry_hashes: Some(viewed.entry_hashes),
-        }
-    }
-
-    /// The file opened directly, parsed into `conversation`.
-    fn parsed(conversation: Arc<ParsedConversation>) -> Self {
-        Self {
-            conversation: Some(conversation),
-            ..Self::missing()
+            entry_hashes: Some(entry_hashes),
         }
     }
 
     fn missing() -> Self {
         Self {
-            conversation: None,
+            entries: None,
             row: None,
             adopted: None,
             identity: None,
             entry_hashes: None,
+        }
+    }
+}
+
+impl ViewerCopy<ReloadedEntries> {
+    /// The file opened directly, parsed into `conversation`.
+    fn parsed(conversation: Arc<ParsedConversation>) -> Self {
+        Self {
+            entries: Some(ReloadedEntries::Whole(conversation)),
+            ..Self::missing()
         }
     }
 }
@@ -417,7 +454,38 @@ pub(super) type RowRead = (OpenedRow, Option<InteractiveRead<ViewedConversation>
 
 /// The open session's row as its finished refresh read it, with the viewer's
 /// read of its copy; `None` for a row without an address in the cache.
-pub(super) type ReloadRead = (ReloadedSession, Option<InteractiveRead<ViewedConversation>>);
+pub(super) type ReloadRead = (ReloadedSession, Option<ReloadedCopy>);
+
+/// A reload's read of the open session's copy before its next step is
+/// recorded: a [`RereadConversation`] with the hashes it was compared with.
+pub(super) struct ReloadedCopy {
+    reread: InteractiveRead<RereadConversation>,
+    /// The shown copy's entry hashes the read compared its copy's with;
+    /// `None` for a read of the whole copy without a comparison.
+    compared_with: Option<Arc<EntryHashes>>,
+}
+
+impl ReloadedCopy {
+    /// The copy `cache` keeps at `address` for a row whose publication is
+    /// `publication`: its tail after the entries equal to the shown copy's,
+    /// by `shown_hashes`, or the whole copy without them.
+    fn read(
+        cache: &InteractiveCache,
+        address: &SessionAddress,
+        publication: &Publication,
+        shown_hashes: Option<Arc<EntryHashes>>,
+    ) -> Self {
+        let reread = match &shown_hashes {
+            Some(shown) => reread_conversation_interactively(cache, address, publication, shown),
+            None => parse_conversation_file_interactively(cache, address, publication)
+                .map(|viewed| RereadConversation::Whole(Box::new(viewed))),
+        };
+        Self {
+            reread,
+            compared_with: shown_hashes,
+        }
+    }
+}
 
 impl ViewerRead<RowRead> {
     /// The viewer's read of `row`'s copy in `cache`.
@@ -475,15 +543,39 @@ pub(super) enum PendingReload {
         read: ViewerRead<ReloadRead>,
         queued: Option<Box<ReloadedSession>>,
     },
+    /// A read's tail that arrived while a render shared the shown
+    /// conversation. The view puts it after the entries it keeps on the
+    /// first pass when nothing else shares the conversation. A newer refresh
+    /// finishing meanwhile is `queued`.
+    WaitingToExtend {
+        tail: Box<ReloadedConversation>,
+        queued: Option<Box<ReloadedSession>>,
+    },
 }
 
-/// A reload whose read arrived, and the newer refresh's row to read once its
+/// A reload ready to show, and the newer refresh's row to read once its
 /// rows show.
-pub(super) type LandedReload = (ReloadRead, Option<Box<ReloadedSession>>);
+pub(super) struct ReadyReload {
+    pub(super) arrived: ArrivedReload,
+    pub(super) queued: Option<Box<ReloadedSession>>,
+}
+
+pub(super) enum ArrivedReload {
+    /// A read that arrived, or a file opened directly as parsed.
+    Read(Box<ReloadRead>),
+    /// A tail that waited for the shown conversation.
+    WaitingTail(Box<ReloadedConversation>),
+}
 
 impl PendingReload {
-    /// `reloaded`, reading its copy in `cache` when it has one.
-    fn start(reloaded: Box<ReloadedSession>, cache: InteractiveCache) -> Self {
+    /// `reloaded`, reading its copy in `cache` when it has one: the tail
+    /// after the entries equal to the shown copy's, by `shown_hashes`, or
+    /// the whole copy without them.
+    fn start(
+        reloaded: Box<ReloadedSession>,
+        cache: InteractiveCache,
+        shown_hashes: Option<Arc<EntryHashes>>,
+    ) -> Self {
         if reloaded.parsed.is_some() {
             return Self::Ready(reloaded);
         }
@@ -492,16 +584,17 @@ impl PendingReload {
         };
         Self::Reading {
             read: ViewerRead::start(move || {
-                let read =
-                    parse_conversation_file_interactively(&cache, &address, &reloaded.publication);
-                (*reloaded, Some(read))
+                let copy =
+                    ReloadedCopy::read(&cache, &address, &reloaded.publication, shown_hashes);
+                (*reloaded, Some(copy))
             }),
             queued: None,
         }
     }
 
-    /// This reload followed by `newer`, a later refresh's: a read running
-    /// keeps running with `newer` queued; otherwise `newer` replaces it.
+    /// This reload followed by `newer`, a later refresh's: a read running or
+    /// a tail waiting stays with `newer` queued; otherwise `newer` replaces
+    /// it.
     fn followed_by(self, newer: Box<ReloadedSession>) -> Self {
         match self {
             Self::Queued(_) | Self::Ready(_) => Self::Queued(newer),
@@ -509,24 +602,43 @@ impl PendingReload {
                 read,
                 queued: Some(newer),
             },
+            Self::WaitingToExtend { tail, .. } => Self::WaitingToExtend {
+                tail,
+                queued: Some(newer),
+            },
         }
     }
 
     /// The reload and the row queued behind it, once its read arrives within
-    /// `wait`; `Err(self)` while it runs or is queued.
-    pub(super) fn finish(self, wait: Duration) -> Result<LandedReload, Self> {
+    /// `wait`; `Err(self)` while it runs or is queued. A waiting tail is
+    /// returned at once.
+    pub(super) fn finish(self, wait: Duration) -> Result<ReadyReload, Self> {
         match self {
             Self::Queued(_) => Err(self),
-            Self::Ready(reloaded) => Ok(((*reloaded, None), None)),
+            Self::Ready(reloaded) => Ok(ReadyReload {
+                arrived: ArrivedReload::Read(Box::new((*reloaded, None))),
+                queued: None,
+            }),
             Self::Reading { read, queued } => match read.finish(wait) {
-                Ok(read) => Ok((read, queued)),
+                Ok(read) => Ok(ReadyReload {
+                    arrived: ArrivedReload::Read(Box::new(read)),
+                    queued,
+                }),
                 Err(read) => Err(Self::Reading { read, queued }),
             },
+            Self::WaitingToExtend { tail, queued } => Ok(ReadyReload {
+                arrived: ArrivedReload::WaitingTail(tail),
+                queued,
+            }),
         }
     }
 
     pub(super) fn is_reading(&self) -> bool {
         matches!(self, Self::Reading { .. })
+    }
+
+    pub(super) fn is_waiting_to_extend(&self) -> bool {
+        matches!(self, Self::WaitingToExtend { .. })
     }
 }
 
@@ -698,8 +810,8 @@ impl App {
         state.cache_address = cache_address;
         state.publication = publication;
         state.header = Some(header);
-        state.is_copy_missing = copy.conversation.is_none();
-        if let Some(conversation) = copy.conversation {
+        state.is_copy_missing = copy.entries.is_none();
+        if let Some(conversation) = copy.entries {
             state.replace_conversation(conversation, copy.identity, copy.entry_hashes);
         }
         state.show_timing = self.show_timing;
@@ -715,8 +827,39 @@ impl App {
         path: &std::path::Path,
         read: InteractiveRead<ViewedConversation>,
         cause: ReadCause,
-    ) -> ViewerCopy {
-        ViewerCopy::of(self.take_interactive(path, read, cause))
+    ) -> ViewerCopy<Arc<ParsedConversation>> {
+        ViewerCopy::of(self.take_interactive(path, read, cause), |viewed| {
+            (
+                Arc::new(viewed.conversation),
+                viewed.entry_hashes,
+                viewed.row,
+            )
+        })
+    }
+
+    /// `read`, a reload's read of the session at `path` after its refresh
+    /// finished, with its next step recorded.
+    fn take_reload_read(
+        &mut self,
+        path: &std::path::Path,
+        read: InteractiveRead<RereadConversation>,
+    ) -> ViewerCopy<ReloadedEntries> {
+        let copy = self.take_interactive(path, read, ReadCause::FinishedRefresh);
+        ViewerCopy::of(copy, |reread| match reread {
+            RereadConversation::Whole(viewed) => {
+                let viewed = *viewed;
+                (
+                    ReloadedEntries::Whole(Arc::new(viewed.conversation)),
+                    viewed.entry_hashes,
+                    viewed.row,
+                )
+            }
+            RereadConversation::Tail(viewed) => (
+                ReloadedEntries::Tail(viewed.tail),
+                viewed.entry_hashes,
+                viewed.row,
+            ),
+        })
     }
 
     /// Ask for the open session to be read again (`Ctrl+R`): through a
@@ -882,11 +1025,42 @@ impl App {
                 {
                     state.show_row_over_its_copy(*reloaded, now);
                 } else {
-                    self.pending_view_reload =
-                        Some(PendingReload::start(reloaded, self.interactive_cache()));
+                    let shown_hashes = match &self.app_mode {
+                        AppMode::View(state) => state.hashes_for_tail_read(),
+                        AppMode::List => None,
+                    };
+                    self.pending_view_reload = Some(PendingReload::start(
+                        reloaded,
+                        self.interactive_cache(),
+                        shown_hashes,
+                    ));
                 }
             }
             pending => self.pending_view_reload = pending,
+        }
+    }
+
+    /// Read `reloaded`'s whole copy, in place of a read that compared its
+    /// copy with other hashes than the view's. The reload queued behind it
+    /// stays queued.
+    fn read_whole_copy_again(&mut self, reloaded: ReloadedSession) {
+        let queued = self.take_queued_reload();
+        let reading = PendingReload::start(Box::new(reloaded), self.interactive_cache(), None);
+        self.pending_view_reload = Some(match queued {
+            Some(queued) => reading.followed_by(queued),
+            None => reading,
+        });
+    }
+
+    /// The refresh's row queued for a read once the arrived reload's rows
+    /// show, taken out of the pending reload.
+    fn take_queued_reload(&mut self) -> Option<Box<ReloadedSession>> {
+        match self.pending_view_reload.take() {
+            Some(PendingReload::Queued(queued)) => Some(queued),
+            pending => {
+                self.pending_view_reload = pending;
+                None
+            }
         }
     }
 
@@ -896,46 +1070,63 @@ impl App {
     /// arrive. The first read of a file opened directly shows from the top,
     /// as an open does. A copy asked for meanwhile runs once nothing more is
     /// pending.
+    ///
+    /// A read that compared its copy with other hashes than the view's is
+    /// dropped, and the whole copy is read in its place: its tail follows
+    /// other entries than the view keeps.
     pub(super) fn reload_open_session(
         &mut self,
         reloaded: ReloadedSession,
-        read: Option<InteractiveRead<ViewedConversation>>,
+        read: Option<ReloadedCopy>,
     ) {
         let AppMode::View(state) = &self.app_mode else {
             return;
         };
+        if let Some(compared) = read.as_ref().and_then(|copy| copy.compared_with.as_ref())
+            && !state
+                .entry_hashes
+                .as_ref()
+                .is_some_and(|shown| Arc::ptr_eq(shown, compared))
+        {
+            return self.read_whole_copy_again(reloaded);
+        }
         let path = state.conversation_path.clone();
         let is_first_read_of_opened_file = self.single_file_mode && state.is_copy_missing;
         let copy = match (reloaded.parsed, read) {
             (Some(conversation), _) => ViewerCopy::parsed(conversation),
-            (None, Some(read)) => self.take_viewer_read(&path, read, ReadCause::FinishedRefresh),
+            (None, Some(copy)) => self.take_reload_read(&path, copy.reread),
             (None, None) => ViewerCopy::missing(),
         };
         if let AppMode::View(state) = &mut self.app_mode {
             state.cache_address = reloaded.address;
         }
-        if let Some(conversation) = copy.conversation {
+        if let Some(entries) = copy.entries {
             let header = ReloadedHeader {
                 row: reloaded.row,
                 external_title: reloaded.external_title,
                 publication: reloaded.publication,
                 adopted: copy.adopted,
             };
-            if is_first_read_of_opened_file {
-                if let AppMode::View(state) = &mut self.app_mode {
-                    state.replace_conversation(conversation, copy.identity, copy.entry_hashes);
-                    state.show_reloaded_row(header, copy.row);
-                    state.session_id = reloaded.session_id;
-                    state.rows_read = RowsRead::BeforeFirstRead;
+            match entries {
+                ReloadedEntries::Whole(conversation) if is_first_read_of_opened_file => {
+                    if let AppMode::View(state) = &mut self.app_mode {
+                        state.replace_conversation(conversation, copy.identity, copy.entry_hashes);
+                        state.show_reloaded_row(header, copy.row);
+                        state.session_id = reloaded.session_id;
+                        state.rows_read = RowsRead::BeforeFirstRead;
+                    }
+                    self.request_view_render();
                 }
-                self.request_view_render();
-            } else {
-                let read = Reread {
-                    conversation,
-                    copy: copy.identity,
-                    entry_hashes: copy.entry_hashes,
-                };
-                self.show_reread_conversation(read, header, copy.row, reloaded.session_id);
+                entries => {
+                    self.show_reloaded_conversation(Box::new(ReloadedConversation {
+                        entries,
+                        copy: copy.identity,
+                        entry_hashes: copy.entry_hashes,
+                        header,
+                        copy_row: copy.row,
+                        session_id: reloaded.session_id,
+                    }));
+                }
             }
         }
         self.run_deferred_copy();
@@ -1271,28 +1462,61 @@ impl App {
         }
     }
 
-    /// Show `read`, the open session read again, where the reader was, once
-    /// its rows arrive (see [`Self::show_render`]): the rows of its tail
-    /// after the shown rows they keep, or of the whole conversation (see
-    /// [`ViewState::rows_after_reread`]). Expanded rows stay expanded where
-    /// their entry is still there. The header shows `copy_row`, the
-    /// conversation's copy's catalogue row, or `header`'s row without it, at
+    /// Show `reloaded`, the open session read again, where the reader was,
+    /// once its rows arrive (see [`Self::show_render`]). Expanded rows stay
+    /// expanded where their entry is still there. The header shows the
+    /// catalogue row of the copy read, or the refreshed row without it, at
     /// once. The previous reload's rows have shown
-    /// ([`Self::start_or_show_queued_reload`]), so the shown rows are
+    /// ([`Self::start_or_show_queued_reload`]): the shown rows are
     /// `parsed_conversation`'s.
-    fn show_reread_conversation(
+    ///
+    /// - A whole read's conversation replaces the shown one, and every row
+    ///   renders again.
+    /// - A tail is put after the entries the shown conversation keeps, and
+    ///   the rows render from the start [`ViewState::rows_after_tail`]
+    ///   finds.
+    /// - A tail whose conversation a render shares is not put in place: the
+    ///   render is stopped, the tail waits in `pending_view_reload` for a
+    ///   later pass, and this returns false.
+    pub(super) fn show_reloaded_conversation(
         &mut self,
-        read: Reread,
-        header: ReloadedHeader,
-        copy_row: Option<Box<Conversation>>,
-        session_id: Option<String>,
-    ) {
+        reloaded: Box<ReloadedConversation>,
+    ) -> bool {
         let (now, today, zone) = (self.clock().now(), self.today(), self.clock().zone());
         let AppMode::View(state) = &mut self.app_mode else {
-            return;
+            return true;
         };
-        let into_new_read =
-            EntryRelocation::between(&state.parsed_conversation, &read.conversation);
+        if matches!(reloaded.entries, ReloadedEntries::Tail(_))
+            && Arc::get_mut(&mut state.parsed_conversation).is_none()
+        {
+            self.wait_to_extend(reloaded);
+            return false;
+        }
+        let ReloadedConversation {
+            entries,
+            copy,
+            entry_hashes,
+            header,
+            copy_row,
+            session_id,
+        } = *reloaded;
+        let (into_new_read, replaced) = match entries {
+            ReloadedEntries::Whole(conversation) => {
+                let relocation =
+                    EntryRelocation::between(&state.parsed_conversation, &conversation);
+                state.parsed_conversation = conversation;
+                (relocation, None)
+            }
+            ReloadedEntries::Tail(tail) => {
+                let conversation = Arc::get_mut(&mut state.parsed_conversation)
+                    .expect("no render shares the conversation: checked above");
+                let replaced = conversation.extend_with(tail);
+                let relocation = EntryRelocation::after_extension(conversation, &replaced);
+                (relocation, Some(replaced))
+            }
+        };
+        state.shown_copy = copy;
+        state.entry_hashes = entry_hashes.map(Arc::new);
         state.expanded_tool_outputs = state
             .expanded_tool_outputs
             .iter()
@@ -1302,13 +1526,28 @@ impl App {
             .focus_first_call_of
             .and_then(|entry| into_new_read.get(entry));
         let options = state.render_options(today, zone);
-        let rows_to_render =
-            state.rows_after_reread(&read.conversation, read.entry_hashes.as_ref(), &options);
+        let rows_to_render = match &replaced {
+            Some(replaced) => state.rows_after_tail(replaced, &options),
+            None => RowsToRender::Whole,
+        };
         state.rows_read = RowsRead::Earlier(into_new_read);
         state.show_reloaded_row(header, copy_row);
         state.session_id = session_id;
-        state.replace_conversation(read.conversation, read.copy, read.entry_hashes);
         request_render(&mut self.viewer_render, state, options, rows_to_render, now);
+        true
+    }
+
+    /// Keep `tail` in `pending_view_reload` until no render shares the shown
+    /// conversation, and stop the render running over it. The worker frees
+    /// its share of the conversation at the render's next check, or, for a
+    /// render that already finished, once the app releases the rows it took.
+    /// The reload queued behind the tail stays queued.
+    fn wait_to_extend(&mut self, tail: Box<ReloadedConversation>) {
+        if let Some(worker) = &self.viewer_render {
+            worker.stop();
+        }
+        let queued = self.take_queued_reload();
+        self.pending_view_reload = Some(PendingReload::WaitingToExtend { tail, queued });
     }
 
     /// Ask the `viewer-render` thread for a render of the open conversation

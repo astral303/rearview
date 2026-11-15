@@ -45,7 +45,9 @@ pub(crate) use roster::SubagentRoster;
 pub use search_rows::find_matches;
 pub use search_rows::{SearchMatch, find_matches_while, update_matches_in_replaced_rows};
 pub(crate) use summary::format_coarse_duration;
-pub(crate) use tail::{RowsToRender, ShownCopy, splice_tail, tail_after_read};
+pub(crate) use tail::{RowsToRender, ShownRender, splice_tail, tail_render_start};
+#[cfg(test)]
+pub(crate) use tests::fields_differing;
 
 use calls::{CallRanges, Lanes, top_level_tool_blocks};
 use days::DayLabels;
@@ -343,6 +345,12 @@ impl ParsedConversation {
         self.activity_span
     }
 
+    /// The count of entries the read returned, file-history snapshots
+    /// included: a copy has one entry hash for each.
+    pub(crate) fn entry_count(&self) -> usize {
+        self.origins.len()
+    }
+
     /// The entry numbered `entry_index` among the displayed entries.
     pub fn entry(&self, entry_index: usize) -> Option<&LogEntry> {
         let position = self
@@ -379,6 +387,7 @@ impl ParsedConversation {
         } = tail;
         if origins.is_empty() && first_changed == self.origins.len() {
             return ReplacedEntries {
+                first_changed,
                 entries: Vec::new(),
                 origins: Vec::new(),
                 roster: None,
@@ -411,6 +420,7 @@ impl ParsedConversation {
         let roster = roster_of_conversation(&self.subagent_identities, &self.entries);
         self.lanes = Lanes::of(top_level_tool_blocks(&self.entries));
         ReplacedEntries {
+            first_changed,
             entries: replaced_entries,
             origins: replaced_origins,
             roster: Some(std::mem::replace(&mut self.roster, roster)),
@@ -465,11 +475,6 @@ impl ConversationTail {
             subagent_identities,
         }
     }
-
-    /// The index of the first entry the tail replaces.
-    pub(crate) fn first_changed(&self) -> usize {
-        self.first_changed
-    }
 }
 
 /// The values of a conversation that [`ParsedConversation::extend_with`]
@@ -477,6 +482,7 @@ impl ConversationTail {
 /// and its roster.
 #[derive(Debug)]
 pub struct ReplacedEntries {
+    first_changed: usize,
     entries: Vec<RenderableEntry>,
     origins: Vec<EntryOrigin>,
     /// `None` when the extension kept the conversation's roster.
@@ -484,6 +490,11 @@ pub struct ReplacedEntries {
 }
 
 impl ReplacedEntries {
+    /// The index of the first entry the extension replaced.
+    pub(crate) fn first_changed(&self) -> usize {
+        self.first_changed
+    }
+
     /// The roster of `conversation` before the extension that returned these
     /// entries.
     pub(crate) fn roster_before<'a>(
@@ -530,11 +541,58 @@ pub fn parse_conversation_file_interactively(
     address: &crate::history::sqlite_cache::SessionAddress,
     publication: &crate::history::sqlite_cache::Publication,
 ) -> crate::history::InteractiveRead<ViewedConversation> {
-    crate::history::viewed_copy_interactively(cache, address, publication).map(|viewed| {
-        ViewedConversation {
+    crate::history::viewed_copy_interactively(cache, address, publication)
+        .map(ViewedConversation::from)
+}
+
+impl From<crate::history::ViewedCopy> for ViewedConversation {
+    fn from(viewed: crate::history::ViewedCopy) -> Self {
+        Self {
             conversation: parsed_conversation(viewed.entries),
             entry_hashes: viewed.entry_hashes,
             row: viewed.row,
+        }
+    }
+}
+
+/// A [`crate::history::RereadCopy`] with its entries as the viewer reads
+/// them: a whole copy's as a [`ParsedConversation`], a tail's as a
+/// [`ConversationTail`].
+pub enum RereadConversation {
+    /// Every entry of the copy.
+    Whole(Box<ViewedConversation>),
+    /// The copy's entries from the first changed entry on.
+    Tail(ViewedConversationTail),
+}
+
+/// A [`ConversationTail`] with one hash per entry of the whole copy and the
+/// copy's catalogue row, as a [`ViewedConversation`] has them.
+pub struct ViewedConversationTail {
+    pub tail: ConversationTail,
+    pub entry_hashes: crate::history::sqlite_cache::EntryHashes,
+    /// `None` when the cache no longer lists the copy.
+    pub row: Option<Box<crate::history::Conversation>>,
+}
+
+/// The conversation the cache keeps at `address`, read for a viewer that
+/// shows a copy whose entry hashes are `shown`: the tail from the first
+/// changed entry on, or the whole copy in the cases
+/// [`crate::history::reread_copy_interactively`] reads whole.
+pub fn reread_conversation_interactively(
+    cache: &crate::history::InteractiveCache,
+    address: &crate::history::sqlite_cache::SessionAddress,
+    publication: &crate::history::sqlite_cache::Publication,
+    shown: &crate::history::sqlite_cache::EntryHashes,
+) -> crate::history::InteractiveRead<RereadConversation> {
+    use crate::history::RereadCopy;
+    crate::history::reread_copy_interactively(cache, address, publication, shown).map(|copy| {
+        match copy {
+            RereadCopy::Whole(viewed) => RereadConversation::Whole(Box::new(viewed.into())),
+            RereadCopy::Tail(tail) => RereadConversation::Tail(ViewedConversationTail {
+                tail: ConversationTail::of(tail.first_changed, tail.entries),
+                entry_hashes: tail.entry_hashes,
+                row: tail.row,
+            }),
         }
     })
 }

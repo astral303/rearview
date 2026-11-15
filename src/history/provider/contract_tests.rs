@@ -33,6 +33,7 @@ use crate::cli::DebugLevel;
 use crate::clock::{Clock, TestClock};
 use crate::error::{AppError, Result};
 use crate::history::environment::test_support::waiting_operation;
+use crate::history::format::RecordLine;
 use crate::history::load_meter::AgentMeter;
 use crate::history::path::with_platform_separators;
 use crate::history::sqlite_cache::SqliteCache;
@@ -40,7 +41,7 @@ use crate::history::{Conversation, Environment, NextStep, ProcessIdentity, Sourc
 use runner::run_contract;
 pub(crate) use runner::{every_record_sessions, registered_fixtures};
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -375,6 +376,84 @@ pub(crate) fn list_row(source: Source, locator: &Path, subagents: &[PathBuf]) ->
         .row
 }
 
+/// The transcript a record is in; `None` for the session's own.
+pub(crate) type RecordTranscript = Option<Arc<Path>>;
+
+/// A session's records as its agent had written them at an earlier time.
+pub(crate) struct EarlierRecords {
+    /// The count of records each transcript had then. A transcript that
+    /// isn't listed had every record.
+    pub(crate) records_kept: BTreeMap<RecordTranscript, usize>,
+    /// The record whose call was running then: the record is kept without
+    /// the call's result.
+    pub(crate) running_call: Option<RecordLine>,
+}
+
+/// One session's files below a temporary home. A test writes the session
+/// there as its agent had written it at an earlier time, and whole again.
+pub(crate) trait RewritableSession: Send {
+    /// True when an earlier time can lack records of `transcript`: the
+    /// session's own, or a sub-agent's.
+    fn can_cut(&self, transcript: &RecordTranscript) -> bool;
+
+    /// True when `record` has a finished call that the agent first wrote as
+    /// a running call, in the same record.
+    fn is_finished_call_written_running_first(&self, record: &RecordLine) -> bool;
+
+    fn write_earlier(&self, earlier: &EarlierRecords);
+
+    fn write_whole(&self);
+}
+
+/// Transcripts of lines whose agent appends whole records: the session's
+/// own and each sub-agent's, with the path and the whole text of each.
+pub(crate) struct LineTranscripts(BTreeMap<RecordTranscript, (PathBuf, String)>);
+
+impl LineTranscripts {
+    /// The transcripts of the session discovery found as `stub`, as they are
+    /// now.
+    pub(crate) fn of(stub: &SessionStub) -> Self {
+        let whole_text = |path: &Path| (path.to_path_buf(), std::fs::read_to_string(path).unwrap());
+        let mut transcripts = BTreeMap::from([(None, whole_text(&stub.locator))]);
+        for subagent in stub.subagents.iter().filter(|path| path.is_file()) {
+            transcripts.insert(Some(Arc::from(subagent.as_path())), whole_text(subagent));
+        }
+        Self(transcripts)
+    }
+}
+
+impl RewritableSession for LineTranscripts {
+    fn can_cut(&self, transcript: &RecordTranscript) -> bool {
+        self.0.contains_key(transcript)
+    }
+
+    /// The agent appends whole records and doesn't write one again.
+    fn is_finished_call_written_running_first(&self, _record: &RecordLine) -> bool {
+        false
+    }
+
+    fn write_earlier(&self, earlier: &EarlierRecords) {
+        for (transcript, (path, whole)) in &self.0 {
+            match earlier.records_kept.get(transcript) {
+                None => std::fs::write(path, whole).unwrap(),
+                // The agent starts a sub-agent's transcript with its first
+                // record.
+                Some(0) if transcript.is_some() => std::fs::remove_file(path).unwrap(),
+                Some(&kept) => {
+                    let lines: Vec<&str> = whole.split_inclusive('\n').collect();
+                    std::fs::write(path, lines[..kept].concat()).unwrap();
+                }
+            }
+        }
+    }
+
+    fn write_whole(&self) {
+        for (path, whole) in self.0.values() {
+            std::fs::write(path, whole).unwrap();
+        }
+    }
+}
+
 /// One provider's sessions, written under a temporary home and read,
 /// resolved and deleted there. Every method takes the home as a parameter:
 /// the providers read their roots from the environment, which a parallel
@@ -585,6 +664,13 @@ pub(crate) trait ProviderFixture: Sync {
         )
         .unwrap();
         path
+    }
+
+    /// The session discovery found as `stub`, for a test that writes it as
+    /// its agent had written it at an earlier time. The default is for an
+    /// agent that appends whole records to transcripts of lines.
+    fn rewritable_session(&self, stub: &SessionStub) -> Box<dyn RewritableSession> {
+        Box::new(LineTranscripts::of(stub))
     }
 
     fn storage(&self) -> &'static dyn SessionStorage {

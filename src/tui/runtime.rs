@@ -427,6 +427,7 @@ impl Runtime {
         } else if self.app.has_search_work_in_flight()
             || self.app.is_view_search_pending()
             || self.app.is_view_render_pending()
+            || self.app.is_tail_waiting_for_conversation()
         {
             Duration::from_millis(8)
         } else {
