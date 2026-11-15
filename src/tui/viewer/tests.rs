@@ -1048,7 +1048,7 @@ fn spawn_agent_result_shows_its_path_alone_without_nicknamed_matching_sub_agent(
     let mut roster = roster_of(&entries);
     roster.record_identity(
         SUB_AGENT_THREAD,
-        crate::log_entry::SubagentIdentity {
+        &crate::log_entry::SubagentIdentity {
             nickname: None,
             role: Some("grunt".to_owned()),
             agent_path: Some("/root/unnamed".to_owned()),
@@ -1089,7 +1089,7 @@ fn spawn_agent_result_takes_calls_agent_type_when_sub_agent_records_no_role() {
     let mut roster = roster_of(&entries);
     roster.record_identity(
         SUB_AGENT_THREAD,
-        crate::log_entry::SubagentIdentity {
+        &crate::log_entry::SubagentIdentity {
             nickname: Some("Lorentz".to_owned()),
             role: None,
             agent_path: Some("/root/scout".to_owned()),

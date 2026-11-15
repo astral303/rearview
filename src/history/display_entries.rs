@@ -29,6 +29,15 @@ pub struct EntryOrigin {
     part: usize,
 }
 
+/// The identity one `agent_progress` record gives the sub-agent `agent_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedIdentity {
+    /// The index of the record's entry among the displayed entries.
+    pub entry_index: usize,
+    pub agent_id: String,
+    pub identity: SubagentIdentity,
+}
+
 /// The entries the viewer, the terminal printout, exports and the clipboard
 /// copy read. Each `agent_progress` record, spliced from a sub-agent
 /// transcript or recorded inline, is converted into the sub-agent message it
@@ -40,9 +49,9 @@ pub struct DisplayEntries {
     pub entries: Vec<LogEntry>,
     /// Where each entry of `entries` was read, at the same position.
     pub origins: Vec<EntryOrigin>,
-    /// The identity each `agent_progress` record names, by its agent id and
-    /// in record order. The converted message no longer carries it.
-    pub subagent_identities: Vec<(String, SubagentIdentity)>,
+    /// The identity each `agent_progress` record gives its sub-agent, in
+    /// record order. The converted message no longer carries it.
+    pub subagent_identities: Vec<RecordedIdentity>,
     /// The lines of the session file that did not parse. The terminal
     /// printout reports under `--debug` the ones whose text the format kept.
     pub(crate) malformed_lines: Vec<MalformedLine>,
@@ -54,11 +63,15 @@ impl From<Vec<(RecordLine, LogEntry)>> for DisplayEntries {
         let mut parts_read: HashMap<RecordLine, usize> = HashMap::new();
         let mut entries = Vec::with_capacity(normalized.len());
         let mut origins = Vec::with_capacity(normalized.len());
-        for (record, entry) in normalized {
+        for (entry_index, (record, entry)) in normalized.into_iter().enumerate() {
             if let LogEntry::Progress { data, .. } = &entry
                 && let Some((agent_id, identity)) = agent_progress_identity(data)
             {
-                subagent_identities.push((agent_id.to_owned(), identity));
+                subagent_identities.push(RecordedIdentity {
+                    entry_index,
+                    agent_id: agent_id.to_owned(),
+                    identity,
+                });
             }
             let part = parts_read.entry(record.clone()).or_insert(0);
             origins.push(EntryOrigin {
@@ -336,6 +349,50 @@ mod tests {
             .position(|entry| serde_json::to_string(entry).unwrap().contains(text))
             .unwrap();
         displayed.origins[position].clone()
+    }
+
+    #[test]
+    fn sub_agents_identity_is_recorded_with_its_entrys_index() {
+        let progress = |nickname: &str| LogEntry::Progress {
+            data: serde_json::json!({
+                "type": "agent_progress",
+                "agentId": "thread-a",
+                "identity": {"nickname": nickname},
+                "message": {
+                    "type": "user",
+                    "message": {"role": "user", "content": [{"type": "text", "text": "turn"}]}
+                }
+            }),
+            extra: serde_json::json!({}),
+        };
+        let parent: LogEntry = serde_json::from_str(&user_line("parent", 0)).unwrap();
+
+        let displayed = DisplayEntries::from(vec![
+            (1, parent.clone()),
+            (2, progress("Lorentz")),
+            (3, parent),
+            (4, progress("Hubble")),
+        ]);
+
+        let recorded: Vec<(usize, &str, Option<&str>)> = displayed
+            .subagent_identities
+            .iter()
+            .map(|recorded| {
+                (
+                    recorded.entry_index,
+                    recorded.agent_id.as_str(),
+                    recorded.identity.nickname.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (1, "thread-a", Some("Lorentz")),
+                (3, "thread-a", Some("Hubble"))
+            ],
+            "each identity is recorded with the index of its record's entry"
+        );
     }
 
     #[test]

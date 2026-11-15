@@ -655,8 +655,8 @@ fn sub_agent_turn_between_exchanges(count: usize, roster: SubagentRoster) -> Par
 /// A roster labelling the sub-agent `toolu_parent` with `nickname`.
 fn roster_naming(nickname: &str) -> SubagentRoster {
     SubagentRoster::from_identities([(
-        "toolu_parent".to_owned(),
-        SubagentIdentity {
+        "toolu_parent",
+        &SubagentIdentity {
             nickname: Some(nickname.to_owned()),
             ..SubagentIdentity::default()
         },

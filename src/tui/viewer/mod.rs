@@ -327,7 +327,7 @@ impl ParsedConversation {
         Self {
             entries: Vec::new(),
             origins: Vec::new(),
-            roster: SubagentRoster::from_identities(Vec::new()),
+            roster: SubagentRoster::default(),
             lanes: Lanes::default(),
             activity_span: None,
         }
@@ -412,7 +412,7 @@ pub fn parse_unattributed_conversation_file(
 /// displayed entries, with each sub-agent's identity recorded in the
 /// `SubagentRoster`.
 pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversation {
-    let mut roster = SubagentRoster::from_identities(displayed.subagent_identities);
+    let mut roster = SubagentRoster::from_recorded(&displayed.subagent_identities);
     let origins = displayed.origins;
     let entries: Vec<RenderableEntry> = displayed
         .entries
