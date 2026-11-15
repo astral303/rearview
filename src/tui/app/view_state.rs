@@ -1173,26 +1173,10 @@ impl App {
             return;
         };
         let options = self.view_render_options(state);
-        let conversation = Arc::clone(&state.parsed_conversation);
-        let generation = self
-            .viewer_render
-            .get_or_insert_with(super::viewer_render::ViewerRenderWorker::spawn)
-            .render(conversation, options);
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        // The render has every expanded output in its options.
-        state.entries_to_render_again.clear();
-        state.run_outputs_to_render_again.clear();
-        match &mut state.pending_render {
-            Some(pending) => pending.generation = generation,
-            None => {
-                state.pending_render = Some(PendingRender {
-                    generation,
-                    since: now,
-                });
-            }
-        }
+        request_render(&mut self.viewer_render, state, options, now);
     }
 
     /// True while a render of the open conversation runs and its rows
@@ -2173,6 +2157,32 @@ impl FocusDrift {
             Self::OnScreen => current,
             Self::OffTop => on_screen.next(),
             Self::OffBottom => on_screen.next_back(),
+        }
+    }
+}
+
+/// Ask `worker`, the `viewer-render` thread, started by the first request,
+/// for a render of `state`'s conversation with `options`, made at `now`,
+/// superseding the running render.
+fn request_render(
+    worker: &mut Option<super::viewer_render::ViewerRenderWorker>,
+    state: &mut ViewState,
+    options: RenderOptions,
+    now: crate::clock::Moment,
+) {
+    let generation = worker
+        .get_or_insert_with(super::viewer_render::ViewerRenderWorker::spawn)
+        .render(Arc::clone(&state.parsed_conversation), options);
+    // The render has every expanded output in its options.
+    state.entries_to_render_again.clear();
+    state.run_outputs_to_render_again.clear();
+    match &mut state.pending_render {
+        Some(pending) => pending.generation = generation,
+        None => {
+            state.pending_render = Some(PendingRender {
+                generation,
+                since: now,
+            });
         }
     }
 }
