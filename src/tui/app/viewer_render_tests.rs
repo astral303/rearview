@@ -1,13 +1,19 @@
 //! Renders of the open session on `viewer-render`: keys act on the shown
 //! rows while a render runs, a newer request stops the running render, and a
-//! finished render waits for the app to take it.
+//! finished render waits for the app to take it. A session opened from the
+//! list renders there too, under the list.
 
+use super::claude_home::{ClaudeHome, app_reading};
 use super::interaction_tests::{app_with_tool_conversation, view_state, write_named_conversation};
-use super::test_waits::{VIEWER_READ_LANDS, finish_view_render};
+use super::test_waits::{
+    ConnectionGate, VIEWER_READ_LANDS, finish_pending_open, finish_view_render,
+};
 use super::viewer_render::ViewerRenderWorker;
 use super::*;
-use crate::tui::viewer::render_parsed_conversation_while;
+use crate::clock::TestClock;
+use crate::tui::viewer::{render_parsed_conversation, render_parsed_conversation_while};
 use std::sync::mpsc;
+use std::time::Instant;
 
 const VIEWPORT: usize = 17;
 
@@ -1028,4 +1034,239 @@ fn viewer_render_thread_panic_resumes_where_renders_are_taken() {
     press_now(&mut app, KeyCode::Char('t'));
 
     finish_view_render(&mut app, VIEWPORT);
+}
+
+/// The list of `home`'s sessions on `clock`, the first selected, its renders
+/// stopped at the returned gate.
+pub(super) fn gated_list(home: &ClaudeHome, clock: Arc<TestClock>) -> (App, Gate) {
+    let environment = home.environment_on(clock);
+    let mut app = app_reading(home.rows(&environment), environment);
+    let (worker, gate) = gated_worker();
+    app.viewer_render = Some(worker);
+    app.selected = Some(0);
+    (app, gate)
+}
+
+/// Passes of the event loop over the pending open until its read arrives
+/// and its render is requested, failing after [`VIEWER_READ_LANDS`].
+pub(super) fn advance_open_to_its_render(app: &mut App) {
+    let deadline = Instant::now() + VIEWER_READ_LANDS;
+    while app.opening_view().is_none() {
+        assert!(Instant::now() < deadline, "the open's read arrives");
+        assert!(
+            app.complete_pending_open(80, VIEWPORT, Duration::from_millis(10)),
+            "the open stays pending until its rows arrive"
+        );
+    }
+}
+
+/// The list's bottom bar in the frame the app draws, without the border.
+fn list_bottom_bar(app: &App) -> String {
+    let rows = frame_rows(app);
+    rows[rows.len() - 2]
+        .trim_matches(|c: char| c == '│' || c.is_whitespace())
+        .to_owned()
+}
+
+#[test]
+fn opened_sessions_rows_render_on_viewer_render_under_the_list() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["first question"]);
+    let (mut app, gate) = gated_list(&home, Arc::new(TestClock::default()));
+    assert!(app.request_open());
+
+    advance_open_to_its_render(&mut app);
+    let (_, _, thread) = gate.next_render_on_thread();
+    let is_pending = app.complete_pending_open(80, VIEWPORT, Duration::from_millis(10));
+
+    assert_eq!(thread.as_deref(), Some("viewer-render"));
+    assert!(
+        is_pending && app.is_opening() && matches!(app.app_mode(), AppMode::List),
+        "the list shows while the open's render runs"
+    );
+    gate.let_one_through();
+    assert!(finish_pending_open(&mut app, 80));
+    assert!(
+        super::claude_home::viewer_text(&app).contains("first question"),
+        "the viewer shows once the rows arrive"
+    );
+}
+
+#[test]
+fn list_shows_spinner_and_seconds_since_open_through_read_and_render() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["first question"]);
+    let clock = Arc::new(TestClock::default());
+    let (mut app, gate) = gated_list(&home, clock.clone());
+    let read_gate = ConnectionGate::closed(app.environment.cache_base().path(), |thread| {
+        thread.name() == Some("viewer-read")
+    });
+    assert!(app.request_open());
+    let pass = |app: &mut App| app.complete_pending_open(80, VIEWPORT, Duration::from_millis(10));
+
+    let read_started = pass(&mut app);
+    clock.sleep(Duration::from_millis(1500));
+    let passes_during_read = pass(&mut app) && pass(&mut app);
+    let during_read = list_bottom_bar(&app);
+    read_gate.open();
+    advance_open_to_its_render(&mut app);
+    gate.next_render();
+    clock.sleep(Duration::from_millis(1500));
+    let passes_during_render = pass(&mut app) && pass(&mut app);
+    let during_render = list_bottom_bar(&app);
+    gate.let_one_through();
+    assert!(finish_pending_open(&mut app, 80));
+
+    assert!(
+        read_started && passes_during_read && passes_during_render,
+        "each pass returns, so the event loop draws, while the read and the render run"
+    );
+    assert!(
+        during_read.ends_with(" Opening… 1s"),
+        "the bar shows the seconds during the read: {during_read:?}"
+    );
+    assert!(
+        during_render.ends_with(" Opening… 3s"),
+        "the seconds count from the open through the render: {during_render:?}"
+    );
+    assert_ne!(
+        during_read.chars().next(),
+        during_render.chars().next(),
+        "the spinner moves"
+    );
+}
+
+#[test]
+fn resize_during_opens_render_shows_viewer_with_rows_of_new_width() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["first question"]);
+    let (mut app, gate) = gated_list(&home, Arc::new(TestClock::default()));
+    assert!(app.request_open());
+    advance_open_to_its_render(&mut app);
+    gate.next_render();
+
+    app.check_view_resize(100);
+    gate.let_one_through();
+
+    assert!(
+        !gate.next_return().finished,
+        "the resize stops the render for the earlier width"
+    );
+    gate.next_render();
+    gate.let_one_through();
+    assert!(finish_pending_open(&mut app, 100));
+    let state = view_state(&app);
+    assert!(
+        state.frame_width == 100 && !app.is_view_render_pending(),
+        "the viewer shows the rows rendered for the new width"
+    );
+}
+
+/// The session's current copy in `app`'s session cache, as the viewer reads
+/// it for `row`.
+fn current_copy_of(app: &App, row: &Conversation) -> crate::tui::viewer::ViewedConversation {
+    crate::history::environment::test_support::current_copy(
+        crate::tui::viewer::parse_conversation_file_interactively(
+            &app.interactive_cache(),
+            row.cache_address
+                .as_ref()
+                .expect("the load lists the row at its address"),
+            &row.publication,
+        ),
+    )
+}
+
+#[test]
+fn opened_sessions_first_frame_shows_its_rows_from_top_for_every_agent() {
+    use crate::history::environment::test_support::{cache_session, environment_reading};
+    use crate::history::provider::contract_tests::every_record_sessions;
+
+    for session in every_record_sessions() {
+        let agent = session.row.source;
+        let row = cache_session(agent, &session.row.path, &session.row.subagents);
+        let mut app = app_reading(
+            vec![row.clone()],
+            environment_reading(std::slice::from_ref(&row)),
+        );
+        app.selected = Some(0);
+        assert!(app.request_open());
+        assert!(finish_pending_open(&mut app, 120));
+        let copy = current_copy_of(&app, &row);
+        let copy_row = copy.row.as_deref().expect("the current copy has its row");
+        let state = view_state(&app);
+        let expected =
+            render_parsed_conversation(&copy.conversation, &app.view_render_options(state));
+
+        assert_eq!(
+            format!("{:?}", state.rendered_lines),
+            format!("{:?}", expected.lines),
+            "{agent:?}: the rows are the read conversation's render with the viewer's options"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                (
+                    &state.message_ranges,
+                    &state.call_ranges,
+                    &state.detail_calls
+                )
+            ),
+            format!(
+                "{:?}",
+                (&expected.messages, &expected.calls, &expected.detail_calls)
+            ),
+            "{agent:?}: the messages and calls are that render's"
+        );
+        assert_eq!(
+            (state.scroll_offset, state.focus, state.message_nav_active),
+            (
+                0,
+                Some(Focus {
+                    message_index: 0,
+                    call_index: None
+                }),
+                false
+            ),
+            "{agent:?}: the viewer shows the top, the first message focused, navigation off"
+        );
+        assert!(
+            state.count_highlight.is_none()
+                && matches!(state.rows_read, RowsRead::Current)
+                && state.pending_render.is_none()
+                && state.expanded_tool_outputs.is_empty()
+                && state.updating_since.is_none()
+                && state.reload_rows_shown_at.is_none(),
+            "{agent:?}: nothing is highlighted, pending, expanded or updating"
+        );
+        assert_eq!(
+            state.shown_copy,
+            CopyIdentity::of(copy_row),
+            "{agent:?}: the viewer records the current copy it shows"
+        );
+        let header = state.header.as_ref().expect("the viewer shows a header");
+        assert_eq!(
+            (
+                &header.project_name,
+                &header.model,
+                header.message_count,
+                header.duration_minutes,
+                header.total_tokens,
+                header.timestamp,
+            ),
+            (
+                &copy_row.project_name,
+                &copy_row.model,
+                copy_row.message_count,
+                copy_row.duration_minutes,
+                copy_row.total_tokens,
+                copy_row.timestamp,
+            ),
+            "{agent:?}: the header shows the copy's row"
+        );
+        assert_eq!(
+            (&header.custom_title, &header.summary),
+            (&row.custom_title, &row.summary),
+            "{agent:?}: the header keeps the listed row's title and summary"
+        );
+    }
 }

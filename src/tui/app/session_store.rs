@@ -554,6 +554,11 @@ impl SessionStore {
         self.finished.back()
     }
 
+    /// The finished refreshes the list has yet to apply, oldest first.
+    pub(super) fn finished_refreshes(&self) -> impl Iterator<Item = &FinishedRefresh> {
+        self.finished.iter()
+    }
+
     /// Take the oldest finished refresh for the list to apply. The newer
     /// ones stay in the store until the list takes them.
     pub(super) fn take_oldest_finished(&mut self) -> Option<FinishedRefresh> {

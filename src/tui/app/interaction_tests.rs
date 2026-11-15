@@ -697,8 +697,8 @@ fn enter_on_row_leaves_open_pending_for_next_frame() {
 }
 
 /// The viewer's read runs off the drawing thread: the pass that starts it
-/// leaves the list opening, and a later pass shows the viewer once the read
-/// lands.
+/// leaves the list opening, and a later pass shows the viewer once its rows
+/// arrive.
 #[test]
 fn pending_open_reads_session_off_drawing_thread_then_enters_viewer() {
     let home = ClaudeHome::new();
@@ -708,7 +708,7 @@ fn pending_open_reads_session_off_drawing_thread_then_enters_viewer() {
     app.selected = Some(0);
     press(&mut app, KeyCode::Enter);
 
-    assert!(app.complete_pending_open(80, Duration::ZERO));
+    assert!(app.complete_pending_open(80, 17, Duration::ZERO));
     assert!(
         matches!(app.app_mode(), AppMode::List) && app.is_opening(),
         "the list shows Opening… while the read runs"
@@ -719,7 +719,7 @@ fn pending_open_reads_session_off_drawing_thread_then_enters_viewer() {
     ));
     assert!(matches!(app.app_mode(), AppMode::View(_)));
     assert!(!app.is_opening());
-    assert!(!app.complete_pending_open(80, Duration::ZERO));
+    assert!(!app.complete_pending_open(80, 17, Duration::ZERO));
 }
 
 #[test]

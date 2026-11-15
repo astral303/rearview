@@ -45,12 +45,14 @@ pub(crate) fn finish_view_render(app: &mut App, viewport_height: usize) {
 /// open fails, failing after [`VIEWER_READ_LANDS`]. True when an open was
 /// pending.
 pub(crate) fn finish_pending_open(app: &mut App, frame_width: usize) -> bool {
+    /// A first render shows from the top whatever the viewport's height.
+    const VIEWPORT: usize = 20;
     let deadline = std::time::Instant::now() + VIEWER_READ_LANDS;
     let mut advanced = false;
-    while app.complete_pending_open(frame_width, Duration::from_millis(10)) {
+    while app.complete_pending_open(frame_width, VIEWPORT, Duration::from_millis(10)) {
         assert!(
             std::time::Instant::now() < deadline,
-            "the viewer's read lands"
+            "the viewer's read and render arrive"
         );
         advanced = true;
     }

@@ -158,8 +158,8 @@ pub struct App {
     viewer_render: Option<viewer_render::ViewerRenderWorker>,
     /// `None` while the query is ordinary text
     session_id_query: Option<SessionIdQuery>,
-    /// The session open (`Enter`) or a row click named, until the load runs
-    /// one frame later, so that frame can show the list as opening
+    /// The session open (`Enter`) or a row click selected, until the viewer
+    /// shows it; the list shows as opening meanwhile
     pending_open: Option<PendingOpen>,
     /// The open session's refresh finished: the viewer shows it once the
     /// read of its copy lands, or the file opened directly as parsed on the
@@ -234,8 +234,38 @@ fn known_fork(source: crate::history::Source) -> Option<bool> {
 struct PendingOpen {
     path: PathBuf,
     source: crate::history::Source,
-    /// The viewer's read of the row's copy, once started.
-    read: Option<view_state::ViewerRead<view_state::RowRead>>,
+    /// When the open was asked for: the status's seconds count from then.
+    since: Moment,
+    stage: OpenStage,
+}
+
+/// The step a pending open is at. The list shows until the viewer's rows
+/// arrive.
+enum OpenStage {
+    /// The read of the row's copy starts on the next pass.
+    Requested,
+    /// The viewer's read of the row's copy runs on `viewer-read`.
+    Reading(view_state::ViewerRead<view_state::RowRead>),
+    /// The viewer's state, from the read, without rows, while
+    /// `viewer-render` renders them.
+    Rendering(Box<ViewState>),
+}
+
+impl PendingOpen {
+    /// The viewer's state while `viewer-render` renders its rows.
+    fn opening_view(&self) -> Option<&ViewState> {
+        match &self.stage {
+            OpenStage::Rendering(state) => Some(state),
+            OpenStage::Requested | OpenStage::Reading(_) => None,
+        }
+    }
+
+    fn opening_view_mut(&mut self) -> Option<&mut ViewState> {
+        match &mut self.stage {
+            OpenStage::Rendering(state) => Some(state),
+            OpenStage::Requested | OpenStage::Reading(_) => None,
+        }
+    }
 }
 
 type ClipboardWriter = fn(&str) -> Result<ClipboardDestination, String>;
@@ -251,6 +281,8 @@ enum DirectFileJob {
 const SPINNER_DELAY: Duration = Duration::from_millis(100);
 const SPINNER_FRAME: Duration = Duration::from_millis(80);
 const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// In the list's bottom bar while a session opens.
+const OPENING_LABEL: &str = "Opening…";
 /// Beside the spinner while a search runs.
 const SEARCHING_LABEL: &str = "searching";
 /// In the viewer's mode cell while the rows shown are rendered again.
@@ -1018,7 +1050,8 @@ impl App {
         self.pending_open = Some(PendingOpen {
             path: row.path.clone(),
             source: row.source,
-            read: None,
+            since: self.clock().now(),
+            stage: OpenStage::Requested,
         });
         true
     }
@@ -1038,44 +1071,105 @@ impl App {
         self.pending_open.is_some()
     }
 
-    /// Advance a pending open: start the viewer's read of the session on a
-    /// thread of its own, or wait up to `wait` for it and show the viewer
-    /// once it lands. True while an open is pending, so the caller draws the
-    /// next frame before reading any terminal event.
-    pub fn complete_pending_open(&mut self, frame_width: usize, wait: Duration) -> bool {
+    /// The list's bottom bar while a session opens: `Opening…`. From
+    /// `SPINNER_DELAY` (100 ms) after the open was requested, a spinner glyph
+    /// precedes the label; from one second on, the whole seconds follow it
+    /// (`⠋ Opening… 3s`). `None` while no session opens.
+    pub fn opening_status_text(&self) -> Option<String> {
+        let since = self.pending_open.as_ref()?.since;
+        Some(
+            spinner_status(OPENING_LABEL, self.clock().elapsed_since(since))
+                .unwrap_or_else(|| OPENING_LABEL.to_owned()),
+        )
+    }
+
+    /// Take the pending open one step, waiting up to `wait` for its read or
+    /// its rows: the read starts on `viewer-read`, its rows are rendered on
+    /// `viewer-render` for a frame `frame_width` columns wide, and the
+    /// viewer shows them. `viewport_height` is the height of the current
+    /// frame's viewport; the viewer's first rows show from the top at any
+    /// height. True while the open is pending and on the call that ends it, with the
+    /// viewer or on the list, so the caller draws the next frame before it
+    /// reads any terminal event.
+    pub fn complete_pending_open(
+        &mut self,
+        frame_width: usize,
+        viewport_height: usize,
+        wait: Duration,
+    ) -> bool {
         let Some(pending) = self.pending_open.take() else {
             return false;
         };
-        let Some(read) = pending.read else {
-            match self
-                .conversations
-                .iter()
-                .position(|row| row.path == pending.path && row.source == pending.source)
-            {
-                Some(index) => {
+        let stage =
+            match pending.stage {
+                OpenStage::Requested => {
+                    let Some(index) = self
+                        .conversations
+                        .iter()
+                        .position(|row| row.path == pending.path && row.source == pending.source)
+                    else {
+                        self.set_status("Session not found".to_owned());
+                        return true;
+                    };
                     let row = view_state::OpenedRow::of(&self.conversations[index]);
+                    OpenStage::Reading(view_state::ViewerRead::of_row(
+                        row,
+                        self.interactive_cache(),
+                    ))
+                }
+                OpenStage::Reading(read) => match read.finish(wait) {
+                    Ok((row, read)) => OpenStage::Rendering(Box::new(
+                        self.request_opened_view_rows(row, read, frame_width),
+                    )),
+                    Err(read) => OpenStage::Reading(read),
+                },
+                OpenStage::Rendering(state) => {
                     self.pending_open = Some(PendingOpen {
-                        read: Some(view_state::ViewerRead::of_row(
-                            row,
-                            self.interactive_cache(),
-                        )),
+                        stage: OpenStage::Rendering(state),
                         ..pending
                     });
+                    self.receive_view_render(viewport_height, wait);
+                    return true;
                 }
-                None => self.set_status("Session not found".to_owned()),
-            }
-            return true;
-        };
-        match read.finish(wait) {
-            Ok((row, read)) => self.show_opened(row, read, frame_width),
-            Err(read) => {
-                self.pending_open = Some(PendingOpen {
-                    read: Some(read),
-                    ..pending
-                });
+            };
+        self.pending_open = Some(PendingOpen { stage, ..pending });
+        true
+    }
+
+    /// The viewer's state of the pending open while `viewer-render` renders
+    /// its rows.
+    fn opening_view(&self) -> Option<&ViewState> {
+        self.pending_open.as_ref()?.opening_view()
+    }
+
+    /// End the pending open with `rendered`, its rows: show its viewer with
+    /// them, `viewport_height` rows high, then follow the finished refreshes
+    /// the list has not applied yet.
+    fn finish_open(
+        &mut self,
+        viewport_height: usize,
+        rendered: crate::tui::viewer::RenderedConversation,
+    ) {
+        if let Some(state) = self.take_opening_view() {
+            self.app_mode = AppMode::View(*state);
+        }
+        self.show_awaited_render(viewport_height, rendered);
+        self.follow_unapplied_refreshes();
+    }
+
+    /// The pending open's viewer state while its rows render, ending the
+    /// open; `None`, the open kept, at an earlier stage.
+    fn take_opening_view(&mut self) -> Option<Box<ViewState>> {
+        match self.pending_open.take() {
+            Some(PendingOpen {
+                stage: OpenStage::Rendering(state),
+                ..
+            }) => Some(state),
+            pending => {
+                self.pending_open = pending;
+                None
             }
         }
-        true
     }
 
     /// True while the file opened directly, already shown, is read again:

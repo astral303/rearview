@@ -1072,11 +1072,21 @@ fn ctrl_r_pressed_while_session_caches_in_background_runs_after_it() {
         &mut terminal,
         vec![key(KeyCode::Enter, KeyModifiers::NONE)],
     );
+    // Take the other rearview's ownership before the refresh the open's read
+    // asks for begins: it begins on the next pass, during the open's render.
+    assert!(
+        ticks_reach(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            App::is_session_refresh_requested
+        ),
+        "the open's read asks for a session refresh"
+    );
+    let other_refresh = AnotherRearviewsRefresh::of(cache.path(), clock);
     tick_until(&mut runtime, &mut terminal, |app| {
         matches!(app.app_mode(), AppMode::View(_))
     });
-    assert!(runtime.app().is_session_refresh_requested());
-    let other_refresh = AnotherRearviewsRefresh::of(cache.path(), clock);
     tick_with(
         &mut runtime,
         &mut terminal,

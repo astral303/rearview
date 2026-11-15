@@ -29,8 +29,9 @@ type TerminalBackend = ShowAfterMove<CrosstermBackend<BufWriter<Stderr>>>;
 /// write.
 const FRAME_BUFFER_BYTES: usize = 256 * 1024;
 
-/// The longest a pass waits for the viewer's read before drawing the next
-/// frame. Terminal events stay unread until the viewer shows.
+/// The longest a pass waits for the read or the render of the session it
+/// opens before drawing the next frame. Terminal events stay unread until the
+/// open ends, with the viewer or on the list.
 const OPENING_REDRAW_INTERVAL: Duration = Duration::from_millis(50);
 
 struct TerminalGuard {
@@ -305,10 +306,11 @@ impl Runtime {
         self.app.receive_fork_read();
         self.app.note_open_session_update();
         draw_frame(&self.app, terminal)?;
-        if self
-            .app
-            .complete_pending_open(frame_state.frame_width(), OPENING_REDRAW_INTERVAL)
-            || self.app.complete_pending_view_refresh(Duration::ZERO)
+        if self.app.complete_pending_open(
+            frame_state.frame_width(),
+            frame_state.viewport_height,
+            OPENING_REDRAW_INTERVAL,
+        ) || self.app.complete_pending_view_refresh(Duration::ZERO)
         {
             return Ok(Tick::Continue);
         }

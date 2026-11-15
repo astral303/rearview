@@ -71,6 +71,21 @@ impl ReloadedSession {
 }
 
 impl ViewState {
+    /// The options the conversation renders with: the view's modes, width
+    /// and expanded outputs, `today` and `zone`.
+    fn render_options(&self, today: chrono::NaiveDate, zone: crate::clock::Zone) -> RenderOptions {
+        RenderOptions {
+            tool_display: self.tool_display,
+            show_thinking: self.show_thinking,
+            show_timing: self.show_timing,
+            content_width: self.content_width(),
+            expanded_tool_outputs: self.expanded_tool_outputs.clone(),
+            can_expand: true,
+            today,
+            zone,
+        }
+    }
+
     /// Replace the view's publication with `reloaded`'s, or with the
     /// publication of the copy the read adopted in the row's place. The
     /// header shows `copy_row`, the catalogue row of the copy the view
@@ -494,8 +509,9 @@ impl OpenSessionRead {
 pub(super) const SESSION_READ_FAILED: &str = "Refresh failed: the session could not be read";
 
 impl App {
-    /// Open the selected session at once; the event loop defers through
-    /// `request_open` and `complete_pending_open` instead.
+    /// Open the selected session at once, reading and rendering it on this
+    /// thread; the event loop defers through `request_open` and
+    /// `complete_pending_open` instead.
     #[cfg(test)]
     pub fn enter_view_mode(&mut self, frame_width: usize) {
         let Some(selected) = self.selected else {
@@ -506,18 +522,42 @@ impl App {
         };
         let row = OpenedRow::of(&self.conversations[conv_idx]);
         let read = row.read(&self.interactive_cache());
-        self.show_opened(row, read, frame_width);
+        let state = self.take_opened_view(row, read, frame_width);
+        let rendered = crate::tui::viewer::render_parsed_conversation(
+            &state.parsed_conversation,
+            &self.view_render_options(&state),
+        );
+        self.app_mode = AppMode::View(state);
+        // A first render shows from the top whatever the viewport's height.
+        self.show_render(0, rendered);
     }
 
-    /// Show `row` in the viewer, from `read`, the viewer's read of its copy.
-    pub(super) fn show_opened(
+    /// The viewer's state for `row`, from `read`, the viewer's read of its
+    /// copy, with its render requested of `viewer-render` at `frame_width`.
+    /// [`Self::receive_view_render`] shows the viewer once its rows arrive.
+    pub(super) fn request_opened_view_rows(
         &mut self,
         row: OpenedRow,
         read: Option<InteractiveRead<ViewedConversation>>,
         frame_width: usize,
-    ) {
-        use crate::tui::viewer::{content_width, render_parsed_conversation};
+    ) -> ViewState {
+        let now = self.clock().now();
+        let mut state = self.take_opened_view(row, read, frame_width);
+        let options = self.view_render_options(&state);
+        request_render(&mut self.viewer_render, &mut state, options, now);
+        state
+    }
 
+    /// The viewer's state for `row`, from `read`, before any render: without
+    /// rows, at the top, nothing focused. Its first render's rows show from
+    /// the top, the first message focused ([`Self::show_render`]). Records
+    /// the read's next step.
+    fn take_opened_view(
+        &mut self,
+        row: OpenedRow,
+        read: Option<InteractiveRead<ViewedConversation>>,
+        frame_width: usize,
+    ) -> ViewState {
         let OpenedRow {
             path,
             source,
@@ -531,67 +571,24 @@ impl App {
             Some(read) => self.take_viewer_read(&path, read, ReadCause::UserAction),
             None => ViewerCopy::missing(),
         };
-        let is_copy_missing = copy.conversation.is_none();
-        let conversation = copy
-            .conversation
-            .unwrap_or_else(|| Arc::new(ParsedConversation::empty()));
-        let options = RenderOptions {
-            tool_display: self.tool_display,
-            show_thinking: self.show_thinking,
-            show_timing: self.show_timing,
-            content_width: content_width(frame_width, self.show_timing),
-            expanded_tool_outputs: BTreeSet::new(),
-            can_expand: true,
-            today: self.today(),
-            zone: self.clock().zone(),
-        };
-        let rendered = render_parsed_conversation(&conversation, &options);
-        let total_lines = rendered.lines.len();
-        let first_msg = (!rendered.messages.is_empty()).then_some(Focus {
-            message_index: 0,
-            call_index: None,
-        });
-        let mut state = ViewState {
-            conversation_path: path,
-            conversation_source: Some(source),
-            cache_address,
-            session_id: Some(session_id),
-            publication,
-            header: Some(header),
-            parsed_conversation: conversation,
-            shown_copy: copy.identity,
-            scroll_offset: 0,
-            rendered_lines: Arc::new(rendered.lines),
-            total_lines,
-            tool_display: self.tool_display,
-            show_thinking: self.show_thinking,
-            show_timing: self.show_timing,
-            frame_width,
-            search_mode: ViewSearchMode::Off,
-            search_query: String::new(),
-            search_matches: Vec::new(),
-            current_match_index: 0,
-            pending_search: None,
-            message_ranges: rendered.messages,
-            call_ranges: rendered.calls,
-            detail_calls: rendered.detail_calls,
-            focus: first_msg,
-            message_nav_active: false,
-            expanded_tool_outputs: BTreeSet::new(),
-            hovered_tool_output: None,
-            count_highlight: None,
-            is_copy_missing,
-            rows_read: RowsRead::Current,
-            pending_render: None,
-            entries_to_render_again: BTreeSet::new(),
-            run_outputs_to_render_again: BTreeSet::new(),
-            focus_first_call_of: None,
-            runs_deferred_copy_once_shown: false,
-            updating_since: None,
-            reload_rows_shown_at: None,
-        };
+        let mut state = ViewState::initial(
+            path,
+            Some(source),
+            Some(session_id),
+            self.tool_display,
+            self.show_thinking,
+        );
+        state.cache_address = cache_address;
+        state.publication = publication;
+        state.header = Some(header);
+        state.is_copy_missing = copy.conversation.is_none();
+        if let Some(conversation) = copy.conversation {
+            state.replace_conversation(conversation, copy.identity);
+        }
+        state.show_timing = self.show_timing;
+        state.frame_width = frame_width;
         state.show_copy_header_and_adopt(copy.row, external_title.as_ref(), copy.adopted);
-        self.app_mode = AppMode::View(state);
+        state
     }
 
     /// `read`, the viewer's read of the session at `path` for `cause`, with
@@ -687,29 +684,56 @@ impl App {
         let AppMode::View(state) = &self.app_mode else {
             return;
         };
-        let read = self
+        if let Some(read) = self
             .store
             .newest_finished()
-            .and_then(|finished| OpenSessionRead::in_finished(finished, state));
+            .and_then(|finished| OpenSessionRead::in_finished(finished, state))
+        {
+            self.follow_open_session_read(read);
+        }
+    }
+
+    /// Follow each finished refresh the list has not applied yet, oldest
+    /// first, as [`Self::follow_open_session`] follows a refresh finishing in
+    /// the viewer, until one leaves the viewer. Call it once an open shows
+    /// its viewer: the list doesn't apply refreshes while an open is pending.
+    pub(super) fn follow_unapplied_refreshes(&mut self) {
+        let AppMode::View(state) = &self.app_mode else {
+            return;
+        };
+        let reads: Vec<OpenSessionRead> = self
+            .store
+            .finished_refreshes()
+            .filter_map(|finished| OpenSessionRead::in_finished(finished, state))
+            .collect();
+        for read in reads {
+            if !matches!(self.app_mode, AppMode::View(_)) {
+                return;
+            }
+            self.follow_open_session_read(read);
+        }
+    }
+
+    /// Follow `read`, a finished refresh's read of the open session.
+    fn follow_open_session_read(&mut self, read: OpenSessionRead) {
         match read {
-            Some(OpenSessionRead::Listed(reloaded)) => self.queue_open_session_reload(reloaded),
-            Some(OpenSessionRead::Gone(status)) => {
+            OpenSessionRead::Listed(reloaded) => self.queue_open_session_reload(reloaded),
+            OpenSessionRead::Gone(status) => {
                 self.deferred_copy = None;
                 if !self.single_file_mode {
                     self.exit_view_mode();
                 }
                 self.set_status(status.to_owned());
             }
-            Some(OpenSessionRead::Failed(status)) => {
+            OpenSessionRead::Failed(status) => {
                 self.set_status(status);
                 self.run_deferred_copy();
             }
-            Some(OpenSessionRead::Retitled(title)) => {
+            OpenSessionRead::Retitled(title) => {
                 if let AppMode::View(state) = &mut self.app_mode {
                     state.show_retitled(&title);
                 }
             }
-            None => {}
         }
     }
 
@@ -1173,26 +1197,10 @@ impl App {
             return;
         };
         let options = self.view_render_options(state);
-        let conversation = Arc::clone(&state.parsed_conversation);
-        let generation = self
-            .viewer_render
-            .get_or_insert_with(super::viewer_render::ViewerRenderWorker::spawn)
-            .render(conversation, options);
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
-        // The render has every expanded output in its options.
-        state.entries_to_render_again.clear();
-        state.run_outputs_to_render_again.clear();
-        match &mut state.pending_render {
-            Some(pending) => pending.generation = generation,
-            None => {
-                state.pending_render = Some(PendingRender {
-                    generation,
-                    since: now,
-                });
-            }
-        }
+        request_render(&mut self.viewer_render, state, options, now);
     }
 
     /// True while a render of the open conversation runs and its rows
@@ -1325,16 +1333,21 @@ impl App {
     /// Show the newest render's rows once they arrive, waiting up to `wait`
     /// for a finished render. Call it on every pass, with the viewer open or
     /// closed: the `viewer-render` thread starts the next render only once
-    /// the finished one is taken and its rows released. A render finished
-    /// for an earlier request or a closed viewer isn't shown. The rows no
-    /// longer shown, or the render's when it isn't shown, are sent to the
-    /// `viewer-render` thread to be freed there. Once a reload's rows show,
-    /// the reload queued behind it starts its read. A panic on the
-    /// `viewer-render` thread resumes here. Then the messages waiting to
-    /// render again render in the rows shown. Once nothing waits to show,
-    /// the first call of the message of the entry in `focus_first_call_of`
-    /// is focused, and then, after a render's rows showed, the deferred copy
-    /// runs.
+    /// the finished one is taken and its rows released.
+    ///
+    /// - A render finished for an earlier request or a closed viewer isn't
+    ///   shown.
+    /// - The rows no longer shown, or the render's when it isn't shown, are
+    ///   sent to the `viewer-render` thread to be freed there.
+    /// - Once a reload's rows show, the reload queued behind it starts its
+    ///   read.
+    /// - Once a pending open's rows arrive, its viewer shows them and follows
+    ///   the finished refreshes the list has not applied yet.
+    /// - A panic on the `viewer-render` thread resumes here.
+    /// - Then the messages waiting to render again render in the rows shown.
+    /// - Once nothing waits to show, the first call of the message of the
+    ///   entry in `focus_first_call_of` is focused.
+    /// - Then, after a render's rows showed, the deferred copy runs.
     pub(crate) fn receive_view_render(&mut self, viewport_height: usize, wait: Duration) {
         self.receive_whole_render(viewport_height, wait);
         self.render_messages_again(viewport_height);
@@ -1355,31 +1368,50 @@ impl App {
     }
 
     fn receive_whole_render(&mut self, viewport_height: usize, wait: Duration) {
-        let Some(worker) = self.viewer_render.as_mut() else {
+        let Some(rendered) = self
+            .viewer_render
+            .as_mut()
+            .and_then(|worker| worker.take_rendered(wait))
+        else {
             return;
         };
-        let Some(rendered) = worker.take_rendered(wait) else {
-            return;
-        };
-        let awaited = match &self.app_mode {
-            AppMode::View(state) => state
+        let generation = rendered.generation;
+        let awaits = |state: &ViewState| {
+            state
                 .pending_render
-                .filter(|pending| pending.generation == rendered.generation),
-            AppMode::List => None,
+                .is_some_and(|pending| pending.generation == generation)
         };
-        if awaited.is_none() {
-            worker.release(Arc::new(rendered.rendered_conversation.lines));
-            return;
+        if matches!(&self.app_mode, AppMode::View(state) if awaits(state)) {
+            self.show_awaited_render(viewport_height, rendered.rendered_conversation);
+        } else if self.opening_view().is_some_and(awaits) {
+            self.finish_open(viewport_height, rendered.rendered_conversation);
+        } else {
+            self.release_rows(Arc::new(rendered.rendered_conversation.lines));
         }
+    }
+
+    /// Show `rendered`, the render the viewer awaits, and release the rows it
+    /// replaces. Once a reload's rows show, the reload queued behind it
+    /// starts.
+    pub(super) fn show_awaited_render(
+        &mut self,
+        viewport_height: usize,
+        rendered: RenderedConversation,
+    ) {
         if let AppMode::View(state) = &mut self.app_mode {
             state.pending_render = None;
             state.runs_deferred_copy_once_shown = true;
         }
-        let replaced = self.show_render(viewport_height, rendered.rendered_conversation);
-        if let Some(worker) = &self.viewer_render {
-            worker.release(replaced);
-        }
+        let replaced = self.show_render(viewport_height, rendered);
+        self.release_rows(replaced);
         self.start_or_show_queued_reload();
+    }
+
+    /// Free `rows`, no longer shown, on the `viewer-render` thread.
+    fn release_rows(&self, rows: Arc<Vec<RenderedLine>>) {
+        if let Some(worker) = &self.viewer_render {
+            worker.release(rows);
+        }
     }
 
     /// Focus the first call of the focused message when that message is
@@ -1398,16 +1430,7 @@ impl App {
     /// The options `state`'s conversation renders with: the view's modes,
     /// width and expanded outputs, today's date and the clock's zone.
     pub(super) fn view_render_options(&self, state: &ViewState) -> RenderOptions {
-        RenderOptions {
-            tool_display: state.tool_display,
-            show_thinking: state.show_thinking,
-            show_timing: state.show_timing,
-            content_width: state.content_width(),
-            expanded_tool_outputs: state.expanded_tool_outputs.clone(),
-            can_expand: true,
-            today: self.today(),
-            zone: self.clock().zone(),
-        }
+        state.render_options(self.today(), self.clock().zone())
     }
 
     /// Show `rendered`, a render of the open conversation, keeping the anchor
@@ -2130,13 +2153,23 @@ impl App {
         )
     }
 
+    /// Render the viewer's rows again, or the pending open's, for a frame
+    /// `frame_width` columns wide when they were requested for another width.
     pub fn check_view_resize(&mut self, frame_width: usize) {
-        if let AppMode::View(ref mut state) = self.app_mode
-            && state.frame_width != frame_width
-        {
-            state.frame_width = frame_width;
-            self.request_view_render();
-        }
+        let (now, today, zone) = (self.clock().now(), self.today(), self.clock().zone());
+        let state = match &mut self.app_mode {
+            AppMode::View(state) => Some(state),
+            AppMode::List => self
+                .pending_open
+                .as_mut()
+                .and_then(super::PendingOpen::opening_view_mut),
+        };
+        let Some(state) = state.filter(|state| state.frame_width != frame_width) else {
+            return;
+        };
+        state.frame_width = frame_width;
+        let options = state.render_options(today, zone);
+        request_render(&mut self.viewer_render, state, options, now);
     }
 }
 
@@ -2173,6 +2206,32 @@ impl FocusDrift {
             Self::OnScreen => current,
             Self::OffTop => on_screen.next(),
             Self::OffBottom => on_screen.next_back(),
+        }
+    }
+}
+
+/// Ask `worker`, the `viewer-render` thread, started by the first request,
+/// for a render of `state`'s conversation with `options`, made at `now`,
+/// superseding the running render.
+fn request_render(
+    worker: &mut Option<super::viewer_render::ViewerRenderWorker>,
+    state: &mut ViewState,
+    options: RenderOptions,
+    now: crate::clock::Moment,
+) {
+    let generation = worker
+        .get_or_insert_with(super::viewer_render::ViewerRenderWorker::spawn)
+        .render(Arc::clone(&state.parsed_conversation), options);
+    // The render has every expanded output in its options.
+    state.entries_to_render_again.clear();
+    state.run_outputs_to_render_again.clear();
+    match &mut state.pending_render {
+        Some(pending) => pending.generation = generation,
+        None => {
+            state.pending_render = Some(PendingRender {
+                generation,
+                since: now,
+            });
         }
     }
 }
