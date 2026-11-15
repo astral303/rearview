@@ -32,8 +32,8 @@ use std::path::Path;
 #[cfg(test)]
 pub(super) use context::CALLS_AND_RESULTS;
 pub(super) use diff::{replace_leading, rewrite_in_place, update, update_tail};
-pub(crate) use hashes::EntryHashes;
-pub(super) use hashes::read as read_hashes;
+pub(crate) use hashes::{EntryHashes, SequencedHashes};
+pub(super) use hashes::{read as read_hashes, read_sequenced as read_sequenced_hashes};
 #[cfg(test)]
 pub(super) use parts::PART_ROW_BUILDS;
 pub(super) use parts::SearchOnlyKind;
@@ -333,6 +333,21 @@ pub(super) fn read(
     messages: Option<RangeInclusive<u64>>,
 ) -> Result<TranscriptEntries> {
     let selected = Selection::new(session, messages);
+    Ok(read_selected(connection, session, places, &selected)?.transcript)
+}
+
+/// The entries of `session` from the entry whose `sequence` is
+/// `first_sequence` on, each decoded as [`read`] decodes it.
+pub(super) fn read_from(
+    connection: &Connection,
+    session: i64,
+    places: &Places,
+    first_sequence: i64,
+) -> Result<TranscriptEntries> {
+    let selected = Selection::of(
+        "SELECT id FROM entries WHERE session = ?1 AND sequence >= ?2",
+        vec![session.into(), first_sequence.into()],
+    );
     Ok(read_selected(connection, session, places, &selected)?.transcript)
 }
 

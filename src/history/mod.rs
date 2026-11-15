@@ -45,8 +45,9 @@ use std::path::PathBuf;
 // Re-export public API
 pub(crate) use content::SemanticContent;
 pub use display_entries::{
-    DisplayEntries, EntryOrigin, RecordedIdentity, display_log_entries_interactively,
-    printed_log_entries, sniffed_display_log_entries, viewed_copy_interactively,
+    CopyTail, DisplayEntries, EntryOrigin, RecordedIdentity, RereadCopy,
+    display_log_entries_interactively, printed_log_entries, reread_copy_interactively,
+    sniffed_display_log_entries, viewed_copy_interactively,
 };
 pub use environment::Environment;
 pub use filter::{FilterTerm, HistoryFilter, active_load_filters};
