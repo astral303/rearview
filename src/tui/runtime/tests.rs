@@ -555,7 +555,7 @@ fn launch_behind_another_rearviews_refresh_lists_cache_as_it_is_under_label() {
         home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock.clone());
     home.rows(&environment);
     home.append(&a, 6, "written after the cache");
-    let other_refresh = acquired_elsewhere(another_rearview(cache.path(), clock));
+    let other_refresh = AnotherRearviewsRefresh::of(cache.path(), clock);
     let mut runtime = launched_in(environment);
     let mut terminal = terminal();
 
@@ -654,7 +654,7 @@ fn launch_behind_another_refresh_waits_out_locked_database_and_refreshes() {
         home.environment_with_cache(cache.path(), ProcessIdentity::default(), clock.clone());
     home.rows(&environment);
     home.append(&a, 6, "written after the cache");
-    let other_refresh = acquired_elsewhere(another_rearview(cache.path(), clock));
+    let other_refresh = AnotherRearviewsRefresh::of(cache.path(), clock);
     let locked = LockedAtNewOwnersFirstWriter::on(cache.path());
     let mut runtime = launched_in(environment);
     let mut terminal = terminal();
@@ -770,7 +770,7 @@ fn list_refresh_waiting_at_quit_doesnt_refresh_once_other_rearview_finishes() {
     ));
     let mut terminal = terminal();
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
-    let other_refresh = acquired_elsewhere(another_rearview(cache.path(), clock.clone()));
+    let other_refresh = AnotherRearviewsRefresh::of(cache.path(), clock.clone());
     home.append(&a, 6, "written after the launch");
     tick_with(
         &mut runtime,
@@ -863,11 +863,6 @@ fn quitting_during_launch_stops_it_before_its_next_parse() {
     );
 }
 
-/// The longest a quit during a held parse may take. The quit does not wait
-/// for the parse: the limit allows for a loaded test machine and is under a
-/// third of the [`BACKGROUND_WORK_LIMIT`] the parse is held for.
-const QUIT_DURING_PARSE_LIMIT: Duration = Duration::from_secs(3);
-
 #[test]
 fn quitting_during_parse_returns_without_waiting_for_it() {
     let cache = admitted_cache();
@@ -876,28 +871,37 @@ fn quitting_during_parse_returns_without_waiting_for_it() {
     let (mut runtime, watch, _roots) =
         launched_with_first_parse_held(cache.path(), clock.clone(), &mut terminal);
     // Release the parse once the quit returns, or after
-    // `BACKGROUND_WORK_LIMIT` should the quit wait for the parse.
+    // `BACKGROUND_WORK_LIMIT` should the quit wait for the parse. The
+    // releasing thread returns true when the quit returned first.
     let (quit_returned, has_quit_returned) = mpsc::channel::<()>();
     let releaser = watch.clone();
-    std::thread::spawn(move || {
-        let _ = has_quit_returned.recv_timeout(BACKGROUND_WORK_LIMIT);
+    let release = std::thread::spawn(move || {
+        let returned_first = has_quit_returned
+            .recv_timeout(BACKGROUND_WORK_LIMIT)
+            .is_ok();
         releaser.release();
+        returned_first
     });
 
-    let quitting = Instant::now();
+    let busy_waits = test_hooks::BusyWaits::record_on_this_thread();
     let tick = tick_with(
         &mut runtime,
         &mut terminal,
         vec![key(KeyCode::Esc, KeyModifiers::NONE)],
     );
     drop(runtime);
-    let quit_took = quitting.elapsed();
+    let waits = busy_waits.take();
     let _ = quit_returned.send(());
+    let quit_returned_during_the_parse = release.join().unwrap();
 
     assert!(matches!(tick, Tick::Exit(Action::Quit)));
     assert!(
-        quit_took < QUIT_DURING_PARSE_LIMIT,
-        "the quit returns while the parse runs: {quit_took:?}"
+        quit_returned_during_the_parse,
+        "the quit returns while the parse runs"
+    );
+    assert!(
+        waits.iter().all(Duration::is_zero),
+        "the quit doesn't wait for SQLite's locks: {waits:?}"
     );
     wait_until_another_rearview_acquires(cache.path(), clock);
 }
@@ -1072,7 +1076,7 @@ fn ctrl_r_pressed_while_session_caches_in_background_runs_after_it() {
         matches!(app.app_mode(), AppMode::View(_))
     });
     assert!(runtime.app().is_session_refresh_requested());
-    let other_refresh = acquired_elsewhere(another_rearview(cache.path(), clock));
+    let other_refresh = AnotherRearviewsRefresh::of(cache.path(), clock);
     tick_with(
         &mut runtime,
         &mut terminal,
@@ -1161,9 +1165,48 @@ fn launched_over_cache(
     runtime
 }
 
-/// Refresh ownership of `cache` held by another rearview until dropped.
-fn another_rearviews_refresh(cache: &Path) -> RefreshOwnership {
-    acquired_elsewhere(another_rearview(cache, Arc::new(SystemClock::new())))
+/// Another rearview's refresh of a cache, inside a write batch until the
+/// batch ends, and owning the cache until dropped. A waiter for refresh
+/// ownership doesn't take over a refresh inside a write batch; it takes over
+/// an idle one once the takeover window passes, which a slow run reaches on
+/// the system clock and a waiter's polls reach on a test clock within a
+/// fraction of a second. The batch doesn't change the launch's first
+/// observation, which still judges the commit's age on the launch's clock.
+struct AnotherRearviewsRefresh {
+    /// Declared before the ownership, so the batch ends first.
+    batch: Option<rusqlite::Connection>,
+    _ownership: RefreshOwnership,
+    clock: Arc<dyn Clock>,
+}
+
+impl AnotherRearviewsRefresh {
+    /// Another rearview's refresh of the cache in `cache`, on `clock`.
+    fn of(cache: &Path, clock: Arc<dyn Clock>) -> Self {
+        let ownership = acquired_elsewhere(another_rearview(cache, Arc::clone(&clock)));
+        Self {
+            batch: Some(writer_lock_held(cache)),
+            _ownership: ownership,
+            clock,
+        }
+    }
+
+    /// Commit the write batch with its time, as a refresh's batch commits.
+    /// The refresh owns the cache, idle, until dropped.
+    fn end_batch(&mut self) {
+        let batch = self.batch.take().expect("the batch hasn't ended");
+        batch
+            .execute(
+                "UPDATE refresh_state SET last_commit_ms = ?1",
+                [self.clock.wall().timestamp_millis()],
+            )
+            .unwrap();
+        batch.execute_batch("COMMIT").unwrap();
+    }
+}
+
+/// Another rearview's refresh of `cache` on the system clock, until dropped.
+fn another_rearviews_refresh(cache: &Path) -> AnotherRearviewsRefresh {
+    AnotherRearviewsRefresh::of(cache, Arc::new(SystemClock::new()))
 }
 
 /// Open the selected session in the viewer.
@@ -1193,7 +1236,9 @@ enum Hold {
     /// No other rearview runs; this rearview's own commit waits at a gate.
     ThisRearviewsCommit { _gate: CommitGate },
     /// Another rearview's refresh owns the cache.
-    AnotherRearviewsRefresh { _ownership: RefreshOwnership },
+    AnotherRearviewsRefresh {
+        _refresh: Box<AnotherRearviewsRefresh>,
+    },
 }
 
 impl Hold {
@@ -1205,7 +1250,7 @@ impl Hold {
 
     fn another_rearviews_refresh(cache: &Path) -> Self {
         Self::AnotherRearviewsRefresh {
-            _ownership: another_rearviews_refresh(cache),
+            _refresh: Box::new(another_rearviews_refresh(cache)),
         }
     }
 
@@ -1939,10 +1984,6 @@ fn rename_and_delete_stay_available_while_launch_waits_for_another_rearviews_ref
     home.rows(&environment);
     home.append(&a, 6, "written after the cache");
     let other_refresh = another_rearviews_refresh(cache.path());
-    // A waiter's polls on the test clock reach the takeover window within a
-    // fraction of a second, and the launch may take over an idle refresh
-    // between two ticks. It waits behind a write batch until the batch ends.
-    let other_refresh_batch = writer_lock_held(cache.path());
     let mut runtime = launched_in(environment);
     let mut terminal = terminal();
     assert!(
@@ -1962,7 +2003,6 @@ fn rename_and_delete_stay_available_while_launch_waits_for_another_rearviews_ref
         runtime.app().is_action_available(SessionAction::Delete),
         "Delete doesn't wait for another rearview's refresh"
     );
-    drop(other_refresh_batch);
     drop(other_refresh);
     tick_until(&mut runtime, &mut terminal, |app| !app.is_loading());
 }
@@ -2746,7 +2786,7 @@ fn transcript_changed_while_refresh_waits_for_ownership_is_read_again_after_its_
     let mut runtime = launched_over_cache(&home, cache.path(), &mut terminal);
     open_the_selected_session(&mut runtime, &mut terminal);
     home.append(&a, 6, "newer question");
-    let other_rearviews_refresh = another_rearviews_refresh(cache.path());
+    let mut other_rearviews_refresh = another_rearviews_refresh(cache.path());
     tick_with(
         &mut runtime,
         &mut terminal,
@@ -2759,6 +2799,7 @@ fn transcript_changed_while_refresh_waits_for_ownership_is_read_again_after_its_
     );
 
     home.append(&a, 7, "newest question");
+    other_rearviews_refresh.end_batch();
     fail_acquisitions(cache.path());
     drop(other_rearviews_refresh);
     // Hand the outcome to the app without a tick: a tick would also start

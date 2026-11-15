@@ -15,6 +15,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Instant, UNIX_EPOCH};
 
+/// The deadline for another thread's or process's step, or for SQLite's lock
+/// that one of them holds: a watchdog for a hang, not a limit on how fast
+/// the step comes. A passing run doesn't wait for it.
+const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+
 /// The cache in `directory` as one rearview reaches it, on the system clock:
 /// these tests interleave with real threads and processes.
 pub(crate) fn rearview(directory: &Path) -> CacheBase {
@@ -90,11 +95,6 @@ pub(crate) struct AnotherRearviewsOwner {
 }
 
 impl AnotherRearviewsOwner {
-    /// The longest the test waits for the other rearview to acquire
-    /// ownership and start its activity before it fails: a watchdog for a
-    /// hang.
-    const ACQUIRES_WITHIN: Duration = Duration::from_secs(60);
-
     pub(crate) fn hold(base: &Path) -> Self {
         Self::start(base, OwnerActivity::Idle)
     }
@@ -110,7 +110,7 @@ impl AnotherRearviewsOwner {
             });
         });
         is_ready
-            .recv_timeout(Self::ACQUIRES_WITHIN)
+            .recv_timeout(HANG_WATCHDOG)
             .expect("another rearview acquires ownership");
         Self {
             base: base.to_path_buf(),
@@ -184,7 +184,7 @@ impl OtherProcessOwner {
             child,
             base: base.to_path_buf(),
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         while !base.join("owner.ready").exists() {
             assert!(
                 owner.child.try_wait().unwrap().is_none(),
@@ -259,13 +259,19 @@ fn run_owner(base: &Path, activity: OwnerActivity, wait_for_release: impl FnOnce
     }
 }
 
+/// A connection for a test's own write to the cache in `base`. Its writes
+/// wait up to [`HANG_WATCHDOG`] for SQLite's writer lock: a rearview waiting
+/// for refresh ownership holds that lock through each of its attempts.
+fn connect_for_test_writes(base: &Path) -> Connection {
+    connect(base, HANG_WATCHDOG).unwrap()
+}
+
 /// Fail each write of a session's catalogue row to the cache in `base`, as a
 /// database that refuses the same statement each time does. The failed
 /// statement rolls its batch back without revoking the owner's write
 /// permission.
 pub(crate) fn fail_session_row_writes(base: &Path) {
-    connect(base, POLL_EVERY)
-        .unwrap()
+    connect_for_test_writes(base)
         .execute_batch(
             "CREATE TRIGGER fail_session_update AFTER UPDATE ON sessions \
              BEGIN SELECT RAISE(ABORT, 'injected session write failure'); END; \
@@ -279,8 +285,7 @@ pub(crate) fn fail_session_row_writes(base: &Path) {
 /// database that cannot record a commit fails it, until
 /// [`allow_owner_commits`].
 pub(crate) fn fail_owner_commits(base: &Path) {
-    connect(base, POLL_EVERY)
-        .unwrap()
+    connect_for_test_writes(base)
         .execute_batch(
             "CREATE TRIGGER fail_owner_commit BEFORE UPDATE OF last_commit_ms ON refresh_state \
              WHEN NEW.owner = OLD.owner \
@@ -291,8 +296,7 @@ pub(crate) fn fail_owner_commits(base: &Path) {
 
 /// Undo [`fail_owner_commits`].
 pub(crate) fn allow_owner_commits(base: &Path) {
-    connect(base, POLL_EVERY)
-        .unwrap()
+    connect_for_test_writes(base)
         .execute_batch("DROP TRIGGER fail_owner_commit")
         .unwrap();
 }
@@ -301,8 +305,7 @@ pub(crate) fn allow_owner_commits(base: &Path) {
 /// database that refuses the write to its refresh state does, until
 /// [`allow_acquisitions`].
 pub(crate) fn fail_acquisitions(base: &Path) {
-    connect(base, POLL_EVERY)
-        .unwrap()
+    connect_for_test_writes(base)
         .execute_batch(
             "CREATE TRIGGER fail_acquisition AFTER UPDATE OF owner ON refresh_state \
              WHEN NEW.owner IS NOT NULL AND NEW.owner IS NOT OLD.owner \
@@ -313,8 +316,7 @@ pub(crate) fn fail_acquisitions(base: &Path) {
 
 /// Undo [`fail_acquisitions`].
 pub(crate) fn allow_acquisitions(base: &Path) {
-    connect(base, POLL_EVERY)
-        .unwrap()
+    connect_for_test_writes(base)
         .execute_batch("DROP TRIGGER fail_acquisition")
         .unwrap();
 }
@@ -343,8 +345,7 @@ pub(crate) fn writer_lock_held(base: &Path) -> rusqlite::Connection {
 
 /// Make the refresh owner's last commit older than the takeover window.
 pub(crate) fn expire_last_commit(base: &Path) {
-    connect(base, POLL_EVERY)
-        .unwrap()
+    connect_for_test_writes(base)
         .execute("UPDATE refresh_state SET last_commit_ms = 0", [])
         .unwrap();
 }
@@ -707,9 +708,9 @@ fn owners_parse_whose_commit_fails_fails_with_commits_error() {
 }
 
 /// The panic message of a parse of an owner's batch that runs `take_turn`
-/// with the owner's token, on a thread of its own. Fail the test after ten
-/// seconds instead of hanging it: a parse that takes the turn waits forever
-/// behind its own batch.
+/// with the owner's token, on a thread of its own. Fail the test after
+/// [`HANG_WATCHDOG`] instead of hanging it: a parse that takes the turn waits
+/// forever behind its own batch.
 #[cfg(debug_assertions)]
 fn panic_of_parse_running(take_turn: fn(&RefreshToken)) -> String {
     let (ended, has_ended) = mpsc::channel();
@@ -730,7 +731,7 @@ fn panic_of_parse_running(take_turn: fn(&RefreshToken)) -> String {
         let _ = ended.send(message);
     });
     has_ended
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(HANG_WATCHDOG)
         .expect("the parse ends instead of waiting for its owner's turn")
         .expect("the parse panics")
 }
@@ -805,10 +806,7 @@ fn long_batch_blocks_takeover_and_timestamps_its_end() {
             "the waiter uses the timestamp from after the active batch commits"
         );
         drop(owner);
-        receive
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        receive.recv_timeout(HANG_WATCHDOG).unwrap().unwrap();
     });
 }
 
@@ -853,10 +851,7 @@ fn rebuild_exclusion_survives_commits_and_waiting_connections() {
             "the waiter uses the rebuild's final timestamp"
         );
         drop(owner);
-        let replacement = receive
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let replacement = receive.recv_timeout(HANG_WATCHDOG).unwrap().unwrap();
         SqliteCache::open_for_refresh(replacement.token()).unwrap();
     });
 }
@@ -1143,10 +1138,10 @@ fn last_commit_ms(base: &Path) -> i64 {
         .unwrap()
 }
 
-/// Polls until `base`'s stored commit time is `expected`, failing after ten
-/// seconds.
+/// Polls until `base`'s stored commit time is `expected`, failing after
+/// [`HANG_WATCHDOG`].
 fn wait_for_commit_at(base: &Path, expected: i64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HANG_WATCHDOG;
     while last_commit_ms(base) != expected {
         assert!(
             Instant::now() < deadline,
@@ -1653,11 +1648,11 @@ fn connection_moved_and_used_is_held_by_its_new_thread_in_debug_check() {
         let holder = scope.spawn(move || {
             cache.is_admitted().unwrap();
             used.send(()).unwrap();
-            let _ = given_back.recv_timeout(Duration::from_secs(10));
+            let _ = given_back.recv_timeout(HANG_WATCHDOG);
             cache
         });
         is_used
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(HANG_WATCHDOG)
             .expect("the other thread uses the connection");
         let refused = base.refuse_connections(Duration::ZERO);
         assert!(
@@ -1701,7 +1696,7 @@ fn space_check_waiting_for_turn_when_quit_revokes_permission_leaves_latch_clear(
 
     let checked = thread::scope(|scope| {
         let check = scope.spawn(|| token.check_space());
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         while token.threads_waiting_for_turn() == 0 {
             assert!(Instant::now() < deadline, "the check waits for the turn");
             thread::yield_now();
@@ -1729,19 +1724,19 @@ fn space_check_answering_after_the_exits_wait_leaves_latch_clear() {
     let answered = Mutex::new(answered);
     let drive = super::super::DriveRunningOut::after(0, move || {
         checking.send(()).unwrap();
-        let _ = answered
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(10));
+        let _ = answered.lock().unwrap().recv_timeout(HANG_WATCHDOG);
     });
     let base = rearview(directory.path()).with_disk_space(Arc::new(drive));
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
     let token = owner.token();
 
     let checked = thread::scope(|scope| {
+        // Owned by the scope: a failed assertion drops it, and the check
+        // stops waiting for the answer.
+        let answer = answer;
         let check = scope.spawn(|| token.check_space());
         is_checking
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(HANG_WATCHDOG)
             .expect("the check reads the drive's free space");
         token.revoke();
         base.low_space().wait_for_checks(Duration::from_millis(50));
@@ -1767,18 +1762,18 @@ fn shutdown_during_own_write_batch_releases_without_busy_wait() {
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     let owner = RefreshOwnership::acquire_for_test(&base).unwrap();
-    let (in_batch, is_in_batch) = mpsc::channel();
-    let (end_batch, batch_may_end) = mpsc::channel::<()>();
 
     let waits = thread::scope(|scope| {
+        let (in_batch, is_in_batch) = mpsc::channel();
+        let (end_batch, batch_may_end) = mpsc::channel::<()>();
         scope.spawn(move || {
             owner.token().write_batch(|| {
                 in_batch.send(()).unwrap();
-                let _ = batch_may_end.recv_timeout(Duration::from_secs(10));
+                let _ = batch_may_end.recv_timeout(HANG_WATCHDOG);
             })
         });
         is_in_batch
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(HANG_WATCHDOG)
             .expect("the write batch begins");
         let busy_waits = connection::test_hooks::BusyWaits::record_on_this_thread();
         super::super::coordinator::Coordinator::of(&base)
@@ -1804,14 +1799,14 @@ fn low_space_deletion_refuses_this_rearviews_new_connections_and_empties_databas
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path())
         .with_free_space(900_000_000)
-        .with_low_space_wait(Duration::from_secs(5));
+        .with_low_space_wait(HANG_WATCHDOG);
     latch_low_space_as_first_write_does(&base);
     let (reader_started, has_reader_started) = mpsc::channel();
     let reader_base = base.clone();
 
     let (outcome, (refused, opened_after_deletion)) = thread::scope(|scope| {
         let reader = scope.spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + HANG_WATCHDOG;
             let mut held = SqliteCache::open_waiting(&reader_base).unwrap();
             reader_started.send(()).unwrap();
             let mut refused = false;
@@ -1831,7 +1826,7 @@ fn low_space_deletion_refuses_this_rearviews_new_connections_and_empties_databas
             (refused, false)
         });
         has_reader_started
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(HANG_WATCHDOG)
             .expect("the reader opens the cache");
         let outcome = run_deletion(&base);
         (outcome, reader.join().unwrap())
@@ -1856,7 +1851,7 @@ fn low_space_deletion_refuses_this_rearviews_new_connections_and_empties_databas
 /// Wait until `base`'s low-space deletion refuses this rearview's new
 /// connections: from then on it waits for the open ones to close.
 fn wait_for_refusal(base: &CacheBase) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HANG_WATCHDOG;
     while base.open_connection().is_ok() {
         assert!(
             Instant::now() < deadline,
@@ -1877,7 +1872,7 @@ fn low_space_deletion_waiting_for_reader_past_takeover_window_empties_database_c
     let clock = Arc::new(TestClock::default());
     let base = rearview_on(directory.path(), Arc::clone(&clock))
         .with_free_space(900_000_000)
-        .with_low_space_wait(Duration::from_secs(10));
+        .with_low_space_wait(HANG_WATCHDOG);
     latch_low_space_as_first_write_does(&base);
     let reader = SqliteCache::open_waiting(&base).unwrap().unwrap();
     let competing = rearview_on(directory.path(), Arc::clone(&clock));
@@ -1887,8 +1882,7 @@ fn low_space_deletion_waiting_for_reader_past_takeover_window_empties_database_c
         wait_for_refusal(&base);
         clock.advance(STALE_AFTER);
         let competitor = RefreshOwnership::acquire_for_test(&competing).unwrap();
-        connect(competing.path(), POLL_EVERY)
-            .unwrap()
+        connect_for_test_writes(competing.path())
             .execute(
                 "INSERT INTO meta (key, value) VALUES ('competitor', 'wrote')",
                 [],
@@ -1945,10 +1939,7 @@ fn rebuild_waits_at_begin_exclusive_for_open_reader_while_waiter_polls() {
                 .unwrap()
         });
         drop(reader);
-        receive
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        receive.recv_timeout(HANG_WATCHDOG).unwrap().unwrap();
         assert!(
             matches!(
                 waiting.recv_timeout(POLL_EVERY * 2),
@@ -1958,10 +1949,7 @@ fn rebuild_waits_at_begin_exclusive_for_open_reader_while_waiter_polls() {
         );
         drop(rebuild.join().unwrap());
         drop(owner);
-        waiting
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        waiting.recv_timeout(HANG_WATCHDOG).unwrap().unwrap();
     });
 }
 
@@ -2427,9 +2415,9 @@ fn uncontended_acquisition_doesnt_publish_wait() {
     drop(owner);
 }
 
-/// Wait until `status` publishes a wait, failing after five seconds.
+/// Wait until `status` publishes a wait, failing after [`HANG_WATCHDOG`].
 fn wait_for_a_published_wait(status: &WaitStatus) -> OtherRearview {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG_WATCHDOG;
     loop {
         if let Some(wait) = status.current() {
             return wait;
@@ -2637,6 +2625,61 @@ fn takeover_from_this_process_is_another_processs_refresh_until_it_completes() {
     drop(held);
 }
 
+/// Stops one thread inside each connection it opens to the session cache
+/// database in a base, until dropped. A refresh waiter stopped there doesn't
+/// have any connection to the cache open, and doesn't take SQLite's writer
+/// lock.
+struct ConnectionsStoppedOnThread {
+    is_released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    stopped: mpsc::Receiver<()>,
+    _hook: connection::test_hooks::Installed,
+}
+
+impl ConnectionsStoppedOnThread {
+    fn of(base: &Path, stopped_thread: thread::ThreadId) -> Self {
+        let is_released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::clone(&is_released);
+        let (stopping, stopped) = mpsc::channel();
+        let hook = connection::test_hooks::on_every_connection(base, move |_| {
+            if thread::current().id() != stopped_thread {
+                return;
+            }
+            let _ = stopping.send(());
+            let (is_released, released) = &*release;
+            let guard = is_released.lock().unwrap();
+            drop(
+                released
+                    .wait_while(guard, |is_released| !*is_released)
+                    .unwrap(),
+            );
+        });
+        Self {
+            is_released,
+            stopped,
+            _hook: hook,
+        }
+    }
+
+    /// Wait until the thread opens its next connection and is stopped there.
+    fn wait_until_stopped(&self) {
+        self.stopped
+            .recv_timeout(HANG_WATCHDOG)
+            .expect("the thread opens its next connection");
+    }
+}
+
+impl Drop for ConnectionsStoppedOnThread {
+    fn drop(&mut self) {
+        let (is_released, released) = &*self.is_released;
+        *is_released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        released.notify_all();
+    }
+}
+
+/// This thread clears the stored owner and takes ownership while the load is
+/// stopped between its polls. A poll between the clearing and this thread's
+/// acquisition would acquire first, and a poll holding the writer lock would
+/// fail the clearing as busy.
 #[test]
 fn this_processs_own_ownership_ends_its_wait_for_another_process() {
     let directory = tempfile::tempdir().unwrap();
@@ -2654,6 +2697,8 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
         let load =
             scope.spawn(|| RefreshOwnership::acquire(&base, &status, &Cancellation::default()));
         wait_for_a_published_wait(&status);
+        let load_stopped = ConnectionsStoppedOnThread::of(base.path(), load.thread().id());
+        load_stopped.wait_until_stopped();
 
         connection
             .execute("UPDATE refresh_state SET owner = NULL", [])
@@ -2661,8 +2706,9 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
         let Acquisition::Acquired(own) = RefreshOwnership::try_acquire_now(&base).unwrap() else {
             panic!("this thread acquires ownership before the load");
         };
+        drop(load_stopped);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         while status.current().is_some() {
             assert!(
                 Instant::now() < deadline,
@@ -2677,6 +2723,9 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
 
 #[test]
 fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
+    /// The longest busy wait a read without waiting records. The rebuild
+    /// holds its lock until the test ends.
+    const LONGEST_WAIT_WITHOUT_WAITING: Duration = Duration::from_secs(5);
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
@@ -2689,7 +2738,7 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
         )),
         "session.jsonl".to_owned(),
     );
-    let started = Instant::now();
+    let busy_waits = connection::test_hooks::BusyWaits::record_on_this_thread();
 
     let lookup = super::super::InteractiveCache::at(base.clone())
         .open()
@@ -2698,12 +2747,22 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
                 .map(|cache| super::super::found(cache.read_copy_at(&address, |_| Ok(()))))
                 .transpose()
         });
+    let waits = busy_waits.take();
+    drop(busy_waits);
+    let observation = observe(&base).unwrap();
 
     assert!(matches!(lookup, Err(error) if super::super::is_busy_error(&error)));
-    assert_eq!(observe(&base).unwrap(), Observation::Unknown);
+    assert_eq!(observation, Observation::Unknown);
+    assert_eq!(
+        waits,
+        [super::super::INTERACTIVE_BUSY_TIMEOUT],
+        "the read meets the rebuild's lock once, with the drawing thread's busy timeout"
+    );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the reads don't wait for the rebuild"
+        waits
+            .iter()
+            .all(|wait| *wait < LONGEST_WAIT_WITHOUT_WAITING),
+        "the read doesn't wait for the rebuild: {waits:?}"
     );
     drop(other);
 }

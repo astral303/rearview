@@ -224,6 +224,7 @@
   did under `mise run test`.
 - Fix each test run on Windows leaving about 80 temporary folders in
   `target`.
+- Fix refresh and TUI tests failing when other programs load the CPU.
 
 ## v0.6.1 (2026-10-26)
 
