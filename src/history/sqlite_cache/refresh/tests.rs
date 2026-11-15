@@ -2665,6 +2665,9 @@ fn this_processs_own_ownership_ends_its_wait_for_another_process() {
 
 #[test]
 fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
+    /// The longest busy wait a read without waiting records. The rebuild
+    /// holds its lock until the test ends.
+    const LONGEST_WAIT_WITHOUT_WAITING: Duration = Duration::from_secs(5);
     let directory = tempfile::tempdir().unwrap();
     let base = rearview(directory.path());
     SqliteCache::open(&base).unwrap().mark_admitted().unwrap();
@@ -2677,7 +2680,7 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
         )),
         "session.jsonl".to_owned(),
     );
-    let started = Instant::now();
+    let busy_waits = connection::test_hooks::BusyWaits::record_on_this_thread();
 
     let lookup = super::super::InteractiveCache::at(base.clone())
         .open()
@@ -2686,12 +2689,22 @@ fn reads_without_waiting_report_another_processs_rebuild_as_busy_at_once() {
                 .map(|cache| super::super::found(cache.read_copy_at(&address, |_| Ok(()))))
                 .transpose()
         });
+    let waits = busy_waits.take();
+    drop(busy_waits);
+    let observation = observe(&base).unwrap();
 
     assert!(matches!(lookup, Err(error) if super::super::is_busy_error(&error)));
-    assert_eq!(observe(&base).unwrap(), Observation::Unknown);
+    assert_eq!(observation, Observation::Unknown);
+    assert_eq!(
+        waits,
+        [super::super::INTERACTIVE_BUSY_TIMEOUT],
+        "the read meets the rebuild's lock once, with the drawing thread's busy timeout"
+    );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the reads don't wait for the rebuild"
+        waits
+            .iter()
+            .all(|wait| *wait < LONGEST_WAIT_WITHOUT_WAITING),
+        "the read doesn't wait for the rebuild: {waits:?}"
     );
     drop(other);
 }
