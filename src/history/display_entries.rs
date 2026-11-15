@@ -4,7 +4,8 @@
 
 use super::format::RecordLine;
 use super::sqlite_cache::{
-    CachedCopy, Currency, HeldCopy, InteractiveCache, InteractiveRead, Publication, SessionAddress,
+    CachedCopy, Currency, EntryHashes, HeldCopy, InteractiveCache, InteractiveRead, Publication,
+    SessionAddress,
 };
 use super::{MalformedLine, Source, TranscriptEntries, sniffed_session};
 use crate::error::Result;
@@ -232,13 +233,15 @@ pub fn display_log_entries_interactively(
 /// A copy of a session as the viewer shows it.
 pub struct ViewedCopy {
     pub entries: DisplayEntries,
+    /// One hash per entry of `entries`, read in the same snapshot.
+    pub entry_hashes: EntryHashes,
     /// The copy's catalogue row, the header's source; `None` when the cache
     /// no longer lists the copy.
     pub row: Option<Box<super::Conversation>>,
 }
 
-/// [`display_log_entries_interactively`] with the copy's catalogue row, as
-/// the viewer reads the session at `address`.
+/// [`display_log_entries_interactively`] with the copy's entry hashes and
+/// catalogue row, as the viewer reads the session at `address`.
 pub fn viewed_copy_interactively(
     cache: &InteractiveCache,
     address: &SessionAddress,
@@ -254,13 +257,16 @@ pub fn viewed_copy_interactively(
                 .filter(|row| row.publication == generation)
                 .map(Box::new))
         };
-        let Some((entries, currency, row)) = newest_copy(reader, address, publication, viewed_row)?
+        let hashes_and_row = |held: &HeldCopy<'_>| Ok((held.entry_hashes()?, viewed_row(held)?));
+        let Some((entries, currency, (entry_hashes, row))) =
+            newest_copy(reader, address, publication, hashes_and_row)?
         else {
             return Ok(None);
         };
         Ok(Some(CachedCopy {
             value: ViewedCopy {
                 entries: DisplayEntries::from(entries),
+                entry_hashes,
                 row,
             },
             currency,

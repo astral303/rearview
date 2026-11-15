@@ -363,10 +363,16 @@ pub fn day_at_line(
     })
 }
 
-/// A copy of a session as the viewer shows it: its conversation, and the
-/// copy's catalogue row the header shows.
+/// A copy of a session as the viewer shows it: its conversation, one hash
+/// per entry, and the copy's catalogue row the header shows.
 pub struct ViewedConversation {
     pub conversation: ParsedConversation,
+    /// By `entry_index`: two reads' hashes show the first changed entry.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the viewer's reload doesn't compare copies yet")
+    )]
+    pub entry_hashes: crate::history::sqlite_cache::EntryHashes,
     /// `None` when the cache no longer lists the copy.
     pub row: Option<Box<crate::history::Conversation>>,
 }
@@ -382,6 +388,7 @@ pub fn parse_conversation_file_interactively(
     crate::history::viewed_copy_interactively(cache, address, publication).map(|viewed| {
         ViewedConversation {
             conversation: parsed_conversation(viewed.entries),
+            entry_hashes: viewed.entry_hashes,
             row: viewed.row,
         }
     })

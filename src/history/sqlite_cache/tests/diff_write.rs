@@ -4,6 +4,7 @@
 //! session with a fresh write of the parse in another database.
 
 mod column_sweep;
+mod entry_hashes;
 pub(super) mod resumed;
 
 use super::*;

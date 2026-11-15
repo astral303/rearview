@@ -1,3 +1,5 @@
+use super::digest::Digest;
+use super::path_text;
 use crate::agent::message_numbering::{NumberingCheckpoint, ThreadIdentity, ThreadNumbers};
 use crate::history::format::RecordLine;
 use crate::history::sqlite_cache::roots::{Places, StoredPath};
@@ -147,7 +149,40 @@ pub(super) struct Thread {
     launch_call: Option<String>,
 }
 
+/// The `threads` columns besides `id` and `transcript` that [`read`]
+/// returns, in the order it reads them.
+pub(in crate::history::sqlite_cache) const TEXT_COLUMNS: [&str; 6] = [
+    "label",
+    "nickname",
+    "role",
+    "agent_path",
+    "agent_id",
+    "launch_call",
+];
+
 impl Thread {
+    /// A hash of every value of the thread.
+    pub(super) fn digest(&self) -> i64 {
+        let Thread {
+            transcript,
+            label,
+            identity:
+                SubagentIdentity {
+                    nickname,
+                    role,
+                    agent_path,
+                    agent_id,
+                },
+            launch_call,
+        } = self;
+        let mut digest = Digest::default();
+        digest.text(transcript.as_deref().map(path_text).as_deref());
+        for text in [label, nickname, role, agent_path, agent_id, launch_call] {
+            digest.text(text.as_deref());
+        }
+        digest.finish()
+    }
+
     pub(super) fn origin(&self) -> Option<Arc<crate::agent::transcript::SubagentOrigin>> {
         Some(Arc::new(crate::agent::transcript::SubagentOrigin {
             label: self.label.clone()?,
@@ -216,10 +251,10 @@ pub(super) fn read(
         transcripts.insert(row.get(0)?, Arc::from(path));
     }
     let threads = connection
-        .prepare(
-            "SELECT id, transcript, label, nickname, role, agent_path, agent_id, launch_call \
-         FROM threads WHERE session = ?1",
-        )?
+        .prepare(&format!(
+            "SELECT id, transcript, {} FROM threads WHERE session = ?1",
+            TEXT_COLUMNS.join(", ")
+        ))?
         .query_map([session], |row| {
             Ok((
                 row.get(0)?,

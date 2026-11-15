@@ -130,6 +130,11 @@ impl HeldCopy<'_> {
         entries::read(self.connection, self.session, self.places, None)
     }
 
+    /// One hash per entry [`Self::entries`] reads, in the same order.
+    pub(crate) fn entry_hashes(&self) -> Result<entries::EntryHashes> {
+        entries::read_hashes(self.connection, self.session, self.places)
+    }
+
     pub(crate) fn numbered_entries(
         &self,
         messages: Option<std::ops::RangeInclusive<u64>>,

@@ -5,6 +5,7 @@
 mod context;
 mod diff;
 mod digest;
+mod hashes;
 mod messages;
 mod parts;
 mod rows;
@@ -31,6 +32,8 @@ use std::path::Path;
 #[cfg(test)]
 pub(super) use context::CALLS_AND_RESULTS;
 pub(super) use diff::{replace_leading, rewrite_in_place, update, update_tail};
+pub(crate) use hashes::EntryHashes;
+pub(super) use hashes::read as read_hashes;
 #[cfg(test)]
 pub(super) use parts::PART_ROW_BUILDS;
 pub(super) use parts::SearchOnlyKind;
@@ -38,6 +41,8 @@ pub(super) use rows::{RowsStart, SessionRows};
 #[cfg(test)]
 pub(super) use semantic::SEMANTIC_TURNS;
 pub(super) use semantic::{read_semantic_turns, read_semantic_turns_in};
+#[cfg(test)]
+pub(super) use threads::TEXT_COLUMNS as THREAD_TEXT_COLUMNS;
 
 /// Entries a first write of a session writes per transaction, so a session
 /// of hundreds of thousands of entries does not hold the database's write
