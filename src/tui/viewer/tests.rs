@@ -9,6 +9,7 @@ use crate::log_entry::Tool;
 use std::path::PathBuf;
 
 mod rerender;
+mod tail;
 
 /// The session at `file_path` with the sub-agent transcripts `subagents`, as
 /// the viewer reads it once a load cached it.

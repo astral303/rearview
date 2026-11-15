@@ -30,7 +30,7 @@ fn area_fields(area: &CallArea) -> AreaFields {
 
 /// The rows, messages and calls of a render, as a test compares them.
 #[derive(Debug, PartialEq)]
-struct RenderShape {
+pub(super) struct RenderShape {
     rows: Vec<RowFields>,
     messages: Vec<(usize, usize, usize)>,
     calls: Vec<CallFields>,
@@ -39,15 +39,15 @@ struct RenderShape {
 
 /// A render's rows and indexes, owned the way the viewer keeps them.
 #[derive(Clone)]
-struct Shown {
-    lines: Vec<RenderedLine>,
-    messages: Vec<MessageRange>,
-    calls: Vec<CallRange>,
-    detail_calls: Vec<DetailCall>,
+pub(super) struct Shown {
+    pub(super) lines: Vec<RenderedLine>,
+    pub(super) messages: Vec<MessageRange>,
+    pub(super) calls: Vec<CallRange>,
+    pub(super) detail_calls: Vec<DetailCall>,
 }
 
 impl Shown {
-    fn of(rendered: RenderedConversation) -> Self {
+    pub(super) fn of(rendered: RenderedConversation) -> Self {
         Self {
             lines: rendered.lines,
             messages: rendered.messages,
@@ -65,7 +65,7 @@ impl Shown {
         }
     }
 
-    fn shape(&self) -> RenderShape {
+    pub(super) fn shape(&self) -> RenderShape {
         RenderShape {
             rows: self
                 .lines
@@ -103,14 +103,14 @@ impl Shown {
 
 /// The options one case renders with.
 #[derive(Clone, Copy, Debug)]
-struct Modes {
+pub(super) struct Modes {
     tool_display: ToolDisplayMode,
     show_timing: bool,
     show_thinking: bool,
 }
 
 impl Modes {
-    fn every() -> Vec<Self> {
+    pub(super) fn every() -> Vec<Self> {
         let mut every = Vec::new();
         for tool_display in [
             ToolDisplayMode::Hidden,
@@ -130,7 +130,7 @@ impl Modes {
         every
     }
 
-    fn options(self, expanded_tool_outputs: BTreeSet<ToolOutputId>) -> RenderOptions {
+    pub(super) fn options(self, expanded_tool_outputs: BTreeSet<ToolOutputId>) -> RenderOptions {
         RenderOptions {
             tool_display: self.tool_display,
             show_thinking: self.show_thinking,
@@ -239,7 +239,7 @@ fn assert_outputs_render_in_place_as_whole_render(
 }
 
 /// Nothing expanded; in summary mode, also every tool run expanded.
-fn first_expanded_sets(
+pub(super) fn first_expanded_sets(
     conversation: &ParsedConversation,
     modes: Modes,
 ) -> Vec<BTreeSet<ToolOutputId>> {
@@ -307,7 +307,7 @@ fn numbered_lines(prefix: &str, count: usize) -> String {
 /// Two interleaved calls with long bodies and results, and a third call
 /// alone. The results arrive two days after the calls, so the connectors
 /// cross a day label while timing is shown.
-fn interleaved_calls_across_a_day() -> ParsedConversation {
+pub(super) fn interleaved_calls_across_a_day() -> ParsedConversation {
     let day_one = day_one();
     let day_three = day_three();
     let old = numbered_lines("old", 6);
@@ -801,11 +801,11 @@ fn conversation_of_records(records: &[serde_json::Value]) -> ParsedConversation 
     )
 }
 
-#[test]
-fn tool_runs_and_outputs_inside_them_render_in_place_as_in_whole_render() {
+/// Two runs of calls between messages.
+pub(super) fn tool_runs_between_messages() -> ParsedConversation {
     let day = day_one();
     let at = Some(day.as_str());
-    let conversation = conversation_of_records(&[
+    conversation_of_records(&[
         text("user", at, "Run the tests."),
         long_call(at, "toolu_a"),
         long_result(at, "toolu_a"),
@@ -815,7 +815,12 @@ fn tool_runs_and_outputs_inside_them_render_in_place_as_in_whole_render() {
         long_call(at, "toolu_c"),
         long_result(at, "toolu_c"),
         text("user", at, "Thanks."),
-    ]);
+    ])
+}
+
+#[test]
+fn tool_runs_and_outputs_inside_them_render_in_place_as_in_whole_render() {
+    let conversation = tool_runs_between_messages();
 
     let toggled = assert_outputs_render_in_place_as_whole_render("runs", &conversation);
     // In each of summary mode's four option sets: two runs, then two runs and
@@ -827,11 +832,11 @@ fn tool_runs_and_outputs_inside_them_render_in_place_as_in_whole_render() {
     );
 }
 
-#[test]
-fn run_with_results_in_later_entries_renders_in_place_as_in_whole_render() {
-    // With thinking shown, each sub-agent's call opens a run of its own,
-    // which ends the run before it; that run's result arrives later.
-    let conversation = conversation_of_records(&[
+/// A top-level call, then two sub-agents' runs. With thinking shown, each
+/// sub-agent's call opens a run of its own, which ends the run before it;
+/// that run's result arrives later.
+pub(super) fn run_with_results_in_later_entries() -> ParsedConversation {
+    conversation_of_records(&[
         text("user", None, "Run both agents."),
         long_call(None, "toolu_top"),
         of_sub_agent(long_call(None, "toolu_a"), "toolu_agent_a"),
@@ -840,7 +845,12 @@ fn run_with_results_in_later_entries_renders_in_place_as_in_whole_render() {
         long_result(None, "toolu_top"),
         of_sub_agent(long_result(None, "toolu_b"), "toolu_agent_b"),
         text("assistant", None, "Both agents finished."),
-    ]);
+    ])
+}
+
+#[test]
+fn run_with_results_in_later_entries_renders_in_place_as_in_whole_render() {
+    let conversation = run_with_results_in_later_entries();
     let mut options = Modes {
         tool_display: ToolDisplayMode::Hidden,
         show_timing: false,
@@ -870,59 +880,62 @@ fn run_with_results_in_later_entries_renders_in_place_as_in_whole_render() {
     );
 }
 
-#[test]
-fn runs_around_midnight_render_in_place_as_in_whole_render() {
+/// Runs of calls whose entries fall on two days: crossing midnight, starting
+/// on a new day, and opened by an unstamped entry. The last starts on the
+/// day of the message before it, and ends at the call on a later day.
+///
+/// Each comes with the count of outputs
+/// [`assert_outputs_render_in_place_as_whole_render`] toggles. Summary mode,
+/// in each of two option sets with timing hidden and two with it shown,
+/// toggles the runs, then the runs and their outputs; the run of two calls
+/// splits at the day label while timing is shown. Truncated mode, in each of
+/// four, toggles the outputs.
+pub(super) fn runs_around_midnight() -> [(&'static str, ParsedConversation, usize); 3] {
     let (day_one, day_three) = (day_one(), day_three());
     let (one, three) = (Some(day_one.as_str()), Some(day_three.as_str()));
-    let crossing_midnight = [
-        text("user", one, "Start."),
-        long_call(one, "toolu_a"),
-        long_result(three, "toolu_a"),
-        long_call(three, "toolu_b"),
-        long_result(three, "toolu_b"),
-        text("assistant", three, "Done."),
-    ];
-    let starting_on_a_new_day = [
-        text("user", one, "Start."),
-        long_call(three, "toolu_a"),
-        long_result(three, "toolu_a"),
-        text("assistant", three, "Done."),
-    ];
-    // The run starts on the day of the message before it, and ends at the
-    // call on a later day.
-    let opened_by_an_unstamped_entry = [
-        text("user", one, "Start."),
-        long_call(None, "toolu_a"),
-        long_result(None, "toolu_a"),
-        long_call(three, "toolu_b"),
-        long_result(three, "toolu_b"),
-        text("assistant", three, "Done."),
-    ];
-
-    // Summary mode, in each of two option sets with timing hidden and two
-    // with it shown: the runs, then the runs and their outputs. The run of
-    // two calls splits at the day label while timing is shown. Truncated
-    // mode, in each of four: the outputs.
     let two_calls_split_by_day = 2 * (1 + 5) + 2 * (2 + 6) + 4 * 4;
-    for (name, records, expected) in [
+    [
         (
             "crossing midnight",
-            &crossing_midnight[..],
+            conversation_of_records(&[
+                text("user", one, "Start."),
+                long_call(one, "toolu_a"),
+                long_result(three, "toolu_a"),
+                long_call(three, "toolu_b"),
+                long_result(three, "toolu_b"),
+                text("assistant", three, "Done."),
+            ]),
             two_calls_split_by_day,
         ),
         (
             "starting on a new day",
-            &starting_on_a_new_day[..],
+            conversation_of_records(&[
+                text("user", one, "Start."),
+                long_call(three, "toolu_a"),
+                long_result(three, "toolu_a"),
+                text("assistant", three, "Done."),
+            ]),
             4 * (1 + 3) + 4 * 2,
         ),
         (
             "opened by an unstamped entry",
-            &opened_by_an_unstamped_entry[..],
+            conversation_of_records(&[
+                text("user", one, "Start."),
+                long_call(None, "toolu_a"),
+                long_result(None, "toolu_a"),
+                long_call(three, "toolu_b"),
+                long_result(three, "toolu_b"),
+                text("assistant", three, "Done."),
+            ]),
             two_calls_split_by_day,
         ),
-    ] {
-        let toggled =
-            assert_outputs_render_in_place_as_whole_render(name, &conversation_of_records(records));
+    ]
+}
+
+#[test]
+fn runs_around_midnight_render_in_place_as_in_whole_render() {
+    for (name, conversation, expected) in runs_around_midnight() {
+        let toggled = assert_outputs_render_in_place_as_whole_render(name, &conversation);
         assert_eq!(
             toggled, expected,
             "{name}: the runs and their outputs toggle in summary mode, and the outputs in truncated mode"
@@ -930,9 +943,10 @@ fn runs_around_midnight_render_in_place_as_in_whole_render() {
     }
 }
 
-#[test]
-fn runs_followed_by_entries_rendering_nothing_render_in_place_as_in_whole_render() {
-    let conversation = conversation_of_records(&[
+/// Runs ended or followed by entries that don't render any rows while
+/// thinking is hidden.
+pub(super) fn runs_followed_by_entries_rendering_nothing() -> ParsedConversation {
+    conversation_of_records(&[
         text("user", None, "Start."),
         long_call(None, "toolu_a"),
         long_result(None, "toolu_a"),
@@ -947,7 +961,12 @@ fn runs_followed_by_entries_rendering_nothing_render_in_place_as_in_whole_render
         long_result(None, "toolu_c"),
         usage(),
         thinking(),
-    ]);
+    ])
+}
+
+#[test]
+fn runs_followed_by_entries_rendering_nothing_render_in_place_as_in_whole_render() {
+    let conversation = runs_followed_by_entries_rendering_nothing();
 
     let toggled =
         assert_outputs_render_in_place_as_whole_render("entries rendering nothing", &conversation);

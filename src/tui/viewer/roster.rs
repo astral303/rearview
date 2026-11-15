@@ -13,7 +13,7 @@ use super::ledger::fitted_name;
 use super::style::subagent_label;
 use super::tools::tool_result_display_text;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct SubagentRoster {
     /// The label of each sub-agent whose provider recorded a nickname, by the
     /// sub-agent's key (its `parent_tool_use_id`).
