@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::log_entry::{
     LogEntry, SubagentIdentity, agent_progress_identity, convert_agent_progress,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -27,6 +27,28 @@ pub struct EntryOrigin {
     /// Which of the entries read from one record this is: a Kimi usage record
     /// becomes several.
     part: usize,
+}
+
+impl EntryOrigin {
+    /// Number the parts of `tail` after `kept`. `tail` has the origins of
+    /// the entries that follow the entries of `kept`, with parts counted
+    /// from its own first entry. Each part then counts the earlier entries
+    /// of both lists read from its record, as one read of all the entries
+    /// counts it.
+    pub(crate) fn number_parts_after(kept: &[Self], tail: &mut [Self]) {
+        let tail_lines: HashSet<usize> = tail.iter().map(|origin| origin.record.line).collect();
+        let mut kept_parts: HashMap<&RecordLine, usize> = HashMap::new();
+        // Skip a kept origin on a line the tail doesn't have before its
+        // record is hashed, because the hash reads the transcript's path.
+        for origin in kept {
+            if tail_lines.contains(&origin.record.line) {
+                *kept_parts.entry(&origin.record).or_insert(0) += 1;
+            }
+        }
+        for origin in tail {
+            origin.part += kept_parts.get(&origin.record).copied().unwrap_or(0);
+        }
+    }
 }
 
 /// The identity one `agent_progress` record gives the sub-agent `agent_id`.

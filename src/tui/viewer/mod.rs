@@ -5,7 +5,7 @@
 //! without using ANSI escape codes.
 
 use crate::clock::Zone;
-use crate::history::{DisplayEntries, EntryOrigin};
+use crate::history::{DisplayEntries, EntryOrigin, RecordedIdentity};
 use crate::log_entry::LogEntry;
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use std::collections::BTreeSet;
@@ -313,6 +313,9 @@ pub struct ParsedConversation {
     entries: Vec<RenderableEntry>,
     /// Where each displayed entry was read, by its `entry_index`.
     origins: Vec<EntryOrigin>,
+    /// The identities the roster was built from, in record order. The
+    /// displayed entries no longer carry them.
+    subagent_identities: Vec<RecordedIdentity>,
     roster: SubagentRoster,
     /// The lanes of the top-level calls, which the detail modes draw.
     lanes: Lanes,
@@ -327,6 +330,7 @@ impl ParsedConversation {
         Self {
             entries: Vec::new(),
             origins: Vec::new(),
+            subagent_identities: Vec::new(),
             roster: SubagentRoster::default(),
             lanes: Lanes::default(),
             activity_span: None,
@@ -346,6 +350,147 @@ impl ParsedConversation {
             .binary_search_by_key(&entry_index, |parsed| parsed.entry_index)
             .ok()?;
         Some(&self.entries[position].entry)
+    }
+
+    /// Put `tail`'s entries in place of the entries from its first changed
+    /// entry on, and return the entries they replace. The entries before the
+    /// first changed entry are not decoded again, and their contents are not
+    /// copied. The conversation then equals [`parsed_conversation`] over a
+    /// whole read of the copy the tail was read from.
+    ///
+    /// A tail without entries that doesn't replace any entry leaves the
+    /// roster, the lanes and the activity span as they are.
+    ///
+    /// Otherwise the roster and the lanes are built again from every entry:
+    /// the roster no longer has a replaced entry's identity or calls, and a
+    /// call before the first changed entry answered in the tail opens beside
+    /// the calls after it. The activity span is extended with the tail's
+    /// times when no entry is replaced, and found again from every entry
+    /// otherwise.
+    ///
+    /// Panics when the first changed entry is greater than the conversation's
+    /// entry count.
+    pub(crate) fn extend_with(&mut self, tail: ConversationTail) -> ReplacedEntries {
+        let ConversationTail {
+            first_changed,
+            entries,
+            mut origins,
+            subagent_identities,
+        } = tail;
+        if origins.is_empty() && first_changed == self.origins.len() {
+            return ReplacedEntries {
+                entries: Vec::new(),
+                origins: Vec::new(),
+                roster: None,
+            };
+        }
+        let kept = self
+            .entries
+            .partition_point(|parsed| parsed.entry_index < first_changed);
+        let replaced_entries = self.entries.split_off(kept);
+        let replaced_origins = self.origins.split_off(first_changed);
+        EntryOrigin::number_parts_after(&self.origins, &mut origins);
+        reserve_for_tail(&mut self.origins, origins.len());
+        self.origins.append(&mut origins);
+
+        let kept_identities = self
+            .subagent_identities
+            .partition_point(|recorded| recorded.entry_index < first_changed);
+        self.subagent_identities.truncate(kept_identities);
+        self.subagent_identities.extend(subagent_identities);
+
+        let span_before_tail = if replaced_entries.is_empty() {
+            self.activity_span
+        } else {
+            extended_activity_span(None, &self.entries)
+        };
+        self.activity_span = extended_activity_span(span_before_tail, &entries);
+        reserve_for_tail(&mut self.entries, entries.len());
+        self.entries.extend(entries);
+
+        let roster = roster_of_conversation(&self.subagent_identities, &self.entries);
+        self.lanes = Lanes::of(top_level_tool_blocks(&self.entries));
+        ReplacedEntries {
+            entries: replaced_entries,
+            origins: replaced_origins,
+            roster: Some(std::mem::replace(&mut self.roster, roster)),
+        }
+    }
+}
+
+/// Free places a list of a conversation's entries gets when a tail outgrows
+/// it. The next tails that add entries then fit without moving every kept
+/// entry again.
+const SPARE_ENTRIES_AFTER_GROWTH: usize = 1024;
+
+/// Make room in `list` for the `tail_len` values of a tail. A list the tail
+/// outgrows gets room for the tail and [`SPARE_ENTRIES_AFTER_GROWTH`] more,
+/// not twice its capacity.
+fn reserve_for_tail<T>(list: &mut Vec<T>, tail_len: usize) {
+    if list.capacity() - list.len() < tail_len {
+        list.reserve_exact(tail_len + SPARE_ENTRIES_AFTER_GROWTH);
+    }
+}
+
+/// A newer copy's entries from the first changed entry on, as
+/// [`parsed_conversation`] numbers and filters them in a whole read. Each
+/// origin's part counts from the tail's first entry until
+/// [`ParsedConversation::extend_with`] numbers it after the kept origins.
+#[derive(Debug)]
+pub struct ConversationTail {
+    first_changed: usize,
+    entries: Vec<RenderableEntry>,
+    /// One origin per entry the read decoded, file-history snapshots
+    /// included.
+    origins: Vec<EntryOrigin>,
+    subagent_identities: Vec<RecordedIdentity>,
+}
+
+impl ConversationTail {
+    /// The tail of `displayed`, the entries a read decoded from the entry
+    /// numbered `first_changed` on.
+    pub(crate) fn of(first_changed: usize, displayed: DisplayEntries) -> Self {
+        let subagent_identities = displayed
+            .subagent_identities
+            .into_iter()
+            .map(|recorded| RecordedIdentity {
+                entry_index: first_changed + recorded.entry_index,
+                ..recorded
+            })
+            .collect();
+        Self {
+            first_changed,
+            entries: renderable_entries(displayed.entries, first_changed),
+            origins: displayed.origins,
+            subagent_identities,
+        }
+    }
+
+    /// The index of the first entry the tail replaces.
+    pub(crate) fn first_changed(&self) -> usize {
+        self.first_changed
+    }
+}
+
+/// The values of a conversation that [`ParsedConversation::extend_with`]
+/// replaced: its entries from the first changed entry on with their origins,
+/// and its roster.
+#[derive(Debug)]
+pub struct ReplacedEntries {
+    entries: Vec<RenderableEntry>,
+    origins: Vec<EntryOrigin>,
+    /// `None` when the extension kept the conversation's roster.
+    roster: Option<SubagentRoster>,
+}
+
+impl ReplacedEntries {
+    /// The roster of `conversation` before the extension that returned these
+    /// entries.
+    pub(crate) fn roster_before<'a>(
+        &'a self,
+        conversation: &'a ParsedConversation,
+    ) -> &'a SubagentRoster {
+        self.roster.as_ref().unwrap_or(&conversation.roster)
     }
 }
 
@@ -412,41 +557,65 @@ pub fn parse_unattributed_conversation_file(
 /// displayed entries, with each sub-agent's identity recorded in the
 /// `SubagentRoster`.
 pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversation {
-    let mut roster = SubagentRoster::from_recorded(&displayed.subagent_identities);
+    let subagent_identities = displayed.subagent_identities;
     let origins = displayed.origins;
-    let entries: Vec<RenderableEntry> = displayed
-        .entries
-        .into_iter()
-        .enumerate()
-        .filter_map(|(entry_index, entry)| {
-            (!matches!(entry, LogEntry::FileHistorySnapshot { .. }))
-                .then_some(RenderableEntry { entry_index, entry })
-        })
-        .collect();
-    for parsed in &entries {
-        roster.record_agent_calls(&parsed.entry);
-    }
+    let entries = renderable_entries(displayed.entries, 0);
+    let roster = roster_of_conversation(&subagent_identities, &entries);
     let lanes = Lanes::of(top_level_tool_blocks(&entries));
-    let activity_span = activity_span(&entries);
+    let activity_span = extended_activity_span(None, &entries);
     ParsedConversation {
         entries,
         origins,
+        subagent_identities,
         roster,
         lanes,
         activity_span,
     }
 }
 
-fn activity_span(
+/// Every entry of `entries` but file-history snapshots, each numbered by
+/// its place in `entries`, the first as `first_index`.
+fn renderable_entries(entries: Vec<LogEntry>, first_index: usize) -> Vec<RenderableEntry> {
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, entry)| {
+            (!matches!(entry, LogEntry::FileHistorySnapshot { .. })).then_some(RenderableEntry {
+                entry_index: first_index + position,
+                entry,
+            })
+        })
+        .collect()
+}
+
+/// The roster of a conversation: `identities` in record order, then the
+/// agent calls of `entries`.
+fn roster_of_conversation(
+    identities: &[RecordedIdentity],
+    entries: &[RenderableEntry],
+) -> SubagentRoster {
+    let mut roster = SubagentRoster::from_recorded(identities);
+    for parsed in entries {
+        roster.record_agent_calls(&parsed.entry);
+    }
+    roster
+}
+
+/// `span`, the earliest and latest message times of the entries before
+/// `entries`, extended with the times of `entries`.
+fn extended_activity_span(
+    span: Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)>,
     entries: &[RenderableEntry],
 ) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
-    let mut times = entries
+    entries
         .iter()
-        .filter_map(|parsed| DateTime::parse_from_rfc3339(parsed.entry.activity_timestamp()?).ok());
-    let first = times.next()?;
-    Some(times.fold((first, first), |(earliest, latest), time| {
-        (earliest.min(time), latest.max(time))
-    }))
+        .filter_map(|parsed| DateTime::parse_from_rfc3339(parsed.entry.activity_timestamp()?).ok())
+        .fold(span, |span, time| {
+            Some(match span {
+                Some((earliest, latest)) => (earliest.min(time), latest.max(time)),
+                None => (time, time),
+            })
+        })
 }
 
 /// The entries a render covers between two calls of its `keep_going`.

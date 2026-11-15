@@ -8,8 +8,48 @@ use super::*;
 use crate::log_entry::Tool;
 use std::path::PathBuf;
 
+mod extension;
 mod rerender;
 mod tail;
+
+/// The names of `conversation`'s fields that differ from `whole`'s, the
+/// conversation of a whole read: empty when the two are equal in every
+/// field.
+pub(crate) fn fields_differing(
+    conversation: &ParsedConversation,
+    whole: &ParsedConversation,
+) -> Vec<&'static str> {
+    // Without `..`: a new field doesn't compile until it is compared.
+    let ParsedConversation {
+        entries,
+        origins,
+        subagent_identities,
+        roster,
+        lanes,
+        activity_span,
+    } = conversation;
+    let fields = [
+        (
+            "entries",
+            format!("{entries:?}") == format!("{:?}", whole.entries),
+        ),
+        ("origins", origins == &whole.origins),
+        (
+            "sub-agent identities",
+            subagent_identities == &whole.subagent_identities,
+        ),
+        ("roster", roster == &whole.roster),
+        ("lanes", lanes == &whole.lanes),
+        (
+            "activity span",
+            format!("{activity_span:?}") == format!("{:?}", whole.activity_span),
+        ),
+    ];
+    fields
+        .into_iter()
+        .filter_map(|(field, is_equal)| (!is_equal).then_some(field))
+        .collect()
+}
 
 /// The session at `file_path` with the sub-agent transcripts `subagents`, as
 /// the viewer reads it once a load cached it.

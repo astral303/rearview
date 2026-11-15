@@ -235,7 +235,7 @@ fn assert_truncated_mode_tail_starts_at(
 }
 
 /// The every-record sessions of every agent, read from the cache.
-fn every_agents_stored_entries() -> Vec<(String, Vec<(RecordLine, LogEntry)>)> {
+pub(super) fn every_agents_stored_entries() -> Vec<(String, Vec<(RecordLine, LogEntry)>)> {
     use crate::history::provider::contract_tests::every_record_sessions;
     every_record_sessions()
         .iter()

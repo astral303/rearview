@@ -164,7 +164,7 @@ impl RenderedToolBlock<'_> {
 
 /// The lane of each call of one sequence of tool blocks that is open beside
 /// another, by `tool_use_id`: see [`lanes`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(super) struct Lanes(HashMap<String, usize>);
 
 impl Lanes {
