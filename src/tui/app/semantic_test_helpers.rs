@@ -72,7 +72,6 @@ pub(crate) fn test_semantic_metadata(
             rationale_kind: SemanticRationaleKind::SemanticOnly,
             chunk: SemanticChunkIdentity {
                 conversation_index,
-                source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
                 session: "test-session".to_string(),
                 chunk_index: 0,
                 message_range: crate::agent::refs::MessageRange::single(1),

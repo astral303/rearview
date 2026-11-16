@@ -27,8 +27,6 @@ pub mod provider;
 mod refresh;
 pub(crate) mod resumed;
 pub(crate) mod row_fold;
-#[cfg(test)]
-mod semantic_route_tests;
 mod shard_files;
 pub(crate) mod skill_text;
 pub(crate) mod sqlite_cache;
@@ -39,11 +37,10 @@ pub(crate) mod workspace;
 
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Local};
-use std::borrow::Cow;
 use std::path::PathBuf;
 
 // Re-export public API
-pub(crate) use content::SemanticContent;
+pub(crate) use content::HeldSemanticTurns;
 pub use display_entries::{
     DisplayEntries, EntryOrigin, RecordedIdentity, RereadCopy, ViewedCopy,
     display_log_entries_interactively, printed_log_entries, reread_copy_interactively,
@@ -73,15 +70,10 @@ pub use sqlite_cache::{
     InteractiveCache, InteractiveRead, NextStep, OperationScope, OtherRearview, ParsePermit,
     Patience, StaleCause, WaitStatus,
 };
-pub(crate) use sqlite_cache::{RoutesStored, SemanticRoute, store_semantic_routes};
 pub(crate) use task_notification::{
     TaskReport, blocks_task_report, parse_task_report, user_task_report,
 };
 pub use workspace::Workspace;
-
-/// The version of [`Conversation::semantic_route_text`]'s output. A route
-/// text the session cache stored under another version is computed again.
-pub(crate) const SEMANTIC_ROUTE_VERSION: i64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(test, derive(strum::EnumIter))]
@@ -291,112 +283,6 @@ impl Conversation {
             .into_iter()
             .filter_map(|text| text.as_deref())
     }
-
-    /// [`Self::title_and_summary_texts`], then `full_text`, each after a
-    /// separator.
-    pub(crate) fn full_text_after_title_and_summary(&self) -> Cow<'_, str> {
-        let mut title_and_summary = self.title_and_summary_texts().peekable();
-        if title_and_summary.peek().is_none() {
-            return Cow::Borrowed(&self.full_text);
-        }
-        let mut text = String::new();
-        for piece in title_and_summary.chain([self.full_text.as_str()]) {
-            message_texts::push_separated(&mut text, piece);
-        }
-        Cow::Owned(text)
-    }
-
-    /// The session's keywords and an excerpt of its text, from its title,
-    /// summary, `full_text` and `agent_search_text`, for the agent's semantic
-    /// route. The parse doesn't compute it: ranking the keywords takes
-    /// seconds on a large session. The session cache stores it per copy
-    /// (`semantic_routes`). Bump [`SEMANTIC_ROUTE_VERSION`] with any change
-    /// to its output.
-    pub(crate) fn semantic_route_text(&self) -> String {
-        const ROUTE_EVIDENCE_CHARS: usize = 1_000;
-        const ROUTE_EVIDENCE_SEGMENTS: usize = 4;
-        const ROUTE_KEYWORDS: usize = 100;
-        const ROUTE_KEYWORD_CHARS: usize = 800;
-
-        let mut text =
-            message_texts::without_message_separators(&self.full_text_after_title_and_summary())
-                .into_owned();
-        if !self.agent_search_text.is_empty() {
-            text.push(' ');
-            text.push_str(&message_texts::without_message_separators(
-                &self.agent_search_text,
-            ));
-        }
-        if text.is_empty() {
-            return String::new();
-        }
-        let keywords = semantic_route_keywords(&text, ROUTE_KEYWORDS)
-            .chars()
-            .take(ROUTE_KEYWORD_CHARS)
-            .collect::<String>();
-        let excerpt = evenly_spaced_excerpt(&text, ROUTE_EVIDENCE_CHARS, ROUTE_EVIDENCE_SEGMENTS);
-        [keywords, excerpt]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-fn semantic_route_keywords(text: &str, limit: usize) -> String {
-    const STOP_WORDS: &[&str] = &[
-        "about", "after", "also", "been", "before", "being", "could", "does", "from", "have",
-        "into", "just", "more", "only", "other", "should", "some", "than", "that", "their",
-        "there", "these", "they", "this", "through", "using", "very", "what", "when", "where",
-        "which", "while", "with", "would", "your",
-    ];
-
-    let normalized = text.to_lowercase();
-    let mut words = std::collections::HashMap::<&str, (usize, usize)>::new();
-    for (position, word) in normalized
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| {
-            let chars = word.chars().count();
-            (4..=40).contains(&chars) && !STOP_WORDS.contains(word)
-        })
-        .enumerate()
-    {
-        let entry = words.entry(word).or_insert((0, position));
-        entry.0 += 1;
-    }
-    let mut ranked = words.into_iter().collect::<Vec<_>>();
-    ranked.sort_unstable_by(|(left_word, left), (right_word, right)| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| right_word.chars().count().cmp(&left_word.chars().count()))
-            .then_with(|| left.1.cmp(&right.1))
-    });
-    ranked
-        .into_iter()
-        .take(limit)
-        .map(|(word, _)| word)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn evenly_spaced_excerpt(text: &str, max_chars: usize, segments: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars || segments <= 1 {
-        return text.chars().take(max_chars).collect();
-    }
-    let segment_chars = max_chars / segments;
-    let last_start = char_count.saturating_sub(segment_chars);
-    (0..segments)
-        .map(|index| {
-            let start = last_start * index / (segments - 1);
-            text.chars()
-                .skip(start)
-                .take(segment_chars)
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n...\n")
 }
 
 /// Message sent from background loader to TUI

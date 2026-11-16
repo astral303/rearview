@@ -616,45 +616,14 @@ mod tests {
             ] {
                 assert_eq!(actual, expected, "{} content", original.source.label());
             }
-            let agent_route = |row: &Conversation| {
-                crate::agent::service::agent_route_of(row, row.semantic_route_text())
-                    .map(|route| route.semantic_turns)
-            };
-            assert_eq!(
-                agent_route(&content),
-                agent_route(original),
-                "the agent's semantic route reads the same text from the {} content as from its parse",
-                original.source.label()
-            );
             assert_eq!(content.semantic_turns, original.semantic_turns);
             assert_eq!(content.semantic_turn_ranges, original.semantic_turn_ranges);
             assert_eq!(content.message_text_starts, original.message_text_starts);
 
-            let parsed_route =
-                (!original.semantic_turns.is_empty()).then(|| original.semantic_route_text());
-            let computed = cached.load_semantic_content().unwrap();
             assert_eq!(
-                (
-                    &computed.route_text,
-                    &computed.held.row.semantic_turns,
-                    computed.computed_route.is_some()
-                ),
-                (
-                    &parsed_route,
-                    &original.semantic_turns,
-                    parsed_route.is_some()
-                ),
-                "the {} copy's route text, computed without one stored, is its parse's",
-                original.source.label()
-            );
-            cache
-                .store_semantic_routes(&Vec::from_iter(computed.computed_route))
-                .unwrap();
-            let stored = cached.load_semantic_content().unwrap();
-            assert_eq!(
-                (&stored.route_text, stored.computed_route.is_none()),
-                (&parsed_route, true),
-                "the {} copy's stored route text is its parse's",
+                cached.load_semantic_content().unwrap().row.semantic_turns,
+                original.semantic_turns,
+                "the {} copy's semantic turns, read alone, are its parse's",
                 original.source.label()
             );
         }

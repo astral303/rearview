@@ -4,7 +4,7 @@ use crate::history::{Conversation, MessageTimes};
 use crate::search::literal::Literal;
 use crate::semantic::cache::{embed_missing, look_up_chunks, semantic_cache_dir};
 #[cfg(test)]
-use crate::semantic::chunk::build_chunks_with_sources;
+use crate::semantic::chunk::build_chunks_with_indices;
 use crate::semantic::chunk::builds_any_chunk;
 use crate::semantic::embed::{SemanticEmbedder, embed_valid_query};
 use crate::semantic::filter::matches_every_literal;
@@ -12,7 +12,7 @@ use crate::semantic::rank::rank_prepared;
 use crate::semantic::store::{PassageStore, StoreUse};
 use crate::semantic::types::{
     ChunkConfig, ChunkHits, EmbeddedChunk, EmbeddingBudget, SemanticCancellationToken,
-    SemanticChunk, SemanticChunkSource, SemanticHit,
+    SemanticChunk, SemanticHit,
 };
 use crate::time_filter::TimeFilter;
 use std::collections::HashMap;
@@ -23,9 +23,30 @@ use resident::{CorpusSignature, ResidentIndex};
 
 #[derive(Clone)]
 pub struct SemanticIndexCandidate {
-    pub index: usize,
-    pub source: SemanticChunkSource,
-    pub conversation: Arc<Conversation>,
+    index: usize,
+    conversation: Arc<Conversation>,
+}
+
+impl SemanticIndexCandidate {
+    /// The candidate of the session at `index` of a corpus: the passages
+    /// built from `conversation`'s semantic turns. The session list's
+    /// semantic search and the agent commands share an embedding where they
+    /// build the same passage text.
+    pub fn of_session(index: usize, conversation: Arc<Conversation>) -> Self {
+        Self {
+            index,
+            conversation,
+        }
+    }
+
+    /// The session's index in its corpus.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn conversation(&self) -> &Arc<Conversation> {
+        &self.conversation
+    }
 }
 
 pub struct SemanticIndexRequest<'a> {
@@ -443,14 +464,10 @@ fn candidate_chunks(
     candidates: &[SemanticIndexCandidate],
     chunk_config: ChunkConfig,
 ) -> Vec<SemanticChunk> {
-    build_chunks_with_sources(
-        candidates.iter().map(|candidate| {
-            (
-                candidate.index,
-                candidate.source,
-                candidate.conversation.as_ref(),
-            )
-        }),
+    build_chunks_with_indices(
+        candidates
+            .iter()
+            .map(|candidate| (candidate.index, candidate.conversation.as_ref())),
         chunk_config,
     )
 }
@@ -555,7 +572,6 @@ mod tests {
             .into_iter()
             .map(|index| SemanticIndexCandidate {
                 index,
-                source: SemanticChunkSource::VisibleDialogue,
                 conversation: Arc::new(conversations[index].clone()),
             })
             .collect();
@@ -600,7 +616,6 @@ mod tests {
             .enumerate()
             .map(|(index, conversation)| SemanticIndexCandidate {
                 index,
-                source: SemanticChunkSource::VisibleDialogue,
                 conversation: Arc::new(conversation),
             })
             .collect()
@@ -901,63 +916,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_hits_preserve_candidate_source() {
-        let conversations = vec![conversation(
-            "/projects/project-a/session-a.jsonl",
-            vec!["visible alpha"],
-        )];
-        let mut candidates = candidates_from(&conversations);
-        candidates[0].source = SemanticChunkSource::AgentSubagentDialogue;
-        let query = "alpha".to_string();
-        let request = index_request(&query, &candidates);
-        let (mut state, mut embedder) = prepare_indexed_state(&request, ChunkConfig::default());
-
-        let response =
-            run_refresh(&mut state, &request, &mut embedder).expect("cached rank succeeds");
-
-        assert_eq!(embedder.passage_calls, 0);
-        assert_eq!(
-            response.hits[0].explanation.chunk.source,
-            SemanticChunkSource::AgentSubagentDialogue
-        );
-    }
-
-    #[test]
-    fn source_aware_scope_filters_same_conversation_index_chunks() {
-        let conversations = vec![conversation(
-            "/projects/project-a/session-a.jsonl",
-            vec!["visible alpha"],
-        )];
-        let visible = candidates_from(&conversations);
-        let mut subagent = visible.clone();
-        subagent[0].source = SemanticChunkSource::AgentSubagentDialogue;
-        let mut all = visible.clone();
-        all.extend(subagent);
-        let query = "alpha".to_string();
-        let request = SemanticIndexRequest {
-            query: &query,
-            literal_filters: &[],
-            full_corpus: &all,
-            scope: &visible,
-            prewarm: false,
-            chunk_hits: ChunkHits::None,
-            window: TimeFilter::default(),
-        };
-        let (mut state, mut embedder) = prepare_indexed_state(&request, ChunkConfig::default());
-
-        let response =
-            run_refresh(&mut state, &request, &mut embedder).expect("scoped rank succeeds");
-
-        assert!(!response.hits.is_empty());
-        assert!(
-            response
-                .hits
-                .iter()
-                .all(|hit| hit.explanation.chunk.source == SemanticChunkSource::VisibleDialogue)
-        );
-    }
-
-    #[test]
     fn reuses_passage_embeddings_for_same_candidate_signature() {
         let conversations = vec![
             conversation("/projects/project-a/session-a.jsonl", vec!["visible alpha"]),
@@ -995,7 +953,6 @@ mod tests {
         run_refresh(&mut state, &request, &mut embedder).expect("same signature rank succeeds");
         candidates = vec![SemanticIndexCandidate {
             index: 0,
-            source: SemanticChunkSource::VisibleDialogue,
             conversation: Arc::new(conversation(
                 "/projects/project-a/session-a.jsonl",
                 vec!["visible beta"],
@@ -1334,7 +1291,6 @@ mod tests {
         let all = (0..conversations.len())
             .map(|index| SemanticIndexCandidate {
                 index,
-                source: SemanticChunkSource::VisibleDialogue,
                 conversation: Arc::new(conversations[index].clone()),
             })
             .collect::<Vec<_>>();

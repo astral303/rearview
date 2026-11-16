@@ -262,6 +262,9 @@ Semantic search finds related ideas even when the wording differs. Press
 `Ctrl+T` in the conversation list to switch between lexical and semantic
 search.
 
+Semantic search ranks user and assistant messages. It does not rank tool
+calls, tool results, thinking or sub-agent text.
+
 The first semantic search may download a local model and build embeddings.
 This model is downloaded to the directory specified by `FASTEMBED_CACHE_DIR`,
 or absent that, to the
@@ -798,10 +801,12 @@ session state database being busy or unreadable, after which no sessions from
 that agent are shown for that launch. The warning's detail names the agent and
 the reason.
 
-A semantic or hybrid `agent search` catches up the semantic index for up to
-2 seconds before it answers, and reports the passages still missing as a
-`partial-index` warning. `rearview --generate-semantic-cache` catches up in
-one run.
+Semantic and hybrid `agent search` and `agent within` rank the passages the
+session list's semantic search embeds. `agent search` catches up the semantic
+index for up to 2 seconds before it answers, `agent within` for up to 32
+passages, and each reports the passages still missing as a `partial-index`
+warning. `rearview --generate-semantic-cache` catches up in one run. The list's
+semantic search catches up while the list is open in semantic mode.
 
 `agent sessions` lists sessions without a query, newest first by their last
 message:

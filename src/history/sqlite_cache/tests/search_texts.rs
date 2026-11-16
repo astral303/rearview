@@ -76,7 +76,7 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
     let (_, parsed) =
         parsed_record_and_row(Source::Claude, &root_of(&session), &stub_of(&session, 1));
     assert_eq!(
-        parsed.full_text_after_title_and_summary(),
+        after_title_and_summary(&parsed, &parsed.full_text),
         normalize_whitespace(&laid_out),
         "the parse lays out the texts in block order, whitespace collapsed"
     );
@@ -138,7 +138,7 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
 
 /// The content a copy gives its row lays out each message's texts as the
 /// parse does when a result's items come ahead of a text block in their
-/// entry: semantic route text reads that layout.
+/// entry.
 #[test]
 fn content_read_from_copy_lays_out_texts_in_block_order_as_parse_does() {
     let home = tempfile::tempdir().unwrap();

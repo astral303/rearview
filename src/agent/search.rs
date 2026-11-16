@@ -20,7 +20,7 @@ use crate::history::Conversation;
 use crate::search::mode::{SearchMode, SearchModeResolution, resolve_search_mode};
 use crate::search::query::ParsedQuery;
 use crate::semantic::rank::RankedHits;
-use crate::semantic::types::{ChunkHits, SemanticChunkSource, SemanticHit, SemanticScoreBreakdown};
+use crate::semantic::types::{ChunkHits, SemanticHit, SemanticScoreBreakdown};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset};
 use std::cmp::Ordering;
@@ -1196,8 +1196,8 @@ fn semantic_output_hit_candidates(
                 evidence_score: semantic_score(hit.score_breakdown),
                 semantic_score_breakdown: Some(hit.score_breakdown),
                 source: AgentHitKind::Semantic,
-                evidence_source: semantic_evidence_source(hit.explanation.chunk.source),
-                render_options: semantic_render_options(hit.explanation.chunk.source),
+                evidence_source: AgentHitSource::Dialogue,
+                render_options: AgentHitRenderOptions::default(),
                 preview: format_evidence_preview(&hit.snippet),
                 focus_range,
                 times: None,
@@ -1237,43 +1237,6 @@ fn apply_semantic_conversation_order(hits: &mut [AgentOutputHit], order: &[Strin
         if let Some(rank) = ranks.get(hit.conversation_ref.as_str()) {
             hit.score = rrf_score(None, Some(*rank));
         }
-    }
-}
-
-fn semantic_evidence_source(source: SemanticChunkSource) -> AgentHitSource {
-    match source {
-        SemanticChunkSource::VisibleDialogue
-        | SemanticChunkSource::AgentRoute
-        | SemanticChunkSource::AgentSubagentDialogue => AgentHitSource::Dialogue,
-        SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool => {
-            AgentHitSource::Tool
-        }
-        SemanticChunkSource::AgentThinking | SemanticChunkSource::AgentSubagentThinking => {
-            AgentHitSource::Thinking
-        }
-    }
-}
-
-fn semantic_render_options(source: SemanticChunkSource) -> AgentHitRenderOptions {
-    AgentHitRenderOptions {
-        tools: matches!(
-            source,
-            SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool
-        ),
-        tool_results: matches!(
-            source,
-            SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool
-        ),
-        thinking: matches!(
-            source,
-            SemanticChunkSource::AgentThinking | SemanticChunkSource::AgentSubagentThinking
-        ),
-        subagents: matches!(
-            source,
-            SemanticChunkSource::AgentSubagentDialogue
-                | SemanticChunkSource::AgentSubagentTool
-                | SemanticChunkSource::AgentSubagentThinking
-        ),
     }
 }
 
@@ -1797,22 +1760,6 @@ mod tests {
     }
 
     fn semantic_hit(index: usize, range: MessageRange, text: &str, score: f32) -> SemanticHit {
-        semantic_hit_with_source(
-            index,
-            range,
-            text,
-            score,
-            SemanticChunkSource::VisibleDialogue,
-        )
-    }
-
-    fn semantic_hit_with_source(
-        index: usize,
-        range: MessageRange,
-        text: &str,
-        score: f32,
-        source: SemanticChunkSource,
-    ) -> SemanticHit {
         SemanticHit::new(
             SemanticScoreBreakdown::new(score, 0.0),
             SemanticExplanation {
@@ -1823,7 +1770,6 @@ mod tests {
                 rationale_kind: SemanticRationaleKind::SemanticOnly,
                 chunk: SemanticChunkIdentity {
                     conversation_index: index,
-                    source,
                     session: "session".to_string(),
                     chunk_index: range.start,
                     message_range: range,
@@ -2392,53 +2338,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_progress_source_enables_subagents_for_mixed_range() {
-        let conv = conversation("session.jsonl", "semantic title");
-        let resolved = resolved("session.jsonl");
-        let hits = semantic_output_hits(
-            &[semantic_hit_with_source(
-                0,
-                MessageRange { start: 2, end: 4 },
-                "subagent",
-                0.8,
-                SemanticChunkSource::AgentSubagentDialogue,
-            )],
-            1,
-            &[AgentConversationInput {
-                conversation: &conv,
-                resolved,
-                original_index: 0,
-            }],
-            TimeFilter::default(),
-        );
-
-        assert!(hits[0].render_options.subagents);
-    }
-
-    #[test]
-    fn semantic_tool_and_thinking_sources_emit_matching_read_policy() {
-        let tool = semantic_render_options(SemanticChunkSource::AgentTool);
-        assert!(tool.tools);
-        assert!(tool.tool_results);
-        assert!(!tool.thinking);
-        assert!(!tool.subagents);
-        assert_eq!(
-            semantic_evidence_source(SemanticChunkSource::AgentTool),
-            AgentHitSource::Tool
-        );
-
-        let thinking = semantic_render_options(SemanticChunkSource::AgentSubagentThinking);
-        assert!(!thinking.tools);
-        assert!(!thinking.tool_results);
-        assert!(thinking.thinking);
-        assert!(thinking.subagents);
-        assert_eq!(
-            semantic_evidence_source(SemanticChunkSource::AgentSubagentThinking),
-            AgentHitSource::Thinking
-        );
-    }
-
-    #[test]
     fn semantic_hits_use_shared_evidence_format_without_changing_recipes() {
         let mut conv = conversation("session.jsonl", "semantic title");
         conv.message_count = 5;
@@ -2446,13 +2345,7 @@ mod tests {
         let raw = format!("semantic\n\u{1b}[31m{} tail", "🙂 ".repeat(200));
 
         let hits = semantic_output_hits(
-            &[semantic_hit_with_source(
-                0,
-                MessageRange::single(3),
-                &raw,
-                0.8,
-                SemanticChunkSource::AgentSubagentTool,
-            )],
+            &[semantic_hit(0, MessageRange::single(3), &raw, 0.8)],
             1,
             &[AgentConversationInput {
                 conversation: &conv,
@@ -2464,12 +2357,10 @@ mod tests {
 
         assert_eq!(hits[0].preview, format_evidence_preview(&raw));
         assert_eq!(hits[0].preview.chars().count(), 160);
-        assert_eq!(hits[0].evidence_source, AgentHitSource::Tool);
+        assert_eq!(hits[0].evidence_source, AgentHitSource::Dialogue);
         assert_eq!(hits[0].focus_range, MessageRange::single(3));
         assert_eq!(hits[0].read_range, MessageRange { start: 2, end: 4 });
-        assert!(hits[0].render_options.tools);
-        assert!(hits[0].render_options.tool_results);
-        assert!(hits[0].render_options.subagents);
+        assert_eq!(hits[0].render_options, AgentHitRenderOptions::default());
     }
 
     #[test]
@@ -3242,83 +3133,13 @@ mod tests {
         assert!(rendered.contains("tools=false tool-results=true thinking=false subagents=false"));
     }
 
-    #[test]
-    fn conversation_ranked_by_its_route_leads_with_its_evidence() {
-        let conv_a = conversation("a.jsonl", "title a");
-        let conv_b = conversation("b.jsonl", "title b");
-        let input_a = AgentConversationInput {
-            conversation: &conv_a,
-            resolved: resolved("a.jsonl"),
-            original_index: 0,
-        };
-        let input_b = AgentConversationInput {
-            conversation: &conv_b,
-            resolved: resolved("b.jsonl"),
-            original_index: 1,
-        };
-        let request = AgentSearchRequest {
-            query: "semantic".to_string(),
-            top: 2,
-            cli_mode: Some(SearchMode::Semantic),
-            config_mode: None,
-            tui_semantic_search: None,
-            flat: false,
-            hits_per_conversation: 1,
-            retrieval_hits_per_conversation: None,
-            all_hits: false,
-            budget: None,
-            session_offset: 0,
-            window: TimeFilter::default(),
-        };
-        let semantic = RankedHits {
-            conversations: vec![
-                semantic_hit_with_source(
-                    1,
-                    MessageRange::single(1),
-                    "synthetic route",
-                    1.0,
-                    SemanticChunkSource::AgentRoute,
-                ),
-                semantic_hit(0, MessageRange::single(2), "evidence a", 0.9),
-            ],
-            chunks: vec![
-                semantic_hit(0, MessageRange::single(2), "evidence a", 0.9),
-                semantic_hit(1, MessageRange::single(3), "evidence b", 0.8),
-            ],
-        };
-
-        let output = run_global_semantic_search(&request, &[input_a, input_b], &semantic);
-
-        assert_eq!(
-            output.groups[0].conversation_ref,
-            resolved("b.jsonl").reference.canonical()
-        );
-        assert_eq!(output.groups[0].hits[0].preview, "evidence b");
-        assert_eq!(
-            output.groups[0].hits[0]
-                .semantic_score_breakdown
-                .unwrap()
-                .semantic,
-            0.8
-        );
-        assert!(
-            format_agent_output(&output)
-                .lines()
-                .find(|line| line.starts_with("conversation rank=1 "))
-                .unwrap()
-                .contains("similarity=0.800000")
-        );
-    }
-
-    /// Sixty sessions with two dialogue chunks each and a route on every
-    /// fourth. Session 2 has only its route, and the route ranks it first.
+    /// Sixty sessions with two dialogue chunks each.
     fn ranked_semantic_corpus(chunk_hits: ChunkHits) -> RankedHits {
         const QUERY_EMBEDDING: [f32; 2] = [1.0, 0.5];
         let varied = |seed: usize| vec![(seed % 11) as f32 - 5.0, (seed % 7) as f32 - 3.0];
-        let chunk = |conversation_index: usize, source, chunk_index: usize, embedding: Vec<f32>| {
+        let chunk = |conversation_index: usize, chunk_index: usize, embedding: Vec<f32>| {
             PreparedChunk::new(EmbeddedChunk {
                 conversation_index,
-                source,
                 session: format!("{conversation_index}"),
                 chunk_index,
                 text: format!("evidence {conversation_index} {chunk_index}"),
@@ -3326,27 +3147,13 @@ mod tests {
                 embedding: embedding.into(),
             })
         };
-        let mut chunks = vec![chunk(
-            2,
-            SemanticChunkSource::AgentRoute,
-            0,
-            QUERY_EMBEDDING.to_vec(),
-        )];
-        for index in (0..60).filter(|index| *index != 2) {
+        let mut chunks = Vec::new();
+        for index in 0..60 {
             for chunk_index in 0..2 {
                 chunks.push(chunk(
                     index,
-                    SemanticChunkSource::VisibleDialogue,
                     chunk_index,
                     varied(index * 7 + chunk_index * 3),
-                ));
-            }
-            if index % 4 == 2 {
-                chunks.push(chunk(
-                    index,
-                    SemanticChunkSource::AgentRoute,
-                    0,
-                    varied(index * 5),
                 ));
             }
         }

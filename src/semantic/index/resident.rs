@@ -1,40 +1,37 @@
 use super::SemanticIndexCandidate;
 use crate::error::{AppError, Result};
 use crate::history::Conversation;
-use crate::semantic::chunk::build_chunks_with_sources;
+use crate::semantic::chunk::build_chunks_with_indices;
 use crate::semantic::rank::PreparedChunk;
 use crate::semantic::types::{
-    ChunkConfig, EmbeddedChunk, SemanticCancellationToken, SemanticChunk, SemanticChunkSource,
+    ChunkConfig, EmbeddedChunk, SemanticCancellationToken, SemanticChunk,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A corpus position: the conversation's index in the list and its chunk
-/// source.
-type Position = (usize, SemanticChunkSource);
+/// A corpus position: the conversation's index in the list.
+type Position = usize;
 
-/// A conversation's identity in the resident index: its transcript path and
-/// chunk source, numbered in corpus order when a corpus lists the same pair
-/// more than once.
+/// A conversation's identity in the resident index: its transcript path,
+/// numbered in corpus order when a corpus lists the same path more than
+/// once.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ConversationKey {
     path: PathBuf,
-    source: SemanticChunkSource,
     occurrence: usize,
 }
 
 /// Each candidate's key, in corpus order.
 fn conversation_keys(candidates: &[SemanticIndexCandidate]) -> Vec<ConversationKey> {
-    let mut occurrences = HashMap::<(&Path, SemanticChunkSource), usize>::new();
+    let mut occurrences = HashMap::<&Path, usize>::new();
     candidates
         .iter()
         .map(|candidate| {
             let path = candidate.conversation.path.as_path();
-            let occurrence = occurrences.entry((path, candidate.source)).or_default();
+            let occurrence = occurrences.entry(path).or_default();
             let key = ConversationKey {
                 path: path.to_path_buf(),
-                source: candidate.source,
                 occurrence: *occurrence,
             };
             *occurrence += 1;
@@ -62,12 +59,7 @@ impl CorpusSignature {
         Self {
             conversations: full_corpus
                 .iter()
-                .map(|candidate| {
-                    (
-                        (candidate.index, candidate.source),
-                        Arc::clone(&candidate.conversation),
-                    )
-                })
+                .map(|candidate| (candidate.index, Arc::clone(&candidate.conversation)))
                 .collect(),
         }
     }
@@ -76,7 +68,7 @@ impl CorpusSignature {
         self.conversations.len() == full_corpus.len()
             && self.conversations.iter().zip(full_corpus).all(
                 |((position, conversation), candidate)| {
-                    *position == (candidate.index, candidate.source)
+                    *position == candidate.index
                         && conversation.path == candidate.conversation.path
                         && builds_same_chunks(conversation, &candidate.conversation)
                 },
@@ -91,9 +83,9 @@ struct ResidentConversation {
     chunks: Vec<PreparedChunk>,
 }
 
-/// Every corpus conversation's prepared chunks, kept by path and source, so
-/// a refresh prepares only conversations whose chunks changed and moves the
-/// rest to their new positions.
+/// Every corpus conversation's prepared chunks, kept by path, so a refresh
+/// prepares only conversations whose chunks changed and moves the rest to
+/// their new positions.
 #[derive(Default)]
 pub(super) struct ResidentIndex {
     conversations: HashMap<ConversationKey, ResidentConversation>,
@@ -135,7 +127,7 @@ impl ResidentIndex {
         self.chunk_count -= removed_chunks;
         self.corpus = full_corpus
             .iter()
-            .map(|candidate| (candidate.index, candidate.source))
+            .map(|candidate| candidate.index)
             .zip(keys.iter().cloned())
             .collect();
 
@@ -154,17 +146,13 @@ impl ResidentIndex {
                 }
                 continue;
             }
-            let chunks = build_chunks_with_sources(
-                std::iter::once((
-                    candidate.index,
-                    candidate.source,
-                    candidate.conversation.as_ref(),
-                )),
+            let chunks = build_chunks_with_indices(
+                std::iter::once((candidate.index, candidate.conversation.as_ref())),
                 chunk_config,
             );
             plan.conversations.push(PendingConversation {
                 key,
-                position: (candidate.index, candidate.source),
+                position: candidate.index,
                 conversation: Arc::clone(&candidate.conversation),
                 chunk_count: chunks.len(),
             });
@@ -190,7 +178,7 @@ impl ResidentIndex {
             .map(|_| Vec::new())
             .collect::<Vec<Vec<EmbeddedChunk>>>();
         for chunk in embedded {
-            if let Some(&slot) = slots.get(&(chunk.conversation_index, chunk.source)) {
+            if let Some(&slot) = slots.get(&chunk.conversation_index) {
                 grouped[slot].push(chunk);
             }
         }
@@ -228,7 +216,7 @@ impl ResidentIndex {
     pub(super) fn has_chunks_in(&self, scope: &[SemanticIndexCandidate]) -> bool {
         let scope = scope
             .iter()
-            .map(|candidate| (candidate.index, candidate.source))
+            .map(|candidate| candidate.index)
             .collect::<HashSet<_>>();
         self.corpus.iter().any(|(position, key)| {
             scope.contains(position)
@@ -247,7 +235,7 @@ impl ResidentIndex {
     ) -> Result<Vec<&PreparedChunk>> {
         let scope = scope
             .iter()
-            .map(|candidate| (candidate.index, candidate.source))
+            .map(|candidate| candidate.index)
             .collect::<HashSet<_>>();
         let mut chunks = Vec::new();
         for (position, key) in &self.corpus {

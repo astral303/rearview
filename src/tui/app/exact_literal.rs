@@ -7,8 +7,8 @@ use crate::history::Conversation;
 use crate::search::LexicalEvidence;
 use crate::search::query::ParsedQuery;
 use crate::semantic::types::{
-    SemanticChunkIdentity, SemanticChunkSource, SemanticExplanation, SemanticQuality,
-    SemanticRationaleKind, SemanticScoreBreakdown,
+    SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
+    SemanticScoreBreakdown,
 };
 use std::collections::HashMap;
 
@@ -78,7 +78,6 @@ fn exact_literal_metadata(
             rationale_kind: SemanticRationaleKind::LexicalBoosted,
             chunk: SemanticChunkIdentity {
                 conversation_index,
-                source: SemanticChunkSource::VisibleDialogue,
                 session: conversation.session_id.clone(),
                 chunk_index: 0,
                 message_range: crate::agent::refs::MessageRange::single(1),

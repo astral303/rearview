@@ -164,9 +164,6 @@
   stored. Stored embeddings no longer have a limit.
   - `--generate-semantic-cache` no longer fails on a history of more than
     50,000 distinct passages.
-  - A semantic `agent within` of a large session now adds passages to the
-    session's semantic index on every call. Before, it deleted as many
-    embeddings as it added.
 - Fix two semantic searches running at the same time losing the embeddings
   one of them computed. Each now keeps the passages it embedded.
 - Fix `--generate-semantic-cache` reporting success when it could not store
@@ -175,6 +172,16 @@
 
 #### `rearview agent` commands
 
+- Fix semantic and hybrid `agent search` and `agent within` embedding
+  passages, and reporting `partial-index`, after the session list's semantic
+  search or `--generate-semantic-cache` had embedded every session. They now
+  rank the passages the list embeds: user and assistant messages.
+  - Semantic `agent within` no longer ranks tool calls, tool results,
+    thinking or sub-agent text. Lexical, exact and hybrid modes find them by
+    words. Before, a long session reported `partial-index` on every call.
+  - A session whose topic appears in its tool results, sub-agent text or
+    title alone no longer ranks by meaning in semantic and hybrid
+    `agent search`. The list's semantic search does not rank it either.
 - Fix `agent within` showing a Codex, Grok Build or Kimi Code session's
   old name after a rename until its transcript changed.
 - Fix `agent within` naming a session without a title or summary differently
@@ -194,6 +201,9 @@
 
 ### Changes
 
+- A semantic `agent within` of a session without a copy in the session
+  cache now fails with `semantic-unavailable`, and hybrid prints that
+  warning with its lexical hits. Before, it embedded and ranked the session.
 - `agent read`, `agent outline` and `agent within` of a handle
   `agent sessions` or `agent search` printed no longer print other agents'
   `io` warnings about sessions that could not be listed or directories that

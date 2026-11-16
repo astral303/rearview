@@ -2013,6 +2013,19 @@ mod tests {
     }
 
     /// Helper to parse JSONL content
+    /// `conversation`'s title, then its summary, then its `full_text`, each
+    /// after a separator: the text the list's search reads.
+    fn full_text_after_title_and_summary(conversation: &Conversation) -> String {
+        let mut text = String::new();
+        for piece in conversation
+            .title_and_summary_texts()
+            .chain([conversation.full_text.as_str()])
+        {
+            crate::history::message_texts::push_separated(&mut text, piece);
+        }
+        text
+    }
+
     fn parse_jsonl(content: &str) -> Result<Option<Conversation>> {
         claude::conversation_from_reader(
             Path::new("test.jsonl"),
@@ -2594,8 +2607,7 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(
-            conv.full_text_after_title_and_summary()
-                .starts_with("Important topic discussion"),
+            full_text_after_title_and_summary(&conv).starts_with("Important topic discussion"),
             "search reads the summary ahead of the full text"
         );
     }
@@ -2679,8 +2691,7 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(
-            conv.full_text_after_title_and_summary()
-                .starts_with("ai-title-search-sentinel"),
+            full_text_after_title_and_summary(&conv).starts_with("ai-title-search-sentinel"),
             "search reads the AI title ahead of the full text"
         );
     }
@@ -2799,8 +2810,7 @@ mod tests {
 
         let conv = parse_jsonl(&content).unwrap().unwrap();
         assert!(
-            conv.full_text_after_title_and_summary()
-                .starts_with("unique-session-name"),
+            full_text_after_title_and_summary(&conv).starts_with("unique-session-name"),
             "search reads the custom title ahead of the full text"
         );
     }
@@ -3078,7 +3088,7 @@ mod tests {
                 "{excluded} leaked into {semantic:?}"
             );
         }
-        let searched = conv.full_text_after_title_and_summary();
+        let searched = full_text_after_title_and_summary(&conv);
         let searched_lower = crate::search::lexical::searchable_conversation(&conv, 0).text_lower;
         for included in [
             "summary lexical sentinel",
@@ -3444,7 +3454,7 @@ mod tests {
         let starts = &conv.message_text_starts.full_text;
 
         assert_eq!(
-            conv.full_text_after_title_and_summary(),
+            full_text_after_title_and_summary(&conv),
             "Named session \u{1e} question \u{1e} answer",
             "search reads the title ahead of every message"
         );
@@ -3499,25 +3509,6 @@ mod tests {
             .to_string(),
         ]
         .join("\n")
-    }
-
-    #[test]
-    fn thinking_and_tool_names_stay_out_of_semantic_route_text() {
-        let content = reply_with_thinking_and_a_tool_call("weighing the stale index");
-
-        let route_text = parse_jsonl(&content)
-            .unwrap()
-            .unwrap()
-            .semantic_route_text();
-
-        assert!(
-            !route_text.contains("weighing"),
-            "the route text leaves out thinking: {route_text}"
-        );
-        assert!(
-            !route_text.contains("WebFetch"),
-            "the route text leaves out tool names: {route_text}"
-        );
     }
 
     #[test]
@@ -3832,11 +3823,6 @@ mod tests {
             .collect();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(session.subagents, subagents);
-        let route_text = session.semantic_route_text();
-        assert!(
-            route_text.contains("thread"),
-            "the route text includes the sub-agent threads' text: {route_text}"
-        );
     }
 
     #[test]

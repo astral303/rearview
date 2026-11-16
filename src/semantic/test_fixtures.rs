@@ -8,8 +8,8 @@ use chrono::Local;
 
 #[cfg(test)]
 use crate::semantic::types::{
-    SemanticChunkIdentity, SemanticChunkSource, SemanticExplanation, SemanticQuality,
-    SemanticRationaleKind, SemanticScoreBreakdown,
+    SemanticChunkIdentity, SemanticExplanation, SemanticQuality, SemanticRationaleKind,
+    SemanticScoreBreakdown,
 };
 
 pub struct SemanticConversationFixture {
@@ -159,7 +159,6 @@ pub fn beta_hit_metadata(
             rationale_kind: SemanticRationaleKind::LexicalBoosted,
             chunk: SemanticChunkIdentity {
                 conversation_index: chunk_conversation_index,
-                source: SemanticChunkSource::VisibleDialogue,
                 session: session.to_string(),
                 chunk_index: 0,
                 message_range: MessageRange::single(1),

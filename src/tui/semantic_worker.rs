@@ -637,10 +637,8 @@ impl WorkerCorpus {
         self.rows
             .iter()
             .enumerate()
-            .map(|(index, conversation)| SemanticIndexCandidate {
-                index,
-                source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                conversation: conversation.clone(),
+            .map(|(index, conversation)| {
+                SemanticIndexCandidate::of_session(index, conversation.clone())
             })
             .collect()
     }
@@ -682,13 +680,18 @@ impl WorkerCorpus {
         let mut without_turns = SessionsWithoutTexts::default();
         let mut candidates = self.full_corpus_candidates();
         for candidate in &mut candidates {
-            let Some(cached) = &candidate.conversation.cached_session else {
+            let Some(cached) = &candidate.conversation().cached_session else {
                 continue;
             };
             let copy = cached.copy_key();
             let held = &self.semantic_turns[&copy.session];
             match (&held.turns, &held.missed) {
-                (Some(turns), _) => candidate.conversation = Arc::clone(&turns.loaded),
+                (Some(turns), _) => {
+                    *candidate = SemanticIndexCandidate::of_session(
+                        candidate.index(),
+                        Arc::clone(&turns.loaded),
+                    );
+                }
                 (None, Some((_, failure))) => without_turns.count(failure),
                 (None, None) => without_turns.unreadable += 1,
             }
@@ -704,16 +707,26 @@ impl WorkerCorpus {
         self.scope
             .iter()
             .filter_map(|&index| {
-                self.rows
-                    .get(index)
-                    .map(|conversation| SemanticIndexCandidate {
-                        index,
-                        source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                        conversation: conversation.clone(),
-                    })
+                self.rows.get(index).map(|conversation| {
+                    SemanticIndexCandidate::of_session(index, conversation.clone())
+                })
             })
             .collect()
     }
+}
+
+/// The candidates the worker embeds and ranks for a session list of `rows`.
+#[cfg(test)]
+pub(crate) fn session_list_candidates(rows: &[Conversation]) -> Vec<SemanticIndexCandidate> {
+    let mut corpus = WorkerCorpus::default();
+    corpus.apply_command(
+        SemanticWorkerCommand::UpdateCorpus {
+            corpus_version: 1,
+            conversations: Arc::new(rows.iter().cloned().map(Arc::new).collect()),
+        },
+        &SemanticCancellationToken::new(),
+    );
+    corpus.loaded_corpus_candidates().candidates
 }
 
 fn rank_or_prewarm_semantic_request(
@@ -988,11 +1001,11 @@ mod tests {
         let candidates = worker.semantic_candidates();
 
         assert_eq!(full_corpus.len(), 2);
-        assert_eq!(full_corpus[0].index, 0);
-        assert_eq!(full_corpus[1].index, 1);
+        assert_eq!(full_corpus[0].index(), 0);
+        assert_eq!(full_corpus[1].index(), 1);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].index, 1);
-        assert_eq!(candidates[0].conversation.semantic_turns, vec!["visible"]);
+        assert_eq!(candidates[0].index(), 1);
+        assert_eq!(candidates[0].conversation().semantic_turns, vec!["visible"]);
     }
 
     /// `rows`, as the corpus of version `version`.
@@ -1017,7 +1030,7 @@ mod tests {
         corpus
             .candidates
             .iter()
-            .map(|candidate| candidate.conversation.semantic_turns.clone())
+            .map(|candidate| candidate.conversation().semantic_turns.clone())
             .collect()
     }
 
@@ -1048,8 +1061,8 @@ mod tests {
         for (search, corpus) in [("the next search", second), ("a renamed row", after_rename)] {
             assert!(
                 Arc::ptr_eq(
-                    &first.candidates[0].conversation,
-                    &corpus.candidates[0].conversation
+                    first.candidates[0].conversation(),
+                    corpus.candidates[0].conversation()
                 ),
                 "{search} searches the row read for the copy"
             );
@@ -1142,8 +1155,8 @@ mod tests {
         );
         assert!(
             Arc::ptr_eq(
-                &first.candidates[1].conversation,
-                &corpus.candidates[1].conversation
+                first.candidates[1].conversation(),
+                corpus.candidates[1].conversation()
             ),
             "the other session's turns stay held"
         );

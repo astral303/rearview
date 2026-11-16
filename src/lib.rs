@@ -588,7 +588,6 @@ fn run_with(
         return semantic_cli::generate_cache(
             &conversations,
             local_workspace(&environment)?.as_ref(),
-            environment.cache_base(),
             clock,
         );
     }
@@ -1008,7 +1007,6 @@ mod agent_command_tests {
     use super::*;
     use crate::agent::refs::AgentConversationKey;
     use crate::agent::service::{
-        agent_semantic_candidates, agent_semantic_candidates_matching_tools,
         resolve_agent_conversation_arg, resolve_agent_read_args, run_agent_outline, run_agent_read,
     };
     use crate::agent::test_support::{
@@ -1646,7 +1644,6 @@ mod agent_command_tests {
     }
 
     fn semantic_hit_for_test(
-        source: crate::semantic::types::SemanticChunkSource,
         message_range: agent::refs::MessageRange,
         evidence_preview: &str,
     ) -> crate::semantic::types::SemanticHit {
@@ -1660,7 +1657,6 @@ mod agent_command_tests {
                 rationale_kind: crate::semantic::types::SemanticRationaleKind::SemanticOnly,
                 chunk: crate::semantic::types::SemanticChunkIdentity {
                     conversation_index: 0,
-                    source,
                     session: "session".to_string(),
                     chunk_index: 0,
                     message_range,
@@ -1760,11 +1756,7 @@ mod agent_command_tests {
             .iter()
             .find(|range| **range == agent::refs::MessageRange::single(5))
             .expect("assistant text should use canonical m5");
-        let semantic_hit = semantic_hit_for_test(
-            crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-            semantic_range,
-            "final assistant text",
-        );
+        let semantic_hit = semantic_hit_for_test(semantic_range, "final assistant text");
         let within_request = agent::search::AgentWithinRequest {
             query: "final assistant".to_string(),
             top: 1,
@@ -1818,11 +1810,7 @@ mod agent_command_tests {
             .iter()
             .find(|range| **range == agent::refs::MessageRange::single(2))
             .expect("assistant text should use canonical m2");
-        let semantic_hit = semantic_hit_for_test(
-            crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-            semantic_range,
-            "final assistant text",
-        );
+        let semantic_hit = semantic_hit_for_test(semantic_range, "final assistant text");
         let within_request = agent::search::AgentWithinRequest {
             query: "final assistant".to_string(),
             top: 1,
@@ -2283,12 +2271,10 @@ mod agent_command_tests {
             )
         };
         let semantic_hit = semantic_hit_for_test(
-            crate::semantic::types::SemanticChunkSource::VisibleDialogue,
             agent::refs::MessageRange { start: 1, end: 2 },
             "Check the cache",
         );
         let semantic_reply_hit = semantic_hit_for_test(
-            crate::semantic::types::SemanticChunkSource::VisibleDialogue,
             agent::refs::MessageRange::single(2),
             "I'll read the cache config first",
         );
@@ -2553,11 +2539,7 @@ mod agent_command_tests {
             original_index: 0,
         }];
         let passage = |start, end| {
-            semantic_hit_for_test(
-                crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                agent::refs::MessageRange { start, end },
-                "the cache",
-            )
+            semantic_hit_for_test(agent::refs::MessageRange { start, end }, "the cache")
         };
         let passages = [passage(1, 5), passage(1, 2)];
         let ranked = crate::semantic::rank::RankedHits {
@@ -2651,400 +2633,6 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn agent_semantic_candidates_preserve_tool_results_and_select_matching_segments() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_jsonl(
-            &dir,
-            "12345678-1234-4234-9234-123456789abc.jsonl",
-            &[
-                user("question"),
-                serde_json::json!({
-                    "type": "assistant",
-                    "timestamp": "2024-01-01T00:00:01Z",
-                    "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/tmp/example"}}]}
-                })
-                .to_string(),
-                tool_result_user(&format!(
-                    "HEAD{}distinctive_calibration{}TAIL",
-                    "x".repeat(5_000),
-                    "y".repeat(5_000)
-                )),
-                assistant("done"),
-            ],
-        );
-        let (keys, resolved) = resolved_test_conversation(path.clone());
-        let conversation = parsed_conversation(&path);
-        let input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved,
-            original_index: 0,
-        };
-
-        let matching_tools_input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved: input.resolved.clone(),
-            original_index: 0,
-        };
-        let unmatched_tools_input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved: input.resolved.clone(),
-            original_index: 0,
-        };
-        let tool_call_input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved: input.resolved.clone(),
-            original_index: 0,
-        };
-        let candidates = agent_semantic_candidates(&[input]).0;
-        let matching_candidates = agent_semantic_candidates_matching_tools(
-            &[matching_tools_input],
-            "distinctive calibration",
-        )
-        .0;
-        let unmatched_candidates =
-            agent_semantic_candidates_matching_tools(&[unmatched_tools_input], "absent needle").0;
-        let tool_call_candidates =
-            agent_semantic_candidates_matching_tools(&[tool_call_input], "Read example").0;
-        let tool = candidates
-            .iter()
-            .find(|candidate| {
-                candidate.source == crate::semantic::types::SemanticChunkSource::AgentTool
-            })
-            .expect("tool result candidate");
-
-        let matching_tool = matching_candidates
-            .iter()
-            .find(|candidate| {
-                candidate.source == crate::semantic::types::SemanticChunkSource::AgentTool
-            })
-            .expect("matching tool result candidate");
-        let tool_call = tool_call_candidates
-            .iter()
-            .find(|candidate| {
-                candidate.source == crate::semantic::types::SemanticChunkSource::AgentTool
-            })
-            .expect("matching tool call candidate");
-
-        assert_eq!(keys.len(), 1);
-        assert!(tool.conversation.semantic_turns.len() > 1);
-        assert!(
-            tool.conversation
-                .semantic_turns
-                .iter()
-                .all(|turn| turn.len() <= crate::semantic::types::DEFAULT_CHUNK_TARGET_CHARS)
-        );
-        let all_tool_text = tool.conversation.semantic_turns.join("");
-        assert!(all_tool_text.contains("Read: /tmp/example"));
-        assert!(all_tool_text.contains("HEAD"));
-        assert!(all_tool_text.contains("TAIL"));
-        assert!(all_tool_text.contains("distinctive_calibration"));
-        assert_eq!(matching_tool.conversation.semantic_turns.len(), 1);
-        assert!(matching_tool.conversation.semantic_turns[0].contains("distinctive_calibration"));
-        assert_eq!(
-            tool_call.conversation.semantic_turns,
-            ["Read: /tmp/example"]
-        );
-        assert!(
-            matching_tool.conversation.semantic_turns[0].len()
-                <= crate::semantic::types::DEFAULT_CHUNK_TARGET_CHARS
-        );
-
-        let config = crate::semantic::types::ChunkConfig::default();
-        let all_chunks = crate::semantic::chunk::build_chunks_with_sources(
-            [(0, tool.source, tool.conversation.as_ref())],
-            config,
-        );
-        let matching_chunks = crate::semantic::chunk::build_chunks_with_sources(
-            [(0, matching_tool.source, matching_tool.conversation.as_ref())],
-            config,
-        );
-        assert!(
-            matching_chunks
-                .iter()
-                .all(|matching| all_chunks.iter().any(|all| all.text == matching.text))
-        );
-        assert!(unmatched_candidates.iter().all(|candidate| !matches!(
-            candidate.source,
-            crate::semantic::types::SemanticChunkSource::AgentTool
-                | crate::semantic::types::SemanticChunkSource::AgentSubagentTool
-        )));
-    }
-
-    #[test]
-    fn agent_semantic_tool_matching_sanitizes_text_and_handles_unicode_and_short_terms() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_jsonl(
-            &dir,
-            "12345678-1234-4234-9234-123456789abc.jsonl",
-            &[
-                user("question"),
-                tool_result_user("prefix \u{1b}[31mÜber UI\u{1b}[0m menuBar suffix"),
-                assistant("done"),
-            ],
-        );
-        let (_, resolved) = resolved_test_conversation(path.clone());
-        let conversation = parsed_conversation(&path);
-        let input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved: resolved.clone(),
-            original_index: 0,
-        };
-        let camel_case_input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved: resolved.clone(),
-            original_index: 0,
-        };
-        let exact_identifier_input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved: resolved.clone(),
-            original_index: 0,
-        };
-        let stop_words_input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved,
-            original_index: 0,
-        };
-
-        let candidates = agent_semantic_candidates_matching_tools(&[input], "über ui").0;
-        let camel_case_candidates =
-            agent_semantic_candidates_matching_tools(&[camel_case_input], "bar").0;
-        let exact_identifier_candidates =
-            agent_semantic_candidates_matching_tools(&[exact_identifier_input], "menuBar").0;
-        let stop_word_candidates =
-            agent_semantic_candidates_matching_tools(&[stop_words_input], "how to the an or if").0;
-        let tool = candidates
-            .iter()
-            .find(|candidate| {
-                candidate.source == crate::semantic::types::SemanticChunkSource::AgentTool
-            })
-            .expect("matching Unicode tool result candidate");
-
-        assert_eq!(
-            tool.conversation.semantic_turns,
-            ["prefix Über UI menuBar suffix"]
-        );
-        assert!(camel_case_candidates.iter().any(|candidate| {
-            candidate.source == crate::semantic::types::SemanticChunkSource::AgentTool
-        }));
-        assert!(exact_identifier_candidates.iter().any(|candidate| {
-            candidate.source == crate::semantic::types::SemanticChunkSource::AgentTool
-        }));
-        assert!(stop_word_candidates.iter().all(|candidate| !matches!(
-            candidate.source,
-            crate::semantic::types::SemanticChunkSource::AgentTool
-                | crate::semantic::types::SemanticChunkSource::AgentSubagentTool
-        )));
-    }
-
-    #[test]
-    fn agent_semantic_candidates_include_progress_only_subagent_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_jsonl(
-            &dir,
-            "12345678-1234-4234-9234-123456789abc.jsonl",
-            &[
-                user("question"),
-                r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"progress_only_semantic_needle"}]}}}}"#.to_string(),
-                assistant("done"),
-            ],
-        );
-        let key = AgentConversationKey::new(
-            "project-a",
-            "12345678-1234-4234-9234-123456789abc.jsonl",
-            path.clone(),
-        );
-        let resolved = agent::refs::ResolvedConversation {
-            key: key.clone(),
-            reference: key.conversation_ref(),
-        };
-        let conversation = history::format::claude::conversation_from_reader(
-            &path,
-            std::io::Cursor::new(std::fs::read_to_string(&path).unwrap()),
-            history::parser::RowDating::new(None, &clock::TestClock::default()),
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            !conversation
-                .semantic_turns
-                .join(" ")
-                .contains("progress_only_semantic_needle")
-        );
-        let input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved,
-            original_index: 0,
-        };
-
-        let candidates = agent_semantic_candidates(&[input]).0;
-        let candidate = candidates[1].conversation.as_ref();
-
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(
-            candidates[0].source,
-            crate::semantic::types::SemanticChunkSource::VisibleDialogue
-        );
-        assert_eq!(
-            candidates[1].source,
-            crate::semantic::types::SemanticChunkSource::AgentSubagentDialogue
-        );
-        assert!(
-            candidate
-                .semantic_turns
-                .join(" ")
-                .contains("progress_only_semantic_needle")
-        );
-        assert_eq!(
-            candidate.semantic_turn_ranges.last().copied(),
-            Some(agent::refs::MessageRange::single(2))
-        );
-        assert!(
-            !conversation
-                .semantic_turns
-                .join(" ")
-                .contains("progress_only_semantic_needle")
-        );
-    }
-
-    #[test]
-    fn agent_semantic_candidates_require_canonical_transcript_projection() {
-        let key = AgentConversationKey::new(
-            "project-a",
-            "missing.jsonl",
-            std::path::PathBuf::from("/missing/session.jsonl"),
-        );
-        let resolved = agent::refs::ResolvedConversation {
-            key: key.clone(),
-            reference: key.conversation_ref(),
-        };
-        let conversation = history::Conversation {
-            source: history::Source::Claude,
-            subagents: Vec::new(),
-            session_id: key.session_id.clone(),
-            path: key.path.clone(),
-            index: 0,
-            timestamp: chrono::Local::now(),
-            preview: "visible semantic".to_string(),
-            preview_first: "visible semantic".to_string(),
-            preview_last: "visible semantic".to_string(),
-            full_text: "visible semantic".to_string(),
-            agent_search_text: String::new(),
-            semantic_turns: vec!["visible semantic".to_string()],
-            semantic_turn_ranges: vec![agent::refs::MessageRange::single(1)],
-            search_text_lower: "visible semantic".to_string(),
-            project_name: Some("project-a".to_string()),
-            project_path: None,
-            cwd: None,
-            message_count: 1,
-            message_times: history::MessageTimes::default(),
-            message_text_starts: history::MessageTextStarts::default(),
-            assistant_messages: 1,
-            parse_errors: Vec::new(),
-            summary: None,
-            custom_title: Some("visible semantic".to_string()),
-            external_title: None,
-            model: None,
-            total_tokens: 0,
-            duration_minutes: None,
-            fingerprint: None,
-            has_transient_read_error: false,
-            is_missing_earlier_turns: false,
-            cached_session: None,
-            cache_address: None,
-            publication: crate::history::sqlite_cache::Publication::Unpublished {
-                discovered: Vec::new(),
-            },
-            thinking_and_tool_call_text: String::new(),
-        };
-        let input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved,
-            original_index: 0,
-        };
-
-        let (candidates, warnings) = agent_semantic_candidates(&[input]);
-
-        assert!(candidates.is_empty());
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(
-            warnings[0].reference,
-            Some(key.conversation_ref().canonical())
-        );
-    }
-
-    #[test]
-    fn agent_semantic_candidates_recover_malformed_transcripts() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_jsonl(
-            &dir,
-            "12345678-1234-4234-9234-123456789abc.jsonl",
-            &[
-                user("visible semantic"),
-                r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"progress_only_semantic_needle"}]}}}}"#.to_string(),
-                "not json".to_string(),
-                assistant("done"),
-            ],
-        );
-        let key = AgentConversationKey::new(
-            "project-a",
-            "12345678-1234-4234-9234-123456789abc.jsonl",
-            path.clone(),
-        );
-        let resolved = agent::refs::ResolvedConversation {
-            key: key.clone(),
-            reference: key.conversation_ref(),
-        };
-        let conversation = history::format::claude::conversation_from_reader(
-            &path,
-            std::io::Cursor::new([
-                user("visible semantic"),
-                r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent-abcdef","message":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"progress_only_semantic_needle"}]}}}}"#.to_string(),
-                "not json".to_string(),
-                assistant("done"),
-            ].join("\n")),
-            history::parser::RowDating::new(None, &clock::TestClock::default()),
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            conversation
-                .agent_search_text
-                .contains("progress_only_semantic_needle")
-        );
-        let input = agent::search::AgentConversationInput {
-            conversation: &conversation,
-            resolved,
-            original_index: 0,
-        };
-
-        let (candidates, warnings) = agent_semantic_candidates(&[input]);
-
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(
-            warnings[0].kind,
-            agent::diagnostic::AgentWarningKind::MalformedTranscript
-        );
-        assert_eq!(
-            candidates[0].source,
-            crate::semantic::types::SemanticChunkSource::VisibleDialogue
-        );
-        assert_eq!(
-            candidates[1].source,
-            crate::semantic::types::SemanticChunkSource::AgentSubagentDialogue
-        );
-        assert!(
-            candidates[1]
-                .conversation
-                .semantic_turns
-                .join(" ")
-                .contains("progress_only_semantic_needle")
-        );
-    }
-
-    #[test]
     fn semantic_progress_hit_read_recipe_enables_subagents() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
@@ -3060,7 +2648,6 @@ mod agent_command_tests {
         let conversation = parsed_conversation(&path);
         let transcript = load_transcript(&resolved.key.path);
         let semantic_hit = semantic_hit_for_test(
-            crate::semantic::types::SemanticChunkSource::AgentSubagentDialogue,
             agent::refs::MessageRange::single(2),
             "progress_only_semantic_needle",
         );

@@ -2,7 +2,7 @@ use crate::error::{AppError, Result};
 use crate::semantic::evidence::{evidence_preview, matched_terms};
 use crate::semantic::types::{
     ChunkHits, EmbeddedChunk, SemanticCancellationToken, SemanticChunkIdentity,
-    SemanticChunkSource, SemanticExplanation, SemanticHit, SemanticQuality, SemanticRationaleKind,
+    SemanticExplanation, SemanticHit, SemanticQuality, SemanticRationaleKind,
     SemanticScoreBreakdown,
 };
 use std::cmp::Ordering;
@@ -117,7 +117,6 @@ impl<'a> Query<'a> {
                 rationale_kind: rationale_kind(scored.score),
                 chunk: SemanticChunkIdentity {
                     conversation_index: chunk.conversation_index,
-                    source: chunk.source,
                     session: chunk.session.clone(),
                     chunk_index: chunk.chunk_index,
                     message_range: chunk.message_range,
@@ -218,29 +217,20 @@ fn best_chunk_per_conversation<'a>(scored: &[ScoredChunk<'a>]) -> Vec<ScoredChun
     winners
 }
 
-/// The evidence chunks of the first `count` conversations in `winners` with
-/// evidence, best first.
+/// The chunks of the first `count` conversations in `winners`, best first.
 fn top_evidence_chunks<'a>(
     scored: &[ScoredChunk<'a>],
     winners: &[ScoredChunk<'a>],
     count: usize,
 ) -> Vec<ScoredChunk<'a>> {
-    let is_evidence =
-        |scored: &ScoredChunk<'_>| scored.chunk.source != SemanticChunkSource::AgentRoute;
-    let with_evidence = scored
-        .iter()
-        .filter(|scored| is_evidence(scored))
-        .map(|scored| scored.chunk.conversation_index)
-        .collect::<HashSet<_>>();
     let selected = winners
         .iter()
         .map(|winner| winner.chunk.conversation_index)
-        .filter(|index| with_evidence.contains(index))
         .take(count)
         .collect::<HashSet<_>>();
     let mut evidence = scored
         .iter()
-        .filter(|scored| is_evidence(scored) && selected.contains(&scored.chunk.conversation_index))
+        .filter(|scored| selected.contains(&scored.chunk.conversation_index))
         .copied()
         .collect::<Vec<_>>();
     evidence.sort_by(compare_scored);
@@ -321,30 +311,11 @@ mod tests {
     ) -> EmbeddedChunk {
         EmbeddedChunk {
             conversation_index,
-            source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
             session: session.to_string(),
             chunk_index,
             text: text.to_string(),
             message_range: crate::agent::refs::MessageRange::single(chunk_index + 1),
             embedding: embedding.into(),
-        }
-    }
-
-    fn embedded_from(
-        conversation_index: usize,
-        source: SemanticChunkSource,
-        chunk_index: usize,
-        embedding: Vec<f32>,
-    ) -> EmbeddedChunk {
-        EmbeddedChunk {
-            source,
-            ..embedded(
-                &format!("session-{conversation_index}"),
-                conversation_index,
-                chunk_index,
-                "text",
-                embedding,
-            )
         }
     }
 
@@ -433,50 +404,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agent_route_ranks_its_conversation_but_is_not_chunk_hit() {
-        let chunks = vec![
-            embedded_from(0, SemanticChunkSource::AgentRoute, 0, vec![1.0, 0.0]),
-            embedded_from(0, SemanticChunkSource::VisibleDialogue, 0, vec![0.0, 1.0]),
-            embedded_from(1, SemanticChunkSource::VisibleDialogue, 0, vec![0.5, 0.5]),
-        ];
-
-        let ranked = rank(&chunks, &[1.0, 0.0], ChunkHits::TopConversations(2));
-
-        assert_eq!(conversation_indices(&ranked.conversations), vec![0, 1]);
-        assert_eq!(
-            ranked.conversations[0].explanation.chunk.source,
-            SemanticChunkSource::AgentRoute
-        );
-        assert_eq!(conversation_indices(&ranked.chunks), vec![1, 0]);
-        assert!(
-            ranked
-                .chunks
-                .iter()
-                .all(|hit| hit.explanation.chunk.source != SemanticChunkSource::AgentRoute)
-        );
-    }
-
-    #[test]
-    fn top_conversations_count_only_conversations_with_evidence() {
-        let chunks = vec![
-            embedded_from(0, SemanticChunkSource::AgentRoute, 0, vec![1.0, 0.0]),
-            embedded_from(1, SemanticChunkSource::VisibleDialogue, 0, vec![0.8, 0.2]),
-            embedded_from(2, SemanticChunkSource::VisibleDialogue, 0, vec![0.5, 0.5]),
-        ];
-
-        let ranked = rank(&chunks, &[1.0, 0.0], ChunkHits::TopConversations(1));
-
-        assert_eq!(conversation_indices(&ranked.conversations), vec![0, 1, 2]);
-        assert_eq!(conversation_indices(&ranked.chunks), vec![1]);
-    }
-
     const FIXTURE_QUERY_EMBEDDING: [f32; 4] = [0.5, 1.0, 0.0, -0.5];
 
-    /// A corpus with exact score ties within and across conversations,
-    /// sessions shared by several conversations, a route tied with its
-    /// conversation's first dialogue chunk, and a route-only conversation
-    /// that ranks first.
+    /// A corpus with exact score ties within and across conversations, and
+    /// sessions shared by several conversations.
     fn tied_fixture_corpus() -> Vec<EmbeddedChunk> {
         const VALUES: [f32; 5] = [-1.0, -0.5, 0.0, 0.5, 1.0];
         const WORDS: [&str; 5] = ["alpha", "beta", "gamma", "Delta", "zeta"];
@@ -488,21 +419,14 @@ mod tests {
         let mut chunks = Vec::new();
         for conversation_index in 0..40 {
             let session = format!("session-{}", conversation_index % 7);
-            let mut dialogue = Vec::new();
-            let dialogue_count = if conversation_index == 3 {
-                0
-            } else {
-                1 + next(4)
-            };
-            for chunk_index in 0..dialogue_count {
+            for chunk_index in 0..1 + next(4) {
                 let embedding = (0..4).map(|_| VALUES[next(5)]).collect();
                 let text = (0..=next(3))
                     .map(|_| WORDS[next(5)])
                     .collect::<Vec<_>>()
                     .join(" ");
-                dialogue.push(EmbeddedChunk {
+                chunks.push(EmbeddedChunk {
                     conversation_index,
-                    source: SemanticChunkSource::VisibleDialogue,
                     session: session.clone(),
                     chunk_index,
                     text,
@@ -510,33 +434,6 @@ mod tests {
                     embedding,
                 });
             }
-            let route = match dialogue.first() {
-                None => Some(EmbeddedChunk {
-                    conversation_index,
-                    source: SemanticChunkSource::AgentRoute,
-                    session: session.clone(),
-                    chunk_index: 0,
-                    text: "route".to_string(),
-                    message_range: MessageRange::single(1),
-                    embedding: FIXTURE_QUERY_EMBEDDING.into(),
-                }),
-                Some(first) if conversation_index % 5 == 0 => Some(EmbeddedChunk {
-                    source: SemanticChunkSource::AgentRoute,
-                    ..first.clone()
-                }),
-                _ if conversation_index % 3 == 0 => Some(EmbeddedChunk {
-                    conversation_index,
-                    source: SemanticChunkSource::AgentRoute,
-                    session: session.clone(),
-                    chunk_index: 0,
-                    text: WORDS[next(5)].to_string(),
-                    message_range: MessageRange::single(1),
-                    embedding: (0..4).map(|_| VALUES[next(5)]).collect(),
-                }),
-                _ => None,
-            };
-            chunks.extend(dialogue);
-            chunks.extend(route);
         }
         chunks
     }
@@ -651,23 +548,14 @@ mod tests {
                 &SemanticCancellationToken::new(),
             )
             .unwrap();
-            let with_evidence = reference
-                .iter()
-                .filter(|hit| hit.explanation.chunk.source != SemanticChunkSource::AgentRoute)
-                .map(|hit| hit.conversation_index)
-                .collect::<HashSet<_>>();
             let top = reference_conversations
                 .iter()
                 .map(|hit| hit.conversation_index)
-                .filter(|index| with_evidence.contains(index))
                 .take(count)
                 .collect::<HashSet<_>>();
             let expected_chunks = reference
                 .iter()
-                .filter(|hit| {
-                    hit.explanation.chunk.source != SemanticChunkSource::AgentRoute
-                        && top.contains(&hit.conversation_index)
-                })
+                .filter(|hit| top.contains(&hit.conversation_index))
                 .cloned()
                 .collect::<Vec<_>>();
 

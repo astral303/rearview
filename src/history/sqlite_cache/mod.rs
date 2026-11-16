@@ -33,7 +33,6 @@ mod schema;
 mod scope;
 mod search_parts;
 mod search_texts;
-mod semantic_routes;
 mod semantic_scan;
 mod text_scan;
 mod window;
@@ -74,9 +73,6 @@ pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_copy_when_unlocked, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart, SemanticTurns};
 pub(crate) use search_texts::SearchedFields;
-pub(crate) use semantic_routes::{
-    RouteKey, RoutesStored, SemanticRoute, store_routes as store_semantic_routes,
-};
 pub(crate) use semantic_scan::{ScannedTurns, scan_semantic_turns};
 pub(crate) use text_scan::{ReadOrder, ScanScope, ScannedRow, TextVisitor, scan_search_texts};
 pub(crate) use window::{InPlaceRow, StoredFile, StoredResume, StoredTurn, WindowUpdate};
