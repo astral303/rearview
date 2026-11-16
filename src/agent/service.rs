@@ -3372,16 +3372,16 @@ fn run_agent_semantic_hits(
         computed_routes,
     } = semantic_candidates(inputs)?;
     service.store_semantic_routes(&computed_routes)?;
-    run_agent_semantic_hits_for_candidates(
-        query,
-        &candidates,
-        embedding_budget,
-        chunk_hits,
-        window,
-        service.clock().clone(),
-        &service.perf,
-    )
-    .map(|(ranked, warnings)| (SemanticHalf { ranked, reads }, warnings))
+    SemanticEngine::of_command(service.clock().clone())
+        .rank(
+            query,
+            &candidates,
+            embedding_budget,
+            chunk_hits,
+            window,
+            &service.perf,
+        )
+        .map(|(ranked, warnings)| (SemanticHalf { ranked, reads }, warnings))
 }
 
 impl AgentService {
@@ -3599,59 +3599,90 @@ fn stripped_semantic_conversation(
     }
 }
 
-/// `candidates` ranked for `query`, the embedding budget timed on `clock`.
-/// Records in `perf` the passages read from the passage store and written
-/// to it.
-fn run_agent_semantic_hits_for_candidates(
-    query: &str,
-    candidates: &[semantic::index::SemanticIndexCandidate],
-    embedding_budget: EmbeddingBudget,
-    chunk_hits: ChunkHits,
-    window: TimeFilter,
-    clock: Arc<dyn Clock>,
-    perf: &CommandPerf,
-) -> Result<(RankedHits, Vec<AgentWarning>)> {
-    let parsed = search::query::ParsedQuery::parse(query);
-    let request = semantic::index::SemanticIndexRequest {
-        query: parsed.semantic_text(),
-        literal_filters: parsed.literals(),
-        full_corpus: candidates,
-        scope: candidates,
-        prewarm: false,
-        chunk_hits,
-        window,
-    };
-    let mut state = semantic::index::SemanticIndexState::new(clock);
-    let mut embedder = semantic::fastembed::FastembedEmbedder::new().map_err(|error| {
-        AgentError::semantic_unavailable(format!("failed to initialize semantic search: {error}"))
-    })?;
-    let cancellation = semantic::types::SemanticCancellationToken::new();
-    let response = state
-        .refresh_or_prewarm_with_budget(
-            &request,
-            &mut embedder,
-            &cancellation,
-            embedding_budget,
-            |_progress| {},
-        )
-        .map_err(|error| {
-            AgentError::semantic_unavailable(format!("semantic search failed: {error}"))
-        })?;
-    if let Some(store_use) = response.store_use {
-        perf.record_semantic_store(store_use);
+/// The index and the embedding model a command's semantic stage ranks with.
+pub(crate) struct SemanticEngine<Open> {
+    /// Reads and writes embeddings in its passage store, and times the
+    /// embedding budget on its clock.
+    pub(crate) index: semantic::index::SemanticIndexState,
+    /// Loads the embedding model. [`SemanticEngine::rank`] calls it, after
+    /// the command has read its candidates.
+    pub(crate) open_embedder: Open,
+}
+
+impl SemanticEngine<fn() -> Result<semantic::fastembed::FastembedEmbedder>> {
+    /// The engine of an agent command: the passage store in the semantic
+    /// cache folder and the fastembed model.
+    fn of_command(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            index: semantic::index::SemanticIndexState::new(clock),
+            open_embedder: open_fastembed_embedder,
+        }
     }
-    let warnings = partial_index_warning(
-        response.indexed_chunk_count,
-        response.missing_chunk_count,
-        embedding_budget,
-    )
-    .into_iter()
-    .collect();
-    let ranked = RankedHits {
-        conversations: response.hits,
-        chunks: response.chunk_hits,
-    };
-    Ok((ranked, warnings))
+}
+
+fn open_fastembed_embedder() -> Result<semantic::fastembed::FastembedEmbedder> {
+    semantic::fastembed::FastembedEmbedder::new().map_err(|error| {
+        AgentError::semantic_unavailable(format!("failed to initialize semantic search: {error}"))
+            .into()
+    })
+}
+
+impl<Embedder, Open> SemanticEngine<Open>
+where
+    Embedder: semantic::embed::SemanticEmbedder,
+    Open: FnOnce() -> Result<Embedder>,
+{
+    /// `candidates` ranked for `query`. Records in `perf` the passages read
+    /// from the passage store and written to it.
+    fn rank(
+        mut self,
+        query: &str,
+        candidates: &[semantic::index::SemanticIndexCandidate],
+        embedding_budget: EmbeddingBudget,
+        chunk_hits: ChunkHits,
+        window: TimeFilter,
+        perf: &CommandPerf,
+    ) -> Result<(RankedHits, Vec<AgentWarning>)> {
+        let parsed = search::query::ParsedQuery::parse(query);
+        let request = semantic::index::SemanticIndexRequest {
+            query: parsed.semantic_text(),
+            literal_filters: parsed.literals(),
+            full_corpus: candidates,
+            scope: candidates,
+            prewarm: false,
+            chunk_hits,
+            window,
+        };
+        let mut embedder = (self.open_embedder)()?;
+        let cancellation = semantic::types::SemanticCancellationToken::new();
+        let response = self
+            .index
+            .refresh_or_prewarm_with_budget(
+                &request,
+                &mut embedder,
+                &cancellation,
+                embedding_budget,
+                |_progress| {},
+            )
+            .map_err(|error| {
+                AgentError::semantic_unavailable(format!("semantic search failed: {error}"))
+            })?;
+        if let Some(store_use) = response.store_use {
+            perf.record_semantic_store(store_use);
+        }
+        let warnings = partial_index_warning(
+            response.indexed_chunk_count,
+            response.missing_chunk_count,
+            embedding_budget,
+        )
+        .into_iter()
+        .collect();
+        let ranked = RankedHits {
+            conversations: response.hits,
+            chunks: response.chunk_hits,
+        };
+        Ok((ranked, warnings))
+    }
 }
 
 /// `None` when every passage in the corpus has an embedding.
@@ -4010,13 +4041,12 @@ fn run_agent_within_semantic<'a>(
         tool_content,
         request.window,
     );
-    let (semantic, warnings) = run_agent_semantic_hits_for_candidates(
+    let (semantic, warnings) = SemanticEngine::of_command(clock).rank(
         &request.query,
         &candidates,
         EmbeddingBudget::passages(semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS),
         request.semantic_chunk_hits(),
         request.window,
-        clock,
         perf,
     )?;
     let output = agent::search::run_within_search(
