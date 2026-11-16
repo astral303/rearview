@@ -197,7 +197,8 @@ pub struct EmbeddedChunk {
     pub chunk_index: usize,
     pub text: String,
     pub message_range: MessageRange,
-    pub embedding: Vec<f32>,
+    /// Shared by every chunk of the same text.
+    pub embedding: Arc<[f32]>,
 }
 
 /// The bonus a chunk holding every query word adds to its similarity.

@@ -9,6 +9,7 @@ use crate::semantic::types::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) const MAX_CACHE_ENTRIES: usize = 50_000;
 
@@ -61,6 +62,7 @@ pub fn embed_chunks_with_budget_and_save(
     let access = cache.access_counter.saturating_add(1);
     cache.access_counter = access;
     let mut embedded = Vec::with_capacity(chunks.len());
+    let mut hits = HashMap::<String, Arc<[f32]>>::new();
     let mut misses = Vec::<Vec<SemanticChunk>>::new();
     let mut miss_indices = HashMap::<String, usize>::new();
 
@@ -69,9 +71,13 @@ pub fn embed_chunks_with_budget_and_save(
             return Err(AppError::SemanticSearchCancelled);
         }
         let key = embedding_cache_key(&chunk.text);
-        if let Some(entry) = cache.entries.get_mut(&key) {
+        if let Some(embedding) = hits.get(&key) {
+            embedded.push(embedded_chunk(&chunk, Arc::clone(embedding)));
+        } else if let Some(entry) = cache.entries.get_mut(&key) {
             entry.last_used = access;
-            embedded.push(embedded_chunk(&chunk, entry.embedding.clone()));
+            let embedding = Arc::<[f32]>::from(entry.embedding.as_slice());
+            embedded.push(embedded_chunk(&chunk, Arc::clone(&embedding)));
+            hits.insert(key, embedding);
         } else if let Some(index) = miss_indices.get(&key).copied() {
             misses[index].push(chunk);
         } else {
@@ -109,16 +115,17 @@ pub fn embed_chunks_with_budget_and_save(
 
         for (chunks, embedding) in batch.iter().zip(embeddings) {
             let key = embedding_cache_key(&chunks[0].text);
+            let shared = Arc::<[f32]>::from(embedding.as_slice());
             cache.entries.insert(
                 key,
                 CachedChunk {
-                    embedding: embedding.clone(),
+                    embedding,
                     last_used: access,
                     protected: false,
                 },
             );
             for chunk in chunks {
-                embedded.push(embedded_chunk(chunk, embedding.clone()));
+                embedded.push(embedded_chunk(chunk, Arc::clone(&shared)));
             }
         }
         completed += batch.len();
@@ -199,7 +206,7 @@ fn prune_cache_to_limit(cache: &mut EmbeddingCache, max_entries: usize) {
     }
 }
 
-fn embedded_chunk(chunk: &SemanticChunk, embedding: Vec<f32>) -> EmbeddedChunk {
+fn embedded_chunk(chunk: &SemanticChunk, embedding: Arc<[f32]>) -> EmbeddedChunk {
     EmbeddedChunk {
         conversation_index: chunk.conversation_index,
         source: chunk.source,
@@ -217,6 +224,7 @@ pub fn cached_chunks(
     cancellation: &crate::semantic::types::SemanticCancellationToken,
 ) -> Result<(Vec<EmbeddedChunk>, usize)> {
     let mut embedded = Vec::with_capacity(chunks.len());
+    let mut hits = HashMap::<String, Arc<[f32]>>::new();
     let mut misses = HashSet::new();
 
     for chunk in chunks {
@@ -224,8 +232,12 @@ pub fn cached_chunks(
             return Err(AppError::SemanticSearchCancelled);
         }
         let key = embedding_cache_key(&chunk.text);
-        if let Some(entry) = cache.entries.get(&key) {
-            embedded.push(embedded_chunk(&chunk, entry.embedding.clone()));
+        if let Some(embedding) = hits.get(&key) {
+            embedded.push(embedded_chunk(&chunk, Arc::clone(embedding)));
+        } else if let Some(entry) = cache.entries.get(&key) {
+            let embedding = Arc::<[f32]>::from(entry.embedding.as_slice());
+            embedded.push(embedded_chunk(&chunk, Arc::clone(&embedding)));
+            hits.insert(key, embedding);
         } else {
             misses.insert(key);
         }
@@ -782,7 +794,7 @@ mod tests {
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, 0);
-        assert_eq!(embedded[0].embedding, vec![0.5, 0.5]);
+        assert_eq!(*embedded[0].embedding, [0.5, 0.5]);
         assert_eq!(embedded[0].chunk_index, 0);
     }
 
@@ -803,7 +815,7 @@ mod tests {
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, 1);
-        assert_eq!(embedded[0].embedding, vec![8.0, 1.0]);
+        assert_eq!(*embedded[0].embedding, [8.0, 1.0]);
         assert_eq!(embedded[0].chunk_index, 0);
         assert!(cache.entries.contains_key(&embedding_cache_key("new text")));
     }
@@ -861,6 +873,10 @@ mod tests {
         assert_eq!(embedder.calls, 0);
         assert_eq!(embedded.len(), 2);
         assert_eq!(cache.entries.len(), 1);
+        assert!(
+            Arc::ptr_eq(&embedded[0].embedding, &embedded[1].embedding),
+            "both chunks of the cached text share one embedding"
+        );
     }
 
     #[test]
@@ -887,6 +903,10 @@ mod tests {
         assert_eq!(embedded.len(), 2);
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(progress, vec![(1, 1)]);
+        assert!(
+            Arc::ptr_eq(&embedded[0].embedding, &embedded[1].embedding),
+            "both chunks of the embedded text share one embedding"
+        );
     }
 
     #[test]
@@ -964,7 +984,7 @@ mod tests {
             .get(&embedding_cache_key("new text"))
             .expect("cache entry");
         assert_eq!(embedder.calls, 1);
-        assert_eq!(embedded[0].embedding, vec![8.0, 1.0]);
+        assert_eq!(*embedded[0].embedding, [8.0, 1.0]);
         assert_eq!(restored.embedding, vec![8.0, 1.0]);
         assert!(cache_contains_text(&cache, "old text"));
     }

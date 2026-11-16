@@ -326,7 +326,7 @@ mod tests {
             chunk_index,
             text: text.to_string(),
             message_range: crate::agent::refs::MessageRange::single(chunk_index + 1),
-            embedding,
+            embedding: embedding.into(),
         }
     }
 
@@ -518,7 +518,7 @@ mod tests {
                     chunk_index: 0,
                     text: "route".to_string(),
                     message_range: MessageRange::single(1),
-                    embedding: FIXTURE_QUERY_EMBEDDING.to_vec(),
+                    embedding: FIXTURE_QUERY_EMBEDDING.into(),
                 }),
                 Some(first) if conversation_index % 5 == 0 => Some(EmbeddedChunk {
                     source: SemanticChunkSource::AgentRoute,

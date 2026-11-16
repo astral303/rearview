@@ -1182,7 +1182,7 @@ mod tests {
                     chunk_index: 0,
                     text: conversation.semantic_turns[0].clone(),
                     message_range: crate::agent::refs::MessageRange::single(1),
-                    embedding: vec![1.0, 0.0],
+                    embedding: [1.0, 0.0].into(),
                 },
             )
             .collect::<Vec<_>>();
