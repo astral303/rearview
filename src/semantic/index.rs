@@ -28,6 +28,21 @@ pub struct SemanticIndexCandidate {
     pub conversation: Arc<Conversation>,
 }
 
+impl SemanticIndexCandidate {
+    /// The candidate of the session at `index` of a corpus: the passages
+    /// built from `conversation`'s semantic turns. Build every searched
+    /// session's candidate here. The session list's semantic search and the
+    /// agent commands share an embedding only where they build the same
+    /// passage text.
+    pub fn of_session(index: usize, conversation: Arc<Conversation>) -> Self {
+        Self {
+            index,
+            source: SemanticChunkSource::VisibleDialogue,
+            conversation,
+        }
+    }
+}
+
 pub struct SemanticIndexRequest<'a> {
     pub query: &'a str,
     pub literal_filters: &'a [Literal],

@@ -637,10 +637,8 @@ impl WorkerCorpus {
         self.rows
             .iter()
             .enumerate()
-            .map(|(index, conversation)| SemanticIndexCandidate {
-                index,
-                source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                conversation: conversation.clone(),
+            .map(|(index, conversation)| {
+                SemanticIndexCandidate::of_session(index, conversation.clone())
             })
             .collect()
     }
@@ -704,13 +702,9 @@ impl WorkerCorpus {
         self.scope
             .iter()
             .filter_map(|&index| {
-                self.rows
-                    .get(index)
-                    .map(|conversation| SemanticIndexCandidate {
-                        index,
-                        source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                        conversation: conversation.clone(),
-                    })
+                self.rows.get(index).map(|conversation| {
+                    SemanticIndexCandidate::of_session(index, conversation.clone())
+                })
             })
             .collect()
     }

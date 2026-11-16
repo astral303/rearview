@@ -522,13 +522,12 @@ fn semantic_index_candidates(
     selected
         .iter()
         .enumerate()
-        .map(
-            |(index, conversation)| crate::semantic::index::SemanticIndexCandidate {
+        .map(|(index, conversation)| {
+            crate::semantic::index::SemanticIndexCandidate::of_session(
                 index,
-                source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
-                conversation: std::sync::Arc::new((*conversation).clone()),
-            },
-        )
+                std::sync::Arc::new((*conversation).clone()),
+            )
+        })
         .collect()
 }
 

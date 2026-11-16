@@ -3497,16 +3497,15 @@ fn session_candidates(
             message_times: conversation.message_times.clone(),
             ..input.conversation.clone()
         });
-    let mut candidates = vec![semantic::index::SemanticIndexCandidate {
-        index: input.original_index,
-        source: semantic::types::SemanticChunkSource::VisibleDialogue,
-        conversation: Arc::new(stripped_semantic_conversation(
+    let mut candidates = vec![semantic::index::SemanticIndexCandidate::of_session(
+        input.original_index,
+        Arc::new(stripped_semantic_conversation(
             conversation,
             input.conversation.path.clone(),
             conversation.semantic_turns.clone(),
             conversation.semantic_turn_ranges.clone(),
         )),
-    }];
+    )];
     if let Some(route) = route_text.and_then(|text| agent_route_of(conversation, text)) {
         candidates.push(semantic::index::SemanticIndexCandidate {
             index: input.original_index,
