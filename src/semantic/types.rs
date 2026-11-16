@@ -1,7 +1,5 @@
 use crate::agent::refs::MessageRange;
 use crate::clock::{Clock, Moment};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -306,22 +304,4 @@ impl SemanticHit {
             explanation,
         }
     }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct EmbeddingCache {
-    pub schema_version: u32,
-    pub model: String,
-    pub chunk_target_chars: usize,
-    pub chunk_overlap_chars: usize,
-    pub chunk_context_turns: usize,
-    pub access_counter: u64,
-    pub entries: HashMap<String, CachedChunk>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct CachedChunk {
-    pub embedding: Vec<f32>,
-    pub last_used: u64,
-    pub protected: bool,
 }

@@ -10,6 +10,7 @@ mod old_download;
 pub mod output;
 mod path_expansion;
 pub mod rank;
+pub mod store;
 pub mod types;
 
 #[cfg(test)]

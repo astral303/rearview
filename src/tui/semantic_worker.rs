@@ -4,7 +4,6 @@ use crate::history::Conversation;
 use crate::history::sqlite_cache::{CachedSession, CopyKey, SessionKey};
 use crate::search::query::ParsedQuery;
 use crate::search::{ReadFailure, SessionsWithoutTexts};
-use crate::semantic::cache::write_embedding_cache;
 use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic::fastembed::FastembedEmbedder;
 use crate::semantic::index::{
@@ -737,7 +736,7 @@ fn rank_or_prewarm_semantic_request(
                 progress: semantic_progress(progress),
             });
         },
-        |cache| write_embedding_cache(cache, clock.as_ref()),
+        |store| store.write(clock.as_ref()),
     )?;
     Ok(semantic_search_response(
         generation,

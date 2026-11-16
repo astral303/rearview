@@ -3628,7 +3628,7 @@ fn run_agent_semantic_hits_for_candidates(
             &cancellation,
             embedding_budget,
             |_progress| {},
-            |cache| semantic::cache::write_embedding_cache(cache, clock.as_ref()),
+            |store| store.write(clock.as_ref()),
         )
         .map_err(|error| {
             AgentError::semantic_unavailable(format!("semantic search failed: {error}"))

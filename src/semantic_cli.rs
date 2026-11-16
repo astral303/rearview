@@ -18,7 +18,6 @@ pub fn run(
     workspace: Option<&Workspace>,
     clock: Arc<dyn Clock>,
 ) -> Result<()> {
-    use crate::semantic::cache::write_embedding_cache;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::index::{SemanticIndexRequest, SemanticIndexState};
     use crate::semantic::output::format_hit;
@@ -71,8 +70,8 @@ pub fn run(
 
     let mut embedder = FastembedEmbedder::new()?;
     let (refresh, response) =
-        refresh_and_rank_interactive(&request, &mut state, &mut embedder, |cache| {
-            write_embedding_cache(cache, clock.as_ref())
+        refresh_and_rank_interactive(&request, &mut state, &mut embedder, |store| {
+            store.write(clock.as_ref())
         })?;
 
     eprintln!(
@@ -130,10 +129,10 @@ pub fn generate_cache(
     base: &CacheBase,
     clock: Arc<dyn Clock>,
 ) -> Result<()> {
-    use crate::semantic::cache::{MAX_CACHE_ENTRIES, embedding_cache_key, write_embedding_cache};
     use crate::semantic::chunk::build_chunks_with_sources;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::index::{SemanticIndexProgress, SemanticIndexRequest, SemanticIndexState};
+    use crate::semantic::store::{MAX_CACHE_ENTRIES, passage_key};
     use crate::semantic::types::ChunkConfig;
 
     let content = semantic_content(&conversations_in_workspace(conversations, workspace))?
@@ -162,7 +161,7 @@ pub fn generate_cache(
     let chunk_count = chunks.len();
     let core_keys = chunks
         .iter()
-        .map(|chunk| embedding_cache_key(&chunk.text))
+        .map(|chunk| passage_key(&chunk.text))
         .collect::<std::collections::HashSet<_>>();
     let unique_chunk_count = core_keys.len();
     if unique_chunk_count > MAX_CACHE_ENTRIES {
@@ -185,9 +184,7 @@ pub fn generate_cache(
         window: TimeFilter::default(),
     };
     let mut state = SemanticIndexState::new(clock.clone());
-    for (key, entry) in &mut state.cache.entries {
-        entry.protected &= core_keys.contains(key);
-    }
+    state.store_mut().unprotect_all_but(&core_keys);
     eprintln!(
         "Semantic cache: checking {chunk_count} chunk(s) from {} recent conversation(s).",
         selected.len()
@@ -206,14 +203,10 @@ pub fn generate_cache(
                 eprintln!("Semantic cache: embedded {completed}/{total} changed chunk(s)");
             }
         },
-        |cache| write_embedding_cache(cache, clock.as_ref()),
+        |store| store.write(clock.as_ref()),
     )?;
-    for key in &core_keys {
-        if let Some(entry) = state.cache.entries.get_mut(key) {
-            entry.protected = true;
-        }
-    }
-    write_embedding_cache(&state.cache, clock.as_ref());
+    state.store_mut().protect(&core_keys);
+    state.store().write(clock.as_ref());
 
     eprintln!(
         "Semantic cache: cached {} chunk(s) from {} recent conversation(s).",
@@ -230,15 +223,13 @@ pub fn debug_search(
     workspace: Option<&Workspace>,
     clock: &dyn Clock,
 ) -> Result<()> {
-    use crate::semantic::cache::{
-        cache_contains_text, cache_miss_count, cached_chunks, embedding_cache_file_path,
-        read_embedding_cache,
-    };
+    use crate::semantic::cache::{cached_chunks, embedding_cache_file_path};
     use crate::semantic::chunk::build_chunks;
     use crate::semantic::embed::embed_valid_query;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::output::{format_hit, truncate};
     use crate::semantic::rank::rank_chunks;
+    use crate::semantic::store::PassageStore;
     use crate::semantic::types::{ChunkConfig, MODEL_NAME, SemanticCancellationToken};
     use std::collections::HashMap;
 
@@ -354,18 +345,18 @@ pub fn debug_search(
         return Ok(());
     }
 
-    let cache = read_embedding_cache(chunk_config, clock);
-    let missing = cache_miss_count(&chunks, &cache);
+    let store = PassageStore::read(chunk_config, clock);
+    let missing = store.missing_passage_count(&chunks);
     let cached_count = chunks.len().saturating_sub(missing);
     eprintln!(
         "Semantic debug: cache entries={}, hits={}, misses={}",
-        cache.entries.len(),
+        store.passage_count(),
         cached_count,
         missing
     );
     for chunk in chunks
         .iter()
-        .filter(|chunk| !cache_contains_text(&cache, &chunk.text))
+        .filter(|chunk| !store.contains_text(&chunk.text))
         .take(5)
     {
         eprintln!(
@@ -376,7 +367,7 @@ pub fn debug_search(
         );
     }
 
-    let (embedded_chunks, _) = cached_chunks(chunks, &cache, &SemanticCancellationToken::new())?;
+    let (embedded_chunks, _) = cached_chunks(chunks, &store, &SemanticCancellationToken::new())?;
     if embedded_chunks.is_empty() {
         eprintln!("Semantic debug: no cached chunks available for ranking.");
         return Ok(());
@@ -455,14 +446,14 @@ fn refresh_and_rank_interactive(
     request: &crate::semantic::index::SemanticIndexRequest<'_>,
     state: &mut crate::semantic::index::SemanticIndexState,
     embedder: &mut dyn crate::semantic::embed::SemanticEmbedder,
-    mut save_cache: impl FnMut(&crate::semantic::types::EmbeddingCache),
+    mut save_store: impl FnMut(&crate::semantic::store::PassageStore),
 ) -> Result<(
     crate::semantic::index::SemanticIndexResponse,
     crate::semantic::index::SemanticIndexResponse,
 )> {
     let cancellation = SemanticCancellationToken::new();
     let refresh = state.refresh_passages(request, embedder, &cancellation, |_| {}, |_| {})?;
-    save_cache(&state.cache);
+    save_store(state.store());
     let response = state.rank_refreshed(request, embedder, &cancellation, |_| {})?;
     Ok((refresh, response))
 }
@@ -654,8 +645,9 @@ fn no_conversations_message(local: bool) -> &'static str {
 mod tests {
     use super::*;
     use crate::semantic::embed::SemanticEmbedder;
+    use crate::semantic::store::PassageStore;
     use crate::semantic::test_fixtures::SemanticConversationFixture;
-    use crate::semantic::types::{ChunkConfig, EmbeddingCache};
+    use crate::semantic::types::ChunkConfig;
     use chrono::Local;
 
     /// The reads behind the semantic search flags ([`held_content`] for
@@ -928,10 +920,9 @@ mod tests {
         )];
         let selected = vec![&conversations[0]];
         let candidates = semantic_index_candidates(&selected);
-        let cache = crate::semantic::cache::empty_embedding_cache(ChunkConfig::default());
-        let state = crate::semantic::index::SemanticIndexState::with_cache(
+        let state = crate::semantic::index::SemanticIndexState::with_store(
             ChunkConfig::default(),
-            cache,
+            PassageStore::empty(ChunkConfig::default()),
             Arc::new(crate::clock::TestClock::default()),
         );
         let mut embedder = FakeEmbedder::new(query_embedding);
@@ -957,7 +948,7 @@ mod tests {
 
     #[test]
     fn interactive_refresh_writes_cache_once_before_query_ranking() {
-        let (query, candidates, mut state, mut embedder, mut saved_entry_counts) =
+        let (query, candidates, mut state, mut embedder, mut saved_passage_counts) =
             interactive_refresh_context("alpha", None, false);
         let request = interactive_refresh_request(&query, &candidates);
 
@@ -965,12 +956,12 @@ mod tests {
             &request,
             &mut state,
             &mut embedder,
-            |cache: &EmbeddingCache| saved_entry_counts.push(cache.entries.len()),
+            |store: &PassageStore| saved_passage_counts.push(store.passage_count()),
         )
         .expect("interactive refresh and rank succeeds");
 
         assert_eq!(refresh.indexed_chunk_count, 1);
-        assert_eq!(saved_entry_counts, vec![1]);
+        assert_eq!(saved_passage_counts, vec![1]);
         assert!(!response.query_embedding_returned);
         assert_eq!(embedder.passage_calls, 1);
         assert_eq!(embedder.query_calls, 1);
@@ -978,7 +969,7 @@ mod tests {
 
     #[test]
     fn interactive_refresh_writes_cache_before_query_error() {
-        let (query, candidates, mut state, mut embedder, mut saved_entry_counts) =
+        let (query, candidates, mut state, mut embedder, mut saved_passage_counts) =
             interactive_refresh_context("alpha", Some(vec![1.0, 0.0]), true);
         let request = interactive_refresh_request(&query, &candidates);
 
@@ -986,13 +977,13 @@ mod tests {
             &request,
             &mut state,
             &mut embedder,
-            |cache: &EmbeddingCache| saved_entry_counts.push(cache.entries.len()),
+            |store: &PassageStore| saved_passage_counts.push(store.passage_count()),
         ) {
             Ok(_) => panic!("query error should propagate"),
             Err(error) => error,
         };
 
-        assert_eq!(saved_entry_counts, vec![1]);
+        assert_eq!(saved_passage_counts, vec![1]);
         assert_eq!(embedder.passage_calls, 1);
         assert_eq!(embedder.query_calls, 1);
         assert!(error.to_string().contains("query failed"));
