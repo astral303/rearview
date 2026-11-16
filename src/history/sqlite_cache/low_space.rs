@@ -6,9 +6,10 @@
 
 use super::base::CacheBase;
 use super::coordinator::WaitStatus;
-use super::refresh::{self, ExclusiveWait, FREE_SPACE_FLOOR, RefreshOwnership};
+use super::refresh::{self, ExclusiveWait, RefreshOwnership};
 use super::scope::Cancellation;
 use crate::error::{AppError, CacheDeletion};
+use crate::free_space::FREE_SPACE_FLOOR;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 

@@ -19,7 +19,6 @@ mod copies_scan;
 mod copy_state;
 mod entries;
 mod files;
-mod free_space;
 mod interactive;
 pub(crate) mod low_space;
 mod next_step;
@@ -40,9 +39,12 @@ mod text_scan;
 mod window;
 mod write_error;
 
-pub use base::{CacheBase, ProcessIdentity};
+pub(crate) use crate::free_space::FREE_SPACE_FLOOR;
 #[cfg(test)]
-pub(crate) use base::{DiskSpace, DriveFilledByCache, DriveRunningOut, UnreportedFreeSpace};
+pub(crate) use crate::free_space::{DriveRunningOut, UnreportedFreeSpace};
+#[cfg(test)]
+pub(crate) use base::DriveFilledByCache;
+pub use base::{CacheBase, ProcessIdentity};
 pub(crate) use cached_session::HeldCopy;
 pub use cached_session::{CachedSession, Publication, SessionAddress};
 pub(crate) use cached_session::{CopyHandles, Currency};
@@ -68,7 +70,6 @@ pub(crate) use permit::{FOR_FIXTURES, admitted_reads};
 pub(crate) use read_catalogue::{CatalogueSession, ListedSession};
 #[cfg(test)]
 pub(crate) use refill::recorded_cache_bytes;
-pub(crate) use refresh::FREE_SPACE_FLOOR;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_copy_when_unlocked, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart, SemanticTurns};
@@ -89,6 +90,7 @@ use crate::history::fingerprint::CachedFingerprint;
 use crate::history::format::RecordLine;
 use crate::history::provider::{SessionCache, SessionRoot};
 use crate::log_entry::LogEntry;
+use crate::sqlite::is_busy;
 use connection::Access;
 use files::RootKey;
 use refresh::WriteBatch;
@@ -181,13 +183,6 @@ fn drop_session_tables(connection: &Connection) -> rusqlite::Result<()> {
         connection.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
     }
     Ok(())
-}
-
-/// True for SQLite's refusal while another connection holds a lock the
-/// statement needs.
-pub(crate) fn is_busy(error: &rusqlite::Error) -> bool {
-    matches!(error, rusqlite::Error::SqliteFailure(error, _)
-        if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
 /// [`is_busy`] for an error as this crate reports it.

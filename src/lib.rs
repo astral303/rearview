@@ -19,6 +19,7 @@ mod debug_log;
 mod display;
 mod dropped_records_cli;
 mod error;
+mod free_space;
 mod history;
 mod log_entry;
 mod markdown;
@@ -31,6 +32,7 @@ mod search;
 mod semantic;
 mod semantic_cli;
 mod sessions_dir_cli;
+mod sqlite;
 mod syntax;
 #[doc(hidden)]
 pub mod test_support;

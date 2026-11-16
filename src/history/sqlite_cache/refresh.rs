@@ -10,6 +10,7 @@ use super::refill::DeletionRecord;
 use super::scope::Cancellation;
 use crate::clock::{Clock, Moment};
 use crate::error::{AppError, CacheDeletion, Result};
+use crate::free_space::FREE_SPACE_FLOOR;
 use crate::history::path::without_verbatim_prefix;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use std::path::Path;
@@ -580,9 +581,6 @@ pub(crate) struct RefreshToken {
     #[cfg(test)]
     waiting_for_turn: Arc<std::sync::atomic::AtomicUsize>,
 }
-
-/// The least free space a write leaves on the cache's drive: 1 GB.
-pub(crate) const FREE_SPACE_FLOOR: u64 = 1_000_000_000;
 
 /// Fail when `base`'s drive has less than [`FREE_SPACE_FLOOR`] free, with
 /// the low-space error once the base's low-space latch is set. A drive

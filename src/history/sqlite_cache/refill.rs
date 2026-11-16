@@ -8,9 +8,9 @@ use super::base::CacheBase;
 use super::connection::{self, Access};
 use super::coordinator::WaitStatus;
 use super::observer::REBUILD_LOCK_THRESHOLD;
-use super::refresh::FREE_SPACE_FLOOR;
 use super::scope::{Cancellation, read_when_unlocked};
 use crate::error::{AppError, Result};
+use crate::free_space::FREE_SPACE_FLOOR;
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
