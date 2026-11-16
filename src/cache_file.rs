@@ -1,11 +1,10 @@
-//! Cache files on disk, for the session caches and the semantic embedding
-//! cache alike: kept under one cache directory, written through a temp file
-//! renamed into place, read only when their header matches, and swept of the
-//! temp files an interrupted write left behind.
+//! Cache files on disk, for the session cache and the semantic cache alike:
+//! kept under one cache directory, measured for `--clear-semantic-cache`,
+//! and swept of the temp files an interrupted whole-file write of an
+//! earlier release left behind.
 
 use crate::clock::Clock;
 use std::collections::HashSet;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -82,65 +81,8 @@ fn add_disk_usage(path: &Path, counted: &mut HashSet<PathBuf>) -> std::io::Resul
     Ok(total)
 }
 
-/// Write `data` to `path` through a temp file renamed into place, so a reader
-/// never sees half a file. On failure the previous file, if any, stays.
-/// Sweeps the file's directory of temp files stale at `clock`'s time first.
-pub(crate) fn write_atomically(path: &Path, data: &[u8], clock: &dyn Clock) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    sweep_stale_temp_files(parent, clock);
-    let Ok(mut temp) = tempfile::Builder::new()
-        .prefix(TEMP_FILE_PREFIX)
-        .tempfile_in(parent)
-    else {
-        return;
-    };
-    if temp.write_all(data).is_err() {
-        return;
-    }
-    let _ = temp.persist(path);
-}
-
-/// The whole file at `path` when it opens with `header`; `None` when it is
-/// absent, unreadable, or opens with anything else. Sweeps the file's
-/// directory of temp files stale at `clock`'s time first.
-pub(crate) fn read_if_header_matches(
-    path: &Path,
-    header: &[u8],
-    clock: &dyn Clock,
-) -> Option<Vec<u8>> {
-    if let Some(parent) = path.parent() {
-        sweep_stale_temp_files(parent, clock);
-    }
-    read_existing_if_header_matches(path, header)
-}
-
-/// [`read_if_header_matches`] without sweeping the directory's stale temp
-/// files.
-pub(crate) fn read_existing_if_header_matches(path: &Path, header: &[u8]) -> Option<Vec<u8>> {
-    read_matching(std::fs::File::open(path).ok()?, header)
-}
-
-/// Everything `reader` holds when it opens with `header`. A reader that opens
-/// with anything else costs only the header's length, so a cache left by an
-/// older release is not read in full only to be dropped.
-fn read_matching(mut reader: impl Read, header: &[u8]) -> Option<Vec<u8>> {
-    let mut data = vec![0; header.len()];
-    reader.read_exact(&mut data).ok()?;
-    if data != header {
-        return None;
-    }
-    reader.read_to_end(&mut data).ok()?;
-    Some(data)
-}
-
-/// Remove `directory`'s stale temp files the first time this process reads
-/// or writes a cache file in it, so a directory of many cache files is
-/// listed once, not once per file.
+/// Remove `directory`'s stale temp files the first time this process opens
+/// a cache in it, so the directory is listed once, not once per open.
 pub(crate) fn sweep_stale_temp_files(directory: &Path, clock: &dyn Clock) {
     static SWEPT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     let first_visit = SWEPT
@@ -187,6 +129,7 @@ fn remove_stale_temp_files(directory: &Path, now: SystemTime) {
 pub(crate) mod test_support {
     use super::*;
     use crate::clock::TestClock;
+    use std::io::Write;
     use std::time::Instant;
 
     thread_local! {
@@ -365,16 +308,6 @@ mod tests {
         drop(database);
     }
 
-    /// A reader that fails the test when read: a body read past a mismatched
-    /// header is the full read the header check exists to skip.
-    struct UnreadableBody;
-
-    impl Read for UnreadableBody {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            panic!("the body of a cache file with another header was read");
-        }
-    }
-
     #[test]
     fn cache_base_override_replaces_home_derived_default() {
         let home = PathBuf::from("/home/user");
@@ -396,44 +329,12 @@ mod tests {
     }
 
     #[test]
-    fn file_with_another_header_is_rejected_without_reading_past_it() {
-        let read = read_matching(b"OLDHEADER".as_slice().chain(UnreadableBody), b"NEWHEADER");
-
-        assert_eq!(read, None);
-    }
-
-    #[test]
-    fn file_with_expected_header_is_read_whole() {
-        let file = b"HEADERentries".to_vec();
-
-        let read = read_matching(file.as_slice(), b"HEADER");
-
-        assert_eq!(read, Some(file));
-    }
-
-    #[test]
-    fn file_shorter_than_its_header_is_rejected() {
-        assert_eq!(read_matching(b"HEAD".as_slice(), b"HEADER"), None);
-    }
-
-    #[test]
-    fn write_sweeps_its_directory_of_leftover_temp_files() {
+    fn sweep_removes_leftover_temp_files_from_its_directory() {
         let directory = tempfile::tempdir().unwrap();
         let clock = TestClock::default();
         let fixture = TempFileFixture::in_directory(directory.path(), &clock);
 
-        write_atomically(&directory.path().join("cache.bin"), b"entries", &clock);
-
-        fixture.assert_swept();
-    }
-
-    #[test]
-    fn read_sweeps_its_directory_of_leftover_temp_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let clock = TestClock::default();
-        let fixture = TempFileFixture::in_directory(directory.path(), &clock);
-
-        read_if_header_matches(&directory.path().join("cache.bin"), b"HEADER", &clock);
+        sweep_stale_temp_files(directory.path(), &clock);
 
         fixture.assert_swept();
     }
@@ -529,7 +430,7 @@ mod tests {
         let fixture = TempFileFixture::in_directory(directory.path(), &clock);
         clock.advance(STALE_TEMP_FILE_AGE + Duration::from_secs(1));
 
-        read_if_header_matches(&directory.path().join("cache.bin"), b"HEADER", &clock);
+        sweep_stale_temp_files(directory.path(), &clock);
 
         assert!(
             !fixture.in_progress.exists(),

@@ -4,7 +4,6 @@ use crate::history::Conversation;
 use crate::history::sqlite_cache::{CachedSession, CopyKey, SessionKey};
 use crate::search::query::ParsedQuery;
 use crate::search::{ReadFailure, SessionsWithoutTexts};
-use crate::semantic::cache::write_embedding_cache;
 use crate::semantic::embed::SemanticEmbedder;
 use crate::semantic::fastembed::FastembedEmbedder;
 use crate::semantic::index::{
@@ -726,19 +725,12 @@ fn rank_or_prewarm_semantic_request(
     cancellation: &SemanticCancellationToken,
     res_tx: &mpsc::Sender<SemanticSearchMessage>,
 ) -> Result<SemanticSearchResponse> {
-    let clock = state.clock();
-    let response = state.refresh_or_prewarm(
-        request,
-        embedder,
-        cancellation,
-        |progress| {
-            let _ = res_tx.send(SemanticSearchMessage::Progress {
-                generation,
-                progress: semantic_progress(progress),
-            });
-        },
-        |cache| write_embedding_cache(cache, clock.as_ref()),
-    )?;
+    let response = state.refresh_or_prewarm(request, embedder, cancellation, |progress| {
+        let _ = res_tx.send(SemanticSearchMessage::Progress {
+            generation,
+            progress: semantic_progress(progress),
+        });
+    })?;
     Ok(semantic_search_response(
         generation,
         response,
@@ -909,6 +901,7 @@ mod tests {
                 query_embedding_returned: true,
                 progress: SemanticIndexProgress::Complete,
                 prewarm: false,
+                store_use: None,
             },
             &[],
             &ParsedQuery::parse("beta"),

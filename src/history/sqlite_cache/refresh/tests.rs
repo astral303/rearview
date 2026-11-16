@@ -894,7 +894,7 @@ struct DriveFilledLater {
     is_full: std::sync::atomic::AtomicBool,
 }
 
-impl super::super::DiskSpace for DriveFilledLater {
+impl crate::free_space::DiskSpace for DriveFilledLater {
     fn available_bytes(&self, _path: &Path) -> Option<u64> {
         Some(if self.is_full.load(Ordering::SeqCst) {
             0

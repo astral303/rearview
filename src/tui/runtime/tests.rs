@@ -418,7 +418,7 @@ impl DriveRunningOutOnCall {
     }
 }
 
-impl crate::history::sqlite_cache::DiskSpace for DriveRunningOutOnCall {
+impl crate::free_space::DiskSpace for DriveRunningOutOnCall {
     fn available_bytes(&self, _path: &Path) -> Option<u64> {
         if !self.is_short.load(Ordering::SeqCst) {
             return Some(10 * crate::history::sqlite_cache::FREE_SPACE_FLOOR);

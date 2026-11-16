@@ -272,10 +272,6 @@ pub(super) struct RefreshPlan {
 }
 
 impl RefreshPlan {
-    pub(super) fn chunks(&self) -> &[SemanticChunk] {
-        &self.chunks
-    }
-
     /// The conversations to store once their chunks are embedded, and the
     /// chunks to embed.
     pub(super) fn into_parts(self) -> (Vec<PendingConversation>, Vec<SemanticChunk>) {

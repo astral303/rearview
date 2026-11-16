@@ -4,6 +4,9 @@ use super::low_space;
 use super::refresh::WriteAccess;
 use crate::clock::Clock;
 use crate::error::AppError;
+#[cfg(test)]
+use crate::free_space::FixedFreeSpace;
+use crate::free_space::{DiskSpace, SystemDiskSpace};
 use crate::history::provider::walk::Canonicaliser;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -158,84 +161,6 @@ pub(crate) struct RevokedOwner {
     pub(crate) is_turn_held: bool,
 }
 
-/// The free space on the drive a path is on, as rearview asks for it.
-pub trait DiskSpace: Send + Sync {
-    /// The bytes this user may still write on the drive holding `path`;
-    /// `None` when the system does not answer.
-    fn available_bytes(&self, path: &Path) -> Option<u64>;
-}
-
-/// The system's answer for free space.
-pub struct SystemDiskSpace;
-
-impl DiskSpace for SystemDiskSpace {
-    fn available_bytes(&self, path: &Path) -> Option<u64> {
-        super::free_space::available_bytes(path)
-    }
-}
-
-/// A drive whose free space stays at the bytes it holds.
-#[cfg(test)]
-struct FixedFreeSpace(u64);
-
-#[cfg(test)]
-impl DiskSpace for FixedFreeSpace {
-    fn available_bytes(&self, _path: &Path) -> Option<u64> {
-        Some(self.0)
-    }
-}
-
-/// A drive with room for the first `roomy_answers` free-space checks and
-/// 0.9 GB free from then on, calling `on_running_out` before each of those
-/// later answers.
-#[cfg(test)]
-pub(crate) struct DriveRunningOut {
-    roomy_answers: usize,
-    answers: std::sync::atomic::AtomicUsize,
-    on_running_out: Box<dyn Fn() + Send + Sync>,
-}
-
-#[cfg(test)]
-impl DriveRunningOut {
-    pub(crate) fn after(
-        roomy_answers: usize,
-        on_running_out: impl Fn() + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            roomy_answers,
-            answers: std::sync::atomic::AtomicUsize::new(0),
-            on_running_out: Box::new(on_running_out),
-        }
-    }
-
-    /// The free-space checks this drive answered.
-    pub(crate) fn answers(&self) -> usize {
-        self.answers.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// The `roomy_answers` that run the drive out at the first, the middle
-    /// and the last of `checks` free-space checks.
-    pub(crate) fn check_points(checks: usize) -> Vec<usize> {
-        let mut points = vec![0, checks / 2, checks - 1];
-        points.dedup();
-        points
-    }
-}
-
-#[cfg(test)]
-impl DiskSpace for DriveRunningOut {
-    fn available_bytes(&self, _path: &Path) -> Option<u64> {
-        let answer = self
-            .answers
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if answer < self.roomy_answers {
-            return Some(10 * super::refresh::FREE_SPACE_FLOOR);
-        }
-        (self.on_running_out)();
-        Some(900_000_000)
-    }
-}
-
 /// A drive of `capacity` bytes with the session cache on it and nothing else:
 /// its free space falls as a load writes the cache's files and rises when
 /// the cache is deleted.
@@ -279,16 +204,6 @@ impl DiskSpace for DriveFilledByCache {
     fn available_bytes(&self, path: &Path) -> Option<u64> {
         let capacity = self.capacity.load(std::sync::atomic::Ordering::SeqCst);
         Some(capacity.saturating_sub(Self::database_and_side_file_bytes(path)))
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct UnreportedFreeSpace;
-
-#[cfg(test)]
-impl DiskSpace for UnreportedFreeSpace {
-    fn available_bytes(&self, _path: &Path) -> Option<u64> {
-        None
     }
 }
 

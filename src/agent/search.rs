@@ -3315,7 +3315,7 @@ mod tests {
     fn ranked_semantic_corpus(chunk_hits: ChunkHits) -> RankedHits {
         const QUERY_EMBEDDING: [f32; 2] = [1.0, 0.5];
         let varied = |seed: usize| vec![(seed % 11) as f32 - 5.0, (seed % 7) as f32 - 3.0];
-        let chunk = |conversation_index: usize, source, chunk_index: usize, embedding| {
+        let chunk = |conversation_index: usize, source, chunk_index: usize, embedding: Vec<f32>| {
             PreparedChunk::new(EmbeddedChunk {
                 conversation_index,
                 source,
@@ -3323,7 +3323,7 @@ mod tests {
                 chunk_index,
                 text: format!("evidence {conversation_index} {chunk_index}"),
                 message_range: MessageRange::single(chunk_index + 1),
-                embedding,
+                embedding: embedding.into(),
             })
         };
         let mut chunks = vec![chunk(

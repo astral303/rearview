@@ -1,136 +1,130 @@
-use crate::clock::Clock;
 use crate::error::{AppError, Result};
 use crate::semantic::embed::{SemanticEmbedder, is_valid_embedding};
-#[cfg(test)]
-use crate::semantic::types::EmbeddingBudget;
+use crate::semantic::store::{OpenPassageStore, PassageKey};
 use crate::semantic::types::{
-    CACHE_SCHEMA_VERSION, CachedChunk, ChunkConfig, DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddedChunk,
-    EmbeddingCache, MODEL_DIMENSIONS, MODEL_NAME, SemanticChunk, TimedBudget,
+    DEFAULT_EMBEDDING_BATCH_SIZE, EmbeddedChunk, SemanticCancellationToken, SemanticChunk,
+    TimedBudget,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-pub(crate) const MAX_CACHE_ENTRIES: usize = 50_000;
+/// The chunks of a lookup with a stored embedding, and the rest.
+pub struct StoredLookup {
+    pub embedded: Vec<EmbeddedChunk>,
+    /// The chunks without a stored embedding, grouped by text, in the order
+    /// each text first appears.
+    pub missing: Vec<Vec<SemanticChunk>>,
+}
 
-#[cfg(test)]
-pub fn embed_chunks_with_progress_and_save(
-    embedder: &mut dyn SemanticEmbedder,
+impl StoredLookup {
+    /// The distinct texts without a stored embedding.
+    pub fn missing_passage_count(&self) -> usize {
+        self.missing.len()
+    }
+}
+
+/// Read the embeddings of `chunks`' texts from `store`, one read per
+/// distinct text. Fail once `cancellation` is cancelled, during the read
+/// too.
+pub fn look_up_chunks(
     chunks: Vec<SemanticChunk>,
-    cache: &mut EmbeddingCache,
-    cancellation: &crate::semantic::types::SemanticCancellationToken,
-    progress: impl FnMut(usize, usize),
-    save: impl FnMut(&EmbeddingCache),
-) -> Result<Vec<EmbeddedChunk>> {
-    embed_chunks_with_budget_and_save(
-        embedder,
-        chunks,
-        cache,
-        cancellation,
-        EmbeddingBudget::unbounded().timed_on(&crate::clock::TestClock::default()),
-        progress,
-        save,
-    )
-    .map(|outcome| outcome.embedded)
+    store: &mut OpenPassageStore<'_>,
+    cancellation: &SemanticCancellationToken,
+) -> Result<StoredLookup> {
+    if cancellation.is_cancelled() {
+        return Err(AppError::SemanticSearchCancelled);
+    }
+    let keys = chunks
+        .iter()
+        .map(|chunk| PassageKey::of(&chunk.text))
+        .collect::<Vec<_>>();
+    let stored = store
+        .read(keys.iter().collect::<HashSet<_>>(), cancellation)
+        .ok_or(AppError::SemanticSearchCancelled)?;
+
+    let mut lookup = StoredLookup {
+        embedded: Vec::with_capacity(chunks.len()),
+        missing: Vec::new(),
+    };
+    let mut missing_indices = HashMap::<PassageKey, usize>::new();
+    for (chunk, key) in chunks.into_iter().zip(keys) {
+        if cancellation.is_cancelled() {
+            return Err(AppError::SemanticSearchCancelled);
+        }
+        if let Some(embedding) = stored.get(&key) {
+            lookup
+                .embedded
+                .push(embedded_chunk(&chunk, Arc::clone(embedding)));
+        } else if let Some(index) = missing_indices.get(&key).copied() {
+            lookup.missing[index].push(chunk);
+        } else {
+            missing_indices.insert(key, lookup.missing.len());
+            lookup.missing.push(vec![chunk]);
+        }
+    }
+    Ok(lookup)
 }
 
 pub struct EmbeddingOutcome {
     pub embedded: Vec<EmbeddedChunk>,
     /// Chunks left without an embedding by the budget, counted per chunk, so
-    /// this and `embedded.len()` sum to the chunks passed in.
+    /// this and `embedded.len()` sum to the chunks looked up.
     pub missing_chunk_count: usize,
 }
 
-/// Embed the chunks missing from `cache` within `budget`; the rest are
-/// counted in the outcome. After each batch, check the time limit; once it
-/// has passed, save the completed batches and stop.
-pub fn embed_chunks_with_budget_and_save(
+/// Embed the texts `lookup` didn't find in `store` within `budget`; the
+/// rest are counted in the outcome. Write each batch to `store` as it
+/// finishes: a run stopped by cancellation, an error or its end keeps every
+/// finished batch. After each batch, check the time limit; once it has
+/// passed, stop.
+pub fn embed_missing(
     embedder: &mut dyn SemanticEmbedder,
-    chunks: Vec<SemanticChunk>,
-    cache: &mut EmbeddingCache,
-    cancellation: &crate::semantic::types::SemanticCancellationToken,
+    lookup: StoredLookup,
+    store: &mut OpenPassageStore<'_>,
+    cancellation: &SemanticCancellationToken,
     budget: TimedBudget<'_>,
     mut progress: impl FnMut(usize, usize),
-    mut save: impl FnMut(&EmbeddingCache),
 ) -> Result<EmbeddingOutcome> {
-    const SAVE_INTERVAL: usize = 256;
-
     if cancellation.is_cancelled() {
         return Err(AppError::SemanticSearchCancelled);
     }
-
-    let access = cache.access_counter.saturating_add(1);
-    cache.access_counter = access;
-    let mut embedded = Vec::with_capacity(chunks.len());
-    let mut misses = Vec::<Vec<SemanticChunk>>::new();
-    let mut miss_indices = HashMap::<String, usize>::new();
-
-    for chunk in chunks {
-        if cancellation.is_cancelled() {
-            return Err(AppError::SemanticSearchCancelled);
-        }
-        let key = embedding_cache_key(&chunk.text);
-        if let Some(entry) = cache.entries.get_mut(&key) {
-            entry.last_used = access;
-            embedded.push(embedded_chunk(&chunk, entry.embedding.clone()));
-        } else if let Some(index) = miss_indices.get(&key).copied() {
-            misses[index].push(chunk);
-        } else {
-            miss_indices.insert(key, misses.len());
-            misses.push(vec![chunk]);
-        }
-    }
+    let StoredLookup {
+        mut embedded,
+        mut missing,
+    } = lookup;
 
     let dimensions = embedder.dimensions();
-    let total_misses = budget.passages_within(misses.len());
-    let mut missing_chunk_count: usize = misses[total_misses..].iter().map(Vec::len).sum();
-    misses.truncate(total_misses);
+    let total_missing = budget.passages_within(missing.len());
+    let mut missing_chunk_count: usize = missing[total_missing..].iter().map(Vec::len).sum();
+    missing.truncate(total_missing);
     let mut completed = 0;
-    let mut last_saved = 0;
     let started = budget.start();
-    for batch in misses.chunks(DEFAULT_EMBEDDING_BATCH_SIZE) {
+    for batch in missing.chunks(DEFAULT_EMBEDDING_BATCH_SIZE) {
         if cancellation.is_cancelled() {
-            save_pending_cache(cache, completed, &mut last_saved, &mut save);
             return Err(AppError::SemanticSearchCancelled);
         }
         let texts = batch
             .iter()
             .map(|chunks| chunks[0].text.clone())
             .collect::<Vec<_>>();
-        let embeddings = match embedder
+        let embeddings = embedder
             .embed_passages(&texts)
-            .and_then(|embeddings| validate_passage_embeddings(&texts, embeddings, dimensions))
-        {
-            Ok(embeddings) => embeddings,
-            Err(error) => {
-                save_pending_cache(cache, completed, &mut last_saved, &mut save);
-                return Err(error);
-            }
-        };
+            .and_then(|embeddings| validate_passage_embeddings(&texts, embeddings, dimensions))?;
 
+        let mut passages = Vec::with_capacity(batch.len());
         for (chunks, embedding) in batch.iter().zip(embeddings) {
-            let key = embedding_cache_key(&chunks[0].text);
-            cache.entries.insert(
-                key,
-                CachedChunk {
-                    embedding: embedding.clone(),
-                    last_used: access,
-                    protected: false,
-                },
-            );
+            let embedding = Arc::<[f32]>::from(embedding);
             for chunk in chunks {
-                embedded.push(embedded_chunk(chunk, embedding.clone()));
+                embedded.push(embedded_chunk(chunk, Arc::clone(&embedding)));
             }
+            passages.push((PassageKey::of(&chunks[0].text), embedding));
         }
+        store.write(&passages);
         completed += batch.len();
-        if completed == total_misses || completed - last_saved >= SAVE_INTERVAL {
-            prune_cache(cache);
-            save(cache);
-            last_saved = completed;
-        }
-        progress(completed, total_misses);
-        if completed < total_misses && budget.time_is_up(started) {
-            missing_chunk_count += misses[completed..].iter().map(Vec::len).sum::<usize>();
-            save_pending_cache(cache, completed, &mut last_saved, &mut save);
+        progress(completed, total_missing);
+        if completed < total_missing && budget.time_is_up(started) {
+            missing_chunk_count += missing[completed..].iter().map(Vec::len).sum::<usize>();
             break;
         }
     }
@@ -142,7 +136,7 @@ pub fn embed_chunks_with_budget_and_save(
 }
 
 /// One embedding per passage, each `dimensions` finite values; otherwise
-/// none of the batch is cached.
+/// none of the batch is stored.
 fn validate_passage_embeddings(
     passages: &[String],
     embeddings: Vec<Vec<f32>>,
@@ -166,40 +160,7 @@ fn validate_passage_embeddings(
     Ok(embeddings)
 }
 
-fn save_pending_cache(
-    cache: &mut EmbeddingCache,
-    completed: usize,
-    last_saved: &mut usize,
-    save: &mut impl FnMut(&EmbeddingCache),
-) {
-    if completed > *last_saved {
-        prune_cache(cache);
-        save(cache);
-        *last_saved = completed;
-    }
-}
-
-fn prune_cache(cache: &mut EmbeddingCache) {
-    prune_cache_to_limit(cache, MAX_CACHE_ENTRIES);
-}
-
-fn prune_cache_to_limit(cache: &mut EmbeddingCache, max_entries: usize) {
-    let excess = cache.entries.len().saturating_sub(max_entries);
-    if excess == 0 {
-        return;
-    }
-    let mut oldest = cache
-        .entries
-        .iter()
-        .map(|(key, entry)| (entry.protected, entry.last_used, key.clone()))
-        .collect::<Vec<_>>();
-    oldest.sort_unstable();
-    for (_, _, key) in oldest.into_iter().take(excess) {
-        cache.entries.remove(&key);
-    }
-}
-
-fn embedded_chunk(chunk: &SemanticChunk, embedding: Vec<f32>) -> EmbeddedChunk {
+fn embedded_chunk(chunk: &SemanticChunk, embedding: Arc<[f32]>) -> EmbeddedChunk {
     EmbeddedChunk {
         conversation_index: chunk.conversation_index,
         source: chunk.source,
@@ -209,113 +170,6 @@ fn embedded_chunk(chunk: &SemanticChunk, embedding: Vec<f32>) -> EmbeddedChunk {
         message_range: chunk.message_range,
         embedding,
     }
-}
-
-pub fn cached_chunks(
-    chunks: Vec<SemanticChunk>,
-    cache: &EmbeddingCache,
-    cancellation: &crate::semantic::types::SemanticCancellationToken,
-) -> Result<(Vec<EmbeddedChunk>, usize)> {
-    let mut embedded = Vec::with_capacity(chunks.len());
-    let mut misses = HashSet::new();
-
-    for chunk in chunks {
-        if cancellation.is_cancelled() {
-            return Err(AppError::SemanticSearchCancelled);
-        }
-        let key = embedding_cache_key(&chunk.text);
-        if let Some(entry) = cache.entries.get(&key) {
-            embedded.push(embedded_chunk(&chunk, entry.embedding.clone()));
-        } else {
-            misses.insert(key);
-        }
-    }
-
-    Ok((embedded, misses.len()))
-}
-
-pub fn cache_miss_count(chunks: &[SemanticChunk], cache: &EmbeddingCache) -> usize {
-    chunks
-        .iter()
-        .map(|chunk| embedding_cache_key(&chunk.text))
-        .filter(|key| !cache.entries.contains_key(key))
-        .collect::<HashSet<_>>()
-        .len()
-}
-
-pub fn embedding_cache_key(text: &str) -> String {
-    blake3::hash(text.as_bytes()).to_hex().to_string()
-}
-
-pub fn cache_contains_text(cache: &EmbeddingCache, text: &str) -> bool {
-    cache.entries.contains_key(&embedding_cache_key(text))
-}
-
-/// The embedding cache for `config`, read after sweeping the cache directory
-/// of temp files stale at `clock`'s time.
-pub fn read_embedding_cache(config: ChunkConfig, clock: &dyn Clock) -> EmbeddingCache {
-    let Some(path) = embedding_cache_path() else {
-        return empty_embedding_cache(config);
-    };
-    read_embedding_cache_from_path(&path, config, MODEL_DIMENSIONS, clock)
-}
-
-fn read_embedding_cache_from_path(
-    path: &Path,
-    config: ChunkConfig,
-    dimensions: usize,
-    clock: &dyn Clock,
-) -> EmbeddingCache {
-    let Some(data) =
-        crate::cache_file::read_if_header_matches(path, &embedding_cache_header(config), clock)
-    else {
-        return empty_embedding_cache(config);
-    };
-    let Ok(mut cache) = bincode::deserialize::<EmbeddingCache>(&data) else {
-        return empty_embedding_cache(config);
-    };
-    drop_invalid_entries(&mut cache, dimensions);
-    if cache.entries.len() > MAX_CACHE_ENTRIES {
-        prune_cache(&mut cache);
-        write_embedding_cache_to_path(&cache, path, clock);
-    }
-    cache
-}
-
-/// Drop an entry unless its embedding is `dimensions` finite values. Its
-/// passage is then embedded again instead of failing every ranking.
-fn drop_invalid_entries(cache: &mut EmbeddingCache, dimensions: usize) {
-    cache
-        .entries
-        .retain(|_, entry| is_valid_embedding(&entry.embedding, dimensions));
-}
-
-/// The bytes an embedding cache for `config` opens with: `EmbeddingCache`'s
-/// schema version, model and chunking, laid out as bincode writes the
-/// struct's leading fields. A cache for any other opens differently and is
-/// rejected after its first bytes.
-fn embedding_cache_header(config: ChunkConfig) -> Vec<u8> {
-    bincode::serialize(&(
-        CACHE_SCHEMA_VERSION,
-        MODEL_NAME,
-        config.target_chars,
-        config.overlap_chars,
-        config.context_turns,
-    ))
-    .expect("integers and a string serialize")
-}
-
-/// Write `cache`, sweeping the cache directory of temp files stale at
-/// `clock`'s time.
-pub fn write_embedding_cache(cache: &EmbeddingCache, clock: &dyn Clock) {
-    let Some(path) = embedding_cache_path() else {
-        return;
-    };
-    write_embedding_cache_to_path(cache, &path, clock);
-}
-
-pub fn embedding_cache_file_path() -> Option<PathBuf> {
-    embedding_cache_path()
 }
 
 /// The folder earlier releases downloaded the semantic model into.
@@ -370,32 +224,10 @@ fn clear_semantic_cache_in(
     Ok(freed)
 }
 
-fn write_embedding_cache_to_path(cache: &EmbeddingCache, path: &Path, clock: &dyn Clock) {
-    if let Ok(data) = bincode::serialize(cache) {
-        crate::cache_file::write_atomically(path, &data, clock);
-    }
-}
-
-pub fn empty_embedding_cache(config: ChunkConfig) -> EmbeddingCache {
-    EmbeddingCache {
-        schema_version: CACHE_SCHEMA_VERSION,
-        model: MODEL_NAME.to_string(),
-        chunk_target_chars: config.target_chars,
-        chunk_overlap_chars: config.overlap_chars,
-        chunk_context_turns: config.context_turns,
-        access_counter: 0,
-        entries: HashMap::new(),
-    }
-}
-
-const EMBEDDING_CACHE_FILE: &str = "embeddings-v1.bin";
 const OLD_MODEL_DIRECTORY: &str = "fastembed";
 
-fn embedding_cache_path() -> Option<PathBuf> {
-    semantic_cache_dir().map(|path| path.join(EMBEDDING_CACHE_FILE))
-}
-
-fn semantic_cache_dir() -> Option<PathBuf> {
+/// The semantic cache folder; `None` without a cache folder.
+pub(crate) fn semantic_cache_dir() -> Option<PathBuf> {
     crate::cache_file::user_cache_base().map(semantic_cache_dir_in)
 }
 
@@ -414,14 +246,13 @@ fn semantic_cache_dir_in(cache_base: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::TestClock;
-    use crate::semantic::types::{
-        DEFAULT_INTERACTIVE_EMBEDDING_SECONDS, SemanticCancellationToken,
+    use crate::clock::{Clock, TestClock};
+    use crate::semantic::store::test_support::{
+        FAKE_DIMENSIONS, store_passages, stored_embedding, stored_passage_count, temporary_store,
     };
+    use crate::semantic::store::{PASSAGE_STORE_FILE, PassageStore};
+    use crate::semantic::types::{DEFAULT_INTERACTIVE_EMBEDDING_SECONDS, EmbeddingBudget};
     use std::time::Duration;
-
-    /// The length of every embedding in these tests.
-    const FAKE_DIMENSIONS: usize = 2;
 
     struct FakeEmbedder {
         calls: usize,
@@ -519,61 +350,44 @@ mod tests {
         }
     }
 
-    fn cached() -> CachedChunk {
-        CachedChunk {
-            embedding: vec![0.5, 0.5],
-            last_used: 0,
-            protected: false,
-        }
+    fn empty_store() -> PassageStore {
+        temporary_store(Arc::new(TestClock::default()))
     }
 
-    fn cache_text(cache: &mut EmbeddingCache, text: &str) {
-        cache.entries.insert(embedding_cache_key(text), cached());
+    /// One run on `store`, as the semantic index runs it: look `chunks` up,
+    /// then embed the missing texts within `budget`.
+    fn embed_chunks_with_budget(
+        embedder: &mut dyn SemanticEmbedder,
+        chunks: Vec<SemanticChunk>,
+        store: &PassageStore,
+        cancellation: &SemanticCancellationToken,
+        budget: TimedBudget<'_>,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<EmbeddingOutcome> {
+        let mut open = store.open();
+        let lookup = look_up_chunks(chunks, &mut open, cancellation)?;
+        let outcome = embed_missing(embedder, lookup, &mut open, cancellation, budget, progress);
+        open.finish();
+        outcome
     }
 
-    #[test]
-    fn cache_pruning_keeps_most_recent_entries() {
-        let mut cache = empty_embedding_cache(ChunkConfig::default());
-        for (text, last_used) in [("oldest", 1), ("middle", 2), ("newest", 3)] {
-            cache.entries.insert(
-                embedding_cache_key(text),
-                CachedChunk {
-                    embedding: vec![last_used as f32],
-                    last_used,
-                    protected: false,
-                },
-            );
-        }
-
-        prune_cache_to_limit(&mut cache, 2);
-
-        assert_eq!(cache.entries.len(), 2);
-        assert!(!cache_contains_text(&cache, "oldest"));
-        assert!(cache_contains_text(&cache, "middle"));
-        assert!(cache_contains_text(&cache, "newest"));
-    }
-
-    #[test]
-    fn cache_pruning_preserves_protected_core_entries() {
-        let mut cache = empty_embedding_cache(ChunkConfig::default());
-        cache_text(&mut cache, "adaptive newest");
-        cache
-            .entries
-            .get_mut(&embedding_cache_key("adaptive newest"))
-            .unwrap()
-            .last_used = 10;
-        cache_text(&mut cache, "core oldest");
-        let core = cache
-            .entries
-            .get_mut(&embedding_cache_key("core oldest"))
-            .unwrap();
-        core.last_used = 1;
-        core.protected = true;
-
-        prune_cache_to_limit(&mut cache, 1);
-
-        assert!(cache_contains_text(&cache, "core oldest"));
-        assert!(!cache_contains_text(&cache, "adaptive newest"));
+    /// [`embed_chunks_with_budget`] without a budget.
+    fn embed_chunks(
+        embedder: &mut dyn SemanticEmbedder,
+        chunks: Vec<SemanticChunk>,
+        store: &PassageStore,
+        cancellation: &SemanticCancellationToken,
+        progress: impl FnMut(usize, usize),
+    ) -> Result<Vec<EmbeddedChunk>> {
+        embed_chunks_with_budget(
+            embedder,
+            chunks,
+            store,
+            cancellation,
+            EmbeddingBudget::unbounded().timed_on(&TestClock::default()),
+            progress,
+        )
+        .map(|outcome| outcome.embedded)
     }
 
     #[test]
@@ -581,9 +395,8 @@ mod tests {
         const BUDGET_BATCHES: usize = 4;
         const BUDGET: usize = BUDGET_BATCHES * DEFAULT_EMBEDDING_BATCH_SIZE;
         const MISSING: usize = BUDGET + 8;
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "cached text");
+        let store = empty_store();
+        store_passages(&store, &["cached text"], [0.5, 0.5]);
         let chunks = std::iter::once(chunk("session:0", "cached text"))
             .chain((1..=MISSING).map(|index| {
                 chunk(
@@ -594,34 +407,26 @@ mod tests {
             .collect::<Vec<_>>();
         let mut embedder = FakeEmbedder { calls: 0 };
 
-        let outcome = embed_chunks_with_budget_and_save(
+        let outcome = embed_chunks_with_budget(
             &mut embedder,
             chunks,
-            &mut cache,
+            &store,
             &SemanticCancellationToken::new(),
             EmbeddingBudget::passages(BUDGET).timed_on(&TestClock::default()),
             |_, _| {},
-            |_| {},
         )
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, BUDGET_BATCHES);
         assert_eq!(outcome.embedded.len(), BUDGET + 1);
         assert_eq!(outcome.missing_chunk_count, MISSING - BUDGET);
-        assert_eq!(cache.entries.len(), BUDGET + 1);
-        assert!(cache_contains_text(
-            &cache,
-            &format!("missing text {BUDGET}")
-        ));
-        assert!(!cache_contains_text(
-            &cache,
-            &format!("missing text {}", BUDGET + 1)
-        ));
+        assert_eq!(stored_passage_count(&store), BUDGET + 1);
+        assert!(stored_embedding(&store, &format!("missing text {BUDGET}")).is_some());
+        assert!(stored_embedding(&store, &format!("missing text {}", BUDGET + 1)).is_none());
     }
 
     #[test]
     fn missing_chunk_count_counts_every_chunk_of_repeated_text_beyond_budget() {
-        let mut cache = empty_embedding_cache(ChunkConfig::default());
         let chunks = vec![
             chunk("session:0", "embedded text"),
             chunk("session:1", "repeated text"),
@@ -629,14 +434,13 @@ mod tests {
         ];
         let mut embedder = FakeEmbedder { calls: 0 };
 
-        let outcome = embed_chunks_with_budget_and_save(
+        let outcome = embed_chunks_with_budget(
             &mut embedder,
             chunks,
-            &mut cache,
+            &empty_store(),
             &SemanticCancellationToken::new(),
             EmbeddingBudget::passages(1).timed_on(&TestClock::default()),
             |_, _| {},
-            |_| {},
         )
         .expect("embedding succeeds");
 
@@ -648,8 +452,7 @@ mod tests {
     /// its end and the second never starts.
     fn embed_past_the_time_limit(
         chunks: Vec<SemanticChunk>,
-        cache: &mut EmbeddingCache,
-        saved_entry_counts: &mut Vec<usize>,
+        store: &PassageStore,
     ) -> (EmbeddingOutcome, usize) {
         let clock = TestClock::default();
         let mut embedder = SlowEmbedder {
@@ -657,14 +460,13 @@ mod tests {
             batch_takes: Duration::from_secs(DEFAULT_INTERACTIVE_EMBEDDING_SECONDS + 1),
             clock: &clock,
         };
-        let outcome = embed_chunks_with_budget_and_save(
+        let outcome = embed_chunks_with_budget(
             &mut embedder,
             chunks,
-            cache,
+            store,
             &SemanticCancellationToken::new(),
             EmbeddingBudget::seconds(DEFAULT_INTERACTIVE_EMBEDDING_SECONDS).timed_on(&clock),
             |_, _| {},
-            |cache| saved_entry_counts.push(cache.entries.len()),
         )
         .expect("embedding succeeds");
         (outcome, embedder.calls)
@@ -681,19 +483,17 @@ mod tests {
             batch_takes: Duration::from_millis(1500),
             clock: &clock,
         };
-        let mut cache = empty_embedding_cache(ChunkConfig::default());
         let chunks = (0..MISSING)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
             .collect();
 
-        let outcome = embed_chunks_with_budget_and_save(
+        let outcome = embed_chunks_with_budget(
             &mut embedder,
             chunks,
-            &mut cache,
+            &empty_store(),
             &SemanticCancellationToken::new(),
             EmbeddingBudget::seconds(2).timed_on(&clock),
             |_, _| {},
-            |_| {},
         )
         .expect("embedding succeeds");
 
@@ -708,14 +508,12 @@ mod tests {
     #[test]
     fn time_limit_stops_embedding_between_batches_and_keeps_finished_batch() {
         const MISSING: usize = 3 * DEFAULT_EMBEDDING_BATCH_SIZE;
-        let mut cache = empty_embedding_cache(ChunkConfig::default());
+        let store = empty_store();
         let chunks = (0..MISSING)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
             .collect();
-        let mut saved_entry_counts = Vec::new();
 
-        let (outcome, calls) =
-            embed_past_the_time_limit(chunks, &mut cache, &mut saved_entry_counts);
+        let (outcome, calls) = embed_past_the_time_limit(chunks, &store);
 
         assert_eq!(calls, 1);
         assert_eq!(outcome.embedded.len(), DEFAULT_EMBEDDING_BATCH_SIZE);
@@ -723,21 +521,18 @@ mod tests {
             outcome.missing_chunk_count,
             MISSING - DEFAULT_EMBEDDING_BATCH_SIZE
         );
-        assert_eq!(cache.entries.len(), DEFAULT_EMBEDDING_BATCH_SIZE);
-        assert_eq!(saved_entry_counts, vec![DEFAULT_EMBEDDING_BATCH_SIZE]);
+        assert_eq!(stored_passage_count(&store), DEFAULT_EMBEDDING_BATCH_SIZE);
     }
 
     #[test]
     fn time_limit_counts_every_chunk_of_repeated_text_it_left_out() {
-        let mut cache = empty_embedding_cache(ChunkConfig::default());
         let mut chunks = (0..DEFAULT_EMBEDDING_BATCH_SIZE)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
             .collect::<Vec<_>>();
         chunks.push(chunk("late:0", "repeated text"));
         chunks.push(chunk("late:1", "repeated text"));
-        let mut saved_entry_counts = Vec::new();
 
-        let (outcome, _) = embed_past_the_time_limit(chunks, &mut cache, &mut saved_entry_counts);
+        let (outcome, _) = embed_past_the_time_limit(chunks, &empty_store());
 
         assert_eq!(outcome.embedded.len(), DEFAULT_EMBEDDING_BATCH_SIZE);
         assert_eq!(outcome.missing_chunk_count, 2);
@@ -745,67 +540,62 @@ mod tests {
 
     #[test]
     fn zero_second_limit_embeds_nothing() {
-        let mut cache = empty_embedding_cache(ChunkConfig::default());
+        let store = empty_store();
         let mut embedder = FakeEmbedder { calls: 0 };
 
-        let outcome = embed_chunks_with_budget_and_save(
+        let outcome = embed_chunks_with_budget(
             &mut embedder,
             vec![chunk("session:0", "new text")],
-            &mut cache,
+            &store,
             &SemanticCancellationToken::new(),
             EmbeddingBudget::seconds(0).timed_on(&TestClock::default()),
             |_, _| {},
-            |_| {},
         )
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, 0);
         assert_eq!(outcome.missing_chunk_count, 1);
-        assert!(cache.entries.is_empty());
+        assert_eq!(stored_passage_count(&store), 0);
     }
 
     #[test]
-    fn embed_chunks_reuses_matching_cache_entry() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "cached text");
+    fn embed_chunks_reuses_stored_embedding() {
+        let store = empty_store();
+        store_passages(&store, &["cached text"], [0.5, 0.5]);
         let mut embedder = FakeEmbedder { calls: 0 };
 
-        let embedded = embed_chunks_with_progress_and_save(
+        let embedded = embed_chunks(
             &mut embedder,
             vec![chunk("session:0", "cached text")],
-            &mut cache,
+            &store,
             &SemanticCancellationToken::new(),
             |_, _| {},
-            |_| {},
         )
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, 0);
-        assert_eq!(embedded[0].embedding, vec![0.5, 0.5]);
+        assert_eq!(*embedded[0].embedding, [0.5, 0.5]);
         assert_eq!(embedded[0].chunk_index, 0);
     }
 
     #[test]
-    fn embed_chunks_embeds_cache_misses() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
+    fn embed_chunks_embeds_passages_missing_from_store() {
+        let store = empty_store();
         let mut embedder = FakeEmbedder { calls: 0 };
 
-        let embedded = embed_chunks_with_progress_and_save(
+        let embedded = embed_chunks(
             &mut embedder,
             vec![chunk("session:0", "new text")],
-            &mut cache,
+            &store,
             &SemanticCancellationToken::new(),
             |_, _| {},
-            |_| {},
         )
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, 1);
-        assert_eq!(embedded[0].embedding, vec![8.0, 1.0]);
+        assert_eq!(*embedded[0].embedding, [8.0, 1.0]);
         assert_eq!(embedded[0].chunk_index, 0);
-        assert!(cache.entries.contains_key(&embedding_cache_key("new text")));
+        assert!(stored_embedding(&store, "new text").is_some());
     }
 
     #[test]
@@ -816,110 +606,115 @@ mod tests {
         let non_finite = vec![vec![f32::NAN, 0.0], vec![1.0, 0.0]];
 
         for invalid in [one_short, differing_lengths, all_longer, non_finite] {
-            let mut cache = empty_embedding_cache(ChunkConfig::default());
+            let store = empty_store();
             let mut embedder = FixedEmbedder {
                 passages: invalid.clone(),
             };
 
-            let embedded = embed_chunks_with_progress_and_save(
+            let embedded = embed_chunks(
                 &mut embedder,
                 vec![chunk("session:0", "alpha"), chunk("session:1", "beta")],
-                &mut cache,
+                &store,
                 &SemanticCancellationToken::new(),
                 |_, _| {},
-                |_| {},
             );
 
             assert!(
                 matches!(embedded, Err(AppError::InvalidEmbeddings(_))),
                 "{invalid:?}"
             );
-            assert!(cache.entries.is_empty(), "{invalid:?}");
+            assert_eq!(stored_passage_count(&store), 0, "{invalid:?}");
         }
     }
 
     #[test]
     fn embed_chunks_reuses_content_across_sessions() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "shared text");
+        let store = empty_store();
+        store_passages(&store, &["shared text"], [0.5, 0.5]);
         let mut embedder = FakeEmbedder { calls: 0 };
 
-        let embedded = embed_chunks_with_progress_and_save(
+        let embedded = embed_chunks(
             &mut embedder,
             vec![
                 chunk("first-session:0", "shared text"),
                 chunk("second-session:4", "shared text"),
             ],
-            &mut cache,
+            &store,
             &SemanticCancellationToken::new(),
             |_, _| {},
-            |_| {},
         )
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, 0);
         assert_eq!(embedded.len(), 2);
-        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(stored_passage_count(&store), 1);
+        assert!(
+            Arc::ptr_eq(&embedded[0].embedding, &embedded[1].embedding),
+            "both chunks of the cached text share one embedding"
+        );
     }
 
     #[test]
     fn embed_chunks_embeds_duplicate_misses_once() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
+        let store = empty_store();
         let mut embedder = FakeEmbedder { calls: 0 };
         let mut progress = Vec::new();
 
-        let embedded = embed_chunks_with_progress_and_save(
+        let embedded = embed_chunks(
             &mut embedder,
             vec![
                 chunk("first-session:0", "duplicate text"),
                 chunk("second-session:0", "duplicate text"),
             ],
-            &mut cache,
+            &store,
             &SemanticCancellationToken::new(),
             |completed, total| progress.push((completed, total)),
-            |_| {},
         )
         .expect("embedding succeeds");
 
         assert_eq!(embedder.calls, 1);
         assert_eq!(embedded.len(), 2);
-        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(stored_passage_count(&store), 1);
         assert_eq!(progress, vec![(1, 1)]);
+        assert!(
+            Arc::ptr_eq(&embedded[0].embedding, &embedded[1].embedding),
+            "both chunks of the embedded text share one embedding"
+        );
     }
 
     #[test]
-    fn embed_chunks_checkpoints_large_runs_and_saves_final_batch() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
+    fn embed_chunks_stores_each_batch_as_it_finishes() {
+        const PASSAGES: usize = 2 * DEFAULT_EMBEDDING_BATCH_SIZE + 4;
+        let store = empty_store();
         let mut embedder = FakeEmbedder { calls: 0 };
-        let chunks = (0..300)
+        let chunks = (0..PASSAGES)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
             .collect();
-        let mut saved_entry_counts = Vec::new();
+        let mut stored_after_each_batch = Vec::new();
 
-        embed_chunks_with_progress_and_save(
+        embed_chunks(
             &mut embedder,
             chunks,
-            &mut cache,
+            &store,
             &SemanticCancellationToken::new(),
-            |_, _| {},
-            |cache| saved_entry_counts.push(cache.entries.len()),
+            |_, _| stored_after_each_batch.push(stored_passage_count(&store)),
         )
         .expect("embedding succeeds");
 
         assert_eq!(
-            embedder.calls,
-            300usize.div_ceil(DEFAULT_EMBEDDING_BATCH_SIZE)
+            stored_after_each_batch,
+            vec![
+                DEFAULT_EMBEDDING_BATCH_SIZE,
+                2 * DEFAULT_EMBEDDING_BATCH_SIZE,
+                PASSAGES
+            ],
+            "the store holds each batch once its progress is reported"
         );
-        assert_eq!(saved_entry_counts, vec![256, 300]);
     }
 
     #[test]
     fn embed_chunks_saves_completed_work_when_cancelled() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
+        let store = empty_store();
         let cancellation = SemanticCancellationToken::new();
         let mut embedder = CancellingEmbedder {
             cancellation: cancellation.clone(),
@@ -927,310 +722,53 @@ mod tests {
         let chunks = (0..=DEFAULT_EMBEDDING_BATCH_SIZE)
             .map(|index| chunk(&format!("session:{index}"), &format!("text {index}")))
             .collect();
-        let mut saved_entry_counts = Vec::new();
 
-        let result = embed_chunks_with_progress_and_save(
-            &mut embedder,
-            chunks,
-            &mut cache,
-            &cancellation,
-            |_, _| {},
-            |cache| saved_entry_counts.push(cache.entries.len()),
-        );
+        let result = embed_chunks(&mut embedder, chunks, &store, &cancellation, |_, _| {});
 
         assert!(matches!(result, Err(AppError::SemanticSearchCancelled)));
-        assert_eq!(saved_entry_counts, vec![DEFAULT_EMBEDDING_BATCH_SIZE]);
+        assert_eq!(stored_passage_count(&store), DEFAULT_EMBEDDING_BATCH_SIZE);
     }
 
     #[test]
-    fn changed_text_creates_distinct_cache_entry() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "old text");
+    fn changed_text_is_stored_as_distinct_passage() {
+        let store = empty_store();
+        store_passages(&store, &["old text"], [0.5, 0.5]);
         let mut embedder = FakeEmbedder { calls: 0 };
 
-        let embedded = embed_chunks_with_progress_and_save(
+        let embedded = embed_chunks(
             &mut embedder,
             vec![chunk("session:0", "new text")],
-            &mut cache,
+            &store,
             &SemanticCancellationToken::new(),
             |_, _| {},
-            |_| {},
         )
         .expect("embedding succeeds");
 
-        let restored = cache
-            .entries
-            .get(&embedding_cache_key("new text"))
-            .expect("cache entry");
         assert_eq!(embedder.calls, 1);
-        assert_eq!(embedded[0].embedding, vec![8.0, 1.0]);
-        assert_eq!(restored.embedding, vec![8.0, 1.0]);
-        assert!(cache_contains_text(&cache, "old text"));
-    }
-
-    /// The read checks an embedding cache's header at its first bytes, so a
-    /// written cache must open with that header.
-    #[test]
-    fn embedding_cache_opens_with_its_schema_model_and_chunking() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "cached text");
-        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
-
-        let bytes = std::fs::read(&path).unwrap();
-
-        assert!(bytes.starts_with(&embedding_cache_header(config)));
+        assert_eq!(*embedded[0].embedding, [8.0, 1.0]);
+        assert_eq!(
+            stored_embedding(&store, "new text"),
+            Some(Arc::from([8.0, 1.0]))
+        );
+        assert!(stored_embedding(&store, "old text").is_some());
     }
 
     #[test]
-    fn embedding_cache_read_or_write_removes_leftover_temp_files() {
-        use crate::cache_file::test_support::TempFileFixture;
-        let config = ChunkConfig::default();
-        for write in [false, true] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("cache.bin");
-            let clock = TestClock::default();
-            let fixture = TempFileFixture::in_directory(dir.path(), &clock);
-
-            if write {
-                write_embedding_cache_to_path(&empty_embedding_cache(config), &path, &clock);
-            } else {
-                read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &clock);
-            }
-
-            fixture.assert_swept();
-        }
-    }
-
-    #[test]
-    fn wrong_schema_cache_is_ignored() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache.schema_version = CACHE_SCHEMA_VERSION - 1;
-        cache_text(&mut cache, "stale");
-        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
-
-        let restored =
-            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
-
-        assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
-        assert!(restored.entries.is_empty());
-    }
-
-    #[test]
-    fn cache_for_another_chunking_is_ignored() {
-        let written = ChunkConfig::default();
-        let other_chunkings = [
-            ChunkConfig {
-                target_chars: written.target_chars + 1,
-                ..written
-            },
-            ChunkConfig {
-                overlap_chars: written.overlap_chars + 1,
-                ..written
-            },
-            ChunkConfig {
-                context_turns: written.context_turns + 1,
-                ..written
-            },
-        ];
-        for read in other_chunkings {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("cache.bin");
-            let mut cache = empty_embedding_cache(written);
-            cache_text(&mut cache, "chunked differently");
-            write_embedding_cache_to_path(&cache, &path, &TestClock::default());
-
-            let restored =
-                read_embedding_cache_from_path(&path, read, FAKE_DIMENSIONS, &TestClock::default());
-
-            assert!(restored.entries.is_empty(), "{read:?}");
-            assert_eq!(restored.chunk_target_chars, read.target_chars);
-            assert_eq!(restored.chunk_overlap_chars, read.overlap_chars);
-            assert_eq!(restored.chunk_context_turns, read.context_turns);
-        }
-    }
-
-    #[test]
-    fn previous_cache_layout_is_ignored() {
-        #[derive(serde::Serialize)]
-        struct PreviousCache {
-            schema_version: u32,
-            model: String,
-            chunk_target_chars: usize,
-            chunk_overlap_chars: usize,
-            chunk_context_turns: usize,
-            entries: HashMap<String, PreviousEntry>,
-        }
-
-        #[derive(serde::Serialize)]
-        struct PreviousEntry {
-            file_size: u64,
-            mtime_secs: u64,
-            mtime_nsecs: u32,
-            text: String,
-            embedding: Vec<f32>,
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
-        let config = ChunkConfig::default();
-        let previous = PreviousCache {
-            schema_version: CACHE_SCHEMA_VERSION - 1,
-            model: MODEL_NAME.to_string(),
-            chunk_target_chars: config.target_chars,
-            chunk_overlap_chars: config.overlap_chars,
-            chunk_context_turns: config.context_turns,
-            entries: HashMap::from([(
-                "session:0".to_string(),
-                PreviousEntry {
-                    file_size: 10,
-                    mtime_secs: 20,
-                    mtime_nsecs: 30,
-                    text: "cached text".to_string(),
-                    embedding: vec![0.5, 0.5],
-                },
-            )]),
-        };
-        std::fs::write(&path, bincode::serialize(&previous).unwrap()).unwrap();
-
-        let restored =
-            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
-
-        assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
-        assert!(restored.entries.is_empty());
-    }
-
-    #[test]
-    fn corrupt_cache_is_ignored() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
-        let config = ChunkConfig::default();
-        std::fs::write(&path, b"not bincode").expect("write corrupt cache");
-
-        let restored =
-            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
-
-        assert_eq!(restored.schema_version, CACHE_SCHEMA_VERSION);
-        assert!(restored.entries.is_empty());
-    }
-
-    #[test]
-    fn mismatched_config_cache_is_ignored_when_read() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache.chunk_overlap_chars += 1;
-        cache_text(&mut cache, "stale");
-        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
-
-        let restored =
-            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
-
-        assert_eq!(restored.chunk_overlap_chars, config.overlap_chars);
-        assert!(restored.entries.is_empty());
-    }
-
-    #[test]
-    fn cache_round_trips_when_config_matches() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "cached text");
-
-        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
-        let restored =
-            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
-
-        assert!(cache_contains_text(&restored, "cached text"));
-    }
-
-    #[test]
-    fn invalid_cached_embeddings_are_dropped_when_cache_is_read() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "valid");
-        cache_text(&mut cache, "also valid");
-        let invalid = [
-            ("not a number", vec![f32::NAN, 0.5]),
-            ("empty", Vec::new()),
-            ("shorter", vec![0.5]),
-        ];
-        for (text, embedding) in invalid.clone() {
-            cache.entries.insert(
-                embedding_cache_key(text),
-                CachedChunk {
-                    embedding,
-                    ..cached()
-                },
-            );
-        }
-        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
-
-        let restored =
-            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
-
-        assert!(cache_contains_text(&restored, "valid"));
-        assert!(cache_contains_text(&restored, "also valid"));
-        for (text, _) in invalid {
-            assert!(!cache_contains_text(&restored, text), "{text}");
-        }
-    }
-
-    #[test]
-    fn cached_embeddings_of_another_length_are_dropped_when_most_entries_share_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("cache.bin");
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "valid");
-        let longer = ["longer one", "longer two", "longer three"];
-        for text in longer {
-            cache.entries.insert(
-                embedding_cache_key(text),
-                CachedChunk {
-                    embedding: vec![0.5, 0.5, 0.5],
-                    ..cached()
-                },
-            );
-        }
-        write_embedding_cache_to_path(&cache, &path, &TestClock::default());
-
-        let restored =
-            read_embedding_cache_from_path(&path, config, FAKE_DIMENSIONS, &TestClock::default());
-
-        assert!(cache_contains_text(&restored, "valid"));
-        for text in longer {
-            assert!(!cache_contains_text(&restored, text), "{text}");
-        }
-    }
-
-    #[test]
-    fn cache_miss_count_matches_cached_chunks() {
-        let config = ChunkConfig::default();
-        let mut cache = empty_embedding_cache(config);
-        cache_text(&mut cache, "cached text");
-        cache_text(&mut cache, "old text");
+    fn lookup_counts_distinct_texts_without_stored_embedding() {
+        let store = empty_store();
+        store_passages(&store, &["cached text", "old text"], [0.5, 0.5]);
         let chunks = vec![
             chunk("session:0", "cached text"),
             chunk("session:1", "new text"),
             chunk("session:2", "uncached text"),
+            chunk("session:3", "new text"),
         ];
 
-        let (_, cached_chunk_misses) =
-            cached_chunks(chunks.clone(), &cache, &SemanticCancellationToken::new()).unwrap();
+        let lookup =
+            look_up_chunks(chunks, &mut store.open(), &SemanticCancellationToken::new()).unwrap();
 
-        assert_eq!(cache_miss_count(&chunks, &cache), cached_chunk_misses);
-        assert_eq!(cache_miss_count(&chunks, &cache), 2);
+        assert_eq!(lookup.embedded.len(), 1);
+        assert_eq!(lookup.missing_passage_count(), 2);
     }
 
     #[test]
@@ -1240,8 +778,8 @@ mod tests {
         )));
 
         assert_eq!(
-            cache_dir.join(EMBEDDING_CACHE_FILE),
-            PathBuf::from("/home/example/.cache/rearview/semantic/embeddings-v1.bin")
+            cache_dir.join(PASSAGE_STORE_FILE),
+            PathBuf::from("/home/example/.cache/rearview/semantic/embeddings-v2.sqlite3")
         );
         assert_eq!(
             cache_dir.join(OLD_MODEL_DIRECTORY),
@@ -1249,11 +787,19 @@ mod tests {
         );
     }
 
-    /// A semantic folder with an embedding cache file of 300 bytes, a shard
-    /// folder containing 200 bytes and a `fastembed` folder containing 1,000.
+    /// A semantic folder with a passage store of 300 bytes and its
+    /// write-ahead log of 100, a shard folder containing 200 bytes and a
+    /// `fastembed` folder containing 1,000.
     fn semantic_folder_with_cache_files() -> tempfile::TempDir {
         let semantic_dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(semantic_dir.path().join(EMBEDDING_CACHE_FILE), [0; 300]).unwrap();
+        std::fs::write(semantic_dir.path().join(PASSAGE_STORE_FILE), [0; 300]).unwrap();
+        std::fs::write(
+            semantic_dir
+                .path()
+                .join(format!("{PASSAGE_STORE_FILE}-wal")),
+            [0; 100],
+        )
+        .unwrap();
         let shard_dir = semantic_dir.path().join("shards");
         std::fs::create_dir(&shard_dir).unwrap();
         std::fs::write(shard_dir.join("shard-0.bin"), [0; 200]).unwrap();
@@ -1279,13 +825,13 @@ mod tests {
 
         assert_eq!(
             freed,
-            Some(1_500),
-            "the bytes freed differ from the cache files' sizes"
+            Some(1_600),
+            "the bytes freed are the sum of the cache files' sizes"
         );
         assert_eq!(
             entry_names(semantic_dir.path()),
             Vec::<std::ffi::OsString>::new(),
-            "a semantic cache file or folder remains"
+            "every semantic cache file and folder is deleted"
         );
     }
 
@@ -1302,17 +848,17 @@ mod tests {
 
         assert_eq!(
             freed,
-            Some(1_500),
-            "the bytes freed count the Hugging Face cache or miss a cache file"
+            Some(1_600),
+            "the bytes freed are the cache files' sizes, without the Hugging Face cache"
         );
         assert_eq!(
             entry_names(semantic_dir.path()),
             ["shared"],
-            "the folder containing the Hugging Face cache is deleted, or a cache file remains"
+            "the folder containing the Hugging Face cache alone stays"
         );
         assert!(
             model.join("model.onnx").is_file(),
-            "the model in the Hugging Face cache is deleted"
+            "the model in the Hugging Face cache stays"
         );
     }
 

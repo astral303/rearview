@@ -25,7 +25,8 @@ echo
 # Start without embeddings so the run embeds the seeded history through the
 # model. The model stays in the Hugging Face cache the binary uses, outside
 # the sandbox.
-rm -f "$sandbox/cache/semantic/embeddings-v1.bin"
+rm -f "$sandbox/cache/semantic/embeddings-v2.sqlite3"{,-wal,-shm} \
+  "$sandbox/cache/semantic/embeddings-v1.bin"
 
 # Every provider is pointed into the sandbox. CLAUDE_CONFIG_DIR alone leaves
 # Codex, OpenCode, Kimi, Grok, Pi and OMP reading their real locations.

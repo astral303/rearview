@@ -1,7 +1,5 @@
 use crate::agent::refs::MessageRange;
 use crate::clock::{Clock, Moment};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -18,7 +16,6 @@ pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 8;
 /// example machines).
 pub const DEFAULT_INTERACTIVE_EMBEDDING_SECONDS: u64 = 2;
 pub const MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 32;
-pub const CACHE_SCHEMA_VERSION: u32 = 7;
 pub const MODEL_NAME: &str = "BGESmallENV15";
 pub const MODEL_DIMENSIONS: usize = 384;
 
@@ -197,7 +194,8 @@ pub struct EmbeddedChunk {
     pub chunk_index: usize,
     pub text: String,
     pub message_range: MessageRange,
-    pub embedding: Vec<f32>,
+    /// Shared by every chunk of the same text.
+    pub embedding: Arc<[f32]>,
 }
 
 /// The bonus a chunk holding every query word adds to its similarity.
@@ -305,22 +303,4 @@ impl SemanticHit {
             explanation,
         }
     }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct EmbeddingCache {
-    pub schema_version: u32,
-    pub model: String,
-    pub chunk_target_chars: usize,
-    pub chunk_overlap_chars: usize,
-    pub chunk_context_turns: usize,
-    pub access_counter: u64,
-    pub entries: HashMap<String, CachedChunk>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct CachedChunk {
-    pub embedding: Vec<f32>,
-    pub last_used: u64,
-    pub protected: bool,
 }
