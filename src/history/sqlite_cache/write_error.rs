@@ -73,6 +73,8 @@ impl WriteErrorClass {
             | AppError::TimeFilter(_)
             | AppError::SemanticSearchCancelled
             | AppError::InvalidEmbeddings(_)
+            | AppError::PassageStoreNotOpened(_)
+            | AppError::PassagesNotStored { .. }
             | AppError::RefreshStopped => Self::Other,
         }
     }

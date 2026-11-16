@@ -6,6 +6,7 @@ use crate::agent::search::SearchedTranscript;
 use crate::agent::transcript::AgentTranscript;
 use crate::clock::{Clock, Moment};
 use crate::history::load_meter::{AgentLoad, ItemCount, LoadMeter, LoadStep};
+use crate::semantic::store::StoreUse;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -139,6 +140,9 @@ pub struct CommandPerf {
     /// The semantic route texts a semantic search computed; `None` when it
     /// didn't compute any.
     semantic_routes: Mutex<Option<ComputedRoutes>>,
+    /// The passages a semantic search read from the passage store and wrote
+    /// to it; `None` when it didn't open the store.
+    semantic_store: Mutex<Option<StoreUse>>,
 }
 
 /// The semantic route texts a semantic search computed from the copies'
@@ -192,7 +196,17 @@ impl CommandPerf {
             refresh_rounds: Mutex::default(),
             search: OnceLock::new(),
             semantic_routes: Mutex::default(),
+            semantic_store: Mutex::default(),
         }
+    }
+
+    /// Records the passages a semantic search read from the passage store
+    /// and wrote to it.
+    pub fn record_semantic_store(&self, store_use: StoreUse) {
+        *self
+            .semantic_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(store_use);
     }
 
     /// Records the `count` semantic route texts a semantic search computed,
@@ -304,7 +318,8 @@ impl CommandPerf {
 
     /// One `perf` record per stage in the order they ran; one per round of
     /// the targeted refresh, in order; the semantic route texts computed;
-    /// each agent's discovery, cache and refresh, agents in the order they
+    /// the passages read from the passage store and written to it; each
+    /// agent's discovery, cache and refresh, agents in the order they
     /// loaded; each transcript parsed; a global search's reads and
     /// retrieval; the `peak_memory` in bytes when the platform reports it;
     /// then the total.
@@ -349,6 +364,21 @@ impl CommandPerf {
                     skipped.record()
                 ),
             };
+        }
+        if let Some(store_use) = &*self
+            .semantic_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            let _ = write!(
+                records,
+                "perf semantic-store read={} written={} skipped={}",
+                store_use.read, store_use.written, store_use.skipped
+            );
+            if let Some(reason) = store_use.skip_reason {
+                let _ = write!(records, " reason={}", reason.label());
+            }
+            records.push('\n');
         }
         for agent in self.load.agents() {
             write_agent_load(&mut records, &agent);
@@ -680,6 +710,42 @@ mod tests {
         assert!(
             records.contains("perf total ms=70\n"),
             "the command took 70 ms in total: {records}"
+        );
+    }
+
+    #[test]
+    fn semantic_store_record_counts_passages_and_gives_reason_for_skipped_ones() {
+        use crate::semantic::store::SkipReason;
+        let stored = perf();
+        stored.record_semantic_store(StoreUse {
+            read: 5034,
+            written: 32,
+            skipped: 0,
+            skip_reason: None,
+        });
+        let skipped = perf();
+        skipped.record_semantic_store(StoreUse {
+            read: 7,
+            written: 8,
+            skipped: 16,
+            skip_reason: Some(SkipReason::LowSpace),
+        });
+
+        assert!(
+            stored
+                .records(None)
+                .contains("perf semantic-store read=5034 written=32 skipped=0\n"),
+            "the record counts the passages read and written"
+        );
+        assert!(
+            skipped
+                .records(None)
+                .contains("perf semantic-store read=7 written=8 skipped=16 reason=low-space\n"),
+            "the record gives the reason the skipped passages were not stored"
+        );
+        assert!(
+            !perf().records(None).contains("semantic-store"),
+            "a command that didn't open the passage store doesn't write the record"
         );
     }
 

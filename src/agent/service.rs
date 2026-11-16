@@ -1915,6 +1915,7 @@ impl AgentService {
                         &transcript,
                         SemanticToolContent::All,
                         self.clock().clone(),
+                        &self.perf,
                     )?;
                     warnings.extend(semantic_warnings);
                     output
@@ -1926,6 +1927,7 @@ impl AgentService {
                     &transcript,
                     SemanticToolContent::MatchingQuery(&request.query),
                     self.clock().clone(),
+                    &self.perf,
                 ) {
                     Ok((output, semantic_warnings)) => {
                         warnings.extend(semantic_warnings);
@@ -3377,6 +3379,7 @@ fn run_agent_semantic_hits(
         chunk_hits,
         window,
         service.clock().clone(),
+        &service.perf,
     )
     .map(|(ranked, warnings)| (SemanticHalf { ranked, reads }, warnings))
 }
@@ -3598,6 +3601,8 @@ fn stripped_semantic_conversation(
 }
 
 /// `candidates` ranked for `query`, the embedding budget timed on `clock`.
+/// Records in `perf` the passages read from the passage store and written
+/// to it.
 fn run_agent_semantic_hits_for_candidates(
     query: &str,
     candidates: &[semantic::index::SemanticIndexCandidate],
@@ -3605,6 +3610,7 @@ fn run_agent_semantic_hits_for_candidates(
     chunk_hits: ChunkHits,
     window: TimeFilter,
     clock: Arc<dyn Clock>,
+    perf: &CommandPerf,
 ) -> Result<(RankedHits, Vec<AgentWarning>)> {
     let parsed = search::query::ParsedQuery::parse(query);
     let request = semantic::index::SemanticIndexRequest {
@@ -3616,7 +3622,7 @@ fn run_agent_semantic_hits_for_candidates(
         chunk_hits,
         window,
     };
-    let mut state = semantic::index::SemanticIndexState::new(clock.clone());
+    let mut state = semantic::index::SemanticIndexState::new(clock);
     let mut embedder = semantic::fastembed::FastembedEmbedder::new().map_err(|error| {
         AgentError::semantic_unavailable(format!("failed to initialize semantic search: {error}"))
     })?;
@@ -3628,11 +3634,13 @@ fn run_agent_semantic_hits_for_candidates(
             &cancellation,
             embedding_budget,
             |_progress| {},
-            |store| store.write(clock.as_ref()),
         )
         .map_err(|error| {
             AgentError::semantic_unavailable(format!("semantic search failed: {error}"))
         })?;
+    if let Some(store_use) = response.store_use {
+        perf.record_semantic_store(store_use);
+    }
     let warnings = partial_index_warning(
         response.indexed_chunk_count,
         response.missing_chunk_count,
@@ -3988,6 +3996,7 @@ fn run_agent_within_semantic<'a>(
     transcript: &agent::transcript::AgentTranscript,
     tool_content: SemanticToolContent<'a>,
     clock: Arc<dyn Clock>,
+    perf: &CommandPerf,
 ) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
     let input = agent::search::AgentConversationInput {
         conversation,
@@ -4009,6 +4018,7 @@ fn run_agent_within_semantic<'a>(
         request.semantic_chunk_hits(),
         request.window,
         clock,
+        perf,
     )?;
     let output = agent::search::run_within_search(
         request,

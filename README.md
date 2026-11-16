@@ -275,6 +275,9 @@ the semantic cache:
 rearview --generate-semantic-cache
 ```
 
+`rearview` deletes the embedding of a passage that a semantic search has not
+read for 180 days. A later search computes it again.
+
 Lexical results appear while semantic ranking runs. The semantic results
 replace them when ranking finishes.
 

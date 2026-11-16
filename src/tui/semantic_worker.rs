@@ -725,19 +725,12 @@ fn rank_or_prewarm_semantic_request(
     cancellation: &SemanticCancellationToken,
     res_tx: &mpsc::Sender<SemanticSearchMessage>,
 ) -> Result<SemanticSearchResponse> {
-    let clock = state.clock();
-    let response = state.refresh_or_prewarm(
-        request,
-        embedder,
-        cancellation,
-        |progress| {
-            let _ = res_tx.send(SemanticSearchMessage::Progress {
-                generation,
-                progress: semantic_progress(progress),
-            });
-        },
-        |store| store.write(clock.as_ref()),
-    )?;
+    let response = state.refresh_or_prewarm(request, embedder, cancellation, |progress| {
+        let _ = res_tx.send(SemanticSearchMessage::Progress {
+            generation,
+            progress: semantic_progress(progress),
+        });
+    })?;
     Ok(semantic_search_response(
         generation,
         response,
@@ -908,6 +901,7 @@ mod tests {
                 query_embedding_returned: true,
                 progress: SemanticIndexProgress::Complete,
                 prewarm: false,
+                store_use: None,
             },
             &[],
             &ParsedQuery::parse("beta"),

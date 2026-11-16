@@ -60,7 +60,7 @@ pub fn run(
         chunk_hits: ChunkHits::None,
         window: TimeFilter::default(),
     };
-    let mut state = SemanticIndexState::new(clock.clone());
+    let mut state = SemanticIndexState::new(clock);
     let cancellation = SemanticCancellationToken::new();
     if !state.has_chunks(&request, &cancellation)? {
         state.clear_empty(&request, &cancellation)?;
@@ -69,10 +69,7 @@ pub fn run(
     }
 
     let mut embedder = FastembedEmbedder::new()?;
-    let (refresh, response) =
-        refresh_and_rank_interactive(&request, &mut state, &mut embedder, |store| {
-            store.write(clock.as_ref())
-        })?;
+    let (refresh, response) = refresh_and_rank_interactive(&request, &mut state, &mut embedder)?;
 
     eprintln!(
         "Semantic search: searching {} cached chunk(s) from {} recent conversation(s) with fastembed {MODEL_NAME}",
@@ -121,8 +118,8 @@ fn megabytes(bytes: u64) -> u64 {
 }
 
 /// Embeds every passage of the conversations in `workspace` missing from the
-/// embedding cache. Stores the route texts it computed in the session cache
-/// under `base`.
+/// passage store. Stores the route texts it computed in the session cache
+/// under `base`. Fails as [`embed_into_store`] does.
 pub fn generate_cache(
     conversations: &[Conversation],
     workspace: Option<&Workspace>,
@@ -131,8 +128,7 @@ pub fn generate_cache(
 ) -> Result<()> {
     use crate::semantic::chunk::build_chunks_with_sources;
     use crate::semantic::fastembed::FastembedEmbedder;
-    use crate::semantic::index::{SemanticIndexProgress, SemanticIndexRequest, SemanticIndexState};
-    use crate::semantic::store::{MAX_CACHE_ENTRIES, passage_key};
+    use crate::semantic::index::{SemanticIndexRequest, SemanticIndexState};
     use crate::semantic::types::ChunkConfig;
 
     let content = semantic_content(&conversations_in_workspace(conversations, workspace))?
@@ -159,16 +155,6 @@ pub fn generate_cache(
         ChunkConfig::default(),
     );
     let chunk_count = chunks.len();
-    let core_keys = chunks
-        .iter()
-        .map(|chunk| passage_key(&chunk.text))
-        .collect::<std::collections::HashSet<_>>();
-    let unique_chunk_count = core_keys.len();
-    if unique_chunk_count > MAX_CACHE_ENTRIES {
-        return Err(AppError::ConfigError(format!(
-            "semantic core has {unique_chunk_count} unique passages, exceeding the {MAX_CACHE_ENTRIES}-entry cache capacity"
-        )));
-    }
     if chunk_count == 0 {
         eprintln!("No semantic dialogue or route text available for cache generation.");
         return Ok(());
@@ -183,30 +169,13 @@ pub fn generate_cache(
         chunk_hits: ChunkHits::None,
         window: TimeFilter::default(),
     };
-    let mut state = SemanticIndexState::new(clock.clone());
-    state.store_mut().unprotect_all_but(&core_keys);
+    let mut state = SemanticIndexState::new(clock);
     eprintln!(
         "Semantic cache: checking {chunk_count} chunk(s) from {} recent conversation(s).",
         selected.len()
     );
 
-    let mut embedder = FastembedEmbedder::new()?;
-    let response = state.refresh_or_prewarm(
-        &request,
-        &mut embedder,
-        &SemanticCancellationToken::new(),
-        |progress| {
-            if let SemanticIndexProgress::Embedding { completed, total } = progress
-                && total > 0
-                && completed > 0
-            {
-                eprintln!("Semantic cache: embedded {completed}/{total} changed chunk(s)");
-            }
-        },
-        |store| store.write(clock.as_ref()),
-    )?;
-    state.store_mut().protect(&core_keys);
-    state.store().write(clock.as_ref());
+    let response = embed_into_store(&request, &mut state, FastembedEmbedder::new)?;
 
     eprintln!(
         "Semantic cache: cached {} chunk(s) from {} recent conversation(s).",
@@ -217,13 +186,55 @@ pub fn generate_cache(
     Ok(())
 }
 
+/// Embeds the passages of `request`'s corpus missing from `state`'s passage
+/// store with the embedder `load_embedder` returns, and reports each batch
+/// on stderr.
+/// - Fails before it loads the embedder when the store's drive is low on
+///   space or the store does not open.
+/// - Fails after embedding when the store skipped a write, with the count
+///   of passages not stored and the reason.
+fn embed_into_store<E: crate::semantic::embed::SemanticEmbedder>(
+    request: &crate::semantic::index::SemanticIndexRequest<'_>,
+    state: &mut crate::semantic::index::SemanticIndexState,
+    load_embedder: impl FnOnce() -> Result<E>,
+) -> Result<crate::semantic::index::SemanticIndexResponse> {
+    use crate::semantic::index::SemanticIndexProgress;
+    use crate::semantic::store::SkipReason;
+
+    state.fail_unless_store_is_writable()?;
+    let mut embedder = load_embedder()?;
+    let response = state.refresh_or_prewarm(
+        request,
+        &mut embedder,
+        &SemanticCancellationToken::new(),
+        |progress| {
+            if let SemanticIndexProgress::Embedding { completed, total } = progress
+                && total > 0
+                && completed > 0
+            {
+                eprintln!("Semantic cache: embedded {completed}/{total} changed chunk(s)");
+            }
+        },
+    )?;
+    match response.store_use {
+        Some(store_use) if store_use.skipped > 0 => Err(AppError::PassagesNotStored {
+            count: store_use.skipped,
+            reason: store_use
+                .skip_reason
+                .unwrap_or(SkipReason::Error)
+                .sentence(),
+        }),
+        _ => Ok(response),
+    }
+}
+
 pub fn debug_search(
     query: &str,
     conversations: &[Conversation],
     workspace: Option<&Workspace>,
-    clock: &dyn Clock,
+    clock: Arc<dyn Clock>,
 ) -> Result<()> {
-    use crate::semantic::cache::{cached_chunks, embedding_cache_file_path};
+    use crate::semantic::cache::look_up_chunks;
     use crate::semantic::chunk::build_chunks;
     use crate::semantic::embed::embed_valid_query;
     use crate::semantic::fastembed::FastembedEmbedder;
@@ -250,7 +261,11 @@ pub fn debug_search(
         "Semantic debug: model cache: {}",
         FastembedEmbedder::cache_dir().display()
     );
-    match embedding_cache_file_path() {
+    let store = PassageStore::in_folder(
+        crate::semantic::cache::semantic_cache_dir().as_deref(),
+        clock,
+    );
+    match store.path() {
         Some(path) => eprintln!("Semantic debug: embedding cache: {}", path.display()),
         None => eprintln!("Semantic debug: embedding cache: unavailable"),
     }
@@ -345,20 +360,18 @@ pub fn debug_search(
         return Ok(());
     }
 
-    let store = PassageStore::read(chunk_config, clock);
-    let missing = store.missing_passage_count(&chunks);
-    let cached_count = chunks.len().saturating_sub(missing);
+    let chunk_count = chunks.len();
+    let mut open_store = store.open();
+    let lookup = look_up_chunks(chunks, &mut open_store, &SemanticCancellationToken::new())?;
+    let missing = lookup.missing_passage_count();
     eprintln!(
         "Semantic debug: cache entries={}, hits={}, misses={}",
-        store.passage_count(),
-        cached_count,
+        open_store.passage_count(),
+        chunk_count.saturating_sub(missing),
         missing
     );
-    for chunk in chunks
-        .iter()
-        .filter(|chunk| !store.contains_text(&chunk.text))
-        .take(5)
-    {
+    drop(open_store);
+    for chunk in lookup.missing.iter().map(|chunks| &chunks[0]).take(5) {
         eprintln!(
             "Semantic debug: missing cache chunk {}:{}: {}",
             chunk.session,
@@ -367,7 +380,7 @@ pub fn debug_search(
         );
     }
 
-    let (embedded_chunks, _) = cached_chunks(chunks, &store, &SemanticCancellationToken::new())?;
+    let embedded_chunks = lookup.embedded;
     if embedded_chunks.is_empty() {
         eprintln!("Semantic debug: no cached chunks available for ranking.");
         return Ok(());
@@ -446,14 +459,12 @@ fn refresh_and_rank_interactive(
     request: &crate::semantic::index::SemanticIndexRequest<'_>,
     state: &mut crate::semantic::index::SemanticIndexState,
     embedder: &mut dyn crate::semantic::embed::SemanticEmbedder,
-    mut save_store: impl FnMut(&crate::semantic::store::PassageStore),
 ) -> Result<(
     crate::semantic::index::SemanticIndexResponse,
     crate::semantic::index::SemanticIndexResponse,
 )> {
     let cancellation = SemanticCancellationToken::new();
-    let refresh = state.refresh_passages(request, embedder, &cancellation, |_| {}, |_| {})?;
-    save_store(state.store());
+    let refresh = state.refresh_passages(request, embedder, &cancellation, |_| {})?;
     let response = state.rank_refreshed(request, embedder, &cancellation, |_| {})?;
     Ok((refresh, response))
 }
@@ -644,8 +655,12 @@ fn no_conversations_message(local: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AppError;
     use crate::semantic::embed::SemanticEmbedder;
     use crate::semantic::store::PassageStore;
+    use crate::semantic::store::test_support::{
+        stored_passage_count, temporary_store_at, temporary_store_path,
+    };
     use crate::semantic::test_fixtures::SemanticConversationFixture;
     use crate::semantic::types::ChunkConfig;
     use chrono::Local;
@@ -911,7 +926,7 @@ mod tests {
         Vec<crate::semantic::index::SemanticIndexCandidate>,
         crate::semantic::index::SemanticIndexState,
         FakeEmbedder,
-        Vec<usize>,
+        PassageStore,
     ) {
         let conversations = [test_conversation(
             "/projects/project-a/session-1.jsonl",
@@ -920,15 +935,23 @@ mod tests {
         )];
         let selected = vec![&conversations[0]];
         let candidates = semantic_index_candidates(&selected);
+        let clock = Arc::new(crate::clock::TestClock::default());
+        let store_path = temporary_store_path();
         let state = crate::semantic::index::SemanticIndexState::with_store(
             ChunkConfig::default(),
-            PassageStore::empty(ChunkConfig::default()),
-            Arc::new(crate::clock::TestClock::default()),
+            temporary_store_at(store_path.clone(), clock.clone()),
+            clock.clone(),
         );
         let mut embedder = FakeEmbedder::new(query_embedding);
         embedder.query_error = query_error;
 
-        (query.to_string(), candidates, state, embedder, Vec::new())
+        (
+            query.to_string(),
+            candidates,
+            state,
+            embedder,
+            temporary_store_at(store_path, clock),
+        )
     }
 
     fn interactive_refresh_request<'a>(
@@ -947,46 +970,123 @@ mod tests {
     }
 
     #[test]
-    fn interactive_refresh_writes_cache_once_before_query_ranking() {
-        let (query, candidates, mut state, mut embedder, mut saved_passage_counts) =
+    fn interactive_refresh_stores_passages_when_query_has_no_embedding() {
+        let (query, candidates, mut state, mut embedder, store) =
             interactive_refresh_context("alpha", None, false);
         let request = interactive_refresh_request(&query, &candidates);
 
-        let (refresh, response) = refresh_and_rank_interactive(
-            &request,
-            &mut state,
-            &mut embedder,
-            |store: &PassageStore| saved_passage_counts.push(store.passage_count()),
-        )
-        .expect("interactive refresh and rank succeeds");
+        let (refresh, response) = refresh_and_rank_interactive(&request, &mut state, &mut embedder)
+            .expect("interactive refresh and rank succeeds");
 
         assert_eq!(refresh.indexed_chunk_count, 1);
-        assert_eq!(saved_passage_counts, vec![1]);
+        assert_eq!(stored_passage_count(&store), 1);
         assert!(!response.query_embedding_returned);
         assert_eq!(embedder.passage_calls, 1);
         assert_eq!(embedder.query_calls, 1);
     }
 
     #[test]
-    fn interactive_refresh_writes_cache_before_query_error() {
-        let (query, candidates, mut state, mut embedder, mut saved_passage_counts) =
+    fn interactive_refresh_stores_passages_before_query_error() {
+        let (query, candidates, mut state, mut embedder, store) =
             interactive_refresh_context("alpha", Some(vec![1.0, 0.0]), true);
         let request = interactive_refresh_request(&query, &candidates);
 
-        let error = match refresh_and_rank_interactive(
-            &request,
-            &mut state,
-            &mut embedder,
-            |store: &PassageStore| saved_passage_counts.push(store.passage_count()),
-        ) {
+        let error = match refresh_and_rank_interactive(&request, &mut state, &mut embedder) {
             Ok(_) => panic!("query error should propagate"),
             Err(error) => error,
         };
 
-        assert_eq!(saved_passage_counts, vec![1]);
+        assert_eq!(stored_passage_count(&store), 1);
         assert_eq!(embedder.passage_calls, 1);
         assert_eq!(embedder.query_calls, 1);
         assert!(error.to_string().contains("query failed"));
+    }
+
+    fn one_passage_corpus() -> Vec<crate::semantic::index::SemanticIndexCandidate> {
+        let conversation = test_conversation(
+            "/projects/project-a/session-1.jsonl",
+            "one",
+            vec!["visible alpha".to_string()],
+        );
+        semantic_index_candidates(&[&conversation])
+    }
+
+    /// The request cache generation makes for `candidates`.
+    fn prewarm_request(
+        candidates: &[crate::semantic::index::SemanticIndexCandidate],
+    ) -> crate::semantic::index::SemanticIndexRequest<'_> {
+        crate::semantic::index::SemanticIndexRequest {
+            query: "",
+            literal_filters: &[],
+            full_corpus: candidates,
+            scope: candidates,
+            prewarm: true,
+            chunk_hits: crate::semantic::types::ChunkHits::None,
+            window: TimeFilter::default(),
+        }
+    }
+
+    #[test]
+    fn cache_generation_fails_before_loading_the_model_when_the_store_doesnt_open() {
+        let candidates = one_passage_corpus();
+        let clock = Arc::new(crate::clock::TestClock::default());
+        let unopenable = temporary_store_path();
+        // A folder where the store's file belongs: SQLite cannot open it.
+        std::fs::create_dir_all(&unopenable).unwrap();
+        let mut state = crate::semantic::index::SemanticIndexState::with_store(
+            ChunkConfig::default(),
+            temporary_store_at(unopenable, clock.clone()),
+            clock,
+        );
+        let mut model_loaded = false;
+
+        let generated = embed_into_store(&prewarm_request(&candidates), &mut state, || {
+            model_loaded = true;
+            Ok(FakeEmbedder::new(None))
+        });
+
+        assert!(
+            matches!(generated, Err(AppError::PassageStoreNotOpened(_))),
+            "cache generation fails with the store's error"
+        );
+        assert!(!model_loaded, "the failure comes before the model loads");
+    }
+
+    #[test]
+    fn cache_generation_fails_with_count_and_reason_when_the_store_skipped_a_write() {
+        use crate::free_space::DriveRunningOut;
+        use crate::semantic::store::SkipReason;
+        use crate::semantic::store::test_support::temporary_store_on;
+        let candidates = one_passage_corpus();
+        let clock = Arc::new(crate::clock::TestClock::default());
+        let path = temporary_store_path();
+        drop(temporary_store_at(path.clone(), clock.clone()).open());
+        // The drive has room at the check before embedding and is low on
+        // space at the write.
+        let drive = Arc::new(DriveRunningOut::after(1, || {}));
+        let mut state = crate::semantic::index::SemanticIndexState::with_store(
+            ChunkConfig::default(),
+            temporary_store_on(path.clone(), clock.clone(), drive),
+            clock.clone(),
+        );
+
+        let generated = embed_into_store(&prewarm_request(&candidates), &mut state, || {
+            Ok(FakeEmbedder::new(None))
+        });
+
+        assert!(
+            matches!(
+                generated,
+                Err(AppError::PassagesNotStored { count: 1, reason })
+                    if reason == SkipReason::LowSpace.sentence()
+            ),
+            "cache generation reports the one passage not stored and the reason"
+        );
+        assert_eq!(
+            stored_passage_count(&temporary_store_at(path, clock)),
+            0,
+            "the skipped passage is not in the store"
+        );
     }
 
     #[test]

@@ -175,6 +175,16 @@ pub enum AppError {
     #[error("{}", refill_low_space_message(*.free_bytes, *.needed_bytes))]
     SessionCacheRefillLowSpace { free_bytes: u64, needed_bytes: u64 },
 
+    /// The passage store, named by its path, did not open:
+    /// `--generate-semantic-cache` stopped before it embedded anything.
+    #[error("the semantic cache's embeddings file could not be opened: {0}")]
+    PassageStoreNotOpened(String),
+
+    /// `--generate-semantic-cache` embedded `count` passages the passage
+    /// store did not store.
+    #[error("{count} embedded passage(s) were not stored: {reason}")]
+    PassagesNotStored { count: usize, reason: &'static str },
+
     /// The session cache's low-space deletion refused a new connection of
     /// this rearview.
     #[error("The session cache is being deleted")]

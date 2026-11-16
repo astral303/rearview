@@ -16,7 +16,6 @@ pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 8;
 /// example machines).
 pub const DEFAULT_INTERACTIVE_EMBEDDING_SECONDS: u64 = 2;
 pub const MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS: usize = 32;
-pub const CACHE_SCHEMA_VERSION: u32 = 7;
 pub const MODEL_NAME: &str = "BGESmallENV15";
 pub const MODEL_DIMENSIONS: usize = 384;
 

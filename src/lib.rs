@@ -570,7 +570,7 @@ fn run_with(
             query,
             &conversations,
             local_workspace(&environment)?.as_ref(),
-            clock.as_ref(),
+            clock,
         );
     }
 
@@ -1205,7 +1205,7 @@ mod agent_command_tests {
         );
         let semantic_cache = cache_file::test_support::test_cache_directory().join("semantic");
         std::fs::create_dir_all(&semantic_cache).unwrap();
-        std::fs::write(semantic_cache.join("embeddings-v1.bin"), "").unwrap();
+        std::fs::write(semantic_cache.join("embeddings-v2.sqlite3"), "").unwrap();
         let claude_folder = history::provider::RootEnvironment::of_process()
             .home()
             .unwrap()
@@ -1237,8 +1237,8 @@ mod agent_command_tests {
             );
         }
         assert!(
-            !semantic_cache.join("embeddings-v1.bin").exists(),
-            "--clear-semantic-cache deletes the embedding cache"
+            !semantic_cache.join("embeddings-v2.sqlite3").exists(),
+            "--clear-semantic-cache deletes the passage store"
         );
     }
 

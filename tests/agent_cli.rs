@@ -1599,10 +1599,10 @@ fn agent_filesystem_failures_use_io_envelope() {
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("protocol agent-error kind=io"));
 }
 
-/// The embedding cache sits under `REARVIEW_CACHE_DIR` with the session
-/// caches; the model sits in the Hugging Face cache `HF_HUB_CACHE` names.
+/// The passage store sits under `REARVIEW_CACHE_DIR` with the session
+/// cache; the model sits in the Hugging Face cache `HF_HUB_CACHE` names.
 #[test]
-fn debug_semantic_search_shows_embedding_cache_and_hugging_face_cache() {
+fn debug_semantic_search_prints_embedding_cache_and_model_cache_paths() {
     let config = tempfile::tempdir().expect("config");
     write_transcript(
         &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
@@ -1611,7 +1611,7 @@ fn debug_semantic_search_shows_embedding_cache_and_hugging_face_cache() {
 
     // The transcript gives the load a history. `--local` from a directory
     // where no session ran selects nothing, so the command prints both cache
-    // paths and stops before reading the embedding cache or loading the model.
+    // paths and stops before reading the passage store or loading the model.
     let output = rearview_with_semantic_caches_in(config.path())
         .args(["--local", "--debug-semantic-search", "needle"])
         .output()
@@ -1624,7 +1624,7 @@ fn debug_semantic_search_shows_embedding_cache_and_hugging_face_cache() {
         &format!(
             "embedding cache: {}",
             semantic_cache_folder(config.path())
-                .join("embeddings-v1.bin")
+                .join("embeddings-v2.sqlite3")
                 .display()
         ),
     );
@@ -1694,10 +1694,10 @@ fn clear_semantic_cache_reports_space_freed_and_model_kept() {
     let config = tempfile::tempdir().expect("config");
     std::fs::create_dir_all(semantic_cache_folder(config.path())).expect("create semantic cache");
     std::fs::write(
-        semantic_cache_folder(config.path()).join("embeddings-v1.bin"),
+        semantic_cache_folder(config.path()).join("embeddings-v2.sqlite3"),
         vec![0; 1_600_000],
     )
-    .expect("write embedding cache");
+    .expect("write the passage store");
     let model = place_semantic_model(&hugging_face_cache(config.path()), 600_000);
 
     let stderr = clear_semantic_cache_in(config.path());

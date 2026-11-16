@@ -54,6 +54,9 @@
   `--debug-semantic-search` about 1.5x.
   - In the TUI, a repeated semantic query takes about 1.8x as long and the
     prewarm about 1.3x as long. The first query takes about as long as before.
+- Write about 27x less to disk in a semantic search that embeds passages (on
+  one example corpus). It now writes the passages it embedded. Before, it
+  wrote every stored embedding again.
 - Show that a slow agent command is still running: after 2 seconds, and every
   5 seconds until its result, it writes a `protocol agent-progress` record to
   stderr naming its stage, such as `stage=refresh done=120 total=860`.
@@ -94,6 +97,9 @@
 - Add `--perf-stats` to every agent command, such as
   `agent read <ref> --perf-stats`. It reports on stderr each stage's time, what
   each agent's load read, each transcript parsed, and the peak memory.
+  - For a semantic search, a `perf semantic-store` line counts the passages
+    whose embeddings were read, written and skipped, with the reason for the
+    skipped ones.
 
 ### Fixes
 
@@ -154,6 +160,18 @@
     match at or below the top row, where it used to keep the match's number.
   - During a display key's render, message copy (`y`) and export (`e`) run at
     once; during a refresh's, they wait for the new rows.
+- Fix semantic search deleting stored embeddings once 50,000 passages were
+  stored. Stored embeddings no longer have a limit.
+  - `--generate-semantic-cache` no longer fails on a history of more than
+    50,000 distinct passages.
+  - A semantic `agent within` of a large session now adds passages to the
+    session's semantic index on every call. Before, it deleted as many
+    embeddings as it added.
+- Fix two semantic searches running at the same time losing the embeddings
+  one of them computed. Each now keeps the passages it embedded.
+- Fix `--generate-semantic-cache` reporting success when it could not store
+  the embeddings it computed. It now fails and reports how many passages were
+  not stored.
 
 #### `rearview agent` commands
 
@@ -186,6 +204,11 @@
   corpus).
 - The session cache takes about 1.3x the disk space it did (on one example
   corpus).
+- The first semantic search after upgrading imports the embeddings earlier
+  versions stored. It takes about 2x as long as a later one, once (on one
+  example corpus; about 5x with 50,000 embeddings stored).
+- rearview deletes the embedding of a passage that a semantic search has not
+  read for 180 days. A later search computes it again.
 - rearview stops when it can't find a directory for the session cache, naming
   `REARVIEW_CACHE_DIR`. Before, it read sessions without caching them. Agent
   commands report the same in a `protocol agent-error` record. `update`,
