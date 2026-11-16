@@ -5,7 +5,7 @@ use crate::semantic::filter::SEMANTIC_TURN_VERSION;
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 40;
+pub(super) const SCHEMA_VERSION: u32 = 41;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The `meta` key holding the [`SEMANTIC_TURN_VERSION`] of the stored
 /// `semantic_turns`. A database holding another is emptied and rebuilt, as
@@ -23,8 +23,12 @@ pub(super) fn layout_versions() -> [(&'static str, String); 2] {
 
 /// Tables an earlier version held, dropped before [`TABLES`] when the schema
 /// changes.
-pub(super) const RETIRED_TABLES: &[&str] =
-    &["message_times", "search_texts", "subagent_search_parts"];
+pub(super) const RETIRED_TABLES: &[&str] = &[
+    "message_times",
+    "search_texts",
+    "subagent_search_parts",
+    "semantic_routes",
+];
 
 /// Every table, dropped in this order when the schema changes.
 pub(super) const TABLES: &[&str] = &[
@@ -37,7 +41,6 @@ pub(super) const TABLES: &[&str] = &[
     "threads",
     "transcripts",
     "parse_errors",
-    "semantic_routes",
     "session_checkpoints",
     "transcript_reads",
     "session_files",
@@ -184,20 +187,6 @@ CREATE TABLE IF NOT EXISTS session_checkpoints (
     sequence INTEGER NOT NULL,
     checkpoint BLOB NOT NULL,
     ledger BLOB NOT NULL
-);
-
--- The agent's semantic route text of the session's copy `generation`,
--- computed from its texts and the row's `custom_title` and `summary` by
--- the route algorithm `version` (`SEMANTIC_ROUTE_VERSION`). A semantic
--- search or semantic cache generation stores it; a read uses it only while
--- all four are still these.
-CREATE TABLE IF NOT EXISTS semantic_routes (
-    session INTEGER PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
-    version INTEGER NOT NULL,
-    generation INTEGER NOT NULL,
-    custom_title TEXT,
-    summary TEXT,
-    text TEXT NOT NULL
 );
 
 -- The session row's parse errors.
@@ -479,8 +468,8 @@ mod tests {
     /// with. A change to either fails `schema_text_matches_its_version`
     /// until both are set again.
     const PINNED_SCHEMA: (u32, &str) = (
-        40,
-        "9be873efe760a4495d3823c44ab1c45f19321d7afe9fd7c4969ebff95935703f",
+        41,
+        "d4cb26e632a6673f369a63dedf831c520c59e9e644c16f86e8918e32a05b6af8",
     );
 
     /// [`CREATE`] without its `--` comments and with its whitespace

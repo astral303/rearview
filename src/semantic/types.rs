@@ -159,27 +159,13 @@ impl Default for ChunkConfig {
 pub enum ChunkHits {
     #[default]
     None,
-    /// Every evidence chunk of the first `n` ranked conversations with
-    /// evidence. An agent route ranks its conversation but is not evidence.
+    /// Every chunk of the first `n` ranked conversations.
     TopConversations(usize),
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum SemanticChunkSource {
-    #[default]
-    VisibleDialogue,
-    AgentRoute,
-    AgentTool,
-    AgentThinking,
-    AgentSubagentDialogue,
-    AgentSubagentTool,
-    AgentSubagentThinking,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticChunk {
     pub conversation_index: usize,
-    pub source: SemanticChunkSource,
     pub session: String,
     pub chunk_index: usize,
     pub text: String,
@@ -189,7 +175,6 @@ pub struct SemanticChunk {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EmbeddedChunk {
     pub conversation_index: usize,
-    pub source: SemanticChunkSource,
     pub session: String,
     pub chunk_index: usize,
     pub text: String,
@@ -257,7 +242,6 @@ pub enum SemanticRationaleKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticChunkIdentity {
     pub conversation_index: usize,
-    pub source: SemanticChunkSource,
     pub session: String,
     pub chunk_index: usize,
     pub message_range: MessageRange,

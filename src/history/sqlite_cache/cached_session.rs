@@ -263,41 +263,12 @@ impl HeldCopy<'_> {
         super::search_parts::visit_search_parts(self.connection, self.session, visit)
     }
 
-    /// [`Self::stored_search_parts`]'s search texts alone.
-    pub(crate) fn stored_agent_search_texts(
-        &self,
-        mut visit: impl FnMut(super::SearchPart),
-    ) -> Result<()> {
-        super::search_parts::visit_agent_search_texts(self.connection, self.session, &mut visit)
-    }
-
     /// [`Self::stored_search_parts`]'s semantic turns alone.
     pub(crate) fn stored_semantic_turns(
         &self,
         mut visit: impl FnMut(super::SearchPart),
     ) -> Result<()> {
         super::search_parts::visit_semantic_turns(self.connection, self.session, &mut visit)
-    }
-
-    /// The agent's semantic route text stored for this copy with
-    /// `custom_title` and `summary`; `None` when none is.
-    pub(crate) fn stored_semantic_route(
-        &self,
-        custom_title: Option<&str>,
-        summary: Option<&str>,
-    ) -> Result<Option<String>> {
-        super::semantic_routes::stored_route(
-            self.connection,
-            self.session,
-            self.generation,
-            custom_title,
-            summary,
-        )
-    }
-
-    /// The key a route text computed from this copy's texts is stored under.
-    pub(crate) fn semantic_route_key(&self) -> super::RouteKey {
-        super::RouteKey::new(self.session, self.generation)
     }
 
     fn message_count(&self) -> Result<usize> {

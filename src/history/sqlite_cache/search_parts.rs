@@ -37,7 +37,7 @@ pub(super) fn visit_search_parts(
 }
 
 /// [`visit_search_parts`]'s search texts, without the semantic turns.
-pub(super) fn visit_agent_search_texts(
+fn visit_agent_search_texts(
     connection: &rusqlite::Connection,
     session: i64,
     visit: &mut impl FnMut(SearchPart),
@@ -131,10 +131,6 @@ impl SemanticTurns {
                 self.ranges.push(MessageRange::single(ordinal));
             }
         }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.texts.is_empty()
     }
 
     /// The turns' texts and message ranges, in order.

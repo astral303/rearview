@@ -1,6 +1,6 @@
 use crate::agent::refs::MessageRange;
 use crate::history::Conversation;
-use crate::semantic::types::{ChunkConfig, SemanticChunk, SemanticChunkSource};
+use crate::semantic::types::{ChunkConfig, SemanticChunk};
 
 pub fn build_chunks(conversations: &[&Conversation], config: ChunkConfig) -> Vec<SemanticChunk> {
     build_chunks_with_indices(conversations.iter().copied().enumerate(), config)
@@ -10,20 +10,8 @@ pub fn build_chunks_with_indices<'a, I>(conversations: I, config: ChunkConfig) -
 where
     I: IntoIterator<Item = (usize, &'a Conversation)>,
 {
-    build_chunks_with_sources(
-        conversations.into_iter().map(|(index, conversation)| {
-            (index, SemanticChunkSource::VisibleDialogue, conversation)
-        }),
-        config,
-    )
-}
-
-pub fn build_chunks_with_sources<'a, I>(conversations: I, config: ChunkConfig) -> Vec<SemanticChunk>
-where
-    I: IntoIterator<Item = (usize, SemanticChunkSource, &'a Conversation)>,
-{
     let mut chunks = Vec::new();
-    for (conversation_index, source, conversation) in conversations {
+    for (conversation_index, conversation) in conversations {
         #[cfg(test)]
         chunked_conversations::record(&conversation.path);
         let semantic_turns = conversation
@@ -36,20 +24,12 @@ where
             })
             .collect::<Vec<_>>();
 
-        let grouped = if matches!(
-            source,
-            SemanticChunkSource::AgentTool | SemanticChunkSource::AgentSubagentTool
-        ) {
-            independent_turns(&semantic_turns, config)
-        } else {
-            group_turns(&semantic_turns, config)
-        };
+        let grouped = group_turns(&semantic_turns, config);
         let session = conversation.session_id.clone();
         for (chunk_index, chunk) in grouped.into_iter().enumerate() {
             push_chunk(
                 &mut chunks,
                 conversation_index,
-                source,
                 &session,
                 chunk_index,
                 &chunk,
@@ -59,7 +39,7 @@ where
     chunks
 }
 
-/// Every conversation [`build_chunks_with_sources`] built chunks of in this
+/// Every conversation [`build_chunks_with_indices`] built chunks of in this
 /// test process, by path, on any thread. Building chunks doesn't leave a
 /// trace outside its result: only this record shows `has_chunks` answering
 /// without building them.
@@ -88,7 +68,7 @@ pub(crate) mod chunked_conversations {
     }
 }
 
-/// True when [`build_chunks_with_sources`] builds at least one chunk of
+/// True when [`build_chunks_with_indices`] builds at least one chunk of
 /// `conversation`: one of its semantic turns with a message range holds text
 /// other than whitespace.
 pub fn builds_any_chunk(conversation: &Conversation) -> bool {
@@ -108,30 +88,6 @@ struct SemanticTurn<'a> {
 struct ChunkText {
     text: String,
     message_range: MessageRange,
-}
-
-fn independent_turns(turns: &[SemanticTurn<'_>], config: ChunkConfig) -> Vec<ChunkText> {
-    let mut chunks = Vec::new();
-    for turn in turns {
-        let text = turn.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        if text.len() <= config.target_chars {
-            chunks.push(ChunkText {
-                text: text.to_string(),
-                message_range: turn.range,
-            });
-        } else {
-            let config = ChunkConfig {
-                overlap_chars: 0,
-                context_turns: 0,
-                ..config
-            };
-            split_long_text(text, turn.range, &mut chunks, config);
-        }
-    }
-    chunks
 }
 
 fn group_turns(turns: &[SemanticTurn<'_>], config: ChunkConfig) -> Vec<ChunkText> {
@@ -228,7 +184,6 @@ fn union_range(current: Option<MessageRange>, next: MessageRange) -> MessageRang
 fn push_chunk(
     chunks: &mut Vec<SemanticChunk>,
     conversation_index: usize,
-    source: SemanticChunkSource,
     session: &str,
     chunk_index: usize,
     chunk: &ChunkText,
@@ -237,7 +192,6 @@ fn push_chunk(
     if !text.is_empty() {
         chunks.push(SemanticChunk {
             conversation_index,
-            source,
             session: session.to_owned(),
             chunk_index,
             text,

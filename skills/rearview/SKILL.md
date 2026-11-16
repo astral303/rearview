@@ -35,6 +35,9 @@ rearview agent search "deployment rollback decision" --mode hybrid --top 5
 rearview agent search "why the cache invalidation approach changed" --mode semantic --top 5
 ```
 
+Semantic mode ranks user and assistant messages; for tool calls, tool
+results, thinking or sub-agent text use hybrid or lexical.
+
 Use lexical or exact search for identifiers, filenames, commands, errors, and
 stack traces:
 
@@ -162,7 +165,9 @@ Successful output can contain `protocol agent-warning` records. Treat
 `malformed-transcript`, `io`, `skipped`, `ignored`, `partial-index`, and
 `stale-cache` as partial coverage. Warnings of one kind for several refs
 print as one `kind=` `count=` record; a budget never cuts them. A
-`semantic-unavailable` warning on hybrid output means lexical fallback.
+`semantic-unavailable` warning on hybrid output means lexical fallback; a
+semantic `agent within` of a session without a copy in the session cache
+fails with that kind, so retry with `--mode lexical`.
 Mention reduced coverage when it matters.
 
 Agent defaults can come from `[agent]`: scope, mode, output budget, result depth,

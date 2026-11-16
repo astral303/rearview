@@ -28,6 +28,8 @@ pub mod sanitize;
 pub mod search;
 #[cfg(test)]
 mod search_text_coverage;
+#[cfg(test)]
+mod semantic_symmetry_coverage;
 pub mod service;
 pub mod sessions;
 #[cfg(test)]

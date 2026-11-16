@@ -44,18 +44,14 @@ fn natural_key_of(table: &str, id: &str) -> Option<String> {
 /// sort by it first.
 pub(super) const NATURAL_KEY_COLUMN: &str = "natural_key";
 
-/// The tables whose rows sessions share or a semantic search writes, each
-/// with the reason. [`stored_rows`] doesn't read them.
-const SHARED_OR_SEARCH_WRITTEN_TABLES: &[(&str, &str)] = &[
+/// The tables whose rows sessions share, each with the reason.
+/// [`stored_rows`] doesn't read them.
+const SHARED_TABLES: &[(&str, &str)] = &[
     (
         "meta",
         "every session shares the database's versions and counters",
     ),
     ("roots", "every session under a root shares its row"),
-    (
-        "semantic_routes",
-        "a semantic search stores its row, not a write of the session",
-    ),
 ];
 
 /// The columns two writes of one session store differently, each with the
@@ -97,7 +93,7 @@ impl StoredTable {
 }
 
 /// The rows of the session row `session` in each table but
-/// [`SHARED_OR_SEARCH_WRITTEN_TABLES`]. Panics when one of the rows
+/// [`SHARED_TABLES`]. Panics when one of the rows
 /// references a row of another session.
 pub(super) fn stored_rows(connection: &Connection, session: i64) -> Vec<StoredTable> {
     session_tables()
@@ -105,7 +101,7 @@ pub(super) fn stored_rows(connection: &Connection, session: i64) -> Vec<StoredTa
         .collect()
 }
 
-/// Each table but [`SHARED_OR_SEARCH_WRITTEN_TABLES`], with the columns of
+/// Each table but [`SHARED_TABLES`], with the columns of
 /// it [`stored_rows`] compares, read from the schema `connection` holds.
 pub(super) fn compared_columns(connection: &Connection) -> Vec<(&'static str, Vec<String>)> {
     session_tables()
@@ -146,11 +142,10 @@ pub(super) fn assert_same_lines(actual: &[String], expected: &[String], claim: &
 }
 
 fn session_tables() -> impl Iterator<Item = &'static str> {
-    schema::TABLES.iter().copied().filter(|table| {
-        !SHARED_OR_SEARCH_WRITTEN_TABLES
-            .iter()
-            .any(|(name, _)| name == table)
-    })
+    schema::TABLES
+        .iter()
+        .copied()
+        .filter(|table| !SHARED_TABLES.iter().any(|(name, _)| name == table))
 }
 
 /// A column of a table, as `pragma_table_info` reports it.
@@ -164,9 +159,8 @@ fn stored_table(connection: &Connection, table: &'static str, session: i64) -> S
     let owner = session_expression(connection, table, "t").unwrap_or_else(|| {
         panic!(
             "stored_rows reads a session's rows of {table}: {table} has a session column or \
-             references a row of a table with one, or SHARED_OR_SEARCH_WRITTEN_TABLES in \
-             stored_rows.rs lists it when sessions share its rows or a semantic search writes \
-             them"
+             references a row of a table with one, or SHARED_TABLES in stored_rows.rs lists it \
+             when sessions share its rows"
         )
     });
     assert_references_stay_in_session(connection, table, &owner, &references, session);

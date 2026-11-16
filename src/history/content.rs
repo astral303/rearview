@@ -4,9 +4,10 @@ use super::Conversation;
 use super::MessageTimes;
 use super::message_texts::{MessageTextBuilder, push_separated};
 use super::sqlite_cache::{
-    self, CachedSession, CopyRead, HeldCopy, Publication, RouteKey, ScannedCopy, ScannedTurns,
-    SearchField, SearchPart, SemanticRoute, SemanticTurns,
+    self, CachedSession, CopyRead, HeldCopy, Publication, ScannedCopy, ScannedTurns, SearchField,
+    SearchPart, SemanticTurns,
 };
+use crate::agent::refs::MessageRange;
 use crate::error::Result;
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -33,57 +34,20 @@ impl Conversation {
 
     /// This row with the semantic turns of the copy the cache holds at its
     /// address now, whichever generation it is, as
-    /// [`Self::load_held_content`] reads it, and the agent route's text
-    /// (see [`Self::semantic_route_text`]); the search texts stay empty.
-    /// The route is the one stored with the copy for the row's title and
-    /// summary, otherwise computed from the copy's texts and returned to
-    /// store.
-    pub(crate) fn load_semantic_content(&self) -> CopyRead<SemanticContent<'_>> {
+    /// [`Self::load_held_content`] reads it; the search texts stay empty.
+    pub(crate) fn load_semantic_content(&self) -> CopyRead<HeldContent<'_>> {
         let Some(cached) = &self.cached_session else {
-            return Ok(SemanticContent {
-                route_text: (!self.semantic_turns.is_empty()).then(|| self.semantic_route_text()),
-                held: HeldContent {
-                    row: Cow::Borrowed(self),
-                    generation: None,
-                },
-                computed_route: None,
+            return Ok(HeldContent {
+                row: Cow::Borrowed(self),
+                generation: None,
             });
         };
-        let (title, summary) = (self.custom_title.as_deref(), self.summary.as_deref());
-        let read = self.read_held_parts(cached, |held, parts| {
-            held.stored_semantic_turns(|part| parts.push(part))?;
-            if parts.semantic.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(match held.stored_semantic_route(title, summary)? {
-                Some(text) => RouteRead::Stored(text),
-                None => {
-                    held.stored_agent_search_texts(|part| parts.push(part))?;
-                    RouteRead::Unstored(held.semantic_route_key())
-                }
-            }))
+        let held = self.read_held_parts(cached, |held, parts| {
+            held.stored_semantic_turns(|part| parts.push(part))
         })?;
-        let HeldParts {
-            mut row,
-            generation,
-            result: route,
-        } = read;
-        let (route_text, computed_route) = match route {
-            None => (None, None),
-            Some(RouteRead::Stored(text)) => (Some(text), None),
-            Some(RouteRead::Unstored(key)) => {
-                let text = row.semantic_route_text();
-                (Some(text.clone()), Some(key.route(title, summary, text)))
-            }
-        };
-        row.clear_search_texts();
-        Ok(SemanticContent {
-            held: HeldContent {
-                row: Cow::Owned(row),
-                generation: Some(generation),
-            },
-            route_text,
-            computed_route,
+        Ok(HeldContent {
+            row: Cow::Owned(held.row),
+            generation: Some(held.generation),
         })
     }
 
@@ -121,7 +85,7 @@ impl Conversation {
     ///   all.
     pub(crate) fn load_held_semantic_turns_of(
         rows: &[(&Conversation, &CachedSession)],
-    ) -> Result<Vec<CopyRead<HeldParts<()>>>> {
+    ) -> Result<Vec<CopyRead<HeldParts>>> {
         let copies = rows.iter().map(|&(_, cached)| cached).collect::<Vec<_>>();
         let scanned =
             sqlite_cache::scan_semantic_turns(&copies, Self::semantic_turns_read_alone(rows))?;
@@ -132,7 +96,7 @@ impl Conversation {
     /// the row at a position of `rows`, as the semantic scan reads it alone.
     pub(in crate::history) fn semantic_turns_read_alone<'r>(
         rows: &'r [(&Conversation, &CachedSession)],
-    ) -> impl Fn(usize, &HeldCopy<'_>) -> Result<PartsRead<()>> + 'r {
+    ) -> impl Fn(usize, &HeldCopy<'_>) -> Result<PartsRead> + 'r {
         move |position: usize, held: &HeldCopy<'_>| {
             let (_, cached) = rows[position];
             PartsRead::of(cached, held, |held, parts| {
@@ -145,8 +109,8 @@ impl Conversation {
     /// row, in order.
     pub(in crate::history) fn with_scanned_turns_of(
         rows: &[(&Conversation, &CachedSession)],
-        scanned: Vec<ScannedTurns<PartsRead<()>>>,
-    ) -> Vec<CopyRead<HeldParts<()>>> {
+        scanned: Vec<ScannedTurns<PartsRead>>,
+    ) -> Vec<CopyRead<HeldParts>> {
         rows.par_iter()
             .zip(scanned)
             .map(|(&(row, cached), scanned)| {
@@ -163,30 +127,29 @@ impl Conversation {
     /// This row with the parts `read_parts` reads of `cached`'s copy the
     /// cache holds now. Messages are counted and timed as that copy holds
     /// them when it replaced the row's.
-    fn read_held_parts<T>(
+    fn read_held_parts(
         &self,
         cached: &CachedSession,
-        read_parts: impl FnOnce(&HeldCopy<'_>, &mut ContentBuilder) -> Result<T>,
-    ) -> CopyRead<HeldParts<T>> {
+        read_parts: impl FnOnce(&HeldCopy<'_>, &mut ContentBuilder) -> Result<()>,
+    ) -> CopyRead<HeldParts> {
         let copy = cached.clone().waiting();
         let read = copy.read_copy(|held| PartsRead::of(cached, held, read_parts))?;
         Ok(self.with_parts_read(read))
     }
 
     /// This row with `read`'s parts.
-    fn with_parts_read<T>(&self, read: PartsRead<T>) -> HeldParts<T> {
+    fn with_parts_read(&self, read: PartsRead) -> HeldParts {
         let PartsRead {
             parts,
-            result,
             times,
             generation,
         } = read;
-        self.with_parts(parts, generation, times).holding(result)
+        self.with_parts(parts, generation, times)
     }
 
     /// This row with `turns`, scanned from the row's own copy, of
     /// `generation`.
-    fn with_scanned_turns(&self, turns: SemanticTurns, generation: i64) -> HeldParts<()> {
+    fn with_scanned_turns(&self, turns: SemanticTurns, generation: i64) -> HeldParts {
         self.with_parts(
             ContentBuilder::of_semantic_turns(turns),
             generation,
@@ -196,48 +159,37 @@ impl Conversation {
 
     /// This row with `parts`, read of the copy of `generation`, counted and
     /// timed as `times` gives.
-    fn with_parts(
-        &self,
-        parts: ContentBuilder,
-        generation: i64,
-        times: HeldTimes,
-    ) -> HeldParts<()> {
+    fn with_parts(&self, parts: ContentBuilder, generation: i64, times: HeldTimes) -> HeldParts {
         let mut row = self.clone();
         if let HeldTimes::OfTheCopy(message_count, message_times) = times {
             row.message_count = message_count;
             row.message_times = message_times;
         }
         parts.finish(&mut row);
-        HeldParts {
-            row,
-            generation,
-            result: (),
-        }
+        HeldParts { row, generation }
     }
 }
 
 /// The parts read of the copy the cache holds for a row, before they are
 /// written into the row.
-pub(in crate::history) struct PartsRead<T> {
+pub(in crate::history) struct PartsRead {
     parts: ContentBuilder,
-    /// The result of the read's `read_parts`.
-    result: T,
     times: HeldTimes,
     /// The generation of the copy read.
     generation: i64,
 }
 
-impl<T> PartsRead<T> {
+impl PartsRead {
     /// The parts `read_parts` reads of `held`, the copy the cache holds for
     /// the row of `cached`'s copy. Messages are counted and timed as `held`
     /// holds them when it replaced the row's copy.
     fn of(
         cached: &CachedSession,
         held: &HeldCopy<'_>,
-        read_parts: impl FnOnce(&HeldCopy<'_>, &mut ContentBuilder) -> Result<T>,
+        read_parts: impl FnOnce(&HeldCopy<'_>, &mut ContentBuilder) -> Result<()>,
     ) -> Result<Self> {
         let mut parts = ContentBuilder::default();
-        let result = read_parts(held, &mut parts)?;
+        read_parts(held, &mut parts)?;
         let times = if held.generation() == cached.generation() {
             HeldTimes::OfTheRow
         } else {
@@ -246,7 +198,6 @@ impl<T> PartsRead<T> {
         };
         Ok(Self {
             parts,
-            result,
             times,
             generation: held.generation(),
         })
@@ -262,25 +213,40 @@ enum HeldTimes {
 }
 
 /// A row with the parts read of the copy the cache holds.
-pub(crate) struct HeldParts<T> {
+pub(crate) struct HeldParts {
     pub(crate) row: Conversation,
     /// The generation of the copy read.
     pub(crate) generation: i64,
-    /// The result of the read's `read_parts`.
-    result: T,
 }
 
-impl HeldParts<()> {
-    fn holding<T>(self, result: T) -> HeldParts<T> {
-        HeldParts {
-            row: self.row,
-            generation: self.generation,
-            result,
-        }
+/// A copy's semantic turns, for a reader that holds the session's address
+/// and not its row, with the copy's messages counted and timed.
+pub(crate) struct HeldSemanticTurns {
+    pub(crate) turns: Vec<String>,
+    pub(crate) ranges: Vec<MessageRange>,
+    pub(crate) message_count: usize,
+    pub(crate) message_times: MessageTimes,
+}
+
+impl HeldSemanticTurns {
+    /// The semantic turns of `held`, laid out as
+    /// [`Conversation::load_semantic_content`] lays out a row's.
+    pub(crate) fn read(held: &HeldCopy<'_>) -> Result<Self> {
+        let mut turns = SemanticTurns::default();
+        held.stored_semantic_turns(|part| push_semantic_turn(&mut turns, part))?;
+        let (message_count, message_times) = held.message_times()?;
+        let (turns, ranges) = turns.into_parts();
+        Ok(Self {
+            turns,
+            ranges,
+            message_count,
+            message_times,
+        })
     }
 }
 
-/// A row's content, read by [`Conversation::load_held_content`].
+/// A row's content, read by [`Conversation::load_held_content`], or its
+/// semantic turns alone, read by [`Conversation::load_semantic_content`].
 pub(crate) struct HeldContent<'r> {
     pub(crate) row: Cow<'r, Conversation>,
     /// The generation of the copy the content was read from; `None` for a
@@ -288,22 +254,12 @@ pub(crate) struct HeldContent<'r> {
     pub(crate) generation: Option<i64>,
 }
 
-/// A row's semantic content, read by [`Conversation::load_semantic_content`].
-pub(crate) struct SemanticContent<'r> {
-    pub(crate) held: HeldContent<'r>,
-    /// The agent route's text; `None` when the copy doesn't have semantic
-    /// turns, because then it doesn't have a route.
-    pub(crate) route_text: Option<String>,
-    /// The route text computed from the copy's texts, to store with it;
-    /// `None` when it was read as stored, or the row doesn't have a copy.
-    pub(crate) computed_route: Option<SemanticRoute>,
-}
-
-/// The route text a copy's read found.
-enum RouteRead {
-    Stored(String),
-    /// Not stored: computed from the texts read, to store under this key.
-    Unstored(RouteKey),
+/// Joins `part`, a stored semantic turn, to its message's turn in `turns`.
+fn push_semantic_turn(turns: &mut SemanticTurns, part: SearchPart) {
+    turns.push(
+        part.ordinal.expect("a semantic turn has a message"),
+        part.text,
+    );
 }
 
 #[derive(Default)]
@@ -329,10 +285,7 @@ impl ContentBuilder {
             SearchField::Agent => self.agent.push(part.ordinal, part.text),
             SearchField::Thinking => self.thinking.push(part.ordinal, part.text),
             SearchField::Supplement => self.supplement.push(part.text),
-            SearchField::Semantic => self.semantic.push(
-                part.ordinal.expect("a semantic turn has a message"),
-                part.text,
-            ),
+            SearchField::Semantic => push_semantic_turn(&mut self.semantic, part),
         }
     }
 

@@ -1732,11 +1732,10 @@ impl AgentService {
                         perf.time(Stage::Semantic, || {
                             run_agent_semantic_hits(
                                 self,
-                                &args.query,
+                                SemanticEngine::of_command(self.clock().clone()),
+                                &request,
                                 &inputs,
                                 embedding_budget,
-                                request.semantic_chunk_hits(),
-                                request.window,
                             )
                         })
                     },
@@ -1909,25 +1908,23 @@ impl AgentService {
                 ),
                 SearchMode::Semantic => {
                     let (output, semantic_warnings) = run_agent_within_semantic(
+                        self,
+                        SemanticEngine::of_command(self.clock().clone()),
                         &request,
                         &conversation,
                         &resolved,
                         &transcript,
-                        SemanticToolContent::All,
-                        self.clock().clone(),
-                        &self.perf,
                     )?;
                     warnings.extend(semantic_warnings);
                     output
                 }
                 SearchMode::Hybrid => match run_agent_within_semantic(
+                    self,
+                    SemanticEngine::of_command(self.clock().clone()),
                     &request,
                     &conversation,
                     &resolved,
                     &transcript,
-                    SemanticToolContent::MatchingQuery(&request.query),
-                    self.clock().clone(),
-                    &self.perf,
                 ) {
                     Ok((output, semantic_warnings)) => {
                         warnings.extend(semantic_warnings);
@@ -2904,7 +2901,7 @@ fn warnings_for_skipped_transcripts(
 
 /// The row of `transcript`, dated by its file's modification time, or by
 /// `clock`'s current time when the file cannot be inspected.
-fn conversation_from_agent_transcript(
+pub(crate) fn conversation_from_agent_transcript(
     transcript: &agent::transcript::AgentTranscript,
     key: &agent::refs::AgentConversationKey,
     clock: &dyn Clock,
@@ -3112,11 +3109,10 @@ fn run_agent_semantic_search(
     let inputs = agent_inputs_for_indices(conversations, keys, indices)?;
     let (semantic, mut warnings) = run_agent_semantic_hits(
         service,
-        &request.query,
+        SemanticEngine::of_command(service.clock().clone()),
+        request,
         &inputs,
         embedding_budget,
-        request.semantic_chunk_hits(),
-        request.window,
     )?;
     let (output, failed_reads) = service.fuse_semantic_hits(
         semantic,
@@ -3130,8 +3126,8 @@ fn run_agent_semantic_search(
 }
 
 /// A semantic search's ranked hits and the copies it read them from.
-struct SemanticHalf {
-    ranked: RankedHits,
+pub(crate) struct SemanticHalf {
+    pub(crate) ranked: RankedHits,
     reads: SemanticReads,
 }
 
@@ -3355,84 +3351,50 @@ fn run_hybrid_halves<S, L>(
     Ok((semantic, lexical(pass)?))
 }
 
-/// The semantic hits of `inputs`' sessions for `query`, with the copies they
-/// were read from. Writes the session cache: stores the route texts the read
-/// computed ([`AgentService::store_semantic_routes`]) before ranking.
-fn run_agent_semantic_hits(
+/// The semantic hits of `inputs`' sessions for `request`, ranked with
+/// `engine`, with the copies they were read from.
+pub(crate) fn run_agent_semantic_hits<Embedder, Open>(
     service: &AgentService,
-    query: &str,
+    engine: SemanticEngine<Open>,
+    request: &agent::search::AgentSearchRequest,
     inputs: &[agent::search::AgentConversationInput<'_>],
     embedding_budget: EmbeddingBudget,
-    chunk_hits: ChunkHits,
-    window: TimeFilter,
-) -> Result<(SemanticHalf, Vec<AgentWarning>)> {
-    let SemanticCandidates {
-        candidates,
-        reads,
-        computed_routes,
-    } = semantic_candidates(inputs)?;
-    service.store_semantic_routes(&computed_routes)?;
-    SemanticEngine::of_command(service.clock().clone())
+) -> Result<(SemanticHalf, Vec<AgentWarning>)>
+where
+    Embedder: semantic::embed::SemanticEmbedder,
+    Open: FnOnce() -> Result<Embedder>,
+{
+    let SemanticCandidates { candidates, reads } = semantic_candidates(inputs)?;
+    engine
         .rank(
-            query,
+            &request.query,
             &candidates,
             embedding_budget,
-            chunk_hits,
-            window,
+            request.semantic_chunk_hits(),
+            request.window,
             &service.perf,
         )
         .map(|(ranked, warnings)| (SemanticHalf { ranked, reads }, warnings))
-}
-
-impl AgentService {
-    /// Stores `routes`, the route texts the semantic stage computed, when
-    /// this command can take refresh ownership without waiting. Fails when
-    /// the drive is low on space. Any other skipped or failed write leaves
-    /// the output as it is: the next semantic search computes those routes
-    /// again. `--perf-stats` reports what was stored, or why nothing was.
-    fn store_semantic_routes(&self, routes: &[history::SemanticRoute]) -> Result<()> {
-        if routes.is_empty() {
-            return Ok(());
-        }
-        let skipped = match history::store_semantic_routes(self.environment.cache_base(), routes) {
-            Ok(history::RoutesStored::Stored) => None,
-            Ok(history::RoutesStored::NotOwner) => {
-                Some(agent::perf::RoutesSkipped::AnotherRearview)
-            }
-            Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => {
-                return Err(error);
-            }
-            Err(error) => Some(agent::perf::RoutesSkipped::WriteFailed(error.to_string())),
-        };
-        self.perf.record_semantic_routes(routes.len(), skipped);
-        Ok(())
-    }
 }
 
 /// The semantic stage's candidates, and the copies it read them from.
 struct SemanticCandidates {
     candidates: Vec<semantic::index::SemanticIndexCandidate>,
     reads: SemanticReads,
-    /// The route texts computed from the copies' texts, to store with them.
-    computed_routes: Vec<history::SemanticRoute>,
 }
 
 /// The semantic candidates of `inputs`' sessions, each read from the copy
 /// the cache holds now, whichever generation it is. A missed read doesn't
-/// give any candidates. The sessions are read on the rayon pool; a failed
+/// give a candidate. The sessions are read on the rayon pool; a failed
 /// read of every session fails the read.
 fn semantic_candidates(
     inputs: &[agent::search::AgentConversationInput<'_>],
 ) -> Result<SemanticCandidates> {
     let sessions = history::sqlite_cache::unless_every_read_failed(
-        inputs
-            .par_iter()
-            .map(session_candidates)
-            .collect::<Vec<_>>(),
+        inputs.par_iter().map(session_candidate).collect::<Vec<_>>(),
     )?;
-    let mut candidates = Vec::with_capacity(inputs.len().saturating_mul(2));
+    let mut candidates = Vec::with_capacity(inputs.len());
     let mut reads = SemanticReads::default();
-    let mut computed_routes = Vec::new();
     for (input, session) in inputs.iter().zip(sessions) {
         let session = match history::sqlite_cache::found(session) {
             Ok(Some(session)) => session,
@@ -3456,37 +3418,26 @@ fn semantic_candidates(
         if let Some(row) = session.replaced_row {
             reads.replaced_rows.insert(input.original_index, row);
         }
-        computed_routes.extend(session.computed_route);
-        candidates.extend(session.candidates);
+        candidates.push(session.candidate);
     }
-    Ok(SemanticCandidates {
-        candidates,
-        reads,
-        computed_routes,
-    })
+    Ok(SemanticCandidates { candidates, reads })
 }
 
-/// One session's semantic candidates, read by [`semantic_candidates`].
-struct SessionCandidates {
-    candidates: Vec<semantic::index::SemanticIndexCandidate>,
+/// One session's semantic candidate, read by [`semantic_candidates`].
+struct SessionCandidate {
+    candidate: semantic::index::SemanticIndexCandidate,
     /// The generation of the copy read; `None` for a row without a copy.
     generation: Option<i64>,
     /// The row, its messages counted and timed as the copy read holds them,
     /// when another write replaced the row's copy.
     replaced_row: Option<history::Conversation>,
-    /// The route text computed from the copy's texts, to store with it.
-    computed_route: Option<history::SemanticRoute>,
 }
 
-/// `input`'s semantic candidates from the copy the cache holds now.
-fn session_candidates(
+/// `input`'s semantic candidate from the copy the cache holds now.
+fn session_candidate(
     input: &agent::search::AgentConversationInput<'_>,
-) -> history::sqlite_cache::CopyRead<SessionCandidates> {
-    let history::SemanticContent {
-        held,
-        route_text,
-        computed_route,
-    } = input.conversation.load_semantic_content()?;
+) -> history::sqlite_cache::CopyRead<SessionCandidate> {
+    let held = input.conversation.load_semantic_content()?;
     let conversation = held.row.as_ref();
     let row_copy = input.conversation.cached_session.as_ref();
     let replaced_row = held
@@ -3497,7 +3448,7 @@ fn session_candidates(
             message_times: conversation.message_times.clone(),
             ..input.conversation.clone()
         });
-    let mut candidates = vec![semantic::index::SemanticIndexCandidate::of_session(
+    let candidate = semantic::index::SemanticIndexCandidate::of_session(
         input.original_index,
         Arc::new(stripped_semantic_conversation(
             conversation,
@@ -3505,51 +3456,12 @@ fn session_candidates(
             conversation.semantic_turns.clone(),
             conversation.semantic_turn_ranges.clone(),
         )),
-    )];
-    if let Some(route) = route_text.and_then(|text| agent_route_of(conversation, text)) {
-        candidates.push(semantic::index::SemanticIndexCandidate {
-            index: input.original_index,
-            source: semantic::types::SemanticChunkSource::AgentRoute,
-            conversation: Arc::new(route),
-        });
-    }
-    Ok(SessionCandidates {
-        candidates,
+    );
+    Ok(SessionCandidate {
+        candidate,
         generation: held.generation,
         replaced_row,
-        computed_route,
     })
-}
-
-/// The agent route's candidate conversation of `conversation`, whose
-/// [`history::Conversation::semantic_route_text`] is `route_text`.
-pub(crate) fn agent_route_of(
-    conversation: &history::Conversation,
-    mut route_text: String,
-) -> Option<history::Conversation> {
-    if route_text.is_empty() {
-        route_text = conversation
-            .custom_title
-            .as_deref()
-            .or(conversation.summary.as_deref())?
-            .to_string();
-    }
-    let file_name = conversation
-        .path
-        .file_name()
-        .map(|name| format!("{}.agent-route-semantic", name.to_string_lossy()))?;
-    Some(stripped_semantic_conversation(
-        conversation,
-        conversation.path.with_file_name(file_name),
-        vec![route_text],
-        vec![
-            conversation
-                .semantic_turn_ranges
-                .first()
-                .copied()
-                .unwrap_or_else(|| agent::refs::MessageRange::single(1)),
-        ],
-    ))
 }
 
 fn stripped_semantic_conversation(
@@ -3705,349 +3617,35 @@ fn partial_index_warning(
     )))
 }
 
-#[cfg(test)]
-pub(crate) fn agent_semantic_candidates(
-    inputs: &[agent::search::AgentConversationInput<'_>],
-) -> (
-    Vec<semantic::index::SemanticIndexCandidate>,
-    Vec<AgentWarning>,
-) {
-    agent_semantic_candidates_with_loader(
-        inputs,
-        |path| agent::transcript::AgentTranscript::load(path),
-        SemanticToolContent::All,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn agent_semantic_candidates_matching_tools(
-    inputs: &[agent::search::AgentConversationInput<'_>],
-    query: &str,
-) -> (
-    Vec<semantic::index::SemanticIndexCandidate>,
-    Vec<AgentWarning>,
-) {
-    agent_semantic_candidates_with_loader(
-        inputs,
-        |path| agent::transcript::AgentTranscript::load(path),
-        SemanticToolContent::MatchingQuery(query),
-    )
-}
-
-#[cfg(test)]
-fn agent_semantic_candidates_with_loader<'a>(
-    inputs: &[agent::search::AgentConversationInput<'_>],
-    load_transcript: impl Fn(&Path) -> Result<agent::transcript::AgentTranscript>,
-    tool_content: SemanticToolContent<'a>,
-) -> (
-    Vec<semantic::index::SemanticIndexCandidate>,
-    Vec<AgentWarning>,
-) {
-    let mut candidates = Vec::new();
-    let mut warnings = Vec::new();
-    for input in inputs {
-        match load_transcript(&input.resolved.key.path) {
-            Ok(transcript) => {
-                if let Some(warning) =
-                    transcript_warning(&transcript, &input.resolved.reference.canonical())
-                {
-                    warnings.push(warning);
-                }
-                push_agent_semantic_candidates(
-                    &mut candidates,
-                    input,
-                    &transcript,
-                    tool_content,
-                    TimeFilter::default(),
-                )
-            }
-            Err(error) => warnings.push(AgentWarning::from_app_error(
-                &error,
-                Some(&input.resolved.reference.canonical()),
-            )),
-        }
-    }
-    (candidates, warnings)
-}
-
-#[derive(Clone, Copy)]
-enum SemanticToolContent<'a> {
-    All,
-    MatchingQuery(&'a str),
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SemanticAgentPartKind {
-    Dialogue,
-    Tool,
-    Thinking,
-}
-
-/// Push a candidate per kind of passage in `transcript`'s messages inside
-/// `window`, so a run embeds only the passages it can rank.
-fn push_agent_semantic_candidates<'a>(
-    candidates: &mut Vec<semantic::index::SemanticIndexCandidate>,
-    input: &agent::search::AgentConversationInput<'_>,
-    transcript: &agent::transcript::AgentTranscript,
-    tool_content: SemanticToolContent<'a>,
-    window: TimeFilter,
-) {
-    let messages: Vec<&agent::transcript::AgentMessage> = transcript
-        .messages
-        .iter()
-        .filter(|message| window.contains_message(agent::time_span::TimeSpan::of_message(message)))
-        .collect();
-    for (subagents, kind, source) in [
-        (
-            false,
-            SemanticAgentPartKind::Dialogue,
-            semantic::types::SemanticChunkSource::VisibleDialogue,
-        ),
-        (
-            false,
-            SemanticAgentPartKind::Tool,
-            semantic::types::SemanticChunkSource::AgentTool,
-        ),
-        (
-            false,
-            SemanticAgentPartKind::Thinking,
-            semantic::types::SemanticChunkSource::AgentThinking,
-        ),
-        (
-            true,
-            SemanticAgentPartKind::Dialogue,
-            semantic::types::SemanticChunkSource::AgentSubagentDialogue,
-        ),
-        (
-            true,
-            SemanticAgentPartKind::Tool,
-            semantic::types::SemanticChunkSource::AgentSubagentTool,
-        ),
-        (
-            true,
-            SemanticAgentPartKind::Thinking,
-            semantic::types::SemanticChunkSource::AgentSubagentThinking,
-        ),
-    ] {
-        push_agent_semantic_candidate(
-            candidates,
-            input,
-            &messages,
-            subagents,
-            kind,
-            source,
-            tool_content,
-        );
-    }
-}
-
-fn push_agent_semantic_candidate<'a>(
-    candidates: &mut Vec<semantic::index::SemanticIndexCandidate>,
-    input: &agent::search::AgentConversationInput<'_>,
-    messages: &[&agent::transcript::AgentMessage],
-    subagents: bool,
-    kind: SemanticAgentPartKind,
-    source: semantic::types::SemanticChunkSource,
-    tool_content: SemanticToolContent<'a>,
-) {
-    let Some(conversation) =
-        agent_semantic_conversation(input.conversation, messages, subagents, kind, tool_content)
-    else {
-        return;
-    };
-    candidates.push(semantic::index::SemanticIndexCandidate {
-        index: input.original_index,
-        source,
-        conversation: Arc::new(conversation),
-    });
-}
-
-fn agent_semantic_conversation<'a>(
-    conversation: &history::Conversation,
-    messages: &[&agent::transcript::AgentMessage],
-    subagents: bool,
-    kind: SemanticAgentPartKind,
-    tool_content: SemanticToolContent<'a>,
-) -> Option<history::Conversation> {
-    let mut semantic_turns = Vec::new();
-    let mut semantic_turn_ranges = Vec::new();
-    for message in messages {
-        if message.parent_tool_use_id.is_some() != subagents {
-            continue;
-        }
-        let role = match message.role {
-            agent::transcript::AgentMessageRole::User => semantic::filter::SemanticTurnRole::User,
-            agent::transcript::AgentMessageRole::Assistant => {
-                semantic::filter::SemanticTurnRole::Assistant
-            }
-        };
-        for part in &message.parts {
-            let matches_kind = matches!(
-                (kind, part),
-                (
-                    SemanticAgentPartKind::Dialogue,
-                    agent::transcript::AgentMessagePart::Text { .. }
-                ) | (
-                    SemanticAgentPartKind::Tool,
-                    agent::transcript::AgentMessagePart::ToolUse { .. }
-                        | agent::transcript::AgentMessagePart::ToolResult { .. }
-                ) | (
-                    SemanticAgentPartKind::Thinking,
-                    agent::transcript::AgentMessagePart::Thinking { .. }
-                )
-            );
-            if !matches_kind {
-                continue;
-            }
-            let texts = match (kind, part) {
-                (SemanticAgentPartKind::Tool, part) => {
-                    agent::transcript::bounded_agent_part_text(part)
-                        .map(|text| semantic_tool_texts(&text, tool_content))
-                        .unwrap_or_default()
-                }
-                _ => agent::transcript::bounded_agent_part_text(part)
-                    .into_iter()
-                    .collect(),
-            };
-            for text in texts {
-                if let Some(turn) = semantic::filter::filter_turn(role, &text) {
-                    semantic_turns.push(turn);
-                    semantic_turn_ranges.push(agent::refs::MessageRange::single(message.ordinal));
-                }
-            }
-        }
-    }
-    if semantic_turns.is_empty() {
-        return None;
-    }
-    let mut conversation = conversation.clone();
-    let scope = if subagents { "subagent" } else { "main" };
-    let content = match kind {
-        SemanticAgentPartKind::Dialogue => "dialogue",
-        SemanticAgentPartKind::Tool => "tool",
-        SemanticAgentPartKind::Thinking => "thinking",
-    };
-    let file_name = conversation.path.file_name().map(|name| {
-        format!(
-            "{}.agent-{scope}-{content}-semantic",
-            name.to_string_lossy()
-        )
-    })?;
-    conversation.path = conversation.path.with_file_name(file_name);
-    conversation.semantic_turns = semantic_turns;
-    conversation.semantic_turn_ranges = semantic_turn_ranges;
-    Some(conversation)
-}
-
-fn semantic_tool_texts(text: &str, tool_content: SemanticToolContent<'_>) -> Vec<String> {
-    let segments = stable_text_segments(text, semantic::types::DEFAULT_CHUNK_TARGET_CHARS);
-    match tool_content {
-        SemanticToolContent::All => segments,
-        SemanticToolContent::MatchingQuery(query) => {
-            let terms = semantic_tool_query_terms(query);
-            let required_matches = if terms.len() >= 3 { 2 } else { 1 };
-            segments
-                .into_iter()
-                .filter_map(|segment| {
-                    let matches = semantic_tool_text_match_count(&segment, &terms);
-                    (matches >= required_matches).then_some((matches, segment))
-                })
-                .max_by_key(|(matches, _)| *matches)
-                .map(|(_, segment)| vec![segment])
-                .unwrap_or_default()
-        }
-    }
-}
-
-fn semantic_tool_text_match_count(text: &str, terms: &[String]) -> usize {
-    let normalized = normalize_semantic_tool_text(text);
-    terms
-        .iter()
-        .filter(|term| crate::text_match::contains_prefix_match(&normalized, term))
-        .count()
-}
-
-fn normalize_semantic_tool_text(text: &str) -> String {
-    let mut expanded = String::with_capacity(text.len());
-    let mut previous_was_lowercase = false;
-    for ch in text.chars() {
-        if previous_was_lowercase && ch.is_uppercase() {
-            expanded.push(' ');
-        }
-        expanded.push(ch);
-        previous_was_lowercase = ch.is_lowercase();
-    }
-    crate::text_match::normalize_for_search(&expanded)
-}
-
-fn semantic_tool_query_terms(query: &str) -> Vec<String> {
-    const STOP_WORDS: &[&str] = &[
-        "after", "all", "an", "and", "are", "as", "at", "be", "before", "but", "by", "can", "do",
-        "does", "for", "from", "has", "have", "how", "if", "in", "is", "it", "its", "my", "no",
-        "not", "of", "on", "or", "our", "so", "than", "that", "the", "them", "then", "they",
-        "this", "to", "up", "was", "we", "what", "when", "where", "which", "why", "with", "would",
-        "you", "your",
-    ];
-
-    normalize_semantic_tool_text(query)
-        .split_whitespace()
-        .map(|term| term.trim_matches(|ch: char| !ch.is_alphanumeric()))
-        .filter(|term| term.chars().count() >= 2)
-        .filter(|term| !STOP_WORDS.contains(term))
-        .map(str::to_string)
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn stable_text_segments(mut text: &str, max_bytes: usize) -> Vec<String> {
-    let mut segments = Vec::new();
-    while !text.is_empty() {
-        let mut end = text.len().min(max_bytes);
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == 0 {
-            end = text
-                .char_indices()
-                .nth(1)
-                .map_or(text.len(), |(index, _)| index);
-        }
-        segments.push(text[..end].to_string());
-        text = &text[end..];
-    }
-    segments
-}
-
-fn run_agent_within_semantic<'a>(
+/// `request`'s semantic or hybrid search of the session `transcript` holds.
+/// Its semantic hits come from the session's stored semantic turns
+/// ([`stored_turns_candidate`]), every passage of them whatever the window;
+/// the window applies after chunking.
+pub(crate) fn run_agent_within_semantic<Embedder, Open>(
+    service: &AgentService,
+    engine: SemanticEngine<Open>,
     request: &agent::search::AgentWithinRequest,
     conversation: &history::Conversation,
     resolved: &agent::refs::ResolvedConversation,
     transcript: &agent::transcript::AgentTranscript,
-    tool_content: SemanticToolContent<'a>,
-    clock: Arc<dyn Clock>,
-    perf: &CommandPerf,
-) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)> {
+) -> Result<(agent::search::AgentSearchOutput, Vec<AgentWarning>)>
+where
+    Embedder: semantic::embed::SemanticEmbedder,
+    Open: FnOnce() -> Result<Embedder>,
+{
     let input = agent::search::AgentConversationInput {
         conversation,
         resolved: resolved.clone(),
         original_index: 0,
     };
-    let mut candidates = Vec::new();
-    push_agent_semantic_candidates(
-        &mut candidates,
-        &input,
-        transcript,
-        tool_content,
-        request.window,
-    );
-    let (semantic, warnings) = SemanticEngine::of_command(clock).rank(
+    let candidate = stored_turns_candidate(service, &input)?;
+    let (semantic, warnings) = engine.rank(
         &request.query,
-        &candidates,
+        &[candidate],
         EmbeddingBudget::passages(semantic::types::MAX_WITHIN_INTERACTIVE_PASSAGE_EMBEDDINGS),
         request.semantic_chunk_hits(),
         request.window,
-        perf,
+        &service.perf,
     )?;
     let output = agent::search::run_within_search(
         request,
@@ -4057,6 +3655,65 @@ fn run_agent_within_semantic<'a>(
         &semantic.chunks,
     );
     Ok((output, warnings))
+}
+
+/// The `semantic-unavailable` detail of a semantic `within` of a session
+/// without a copy in the session cache.
+const SEMANTIC_WITHIN_WITHOUT_COPY: &str =
+    "semantic search needs this session in the session cache; search it with --mode lexical";
+
+/// The `semantic-unavailable` detail of a semantic `within` of a session
+/// whose copy is not ready: another rearview is writing it, or its entries
+/// were kept out until the next write.
+const SEMANTIC_WITHIN_COPY_NOT_READY: &str =
+    "this session's copy in the session cache is being written; repeat the command";
+
+/// The semantic candidate of `input`'s session, a `within` target: the
+/// semantic turns of the copy the session cache holds at the target's
+/// address now, the turns `agent search` and the session list's semantic
+/// search read. Its messages are counted and timed as that copy holds them.
+/// Fails as `semantic-unavailable` for a session without a copy in the
+/// session cache, because semantic turns are computed when a copy is
+/// written, and for a copy that is not ready, with its own detail.
+fn stored_turns_candidate(
+    service: &AgentService,
+    input: &agent::search::AgentConversationInput<'_>,
+) -> Result<semantic::index::SemanticIndexCandidate> {
+    use history::sqlite_cache::CopyMiss;
+    let key = &input.resolved.key;
+    let read = service.read_copy_when_unlocked(|| {
+        history::sqlite_cache::read_copy_without_waiting(
+            service.environment.cache_base(),
+            &key.address,
+            history::HeldSemanticTurns::read,
+        )
+    });
+    let unavailable = |detail: &str| -> AppError {
+        AgentError::new(
+            AgentErrorKind::SemanticUnavailable,
+            Some(&input.resolved.reference.canonical()),
+            detail,
+        )
+        .into()
+    };
+    let held = match read {
+        Ok(held) => held,
+        Err(CopyMiss::NotThere) => return Err(unavailable(SEMANTIC_WITHIN_WITHOUT_COPY)),
+        Err(CopyMiss::NotReady) => return Err(unavailable(SEMANTIC_WITHIN_COPY_NOT_READY)),
+        Err(CopyMiss::ReadError(error)) => return Err(error),
+    };
+    let mut session = stripped_semantic_conversation(
+        input.conversation,
+        input.conversation.path.clone(),
+        held.turns,
+        held.ranges,
+    );
+    session.message_count = held.message_count;
+    session.message_times = held.message_times;
+    Ok(semantic::index::SemanticIndexCandidate::of_session(
+        input.original_index,
+        Arc::new(session),
+    ))
 }
 
 fn agent_inputs_for_indices<'a>(
@@ -7604,7 +7261,6 @@ mod tests {
                 rationale_kind: crate::semantic::types::SemanticRationaleKind::SemanticOnly,
                 chunk: crate::semantic::types::SemanticChunkIdentity {
                     conversation_index: index,
-                    source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
                     session: "session".to_owned(),
                     chunk_index: 0,
                     message_range: focus,
@@ -7628,191 +7284,6 @@ mod tests {
             session_offset: 0,
             window: TimeFilter::default(),
         }
-    }
-
-    /// The agent route's text of each semantic candidate read from `rows`,
-    /// and the route texts the read computed from the copies' texts.
-    fn routes_read(
-        rows: &[history::Conversation],
-    ) -> (Vec<Vec<String>>, Vec<history::SemanticRoute>) {
-        let (_, inputs) = keyed_inputs(rows);
-        let read = semantic_candidates(&inputs).unwrap();
-        let routes = read
-            .candidates
-            .iter()
-            .filter(|candidate| {
-                candidate.source == crate::semantic::types::SemanticChunkSource::AgentRoute
-            })
-            .map(|candidate| candidate.conversation.semantic_turns.clone())
-            .collect();
-        (routes, read.computed_routes)
-    }
-
-    /// A semantic search stores the route text it computed from a copy's
-    /// texts, and later searches read it while the copy, the row's title and
-    /// summary and the route algorithm's version stay; a change to any of
-    /// them computes it again.
-    #[test]
-    fn semantic_route_text_is_read_as_stored_until_title_summary_version_or_copy_changes() {
-        use crate::search::test_fixtures::cached_claude_sessions;
-        let sessions = cached_claude_sessions(&[(
-            "routed",
-            october_messages(&["zebrafish keeper", "zebrafish tanks"]),
-        )]);
-        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
-        let (computed, routes) = routes_read(&sessions.rows);
-        assert_eq!(routes.len(), 1, "the first read computes the route text");
-        assert!(
-            computed[0][0].contains("zebrafish"),
-            "the route reads the session's text: {computed:?}"
-        );
-        service.store_semantic_routes(&routes).unwrap();
-        assert!(
-            service
-                .perf
-                .records(None)
-                .contains("perf semantic-routes computed=1 stored=1\n"),
-            "the route text is stored"
-        );
-        // A stored text other than the computed one shows which is read.
-        let cache =
-            rusqlite::Connection::open(sessions.cache_path().join("history.sqlite3")).unwrap();
-        cache
-            .execute("UPDATE semantic_routes SET text = 'stored route'", [])
-            .unwrap();
-
-        assert_eq!(
-            routes_read(&sessions.rows),
-            (vec![vec!["stored route".to_owned()]], Vec::new()),
-            "a later read reads the stored route text"
-        );
-        let mut renamed = sessions.rows.clone();
-        renamed[0].custom_title = Some("Renamed keeper".to_owned());
-        let (route, routes) = routes_read(&renamed);
-        assert!(
-            routes.len() == 1 && route[0][0].contains("renamed"),
-            "a renamed row computes its route text again: {route:?}"
-        );
-        let mut summarised = sessions.rows.clone();
-        summarised[0].summary = Some("Aquarium chores".to_owned());
-        let (route, routes) = routes_read(&summarised);
-        assert!(
-            routes.len() == 1 && route[0][0].contains("aquarium"),
-            "a row with another summary computes its route text again: {route:?}"
-        );
-        cache
-            .execute("UPDATE semantic_routes SET version = version - 1", [])
-            .unwrap();
-        let (route, routes) = routes_read(&sessions.rows);
-        assert!(
-            routes.len() == 1 && route[0][0].contains("zebrafish"),
-            "a route text an older route algorithm stored is computed again: {route:?}"
-        );
-        sessions.rewrite(
-            0,
-            &october_messages(&["zebrafish keeper", "zebrafish tanks", "zebrafish food"]),
-        );
-        let (route, routes) = routes_read(&sessions.rows);
-        assert!(
-            routes.len() == 1 && route[0][0].contains("food"),
-            "another copy computes its route text again: {route:?}"
-        );
-    }
-
-    /// While another rearview owns the refresh, a computed route text is not
-    /// stored, and `--perf-stats` reports why.
-    #[test]
-    fn semantic_route_text_isnt_stored_while_another_rearview_owns_refresh() {
-        use crate::search::test_fixtures::cached_claude_sessions;
-        let sessions = cached_claude_sessions(&[("routed", october_messages(&["zebrafish"]))]);
-        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
-        let (_, routes) = routes_read(&sessions.rows);
-        let other_refresh = history::sqlite_cache::refresh::RefreshOwnership::acquire_for_test(
-            &history::CacheBase::new(
-                sessions.cache_path(),
-                history::ProcessIdentity::default(),
-                Arc::new(TestClock::default()),
-                SystemCanonicaliser::shared(),
-            ),
-        )
-        .unwrap();
-
-        service.store_semantic_routes(&routes).unwrap();
-
-        drop(other_refresh);
-        assert!(
-            service
-                .perf
-                .records(None)
-                .contains("perf semantic-routes computed=1 stored=0 skipped=another-rearview\n"),
-            "the route text isn't stored: {}",
-            service.perf.records(None)
-        );
-        assert_eq!(
-            routes_read(&sessions.rows).1.len(),
-            1,
-            "the next read computes the route text again"
-        );
-    }
-
-    /// A route write on a drive low on space fails with the low-space error
-    /// and sets the cache's low-space latch. The low-space deletion then empties
-    /// the cache database.
-    #[test]
-    fn semantic_route_write_finding_drive_low_on_space_fails_and_deletes_cache() {
-        use crate::search::test_fixtures::cached_claude_sessions;
-        let sessions = cached_claude_sessions(&[("routed", october_messages(&["zebrafish"]))]);
-        let (_, routes) = routes_read(&sessions.rows);
-        let service = AgentService::new(
-            test_environment(Vec::new(), Some(sessions.cache_path())).with_disk_space(Arc::new(
-                history::sqlite_cache::DriveRunningOut::after(0, || {}),
-            )),
-        );
-
-        let stored = service.store_semantic_routes(&routes);
-
-        assert!(
-            matches!(&stored, Err(AppError::SessionCacheLowSpace { .. })),
-            "the write fails with the low-space error: {stored:?}"
-        );
-        assert_eq!(
-            history::sqlite_cache::low_space::run_deletion(service.environment.cache_base()),
-            Some(crate::error::CacheDeletion::Deleted)
-        );
-        assert!(
-            history::sqlite_cache::is_emptied(sessions.cache_path()),
-            "the cache database's contents are deleted"
-        );
-    }
-
-    /// A route write that fails for another reason doesn't stop the search;
-    /// `--perf-stats` reports the cause.
-    #[test]
-    fn failed_semantic_route_write_reports_its_cause() {
-        use crate::search::test_fixtures::cached_claude_sessions;
-        let sessions = cached_claude_sessions(&[("routed", october_messages(&["zebrafish"]))]);
-        let (_, routes) = routes_read(&sessions.rows);
-        rusqlite::Connection::open(sessions.cache_path().join("history.sqlite3"))
-            .unwrap()
-            .execute_batch(
-                "DROP TABLE semantic_routes; CREATE TABLE semantic_routes (session INTEGER \
-                 PRIMARY KEY, version INTEGER, generation INTEGER, custom_title TEXT, \
-                 summary TEXT, text TEXT CHECK (text = 'refused'))",
-            )
-            .unwrap();
-        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
-
-        service.store_semantic_routes(&routes).unwrap();
-
-        let records = service.perf.records(None);
-        assert!(
-            records.contains(
-                "perf semantic-routes computed=1 stored=0 skipped=write-failed \
-                 cause=Session%20cache%20database%20error:%20CHECK%20constraint%20failed:\
-                 %20text%20%3D%20%27refused%27\n"
-            ),
-            "the record names the write's cause, encoded as one field: {records}"
-        );
     }
 
     /// The semantic stage reads a session another rearview wrote again since
@@ -7840,22 +7311,16 @@ mod tests {
             .read_copy(|held| Ok(held.generation()))
             .unwrap();
 
-        let SemanticCandidates {
-            candidates, reads, ..
-        } = semantic_candidates(&inputs).unwrap();
+        let SemanticCandidates { candidates, reads } = semantic_candidates(&inputs).unwrap();
 
         let visible = |index| {
             candidates
                 .iter()
-                .find(|candidate| {
-                    candidate.index == index
-                        && candidate.source
-                            == crate::semantic::types::SemanticChunkSource::VisibleDialogue
-                })
+                .find(|candidate| candidate.index() == index)
                 .map(|candidate| {
                     (
-                        candidate.conversation.semantic_turns.clone(),
-                        candidate.conversation.semantic_turn_ranges.clone(),
+                        candidate.conversation().semantic_turns.clone(),
+                        candidate.conversation().semantic_turn_ranges.clone(),
                     )
                 })
         };
@@ -7952,9 +7417,8 @@ mod tests {
         let (keys, inputs) = keyed_inputs(&sessions.rows);
         let reference = inputs[1].resolved.reference.canonical();
 
-        let SemanticCandidates {
-            candidates, reads, ..
-        } = semantic_candidates(&inputs).expect("the semantic stage reads the other session");
+        let SemanticCandidates { candidates, reads } =
+            semantic_candidates(&inputs).expect("the semantic stage reads the other session");
         let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
         let (output, _) = service.fuse_semantic_hits(
             SemanticHalf {
@@ -7973,7 +7437,7 @@ mod tests {
         );
 
         assert!(
-            !candidates.is_empty() && candidates.iter().all(|candidate| candidate.index == 0),
+            !candidates.is_empty() && candidates.iter().all(|candidate| candidate.index() == 0),
             "the other session alone is a candidate"
         );
         assert_eq!(
@@ -8005,6 +7469,103 @@ mod tests {
                 warning_records(&reads.failed)
             );
         }
+    }
+
+    /// A semantic `within` of a session whose copy is no longer in the
+    /// session cache fails as `semantic-unavailable`, naming the session and
+    /// `--mode lexical`, before the embedding model loads.
+    #[test]
+    fn semantic_within_of_session_missing_from_cache_fails_before_model_loads() {
+        let error = semantic_within_error_after(|sessions| sessions.remove(0));
+
+        assert_eq!(
+            error.detail, SEMANTIC_WITHIN_WITHOUT_COPY,
+            "the detail names the session cache and lexical mode"
+        );
+    }
+
+    /// A semantic `within` of a session another rearview is writing fails as
+    /// `semantic-unavailable` with a detail asking to repeat the command,
+    /// before the embedding model loads.
+    #[test]
+    fn semantic_within_of_session_being_written_asks_to_repeat_the_command() {
+        let error = semantic_within_error_after(|sessions| sessions.mark_writing(0));
+
+        assert_eq!(
+            error.detail, SEMANTIC_WITHIN_COPY_NOT_READY,
+            "the detail reports the copy as being written"
+        );
+        assert!(
+            !error.detail.contains("lexical"),
+            "the detail doesn't advise lexical mode: {}",
+            error.detail
+        );
+    }
+
+    /// The `semantic-unavailable` error of a semantic `within` of a cached
+    /// session after `change` to its copy. The embedding model's load
+    /// panics.
+    fn semantic_within_error_after(
+        change: impl FnOnce(&crate::search::test_fixtures::CachedClaudeSessions),
+    ) -> AgentError {
+        use crate::search::test_fixtures::cached_claude_sessions;
+        let sessions = cached_claude_sessions(&[("changed", october_messages(&["zebrafish"]))]);
+        let (_, inputs) = keyed_inputs(&sessions.rows);
+        let input = &inputs[0];
+        let transcript = agent::transcript::AgentTranscript::from_stored(
+            &input.resolved.key.path,
+            sessions.rows[0]
+                .cached_session
+                .as_ref()
+                .unwrap()
+                .read_copy(|held| held.numbered_entries(None))
+                .unwrap(),
+        )
+        .unwrap();
+        change(&sessions);
+        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
+        let clock = service.clock().clone();
+        let engine = SemanticEngine {
+            index: semantic::index::SemanticIndexState::with_store(
+                semantic::types::ChunkConfig::default(),
+                semantic::store::test_support::temporary_store(clock.clone()),
+                clock,
+            ),
+            open_embedder: || -> Result<semantic::fastembed::FastembedEmbedder> {
+                panic!("the embedding model doesn't load for a session without a copy")
+            },
+        };
+        let request = agent::search::AgentWithinRequest {
+            query: "zebrafish".to_owned(),
+            top: 10,
+            cli_mode: Some(SearchMode::Semantic),
+            config_mode: None,
+            tui_semantic_search: None,
+            budget: None,
+            window: TimeFilter::default(),
+        };
+
+        let searched = run_agent_within_semantic(
+            &service,
+            engine,
+            &request,
+            input.conversation,
+            &input.resolved,
+            &transcript,
+        );
+
+        let Err(AppError::Agent(error)) = searched else {
+            panic!("the search fails with an agent error");
+        };
+        assert_eq!(
+            (error.kind, error.reference.clone()),
+            (
+                AgentErrorKind::SemanticUnavailable,
+                Some(input.resolved.reference.canonical())
+            ),
+            "the error names the session as unavailable to semantic search"
+        );
+        error
     }
 
     /// A semantic hit gets the anchors of its focus message in the copy the
@@ -9054,6 +8615,50 @@ mod tests {
         assert!(
             output.contains("the%20session%20is%20not%20in%20the%20session%20cache"),
             "the empty session is reported as not in the session cache:\n{output}"
+        );
+    }
+
+    /// A hybrid `within` of a session without a copy in the session cache,
+    /// whose write by the command failed, prints the `semantic-unavailable`
+    /// warning and the lexical hits.
+    #[test]
+    fn hybrid_within_of_session_without_copy_warns_and_prints_lexical_hits() {
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let cache = crate::tui::claude_home::admitted_cache();
+        let environment = home.environment_with_cache(
+            cache.path(),
+            history::ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+        );
+        let uncached = home.write("never", 6, &["an unseen zebrafish question"]);
+        let reference = uncached.to_string_lossy().into_owned();
+        let failing = fail_the_first_data_commit(cache.path(), || {});
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&[
+                "within",
+                &reference,
+                "zebrafish",
+                "--mode",
+                "hybrid",
+            ]))
+            .unwrap_or_else(crate::error_report);
+
+        drop(failing);
+        let warning = output
+            .lines()
+            .find(|line| line.starts_with("protocol agent-warning kind=semantic-unavailable "))
+            .unwrap_or_else(|| panic!("the output carries the warning:\n{output}"));
+        assert!(
+            warning.ends_with(&format!(
+                " detail={}",
+                agent::diagnostic::encode_detail(SEMANTIC_WITHIN_WITHOUT_COPY)
+            )),
+            "the warning names the session cache and lexical mode: {warning}"
+        );
+        assert!(
+            output.contains("source=lexical") && output.contains("zebrafish"),
+            "the output carries the lexical hit:\n{output}"
         );
     }
 
@@ -10192,39 +9797,6 @@ mod tests {
             })
             .embeds_nothing()
         );
-    }
-
-    #[test]
-    fn agent_route_uses_compact_route_text() {
-        let mut conversation = crate::semantic::test_fixtures::SemanticConversationFixture::new(
-            "/tmp/session.jsonl",
-            ["dialogue that should not be copied into the route"],
-        )
-        .with_title("Align step calibration and treadmill UX")
-        .with_summary(Some(
-            "Calibrate automatic counting across treadmill sessions",
-        ))
-        .build();
-        conversation.full_text =
-            "calibration isolation and per-device capability memory from bounded tool evidence"
-                .to_string();
-
-        let route = agent_route_of(&conversation, conversation.semantic_route_text()).unwrap();
-
-        assert_eq!(route.semantic_turns.len(), 1);
-        assert!(route.semantic_turns[0].chars().count() <= 1_805);
-        assert!(route.semantic_turns[0].contains("per-device capability memory"));
-        assert_eq!(
-            route.semantic_turn_ranges,
-            conversation.semantic_turn_ranges[..1]
-        );
-        assert!(
-            route
-                .path
-                .to_string_lossy()
-                .ends_with("session.jsonl.agent-route-semantic")
-        );
-        assert!(!route.semantic_turns[0].contains("should not be copied"));
     }
 
     #[test]

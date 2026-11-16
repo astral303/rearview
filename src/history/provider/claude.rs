@@ -1344,21 +1344,22 @@ pub(crate) mod tests {
         assert_eq!(restored.total_tokens, session.total_tokens);
     }
 
-    /// Semantic and hybrid `agent search` route to a session by its
-    /// `semantic_route_text`, so a phrase only a sub-agent transcript holds
-    /// has to reach it.
+    /// `agent search` finds a phrase only a sub-agent transcript holds in the
+    /// session's `agent_search_text`.
     #[test]
-    fn claude_sub_agents_text_reaches_sessions_semantic_routing_text() {
+    fn claude_sub_agents_text_reaches_sessions_agent_search_text() {
         let root = fixture_root();
         let cache = tempfile::tempdir().unwrap();
         let session = load_the_one_session(root.path(), cache.path());
         let content = session.load_held_content().unwrap().row;
 
         assert!(!content.full_text.contains("NESTED_SUBAGENT_SENTINEL"));
-        let route_text = content.semantic_route_text();
         assert!(
-            route_text.contains("NESTED_SUBAGENT_SENTINEL"),
-            "{route_text}"
+            content
+                .agent_search_text
+                .contains("NESTED_SUBAGENT_SENTINEL"),
+            "the sub-agent transcript's text is in the session's agent search text: {}",
+            content.agent_search_text
         );
     }
 

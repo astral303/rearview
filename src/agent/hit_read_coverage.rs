@@ -666,7 +666,7 @@ fn retrieved_messages(
 
 /// No window, a window over the middle third of `transcript`'s dated
 /// messages, and one over its middle dated message alone.
-fn windows_over_middle_messages(transcript: &AgentTranscript) -> Vec<TimeFilter> {
+pub(super) fn windows_over_middle_messages(transcript: &AgentTranscript) -> Vec<TimeFilter> {
     let spans = transcript
         .messages
         .iter()

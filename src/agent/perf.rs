@@ -137,43 +137,9 @@ pub struct CommandPerf {
     refresh_rounds: Mutex<Vec<usize>>,
     /// `None` until a global search starts.
     search: OnceLock<SearchReads>,
-    /// The semantic route texts a semantic search computed; `None` when it
-    /// didn't compute any.
-    semantic_routes: Mutex<Option<ComputedRoutes>>,
     /// The passages a semantic search read from the passage store and wrote
     /// to it; `None` when it didn't open the store.
     semantic_store: Mutex<Option<StoreUse>>,
-}
-
-/// The semantic route texts a semantic search computed from the copies'
-/// texts.
-#[derive(Clone, Debug)]
-struct ComputedRoutes {
-    count: usize,
-    /// The reason they were not stored; `None` once stored.
-    skipped: Option<RoutesSkipped>,
-}
-
-/// The reason computed semantic route texts were not stored.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RoutesSkipped {
-    /// Another rearview owns the refresh.
-    AnotherRearview,
-    /// The write failed with this error.
-    WriteFailed(String),
-}
-
-impl RoutesSkipped {
-    /// The `skipped=` value, and the cause when the record carries one.
-    fn record(&self) -> String {
-        match self {
-            Self::AnotherRearview => "skipped=another-rearview".to_owned(),
-            Self::WriteFailed(cause) => format!(
-                "skipped=write-failed cause={}",
-                super::diagnostic::encode_detail(cause)
-            ),
-        }
-    }
 }
 
 /// One transcript parsed.
@@ -195,7 +161,6 @@ impl CommandPerf {
             transcripts: Mutex::default(),
             refresh_rounds: Mutex::default(),
             search: OnceLock::new(),
-            semantic_routes: Mutex::default(),
             semantic_store: Mutex::default(),
         }
     }
@@ -207,15 +172,6 @@ impl CommandPerf {
             .semantic_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(store_use);
-    }
-
-    /// Records the `count` semantic route texts a semantic search computed,
-    /// and why they were not stored; `skipped` is `None` once stored.
-    pub fn record_semantic_routes(&self, count: usize, skipped: Option<RoutesSkipped>) {
-        *self
-            .semantic_routes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(ComputedRoutes { count, skipped });
     }
 
     /// Records one round of the targeted refresh, reading `sessions`
@@ -317,12 +273,11 @@ impl CommandPerf {
     }
 
     /// One `perf` record per stage in the order they ran; one per round of
-    /// the targeted refresh, in order; the semantic route texts computed;
-    /// the passages read from the passage store and written to it; each
-    /// agent's discovery, cache and refresh, agents in the order they
-    /// loaded; each transcript parsed; a global search's reads and
-    /// retrieval; the `peak_memory` in bytes when the platform reports it;
-    /// then the total.
+    /// the targeted refresh, in order; the passages read from the passage
+    /// store and written to it; each agent's discovery, cache and refresh,
+    /// agents in the order they loaded; each transcript parsed; a global
+    /// search's reads and retrieval; the `peak_memory` in bytes when the
+    /// platform reports it; then the total.
     pub fn records(&self, peak_memory: Option<u64>) -> String {
         let mut records = String::new();
         for (stage, time) in self
@@ -345,25 +300,6 @@ impl CommandPerf {
             .iter()
         {
             let _ = writeln!(records, "perf refresh-round sessions={sessions}");
-        }
-        if let Some(routes) = &*self
-            .semantic_routes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-        {
-            let _ = match &routes.skipped {
-                None => writeln!(
-                    records,
-                    "perf semantic-routes computed={0} stored={0}",
-                    routes.count
-                ),
-                Some(skipped) => writeln!(
-                    records,
-                    "perf semantic-routes computed={} stored=0 {}",
-                    routes.count,
-                    skipped.record()
-                ),
-            };
         }
         if let Some(store_use) = &*self
             .semantic_store

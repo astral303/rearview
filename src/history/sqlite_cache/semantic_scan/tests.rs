@@ -95,7 +95,7 @@ fn failed_copy_drops_its_waiting_turns_and_doesnt_add_later_reads() {
     copy.add(0..=2, vec![(1, "the first task's turn".to_owned())]);
 
     assert!(
-        copy.waiting.is_empty() && copy.turns.is_empty(),
+        copy.waiting.is_empty() && copy.turns == SemanticTurns::default(),
         "the failed copy doesn't hold any turns"
     );
 }
@@ -134,7 +134,7 @@ fn failed_read_of_one_sessions_turns_fails_that_session_alone() {
     let own = copies.iter().map(own_turns).collect::<Vec<_>>();
     let failing = own
         .iter()
-        .position(|turns| !turns.is_empty())
+        .position(|turns| *turns != SemanticTurns::default())
         .expect("a fixture holds a turn");
     admitted_cache(base.path())
         .connection

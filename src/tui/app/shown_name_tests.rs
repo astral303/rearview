@@ -642,8 +642,8 @@ fn list_search_misses(
 
 /// The misses of the readers other than the list's search, for the session
 /// of `conversations`, which shows `shown`: the list's evidence and context
-/// lines, `agent search`'s ranking and exact filter, the agent's semantic
-/// route and the semantic search's exact preview.
+/// lines, `agent search`'s ranking and exact filter, and the semantic
+/// search's exact preview.
 fn other_reader_misses(
     conversations: &[Conversation],
     shown: &TitleAndSummary,
@@ -659,8 +659,6 @@ fn other_reader_misses(
     let in_memory = crate::search::SearchTextsInMemory::read(conversations);
     let unwindowed = crate::time_filter::TimeFilter::default();
     let agent_texts = precompute_agent_search_text(conversations, &unwindowed);
-    let content = conversations[0].load_held_content().unwrap().row;
-    let route = content.semantic_route_text().to_lowercase();
     let every_row = (0..conversations.len()).collect::<Vec<_>>();
     for name in given {
         let word = first_word(name);
@@ -702,12 +700,6 @@ fn other_reader_misses(
         if found != expected {
             misses.push(format!(
                 "exact agent search {phrase:?} finds {expected} session(s), not {found}"
-            ));
-        }
-        if route.contains(&query) != is_shown {
-            misses.push(format!(
-                "the semantic route text contains {query:?} only while the session shows it: \
-                 {route:?}"
             ));
         }
         if !is_shown {

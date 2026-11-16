@@ -1,7 +1,7 @@
 use crate::clock::Clock;
 use crate::error::{AppError, Result};
-use crate::history::sqlite_cache::{CopyMiss, CopyRead, WriteErrorClass, unless_every_read_failed};
-use crate::history::{CacheBase, Conversation, SemanticContent, Workspace};
+use crate::history::sqlite_cache::{CopyMiss, CopyRead, unless_every_read_failed};
+use crate::history::{Conversation, Workspace};
 use crate::search::literal::{build_literal_corpus, exact_fallback};
 use crate::search::query::ParsedQuery;
 use crate::semantic::filter::filter_embedded_chunks_by_literals;
@@ -118,45 +118,35 @@ fn megabytes(bytes: u64) -> u64 {
 }
 
 /// Embeds every passage of the conversations in `workspace` missing from the
-/// passage store. Stores the route texts it computed in the session cache
-/// under `base`. Fails as [`embed_into_store`] does.
+/// passage store. Fails as [`embed_into_store`] does.
 pub fn generate_cache(
     conversations: &[Conversation],
     workspace: Option<&Workspace>,
-    base: &CacheBase,
     clock: Arc<dyn Clock>,
 ) -> Result<()> {
-    use crate::semantic::chunk::build_chunks_with_sources;
+    use crate::semantic::chunk::build_chunks_with_indices;
     use crate::semantic::fastembed::FastembedEmbedder;
     use crate::semantic::index::{SemanticIndexRequest, SemanticIndexState};
     use crate::semantic::types::ChunkConfig;
 
-    let content = semantic_content(&conversations_in_workspace(conversations, workspace))?
+    let content = semantic_turns(&conversations_in_workspace(conversations, workspace))?
         .reporting_skipped(&mut std::io::stderr());
-    let selected = content
-        .iter()
-        .map(|content| content.held.row.as_ref())
-        .collect::<Vec<_>>();
+    let selected = content.iter().map(Cow::as_ref).collect::<Vec<_>>();
     if selected.is_empty() {
         eprintln!("{}", no_conversations_message(workspace.is_some()));
         return Ok(());
     }
 
-    let candidates = semantic_cache_candidates(&content);
-    store_route_texts(base, &content)?;
-    let chunks = build_chunks_with_sources(
-        candidates.iter().map(|candidate| {
-            (
-                candidate.index,
-                candidate.source,
-                candidate.conversation.as_ref(),
-            )
-        }),
+    let candidates = semantic_index_candidates(&selected);
+    let chunks = build_chunks_with_indices(
+        candidates
+            .iter()
+            .map(|candidate| (candidate.index(), candidate.conversation().as_ref())),
         ChunkConfig::default(),
     );
     let chunk_count = chunks.len();
     if chunk_count == 0 {
-        eprintln!("No semantic dialogue or route text available for cache generation.");
+        eprintln!("No semantic dialogue available for cache generation.");
         return Ok(());
     }
 
@@ -469,51 +459,14 @@ fn refresh_and_rank_interactive(
     Ok((refresh, response))
 }
 
-fn semantic_cache_candidates(
-    content: &[SemanticContent<'_>],
+/// The candidates `--generate-semantic-cache` embeds for `rows`, without the
+/// rows whose read missed.
+#[cfg(test)]
+pub(crate) fn cache_generation_candidates(
+    rows: &[&Conversation],
 ) -> Vec<crate::semantic::index::SemanticIndexCandidate> {
-    let selected = content
-        .iter()
-        .map(|content| content.held.row.as_ref())
-        .collect::<Vec<_>>();
-    let mut candidates = semantic_index_candidates(&selected);
-    for (index, content) in content.iter().enumerate() {
-        if let Some(route) = content
-            .route_text
-            .clone()
-            .and_then(|text| crate::agent::service::agent_route_of(content.held.row.as_ref(), text))
-        {
-            candidates.push(crate::semantic::index::SemanticIndexCandidate {
-                index,
-                source: crate::semantic::types::SemanticChunkSource::AgentRoute,
-                conversation: std::sync::Arc::new(route),
-            });
-        }
-    }
-    candidates
-}
-
-/// Stores the route texts `content`'s reads computed. Fails when the drive
-/// is low on space; after any other failure, the next semantic search
-/// computes the route texts again.
-fn store_route_texts(base: &CacheBase, content: &[SemanticContent<'_>]) -> Result<()> {
-    let routes = content
-        .iter()
-        .filter_map(|content| content.computed_route.clone())
-        .collect::<Vec<_>>();
-    if routes.is_empty() {
-        return Ok(());
-    }
-    match crate::history::store_semantic_routes(base, &routes) {
-        Err(error) if WriteErrorClass::of(&error) == WriteErrorClass::LowSpace => Err(error),
-        Ok(_) | Err(_) => Ok(()),
-    }
-}
-
-/// The semantic content of each of `rows`, read as
-/// [`Conversation::load_semantic_content`] reads it.
-fn semantic_content<'r>(rows: &[&'r Conversation]) -> Result<HeldReads<'r, SemanticContent<'r>>> {
-    HeldReads::of(rows, Conversation::load_semantic_content)
+    let content = semantic_turns(rows).unwrap().held;
+    semantic_index_candidates(&content.iter().map(Cow::as_ref).collect::<Vec<_>>())
 }
 
 fn semantic_index_candidates(
@@ -664,11 +617,11 @@ mod tests {
     use crate::semantic::types::ChunkConfig;
     use chrono::Local;
 
-    /// The reads behind the semantic search flags ([`held_content`] for
-    /// quoted phrases alone, [`semantic_turns`] otherwise) and cache
-    /// generation ([`semantic_content`]) read a session another rearview
-    /// wrote again from the copy the cache holds, and write one line to
-    /// stderr naming a session it removed.
+    /// The reads behind the semantic search flags and cache generation
+    /// ([`held_content`] for quoted phrases alone, [`semantic_turns`]
+    /// otherwise) read a session another rearview wrote again from the copy
+    /// the cache holds, and write one line to stderr naming a session it
+    /// removed.
     #[test]
     fn held_content_reads_copy_cache_holds_and_skips_removed_session() {
         use crate::search::test_fixtures::{cached_claude_sessions, october_messages as messages};
@@ -680,15 +633,11 @@ mod tests {
         sessions.remove(1);
         let rows = sessions.rows.iter().collect::<Vec<_>>();
 
-        let (mut stderr, mut turns_stderr, mut semantic_stderr) =
-            (Vec::new(), Vec::new(), Vec::new());
+        let (mut stderr, mut turns_stderr) = (Vec::new(), Vec::new());
         let content = held_content(&rows).unwrap().reporting_skipped(&mut stderr);
         let read_turns = semantic_turns(&rows)
             .unwrap()
             .reporting_skipped(&mut turns_stderr);
-        let semantic = semantic_content(&rows)
-            .unwrap()
-            .reporting_skipped(&mut semantic_stderr);
 
         let turns = [vec!["inserted".to_owned(), "first".to_owned()]];
         for (read, rows) in [("held", &content), ("semantic turns", &read_turns)] {
@@ -700,23 +649,11 @@ mod tests {
                 "the {read} read reads the replaced session as the cache holds it"
             );
         }
-        assert_eq!(
-            semantic
-                .iter()
-                .map(|content| content.held.row.semantic_turns.clone())
-                .collect::<Vec<_>>(),
-            turns,
-            "cache generation reads the replaced session as the cache holds it"
-        );
         let skipped = format!(
             "Skipped session {}: it is no longer in the session cache.\n",
             sessions.rows[1].session_id
         );
-        for (read, stderr) in [
-            ("held", stderr),
-            ("semantic turns", turns_stderr),
-            ("semantic", semantic_stderr),
-        ] {
+        for (read, stderr) in [("held", stderr), ("semantic turns", turns_stderr)] {
             assert_eq!(
                 String::from_utf8(stderr).unwrap(),
                 skipped,
@@ -811,7 +748,7 @@ mod tests {
         let flags = semantic_turns(&rows).unwrap().held;
         let agent = rows
             .iter()
-            .map(|row| row.load_semantic_content().unwrap().held.row)
+            .map(|row| row.load_semantic_content().unwrap().row)
             .collect::<Vec<_>>();
 
         let agent_chunks = chunks(&agent.iter().map(Cow::as_ref).collect::<Vec<_>>());
@@ -825,38 +762,6 @@ mod tests {
             chunks(&flags.iter().map(Cow::as_ref).collect::<Vec<_>>()),
             agent_chunks,
             "the semantic search flags chunk the turns agent search reads"
-        );
-    }
-
-    /// Cache generation stores the route texts it computed, so the next
-    /// read finds them stored.
-    #[test]
-    fn cache_generation_stores_route_texts_it_computed() {
-        use crate::search::test_fixtures::{cached_claude_sessions, claude_user_record, october};
-        let sessions = cached_claude_sessions(&[(
-            "routed",
-            vec![claude_user_record("zebrafish keeper", october(10, 12))],
-        )]);
-        let rows = sessions.rows.iter().collect::<Vec<_>>();
-        let base = CacheBase::new(
-            sessions.cache_path(),
-            crate::history::ProcessIdentity::default(),
-            Arc::new(crate::clock::TestClock::default()),
-            crate::history::provider::walk::SystemCanonicaliser::shared(),
-        );
-        let computed = semantic_content(&rows).unwrap().held;
-        assert!(
-            computed[0].computed_route.is_some(),
-            "the first read computes the route text"
-        );
-
-        store_route_texts(&base, &computed).unwrap();
-
-        let stored = semantic_content(&rows).unwrap().held;
-        assert_eq!(
-            (stored[0].computed_route.is_none(), &stored[0].route_text),
-            (true, &computed[0].route_text),
-            "the next read finds the route text stored"
         );
     }
 
@@ -1184,14 +1089,14 @@ mod tests {
 
         let candidates = semantic_index_candidates(&selected);
 
-        assert_eq!(candidates[0].index, 0);
+        assert_eq!(candidates[0].index(), 0);
         assert_eq!(
-            candidates[0].conversation.custom_title.as_deref(),
+            candidates[0].conversation().custom_title.as_deref(),
             Some("two")
         );
-        assert_eq!(candidates[1].index, 1);
+        assert_eq!(candidates[1].index(), 1);
         assert_eq!(
-            candidates[1].conversation.custom_title.as_deref(),
+            candidates[1].conversation().custom_title.as_deref(),
             Some("one")
         );
     }
@@ -1267,7 +1172,6 @@ mod tests {
             .map(
                 |(conversation_index, conversation)| crate::semantic::types::EmbeddedChunk {
                     conversation_index,
-                    source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
                     session: format!("session-{}", conversation_index + 1),
                     chunk_index: 0,
                     text: conversation.semantic_turns[0].clone(),

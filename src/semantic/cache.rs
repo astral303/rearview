@@ -163,7 +163,6 @@ fn validate_passage_embeddings(
 fn embedded_chunk(chunk: &SemanticChunk, embedding: Arc<[f32]>) -> EmbeddedChunk {
     EmbeddedChunk {
         conversation_index: chunk.conversation_index,
-        source: chunk.source,
         session: chunk.session.clone(),
         chunk_index: chunk.chunk_index,
         text: chunk.text.clone(),
@@ -342,7 +341,6 @@ mod tests {
         let (session, chunk_index) = identity.rsplit_once(':').expect("session:chunk_index");
         SemanticChunk {
             conversation_index: 0,
-            source: crate::semantic::types::SemanticChunkSource::VisibleDialogue,
             session: session.to_string(),
             chunk_index: chunk_index.parse().expect("chunk index"),
             text: text.to_string(),

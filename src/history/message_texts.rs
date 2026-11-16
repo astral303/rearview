@@ -131,15 +131,6 @@ impl Conversation {
     }
 }
 
-/// Each padded separator becomes one space.
-pub fn without_message_separators(text: &str) -> Cow<'_, str> {
-    if text.contains(PADDED_MESSAGE_SEPARATOR) {
-        Cow::Owned(text.replace(PADDED_MESSAGE_SEPARATOR, " "))
-    } else {
-        Cow::Borrowed(text)
-    }
-}
-
 /// Append `piece` to `text`, after a separator when `text` is not empty. An
 /// empty `piece` adds nothing, separator included.
 pub(crate) fn push_separated(text: &mut String, piece: &str) {
@@ -314,16 +305,6 @@ mod tests {
         push_separated(&mut text, "nested");
 
         assert_eq!(starts.text_of(&text, &[range(3, 3)]), " \u{1e} gamma");
-    }
-
-    #[test]
-    fn without_message_separators_writes_one_space_for_each_separator() {
-        let (text, _) = outside_parts_and_three_messages();
-
-        assert_eq!(
-            without_message_separators(&text),
-            "outside beside alpha beta gamma"
-        );
     }
 
     #[test]
