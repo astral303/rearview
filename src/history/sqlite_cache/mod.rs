@@ -55,7 +55,7 @@ pub use coordinator::WaitStatus;
 pub(crate) use coordinator::{Coordinator, SHUTDOWN_RELEASE_WAIT};
 pub(crate) use copies_scan::ScannedCopy;
 pub(crate) use copy_state::{CopyMiss, CopyRead, found, unless_every_read_failed};
-pub(crate) use entries::{EntryHashes, StoredEntries};
+pub(crate) use entries::{EntryHashes, SequencedHashes, StoredEntries};
 pub use interactive::{
     AdoptedCopy, CachedRead, CurrentCopy, DrawingThread, InteractiveCache, InteractiveRead,
 };

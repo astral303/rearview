@@ -8,8 +8,48 @@ use super::*;
 use crate::log_entry::Tool;
 use std::path::PathBuf;
 
+mod extension;
 mod rerender;
 mod tail;
+
+/// The names of `conversation`'s fields that differ from `whole`'s, the
+/// conversation of a whole read: empty when the two are equal in every
+/// field.
+pub(crate) fn fields_differing(
+    conversation: &ParsedConversation,
+    whole: &ParsedConversation,
+) -> Vec<&'static str> {
+    // Without `..`: a new field doesn't compile until it is compared.
+    let ParsedConversation {
+        entries,
+        origins,
+        subagent_identities,
+        roster,
+        lanes,
+        activity_span,
+    } = conversation;
+    let fields = [
+        (
+            "entries",
+            format!("{entries:?}") == format!("{:?}", whole.entries),
+        ),
+        ("origins", origins == &whole.origins),
+        (
+            "sub-agent identities",
+            subagent_identities == &whole.subagent_identities,
+        ),
+        ("roster", roster == &whole.roster),
+        ("lanes", lanes == &whole.lanes),
+        (
+            "activity span",
+            format!("{activity_span:?}") == format!("{:?}", whole.activity_span),
+        ),
+    ];
+    fields
+        .into_iter()
+        .filter_map(|(field, is_equal)| (!is_equal).then_some(field))
+        .collect()
+}
 
 /// The session at `file_path` with the sub-agent transcripts `subagents`, as
 /// the viewer reads it once a load cached it.
@@ -1048,7 +1088,7 @@ fn spawn_agent_result_shows_its_path_alone_without_nicknamed_matching_sub_agent(
     let mut roster = roster_of(&entries);
     roster.record_identity(
         SUB_AGENT_THREAD,
-        crate::log_entry::SubagentIdentity {
+        &crate::log_entry::SubagentIdentity {
             nickname: None,
             role: Some("grunt".to_owned()),
             agent_path: Some("/root/unnamed".to_owned()),
@@ -1089,7 +1129,7 @@ fn spawn_agent_result_takes_calls_agent_type_when_sub_agent_records_no_role() {
     let mut roster = roster_of(&entries);
     roster.record_identity(
         SUB_AGENT_THREAD,
-        crate::log_entry::SubagentIdentity {
+        &crate::log_entry::SubagentIdentity {
             nickname: Some("Lorentz".to_owned()),
             role: None,
             agent_path: Some("/root/scout".to_owned()),

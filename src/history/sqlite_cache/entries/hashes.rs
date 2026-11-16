@@ -34,6 +34,22 @@ impl EntryHashes {
     }
 }
 
+/// A copy's entry hashes with each entry's `sequence`, both in entry order.
+/// A read of the copy's entries from one entry on selects them by that
+/// entry's sequence.
+pub(crate) struct SequencedHashes {
+    pub(crate) hashes: EntryHashes,
+    sequences: Vec<i64>,
+}
+
+impl SequencedHashes {
+    /// The `sequence` of the entry at `position`; `None` at or after the
+    /// copy's entry count.
+    pub(crate) fn sequence_at(&self, position: usize) -> Option<i64> {
+        self.sequences.get(position).copied()
+    }
+}
+
 /// The hashes of `session`'s entries, their transcripts at their paths in
 /// `places`.
 pub(in super::super) fn read(
@@ -41,15 +57,24 @@ pub(in super::super) fn read(
     session: i64,
     places: &Places,
 ) -> Result<EntryHashes> {
+    Ok(read_sequenced(connection, session, places)?.hashes)
+}
+
+/// [`read`] with each entry's `sequence`.
+pub(in super::super) fn read_sequenced(
+    connection: &Connection,
+    session: i64,
+    places: &Places,
+) -> Result<SequencedHashes> {
     let stored = threads::read(connection, session, places)?;
     let thread_hashes: HashMap<i64, i64> = stored
         .threads
         .iter()
         .map(|(id, thread)| (*id, thread.digest()))
         .collect();
-    let hashes = connection
+    let (hashes, sequences) = connection
         .prepare_cached(
-            "SELECT e.digest, m.digest, m.thread, e.record_transcript FROM entries e \
+            "SELECT e.digest, m.digest, m.thread, e.record_transcript, e.sequence FROM entries e \
              LEFT JOIN messages m ON m.id = e.message WHERE e.session = ?1 ORDER BY e.sequence",
         )?
         .query_map([session], |row| {
@@ -66,10 +91,13 @@ pub(in super::super) fn read(
                     .map(|transcript| path_text(&stored.transcripts[&transcript]))
                     .as_deref(),
             );
-            Ok(digest.finish())
+            Ok((digest.finish(), row.get::<_, i64>(4)?))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(EntryHashes(hashes))
+        .collect::<rusqlite::Result<(Vec<_>, Vec<_>)>>()?;
+    Ok(SequencedHashes {
+        hashes: EntryHashes(hashes),
+        sequences,
+    })
 }
 
 #[cfg(test)]

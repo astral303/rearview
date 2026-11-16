@@ -1773,14 +1773,16 @@ pub(super) fn refresh_and_receive_read(app: &mut App) {
     );
 }
 
-/// The render stopped at the gate returns stopped, and the newer render
-/// reaches the gate with timing shown.
-fn stop_first_render_and_reach_timed_one(gate: &Gate) {
+/// The render stopped at the gate returns stopped, the reload's tail is put
+/// after the entries the view keeps, and the reload's render reaches the
+/// gate with timing shown.
+fn stop_first_render_and_reach_timed_one(app: &mut App, gate: &Gate) {
     gate.let_one_through();
     assert!(
         !gate.next_return().finished,
-        "the newer request stops the running render"
+        "the reload's read stops the running render"
     );
+    test_waits::finish_waiting_tail(app);
     assert_eq!(gate.next_render(), (ToolDisplayMode::Hidden, true));
 }
 
@@ -1811,7 +1813,7 @@ fn refresh_during_display_key_render_shows_new_messages_in_new_mode() {
 
     write_messages(&path, &numbered(0..32));
     refresh_and_receive_read(&mut app);
-    stop_first_render_and_reach_timed_one(&gate);
+    stop_first_render_and_reach_timed_one(&mut app, &gate);
     finish_timed_render(&mut app, &gate);
 
     assert!(view_text(&app).contains("message 31"));
@@ -1829,7 +1831,7 @@ fn reader_at_bottom_during_display_key_render_stays_at_bottom_of_reload() {
 
     write_messages(&path, &numbered(0..32));
     refresh_and_receive_read(&mut app);
-    stop_first_render_and_reach_timed_one(&gate);
+    stop_first_render_and_reach_timed_one(&mut app, &gate);
     gate.let_one_through();
     test_waits::finish_view_render(&mut app, VIEWPORT);
 
@@ -1924,7 +1926,7 @@ fn display_key_during_reloads_render_stops_it_and_shows_reload_in_new_mode() {
     let (mut app, gate) = viewer_with_reload_render_at_gate(&home);
 
     press_now(&mut app, KeyCode::Char('i'));
-    stop_first_render_and_reach_timed_one(&gate);
+    stop_first_render_and_reach_timed_one(&mut app, &gate);
     finish_timed_render(&mut app, &gate);
 
     assert!(view_text(&app).contains("message 30"));

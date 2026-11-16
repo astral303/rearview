@@ -500,7 +500,7 @@ impl ExportedConversation {
 impl From<DisplayEntries> for ExportedConversation {
     fn from(displayed: DisplayEntries) -> Self {
         Self {
-            roster: SubagentRoster::from_identities(displayed.subagent_identities),
+            roster: SubagentRoster::from_recorded(&displayed.subagent_identities),
             entries: displayed.entries,
         }
     }

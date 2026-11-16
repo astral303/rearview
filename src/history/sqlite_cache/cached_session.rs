@@ -135,6 +135,17 @@ impl HeldCopy<'_> {
         entries::read_hashes(self.connection, self.session, self.places)
     }
 
+    /// [`Self::entry_hashes`] with each entry's `sequence`.
+    pub(crate) fn sequenced_entry_hashes(&self) -> Result<entries::SequencedHashes> {
+        entries::read_sequenced_hashes(self.connection, self.session, self.places)
+    }
+
+    /// The entries [`Self::entries`] reads, from the entry whose `sequence`
+    /// is `first_sequence` on. The earlier entries aren't decoded.
+    pub(crate) fn entries_from(&self, first_sequence: i64) -> Result<TranscriptEntries> {
+        entries::read_from(self.connection, self.session, self.places, first_sequence)
+    }
+
     pub(crate) fn numbered_entries(
         &self,
         messages: Option<std::ops::RangeInclusive<u64>>,

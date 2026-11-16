@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
+use crate::history::RecordedIdentity;
 use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool};
 
 use super::NAME_WIDTH;
@@ -13,7 +14,7 @@ use super::ledger::fitted_name;
 use super::style::subagent_label;
 use super::tools::tool_result_display_text;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct SubagentRoster {
     /// The label of each sub-agent whose provider recorded a nickname, by the
     /// sub-agent's key (its `parent_tool_use_id`).
@@ -26,18 +27,28 @@ pub(crate) struct SubagentRoster {
 }
 
 impl SubagentRoster {
-    /// A roster holding a label for each sub-agent in `identities`, by its key.
-    pub(crate) fn from_identities(
-        identities: impl IntoIterator<Item = (String, SubagentIdentity)>,
+    /// A roster with a label for each sub-agent in `identities`, by its key.
+    /// The first identity recorded for a key or a task path stays.
+    pub(crate) fn from_identities<'a>(
+        identities: impl IntoIterator<Item = (&'a str, &'a SubagentIdentity)>,
     ) -> Self {
         let mut roster = Self::default();
         for (key, identity) in identities {
-            roster.record_identity(&key, identity);
+            roster.record_identity(key, identity);
         }
         roster
     }
 
-    pub(super) fn record_identity(&mut self, key: &str, identity: SubagentIdentity) {
+    /// A roster with each of `recorded`, in record order.
+    pub(crate) fn from_recorded(recorded: &[RecordedIdentity]) -> Self {
+        Self::from_identities(
+            recorded
+                .iter()
+                .map(|recorded| (recorded.agent_id.as_str(), &recorded.identity)),
+        )
+    }
+
+    pub(super) fn record_identity(&mut self, key: &str, identity: &SubagentIdentity) {
         if let Some(nickname) = &identity.nickname {
             self.labels
                 .entry(key.to_owned())
@@ -46,7 +57,7 @@ impl SubagentRoster {
         if let Some(agent_path) = &identity.agent_path {
             self.by_agent_path
                 .entry(agent_path.clone())
-                .or_insert(identity);
+                .or_insert_with(|| identity.clone());
         }
     }
 

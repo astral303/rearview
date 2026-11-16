@@ -119,12 +119,13 @@ pub struct ViewState {
     /// finds the copy missing keeps it, as it keeps the conversation. The
     /// refresh of an unchanged shown copy shows without a read or a render.
     pub shown_copy: Option<CopyIdentity>,
-    /// One hash per entry of `parsed_conversation`, read with it: a reload
-    /// compares them with its read's to find the first changed entry.
-    /// `None` for a file outside every provider's session roots, before the
-    /// first read of a file opened directly, and while an open found the
-    /// copy missing.
-    pub entry_hashes: Option<EntryHashes>,
+    /// One hash per entry of `parsed_conversation`, read with it: a reload's
+    /// read on `viewer-read` shares them, compares them with its copy's and
+    /// reads the entries from the first changed entry on. `None` for a file
+    /// outside every provider's session roots, before the first read of a
+    /// file opened directly, and while an open found the copy missing: the
+    /// reload then reads the whole copy.
+    pub entry_hashes: Option<Arc<EntryHashes>>,
     /// Current scroll position (line offset)
     pub scroll_offset: usize,
     /// Pre-rendered conversation lines, shared with the viewer's search

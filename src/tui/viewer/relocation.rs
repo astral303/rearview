@@ -1,4 +1,4 @@
-use super::{ParsedConversation, ToolOutputId};
+use super::{ParsedConversation, ReplacedEntries, ToolOutputId};
 use crate::history::EntryOrigin;
 use std::collections::{HashMap, HashSet};
 
@@ -14,10 +14,24 @@ pub struct EntryRelocation {
 
 impl EntryRelocation {
     pub fn between(earlier: &ParsedConversation, later: &ParsedConversation) -> Self {
+        Self::of_origins(earlier.origins.clone(), &later.origins)
+    }
+
+    /// The relocation into `conversation` from the entries it had before
+    /// the extension that replaced `replaced`.
+    pub fn after_extension(conversation: &ParsedConversation, replaced: &ReplacedEntries) -> Self {
+        let mut earlier = conversation.origins[..replaced.first_changed].to_vec();
+        earlier.extend_from_slice(&replaced.origins);
+        Self::of_origins(earlier, &conversation.origins)
+    }
+
+    /// The relocation from a read whose entries have the origins `earlier`
+    /// into a read whose entries have the origins `later`, each list in
+    /// entry order.
+    fn of_origins(earlier: Vec<EntryOrigin>, later: &[EntryOrigin]) -> Self {
         Self {
-            earlier: earlier.origins.clone(),
+            earlier,
             later: later
-                .origins
                 .iter()
                 .cloned()
                 .enumerate()

@@ -5,14 +5,14 @@
 use super::format::RecordLine;
 use super::sqlite_cache::{
     CachedCopy, Currency, EntryHashes, HeldCopy, InteractiveCache, InteractiveRead, Publication,
-    SessionAddress,
+    SequencedHashes, SessionAddress,
 };
 use super::{MalformedLine, Source, TranscriptEntries, sniffed_session};
 use crate::error::Result;
 use crate::log_entry::{
     LogEntry, SubagentIdentity, agent_progress_identity, convert_agent_progress,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,6 +29,37 @@ pub struct EntryOrigin {
     part: usize,
 }
 
+impl EntryOrigin {
+    /// Number the parts of `tail` after `kept`. `tail` has the origins of
+    /// the entries that follow the entries of `kept`, with parts counted
+    /// from its own first entry. Each part then counts the earlier entries
+    /// of both lists read from its record, as one read of all the entries
+    /// counts it.
+    pub(crate) fn number_parts_after(kept: &[Self], tail: &mut [Self]) {
+        let tail_lines: HashSet<usize> = tail.iter().map(|origin| origin.record.line).collect();
+        let mut kept_parts: HashMap<&RecordLine, usize> = HashMap::new();
+        // Skip a kept origin on a line the tail doesn't have before its
+        // record is hashed, because the hash reads the transcript's path.
+        for origin in kept {
+            if tail_lines.contains(&origin.record.line) {
+                *kept_parts.entry(&origin.record).or_insert(0) += 1;
+            }
+        }
+        for origin in tail {
+            origin.part += kept_parts.get(&origin.record).copied().unwrap_or(0);
+        }
+    }
+}
+
+/// The identity one `agent_progress` record gives the sub-agent `agent_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedIdentity {
+    /// The index of the record's entry among the displayed entries.
+    pub entry_index: usize,
+    pub agent_id: String,
+    pub identity: SubagentIdentity,
+}
+
 /// The entries the viewer, the terminal printout, exports and the clipboard
 /// copy read. Each `agent_progress` record, spliced from a sub-agent
 /// transcript or recorded inline, is converted into the sub-agent message it
@@ -40,9 +71,9 @@ pub struct DisplayEntries {
     pub entries: Vec<LogEntry>,
     /// Where each entry of `entries` was read, at the same position.
     pub origins: Vec<EntryOrigin>,
-    /// The identity each `agent_progress` record names, by its agent id and
-    /// in record order. The converted message no longer carries it.
-    pub subagent_identities: Vec<(String, SubagentIdentity)>,
+    /// The identity each `agent_progress` record gives its sub-agent, in
+    /// record order. The converted message no longer carries it.
+    pub subagent_identities: Vec<RecordedIdentity>,
     /// The lines of the session file that did not parse. The terminal
     /// printout reports under `--debug` the ones whose text the format kept.
     pub(crate) malformed_lines: Vec<MalformedLine>,
@@ -54,11 +85,15 @@ impl From<Vec<(RecordLine, LogEntry)>> for DisplayEntries {
         let mut parts_read: HashMap<RecordLine, usize> = HashMap::new();
         let mut entries = Vec::with_capacity(normalized.len());
         let mut origins = Vec::with_capacity(normalized.len());
-        for (record, entry) in normalized {
+        for (entry_index, (record, entry)) in normalized.into_iter().enumerate() {
             if let LogEntry::Progress { data, .. } = &entry
                 && let Some((agent_id, identity)) = agent_progress_identity(data)
             {
-                subagent_identities.push((agent_id.to_owned(), identity));
+                subagent_identities.push(RecordedIdentity {
+                    entry_index,
+                    agent_id: agent_id.to_owned(),
+                    identity,
+                });
             }
             let part = parts_read.entry(record.clone()).or_insert(0);
             origins.push(EntryOrigin {
@@ -248,16 +283,8 @@ pub fn viewed_copy_interactively(
     publication: &Publication,
 ) -> InteractiveRead<ViewedCopy> {
     cache.read(|reader| {
-        let viewed_row = |held: &HeldCopy<'_>| -> Result<Option<Box<super::Conversation>>> {
-            let generation = Publication::Published {
-                generation: held.generation(),
-            };
-            Ok(reader
-                .catalogue_row_of(held)?
-                .filter(|row| row.publication == generation)
-                .map(Box::new))
-        };
-        let hashes_and_row = |held: &HeldCopy<'_>| Ok((held.entry_hashes()?, viewed_row(held)?));
+        let hashes_and_row =
+            |held: &HeldCopy<'_>| Ok((held.entry_hashes()?, viewed_row(reader, held)?));
         let Some((entries, currency, (entry_hashes, row))) =
             newest_copy(reader, address, publication, hashes_and_row)?
         else {
@@ -272,6 +299,118 @@ pub fn viewed_copy_interactively(
             currency,
         }))
     })
+}
+
+/// The catalogue row `reader` lists for the copy `held`; `None` when the
+/// cache no longer lists that copy.
+fn viewed_row(
+    reader: &super::sqlite_cache::SqliteCache,
+    held: &HeldCopy<'_>,
+) -> Result<Option<Box<super::Conversation>>> {
+    let generation = Publication::Published {
+        generation: held.generation(),
+    };
+    Ok(reader
+        .catalogue_row_of(held)?
+        .filter(|row| row.publication == generation)
+        .map(Box::new))
+}
+
+/// A reload's read of a session's copy in the cache, for a viewer that
+/// shows an earlier copy: the copy's display entries, whole or from the
+/// first changed entry on, with its entry hashes and catalogue row.
+pub enum RereadCopy {
+    /// Every entry of the copy, as [`viewed_copy_interactively`] reads it.
+    Whole(ViewedCopy),
+    Tail(CopyTail),
+}
+
+/// A copy's entries from the first changed entry on: the first entry whose
+/// hash differs from the shown copy's.
+pub struct CopyTail {
+    /// The index of the first changed entry. It is the copy's entry count
+    /// when the copy has the shown copy's entries, or the first of them
+    /// alone; `entries` is then empty.
+    pub first_changed: usize,
+    /// The entries from the first changed entry on, the only ones the read
+    /// decoded. Each origin's part and each identity's entry index count
+    /// from the first of them.
+    pub entries: DisplayEntries,
+    /// One hash per entry of the whole copy, read in the same snapshot.
+    pub entry_hashes: EntryHashes,
+    /// The copy's catalogue row, as [`ViewedCopy::row`].
+    pub row: Option<Box<super::Conversation>>,
+}
+
+/// The newest copy of the session at `address`, read for a viewer that
+/// shows a copy whose entry hashes are `shown`: in one read snapshot, the
+/// copy's hashes, then its entries from the first changed entry on.
+///
+/// The read decodes the whole copy, as [`viewed_copy_interactively`] does,
+/// when the first changed entry is the first entry.
+pub fn reread_copy_interactively(
+    cache: &InteractiveCache,
+    address: &SessionAddress,
+    publication: &Publication,
+    shown: &EntryHashes,
+) -> InteractiveRead<RereadCopy> {
+    cache.read(|reader| {
+        let read = reader.read_copy_at(address, |held| {
+            let hashes = held.sequenced_entry_hashes()?;
+            let tail = tail_entries(held, shown, &hashes)?;
+            let currency = held.currency(publication)?;
+            let row = viewed_row(reader, held)?;
+            let copy = match tail {
+                Some((first_changed, entries)) => RereadCopy::Tail(CopyTail {
+                    first_changed,
+                    entries: entries.into(),
+                    entry_hashes: hashes.hashes,
+                    row,
+                }),
+                None => RereadCopy::Whole(ViewedCopy {
+                    entries: held.entries()?.into(),
+                    entry_hashes: hashes.hashes,
+                    row,
+                }),
+            };
+            Ok((copy, currency))
+        });
+        let Some((value, currency)) = super::sqlite_cache::found(read)? else {
+            return Ok(None);
+        };
+        Ok(Some(CachedCopy { value, currency }))
+    })
+}
+
+/// The index of the first entry of the copy `held` whose hash in `hashes`
+/// differs from `shown`'s, and the copy's entries from it on; `None` when
+/// the whole copy is to be read (see [`reread_copy_interactively`]).
+///
+/// The count check guards the cache's constraint of one entry per
+/// `sequence` in a session, which gives one entry read per hash from the
+/// first changed entry on. A copy in the cache doesn't fail it.
+fn tail_entries(
+    held: &HeldCopy<'_>,
+    shown: &EntryHashes,
+    hashes: &SequencedHashes,
+) -> Result<Option<(usize, TranscriptEntries)>> {
+    let copy_len = hashes.hashes.len();
+    let first_changed = shown.first_change_in(&hashes.hashes).unwrap_or(copy_len);
+    if first_changed == 0 {
+        return Ok(None);
+    }
+    let Some(first_sequence) = hashes.sequence_at(first_changed) else {
+        let unread = TranscriptEntries {
+            entries: Vec::new(),
+            malformed_lines: Vec::new(),
+        };
+        return Ok(Some((first_changed, unread)));
+    };
+    let entries = held.entries_from(first_sequence)?;
+    if entries.entries.len() != copy_len - first_changed {
+        return Ok(None);
+    }
+    Ok(Some((first_changed, entries)))
 }
 
 /// The newest copy `reader` holds of the session at `address`, its entries
@@ -336,6 +475,187 @@ mod tests {
             .position(|entry| serde_json::to_string(entry).unwrap().contains(text))
             .unwrap();
         displayed.origins[position].clone()
+    }
+
+    /// A Claude session of one prompt per text, written to `path` and
+    /// cached; returns its row.
+    fn cache_prompts(path: &Path, texts: &[&str]) -> crate::history::Conversation {
+        let lines: String = texts
+            .iter()
+            .enumerate()
+            .map(|(second, text)| user_line(text, second) + "\n")
+            .collect();
+        std::fs::write(path, lines).unwrap();
+        crate::history::environment::test_support::cache_session(Source::Claude, path, &[])
+    }
+
+    fn test_cache() -> InteractiveCache {
+        InteractiveCache::at(crate::history::environment::test_support::test_cache_base())
+    }
+
+    /// The whole copy of `row`'s session, as the viewer's open reads it.
+    fn whole_copy(row: &crate::history::Conversation) -> ViewedCopy {
+        crate::history::environment::test_support::current_copy(viewed_copy_interactively(
+            &test_cache(),
+            row.cache_address.as_ref().unwrap(),
+            &row.publication,
+        ))
+    }
+
+    /// The copy of `row`'s session, read for a viewer that shows `shown`.
+    fn reread_after(row: &crate::history::Conversation, shown: &ViewedCopy) -> RereadCopy {
+        crate::history::environment::test_support::current_copy(reread_copy_interactively(
+            &test_cache(),
+            row.cache_address.as_ref().unwrap(),
+            &row.publication,
+            &shown.entry_hashes,
+        ))
+    }
+
+    /// The tail a reread returned; panics for a whole copy.
+    fn tail_of(reread: RereadCopy, case: &str) -> CopyTail {
+        match reread {
+            RereadCopy::Tail(tail) => tail,
+            RereadCopy::Whole(_) => panic!("{case}: the read returns a tail"),
+        }
+    }
+
+    #[test]
+    fn reread_decodes_entries_from_first_changed_entry_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let shown = whole_copy(&cache_prompts(&path, &["a", "b", "c", "d"]));
+        let changes: [(&str, &[&str], usize); 2] = [
+            ("two prompts appended", &["a", "b", "c", "d", "e", "f"], 4),
+            ("third prompt edited", &["a", "b", "c, edited", "d"], 2),
+        ];
+
+        for (case, texts, first_changed) in changes {
+            let row = cache_prompts(&path, texts);
+            let whole = whole_copy(&row);
+            let tail = tail_of(reread_after(&row, &shown), case);
+
+            assert_eq!(
+                (tail.first_changed, tail.entries.entries.len()),
+                (first_changed, texts.len() - first_changed),
+                "{case}: the read decodes the entries from the first changed entry on alone"
+            );
+            assert_eq!(
+                format!("{:?}", (&tail.entries.entries, &tail.entries.origins)),
+                format!(
+                    "{:?}",
+                    (
+                        &whole.entries.entries[first_changed..],
+                        &whole.entries.origins[first_changed..]
+                    )
+                ),
+                "{case}: the tail's entries are the whole read's from the first changed entry on"
+            );
+            assert_eq!(
+                tail.entry_hashes, whole.entry_hashes,
+                "{case}: the tail comes with one hash per entry of the whole copy"
+            );
+        }
+    }
+
+    #[test]
+    fn reread_of_copy_with_equal_kept_entries_doesnt_decode_any_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let shown = whole_copy(&cache_prompts(&path, &["a", "b", "c"]));
+
+        let mut transcript = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut transcript, b"\n").unwrap();
+        drop(transcript);
+        let row =
+            crate::history::environment::test_support::cache_session(Source::Claude, &path, &[]);
+        let equal = tail_of(reread_after(&row, &shown), "an equal copy");
+        let shorter = tail_of(
+            reread_after(&cache_prompts(&path, &["a", "b"]), &shown),
+            "a shorter copy",
+        );
+
+        assert_eq!(
+            (equal.first_changed, equal.entries.entries.len()),
+            (3, 0),
+            "a copy with the shown entries: the first changed entry is its entry count, and \
+             no entry is decoded"
+        );
+        assert_eq!(
+            (
+                shorter.first_changed,
+                shorter.entries.entries.len(),
+                shorter.entry_hashes.len()
+            ),
+            (2, 0, 2),
+            "a copy with the first two shown entries alone: no entry is decoded"
+        );
+    }
+
+    #[test]
+    fn reread_of_copy_changed_at_first_entry_reads_whole_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let shown = whole_copy(&cache_prompts(&path, &["a", "b", "c"]));
+
+        let row = cache_prompts(&path, &["a, edited", "b", "c"]);
+        let reread = reread_after(&row, &shown);
+
+        let RereadCopy::Whole(copy) = reread else {
+            panic!("a copy changed at its first entry is read whole");
+        };
+        assert_eq!(
+            (copy.entries.entries.len(), copy.entry_hashes.len()),
+            (3, 3),
+            "the whole read decodes every entry and returns one hash per entry"
+        );
+    }
+
+    #[test]
+    fn sub_agents_identity_is_recorded_with_its_entrys_index() {
+        let progress = |nickname: &str| LogEntry::Progress {
+            data: serde_json::json!({
+                "type": "agent_progress",
+                "agentId": "thread-a",
+                "identity": {"nickname": nickname},
+                "message": {
+                    "type": "user",
+                    "message": {"role": "user", "content": [{"type": "text", "text": "turn"}]}
+                }
+            }),
+            extra: serde_json::json!({}),
+        };
+        let parent: LogEntry = serde_json::from_str(&user_line("parent", 0)).unwrap();
+
+        let displayed = DisplayEntries::from(vec![
+            (1, parent.clone()),
+            (2, progress("Lorentz")),
+            (3, parent),
+            (4, progress("Hubble")),
+        ]);
+
+        let recorded: Vec<(usize, &str, Option<&str>)> = displayed
+            .subagent_identities
+            .iter()
+            .map(|recorded| {
+                (
+                    recorded.entry_index,
+                    recorded.agent_id.as_str(),
+                    recorded.identity.nickname.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (1, "thread-a", Some("Lorentz")),
+                (3, "thread-a", Some("Hubble"))
+            ],
+            "each identity is recorded with the index of its record's entry"
+        );
     }
 
     #[test]

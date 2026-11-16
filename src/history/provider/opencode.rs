@@ -718,9 +718,11 @@ fn session_id_of(path: &Path) -> Result<String> {
 pub(super) mod tests {
     use super::*;
     use crate::clock::TestClock;
+    use crate::history::format::RecordLine;
     use crate::history::format::opencode::fixture::{self, SessionSpec};
     use crate::history::provider::contract_tests::{
-        AgentSession, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture, copy_file,
+        AgentSession, EarlierRecords, ExpectedCommand, FixtureIds, IdCase, Marker, ProviderFixture,
+        RecordTranscript, RewritableSession, copy_file,
     };
     use crate::history::provider::walk::SystemLister;
     use serde_json::json;
@@ -754,6 +756,151 @@ pub(super) mod tests {
         let database = contract_database(home);
         subagent_session(&Connection::open(&database).unwrap(), subagent, parent);
         database.join(format!("{subagent}.jsonl"))
+    }
+
+    /// A session of messages and parts in a database, with `original`, a
+    /// copy of the whole database in a temporary folder of its own. A record
+    /// is a part: line N is the session's Nth part by creation time.
+    struct RewritableDatabaseSession {
+        database: PathBuf,
+        locator: PathBuf,
+        original: PathBuf,
+        _original_folder: tempfile::TempDir,
+    }
+
+    impl RewritableDatabaseSession {
+        /// The session at `locator`, a path below its database's.
+        fn of(locator: &Path) -> Self {
+            let database = locator
+                .ancestors()
+                .find(|path| path.is_file())
+                .expect("a session's path is below its database's")
+                .to_path_buf();
+            let original_folder = tempfile::tempdir().unwrap();
+            let original = original_folder.path().join("original.db");
+            std::fs::copy(&database, &original).unwrap();
+            Self {
+                database,
+                locator: locator.to_path_buf(),
+                original,
+                _original_folder: original_folder,
+            }
+        }
+
+        /// The id of the session `transcript` is: the path's stem.
+        fn session_id<'a>(&'a self, transcript: &'a RecordTranscript) -> &'a str {
+            transcript
+                .as_deref()
+                .unwrap_or(&self.locator)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("a session's path ends in its id")
+        }
+
+        /// The part `record` numbers: its id and its data.
+        fn part(
+            &self,
+            connection: &Connection,
+            record: &RecordLine,
+        ) -> (String, serde_json::Value) {
+            let (id, data): (String, String) = connection
+                .query_row(
+                    "SELECT id, data FROM part WHERE session_id = ?1 \
+                     ORDER BY time_created, id LIMIT 1 OFFSET ?2",
+                    rusqlite::params![
+                        self.session_id(&record.transcript),
+                        (record.line - 1) as i64
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            (id, serde_json::from_str(&data).unwrap())
+        }
+
+        /// Write the part `record` numbers as the part of a running call:
+        /// without its output and its end time.
+        fn write_call_running(&self, connection: &Connection, record: &RecordLine) {
+            let (id, mut part) = self.part(connection, record);
+            let state = part["state"].as_object_mut().unwrap();
+            state.insert("status".to_owned(), json!("running"));
+            state.remove("output");
+            if let Some(time) = state.get_mut("time").and_then(|time| time.as_object_mut()) {
+                time.remove("end");
+            }
+            connection
+                .execute(
+                    "UPDATE part SET data = ?1, time_updated = time_updated - 1 WHERE id = ?2",
+                    rusqlite::params![part.to_string(), id],
+                )
+                .unwrap();
+        }
+    }
+
+    impl RewritableSession for RewritableDatabaseSession {
+        /// Every session of the database can lack its later parts.
+        fn can_cut(&self, _transcript: &RecordTranscript) -> bool {
+            true
+        }
+
+        fn is_finished_call_written_running_first(&self, record: &RecordLine) -> bool {
+            let (_, part) = self.part(&Connection::open(&self.database).unwrap(), record);
+            part["type"] == "tool" && part["state"]["status"] == "completed"
+        }
+
+        fn write_earlier(&self, earlier: &EarlierRecords) {
+            let connection = Connection::open(&self.database).unwrap();
+            for (transcript, kept) in &earlier.records_kept {
+                let session = self.session_id(transcript);
+                connection
+                    .execute(
+                        "DELETE FROM part WHERE session_id = ?1 AND id IN \
+                         (SELECT id FROM part WHERE session_id = ?1 \
+                          ORDER BY time_created, id LIMIT -1 OFFSET ?2)",
+                        rusqlite::params![session, *kept as i64],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "DELETE FROM message WHERE session_id = ?1 \
+                         AND id NOT IN (SELECT message_id FROM part)",
+                        [session],
+                    )
+                    .unwrap();
+            }
+            if let Some(record) = &earlier.running_call {
+                self.write_call_running(&connection, record);
+            }
+        }
+
+        /// Put back the messages and parts missing from the database, and
+        /// every part's data, from the copy of the whole database.
+        fn write_whole(&self) {
+            let connection = Connection::open(&self.database).unwrap();
+            connection
+                .execute(
+                    "ATTACH DATABASE ?1 AS original",
+                    [self.original.to_string_lossy()],
+                )
+                .unwrap();
+            for table in ["message", "part"] {
+                connection
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} SELECT * FROM original.{table} \
+                             WHERE id NOT IN (SELECT id FROM {table})"
+                        ),
+                        [],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "UPDATE part SET (data, time_updated) = \
+                     (SELECT data, time_updated FROM original.part whole WHERE whole.id = part.id)",
+                    [],
+                )
+                .unwrap();
+        }
     }
 
     /// OpenCode's sessions for the provider contracts in `contract_tests`.
@@ -824,6 +971,12 @@ pub(super) mod tests {
         /// directory.
         fn listed_directory_of(&self, _locator: &Path) -> Option<PathBuf> {
             None
+        }
+
+        /// OpenCode writes a session as rows of a database, and writes the
+        /// part of a running call again once the call finishes.
+        fn rewritable_session(&self, stub: &SessionStub) -> Box<dyn RewritableSession> {
+            Box::new(RewritableDatabaseSession::of(&stub.locator))
         }
 
         /// OpenCode keeps sessions in a database, so this session is built

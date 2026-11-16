@@ -28,16 +28,38 @@ pub(crate) fn finish_pending_view_reload(app: &mut App, viewport_height: usize) 
 }
 
 /// Shows the viewer's pending render once it arrives, as the event loop
-/// does, failing after [`VIEWER_READ_LANDS`]. Does nothing without a pending
-/// render.
+/// does, failing after [`VIEWER_READ_LANDS`]. A reload's tail waiting for a
+/// render to free the shown conversation is put in place on the way, and
+/// its render shown. Does nothing without a pending render or a waiting
+/// tail.
 pub(crate) fn finish_view_render(app: &mut App, viewport_height: usize) {
     let deadline = std::time::Instant::now() + VIEWER_READ_LANDS;
-    while app.is_view_render_pending() {
+    while app.is_view_render_pending() || app.is_tail_waiting_for_conversation() {
         assert!(
             std::time::Instant::now() < deadline,
             "the viewer's render arrives within {VIEWER_READ_LANDS:?}"
         );
+        if app.is_tail_waiting_for_conversation() {
+            app.complete_pending_view_refresh(Duration::ZERO);
+        }
         app.receive_view_render(viewport_height, Duration::from_millis(10));
+    }
+}
+
+/// Puts the reload's waiting tail after the entries the view keeps, once the
+/// render sharing the shown conversation frees it, as the event loop's
+/// passes do, failing after [`VIEWER_READ_LANDS`]. Does nothing without a
+/// waiting tail.
+pub(crate) fn finish_waiting_tail(app: &mut App) {
+    let deadline = std::time::Instant::now() + VIEWER_READ_LANDS;
+    while app.is_tail_waiting_for_conversation() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the render sharing the shown conversation frees it within {VIEWER_READ_LANDS:?}"
+        );
+        if !app.complete_pending_view_refresh(Duration::ZERO) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

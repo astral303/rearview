@@ -291,6 +291,7 @@ pub(super) fn conversation_of(entries: Vec<RenderableEntry>) -> ParsedConversati
     ParsedConversation {
         entries,
         origins: Vec::new(),
+        subagent_identities: Vec::new(),
         roster: SubagentRoster::default(),
         lanes,
         activity_span: None,
@@ -624,6 +625,7 @@ fn sub_agents_reply_and_output_render_in_place_as_in_whole_render() {
     let conversation = ParsedConversation {
         entries,
         origins: Vec::new(),
+        subagent_identities: Vec::new(),
         roster,
         lanes,
         activity_span: None,
