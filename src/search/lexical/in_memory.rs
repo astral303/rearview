@@ -1,13 +1,13 @@
-//! Each listed session's search texts in the session list's fields, read
-//! from the session cache into memory, so a search of the list scans memory
-//! instead of reading the cache. The texts stay as the cache stores them.
+//! Each listed session's search texts, read from the session cache into
+//! memory, so a search of the list scans memory instead of reading the
+//! cache. The texts stay as the cache stores them.
 
 use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
     CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScanScope, ScannedCopy,
-    ScannedRow, SearchField, SearchedFields, SessionKey, TextVisitor, scan_search_texts,
+    ScannedRow, SearchField, SessionKey, TextVisitor, scan_search_texts,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -16,11 +16,11 @@ use std::collections::HashMap;
 use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 
-/// One session's search texts in the session list's fields, as the session
-/// cache stores them: the dialogue, then the other fields' texts. Each of
-/// the two holds the text outside every message, then each message's texts
-/// in message order, each after a separator as `full_text` lays out its
-/// parts. The title and the summary are the row's (see
+/// One session's search texts, as the session cache stores them: the
+/// dialogue, then sub-agents' text, the sub-agent metadata, and thinking and
+/// tool calls. Each field holds the text outside every message, then each
+/// message's texts in message order, each after a separator as `full_text`
+/// lays out its parts. The title and the summary are the row's (see
 /// [`Conversation::title_and_summary_texts`]).
 pub struct SessionSearchTexts {
     joined: Arc<str>,
@@ -65,22 +65,29 @@ impl SessionSearchTexts {
     }
 }
 
-/// The fields a text's layout tells apart: the dialogue, the `Full` field's
-/// texts, is laid out ahead of the other fields' texts.
+/// A text's field group, in the order a parsed row joins its texts:
+/// `full_text`, then `agent_search_text` (sub-agents' text, ending with the
+/// sub-agent metadata), then `thinking_and_tool_call_text`. A row read from
+/// the cache then shows the context line a parsed row shows.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum FieldGroup {
     Dialogue,
-    OtherFields,
+    SubagentText,
+    SubagentMetadata,
+    ThinkingAndToolCalls,
+    /// Semantic turns are not search texts; a read of search texts doesn't
+    /// return any.
+    SemanticTurns,
 }
 
 impl FieldGroup {
     fn of(field: SearchField) -> Self {
         match field {
             SearchField::Full => Self::Dialogue,
-            SearchField::Agent
-            | SearchField::Thinking
-            | SearchField::Supplement
-            | SearchField::Semantic => Self::OtherFields,
+            SearchField::Agent => Self::SubagentText,
+            SearchField::Supplement => Self::SubagentMetadata,
+            SearchField::Thinking => Self::ThinkingAndToolCalls,
+            SearchField::Semantic => Self::SemanticTurns,
         }
     }
 }
@@ -112,11 +119,10 @@ fn layout_key(field: SearchField, ordinal: Option<usize>, order: ReadOrder) -> L
     (FieldGroup::of(field), Placement::of(ordinal), order)
 }
 
-/// The texts of `held` in the session list's fields, in the order its read
-/// returns them.
+/// The search texts of `held`, in the order its read returns them.
 fn texts_in_read_order(held: &HeldCopy<'_>) -> Result<TextsInReadOrder> {
     let mut read = TextsInReadOrder::default();
-    held.visit_search_texts(SearchedFields::List, &TimeFilter::default(), |text| {
+    held.visit_search_texts(&TimeFilter::default(), |text| {
         read.push(layout_key(text.field, text.ordinal, text.order), text.text);
         ControlFlow::Continue(())
     })?;
@@ -250,7 +256,6 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
     let references = copies.iter().collect::<Vec<_>>();
     let scanned = scan_search_texts(
         &references,
-        SearchedFields::List,
         &TimeFilter::default(),
         ScanScope::AllWorkspaces,
         TextCollector::default,

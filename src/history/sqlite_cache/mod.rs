@@ -72,7 +72,6 @@ pub(crate) use refill::recorded_cache_bytes;
 pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_copy_when_unlocked, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart, SemanticTurns};
-pub(crate) use search_texts::SearchedFields;
 pub(crate) use semantic_scan::{ScannedTurns, scan_semantic_turns};
 pub(crate) use text_scan::{ReadOrder, ScanScope, ScannedRow, TextVisitor, scan_search_texts};
 pub(crate) use window::{InPlaceRow, StoredFile, StoredResume, StoredTurn, WindowUpdate};

@@ -7,7 +7,8 @@
 //! tasks and rechecks the sessions read.
 
 use super::copies_scan::{CopiesScan, KeySplit, ScannedCopies, SessionsById, scan_copies};
-use super::{CachedSession, HeldCopy, SearchField, SearchedFields};
+use super::search_texts::searched_part_field_codes;
+use super::{CachedSession, HeldCopy, SearchField};
 use crate::error::Result;
 use crate::time_filter::TimeFilter;
 use rusqlite::Connection;
@@ -40,11 +41,11 @@ pub(crate) trait TextVisitor: Send {
     /// True when the scan is to look up `text`'s row and keep it.
     fn examine(&mut self, text: &str) -> bool;
     /// `text`, the text last examined, belongs to a scanned copy, inside the
-    /// fields and the window scanned.
+    /// window scanned.
     fn keep(&mut self, row: &ScannedRow, text: &str);
     /// The scanned copy at `copy` holds a text with more than whitespace
-    /// inside the fields and the window scanned. Called at most once per
-    /// copy and task, before the copy's first [`Self::keep`] in the task.
+    /// inside the window scanned. Called at most once per copy and task,
+    /// before the copy's first [`Self::keep`] in the task.
     fn holds_text(&mut self, _copy: usize) {}
 }
 
@@ -62,24 +63,24 @@ pub(super) enum LayoutGroup {
 const SCANNED_PART_COLUMNS: &str =
     "session, entry_sequence, message_ordinal, search_position, search_field, text";
 
-/// The parts holding search text in `fields` with ids from `?1` to `?2`, of
+/// The entries' parts holding search text with ids from `?1` to `?2`, of
 /// the sessions `only` keeps.
-fn parts_in_rows(fields: SearchedFields, only: &SessionFilter) -> String {
+fn parts_in_rows(only: &SessionFilter) -> String {
     format!(
         "SELECT {SCANNED_PART_COLUMNS} FROM parts WHERE id BETWEEN ?1 AND ?2 \
          AND search_field IN ({}) AND text IS NOT NULL{}",
-        fields.part_field_codes(),
+        searched_part_field_codes(),
         only.session_filter_through_index(),
     )
 }
 
-/// The parts holding search text in `fields` of the messages of the session
+/// The entries' parts holding search text of the messages of the session
 /// `?1` numbered from `?2` to `?3`, read through `parts_by_message`.
-pub(super) fn parts_of_messages(fields: SearchedFields) -> String {
+pub(super) fn parts_of_messages() -> String {
     format!(
         "SELECT {SCANNED_PART_COLUMNS} FROM parts WHERE session = ?1 \
          AND message_ordinal BETWEEN ?2 AND ?3 AND search_field IN ({}) AND text IS NOT NULL",
-        fields.part_field_codes(),
+        searched_part_field_codes(),
     )
 }
 
@@ -101,15 +102,13 @@ pub(crate) enum ScanScope {
     AllWorkspaces,
 }
 
-/// Calls `visitor()`'s methods for each search text in `fields` of the
-/// sessions `copies` read, within `window`: with `window` active, only the
-/// texts of messages inside it, without the title, the summary or text
-/// outside every message. `scope` is the selection `copies` came from.
-/// Scans as [`scan_copies`] does, one visitor per task, and reads a replaced
-/// copy with `read_alone`.
+/// Calls `visitor()`'s methods for each search text of the sessions `copies`
+/// read, within `window`: with `window` active, only the texts of messages
+/// inside it, without the title, the summary or text outside every message.
+/// `scope` is the selection `copies` came from. Scans as [`scan_copies`]
+/// does, one visitor per task, and reads a replaced copy with `read_alone`.
 pub(crate) fn scan_search_texts<V: TextVisitor, A>(
     copies: &[&CachedSession],
-    fields: SearchedFields,
     window: &TimeFilter,
     scope: ScanScope,
     visitor: impl Fn() -> V + Sync,
@@ -125,7 +124,6 @@ pub(crate) fn scan_search_texts<V: TextVisitor, A>(
                 scan: Scan {
                     only: SessionFilter::of(connection, &sessions)?,
                     sessions,
-                    fields,
                     window,
                 },
                 visitor: &visitor,
@@ -177,7 +175,6 @@ impl<V: TextVisitor, F: Fn() -> V + Sync> CopiesScan for TextScan<'_, F> {
 struct Scan {
     sessions: SessionsById,
     only: SessionFilter,
-    fields: SearchedFields,
     window: Option<MessagesInWindow>,
 }
 
@@ -384,7 +381,7 @@ impl Scan {
     /// The scan's tasks, read on `connection`. With a window, the parts of
     /// each run of messages inside it. Without one, the parts in row ranges
     /// from the scanned sessions' least to their greatest part id, then the
-    /// sub-agent metadata when `fields` reads it.
+    /// sub-agent metadata.
     fn tasks(&self, connection: &Connection) -> Result<Vec<ScanTask>> {
         if let Some(window) = &self.window {
             return Ok(window.runs().collect());
@@ -395,9 +392,7 @@ impl Scan {
             KeySplit::of_sessions_parts(connection, self.sessions.keys().copied())?
         };
         let mut tasks = split.ranges().map(ScanTask::Parts).collect::<Vec<_>>();
-        if matches!(self.fields, SearchedFields::Agent) {
-            tasks.push(ScanTask::SubagentMetadata);
-        }
+        tasks.push(ScanTask::SubagentMetadata);
         Ok(tasks)
     }
 }
@@ -479,15 +474,14 @@ struct TaskScan<'s> {
 
 impl TaskScan<'_> {
     fn scan(&mut self, task: ScanTask, visitor: &mut impl TextVisitor) -> Result<()> {
-        let fields = self.scan.fields;
         match task {
             ScanTask::Parts(rows) => self.scan_parts(
-                &parts_in_rows(fields, &self.scan.only),
+                &parts_in_rows(&self.scan.only),
                 &[*rows.start(), *rows.end()],
                 visitor,
             ),
             ScanTask::Messages { session, ordinals } => self.scan_parts(
-                &parts_of_messages(fields),
+                &parts_of_messages(),
                 &[session, *ordinals.start(), *ordinals.end()],
                 visitor,
             ),
@@ -680,19 +674,15 @@ mod tests {
         copies
     }
 
-    /// Every text the scan keeps in `fields` within `window`, by copy, each
-    /// copy's texts in their session's order.
+    /// Every text the scan keeps within `window`, by copy, each copy's texts
+    /// in their session's order.
     fn kept_rows(
         copies: &[&CachedSession],
-        fields: SearchedFields,
         window: &TimeFilter,
         scope: ScanScope,
     ) -> Vec<(usize, PlacedText)> {
         let scanned =
-            scan_search_texts(copies, fields, window, scope, KeepEvery::default, |_, _| {
-                Ok(())
-            })
-            .unwrap();
+            scan_search_texts(copies, window, scope, KeepEvery::default, |_, _| Ok(())).unwrap();
         assert!(
             scanned
                 .copies
@@ -710,16 +700,12 @@ mod tests {
         kept
     }
 
-    /// Every text of `copy` in `fields` within `window`, read by range, in
-    /// its session's order.
-    fn read_by_range(
-        copy: &CachedSession,
-        fields: SearchedFields,
-        window: &TimeFilter,
-    ) -> Vec<PlacedText> {
+    /// Every text of `copy` within `window`, read by range, in its session's
+    /// order.
+    fn read_by_range(copy: &CachedSession, window: &TimeFilter) -> Vec<PlacedText> {
         let mut read = Vec::new();
         copy.read_copy(|held| {
-            held.visit_search_texts(fields, window, |text| {
+            held.visit_search_texts(window, |text| {
                 read.push((
                     text.order,
                     text.ordinal,
@@ -742,7 +728,6 @@ mod tests {
 
         let kept = kept_rows(
             &references,
-            SearchedFields::Agent,
             &TimeFilter::default(),
             ScanScope::AllWorkspaces,
         );
@@ -810,7 +795,6 @@ mod tests {
         let replace = || super::super::tests::replace_copy(&copies[1]);
         let scanned = scan_search_texts(
             &references,
-            SearchedFields::Agent,
             &TimeFilter::default(),
             ScanScope::AllWorkspaces,
             || WritesDuringScan {
@@ -854,10 +838,10 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies_with_texts_outside_messages(base.path());
         let references = copies.iter().collect::<Vec<_>>();
-        let (fields, window) = (SearchedFields::Agent, TimeFilter::default());
+        let window = TimeFilter::default();
         let own = copies
             .iter()
-            .map(|copy| read_by_range(copy, fields, &window))
+            .map(|copy| read_by_range(copy, &window))
             .collect::<Vec<_>>();
         let (before, during) = (0, 2);
         super::super::tests::mark_writing(&copies[before]);
@@ -866,7 +850,6 @@ mod tests {
 
         let scanned = scan_search_texts(
             &references,
-            fields,
             &window,
             ScanScope::AllWorkspaces,
             || WritesDuringScan {
@@ -946,7 +929,6 @@ mod tests {
         }) {
             let visitors = scan_search_texts(
                 scanned,
-                SearchedFields::Agent,
                 &TimeFilter::default(),
                 scope,
                 KeepEvery::default,
@@ -1043,11 +1025,11 @@ mod tests {
         );
         for (query, read) in [
             (
-                parts_in_rows(SearchedFields::Agent, &every),
+                parts_in_rows(&every),
                 "SEARCH parts USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)",
             ),
             (
-                parts_in_rows(SearchedFields::Agent, &some),
+                parts_in_rows(&some),
                 "SEARCH parts USING INDEX parts_by_session (session=? AND rowid>? AND rowid<?)",
             ),
             (
@@ -1115,28 +1097,26 @@ mod tests {
             after: Some(crate::clock::Zone::System.timestamp_opt(0, 0).unwrap()),
             before: None,
         };
-        for fields in [SearchedFields::List, SearchedFields::Agent] {
-            for window in [TimeFilter::default(), since_1970] {
-                for scope in [ScanScope::Project, ScanScope::AllWorkspaces] {
-                    let scanned = kept_rows(&references, fields, &window, scope);
-                    for (position, copy) in copies.iter().enumerate() {
-                        let from_scan = scanned
-                            .iter()
-                            .filter(|(copy, _)| *copy == position)
-                            .map(|(_, text)| text.clone())
-                            .collect::<Vec<_>>();
-                        let source = copy.address().source;
-                        assert!(
-                            !from_scan.is_empty(),
-                            "{source:?}, window {window:?}, {scope:?}: the scan finds texts"
-                        );
-                        assert_eq!(
-                            read_by_range(copy, fields, &window),
-                            from_scan,
-                            "{source:?}, window {window:?}, {scope:?}: the range reads return \
-                             the scan's texts, places and fields"
-                        );
-                    }
+        for window in [TimeFilter::default(), since_1970] {
+            for scope in [ScanScope::Project, ScanScope::AllWorkspaces] {
+                let scanned = kept_rows(&references, &window, scope);
+                for (position, copy) in copies.iter().enumerate() {
+                    let from_scan = scanned
+                        .iter()
+                        .filter(|(copy, _)| *copy == position)
+                        .map(|(_, text)| text.clone())
+                        .collect::<Vec<_>>();
+                    let source = copy.address().source;
+                    assert!(
+                        !from_scan.is_empty(),
+                        "{source:?}, window {window:?}, {scope:?}: the scan finds texts"
+                    );
+                    assert_eq!(
+                        read_by_range(copy, &window),
+                        from_scan,
+                        "{source:?}, window {window:?}, {scope:?}: the range reads return \
+                         the scan's texts, places and fields"
+                    );
                 }
             }
         }
@@ -1181,7 +1161,6 @@ mod tests {
                 let tasks = Scan {
                     only: SessionFilter::of(connection, &sessions)?,
                     sessions,
-                    fields: SearchedFields::Agent,
                     window: None,
                 }
                 .tasks(connection)?;
@@ -1203,7 +1182,7 @@ mod tests {
         );
         assert!(
             tasks.contains(&ScanTask::SubagentMetadata),
-            "the agent fields' scan reads the sub-agent metadata: {tasks:?}"
+            "the scan reads the sub-agent metadata: {tasks:?}"
         );
     }
 }

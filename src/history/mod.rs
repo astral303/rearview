@@ -222,7 +222,7 @@ pub struct Conversation {
     pub agent_search_text: String,
     /// Whole thinking and each tool call's
     /// [`tool_call_text`](crate::agent::transcript::tool_call_text), the
-    /// session's and its sub-agents'. Only `agent search` reads it.
+    /// session's and its sub-agents'.
     pub thinking_and_tool_call_text: String,
     pub semantic_turns: Vec<String>,
     pub semantic_turn_ranges: Vec<crate::agent::refs::MessageRange>,

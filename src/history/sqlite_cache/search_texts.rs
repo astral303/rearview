@@ -43,33 +43,21 @@ impl FromSql for SearchField {
     }
 }
 
-/// The fields a search reads.
-#[derive(Clone, Copy)]
-pub(crate) enum SearchedFields {
-    /// The session list's: the session's text, title and summary.
-    List,
-    /// `agent search`'s: also sub-agents' text, thinking, tool calls and the
-    /// text of sub-agent transcripts outside their turns.
-    Agent,
-}
+/// The fields lexical search reads in the `search_field` column of an
+/// entry's parts: the dialogue, sub-agents' text, thinking and tool calls.
+/// The session list's search and `agent search` read the same fields. The
+/// sub-agent metadata parts, outside every entry, are read by their own
+/// statement.
+const SEARCHED_PART_FIELDS: [SearchField; 3] =
+    [SearchField::Full, SearchField::Agent, SearchField::Thinking];
 
-impl SearchedFields {
-    /// The fields read in the `search_field` column of `parts`.
-    fn part_fields(self) -> &'static [SearchField] {
-        match self {
-            Self::List => &[SearchField::Full],
-            Self::Agent => &[SearchField::Full, SearchField::Agent, SearchField::Thinking],
-        }
-    }
-
-    /// The codes of [`Self::part_fields`], as an SQL list.
-    pub(super) fn part_field_codes(self) -> String {
-        self.part_fields()
-            .iter()
-            .map(|field| field.code().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
+/// The codes of [`SEARCHED_PART_FIELDS`], as an SQL list.
+pub(super) fn searched_part_field_codes() -> String {
+    SEARCHED_PART_FIELDS
+        .iter()
+        .map(|field| field.code().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One stored search text.
@@ -84,20 +72,18 @@ pub(crate) struct SearchText<'a> {
     pub(crate) text: &'a str,
 }
 
-/// Calls `visit` with each search text in `fields` of the session row
-/// `session`, each placed in the session by its `order`, until `visit`
-/// breaks. With `window` active, reads only the texts of messages inside it,
-/// without text outside every message. Leaves out the session's title and
-/// summary: search reads them from the listed row, to match a name changed
-/// outside the transcript.
+/// Calls `visit` with each search text of the session row `session`, each
+/// placed in the session by its `order`, until `visit` breaks. With `window`
+/// active, reads only the texts of messages inside it, without text outside
+/// every message. Leaves out the session's title and summary: search reads
+/// them from the listed row, to match a name changed outside the transcript.
 pub(super) fn visit_texts_within(
     connection: &Connection,
     session: i64,
-    fields: SearchedFields,
     window: &TimeFilter,
     mut visit: impl FnMut(SearchText<'_>) -> ControlFlow<()>,
 ) -> Result<()> {
-    let read = SessionRead::new(connection, session, fields, StoredWindow::of(window))?;
+    let read = SessionRead::new(connection, session, StoredWindow::of(window))?;
     let _ = read.visit_texts(&mut visit)?;
     Ok(())
 }
@@ -113,21 +99,21 @@ const SUBAGENT_METADATA_READ: &str =
 const READ_PART_COLUMNS: &str =
     "entry_sequence, message_ordinal, search_position, search_field, text";
 
-/// The session `?1`'s parts holding search text in `fields`.
-fn parts_query(fields: SearchedFields) -> String {
+/// The session `?1`'s entries' parts holding search text.
+fn parts_query() -> String {
     format!(
         "SELECT {READ_PART_COLUMNS} FROM parts WHERE session = ?1 AND search_field IN ({})",
-        fields.part_field_codes()
+        searched_part_field_codes()
     )
 }
 
-/// The session `?1`'s parts holding search text in `fields` of its messages
+/// The session `?1`'s entries' parts holding search text of its messages
 /// numbered from `?2` to `?3`.
-fn parts_of_messages_query(fields: SearchedFields) -> String {
+fn parts_of_messages_query() -> String {
     format!(
         "SELECT {READ_PART_COLUMNS} FROM parts WHERE session = ?1 \
          AND message_ordinal BETWEEN ?2 AND ?3 AND search_field IN ({})",
-        fields.part_field_codes()
+        searched_part_field_codes()
     )
 }
 
@@ -135,24 +121,17 @@ fn parts_of_messages_query(fields: SearchedFields) -> String {
 struct SessionRead<'c> {
     connection: &'c Connection,
     session: i64,
-    fields: SearchedFields,
     window: Option<MessagesInWindow>,
 }
 
 impl<'c> SessionRead<'c> {
-    fn new(
-        connection: &'c Connection,
-        session: i64,
-        fields: SearchedFields,
-        window: Option<StoredWindow>,
-    ) -> Result<Self> {
+    fn new(connection: &'c Connection, session: i64, window: Option<StoredWindow>) -> Result<Self> {
         let window = window
             .map(|window| MessagesInWindow::of_session(connection, window, session))
             .transpose()?;
         Ok(Self {
             connection,
             session,
-            fields,
             window,
         })
     }
@@ -168,10 +147,7 @@ impl<'c> SessionRead<'c> {
         if self.window.is_some() {
             return Ok(ControlFlow::Continue(()));
         }
-        match self.fields {
-            SearchedFields::List => Ok(ControlFlow::Continue(())),
-            SearchedFields::Agent => self.visit_subagent_metadata(visit),
-        }
+        self.visit_subagent_metadata(visit)
     }
 
     /// Visits the parts holding search text, of every kind: with a window,
@@ -181,12 +157,10 @@ impl<'c> SessionRead<'c> {
         visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
     ) -> Result<ControlFlow<()>> {
         let Some(window) = &self.window else {
-            let mut statement = self.connection.prepare_cached(&parts_query(self.fields))?;
+            let mut statement = self.connection.prepare_cached(&parts_query())?;
             return Self::visit_rows(statement.query([self.session])?, visit);
         };
-        let mut statement = self
-            .connection
-            .prepare_cached(&parts_of_messages_query(self.fields))?;
+        let mut statement = self.connection.prepare_cached(&parts_of_messages_query())?;
         for run in window.runs_of(self.session) {
             let rows = statement.query([self.session, *run.start(), *run.end()])?;
             if Self::visit_rows(rows, visit)?.is_break() {
@@ -257,33 +231,31 @@ mod tests {
         connection
             .execute_batch(super::super::schema::CREATE)
             .unwrap();
-        for fields in [SearchedFields::List, SearchedFields::Agent] {
-            for (query, index) in [
-                (parts_query(fields), "parts_by_session"),
-                (parts_of_messages_query(fields), "parts_by_message"),
-                (SUBAGENT_METADATA_READ.to_owned(), "parts_outside_entries"),
-                (parts_of_messages(fields), "parts_by_message"),
-            ] {
-                let mut statement = connection
-                    .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
-                    .unwrap();
-                let parameters = vec![1; statement.parameter_count()];
-                let plan = statement
-                    .query_map(rusqlite::params_from_iter(parameters), |row| {
-                        row.get::<_, String>(3)
-                    })
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap()
-                    .join("\n");
-                assert!(
-                    plan.contains(&format!("SEARCH parts USING INDEX {index} "))
-                        && !plan.contains("SCAN")
-                        && !plan.contains("TEMP B-TREE"),
-                    "{query}: the statement reads through {index} without scanning or sorting: \
-                     {plan}"
-                );
-            }
+        for (query, index) in [
+            (parts_query(), "parts_by_session"),
+            (parts_of_messages_query(), "parts_by_message"),
+            (SUBAGENT_METADATA_READ.to_owned(), "parts_outside_entries"),
+            (parts_of_messages(), "parts_by_message"),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let parameters = vec![1; statement.parameter_count()];
+            let plan = statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                plan.contains(&format!("SEARCH parts USING INDEX {index} "))
+                    && !plan.contains("SCAN")
+                    && !plan.contains("TEMP B-TREE"),
+                "{query}: the statement reads through {index} without scanning or sorting: \
+                 {plan}"
+            );
         }
     }
 }

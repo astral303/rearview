@@ -1,8 +1,7 @@
 //! `agent read` over each registered agent's every-record session.
-//! - With `--tools --subagents`, each agent-searched marker shows, in a
-//!   call's header, a launch prompt or a sub-agent's message. Tool results
-//!   stay hidden, so a marker in a call's header cannot show through the
-//!   call's result.
+//! - With `--tools --subagents`, each marker in a call's header, a launch
+//!   prompt or a sub-agent's message shows. Tool results stay hidden, so a
+//!   marker in a call's header cannot show through the call's result.
 //! - With default flags, the header counts the hidden tool calls, and the
 //!   read covers each message a read with every flag covers: a message, call
 //!   or hidden record holds it. A read with every flag does not report a
@@ -36,7 +35,7 @@ use crate::agent::test_support::{
     PositionalRecord, atom, outline_records, read_records, segment_records,
 };
 use crate::agent::transcript::AgentTranscript;
-use crate::history::provider::contract_tests::{AgentSession, MarkerSearch, every_record_sessions};
+use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
 use crate::time_filter::TimeFilter;
 use std::collections::{BTreeSet, HashMap};
 
@@ -134,14 +133,15 @@ fn read_range(
     .unwrap()
 }
 
-/// Each agent-searched marker of `session` missing from `agent read --tools
+/// Each marker of `session` in a call's header, a launch prompt or a
+/// sub-agent's message that is missing from `agent read --tools
 /// --subagents`.
-fn unshown_agent_searched_markers(session: &AgentSession) -> Vec<String> {
+fn unshown_call_and_subagent_markers(session: &AgentSession) -> Vec<String> {
     let output = read(session, WITH_TOOLS_AND_SUBAGENTS);
     session
         .markers
         .iter()
-        .filter(|marker| marker.search == MarkerSearch::AgentOnly)
+        .filter(|marker| marker.is_in_call_or_subagent)
         .filter(|marker| !output.contains(marker.text))
         .map(|marker| format!("{:?}: {}", session.row.source, marker.record))
         .collect()
@@ -426,10 +426,10 @@ fn every_agents_sub_agent_read_alone_shows_exactly_its_messages_launch_and_repor
 }
 
 #[test]
-fn every_agents_read_with_tools_and_subagents_shows_each_agent_searched_marker() {
+fn every_agents_read_with_tools_and_subagents_shows_each_call_and_subagent_marker() {
     let gaps: Vec<String> = every_record_sessions()
         .iter()
-        .flat_map(unshown_agent_searched_markers)
+        .flat_map(unshown_call_and_subagent_markers)
         .collect();
 
     assert!(gaps.is_empty(), "{}", gaps.join("\n"));

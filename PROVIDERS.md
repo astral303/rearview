@@ -910,9 +910,9 @@ grows after the parent's last write invalidates the entry. The entry stores the
 sub-agent paths (`ListedSessionEntry::subagents`), so a cache hit carries them
 without a lookup.
 
-Sub-agent text reaches `agent_search_text` only. It stays out of `full_text`, so the
-TUI list does not search it. This matches how Claude already treats its own sub-agent
-turns.
+Sub-agent text reaches `agent_search_text` only and stays out of `full_text`,
+the dialogue, as Claude's own sub-agent turns do. Lexical and exact search, in
+the list and in `agent search`, read both.
 
 `agent read` shows a tool call as the header the viewer shows for it, such as
 `Bash: cargo test`. A read of several messages shows a shell command's first

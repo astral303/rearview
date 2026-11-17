@@ -16,7 +16,8 @@ pub struct LexicalEvidence {
     /// retitle the row before the evidence is built again.
     title_and_summary: Vec<String>,
     /// The session's other texts, shared with the texts held in memory;
-    /// `None` for the conversation's `full_text`.
+    /// `None` for the conversation's own texts: its `full_text`, then its
+    /// `agent_search_text` and `thinking_and_tool_call_text`.
     body: Option<Arc<str>>,
     /// Ranges in `title_and_summary`, then `body`, each after a separator.
     pub context_ranges: Vec<(usize, usize)>,
@@ -26,13 +27,19 @@ impl LexicalEvidence {
     /// The texts `context_ranges` index, `conversation` being the row the
     /// evidence was built for.
     pub(crate) fn texts<'a>(&'a self, conversation: &'a Conversation) -> SeparatedTexts<'a> {
-        let body = self.body.as_deref().unwrap_or(&conversation.full_text);
-        SeparatedTexts::new(
-            self.title_and_summary
-                .iter()
-                .map(String::as_str)
-                .chain([body]),
-        )
+        let title_and_summary = self.title_and_summary();
+        match self.body.as_deref() {
+            Some(body) => SeparatedTexts::new(title_and_summary.chain([body])),
+            None => SeparatedTexts::new(title_and_summary.chain([
+                conversation.full_text.as_str(),
+                conversation.agent_search_text.as_str(),
+                conversation.thinking_and_tool_call_text.as_str(),
+            ])),
+        }
+    }
+
+    fn title_and_summary(&self) -> impl Iterator<Item = &str> {
+        self.title_and_summary.iter().map(String::as_str)
     }
 }
 
@@ -130,10 +137,12 @@ pub fn build_session_list_evidence<C: Borrow<Conversation>>(
 
 /// The evidence for `conversation` in its search texts: its row's title and
 /// summary, then `texts`, those held in memory. A conversation not in the
-/// session cache reads its `full_text` in place of `texts`. A cached
-/// conversation without texts in memory reads its title and summary alone.
-/// The texts after `texts`' dialogue are read only when some query term
-/// doesn't have a hit in the title, the summary or the dialogue.
+/// session cache reads its own texts in place of `texts`: its `full_text`,
+/// the dialogue, then its `agent_search_text` and
+/// `thinking_and_tool_call_text`. A cached conversation without texts in
+/// memory reads its title and summary alone. The texts after the dialogue
+/// are read only when some query term doesn't have a hit in the title, the
+/// summary or the dialogue.
 pub fn build_lexical_evidence(
     conversation: &Conversation,
     texts: Option<&SessionSearchTexts>,
@@ -151,11 +160,14 @@ pub fn build_lexical_evidence(
         body: texts.map(|texts| Arc::clone(texts.joined())),
         context_ranges: Vec::new(),
     };
-    let other_fields_len = texts.map_or(0, |texts| texts.joined().len() - texts.dialogue().len());
-    let searched = evidence.texts(conversation);
+    let dialogue = texts.map_or(
+        conversation.full_text.as_str(),
+        SessionSearchTexts::dialogue,
+    );
+    let dialogue_end = SeparatedTexts::new(evidence.title_and_summary().chain([dialogue])).len();
     let ranges = select_context_ranges(
-        &searched,
-        searched.len() - other_fields_len,
+        &evidence.texts(conversation),
+        dialogue_end,
         &conversation.preview,
         &specs,
     )?;

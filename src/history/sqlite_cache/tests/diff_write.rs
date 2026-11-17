@@ -231,15 +231,11 @@ fn stored_session(
     let copy = listed.cached_session.clone().unwrap();
     let mut texts = Vec::new();
     copy.read_copy(|held| {
-        held.visit_search_texts(
-            SearchedFields::Agent,
-            &crate::time_filter::TimeFilter::default(),
-            |text| {
-                let placed = format!("{:?} {:?} {}", text.order, text.ordinal, text.text);
-                texts.push((text.order, placed));
-                ControlFlow::Continue(())
-            },
-        )
+        held.visit_search_texts(&crate::time_filter::TimeFilter::default(), |text| {
+            let placed = format!("{:?} {:?} {}", text.order, text.ordinal, text.text);
+            texts.push((text.order, placed));
+            ControlFlow::Continue(())
+        })
     })
     .unwrap();
     texts.sort();

@@ -3,10 +3,8 @@ use crate::history::Conversation;
 use crate::history::message_texts::{PADDED_MESSAGE_SEPARATOR, push_separated};
 use crate::history::parser::normalize_whitespace;
 pub(crate) use crate::history::sqlite_cache::ScanScope;
-use crate::history::sqlite_cache::SearchedFields;
 use crate::search::literal::{
-    Literal, LiteralCorpusEntry, build_agent_literal_corpus, build_literal_corpus,
-    matches_all_literals,
+    Literal, LiteralCorpusEntry, build_literal_corpus_within, matches_all_literals,
 };
 use crate::search::query::ParsedQuery;
 pub use crate::text_match::normalize_for_search;
@@ -97,11 +95,15 @@ pub fn session_id_for_lookup(query: &str) -> Cow<'_, str> {
     }
 }
 
-/// Build searchable index from conversations using pre-normalized search text.
-/// Only appends the (small) project name — the expensive full_text normalization
-/// was already done during parsing/cache load.
+/// The search data of each of `conversations`. The parse or the cache load
+/// normalised the dialogue; this normalises the sub-agents' text, thinking
+/// and tool calls.
 pub fn precompute_search_text(conversations: &[Conversation]) -> Vec<SearchableConversation> {
-    precompute_search_text_with(conversations, false)
+    conversations
+        .par_iter()
+        .enumerate()
+        .map(|(index, conversation)| searchable_conversation(conversation, index))
+        .collect()
 }
 
 /// `agent search`'s texts for each session, built for one time window. With
@@ -124,7 +126,7 @@ pub fn precompute_agent_search_text(
             .map(|(index, conv)| searchable_conversation_within(conv, index, window))
             .collect()
     } else {
-        precompute_search_text_with(conversations, true)
+        precompute_search_text(conversations)
     };
     AgentSearchTexts {
         searchable,
@@ -157,39 +159,17 @@ fn normalized_field(field: Option<&str>) -> String {
     field.map(normalize_for_search).unwrap_or_default()
 }
 
-fn precompute_search_text_with(
-    conversations: &[Conversation],
-    include_agent_text: bool,
-) -> Vec<SearchableConversation> {
-    conversations
-        .par_iter()
-        .enumerate()
-        .map(|(idx, conv)| searchable_conversation_with(conv, idx, include_agent_text))
-        .collect()
-}
-
 /// The search data of the conversation at `index`, as
-/// [`precompute_search_text`] builds it for each conversation.
+/// [`precompute_search_text`] builds it for each conversation: its body
+/// holds the dialogue, then sub-agents' text, thinking and tool calls.
 pub fn searchable_conversation(conv: &Conversation, index: usize) -> SearchableConversation {
-    searchable_conversation_with(conv, index, false)
-}
-
-fn searchable_conversation_with(
-    conv: &Conversation,
-    index: usize,
-    include_agent_text: bool,
-) -> SearchableConversation {
     let title_lower = normalized_field(conv.custom_title.as_deref());
     let summary_lower = normalized_field(conv.summary.as_deref());
     let project_lower = normalized_field(conv.project_name.as_deref());
-    let agent_texts = if include_agent_text {
-        vec![
-            normalize_for_search(&conv.agent_search_text),
-            normalize_for_search(&conv.thinking_and_tool_call_text),
-        ]
-    } else {
-        Vec::new()
-    };
+    let agent_texts = [
+        normalize_for_search(&conv.agent_search_text),
+        normalize_for_search(&conv.thinking_and_tool_call_text),
+    ];
 
     // The title and the summary are read with whitespace collapsed, as a
     // search of the session cache's texts reads them. A cached row leaves
@@ -384,10 +364,11 @@ pub fn try_agent_search(
 /// The texts a search matches.
 #[derive(Clone, Copy)]
 enum SearchSurface<'w> {
-    /// The session list's: the conversation's text and its project name,
-    /// read from memory for each session whose texts are held there.
+    /// The session list's: the conversation's dialogue, its sub-agents'
+    /// text, thinking and tool calls, and its project name, read from memory
+    /// for each session whose texts are held there.
     List(&'w SearchTextsInMemory),
-    /// `agent search`'s: also sub-agents' text, thinking and tool calls; with
+    /// `agent search`'s: the same texts, read from the session cache; with
     /// the window active, only the text of the messages inside it. The scan
     /// also finds the messages holding every term `retrieval` requires.
     /// `scope` is the selection the searched sessions came from.
@@ -411,17 +392,14 @@ impl<'w> SearchSurface<'w> {
         self,
         conversations: &[C],
     ) -> Vec<LiteralCorpusEntry> {
-        match self {
-            Self::List(_) => build_literal_corpus(conversations),
-            Self::Agent { window, .. } => build_agent_literal_corpus(conversations, window),
-        }
+        build_literal_corpus_within(conversations, &self.window())
     }
 
-    /// The stored search fields this surface reads, and its time window.
-    fn stored_fields(self) -> (SearchedFields, TimeFilter) {
+    /// The surface's time window: none for the session list.
+    fn window(self) -> TimeFilter {
         match self {
-            Self::List(_) => (SearchedFields::List, TimeFilter::default()),
-            Self::Agent { window, .. } => (SearchedFields::Agent, *window),
+            Self::List(_) => TimeFilter::default(),
+            Self::Agent { window, .. } => *window,
         }
     }
 
@@ -1324,79 +1302,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agent_search_text_includes_progress_without_polluting_full_text() {
+    /// Asserts that the session list's search and `agent search` each find
+    /// `conv`, a row outside the session cache, for each of `queries`.
+    fn assert_list_and_agent_search_find(conv: Conversation, queries: &[&str]) {
         let now = Local::now();
-        let mut conv = make_conv("visible dialogue", now);
+        let convs = vec![conv];
+        let list_searchable = precompute_search_text(&convs);
+        let agent_searchable = precompute_agent_search_text(&convs, &TimeFilter::default());
+        for query in queries {
+            assert_eq!(
+                search(&convs, &list_searchable, query, now),
+                vec![0],
+                "the session list's search finds the session for {query}"
+            );
+            assert_eq!(
+                agent_search(&convs, &agent_searchable, query, now),
+                vec![0],
+                "`agent search` finds the session for {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_and_agent_search_find_subagent_progress_kept_out_of_full_text() {
+        let mut conv = make_conv("visible dialogue", Local::now());
         conv.agent_search_text = "subagent_progress_needle".to_string();
-        let convs = vec![conv];
-        let normal_searchable = precompute_search_text(&convs);
-        let agent_searchable = precompute_agent_search_text(&convs, &TimeFilter::default());
 
-        assert!(!convs[0].full_text.contains("subagent_progress_needle"));
-        assert_eq!(
-            search(&convs, &normal_searchable, "subagent_progress_needle", now),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            agent_search(&convs, &agent_searchable, "subagent_progress_needle", now),
-            vec![0]
-        );
-        assert_eq!(
-            agent_search(
-                &convs,
-                &agent_searchable,
-                "\"subagent_progress_needle\"",
-                now,
-            ),
-            vec![0]
+        assert!(!conv.full_text.contains("subagent_progress_needle"));
+        assert_list_and_agent_search_find(
+            conv,
+            &["subagent_progress_needle", "\"subagent_progress_needle\""],
         );
     }
 
     #[test]
-    fn agent_search_finds_session_matching_only_in_thinking() {
-        let now = Local::now();
-        let mut conv = make_conv("visible dialogue", now);
+    fn list_and_agent_search_find_session_matching_only_in_thinking() {
+        let mut conv = make_conv("visible dialogue", Local::now());
         conv.thinking_and_tool_call_text = "weighing the stale index".to_string();
-        let convs = vec![conv];
-        let normal_searchable = precompute_search_text(&convs);
-        let agent_searchable = precompute_agent_search_text(&convs, &TimeFilter::default());
 
-        assert_eq!(
-            search(&convs, &normal_searchable, "stale", now),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            agent_search(&convs, &agent_searchable, "stale", now),
-            vec![0]
-        );
-        assert_eq!(
-            agent_search(&convs, &agent_searchable, "\"stale index\"", now),
-            vec![0]
-        );
+        assert_list_and_agent_search_find(conv, &["stale", "\"stale index\""]);
     }
 
     #[test]
-    fn agent_search_finds_session_matching_only_in_tool_name() {
-        let now = Local::now();
-        let mut conv = make_conv("visible dialogue", now);
+    fn list_and_agent_search_find_session_matching_only_in_tool_name() {
+        let mut conv = make_conv("visible dialogue", Local::now());
         conv.thinking_and_tool_call_text = "WebFetch: https://example.com".to_string();
-        let convs = vec![conv];
-        let normal_searchable = precompute_search_text(&convs);
-        let agent_searchable = precompute_agent_search_text(&convs, &TimeFilter::default());
 
-        assert_eq!(
-            search(&convs, &normal_searchable, "webfetch", now),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            agent_search(&convs, &agent_searchable, "webfetch", now),
-            vec![0]
-        );
-        assert_eq!(
-            agent_search(&convs, &agent_searchable, "\"WebFetch\"", now),
-            vec![0]
-        );
+        assert_list_and_agent_search_find(conv, &["webfetch", "\"WebFetch\""]);
     }
 
     /// `convs` in `agent search`'s order for `query` within `window`.

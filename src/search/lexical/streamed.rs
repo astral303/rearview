@@ -71,8 +71,7 @@ pub(super) fn collect_all<C: Borrow<Conversation> + Sync>(
             found
         }
     };
-    let (_, window) = surface.stored_fields();
-    if !window.is_active() {
+    if !surface.window().is_active() {
         let mut matcher = query.matcher();
         for (index, counts) in &mut stored.counts {
             let conversation = conversations[*index].borrow();
@@ -144,19 +143,13 @@ fn count_stored<C: Borrow<Conversation>>(
         .iter()
         .map(|&index| cached_copy(conversations[index].borrow()))
         .collect::<Vec<_>>();
-    let (fields, window) = surface.stored_fields();
+    let window = surface.window();
     let scanned = scan_search_texts(
         &copies,
-        fields,
         &window,
         surface.scan_scope(),
         || BodyCounter::new(query),
-        |_, held| {
-            Ok((
-                held.generation(),
-                count_alone(held, (fields, &window), query)?,
-            ))
-        },
+        |_, held| Ok((held.generation(), count_alone(held, &window, query)?)),
     )?;
     let counts = &mut stored.counts;
     let required = query.required_terms(retrieval);
@@ -218,11 +211,11 @@ fn count_stored<C: Borrow<Conversation>>(
 /// terms each message's texts hold.
 fn count_alone(
     held: &HeldCopy<'_>,
-    (fields, window): (SearchedFields, &TimeFilter),
+    window: &TimeFilter,
     query: &RawQuery<'_>,
 ) -> Result<(Counts, HashMap<usize, MessageTerms>)> {
     let mut counter = BodyCounter::new(query);
-    held.visit_search_texts(fields, window, |text| {
+    held.visit_search_texts(window, |text| {
         counter.count(ALONE, text.ordinal, text.text);
         std::ops::ControlFlow::Continue(())
     })?;
@@ -266,7 +259,7 @@ pub(super) fn hit_messages_in(
     retrieval: &RetrievalTerms,
     query: &RawQuery<'_>,
 ) -> Result<SessionHitMessages> {
-    let (_, messages) = count_alone(held, (SearchedFields::Agent, window), query)?;
+    let (_, messages) = count_alone(held, window, query)?;
     Ok(SessionHitMessages::holding(
         held.generation(),
         &messages,
@@ -679,6 +672,173 @@ mod tests {
                 session.row.source.label()
             );
         }
+    }
+
+    /// A result's index and total score, and each of its fields' name, term
+    /// score and adjacency score.
+    type ResultScores = (usize, u64, Vec<(&'static str, u64, u64)>);
+
+    fn scores(results: Vec<(usize, ScoreDebug)>) -> Vec<ResultScores> {
+        results
+            .into_iter()
+            .map(|(index, score)| {
+                let fields = score.fields.iter().map(|field| {
+                    (
+                        field.name,
+                        field.tf_score.to_bits(),
+                        field.adjacency_score.to_bits(),
+                    )
+                });
+                (index, score.total.to_bits(), fields.collect())
+            })
+            .collect()
+    }
+
+    /// The count of `queries` with results. Fails unless the lexical search
+    /// of `rows` gives each query the same results, order and scores reading
+    /// the session list's texts in memory as reading `agent search`'s texts
+    /// from the session cache. `agent search`'s own ranking is not compared.
+    fn queries_scored_alike_from_memory_and_cache(
+        rows: &[Conversation],
+        queries: &[String],
+    ) -> usize {
+        let searchable = precompute_search_text(rows);
+        let in_memory = SearchTextsInMemory::read(rows);
+        let window = TimeFilter::default();
+        let from_cache = SearchSurface::Agent {
+            window: &window,
+            retrieval: &RetrievalTerms::WordsAndLiterals,
+            scope: ScanScope::AllWorkspaces,
+        };
+        let now = crate::search::test_fixtures::october(20, 12);
+        let mut queries_with_results = 0;
+        for query in queries {
+            let ranked = |surface| {
+                let searched =
+                    debug_search_with_surface(rows, &searchable, query, now, surface, |_| true);
+                scores(searched.unwrap().results)
+            };
+            let from_memory = ranked(SearchSurface::List(&in_memory));
+            queries_with_results += usize::from(!from_memory.is_empty());
+            assert_eq!(
+                from_memory,
+                ranked(from_cache),
+                "{:?} {query:?}: the texts in memory give the results, order and scores the \
+                 session cache's texts give",
+                rows[0].source
+            );
+        }
+        queries_with_results
+    }
+
+    /// The session list holds the dialogue ahead of the other fields' texts,
+    /// and `agent search` reads the texts in the cache's order: this test
+    /// fails when a score depends on the order of a session's texts. Each
+    /// session has a cache of its own, because the every-record sessions
+    /// share one cache key.
+    #[test]
+    fn list_search_scores_every_providers_session_from_memory_as_from_cache() {
+        for session in every_record_sessions() {
+            let base = tempfile::tempdir().unwrap();
+            let rows = [crate::history::sqlite_cache::tests::cached_row(
+                base.path(),
+                &session,
+            )];
+            let markers = session.markers.iter().map(|marker| marker.text);
+            let (first, last) = (
+                session.markers[0].text,
+                session.markers.last().unwrap().text,
+            );
+            let queries = QUERIES
+                .map(str::to_owned)
+                .into_iter()
+                .chain(markers.flat_map(|text| [text.to_owned(), format!("\"{text}\"")]))
+                .chain([format!("{first} {last}"), format!("{last} \"{first}\"")])
+                .collect::<Vec<_>>();
+
+            let queries_with_results = queries_scored_alike_from_memory_and_cache(&rows, &queries);
+
+            assert!(
+                queries_with_results > session.markers.len(),
+                "{:?}: the queries find the session: {queries_with_results}",
+                session.row.source
+            );
+        }
+    }
+
+    #[test]
+    fn list_search_scores_sessions_matching_in_different_fields_from_memory_as_from_cache() {
+        use crate::search::test_fixtures::{cached_claude_sessions, claude_user_record, october};
+        let at = |hour| october(10, hour).to_rfc3339();
+        let asking = |text: &str| claude_user_record(text, october(10, 10));
+        let assistant = |block: serde_json::Value| {
+            serde_json::json!({"type": "assistant", "timestamp": at(11),
+                "message": {"role": "assistant", "content": [block]}})
+        };
+        let sessions = cached_claude_sessions(&[
+            (
+                "dialogue",
+                vec![asking("rotate the ledger keys"), asking("ledger again")],
+            ),
+            (
+                "tool-call",
+                vec![
+                    asking("check the keys"),
+                    assistant(serde_json::json!({"type": "tool_use", "id": "call",
+                        "name": "Bash", "input": {"command": "cat ledger.txt ledger.bak"}})),
+                ],
+            ),
+            (
+                "thinking",
+                vec![
+                    asking("check the ledger"),
+                    assistant(serde_json::json!({"type": "thinking",
+                        "thinking": "the ledger keys rotate; the ledger keys expire",
+                        "signature": "sig"})),
+                ],
+            ),
+            (
+                "sub-agent",
+                vec![
+                    asking("delegate the work"),
+                    serde_json::json!({"type": "progress", "timestamp": at(12),
+                        "parentToolUseID": "toolu_task",
+                        "data": {"type": "agent_progress", "agentId": "a7777777",
+                            "prompt": "Read the ledger",
+                            "message": {"type": "assistant", "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": "ledger keys found"}]}}}}),
+                ],
+            ),
+            ("unrelated", vec![asking("water the plants")]),
+        ]);
+        let queries = [
+            "ledger",
+            "ledger keys",
+            "\"ledger keys\"",
+            "keys ledger rotate",
+        ]
+        .map(str::to_owned);
+
+        let queries_with_results =
+            queries_scored_alike_from_memory_and_cache(&sessions.rows, &queries);
+
+        assert_eq!(
+            queries_with_results,
+            queries.len(),
+            "each query finds a session"
+        );
+        let listed = search_with_texts(
+            &sessions.rows,
+            &precompute_search_text(&sessions.rows),
+            &SearchTextsInMemory::read(&sessions.rows),
+            "ledger",
+            october(20, 12),
+        );
+        assert_eq!(
+            listed.len(),
+            4,
+            "the session list finds the session of each field holding the word"
+        );
     }
 
     #[test]

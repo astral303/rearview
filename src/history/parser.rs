@@ -1063,7 +1063,7 @@ impl SubagentContribution {
     }
 
     /// Add the text to the end of `session`'s `agent_search_text`, outside
-    /// the session list's search and outside every message, and add the
+    /// the dialogue and outside every message, and add the
     /// tokens and read errors. Do not add a message: the session's numbering
     /// already counts each spliced turn. The caller rebuilds the semantic
     /// routing text once, after the last contribution.
@@ -2012,9 +2012,8 @@ mod tests {
         )
     }
 
-    /// Helper to parse JSONL content
     /// `conversation`'s title, then its summary, then its `full_text`, each
-    /// after a separator: the text the list's search reads.
+    /// after a separator: the start of the text the list's search reads.
     fn full_text_after_title_and_summary(conversation: &Conversation) -> String {
         let mut text = String::new();
         for piece in conversation

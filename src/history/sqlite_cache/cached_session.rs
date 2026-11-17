@@ -240,21 +240,14 @@ impl HeldCopy<'_> {
         })
     }
 
-    /// Calls `visit` with each search text in `fields` within `window`, as
+    /// Calls `visit` with each search text within `window`, as
     /// [`super::search_texts::visit_texts_within`] does.
     pub(crate) fn visit_search_texts(
         &self,
-        fields: super::SearchedFields,
         window: &crate::time_filter::TimeFilter,
         visit: impl FnMut(super::search_texts::SearchText<'_>) -> std::ops::ControlFlow<()>,
     ) -> Result<()> {
-        super::search_texts::visit_texts_within(
-            self.connection,
-            self.session,
-            fields,
-            window,
-            visit,
-        )
+        super::search_texts::visit_texts_within(self.connection, self.session, window, visit)
     }
 
     /// Calls `visit` with each search text and semantic turn the copy

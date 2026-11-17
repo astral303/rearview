@@ -5,7 +5,7 @@
 
 use crate::agent::refs::MessageRange;
 use crate::agent::transcript::{AgentTranscript, agent_part_text};
-use crate::history::provider::contract_tests::{MarkerSearch, every_record_sessions, list_row};
+use crate::history::provider::contract_tests::{every_record_sessions, list_row};
 use crate::history::{Conversation, Source};
 use crate::search::literal::Literal;
 use serde_json::{Value, json};
@@ -53,7 +53,7 @@ fn each_markers_cached_text_is_in_message_agent_read_shows_it_in() {
             session
                 .markers
                 .iter()
-                .filter(|marker| marker.search != MarkerSearch::Unchecked)
+                .filter(|marker| marker.is_searched)
                 .filter_map(|marker| {
                     let literal = Literal::new(marker.text.to_owned());
                     let cached = messages_holding_in_cache(row, &literal);

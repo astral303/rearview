@@ -343,14 +343,15 @@ pub(super) mod tests {
                 vec![
                     Marker::searched("user text", "active root question"),
                     Marker::searched("assistant text", "root answer"),
-                    Marker::shown("thinking", "private reasoning"),
-                    Marker::agent_searched("tool call", "README.md").in_summary_row("Read 1 file"),
+                    Marker::searched("thinking", "private reasoning"),
+                    Marker::in_call_or_subagent("tool call", "README.md")
+                        .in_summary_row("Read 1 file"),
                     Marker::searched("tool result", "tool output searchable"),
                     Marker::searched("user's shell command output", "bash output searchable"),
                     Marker::searched("custom message", "visible custom searchable"),
-                    Marker::agent_searched("powershell call", "POWERSHELL_SENTINEL")
+                    Marker::in_call_or_subagent("powershell call", "POWERSHELL_SENTINEL")
                         .in_summary_row(LISTING_RUN),
-                    Marker::agent_searched("directory listing", "LS_SENTINEL_DIR")
+                    Marker::in_call_or_subagent("directory listing", "LS_SENTINEL_DIR")
                         .in_summary_row(LISTING_RUN),
                 ],
             )

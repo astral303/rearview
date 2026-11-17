@@ -151,56 +151,49 @@ pub(crate) struct FixtureIds {
     pub(crate) session_in_other_case: &'static str,
 }
 
-/// One record kind in a fixture session and its marker text.
+/// One record kind in a fixture session and its marker text. Every output
+/// shows it.
 pub(crate) struct Marker {
     pub(crate) record: &'static str,
     pub(crate) text: &'static str,
-    pub(crate) search: MarkerSearch,
+    /// True when the session list's search and `agent search` both find the
+    /// marker; false when neither does.
+    pub(crate) is_searched: bool,
+    /// True for a marker in a call's header, a launch prompt or a sub-agent's
+    /// message: `agent read --tools --subagents` shows it.
+    pub(crate) is_in_call_or_subagent: bool,
     /// The summary-mode row of the run holding the marker's call; `None` for a
     /// marker outside a call, or in a `Tool::Other` call: such a call shows
     /// its input as JSON.
     pub(crate) summary_row: Option<&'static str>,
 }
 
-/// Search coverage of a [`Marker`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MarkerSearch {
-    /// A searched marker: the session list's search and `agent search` both
-    /// find it.
-    ListAndAgent,
-    /// An agent-searched marker: `agent search` finds it, and the session
-    /// list's search does not.
-    AgentOnly,
-    /// The session list's search does not find the marker, and no test checks
-    /// `agent search` for it.
-    Unchecked,
-}
-
 impl Marker {
-    /// A searched marker. Every output shows it.
+    /// A marker both searches find.
     pub(crate) fn searched(record: &'static str, text: &'static str) -> Self {
         Self {
             record,
             text,
-            search: MarkerSearch::ListAndAgent,
+            is_searched: true,
+            is_in_call_or_subagent: false,
             summary_row: None,
         }
     }
 
-    /// An agent-searched marker, as for a sub-agent's text or a call's
-    /// header. Every output shows it.
-    pub(crate) fn agent_searched(record: &'static str, text: &'static str) -> Self {
+    /// A marker both searches find, in a call's header, a launch prompt or a
+    /// sub-agent's message.
+    pub(crate) fn in_call_or_subagent(record: &'static str, text: &'static str) -> Self {
         Self {
-            search: MarkerSearch::AgentOnly,
+            is_in_call_or_subagent: true,
             ..Self::searched(record, text)
         }
     }
 
-    /// A marker outside the session list's search, as for thinking or a call's
-    /// body. Every output shows it.
-    pub(crate) fn shown(record: &'static str, text: &'static str) -> Self {
+    /// A marker in a call's body: the viewer shows it, and neither search
+    /// finds it.
+    pub(crate) fn unsearched(record: &'static str, text: &'static str) -> Self {
         Self {
-            search: MarkerSearch::Unchecked,
+            is_searched: false,
             ..Self::searched(record, text)
         }
     }

@@ -1023,22 +1023,25 @@ pub(super) mod tests {
                 vec![
                     Marker::searched("user text", "active kimi question"),
                     Marker::searched("assistant text", "kimi answer searchable"),
-                    Marker::shown("thinking", "THINKING_VISIBLE"),
-                    Marker::agent_searched("tool call", "TOOL_INPUT_VISIBLE")
+                    Marker::searched("thinking", "THINKING_VISIBLE"),
+                    Marker::in_call_or_subagent("tool call", "TOOL_INPUT_VISIBLE")
                         .in_summary_row("Ran 1 shell command"),
                     Marker::searched("tool result", "kimi tool output searchable")
                         .in_summary_row("Ran 1 shell command"),
-                    Marker::agent_searched("sub-agent message", "kimi child answer searchable"),
+                    Marker::in_call_or_subagent(
+                        "sub-agent message",
+                        "kimi child answer searchable",
+                    ),
                     Marker::searched("task notice", "TASK_NOTICE_SENTINEL"),
                     Marker::searched("hook output", "HOOK_RESULT_SENTINEL"),
                     Marker::searched("blocking hook output", "BLOCKED_HOOK_SENTINEL"),
                     Marker::searched("scheduled reminder", "SCHEDULED_SENTINEL"),
-                    Marker::agent_searched("user's shell command", "SHELL_COMMAND_SENTINEL"),
+                    Marker::in_call_or_subagent("user's shell command", "SHELL_COMMAND_SENTINEL"),
                     Marker::searched("user's shell command output", "SHELL_OUTPUT_SENTINEL"),
-                    Marker::shown("model-run skill call", "MODEL_SKILL_ARGS_SENTINEL")
+                    Marker::unsearched("model-run skill call", "MODEL_SKILL_ARGS_SENTINEL")
                         .in_summary_row("Loaded 1 skill"),
                     Marker::searched("user-run slash command", "/mcp-config SLASH_ARGS_SENTINEL"),
-                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                    Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
                 ],
             )
