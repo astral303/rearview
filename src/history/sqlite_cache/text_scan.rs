@@ -7,7 +7,7 @@
 //! tasks and rechecks the sessions read.
 
 use super::copies_scan::{CopiesScan, KeySplit, ScannedCopies, SessionsById, scan_copies};
-use super::{CachedSession, HeldCopy, SearchedFields};
+use super::{CachedSession, HeldCopy, SearchField, SearchedFields};
 use crate::error::Result;
 use crate::time_filter::TimeFilter;
 use rusqlite::Connection;
@@ -22,6 +22,7 @@ pub(crate) struct ScannedRow {
     pub(crate) ordinal: Option<usize>,
     /// The text's place in its session.
     pub(crate) order: ReadOrder,
+    pub(crate) field: SearchField,
 }
 
 /// A text's place in its session's order: its layout group, then its
@@ -59,7 +60,7 @@ pub(super) enum LayoutGroup {
 
 /// The columns a scan reads of each part holding search text.
 const SCANNED_PART_COLUMNS: &str =
-    "session, entry_sequence, message_ordinal, search_position, text";
+    "session, entry_sequence, message_ordinal, search_position, search_field, text";
 
 /// The parts holding search text in `fields` with ids from `?1` to `?2`, of
 /// the sessions `only` keeps.
@@ -505,12 +506,13 @@ impl TaskScan<'_> {
         let mut statement = self.connection.prepare_cached(sql)?;
         let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         while let Some(row) = rows.next()? {
-            let (session, text) = (row.get(0)?, text_at(row, 4)?);
+            let (session, text) = (row.get(0)?, text_at(row, 5)?);
             let examined = visitor.examine(text);
             if !examined && !self.is_first_text(session, text) {
                 continue;
             }
-            if let Some(scanned) = self.entry_row(session, StoredPlace::at(row, (1, 2, 3))?) {
+            let place = StoredPlace::at(row, (1, 2, 3))?;
+            if let Some(scanned) = self.entry_row(session, place, row.get(4)?) {
                 self.record_first_text(visitor, session, &scanned, text);
                 if examined {
                     visitor.keep(&scanned, text);
@@ -543,6 +545,7 @@ impl TaskScan<'_> {
                         sequence: 0,
                         position: row.get(1)?,
                     },
+                    field: SearchField::Supplement,
                 };
                 self.record_first_text(visitor, session, &scanned, text);
                 if examined {
@@ -575,15 +578,21 @@ impl TaskScan<'_> {
         }
     }
 
-    /// The row of an entry's text of `session` at `place`; `None` when its
-    /// session is not scanned. A windowed scan reads only the messages inside
-    /// its window.
-    fn entry_row(&self, session: i64, place: StoredPlace) -> Option<ScannedRow> {
+    /// The row of an entry's text of `session` at `place`, in `field`; `None`
+    /// when its session is not scanned. A windowed scan reads only the
+    /// messages inside its window.
+    fn entry_row(
+        &self,
+        session: i64,
+        place: StoredPlace,
+        field: SearchField,
+    ) -> Option<ScannedRow> {
         let copy = self.copy_of(session)?;
         Some(ScannedRow {
             copy,
             ordinal: place.message(),
             order: place.order(),
+            field,
         })
     }
 
@@ -619,8 +628,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ops::ControlFlow;
 
-    /// A text with its place in its session and message number.
-    type PlacedText = (ReadOrder, Option<usize>, String);
+    /// A text with its place in its session, its message number and its
+    /// field's code.
+    type PlacedText = (ReadOrder, Option<usize>, i64, String);
 
     /// Every kept text with the position of its copy, and the count of texts
     /// examined.
@@ -637,8 +647,8 @@ mod tests {
         }
 
         fn keep(&mut self, row: &ScannedRow, text: &str) {
-            self.kept
-                .push((row.copy, (row.order, row.ordinal, text.to_owned())));
+            let placed = (row.order, row.ordinal, row.field.code(), text.to_owned());
+            self.kept.push((row.copy, placed));
         }
     }
 
@@ -710,7 +720,12 @@ mod tests {
         let mut read = Vec::new();
         copy.read_copy(|held| {
             held.visit_search_texts(fields, window, |text| {
-                read.push((text.order, text.ordinal, text.text.to_owned()));
+                read.push((
+                    text.order,
+                    text.ordinal,
+                    text.field.code(),
+                    text.text.to_owned(),
+                ));
                 ControlFlow::Continue(())
             })
         })
@@ -741,9 +756,9 @@ mod tests {
             "entries' parts and sub-agent metadata parts each hold a text"
         );
         assert!(
-            kept.iter()
-                .any(|(_, (order, ordinal, _))| order.group == LayoutGroup::Entry
-                    && ordinal.is_none()),
+            kept.iter().any(
+                |(_, (order, ordinal, ..))| order.group == LayoutGroup::Entry && ordinal.is_none()
+            ),
             "a part outside every message holds a text"
         );
         let cache = SqliteCache::open_waiting(&copies[0].base).unwrap().unwrap();
@@ -1119,7 +1134,7 @@ mod tests {
                             read_by_range(copy, fields, &window),
                             from_scan,
                             "{source:?}, window {window:?}, {scope:?}: the range reads return \
-                             the scan's texts and places"
+                             the scan's texts, places and fields"
                         );
                     }
                 }

@@ -7,7 +7,7 @@ use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
     CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScanScope, ScannedCopy,
-    ScannedRow, SearchedFields, SessionKey, TextVisitor, scan_search_texts,
+    ScannedRow, SearchField, SearchedFields, SessionKey, TextVisitor, scan_search_texts,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -17,9 +17,10 @@ use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 
 /// One session's search texts in the session list's fields, as the session
-/// cache stores them: the text outside every message, then each message's
-/// texts in message order, each after a separator as `full_text` lays out
-/// its parts. The title and the summary are the row's (see
+/// cache stores them: the dialogue, then the other fields' texts. Each of
+/// the two holds the text outside every message, then each message's texts
+/// in message order, each after a separator as `full_text` lays out its
+/// parts. The title and the summary are the row's (see
 /// [`Conversation::title_and_summary_texts`]).
 pub struct SessionSearchTexts {
     joined: Arc<str>,
@@ -56,8 +57,28 @@ impl SessionSearchTexts {
     }
 }
 
-/// A text's place in the session's layout: the text outside every message,
-/// then each message's texts.
+/// The fields a text's layout tells apart: the dialogue, the `Full` field's
+/// texts, is laid out ahead of the other fields' texts.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FieldGroup {
+    Dialogue,
+    OtherFields,
+}
+
+impl FieldGroup {
+    fn of(field: SearchField) -> Self {
+        match field {
+            SearchField::Full => Self::Dialogue,
+            SearchField::Agent
+            | SearchField::Thinking
+            | SearchField::Supplement
+            | SearchField::Semantic => Self::OtherFields,
+        }
+    }
+}
+
+/// A text's place among its field group's texts: the text outside every
+/// message, then each message's texts.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Placement {
     OutsideMessages,
@@ -73,17 +94,22 @@ impl Placement {
     }
 }
 
-/// A text's place in the session's layout: its placement, then its place in
-/// the order a read of the session alone returns it.
-type LayoutKey = (Placement, ReadOrder);
+/// A text's place in the session's layout: its field group, its placement,
+/// then its place in the order a read of the session alone returns it.
+type LayoutKey = (FieldGroup, Placement, ReadOrder);
+
+/// The layout key of a text of `field` in the message `ordinal`, at `order`
+/// in its session.
+fn layout_key(field: SearchField, ordinal: Option<usize>, order: ReadOrder) -> LayoutKey {
+    (FieldGroup::of(field), Placement::of(ordinal), order)
+}
 
 /// The texts of `held` in the session list's fields, in the order its read
 /// returns them.
 fn texts_in_read_order(held: &HeldCopy<'_>) -> Result<TextsInReadOrder> {
     let mut read = TextsInReadOrder::default();
     held.visit_search_texts(SearchedFields::List, &TimeFilter::default(), |text| {
-        let placement = Placement::of(text.ordinal);
-        read.push((placement, text.order), text.text);
+        read.push(layout_key(text.field, text.ordinal, text.order), text.text);
         ControlFlow::Continue(())
     })?;
     Ok(read)
@@ -341,11 +367,10 @@ impl TextVisitor for TextCollector {
     }
 
     fn keep(&mut self, row: &ScannedRow, text: &str) {
-        let placement = Placement::of(row.ordinal);
         self.by_copy
             .entry(row.copy)
             .or_default()
-            .push((placement, row.order), text);
+            .push(layout_key(row.field, row.ordinal, row.order), text);
     }
 }
 
