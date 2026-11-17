@@ -1,13 +1,13 @@
-//! Each listed session's search texts in the session list's fields, read
-//! from the session cache into memory, so a search of the list scans memory
-//! instead of reading the cache. The texts stay as the cache stores them.
+//! Each listed session's search texts, read from the session cache into
+//! memory, so a search of the list scans memory instead of reading the
+//! cache. The texts stay as the cache stores them.
 
 use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
     CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScanScope, ScannedCopy,
-    ScannedRow, SearchedFields, SessionKey, TextVisitor, scan_search_texts,
+    ScannedRow, SearchField, SessionKey, TextVisitor, scan_search_texts,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -16,15 +16,18 @@ use std::collections::HashMap;
 use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 
-/// One session's search texts in the session list's fields, as the session
-/// cache stores them: the text outside every message, then each message's
-/// texts in message order, each after a separator as `full_text` lays out
-/// its parts. The title and the summary are the row's (see
+/// One session's search texts, as the session cache stores them: the
+/// dialogue, then sub-agents' text, the sub-agent metadata, and thinking and
+/// tool calls. Each field holds the text outside every message, then each
+/// message's texts in message order, each after a separator as `full_text`
+/// lays out its parts. The title and the summary are the row's (see
 /// [`Conversation::title_and_summary_texts`]).
 pub struct SessionSearchTexts {
     joined: Arc<str>,
     /// Each text's byte range in `joined`.
     texts: Box<[Range<usize>]>,
+    /// The length of the dialogue at the start of `joined`.
+    dialogue_len: usize,
 }
 
 impl SessionSearchTexts {
@@ -54,10 +57,43 @@ impl SessionSearchTexts {
     pub fn joined(&self) -> &Arc<str> {
         &self.joined
     }
+
+    /// The dialogue's texts, each after a separator: the start of
+    /// [`Self::joined`].
+    pub fn dialogue(&self) -> &str {
+        &self.joined[..self.dialogue_len]
+    }
 }
 
-/// A text's place in the session's layout: the text outside every message,
-/// then each message's texts.
+/// A text's field group, in the order a parsed row joins its texts:
+/// `full_text`, then `agent_search_text` (sub-agents' text, ending with the
+/// sub-agent metadata), then `thinking_and_tool_call_text`. A row read from
+/// the cache then shows the context line a parsed row shows.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FieldGroup {
+    Dialogue,
+    SubagentText,
+    SubagentMetadata,
+    ThinkingAndToolCalls,
+    /// Semantic turns are not search texts; a read of search texts doesn't
+    /// return any.
+    SemanticTurns,
+}
+
+impl FieldGroup {
+    fn of(field: SearchField) -> Self {
+        match field {
+            SearchField::Full => Self::Dialogue,
+            SearchField::Agent => Self::SubagentText,
+            SearchField::Supplement => Self::SubagentMetadata,
+            SearchField::Thinking => Self::ThinkingAndToolCalls,
+            SearchField::Semantic => Self::SemanticTurns,
+        }
+    }
+}
+
+/// A text's place among its field group's texts: the text outside every
+/// message, then each message's texts.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Placement {
     OutsideMessages,
@@ -73,17 +109,21 @@ impl Placement {
     }
 }
 
-/// A text's place in the session's layout: its placement, then its place in
-/// the order a read of the session alone returns it.
-type LayoutKey = (Placement, ReadOrder);
+/// A text's place in the session's layout: its field group, its placement,
+/// then its place in the order a read of the session alone returns it.
+type LayoutKey = (FieldGroup, Placement, ReadOrder);
 
-/// The texts of `held` in the session list's fields, in the order its read
-/// returns them.
+/// The layout key of a text of `field` in the message `ordinal`, at `order`
+/// in its session.
+fn layout_key(field: SearchField, ordinal: Option<usize>, order: ReadOrder) -> LayoutKey {
+    (FieldGroup::of(field), Placement::of(ordinal), order)
+}
+
+/// The search texts of `held`, in the order its read returns them.
 fn texts_in_read_order(held: &HeldCopy<'_>) -> Result<TextsInReadOrder> {
     let mut read = TextsInReadOrder::default();
-    held.visit_search_texts(SearchedFields::List, &TimeFilter::default(), |text| {
-        let placement = Placement::of(text.ordinal);
-        read.push((placement, text.order), text.text);
+    held.visit_search_texts(&TimeFilter::default(), |text| {
+        read.push(layout_key(text.field, text.ordinal, text.order), text.text);
         ControlFlow::Continue(())
     })?;
     Ok(read)
@@ -118,13 +158,14 @@ fn laid_out(pieces: Vec<TextsInReadOrder>) -> SessionSearchTexts {
         })
         .collect::<Vec<_>>();
     ordered.par_sort_by_key(|(key, _)| *key);
+    let dialogue_texts = ordered.partition_point(|((group, ..), _)| *group == FieldGroup::Dialogue);
     let texts_in_order = ordered.iter().map(|(_, text)| *text).collect::<Vec<_>>();
-    joined(&texts_in_order)
+    joined(&texts_in_order, dialogue_texts)
 }
 
 /// `texts`, in their order, each after a separator once the joined text
-/// holds a byte.
-fn joined(texts: &[&str]) -> SessionSearchTexts {
+/// holds a byte. The first `dialogue_texts` of them are the dialogue.
+fn joined(texts: &[&str], dialogue_texts: usize) -> SessionSearchTexts {
     let mut end = 0;
     let ranges = texts
         .iter()
@@ -140,6 +181,7 @@ fn joined(texts: &[&str]) -> SessionSearchTexts {
         .collect::<Box<[_]>>();
     SessionSearchTexts {
         joined: joined_once(texts, &ranges),
+        dialogue_len: ranges[..dialogue_texts].last().map_or(0, |range| range.end),
         texts: ranges,
     }
 }
@@ -214,7 +256,6 @@ fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
     let references = copies.iter().collect::<Vec<_>>();
     let scanned = scan_search_texts(
         &references,
-        SearchedFields::List,
         &TimeFilter::default(),
         ScanScope::AllWorkspaces,
         TextCollector::default,
@@ -341,11 +382,10 @@ impl TextVisitor for TextCollector {
     }
 
     fn keep(&mut self, row: &ScannedRow, text: &str) {
-        let placement = Placement::of(row.ordinal);
         self.by_copy
             .entry(row.copy)
             .or_default()
-            .push((placement, row.order), text);
+            .push(layout_key(row.field, row.ordinal, row.order), text);
     }
 }
 
@@ -590,7 +630,7 @@ mod tests {
             ],
             vec![longer.as_str(), longer.as_str()],
         ] {
-            let joined = joined(&texts);
+            let joined = joined(&texts, texts.len());
             assert_eq!(
                 &*joined.joined,
                 pushed_one_by_one(&texts),
@@ -601,6 +641,18 @@ mod tests {
                 joined.texts_at(0..texts.len()).collect::<Vec<_>>(),
                 texts,
                 "each text's range holds the text"
+            );
+        }
+    }
+
+    #[test]
+    fn dialogue_is_its_texts_joined_without_the_other_fields_texts() {
+        let texts = ["asked", "", "answered", "tool call", "thinking"];
+        for dialogue_texts in 0..=texts.len() {
+            assert_eq!(
+                joined(&texts, dialogue_texts).dialogue(),
+                pushed_one_by_one(&texts[..dialogue_texts]),
+                "the dialogue is the first {dialogue_texts} texts, joined"
             );
         }
     }

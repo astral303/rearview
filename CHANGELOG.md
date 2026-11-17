@@ -2,7 +2,7 @@
 
 ### Enhancements
 
-- Use about 4–6x less memory in the TUI and 3–50x less in agent commands (on
+- Use about 3–4x less memory in the TUI and 3–50x less in agent commands (on
   one example corpus): sessions stay in the session cache until a view or
   command needs them. Gains grow with the session store; a small one gains
   little.
@@ -25,8 +25,8 @@
   - Until a session's texts are read, it matches on its title, summary and
     project name, and the search bar shows ` · N sessions loading`.
     ` · N sessions unreadable` counts sessions whose texts could not be read.
-  - Reading those texts takes about 3–4x as long as before. The list loads
-    faster, and becomes searchable about 1.5x sooner after launch.
+  - Reading those texts takes about 5–6x as long as before. The list loads
+    faster, and becomes searchable about 1.2x sooner after launch.
 - Open a large session about 2.5x faster (on one example corpus), and keep the
   list and its search drawing while it opens. Reading an open session again
   after a refresh no longer freezes the viewer.
@@ -105,6 +105,8 @@
 
 #### All agents
 
+- Fix the session list's search missing text in tool calls, thinking and
+  sub-agent transcripts.
 - Fix one unreadable directory hiding all of an agent's sessions from the list
   and agent commands (Codex, Grok Build, Kimi Code, OMP and Pi). Its cached
   sessions now stay listed and readable, agent commands report the directory

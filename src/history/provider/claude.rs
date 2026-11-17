@@ -949,22 +949,25 @@ pub(crate) mod tests {
                 vec![
                     Marker::searched("user text", "USER_TEXT_SENTINEL"),
                     Marker::searched("assistant text", "ASSISTANT_TEXT_SENTINEL"),
-                    Marker::shown("thinking", "THINKING_SENTINEL"),
-                    Marker::agent_searched("tool call", "TOOL_CALL_SENTINEL")
+                    Marker::searched("thinking", "THINKING_SENTINEL"),
+                    Marker::in_call_or_subagent("tool call", "TOOL_CALL_SENTINEL")
                         .in_summary_row(FIRST_RUN),
                     Marker::searched("tool result", "TOOL_RESULT_SENTINEL")
                         .in_summary_row(FIRST_RUN),
                     Marker::searched("task report", "TASK_REPORT_SENTINEL"),
-                    Marker::agent_searched(
+                    Marker::in_call_or_subagent(
                         "sub-agent transcript message",
                         "SPLICED_SUBAGENT_SENTINEL",
                     ),
-                    Marker::agent_searched(
+                    Marker::in_call_or_subagent(
                         "message of a sub-agent without user text",
                         "FORKED_SUBAGENT_SENTINEL",
                     ),
-                    Marker::agent_searched("inline sub-agent message", "INLINE_SUBAGENT_SENTINEL"),
-                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                    Marker::in_call_or_subagent(
+                        "inline sub-agent message",
+                        "INLINE_SUBAGENT_SENTINEL",
+                    ),
+                    Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
                     Marker::searched("slash command", "/model SLASH_COMMAND_SENTINEL"),
                     Marker::searched("slash command output", "SLASH_OUTPUT_SENTINEL"),
@@ -977,7 +980,7 @@ pub(crate) mod tests {
                         .in_summary_row(ATTACHMENTS),
                     Marker::searched("attached file", "ATTACHED_FILE_SENTINEL")
                         .in_summary_row(ATTACHMENTS),
-                    Marker::agent_searched("file reference", "REFERENCE_SENTINEL")
+                    Marker::in_call_or_subagent("file reference", "REFERENCE_SENTINEL")
                         .in_summary_row(ATTACHMENTS),
                     Marker::searched("hook message", "HOOK_MESSAGE_SENTINEL")
                         .in_summary_row(HOOKED_CALLS),

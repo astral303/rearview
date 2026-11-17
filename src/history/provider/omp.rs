@@ -452,10 +452,13 @@ pub(super) mod tests {
                 vec![
                     Marker::searched("user text", "OMP active question"),
                     Marker::searched("assistant text", "OMP active answer"),
-                    Marker::shown("thinking", "OMP private reasoning"),
-                    Marker::agent_searched("sub-agent message", "OMP sub-agent answer searchable"),
+                    Marker::searched("thinking", "OMP private reasoning"),
+                    Marker::in_call_or_subagent(
+                        "sub-agent message",
+                        "OMP sub-agent answer searchable",
+                    ),
                     Marker::searched("/clear boundary", "Context cleared"),
-                    Marker::agent_searched("tool call", "OMP_COMMAND_SENTINEL")
+                    Marker::in_call_or_subagent("tool call", "OMP_COMMAND_SENTINEL")
                         .in_summary_row("Ran 1 shell command"),
                 ],
             )

@@ -176,7 +176,8 @@ removed. In an open session, `Ctrl+R` reads it again and shows new messages.
 ## Search
 
 Lexical search is the default. It searches user messages, assistant messages,
-and tool results. All unquoted terms must match.
+tool calls, tool results, thinking and sub-agent text. All unquoted terms must
+match.
 
 | Query                        | What it matches                                                        |
 |------------------------------|------------------------------------------------------------------------|
@@ -519,9 +520,10 @@ The **History location** and **Location override** columns in
 agent's history; the sections below give each agent's details.
 
 `rearview` reads agent logs selectively. User and assistant messages and useful
-tool output remain visible and searchable. Agent control records,
-request framing, telemetry, and other runtime data are omitted when they are
-not part of the conversation.
+tool output remain visible and searchable. Lexical and exact search, in the list
+and in `agent search`, also read tool calls, thinking and sub-agent text. Agent
+control records, request framing, telemetry, and other runtime data are omitted
+when they are not part of the conversation.
 
 ### Claude Code
 
@@ -584,11 +586,11 @@ OpenCode stores sessions in
 `OPENCODE_DB` overrides the database path. `rearview` reads the database in
 read-only mode, and a running OpenCode process does not block it.
 
-User prompts, assistant text, and tool output are searchable. Reasoning can be
-shown but is not searched. A file or MCP resource added with an `@` mention
-appears as an indexed read-tool call in OpenCode 1, and as a line naming the
-file in OpenCode 2. Request framing, snapshots, OpenCode 1's patch and file
-attachments, synthetic reminders, and editor context are omitted.
+User prompts, assistant text, tool output, and reasoning are searchable. A file
+or MCP resource added with an `@` mention appears as an indexed read-tool call
+in OpenCode 1, and as a line naming the file in OpenCode 2. Request framing,
+snapshots, OpenCode 1's patch and file attachments, synthetic reminders, and
+editor context are omitted.
 
 OpenCode subagents are child database sessions. They are folded into the parent
 session and remain searchable.
@@ -612,10 +614,9 @@ Both wire layouts are supported:
 - `agents/<agent>/wire.jsonl`
 - Legacy `wire.jsonl` at the session root
 
-User prompts, assistant text, and tool output are searchable. Duplicate prompt
-events are indexed once. Thinking can be shown but is not searched. Injected
-`<system-reminder>` context, compaction records, model requests, and runtime
-events are omitted.
+User prompts, assistant text, tool output, and thinking are searchable.
+Duplicate prompt events are indexed once. Injected `<system-reminder>` context,
+compaction records, model requests, and runtime events are omitted.
 
 Titles and working directories come from `state.json`. Subagent wires are
 folded into the parent session and remain searchable.
@@ -629,9 +630,8 @@ Grok Build stores each session in its own directory under `~/.grok/sessions`,
 in a directory per working directory. `GROK_HOME` moves the Grok home
 directory.
 
-User prompts, assistant text, tool output, and Grok's session recaps are
-searchable. Session recaps show behind the thinking toggle. Thinking can be
-shown but is not searched in the list. Plans, task
+User prompts, assistant text, tool output, thinking, and Grok's session recaps
+are searchable. Session recaps show behind the thinking toggle. Plans, task
 lifecycle, compaction, retry, and memory records are omitted.
 
 Titles and working directories come from `summary.json`. A rename in either

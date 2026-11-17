@@ -2,16 +2,15 @@
 //! holds every segment an opened session's search reads, so exact search
 //! never skips a session it would match. Checked over each registered agent's
 //! every-record session, and over text, thinking and tool results longer than
-//! a search segment. The cached text also holds each searched and
-//! agent-searched marker of the every-record sessions. It does not hold any
-//! of their hidden markers.
+//! a search segment. The cached text also holds each searched marker of the
+//! every-record sessions. It does not hold any of their hidden markers.
 
 use crate::agent::retrieval::segment_texts;
 use crate::agent::transcript::{AgentTranscript, MAX_AGENT_SEGMENT_CHARS};
 use crate::history::parser::normalize_whitespace;
-use crate::history::provider::contract_tests::{MarkerSearch, every_record_sessions, list_row};
+use crate::history::provider::contract_tests::{every_record_sessions, list_row};
 use crate::history::{Conversation, Source};
-use crate::search::literal::{Literal, build_agent_literal_corpus};
+use crate::search::literal::{Literal, build_literal_corpus_within};
 use crate::time_filter::TimeFilter;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -41,7 +40,7 @@ fn cached_and_searched_text(
 }
 
 fn cached_text(row: &Conversation) -> String {
-    build_agent_literal_corpus(std::slice::from_ref(row), &TimeFilter::default())
+    build_literal_corpus_within(std::slice::from_ref(row), &TimeFilter::default())
         .remove(0)
         .text
 }
@@ -76,7 +75,7 @@ fn every_agents_cached_text_holds_each_segment_opened_session_searches() {
 }
 
 #[test]
-fn every_agents_cached_text_holds_each_searched_and_agent_searched_marker() {
+fn every_agents_cached_text_holds_each_searched_marker() {
     let gaps: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(|session| {
@@ -84,7 +83,7 @@ fn every_agents_cached_text_holds_each_searched_and_agent_searched_marker() {
             session
                 .markers
                 .iter()
-                .filter(|marker| marker.search != MarkerSearch::Unchecked)
+                .filter(|marker| marker.is_searched)
                 .filter(|marker| !Literal::new(marker.text.to_owned()).matches(&cached))
                 .map(|marker| format!("{:?}: {}", session.row.source, marker.record))
                 .collect::<Vec<_>>()
@@ -93,7 +92,7 @@ fn every_agents_cached_text_holds_each_searched_and_agent_searched_marker() {
 
     assert!(
         gaps.is_empty(),
-        "searched and agent-searched markers missing from the cached text:\n{}",
+        "the cached text holds each searched marker:\n{}",
         gaps.join("\n")
     );
 }

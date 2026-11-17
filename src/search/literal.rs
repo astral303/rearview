@@ -411,20 +411,30 @@ pub struct LiteralCorpusEntry {
     pub text: String,
 }
 
+/// Each session's texts an exact search reads: its title, summary, dialogue,
+/// sub-agents' text, thinking and tool calls, and its project name.
 pub fn build_literal_corpus<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
 ) -> Vec<LiteralCorpusEntry> {
-    build_literal_corpus_with(conversations, false)
+    conversations
+        .par_iter()
+        .enumerate()
+        .map(|(index, conversation)| LiteralCorpusEntry {
+            index,
+            text: literal_text(conversation.borrow()),
+        })
+        .collect()
 }
 
-/// With `window` active, each session's entry holds only the text of its
-/// messages inside the window.
-pub fn build_agent_literal_corpus<C: Borrow<Conversation> + Sync>(
+/// [`build_literal_corpus`] without an active `window`. With `window`
+/// active, each session's entry holds only the text of its messages inside
+/// the window.
+pub fn build_literal_corpus_within<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     window: &TimeFilter,
 ) -> Vec<LiteralCorpusEntry> {
     if !window.is_active() {
-        return build_literal_corpus_with(conversations, true);
+        return build_literal_corpus(conversations);
     }
     conversations
         .par_iter()
@@ -435,20 +445,6 @@ pub fn build_agent_literal_corpus<C: Borrow<Conversation> + Sync>(
                 push_separated(&mut text, &search_text);
             }
             LiteralCorpusEntry { index, text }
-        })
-        .collect()
-}
-
-fn build_literal_corpus_with<C: Borrow<Conversation> + Sync>(
-    conversations: &[C],
-    include_agent_text: bool,
-) -> Vec<LiteralCorpusEntry> {
-    conversations
-        .par_iter()
-        .enumerate()
-        .map(|(index, conversation)| LiteralCorpusEntry {
-            index,
-            text: literal_text(conversation.borrow(), include_agent_text),
         })
         .collect()
 }
@@ -488,17 +484,14 @@ pub fn exact_fallback(
 
 /// A session's texts joined with separators, so quoted text does not match
 /// across two of them.
-fn literal_text(conversation: &Conversation, include_agent_text: bool) -> String {
+fn literal_text(conversation: &Conversation) -> String {
     let mut text = String::new();
-    for piece in conversation
-        .title_and_summary_texts()
-        .chain([conversation.full_text.as_str()])
-    {
+    for piece in conversation.title_and_summary_texts().chain([
+        conversation.full_text.as_str(),
+        conversation.agent_search_text.as_str(),
+        conversation.thinking_and_tool_call_text.as_str(),
+    ]) {
         push_separated(&mut text, piece);
-    }
-    if include_agent_text {
-        push_separated(&mut text, &conversation.agent_search_text);
-        push_separated(&mut text, &conversation.thinking_and_tool_call_text);
     }
     push_separated(
         &mut text,
@@ -767,7 +760,7 @@ mod tests {
         let conversation = conversation_with_agent_texts("ends with alpha", "beta starts", "");
 
         assert!(
-            build_agent_literal_corpus(&[conversation], &TimeFilter::default())
+            build_literal_corpus_within(&[conversation], &TimeFilter::default())
                 .iter()
                 .all(|entry| !Literal::new("alpha beta".to_owned()).matches(&entry.text))
         );

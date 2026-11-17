@@ -625,14 +625,10 @@ fn stored_texts(row: &Conversation, window: TimeFilter) -> Vec<(Option<usize>, S
         .clone()
         .expect("the row reads its copy")
         .read_copy(|held| {
-            held.visit_search_texts(
-                crate::history::sqlite_cache::SearchedFields::Agent,
-                &window,
-                |text| {
-                    texts.push((text.ordinal, text.text.to_owned()));
-                    std::ops::ControlFlow::Continue(())
-                },
-            )
+            held.visit_search_texts(&window, |text| {
+                texts.push((text.ordinal, text.text.to_owned()));
+                std::ops::ControlFlow::Continue(())
+            })
         })
         .expect("the cache holds the copy");
     texts

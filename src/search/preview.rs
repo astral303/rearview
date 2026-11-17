@@ -2,7 +2,7 @@
 //! preview to show at a width, and where the query matches inside it.
 
 use crate::history::{Conversation, MESSAGE_SEPARATOR};
-use crate::search::evidence::select_hidden_context_ranges;
+use crate::search::evidence::{MAX_CONTEXT_SPECS, SpecMask, select_hidden_context_ranges};
 use crate::search::literal::{Literal, match_literal_ranges};
 use crate::search::normalize_for_search;
 use crate::search::query::ParsedQuery;
@@ -299,7 +299,7 @@ fn build_context_segments_with_specs(
     }
 
     let preview_texts = SpecTexts::new(&SeparatedTexts::new([preview]));
-    let mut missing_mask: u64 = 0;
+    let mut missing_mask: SpecMask = 0;
     let mut missing_count = 0u32;
     for (i, spec) in specs.iter().enumerate() {
         if !preview_texts.hold(spec) {
@@ -708,7 +708,7 @@ fn dedupe_context_specs(specs: &[ContextMatchSpec]) -> Vec<ContextMatchSpec> {
             existing_is_literal == is_literal && existing_text.eq_ignore_ascii_case(text)
         }) {
             deduped.push(spec.clone());
-            if deduped.len() == 64 {
+            if deduped.len() == MAX_CONTEXT_SPECS {
                 break;
             }
         }

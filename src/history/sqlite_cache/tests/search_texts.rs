@@ -7,10 +7,11 @@ use crate::history::parser::normalize_whitespace;
 use crate::history::provider::Capability;
 use crate::history::provider::contract_tests::registered_fixtures;
 
-/// The lines of a Claude session holding a text of each layout group the
-/// list's search reads: a title and a summary, a reply written as two
-/// records, a tool result's items ahead of a text block in its entry, and a
-/// command's derived text.
+/// The lines of a Claude session holding a text of each kind of layout:
+/// a title and a summary, a reply written as two records, a tool result's
+/// items ahead of a text block in its entry, a command's derived text, and
+/// texts outside the dialogue: thinking, a tool call and a sub-agent's
+/// reply.
 fn every_layout_kind_lines() -> Vec<String> {
     let user = |content: serde_json::Value| serde_json::json!({"type": "user", "message": {"role": "user", "content": content}});
     let reply = |content: serde_json::Value| {
@@ -21,7 +22,10 @@ fn every_layout_kind_lines() -> Vec<String> {
         serde_json::json!({"type": "custom-title", "customTitle": "Layout title"}),
         serde_json::json!({"type": "summary", "summary": "Layout summary", "leafUuid": "l"}),
         user(serde_json::json!("first question")),
-        reply(serde_json::json!([{"type": "text", "text": "answer part one"}])),
+        reply(serde_json::json!([
+            {"type": "thinking", "thinking": "weigh the layout", "signature": ""},
+            {"type": "text", "text": "answer part one"},
+        ])),
         reply(serde_json::json!([
             {"type": "text", "text": "answer part two"},
             {"type": "tool_use", "id": "call", "name": "Bash", "input": {"command": "ls"}},
@@ -36,25 +40,33 @@ fn every_layout_kind_lines() -> Vec<String> {
         user(serde_json::json!(
             "<command-name>/model</command-name>\n<command-args>opus</command-args>"
         )),
+        serde_json::json!({"type": "progress", "parentToolUseID": "call",
+            "data": {"type": "agent_progress", "agentId": "a7777777",
+                "message": {"type": "assistant", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "sub-agent reply"}]}}}}),
     ]
     .iter()
     .map(serde_json::Value::to_string)
     .collect()
 }
 
-/// `body` after the row's title and summary, each after a separator: the
-/// text the list's evidence reads.
-fn after_title_and_summary(row: &Conversation, body: &str) -> String {
+/// The texts of `body` after the row's title and summary, each after a
+/// separator: the text the list's evidence reads.
+fn after_title_and_summary<'a>(
+    row: &'a Conversation,
+    body: impl IntoIterator<Item = &'a str>,
+) -> String {
     let mut text = String::new();
-    for piece in row.title_and_summary_texts().chain([body]) {
+    for piece in row.title_and_summary_texts().chain(body) {
         crate::history::message_texts::push_separated(&mut text, piece);
     }
     text
 }
 
-/// The parse and the cache lay out a row's list search texts in block
-/// order; the parse collapses whitespace, the cache keeps each text as
-/// written. A context line's snippets read this layout.
+/// The parse and the cache lay out a row's texts in block order, the
+/// dialogue first, then the other fields; the parse collapses whitespace,
+/// the cache keeps each text as written. A context line's snippets read
+/// this layout.
 #[test]
 fn parse_and_cache_lay_out_texts_in_block_order() {
     let laid_out = [
@@ -66,6 +78,9 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
         "item one\nitem two",
         "after the result",
         "/model opus",
+        "sub-agent reply",
+        "weigh the layout",
+        "Bash: ls",
     ]
     .join(" \u{1e} ");
     let home = tempfile::tempdir().unwrap();
@@ -76,7 +91,14 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
     let (_, parsed) =
         parsed_record_and_row(Source::Claude, &root_of(&session), &stub_of(&session, 1));
     assert_eq!(
-        after_title_and_summary(&parsed, &parsed.full_text),
+        after_title_and_summary(
+            &parsed,
+            [
+                parsed.full_text.as_str(),
+                &parsed.agent_search_text,
+                &parsed.thinking_and_tool_call_text
+            ]
+        ),
         normalize_whitespace(&laid_out),
         "the parse lays out the texts in block order, whitespace collapsed"
     );
@@ -119,13 +141,13 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
             .expect("the cache holds the copy");
         reads.push((
             format!("the copy {read} left"),
-            after_title_and_summary(&listed, cached.joined()),
+            after_title_and_summary(&listed, [&**cached.joined()]),
         ));
         let rows = [*listed];
         let scanned = crate::search::SearchTextsInMemory::read(&rows);
         reads.push((
             format!("a scan of the copy {read} left"),
-            after_title_and_summary(&rows[0], scanned.get(&rows[0]).unwrap().joined()),
+            after_title_and_summary(&rows[0], [&**scanned.get(&rows[0]).unwrap().joined()]),
         ));
     }
     for (read, text) in reads {

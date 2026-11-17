@@ -1,8 +1,8 @@
 //! A session's search texts and semantic turns, read from its stored parts
 //! for [`crate::history::Conversation::load_held_content`].
 
+use super::entries;
 use super::search_texts::visit_texts_within;
-use super::{SearchedFields, entries};
 use crate::agent::refs::MessageRange;
 use crate::error::Result;
 use crate::history::parser::{normalize_full_text, normalize_whitespace};
@@ -24,47 +24,41 @@ pub(crate) struct SearchPart {
     pub(crate) text: String,
 }
 
-/// Calls `visit` with each search text the session row `session` stores in
-/// the fields `agent search` reads, as the parse lays them out and
-/// normalises them, then each semantic turn. Text left empty is dropped.
+/// Calls `visit` with each search text the session row `session` stores, as
+/// the parse lays them out and normalises them, then each semantic turn.
+/// Text left empty is dropped.
 pub(super) fn visit_search_parts(
     connection: &rusqlite::Connection,
     session: i64,
     mut visit: impl FnMut(SearchPart),
 ) -> Result<()> {
-    visit_agent_search_texts(connection, session, &mut visit)?;
+    visit_search_texts_as_parsed(connection, session, &mut visit)?;
     visit_semantic_turns(connection, session, &mut visit)
 }
 
 /// [`visit_search_parts`]'s search texts, without the semantic turns.
-fn visit_agent_search_texts(
+fn visit_search_texts_as_parsed(
     connection: &rusqlite::Connection,
     session: i64,
     visit: &mut impl FnMut(SearchPart),
 ) -> Result<()> {
     let mut texts = Vec::new();
     let unwindowed = crate::time_filter::TimeFilter::default();
-    visit_texts_within(
-        connection,
-        session,
-        SearchedFields::Agent,
-        &unwindowed,
-        |text| {
-            let normalised = match text.field {
-                SearchField::Supplement => normalize_whitespace(text.text),
-                _ => normalize_full_text(text.text),
+    visit_texts_within(connection, session, &unwindowed, |text| {
+        let normalised = match text.field {
+            SearchField::Supplement => normalize_whitespace(text.text),
+            _ => normalize_full_text(text.text),
+        };
+        if !normalised.is_empty() {
+            let part = SearchPart {
+                ordinal: text.ordinal,
+                field: text.field,
+                text: normalised,
             };
-            if !normalised.is_empty() {
-                let part = SearchPart {
-                    ordinal: text.ordinal,
-                    field: text.field,
-                    text: normalised,
-                };
-                texts.push((text.order, part));
-            }
-            ControlFlow::Continue(())
-        },
-    )?;
+            texts.push((text.order, part));
+        }
+        ControlFlow::Continue(())
+    })?;
     texts.sort_by_key(|(order, _)| *order);
     for (_, part) in texts {
         visit(part);

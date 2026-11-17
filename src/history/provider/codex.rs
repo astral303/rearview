@@ -1145,22 +1145,25 @@ pub(super) mod tests {
                 vec![
                     Marker::searched("user text", "active codex question"),
                     Marker::searched("assistant text", "codex answer searchable"),
-                    Marker::shown("thinking", "reasoning summary visible"),
-                    Marker::shown("tool call", "TOOL_INPUT_VISIBLE"),
+                    Marker::searched("thinking", "reasoning summary visible"),
+                    Marker::unsearched("tool call", "TOOL_INPUT_VISIBLE"),
                     Marker::searched("tool result", "tool output searchable"),
-                    Marker::agent_searched("sub-agent message", "child answer searchable"),
-                    Marker::agent_searched(
+                    Marker::in_call_or_subagent("sub-agent message", "child answer searchable"),
+                    Marker::in_call_or_subagent(
                         "message of a sub-agent without user text",
                         "TASKED_SUBAGENT_SENTINEL",
                     ),
                     Marker::searched("interrupted-turn notice", "Conversation interrupted"),
                     Marker::searched("goal", "GOAL_SENTINEL"),
-                    Marker::agent_searched("web search", "WEB_SEARCH_SENTINEL")
+                    Marker::in_call_or_subagent("web search", "WEB_SEARCH_SENTINEL")
                         .in_summary_row("Fetched 1 URL, searched the web 2 times"),
-                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                    Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
-                    Marker::agent_searched("exec script's shell command", "EXEC_COMMAND_SENTINEL")
-                        .in_summary_row("Ran 1 shell command"),
+                    Marker::in_call_or_subagent(
+                        "exec script's shell command",
+                        "EXEC_COMMAND_SENTINEL",
+                    )
+                    .in_summary_row("Ran 1 shell command"),
                 ],
             )
             .with_hidden(&[

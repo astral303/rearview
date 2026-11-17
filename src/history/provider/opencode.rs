@@ -1107,13 +1107,13 @@ pub(super) mod tests {
                 vec![
                     Marker::searched("user text", "find the fixture defect"),
                     Marker::searched("assistant text", "the defect hides in lib.rs"),
-                    Marker::shown("thinking", "considering the fixture layout"),
-                    Marker::agent_searched("tool call", "/tmp/opencode-project/lib.rs"),
+                    Marker::searched("thinking", "considering the fixture layout"),
+                    Marker::in_call_or_subagent("tool call", "/tmp/opencode-project/lib.rs"),
                     Marker::searched("tool result", "fn defect() {}"),
-                    Marker::agent_searched("directory listing", "OPENCODE_LIST_SENTINEL")
+                    Marker::in_call_or_subagent("directory listing", "OPENCODE_LIST_SENTINEL")
                         .in_summary_row("Listed 1 directory, ran 1 shell command"),
-                    Marker::agent_searched("sub-agent message", "sub-agent answer"),
-                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                    Marker::in_call_or_subagent("sub-agent message", "sub-agent answer"),
+                    Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
                 ],
             )

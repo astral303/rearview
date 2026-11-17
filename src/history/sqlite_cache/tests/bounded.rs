@@ -335,7 +335,7 @@ fn sql_windows_keep_full_message_spans_and_final_millisecond() {
         .as_ref()
         .unwrap()
         .read_copy(|held| {
-            held.visit_search_texts(SearchedFields::List, &window, |text| {
+            held.visit_search_texts(&window, |text| {
                 selected.push((text.order, text.ordinal, text.text.to_owned()));
                 std::ops::ControlFlow::Continue(())
             })

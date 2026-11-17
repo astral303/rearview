@@ -16,7 +16,8 @@ pub struct LexicalEvidence {
     /// retitle the row before the evidence is built again.
     title_and_summary: Vec<String>,
     /// The session's other texts, shared with the texts held in memory;
-    /// `None` for the conversation's `full_text`.
+    /// `None` for the conversation's own texts: its `full_text`, then its
+    /// `agent_search_text` and `thinking_and_tool_call_text`.
     body: Option<Arc<str>>,
     /// Ranges in `title_and_summary`, then `body`, each after a separator.
     pub context_ranges: Vec<(usize, usize)>,
@@ -26,13 +27,19 @@ impl LexicalEvidence {
     /// The texts `context_ranges` index, `conversation` being the row the
     /// evidence was built for.
     pub(crate) fn texts<'a>(&'a self, conversation: &'a Conversation) -> SeparatedTexts<'a> {
-        let body = self.body.as_deref().unwrap_or(&conversation.full_text);
-        SeparatedTexts::new(
-            self.title_and_summary
-                .iter()
-                .map(String::as_str)
-                .chain([body]),
-        )
+        let title_and_summary = self.title_and_summary();
+        match self.body.as_deref() {
+            Some(body) => SeparatedTexts::new(title_and_summary.chain([body])),
+            None => SeparatedTexts::new(title_and_summary.chain([
+                conversation.full_text.as_str(),
+                conversation.agent_search_text.as_str(),
+                conversation.thinking_and_tool_call_text.as_str(),
+            ])),
+        }
+    }
+
+    fn title_and_summary(&self) -> impl Iterator<Item = &str> {
+        self.title_and_summary.iter().map(String::as_str)
     }
 }
 
@@ -43,12 +50,19 @@ struct TermHit {
     term_idx: usize,
 }
 
+/// A set of a context line's specs, such as those with a hit: spec `i` is
+/// bit `i`.
+pub(crate) type SpecMask = u64;
+
+/// The most specs a context line reads: a [`SpecMask`] holds a bit for each.
+pub(crate) const MAX_CONTEXT_SPECS: usize = SpecMask::BITS as usize;
+
 #[derive(Clone, Debug)]
 struct HitCluster {
     start: usize,
     end: usize,
-    unique_terms: u64,
-    missing_terms: u64,
+    unique_terms: SpecMask,
+    missing_terms: SpecMask,
     adjacent_pairs: u32,
     last_hit_end: usize,
     last_term_idx: usize,
@@ -123,8 +137,12 @@ pub fn build_session_list_evidence<C: Borrow<Conversation>>(
 
 /// The evidence for `conversation` in its search texts: its row's title and
 /// summary, then `texts`, those held in memory. A conversation not in the
-/// session cache reads its `full_text` in place of `texts`. A cached
-/// conversation without texts in memory reads its title and summary alone.
+/// session cache reads its own texts in place of `texts`: its `full_text`,
+/// the dialogue, then its `agent_search_text` and
+/// `thinking_and_tool_call_text`. A cached conversation without texts in
+/// memory reads its title and summary alone. The texts after the dialogue
+/// are read only when some query term doesn't have a hit in the title, the
+/// summary or the dialogue.
 pub fn build_lexical_evidence(
     conversation: &Conversation,
     texts: Option<&SessionSearchTexts>,
@@ -142,8 +160,17 @@ pub fn build_lexical_evidence(
         body: texts.map(|texts| Arc::clone(texts.joined())),
         context_ranges: Vec::new(),
     };
-    let ranges =
-        select_context_ranges(&evidence.texts(conversation), &conversation.preview, &specs)?;
+    let dialogue = texts.map_or(
+        conversation.full_text.as_str(),
+        SessionSearchTexts::dialogue,
+    );
+    let dialogue_end = SeparatedTexts::new(evidence.title_and_summary().chain([dialogue])).len();
+    let ranges = select_context_ranges(
+        &evidence.texts(conversation),
+        dialogue_end,
+        &conversation.preview,
+        &specs,
+    )?;
     evidence.context_ranges = ranges;
     Some(evidence)
 }
@@ -185,7 +212,7 @@ fn dedupe_specs(specs: &[EvidenceSpec]) -> Vec<EvidenceSpec> {
             existing_is_literal == is_literal && existing_text.eq_ignore_ascii_case(text)
         }) {
             deduped.push(spec.clone());
-            if deduped.len() == 64 {
+            if deduped.len() == MAX_CONTEXT_SPECS {
                 break;
             }
         }
@@ -193,12 +220,15 @@ fn dedupe_specs(specs: &[EvidenceSpec]) -> Vec<EvidenceSpec> {
     deduped
 }
 
+/// The context ranges in `texts`: the title, the summary and the dialogue,
+/// ending at `dialogue_end`, then the other fields' texts.
 fn select_context_ranges(
-    full_text: &SeparatedTexts<'_>,
+    texts: &SeparatedTexts<'_>,
+    dialogue_end: usize,
     preview: &str,
     specs: &[EvidenceSpec],
 ) -> Option<Vec<(usize, usize)>> {
-    let mut missing_mask: u64 = 0;
+    let mut missing_mask: SpecMask = 0;
     let mut missing_count = 0u32;
     for (i, spec) in specs.iter().enumerate() {
         if !spec.has_match(preview) {
@@ -207,13 +237,13 @@ fn select_context_ranges(
         }
     }
 
-    let all_hits = find_all_spec_hits(full_text, specs);
+    let all_hits = find_hits_dialogue_first(texts, dialogue_end, specs);
     if all_hits.is_empty() {
         return None;
     }
 
     if missing_count == 0 {
-        let preview_hit_count = find_all_spec_hits(&SeparatedTexts::new([preview]), specs).len();
+        let preview_hit_count = find_spec_hits(&[(0, preview)], specs).len();
         if all_hits.len() <= preview_hit_count {
             return None;
         }
@@ -223,13 +253,13 @@ fn select_context_ranges(
         .iter()
         .map(|hit| (hit.start, hit.end, hit.term_idx))
         .collect();
-    select_hidden_context_ranges(full_text, &hit_spans, missing_mask, missing_count)
+    select_hidden_context_ranges(texts, &hit_spans, missing_mask, missing_count)
 }
 
 pub(crate) fn select_hidden_context_ranges(
     full_text: &SeparatedTexts<'_>,
     hits: &[(usize, usize, usize)],
-    missing_mask: u64,
+    missing_mask: SpecMask,
     missing_count: u32,
 ) -> Option<Vec<(usize, usize)>> {
     let merge_gap_bytes: usize = 50;
@@ -242,7 +272,7 @@ pub(crate) fn select_hidden_context_ranges(
 
     let mut clusters: Vec<HitCluster> = Vec::new();
     for &(start, end, term_idx) in hits {
-        let term_bit: u64 = 1u64 << term_idx;
+        let term_bit: SpecMask = 1 << term_idx;
         let is_missing = (missing_mask & term_bit) != 0;
         let mut extended = false;
 
@@ -299,7 +329,7 @@ pub(crate) fn select_hidden_context_ranges(
     });
 
     let mut selected: Vec<HitCluster> = Vec::new();
-    let mut covered_missing: u64 = 0;
+    let mut covered_missing: SpecMask = 0;
 
     for cluster in &clusters {
         if selected.len() >= max_clusters {
@@ -333,21 +363,49 @@ pub(crate) fn select_hidden_context_ranges(
     )
 }
 
-/// Every spec's hits in `texts`, sorted by start, each text searched on its
-/// own: a hit doesn't cross a separator.
-fn find_all_spec_hits(texts: &SeparatedTexts<'_>, specs: &[EvidenceSpec]) -> Vec<TermHit> {
-    let mut all_hits = Vec::new();
+/// Every spec's hits in `texts` before `dialogue_end`, sorted by start. When
+/// some spec doesn't have a hit there, also every spec's hits from
+/// `dialogue_end` on, in the other fields' texts: reading those texts for a
+/// query the dialogue matches would add their size to the context line's
+/// time.
+fn find_hits_dialogue_first(
+    texts: &SeparatedTexts<'_>,
+    dialogue_end: usize,
+    specs: &[EvidenceSpec],
+) -> Vec<TermHit> {
+    let (through_dialogue, other_fields): (Vec<_>, Vec<_>) = texts
+        .texts()
+        .map(|(offset, text)| {
+            let (before, after) =
+                text.split_at(dialogue_end.saturating_sub(offset).min(text.len()));
+            ((offset, before), (offset + before.len(), after))
+        })
+        .unzip();
+    let mut hits = find_spec_hits(&through_dialogue, specs);
+    let specs_hit = hits
+        .iter()
+        .fold(0, |specs_hit: SpecMask, hit| specs_hit | 1 << hit.term_idx);
+    if (specs_hit.count_ones() as usize) < specs.len() {
+        hits.extend(find_spec_hits(&other_fields, specs));
+    }
+    hits.sort_unstable_by_key(|hit| hit.start);
+    hits
+}
+
+/// Every spec's hits in `texts`, each with its offset, in the specs' order.
+/// Each text is searched on its own: a hit doesn't cross a separator.
+fn find_spec_hits(texts: &[(usize, &str)], specs: &[EvidenceSpec]) -> Vec<TermHit> {
+    let mut hits = Vec::new();
     for (term_idx, spec) in specs.iter().enumerate() {
-        for (offset, text) in texts.texts() {
-            all_hits.extend(spec.ranges(text).into_iter().map(|(start, end)| TermHit {
+        for &(offset, text) in texts {
+            hits.extend(spec.ranges(text).into_iter().map(|(start, end)| TermHit {
                 start: offset + start,
                 end: offset + end,
                 term_idx,
             }));
         }
     }
-    all_hits.sort_unstable_by_key(|hit| hit.start);
-    all_hits
+    hits
 }
 
 fn find_first_normalized_match(text: &str, term: &str) -> Option<(usize, usize)> {
@@ -673,6 +731,78 @@ mod tests {
                 line(&titled, query),
                 expected,
                 "{query:?}: the context line reads the titles ahead of the text"
+            );
+        }
+    }
+
+    #[test]
+    fn other_fields_hits_are_read_only_when_some_term_doesnt_hit_through_the_dialogue() {
+        let separator = crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
+        let dialogue = "asked about the cache";
+        let body = format!("{dialogue}{separator}Bash: cargo cache --needle");
+        let texts = SeparatedTexts::new(["Cache title", body.as_str()]);
+        let dialogue_end = texts.len() - (body.len() - dialogue.len());
+        for (query, through_dialogue, in_other_fields) in [
+            ("cache", 2, 0),
+            ("title asked", 2, 0),
+            ("cache needle", 2, 2),
+            ("\"--needle\"", 0, 1),
+            ("cache absent", 2, 1),
+        ] {
+            let specs = evidence_specs(&ParsedQuery::parse(query));
+            let hits = find_hits_dialogue_first(&texts, dialogue_end, &specs);
+            let starts = hits.iter().map(|hit| hit.start).collect::<Vec<_>>();
+            assert!(
+                starts.is_sorted(),
+                "{query:?}: the hits are sorted by start: {starts:?}"
+            );
+            let hits_through_dialogue = starts.iter().filter(|start| **start < dialogue_end);
+            assert_eq!(
+                (
+                    hits_through_dialogue.count(),
+                    starts
+                        .iter()
+                        .filter(|start| **start >= dialogue_end)
+                        .count()
+                ),
+                (through_dialogue, in_other_fields),
+                "{query:?}: the other fields' hits are read only when a term doesn't hit in \
+                 the title or the dialogue: {starts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dialogue_first_rule_holds_for_the_most_specs_a_context_line_reads() {
+        let separator = crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
+        let terms = (0..MAX_CONTEXT_SPECS + 6)
+            .map(|term| format!("term{term}x"))
+            .collect::<Vec<_>>();
+        let specs = dedupe_specs(
+            &terms
+                .iter()
+                .cloned()
+                .map(EvidenceSpec::Normalized)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            specs.len(),
+            MAX_CONTEXT_SPECS,
+            "a context line reads the first {MAX_CONTEXT_SPECS} specs"
+        );
+        let last = MAX_CONTEXT_SPECS - 1;
+        for (terms_in_dialogue, in_other_fields) in [(MAX_CONTEXT_SPECS, 0), (last, 2)] {
+            let dialogue = terms[..terms_in_dialogue].join(" ");
+            let body = format!("{dialogue}{separator}{} {}", terms[0], terms[last]);
+            let texts = SeparatedTexts::new([body.as_str()]);
+            let hits = find_hits_dialogue_first(&texts, dialogue.len(), &specs);
+            assert_eq!(
+                hits.iter()
+                    .filter(|hit| hit.start >= dialogue.len())
+                    .count(),
+                in_other_fields,
+                "{terms_in_dialogue} of {MAX_CONTEXT_SPECS} specs hit in the dialogue: the other \
+                 fields' hits are read only when a spec doesn't hit in the dialogue"
             );
         }
     }

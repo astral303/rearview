@@ -1057,15 +1057,18 @@ pub(super) mod tests {
                 vec![
                     Marker::searched("user text", "active grok question"),
                     Marker::searched("assistant text", "grok answer searchable"),
-                    Marker::shown("thinking", "GROK_THINKING_VISIBLE"),
-                    Marker::agent_searched("tool call", "GROK_TOOL_INPUT_VISIBLE")
+                    Marker::searched("thinking", "GROK_THINKING_VISIBLE"),
+                    Marker::in_call_or_subagent("tool call", "GROK_TOOL_INPUT_VISIBLE")
                         .in_summary_row(CALLS),
                     Marker::searched("tool result", "grok tool output searchable")
                         .in_summary_row(CALLS),
-                    Marker::agent_searched("sub-agent message", "grok child answer searchable"),
-                    Marker::agent_searched("directory listing", "GROK_LIST_DIR_SENTINEL")
+                    Marker::in_call_or_subagent(
+                        "sub-agent message",
+                        "grok child answer searchable",
+                    ),
+                    Marker::in_call_or_subagent("directory listing", "GROK_LIST_DIR_SENTINEL")
                         .in_summary_row(CALLS),
-                    Marker::agent_searched("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                    Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
                 ],
             )
