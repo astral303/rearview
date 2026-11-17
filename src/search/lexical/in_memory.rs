@@ -26,6 +26,8 @@ pub struct SessionSearchTexts {
     joined: Arc<str>,
     /// Each text's byte range in `joined`.
     texts: Box<[Range<usize>]>,
+    /// The length of the dialogue at the start of `joined`.
+    dialogue_len: usize,
 }
 
 impl SessionSearchTexts {
@@ -54,6 +56,12 @@ impl SessionSearchTexts {
     /// Every text, each after a separator.
     pub fn joined(&self) -> &Arc<str> {
         &self.joined
+    }
+
+    /// The dialogue's texts, each after a separator: the start of
+    /// [`Self::joined`].
+    pub fn dialogue(&self) -> &str {
+        &self.joined[..self.dialogue_len]
     }
 }
 
@@ -144,13 +152,14 @@ fn laid_out(pieces: Vec<TextsInReadOrder>) -> SessionSearchTexts {
         })
         .collect::<Vec<_>>();
     ordered.par_sort_by_key(|(key, _)| *key);
+    let dialogue_texts = ordered.partition_point(|((group, ..), _)| *group == FieldGroup::Dialogue);
     let texts_in_order = ordered.iter().map(|(_, text)| *text).collect::<Vec<_>>();
-    joined(&texts_in_order)
+    joined(&texts_in_order, dialogue_texts)
 }
 
 /// `texts`, in their order, each after a separator once the joined text
-/// holds a byte.
-fn joined(texts: &[&str]) -> SessionSearchTexts {
+/// holds a byte. The first `dialogue_texts` of them are the dialogue.
+fn joined(texts: &[&str], dialogue_texts: usize) -> SessionSearchTexts {
     let mut end = 0;
     let ranges = texts
         .iter()
@@ -166,6 +175,7 @@ fn joined(texts: &[&str]) -> SessionSearchTexts {
         .collect::<Box<[_]>>();
     SessionSearchTexts {
         joined: joined_once(texts, &ranges),
+        dialogue_len: ranges[..dialogue_texts].last().map_or(0, |range| range.end),
         texts: ranges,
     }
 }
@@ -615,7 +625,7 @@ mod tests {
             ],
             vec![longer.as_str(), longer.as_str()],
         ] {
-            let joined = joined(&texts);
+            let joined = joined(&texts, texts.len());
             assert_eq!(
                 &*joined.joined,
                 pushed_one_by_one(&texts),
@@ -626,6 +636,18 @@ mod tests {
                 joined.texts_at(0..texts.len()).collect::<Vec<_>>(),
                 texts,
                 "each text's range holds the text"
+            );
+        }
+    }
+
+    #[test]
+    fn dialogue_is_its_texts_joined_without_the_other_fields_texts() {
+        let texts = ["asked", "", "answered", "tool call", "thinking"];
+        for dialogue_texts in 0..=texts.len() {
+            assert_eq!(
+                joined(&texts, dialogue_texts).dialogue(),
+                pushed_one_by_one(&texts[..dialogue_texts]),
+                "the dialogue is the first {dialogue_texts} texts, joined"
             );
         }
     }
