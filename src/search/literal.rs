@@ -29,7 +29,7 @@ pub struct Literal {
     /// mismatch.
     resume_at: Vec<usize>,
     /// `folded` split at its whitespace: each must appear in a text that
-    /// holds a match.
+    /// contains a match.
     words: Vec<String>,
     search: LiteralSearch,
 }
@@ -49,8 +49,8 @@ enum LiteralSearch {
     /// The literal starts and ends with a word: find its first word, then
     /// check the rest from there.
     FirstWord(WordFinders),
-    /// Check that the text holds each word, when the literal has finders for
-    /// them, then fold the text one character at a time.
+    /// Check that the text contains each word, when the literal has finders
+    /// for them, then fold the text one character at a time.
     EachChar(Option<WordFinders>),
 }
 
@@ -100,17 +100,18 @@ impl WordFinders {
         }
     }
 
-    /// The byte where `text` first holds a character whose lowercase holds a
-    /// letter of a case-insensitive literal: from there its ASCII bytes alone
-    /// cannot settle a match.
-    fn first_non_ascii_capital(&self, text: &str) -> Option<usize> {
+    /// The characters outside ASCII whose lowercase contains a letter of a
+    /// case-insensitive literal: around one of them in a text, its ASCII
+    /// bytes alone cannot settle a match. `None` for a case-sensitive
+    /// literal.
+    fn non_ascii_capitals(&self) -> Option<NonAsciiCapitals> {
         match self {
             Self::Exact { .. } => None,
-            Self::IgnoringAsciiCase { capitals, .. } => capitals.first_in(text),
+            Self::IgnoringAsciiCase { capitals, .. } => Some(*capitals),
         }
     }
 
-    fn holds_word(&self, index: usize, text: &str) -> bool {
+    fn contains_word(&self, index: usize, text: &str) -> bool {
         self.find(index, text, 0).is_some()
     }
 
@@ -205,11 +206,11 @@ impl Literal {
     ///
     /// A literal that starts and ends with a word, case-sensitive or ASCII,
     /// is found by searching for its first word and checking the rest from
-    /// there. Reaching a character whose lowercase holds a letter of a
-    /// case-insensitive literal, that search folds the rest of `text` one
-    /// character at a time from the end of its last match. Any other literal
-    /// first checks that `text` holds each of its words, when it can, then
-    /// folds `text` one character at a time.
+    /// there. Around each character whose lowercase contains a letter of a
+    /// case-insensitive literal, that search folds the text a match
+    /// containing the character can cover one character at a time. Any other
+    /// literal first checks that `text` contains each of its words, when it
+    /// can, then folds `text` one character at a time.
     fn scan(&self, text: &str, mut on_match: impl FnMut(usize, usize) -> ControlFlow<()>) {
         if self.folded.is_empty() {
             return;
@@ -221,20 +222,22 @@ impl Literal {
                     .as_ref()
                     .is_none_or(|finders| self.may_occur_in(text, finders))
                 {
-                    self.scan_each_char(text, 0, on_match);
+                    self.scan_each_char(text, on_match);
                 }
                 return;
             }
         };
-        let fold_from = finders.first_non_ascii_capital(text);
+        let first_capital = finders
+            .non_ascii_capitals()
+            .and_then(|capitals| capitals.first_in(text));
         let mut from = 0;
         let mut last_match_end = 0;
         loop {
             let start = finders.find(0, text, from);
-            if let Some(fold_from) = fold_from
-                && start.is_none_or(|start| start > fold_from)
+            if let Some(first_capital) = first_capital
+                && start.is_none_or(|start| start > first_capital)
             {
-                self.scan_each_char(text, last_match_end, on_match);
+                self.scan_around_capitals(text, finders, last_match_end, start, on_match);
                 return;
             }
             let Some(start) = start else { return };
@@ -249,6 +252,101 @@ impl Literal {
                 None => from = start + 1,
             }
         }
+    }
+
+    /// [`Self::scan`] from byte `scanned_to`, the end of the last match or 0,
+    /// of a text containing a character outside ASCII whose lowercase
+    /// contains one of the literal's letters. `word_start` is where the
+    /// literal's first word next occurs at or after `scanned_to`, past
+    /// occurrences that don't start a byte match.
+    ///
+    /// Fold one character at a time around each such character, from the
+    /// earliest start a match containing it can have until past it without a
+    /// partial match, and compare bytes elsewhere: only a match containing
+    /// one of them can differ from what comparing bytes finds. Kept out of
+    /// line because the same search sharing the byte loop in [`Self::scan`]
+    /// slowed each call on a text containing neither character.
+    #[cold]
+    #[inline(never)]
+    fn scan_around_capitals(
+        &self,
+        text: &str,
+        finders: &WordFinders,
+        mut scanned_to: usize,
+        mut word_start: Option<usize>,
+        mut on_match: impl FnMut(usize, usize) -> ControlFlow<()>,
+    ) {
+        let mut capitals = finders
+            .non_ascii_capitals()
+            .into_iter()
+            .flat_map(|capitals| capitals.positions_in(text))
+            .peekable();
+        let mut matcher = FoldedMatcher::new(self);
+        loop {
+            while capitals
+                .next_if(|capital| capital.start < scanned_to)
+                .is_some()
+            {}
+            let capital = capitals.next();
+            let earliest_start = capital.as_ref().map_or(text.len(), |capital| {
+                self.earliest_match_start(text, scanned_to, capital.start)
+            });
+            while let Some(start) = word_start
+                && start < earliest_start
+            {
+                match self.match_end(text, start, finders) {
+                    Some(end) => {
+                        if on_match(start, end).is_break() {
+                            return;
+                        }
+                        scanned_to = end;
+                        word_start = finders.find(0, text, end);
+                    }
+                    None => word_start = finders.find(0, text, start + 1),
+                }
+            }
+            let Some(capital) = capital else { return };
+            // Fold on through each next character starting within twice the
+            // literal's length: stopping, then folding again from its
+            // earliest match start, would fold about as much text and add a
+            // restart.
+            let mut capital_end = capital.end;
+            while let Some(next) =
+                capitals.next_if(|next| next.start < capital_end + 2 * self.folded.len())
+            {
+                capital_end = next.end;
+            }
+            let fold_from = scanned_to.max(earliest_start);
+            match self.fold_until_idle(&mut matcher, text, fold_from, capital_end, &mut on_match) {
+                ControlFlow::Break(()) => return,
+                ControlFlow::Continue(stop) => scanned_to = stop,
+            }
+            if word_start.is_some_and(|start| start < scanned_to) {
+                word_start = finders.find(0, text, scanned_to);
+            }
+        }
+    }
+
+    /// The earliest byte at or after `scanned_to` a match containing the
+    /// character at byte `capital` can start at: `folded.len() - 1` folded
+    /// characters before it, each run of whitespace one of them, and each
+    /// other character at least one.
+    fn earliest_match_start(&self, text: &str, scanned_to: usize, capital: usize) -> usize {
+        let mut start = capital;
+        let mut folded = 0;
+        let mut previous_was_whitespace = false;
+        for ch in text[scanned_to..capital].chars().rev() {
+            let is_whitespace = ch.is_whitespace();
+            if !(is_whitespace && previous_was_whitespace) {
+                if folded + 1 == self.folded.len() {
+                    break;
+                }
+                folded += 1;
+            }
+            previous_was_whitespace = is_whitespace;
+            start -= ch.len_utf8();
+        }
+        start
     }
 
     /// The end of the match starting with the literal's first word at
@@ -273,54 +371,68 @@ impl Literal {
         Some(end)
     }
 
-    /// False when `text` lacks one of the literal's words and can't hold a
-    /// match. A case-insensitive literal may match any text holding a
-    /// character whose lowercase holds one of its letters.
+    /// False when `text` lacks one of the literal's words and can't contain
+    /// a match. A case-insensitive literal may match any text containing a
+    /// character whose lowercase contains one of its letters.
     fn may_occur_in(&self, text: &str, finders: &WordFinders) -> bool {
-        finders.first_non_ascii_capital(text).is_some()
-            || (0..self.words.len()).all(|index| finders.holds_word(index, text))
+        finders
+            .non_ascii_capitals()
+            .is_some_and(|capitals| capitals.first_in(text).is_some())
+            || (0..self.words.len()).all(|index| finders.contains_word(index, text))
     }
 
-    /// [`Self::scan`] by folding `text` from byte `from` one character at a
-    /// time: each run of whitespace as one space, and each character
-    /// lowercased unless the literal is case-sensitive. `from` must be 0 or
-    /// the end of a match: the matcher starts with no partial match.
-    fn scan_each_char(
-        &self,
-        text: &str,
-        from: usize,
-        mut on_match: impl FnMut(usize, usize) -> ControlFlow<()>,
-    ) {
+    /// [`Self::scan`] by folding `text` one character at a time: each run of
+    /// whitespace as one space, and each character lowercased unless the
+    /// literal is case-sensitive.
+    fn scan_each_char(&self, text: &str, on_match: impl FnMut(usize, usize) -> ControlFlow<()>) {
         let mut matcher = FoldedMatcher::new(self);
-        let mut feed = |ch: char, start: usize, end: usize| match matcher.feed(ch, start, end) {
-            Some((match_start, match_end)) => on_match(match_start, match_end),
-            None => ControlFlow::Continue(()),
-        };
+        let _ = self.fold_until_idle(&mut matcher, text, 0, text.len(), on_match);
+    }
+
+    /// [`Self::scan_each_char`] from byte `fold_from` until the first
+    /// character at or after byte `capital_end` that `matcher` meets without
+    /// a partial match. Returns `Continue` with that character's byte, or
+    /// the text's length, unless `on_match` breaks. `matcher` must be
+    /// without a partial match, and no match may start between the end of
+    /// the last match and `fold_from`.
+    fn fold_until_idle(
+        &self,
+        matcher: &mut FoldedMatcher,
+        text: &str,
+        fold_from: usize,
+        capital_end: usize,
+        mut on_match: impl FnMut(usize, usize) -> ControlFlow<()>,
+    ) -> ControlFlow<(), usize> {
+        let mut feed =
+            |matcher: &mut FoldedMatcher, ch: char, start: usize, end: usize| match matcher
+                .feed(ch, start, end)
+            {
+                Some((match_start, match_end)) => on_match(match_start, match_end),
+                None => ControlFlow::Continue(()),
+            };
         let mut previous_was_whitespace = false;
-        for (offset, ch) in text[from..].char_indices() {
-            let start = from + offset;
+        for (offset, ch) in text[fold_from..].char_indices() {
+            let start = fold_from + offset;
+            if start >= capital_end && matcher.is_idle() {
+                return ControlFlow::Continue(start);
+            }
             let end = start + ch.len_utf8();
-            let flow = if ch.is_whitespace() {
-                let flow = if previous_was_whitespace {
-                    ControlFlow::Continue(())
-                } else {
-                    feed(' ', start, end)
-                };
+            if ch.is_whitespace() {
+                if !previous_was_whitespace {
+                    feed(matcher, ' ', start, end)?;
+                }
                 previous_was_whitespace = true;
-                flow
             } else {
                 previous_was_whitespace = false;
                 match self.case_mode {
-                    CaseMode::Sensitive => feed(ch, start, end),
+                    CaseMode::Sensitive => feed(matcher, ch, start, end)?,
                     CaseMode::Insensitive => ch
                         .to_lowercase()
-                        .try_for_each(|folded| feed(folded, start, end)),
+                        .try_for_each(|folded| feed(matcher, folded, start, end))?,
                 }
-            };
-            if flow.is_break() {
-                return;
             }
         }
+        ControlFlow::Continue(text.len())
     }
 }
 
@@ -345,6 +457,11 @@ impl<'a> FoldedMatcher<'a> {
             starts: vec![0; literal.folded.len()],
             next_slot: 0,
         }
+    }
+
+    /// True without a partial match.
+    fn is_idle(&self) -> bool {
+        self.matched == 0
     }
 
     /// The byte range of the match `ch` completes, if it completes one.
@@ -427,8 +544,8 @@ pub fn build_literal_corpus<C: Borrow<Conversation> + Sync>(
 }
 
 /// [`build_literal_corpus`] without an active `window`. With `window`
-/// active, each session's entry holds only the text of its messages inside
-/// the window.
+/// active, each session's entry contains only the text of its messages
+/// inside the window.
 pub fn build_literal_corpus_within<C: Borrow<Conversation> + Sync>(
     conversations: &[C],
     window: &TimeFilter,
@@ -520,7 +637,7 @@ mod tests {
     /// faster search must reproduce.
     fn ranges_folding_each_char(literal: &Literal, text: &str) -> Vec<(usize, usize)> {
         let mut ranges = Vec::new();
-        literal.scan_each_char(text, 0, |start, end| {
+        literal.scan_each_char(text, |start, end| {
             ranges.push((start, end));
             ControlFlow::Continue(())
         });
@@ -550,11 +667,27 @@ mod tests {
             "日本 語",
             "abi",
             "kit",
+            "kit kit",
+            "kiki k",
+            "mise run check",
         ]
         .map(|literal| Literal::new(literal.to_owned()));
         let ignoring_case = ["\u{212A}it", "Mixed Case", "SQLITE_PROTOCOL"]
             .map(|literal| Literal::ignoring_case(literal.to_owned()));
+        let far_apart = format!(
+            "\u{212A}it kit{}kit \u{212A}it\n{}mise run chec\u{212A} m\u{130}se run check",
+            " x".repeat(200),
+            "mise run check ".repeat(20)
+        );
         let texts = [
+            far_apart.as_str(),
+            "\u{212A}it mise run check, mise run chec\u{212A}, mise run check \u{212A}",
+            "m\u{130}se run check, mise run check, MISE RUN CHEC\u{212A}",
+            "mise \t run\n\n \u{212A}it check, mise\u{212A} run check",
+            "k \t \u{212A} \n k, \u{212A}\t\t k k \u{212A}",
+            "\u{212A}\u{212A}it \u{212A}it\u{130}t kit \u{212A}i\u{130}",
+            "kit kit \u{212A}it kit, \u{212A}it kit kit, \u{212A}i kit kit kit",
+            "kiki\u{212A}iki  k kiki k, kikiki \u{212A}",
             "",
             "pass --isolated to panache, not --Isolated twice: --ISOLATED",
             "cache rebuild, Cache\tRebuild, cache\n\n rebuild, CACHE\u{a0}REBUILD, cacherebuild",
@@ -583,18 +716,54 @@ mod tests {
         ];
         for literal in literals.iter().chain(&ignoring_case) {
             for text in texts {
+                let expected = ranges_folding_each_char(literal, text);
                 assert_eq!(
                     literal.match_ranges(text),
-                    ranges_folding_each_char(literal, text),
-                    "{:?} in {text:?}",
+                    expected,
+                    "the search finds the ranges folding finds for {:?} in {text:?}",
                     literal.text()
                 );
                 assert_eq!(
                     literal.matches(text),
-                    !ranges_folding_each_char(literal, text).is_empty(),
-                    "{:?} in {text:?}",
+                    !expected.is_empty(),
+                    "the search matches where folding finds a range for {:?} in {text:?}",
                     literal.text()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn search_finds_ranges_folding_each_character_finds_in_texts_of_letters_capitals_and_whitespace()
+     {
+        const ALPHABET: [char; 7] = ['k', 'i', 'K', '\u{212A}', '\u{130}', ' ', '\t'];
+        const MAX_TEXT_CHARS: u32 = 5;
+        let literals = ["k", "i", "kk", "ki", "k i", "kik", "iki k"]
+            .map(|literal| Literal::new(literal.to_owned()));
+        let mut text = String::new();
+        for length in 0..=MAX_TEXT_CHARS {
+            for combination in 0..ALPHABET.len().pow(length) {
+                text.clear();
+                let mut rest = combination;
+                for _ in 0..length {
+                    text.push(ALPHABET[rest % ALPHABET.len()]);
+                    rest /= ALPHABET.len();
+                }
+                for literal in &literals {
+                    let expected = ranges_folding_each_char(literal, &text);
+                    assert_eq!(
+                        literal.match_ranges(&text),
+                        expected,
+                        "the search finds the ranges folding finds for {:?} in {text:?}",
+                        literal.text()
+                    );
+                    assert_eq!(
+                        literal.matches(&text),
+                        !expected.is_empty(),
+                        "the search matches where folding finds a range for {:?} in {text:?}",
+                        literal.text()
+                    );
+                }
             }
         }
     }

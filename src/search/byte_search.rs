@@ -1,13 +1,14 @@
 //! Searches for lowercase ASCII text that ignore ASCII case and read the
 //! text's bytes with SIMD instructions.
 //!
-//! A text's ASCII bytes alone settle such a match unless the text holds a
-//! character outside ASCII whose lowercase holds ASCII: LATIN CAPITAL LETTER I
-//! WITH DOT ABOVE lowercases to `i` and a combining dot, KELVIN SIGN to `k`.
+//! A text's ASCII bytes alone settle such a match unless the text contains a
+//! character outside ASCII whose lowercase contains ASCII: LATIN CAPITAL LETTER
+//! I WITH DOT ABOVE lowercases to `i` and a combining dot, KELVIN SIGN to `k`.
 
 use aho_corasick::{AhoCorasick, Input, Span, packed};
 use memchr::arch::all::packedpair::Pair;
 use memchr::memmem;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 pub(crate) const DOTTED_CAPITAL_I: &str = "\u{130}";
@@ -94,9 +95,9 @@ impl AsciiCaselessFinder {
         &self.needle
     }
 
-    /// False when `haystack` holds neither the anchor byte, in either case,
-    /// nor a character lowercasing to it: `haystack` lowercased then cannot
-    /// hold the needle.
+    /// False when `haystack` contains neither the anchor byte, in either
+    /// case, nor a character lowercasing to it: `haystack` lowercased then
+    /// cannot contain the needle.
     pub(crate) fn anchor_may_occur_in(&self, haystack: &str) -> bool {
         let Some(&lower) = self.needle.get(self.anchor) else {
             return false;
@@ -163,9 +164,9 @@ fn case_variants(prefix: &[u8]) -> Vec<Vec<u8>> {
     })
 }
 
-/// The characters outside ASCII whose lowercase holds a letter of a
-/// lowercase ASCII needle. From the first of them in a text, the needle's
-/// matches there depend on more than the text's ASCII bytes.
+/// The characters outside ASCII whose lowercase contains a letter of a
+/// lowercase ASCII needle. Around one of them in a text, the needle's
+/// matches depend on more than the text's ASCII bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NonAsciiCapitals {
     dotted_capital_i: bool,
@@ -180,7 +181,7 @@ impl NonAsciiCapitals {
         }
     }
 
-    /// The byte where `text` first holds one of them.
+    /// The byte where `text` first contains one of them.
     pub(crate) fn first_in(self, text: &str) -> Option<usize> {
         let dotted_capital_i = self
             .dotted_capital_i
@@ -191,6 +192,32 @@ impl NonAsciiCapitals {
             .then(|| KELVIN_SIGN_FINDER.find(text.as_bytes()))
             .flatten();
         dotted_capital_i.into_iter().chain(kelvin_sign).min()
+    }
+
+    /// The byte range of each of them in `text`, in order. One pass over
+    /// `text` per character finds every occurrence of that character.
+    pub(crate) fn positions_in<'t>(self, text: &'t str) -> impl Iterator<Item = Range<usize>> + 't {
+        let bytes = text.as_bytes();
+        let positions_of = move |is_matchable: bool, finder: &'static memmem::Finder<'static>| {
+            let len = finder.needle().len();
+            is_matchable
+                .then(|| finder.find_iter(bytes))
+                .into_iter()
+                .flatten()
+                .map(move |start| start..start + len)
+                .peekable()
+        };
+        let mut dotted_capital_i = positions_of(self.dotted_capital_i, &DOTTED_CAPITAL_I_FINDER);
+        let mut kelvin_sign = positions_of(self.kelvin_sign, &KELVIN_SIGN_FINDER);
+        std::iter::from_fn(
+            move || match (dotted_capital_i.peek(), kelvin_sign.peek()) {
+                (Some(dotted), Some(kelvin)) if dotted.start < kelvin.start => {
+                    dotted_capital_i.next()
+                }
+                (Some(_), None) => dotted_capital_i.next(),
+                _ => kelvin_sign.next(),
+            },
+        )
     }
 }
 
@@ -278,7 +305,45 @@ mod tests {
         assert_eq!(
             first_in(b"kit", "plain text"),
             None,
-            "plain text holds neither"
+            "plain text contains neither"
+        );
+    }
+
+    #[test]
+    fn positions_are_the_byte_ranges_of_each_matchable_capital_in_order() {
+        let text = "\u{130} ok \u{212A}\u{212A} then \u{130}";
+        let positions = |needle: &[u8]| {
+            NonAsciiCapitals::matchable_by(needle)
+                .positions_in(text)
+                .collect::<Vec<_>>()
+        };
+        let of = |capital: &'static str| {
+            text.match_indices(capital)
+                .map(|(at, found)| at..at + found.len())
+                .collect::<Vec<_>>()
+        };
+        let mut both = [of(DOTTED_CAPITAL_I), of(KELVIN_SIGN)].concat();
+        both.sort_unstable_by_key(|range| range.start);
+
+        assert_eq!(
+            positions(b"kit"),
+            both,
+            "a needle containing `k` and `i` gets both characters' positions, in order"
+        );
+        assert_eq!(
+            positions(b"is"),
+            of(DOTTED_CAPITAL_I),
+            "a needle containing `i` gets the dotted capital I's positions"
+        );
+        assert_eq!(
+            positions(b"ok"),
+            of(KELVIN_SIGN),
+            "a needle containing `k` gets the Kelvin sign's positions"
+        );
+        assert_eq!(
+            positions(b"cache"),
+            Vec::<Range<usize>>::new(),
+            "a needle containing neither letter doesn't get any position"
         );
     }
 }
