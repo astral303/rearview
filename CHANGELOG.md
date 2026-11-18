@@ -117,8 +117,13 @@
 - Fix confirming a delete (`y`) deleting a session the user didn't choose. The
   actions menu (`Ctrl+X`), the delete prompt and the name box now act on the
   session they were opened for, and close when it is removed from the list.
+  - The prompt now names the session: `Delete "<title>"? (y/n)`.
 - Fix the list's selection moving to another session when a delete or a
   refresh removed or added rows above it. It now stays on its session.
+- Fix a delete showing nothing while it ran. Its row is now greyed and can't
+  be selected until the delete ends, and the bottom bar shows `Deleting…` or
+  `Deleting N sessions…`. Confirming a delete in the viewer now returns to the
+  list at once.
 - Fix a confirmed delete or rename not being carried out when another was
   confirmed while a delete or a refresh ran. Each now runs, in the order
   confirmed.

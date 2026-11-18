@@ -129,9 +129,12 @@ fn viewers_menu_acts_on_open_session_after_selection_moved() {
     );
 }
 
+/// Keys that open a dialog on the selected session.
+type OpenDialog = fn(&mut App);
+
 #[test]
 fn menu_prompt_and_name_box_close_when_their_session_leaves_list() {
-    let dialogs: [(&str, fn(&mut App)); 3] = [
+    let dialogs: [(&str, OpenDialog); 3] = [
         ("the actions menu", |app| {
             press_ctrl(app, KeyCode::Char('x'));
         }),
@@ -250,20 +253,23 @@ fn removed_last_selected_session_passes_selection_to_new_last_row() {
     assert_eq!(selected_name(&app), Some("b"));
 }
 
-/// Select the row of the session at `path`, as the arrow keys select it.
-fn select(app: &mut App, path: &std::path::Path) {
-    let row = app
-        .filtered()
-        .iter()
-        .position(|&index| app.conversations()[index].path == path)
-        .unwrap_or_else(|| panic!("{} is shown", path.display()));
-    app.selected = Some(row);
+/// Select the row of the session at `path` with `Home`, then `Down` until
+/// the selection reaches it.
+fn select_with_keys(app: &mut App, path: &std::path::Path) {
+    press(app, KeyCode::Home);
+    for _ in 0..app.filtered().len() {
+        if app.get_selected_path().as_deref() == Some(path) {
+            return;
+        }
+        press(app, KeyCode::Down);
+    }
+    panic!("the keys don't reach {}", path.display());
 }
 
 /// Confirm the delete of the session at `path` through the actions menu,
 /// and hand it on as the runtime hands a confirmed delete to the worker.
 fn confirm_delete_of(app: &mut App, path: &std::path::Path) {
-    select(app, path);
+    select_with_keys(app, path);
     press_ctrl(app, KeyCode::Char('x'));
     press(app, KeyCode::Char('d'));
     match press(app, KeyCode::Char('y')) {
@@ -380,4 +386,270 @@ fn menu_stays_open_when_another_session_leaves_list() {
             if *session == path_of(&app, "b")),
         "the menu stays open on its own session"
     );
+}
+
+/// Confirm the delete of session `name` through the actions menu, and hand
+/// it on as the runtime does; the worker doesn't take it.
+fn confirm_delete_of_named(app: &mut App, name: &str) {
+    let path = path_of(app, name);
+    confirm_delete_of(app, &path);
+}
+
+/// Hand `app` a failed outcome of the delete of the session at `path`.
+fn fail_deleting(app: &mut App, path: &std::path::Path) {
+    app.finish_list_change(crate::tui::list_change::ListChangeOutcome::Deleted {
+        path: path.to_path_buf(),
+        result: Err(crate::error::AppError::DeleteRefused("refused".to_owned())),
+    });
+}
+
+#[test]
+fn confirmed_delete_passes_selection_to_next_row_or_previous_when_last() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "b");
+    assert_eq!(selected_name(&app), Some("a"), "the next row");
+
+    confirm_delete_of_named(&mut app, "a");
+    assert_eq!(
+        selected_name(&app),
+        Some("c"),
+        "the previous selectable row, with none after"
+    );
+}
+
+#[test]
+fn keys_and_click_pass_over_deleting_row() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "b");
+
+    for (key, expected) in [
+        (KeyCode::Up, "c"),
+        (KeyCode::Down, "a"),
+        (KeyCode::PageUp, "c"),
+        (KeyCode::PageDown, "a"),
+        (KeyCode::Home, "c"),
+        (KeyCode::End, "a"),
+    ] {
+        press(&mut app, key);
+        assert_eq!(selected_name(&app), Some(expected), "{key:?}");
+    }
+
+    let frame = ratatui::layout::Rect::new(0, 0, 100, 30);
+    let list_top = 3;
+    let b_row = list_top + LIST_LINES_PER_ITEM as u16;
+    assert!(
+        !app.handle_list_click(b_row, frame),
+        "a click on the deleting row doesn't land"
+    );
+    assert_eq!(selected_name(&app), Some("a"));
+}
+
+#[test]
+fn search_results_list_deleting_row_without_selecting_it() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "c");
+    press(&mut app, KeyCode::End);
+    let results = take_over_search_results(&mut app);
+
+    answer_search(&mut app, &results, vec![0, 1, 2]);
+
+    assert_eq!(listed_names(&app), ["c", "b", "a"]);
+    assert_eq!(
+        selected_name(&app),
+        Some("b"),
+        "the results select the first selectable row"
+    );
+}
+
+#[test]
+fn failed_delete_makes_row_selectable_again_and_reports_failure() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "b");
+    let b = path_of(&app, "b");
+
+    fail_deleting(&mut app, &b);
+    press(&mut app, KeyCode::Up);
+
+    assert_eq!(selected_name(&app), Some("b"));
+    assert!(!app.is_deleting(&b));
+    assert_eq!(
+        app.status_message().map(|(message, _)| message.as_str()),
+        Some("Failed to delete: refused")
+    );
+    assert_eq!(app.deleting_status_text(), None);
+}
+
+#[test]
+fn failed_delete_of_only_row_lets_keys_act_on_it_again() {
+    let mut app = app_listing(vec![session("a", "a", 5, 1)]);
+    confirm_delete_of_named(&mut app, "a");
+    assert_eq!(selected_name(&app), None, "the deleting row isn't selected");
+    let a = path_of(&app, "a");
+
+    fail_deleting(&mut app, &a);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(selected_name(&app), Some("a"), "Down keeps a selected");
+    assert_eq!(
+        app.pending_open.as_ref().map(|open| &open.path),
+        Some(&a),
+        "Enter opens a"
+    );
+}
+
+#[test]
+fn row_arriving_while_every_listed_row_is_deleting_is_selected() {
+    let mut app = App::new_loading_with_options(
+        ToolDisplayMode::Hidden,
+        false,
+        KeyBindings::default(),
+        ListScope::default(),
+        TuiSearchOptions::default(),
+        crate::history::environment::test_support::test_environment(Vec::new(), None),
+    );
+    app.append_conversations(vec![session("b", "b", 10, 1)]);
+    // Delete is available during the launch while it waits for another
+    // rearview.
+    app.set_cache_wait(Some(crate::history::OtherRearview::Rebuilding));
+    confirm_delete_of_named(&mut app, "b");
+
+    app.append_conversations(vec![session("a", "a", 5, 1)]);
+
+    assert_eq!(
+        selected_name(&app),
+        Some("a"),
+        "the arriving row is selected, not the deleting one"
+    );
+}
+
+#[test]
+fn y_in_viewer_returns_to_list_showing_session_as_deleting() {
+    let mut app = three_sessions();
+    press(&mut app, KeyCode::Down);
+    app.enter_view_mode(80);
+    let b = path_of(&app, "b");
+
+    press_ctrl(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('d'));
+    match press(&mut app, KeyCode::Char('y')) {
+        Some(Action::Delete(path)) => app.request_delete(&path),
+        _ => panic!("y deletes the open session"),
+    }
+
+    assert!(matches!(app.app_mode(), AppMode::List));
+    assert!(app.is_deleting(&b));
+    assert_eq!(selected_name(&app), Some("a"));
+}
+
+/// An app on `clock` listing sessions `c`, `b` and `a`, newest first.
+fn three_sessions_on(clock: &Arc<crate::clock::TestClock>) -> App {
+    super::claude_home::app_reading(
+        vec![
+            session("c", "c", 15, 1),
+            session("b", "b", 10, 1),
+            session("a", "a", 5, 1),
+        ],
+        crate::history::environment::test_support::environment_on(clock.clone()),
+    )
+}
+
+#[test]
+fn bar_shows_deleting_for_single_session_and_count_for_multiple() {
+    let clock = Arc::new(crate::clock::TestClock::default());
+    let mut app = three_sessions_on(&clock);
+    assert_eq!(app.deleting_status_text(), None);
+
+    confirm_delete_of_named(&mut app, "b");
+    assert_eq!(app.deleting_status_text().as_deref(), Some("Deleting…"));
+    clock.advance(std::time::Duration::from_millis(200));
+    assert_eq!(app.deleting_status_text().as_deref(), Some("⠹ Deleting…"));
+
+    confirm_delete_of_named(&mut app, "c");
+    clock.advance(std::time::Duration::from_millis(1000));
+    assert_eq!(
+        app.deleting_status_text().as_deref(),
+        Some("⠴ Deleting 2 sessions… 1s"),
+        "the spinner and seconds count from the first delete"
+    );
+
+    for name in ["b", "c"] {
+        let path = path_of(&app, name);
+        finish_deleting(&mut app, &path);
+    }
+    assert_eq!(app.deleting_status_text(), None);
+}
+
+/// Every character of the frame `app` draws `width` columns wide, row
+/// after row.
+fn drawn_rows(app: &App, width: u16) -> Vec<String> {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::ui::render(frame, app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn prompt_names_session_by_its_title_shortened_to_fit() {
+    let mut row = session("b", "b", 10, 1);
+    row.custom_title = Some("Plan the release of the migration tool".to_owned());
+    let mut app = app_listing(vec![row]);
+    press_ctrl(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('d'));
+
+    let wide = drawn_rows(&app, 80);
+    let narrow = drawn_rows(&app, 40);
+
+    assert!(
+        wide.iter()
+            .any(|row| row.contains(" Delete \"Plan the release of the migration tool\"? (y/n)")),
+        "{wide:#?}"
+    );
+    assert!(
+        narrow
+            .iter()
+            .any(|row| row.contains(" Delete \"Plan the release of …\"? (y/n)")),
+        "{narrow:#?}"
+    );
+}
+
+#[test]
+fn deleting_row_is_drawn_in_disabled_grey() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "b");
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+    terminal
+        .draw(|frame| crate::tui::ui::render(frame, &app))
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let disabled = crate::tui::theme::detect_theme().dim_label;
+    let disabled = ratatui::style::Color::Rgb(disabled.0, disabled.1, disabled.2);
+    // Inside the border, below the search bar, each row's header line and
+    // preview line.
+    let first_row_line = 3;
+    let lines_of = |row: u16| {
+        let top = first_row_line + row * LIST_LINES_PER_ITEM as u16;
+        top..top + 2
+    };
+    let is_grey = |row: u16| {
+        lines_of(row).all(|y| {
+            (1..buffer.area.width - 1)
+                .map(|x| &buffer[(x, y)])
+                .filter(|cell| !cell.symbol().trim().is_empty())
+                .all(|cell| cell.fg == disabled)
+        })
+    };
+    assert!(is_grey(1), "b's row, deleting, is grey");
+    assert!(!is_grey(2), "a's row keeps its colours");
 }
