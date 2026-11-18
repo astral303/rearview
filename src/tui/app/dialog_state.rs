@@ -234,7 +234,7 @@ impl App {
             return;
         };
         let row = &self.conversations[idx];
-        self.list_change = Some(ListChange::Rename {
+        self.list_changes.push_back(ListChange::Rename {
             source: row.source,
             path: row.path.clone(),
             title,

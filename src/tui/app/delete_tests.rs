@@ -250,6 +250,122 @@ fn removed_last_selected_session_passes_selection_to_new_last_row() {
     assert_eq!(selected_name(&app), Some("b"));
 }
 
+/// Select the row of the session at `path`, as the arrow keys select it.
+fn select(app: &mut App, path: &std::path::Path) {
+    let row = app
+        .filtered()
+        .iter()
+        .position(|&index| app.conversations()[index].path == path)
+        .unwrap_or_else(|| panic!("{} is shown", path.display()));
+    app.selected = Some(row);
+}
+
+/// Confirm the delete of the session at `path` through the actions menu,
+/// and hand it on as the runtime hands a confirmed delete to the worker.
+fn confirm_delete_of(app: &mut App, path: &std::path::Path) {
+    select(app, path);
+    press_ctrl(app, KeyCode::Char('x'));
+    press(app, KeyCode::Char('d'));
+    match press(app, KeyCode::Char('y')) {
+        Some(Action::Delete(deleted)) => app.request_delete(&deleted),
+        _ => panic!("y deletes {}", path.display()),
+    }
+}
+
+/// Run each rename or delete `app` hands the worker, oldest first, as the
+/// worker runs it; returns the paths in the order they ran.
+fn serve_every_list_change(app: &mut App) -> Vec<PathBuf> {
+    let mut served = Vec::new();
+    while let Some(change) = app.begin_list_change() {
+        served.push(match &change {
+            ListChange::Rename { path, .. } | ListChange::Delete { path, .. } => path.clone(),
+        });
+        let environment = app.environment.clone();
+        let outcome = std::thread::spawn(move || {
+            let operation =
+                crate::history::environment::test_support::waiting_operation(&environment);
+            let outcome = change.make(&operation);
+            operation.finish().fail_if_low_space().unwrap();
+            outcome
+        })
+        .join()
+        .unwrap();
+        app.finish_list_change(outcome);
+    }
+    served
+}
+
+/// The Codex thread ID numbered `number`, which the rollout's file name
+/// carries.
+fn codex_thread(number: usize) -> String {
+    format!("019f0000-0000-7000-8000-0000000000{number:02}")
+}
+
+/// An app listing Codex sessions `0` to `5` written under `home`, loaded
+/// through the test's own session cache. Codex deletes the sessions under
+/// the tree holding the transcript, so a delete stays inside `home`.
+fn app_listing_six_codex_sessions(home: &std::path::Path) -> (App, Vec<PathBuf>) {
+    use crate::history::provider::contract_tests::{kept_storage_under, registered_fixtures};
+    let fixture = registered_fixtures()
+        .into_iter()
+        .find(|fixture| fixture.storage().source() == crate::history::Source::Codex)
+        .expect("Codex has a fixture");
+    let transcripts = (0..6)
+        .map(|number| fixture.write_session(home, &codex_thread(number)))
+        .collect();
+    let environment = crate::history::environment::test_support::test_environment(
+        vec![kept_storage_under(fixture, home)],
+        None,
+    );
+    let rows = crate::history::environment::test_support::load_rows_in(
+        &environment,
+        kept_storage_under(fixture, home),
+    );
+    (
+        super::claude_home::app_reading(rows, environment),
+        transcripts,
+    )
+}
+
+/// The listed path of the session whose transcript is named as `transcript`.
+fn listed_path_of(app: &App, transcript: &std::path::Path) -> PathBuf {
+    app.conversations()
+        .iter()
+        .map(|row| row.path.clone())
+        .find(|path| path.file_name() == transcript.file_name())
+        .unwrap_or_else(|| panic!("{} is listed", transcript.display()))
+}
+
+#[test]
+fn every_delete_confirmed_before_the_first_ends_is_carried_out_in_order() {
+    let home = tempfile::tempdir().unwrap();
+    let (mut app, transcripts) = app_listing_six_codex_sessions(home.path());
+    let confirmed: Vec<PathBuf> = [4, 0, 2, 5, 1]
+        .iter()
+        .map(|&number| listed_path_of(&app, &transcripts[number]))
+        .collect();
+
+    for path in &confirmed {
+        confirm_delete_of(&mut app, path);
+    }
+    let served = serve_every_list_change(&mut app);
+
+    assert_eq!(served, confirmed, "each confirmed delete runs, in order");
+    assert_eq!(
+        app.conversations().len(),
+        1,
+        "the five deleted rows leave the list: {:?}",
+        app.status_message()
+    );
+    for (number, transcript) in transcripts.iter().enumerate() {
+        assert_eq!(
+            transcript.exists(),
+            number == 3,
+            "session {number}'s transcript is deleted only when its delete was confirmed"
+        );
+    }
+}
+
 #[test]
 fn menu_stays_open_when_another_session_leaves_list() {
     let mut app = three_sessions();

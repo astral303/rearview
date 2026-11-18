@@ -119,6 +119,9 @@
   session they were opened for, and close when it is removed from the list.
 - Fix the list's selection moving to another session when a delete or a
   refresh removed or added rows above it. It now stays on its session.
+- Fix a confirmed delete or rename not being carried out when another was
+  confirmed while a delete or a refresh ran. Each now runs, in the order
+  confirmed.
 - Fix search missing text the viewer shows in tool calls, thinking and
   sub-agent transcripts. The session list missed all three, and the list and
   `agent search` both missed a tool call's body, such as an edit's diff, a

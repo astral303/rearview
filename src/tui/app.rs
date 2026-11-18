@@ -168,8 +168,9 @@ pub struct App {
     /// A copy or export asked for while the open session's refresh was
     /// pending, run once the refresh finishes
     deferred_copy: Option<view_state::DeferredCopy>,
-    /// A confirmed rename or delete, until the background worker receives it
-    list_change: Option<super::list_change::ListChange>,
+    /// Confirmed renames and deletes in the order confirmed, each until the
+    /// background worker receives it
+    list_changes: std::collections::VecDeque<super::list_change::ListChange>,
     /// The load filters that narrowed this list, named for the user: the
     /// ones it launched with, then the terms the last load or refresh
     /// reported
@@ -390,7 +391,7 @@ impl App {
             pending_open: None,
             pending_view_reload: None,
             deferred_copy: None,
-            list_change: None,
+            list_changes: std::collections::VecDeque::new(),
             active_filters: Vec::new(),
             launch_filter_count: 0,
             missing_earlier_turns,

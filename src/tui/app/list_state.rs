@@ -192,16 +192,16 @@ impl App {
             );
             return;
         };
-        self.list_change = Some(ListChange::Delete {
+        self.list_changes.push_back(ListChange::Delete {
             source: row.source,
             path: path.to_path_buf(),
         });
     }
 
-    /// Hand the background worker the confirmed rename or delete; `None`
-    /// while none waits.
+    /// Hand the background worker the oldest confirmed rename or delete;
+    /// `None` while none waits.
     pub(crate) fn begin_list_change(&mut self) -> Option<ListChange> {
-        self.list_change.take()
+        self.list_changes.pop_front()
     }
 
     /// Show the result of a rename or delete.
