@@ -104,6 +104,11 @@
   - For a semantic search, a `perf semantic-store` line counts the passages
     whose embeddings were read, written and skipped, with the reason for the
     skipped ones.
+- Show a tool call's body in `agent read` of one message or one call, such as
+  `agent read <ref>:m7`: an edit's diff, a skill's arguments, a plan or a
+  message to another agent. `--match` now finds text in the body.
+  - A read of several messages and `agent outline` count the body's lines on
+    the call's line: `Edit: src/lib.rs (+2 lines)`.
 
 ### Fixes
 

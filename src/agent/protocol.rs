@@ -22,7 +22,6 @@ use crate::agent::transcript::{
 use crate::agent::visibility::ContentVisibility;
 use crate::clock::Zone;
 use crate::error::Result;
-use crate::log_entry::Tool;
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
@@ -231,7 +230,7 @@ impl<'a> RenderedMessage<'a> {
         let content = &self.content;
         debug_assert!(
             matches!(content.numbering, LineNumbering::Own),
-            "a call read alone shows every line of each command, without a slice"
+            "a call read alone shows the call's whole text, without a slice"
         );
         let is_kept = |owner| match owner {
             BlockOwner::Call(call) => content.calls[call].address.number == number,
@@ -516,8 +515,8 @@ struct MessageContent<'a> {
     results: Vec<ShownResult<'a>>,
     /// The blocks joined by line breaks.
     text: String,
-    /// The body's block, then each call header's, each followed by the
-    /// blocks of its results. A message showing calls or results alone has
+    /// The body's block, then the block of each call's text, followed by
+    /// the blocks of its results. A message showing calls or results alone has
     /// no body block.
     blocks: Vec<ContentBlock>,
     numbering: LineNumbering,
@@ -708,8 +707,8 @@ struct ContentBlock {
 enum LineNumbering {
     /// Line `i` of the content is line `i + 1`.
     Own,
-    /// The content shows each call collapsed, as a read of several
-    /// messages does: a call has fewer lines than `--lines` counts.
+    /// The content shows each call collapsed: a call has fewer lines than
+    /// `--lines` counts.
     CallsCollapsed,
     /// The line each line of part of the content shows, as a slice or a call
     /// read alone shows it; `None` for a `...` between a slice's runs.
@@ -743,7 +742,7 @@ impl LineNumbering {
                         });
                     }
                     next_line += match block.owner {
-                        BlockOwner::Call(call) => content.calls[call].whole_lines(),
+                        BlockOwner::Call(call) => content.calls[call].whole_lines,
                         _ => block.lines,
                     };
                 }
@@ -767,13 +766,14 @@ struct Omission {
 struct ShownCall<'a> {
     address: CallAddress,
     time: Option<TimeSpan>,
-    /// The call's lines as the read shows them.
+    /// The call's lines the read prints.
     text: String,
-    /// `Collapsed` when `text` leaves out lines of the call, `Whole`
+    /// `Collapsed` when `text` differs from the whole call, `Whole`
     /// otherwise.
     copy: CallCopy,
+    /// The lines of the whole call, which `--lines` numbers.
+    whole_lines: usize,
     name: &'a str,
-    tool: Tool,
     input: &'a Value,
     /// The messages other than its own holding its result: `result=`.
     results: Vec<usize>,
@@ -795,13 +795,6 @@ impl ShownCall<'_> {
             name: self.name,
             input: self.input,
         }
-    }
-
-    /// The lines of the call as a one-message read shows it.
-    fn whole_lines(&self) -> usize {
-        tool_call_read_text(self.name, self.tool, self.input, CallLines::Whole)
-            .split('\n')
-            .count()
     }
 }
 
@@ -2179,13 +2172,11 @@ fn render_message<'a>(
                 input,
                 source,
             } => {
-                let text = tool_call_read_text(name, *tool, input, call_lines);
-                let copy = if call_lines == CallLines::Whole
-                    || text == tool_call_read_text(name, *tool, input, CallLines::Whole)
-                {
-                    CallCopy::Whole
-                } else {
+                let read = tool_call_read_text(name, *tool, input, call_lines);
+                let copy = if read.is_collapsed {
                     CallCopy::Collapsed
+                } else {
+                    CallCopy::Whole
                 };
                 Some(ShownCall {
                     address: CallAddress {
@@ -2193,10 +2184,10 @@ fn render_message<'a>(
                         number,
                     },
                     time: source.timestamp.as_deref().and_then(TimeSpan::of_timestamp),
-                    text,
+                    text: read.text,
                     copy,
+                    whole_lines: read.whole_lines,
                     name,
-                    tool: *tool,
                     input,
                     results: links.results_of(message, id),
                     launches: None,
@@ -6624,40 +6615,99 @@ mod tests {
         );
     }
 
-    /// A read of several messages shows the first line of a command; the
-    /// one-message read the `read` record names shows every line.
+    /// m1 holds `intro`, an edit whose body is a diff of two lines, and
+    /// `cargo build`.
+    fn an_edit_of_three_lines() -> AgentTranscript {
+        use AgentMessageRole::{Assistant, User};
+        let mut reply = text_message(1, Assistant, "intro");
+        reply.parts.extend([
+            edit_with_id("m", source(Assistant)),
+            call_with_id("b", "Bash", "cargo build", source(Assistant)),
+        ]);
+        transcript(vec![reply, text_message(2, User, "thanks")])
+    }
+
+    /// An edit of `src/lib.rs` replacing `old line` with `new line`.
+    fn edit_with_id(id: &str, source: AgentPartSource) -> AgentMessagePart {
+        AgentMessagePart::ToolUse {
+            id: id.to_owned(),
+            name: "Edit".to_owned(),
+            tool: Tool::Edit,
+            input: json!({
+                "file_path": "src/lib.rs",
+                "old_string": "old line",
+                "new_string": "new line"
+            }),
+            source,
+        }
+    }
+
+    /// A read of several messages shows the first line of a command and the
+    /// header of an edit; the one-message read the `read` record names shows
+    /// every line of each.
     #[test]
     fn omitted_record_numbers_lines_as_one_message_read_does() {
-        let transcript = a_command_of_three_lines();
         let reference = resolved("session.jsonl").reference.canonical();
         let with_tools = ProtocolOptions {
             tools: true,
             ..options()
         };
         let several = Some(MessageRange { start: 1, end: 2 });
-        let intro_and_first_call = "intro\nBash: cd src (+2 lines)\n".chars().count();
         let flags = "tools=true tool-results=false thinking=false subagents=false";
+        for (transcript, first_call) in [
+            (a_command_of_three_lines(), "Bash: cd src (+2 lines)"),
+            (an_edit_of_three_lines(), "Edit: src/lib.rs (+2 lines)"),
+        ] {
+            let intro_and_first_call = format!("intro\n{first_call}\n").chars().count();
 
-        let inside_first_call = omitted_records_keeping(&transcript, several, with_tools, 8);
-        let inside_second_call =
-            omitted_records_keeping(&transcript, several, with_tools, intro_and_first_call + 3);
-        let reread = read_slice(
-            &transcript,
-            ReadSlice::Lines(MessageLineRange { start: 5, end: 5 }),
-        );
+            let inside_first_call = omitted_records_keeping(&transcript, several, with_tools, 8);
+            let inside_second_call =
+                omitted_records_keeping(&transcript, several, with_tools, intro_and_first_call + 3);
+            let reread = read_slice(
+                &transcript,
+                ReadSlice::Lines(MessageLineRange { start: 5, end: 5 }),
+            );
 
-        assert_eq!(
-            inside_first_call,
-            format!("m1 omitted lines=2..5 calls=m1.2\nread ref={reference}:m1 lines=2..5 {flags}")
-        );
-        assert_eq!(
-            inside_second_call,
-            format!("m1 omitted lines=5..5\nread ref={reference}:m1 lines=5..5 {flags}")
-        );
-        assert!(
-            reread.ends_with("\nm1.2\n|  5: Bash: cargo build\n"),
-            "{reread}"
-        );
+            assert_eq!(
+                inside_first_call,
+                format!(
+                    "m1 omitted lines=2..5 calls=m1.2\nread ref={reference}:m1 lines=2..5 {flags}"
+                ),
+                "{first_call}"
+            );
+            assert_eq!(
+                inside_second_call,
+                format!("m1 omitted lines=5..5\nread ref={reference}:m1 lines=5..5 {flags}"),
+                "{first_call}"
+            );
+            assert!(
+                reread.ends_with("\nm1.2\n|  5: Bash: cargo build\n"),
+                "{reread}"
+            );
+        }
+    }
+
+    /// `--match` in a read of one message matches a line a read of several
+    /// messages leaves out of a call, numbered as `--lines` numbers it.
+    #[test]
+    fn match_in_read_of_one_message_hits_command_line_and_body_line() {
+        for (transcript, last_line) in [
+            (a_command_of_three_lines(), "cargo clippy"),
+            (an_edit_of_three_lines(), "new line"),
+        ] {
+            let output = read_slice(
+                &transcript,
+                ReadSlice::Match {
+                    query: last_line.to_owned(),
+                    context: 0,
+                },
+            );
+
+            assert!(
+                output.contains(" hits=1 ") && output.contains("| >4: "),
+                "{last_line} is m1's line 4: {output}"
+            );
+        }
     }
 
     /// The omitted records follow the last line the truncation keeps, below
@@ -8282,74 +8332,204 @@ mod tests {
         );
     }
 
-    /// m1 and m3 each run `cd src` then `cargo test`; m2 and m4 hold their
-    /// results.
-    fn one_command_run_twice() -> AgentTranscript {
+    /// A call made with a given id, and its collapsed and whole lines.
+    struct CollapsedCall {
+        with_id: fn(&str) -> AgentMessagePart,
+        collapsed: &'static str,
+        whole: &'static str,
+    }
+
+    /// A command of two lines, and an edit whose body is a diff of two
+    /// lines.
+    fn collapsed_calls() -> [CollapsedCall; 2] {
+        [
+            CollapsedCall {
+                with_id: |id| {
+                    call_with_id(
+                        id,
+                        "Bash",
+                        "cd src\ncargo test",
+                        source(AgentMessageRole::Assistant),
+                    )
+                },
+                collapsed: "| Bash: cd src (+1 line)\n",
+                whole: "| Bash: cd src\n|   cargo test\n",
+            },
+            CollapsedCall {
+                with_id: |id| edit_with_id(id, source(AgentMessageRole::Assistant)),
+                collapsed: "| Edit: src/lib.rs (+2 lines)\n",
+                whole: "| Edit: src/lib.rs\n| -old line\n| +new line\n",
+            },
+        ]
+    }
+
+    /// m1 and m3 each make `call`; m2 and m4 hold their results.
+    fn one_call_made_twice(call: &CollapsedCall) -> AgentTranscript {
         use AgentMessageRole::{Assistant, User};
-        let run = |id| call_with_id(id, "Bash", "cd src\ncargo test", source(Assistant));
         transcript(vec![
-            message(1, Assistant, vec![run("a")]),
+            message(1, Assistant, vec![(call.with_id)("a")]),
             message(2, User, vec![result_for("a", "ok", source(User))]),
-            message(3, Assistant, vec![run("b")]),
+            message(3, Assistant, vec![(call.with_id)("b")]),
             message(4, User, vec![result_for("b", "ok", source(User))]),
         ])
     }
 
     #[test]
     fn call_read_alone_doesnt_repeat_collapsed_copy() {
-        let transcript = one_command_run_twice();
-        let resolved = resolved("session.jsonl");
-        let first_run = ReadRequest {
-            range: Some(MessageRange { start: 1, end: 2 }),
-            ..whole_session_request(&resolved, &transcript)
-        };
-        let second_call = ReadRequest {
-            range: Some(MessageRange::single(3)),
-            call: Some(1),
-            ..whole_session_request(&resolved, &transcript)
-        };
-        let with_tools = ProtocolOptions {
-            tools: true,
-            ..options()
-        };
+        for call in collapsed_calls() {
+            let transcript = one_call_made_twice(&call);
+            let resolved = resolved("session.jsonl");
+            let first_run = ReadRequest {
+                range: Some(MessageRange { start: 1, end: 2 }),
+                ..whole_session_request(&resolved, &transcript)
+            };
+            let second_call = ReadRequest {
+                range: Some(MessageRange::single(3)),
+                call: Some(1),
+                ..whole_session_request(&resolved, &transcript)
+            };
+            let with_tools = ProtocolOptions {
+                tools: true,
+                ..options()
+            };
 
-        let output = format_read(&[first_run, second_call], None, None, with_tools).unwrap();
+            let output = format_read(&[first_run, second_call], None, None, with_tools).unwrap();
 
-        assert!(
-            output.contains("\nm1.1 result=m2\n| Bash: cd src (+1 line)\n"),
-            "{output}"
-        );
-        assert!(
-            output.contains("\nm3.1 result=m4\n| Bash: cd src\n|   cargo test\n"),
-            "{output}"
-        );
+            assert!(
+                output.contains(&format!("\nm1.1 result=m2\n{}", call.collapsed)),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!("\nm3.1 result=m4\n{}", call.whole)),
+                "{output}"
+            );
+        }
     }
 
     #[test]
     fn collapsed_call_repeats_copy_read_alone() {
-        let transcript = one_command_run_twice();
-        let resolved = resolved("session.jsonl");
-        let first_call = ReadRequest {
-            range: Some(MessageRange::single(1)),
-            call: Some(1),
-            ..whole_session_request(&resolved, &transcript)
-        };
-        let second_run = ReadRequest {
-            range: Some(MessageRange { start: 3, end: 4 }),
-            ..whole_session_request(&resolved, &transcript)
-        };
+        for call in collapsed_calls() {
+            let transcript = one_call_made_twice(&call);
+            let resolved = resolved("session.jsonl");
+            let first_call = ReadRequest {
+                range: Some(MessageRange::single(1)),
+                call: Some(1),
+                ..whole_session_request(&resolved, &transcript)
+            };
+            let second_run = ReadRequest {
+                range: Some(MessageRange { start: 3, end: 4 }),
+                ..whole_session_request(&resolved, &transcript)
+            };
+            let with_tools = ProtocolOptions {
+                tools: true,
+                ..options()
+            };
+
+            let output = format_read(&[first_call, second_run], None, None, with_tools).unwrap();
+
+            assert!(
+                output.contains(&format!("\nm1.1 result=m2\n{}", call.whole)),
+                "{output}"
+            );
+            assert!(output.contains("\nm3.1 result=m4 same=m1.1\n"), "{output}");
+        }
+    }
+
+    /// m1 makes an edit, runs a skill with arguments, updates a plan the
+    /// viewer shows as JSON, and launches a sub-agent with a setting its
+    /// header doesn't show; m2 thanks.
+    fn calls_with_bodies() -> AgentTranscript {
+        use AgentMessageRole::{Assistant, User};
+        let made = || source(Assistant);
+        transcript(vec![
+            message(
+                1,
+                Assistant,
+                vec![
+                    edit_with_id("e", made()),
+                    call(
+                        "Skill",
+                        Tool::Skill,
+                        json!({"skill": "review", "args": "--strict"}),
+                        made(),
+                    ),
+                    call(
+                        "update_plan",
+                        Tool::Other,
+                        json!({"plan": [{"step": "Ship"}]}),
+                        made(),
+                    ),
+                    call(
+                        "spawn_agent",
+                        Tool::Agent,
+                        json!({
+                            "description": "scout",
+                            "prompt": "List the modules.",
+                            "launch": {"fork_turns": "none", "service_tier": "flex"}
+                        }),
+                        made(),
+                    ),
+                ],
+            ),
+            text_message(2, User, "thanks"),
+        ])
+    }
+
+    #[test]
+    fn read_of_one_message_or_call_shows_each_calls_body_and_read_of_several_counts_its_lines() {
+        let transcript = calls_with_bodies();
         let with_tools = ProtocolOptions {
             tools: true,
             ..options()
         };
-
-        let output = format_read(&[first_call, second_run], None, None, with_tools).unwrap();
-
-        assert!(
-            output.contains("\nm1.1 result=m2\n| Bash: cd src\n|   cargo test\n"),
-            "{output}"
+        let one_message = read(&transcript, Some(MessageRange::single(1)), with_tools);
+        let several = read(
+            &transcript,
+            Some(MessageRange { start: 1, end: 2 }),
+            with_tools,
         );
-        assert!(output.contains("\nm3.1 result=m4 same=m1.1\n"), "{output}");
+        let resolved = resolved("session.jsonl");
+        let edit_alone = format_read(
+            &[ReadRequest {
+                range: Some(MessageRange::single(1)),
+                call: Some(1),
+                ..whole_session_request(&resolved, &transcript)
+            }],
+            None,
+            None,
+            options(),
+        )
+        .unwrap();
+
+        let calls_of = |output: &str| {
+            output
+                .split_once("\nm1.1")
+                .map(|(_, calls)| format!("m1.1{calls}"))
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            calls_of(&one_message),
+            concat!(
+                "m1.1\n| Edit: src/lib.rs\n| -old line\n| +new line\n",
+                "m1.2\n| Skill: review\n| --strict\n",
+                "m1.3\n| tool update_plan input_keys=plan\n| {\n| \"plan\": [\n| {\n| \"step\": \"Ship\"\n| }\n| ]\n| }\n",
+                "m1.4\n| spawn_agent: scout\n| service_tier: flex\n| List the modules.\n",
+            ),
+            "{one_message}"
+        );
+        assert!(
+            calls_of(&several).starts_with(concat!(
+                "m1.1\n| Edit: src/lib.rs (+2 lines)\n",
+                "m1.2\n| Skill: review (+1 line)\n",
+                "m1.3\n| tool update_plan input_keys=plan (+7 lines)\n",
+                "m1.4\n| spawn_agent: scout (+1 line)\n| List the modules.\n",
+            )),
+            "{several}"
+        );
+        assert!(
+            edit_alone.ends_with("\nm1.1\n| Edit: src/lib.rs\n| -old line\n| +new line\n"),
+            "{edit_alone}"
+        );
     }
 
     /// m1 holds text, a command of two lines and a long command of one line,

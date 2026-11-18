@@ -66,8 +66,9 @@ pub struct CallRecord<'e> {
 pub enum CallCopy {
     /// Part of the call's lines: a budget or a slice cut them.
     Truncated,
-    /// The call as a read of several messages shows it, its command
-    /// shortened: `Bash: cd src (+1 line)`.
+    /// The form `agent read` prints when it reads several messages: the
+    /// call's line, plus `(+N lines)` for the lines it leaves out:
+    /// `Bash: cd src (+1 line)`.
     Collapsed,
     /// Every line of the call.
     Whole,

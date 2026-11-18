@@ -26,11 +26,19 @@
 //!   messages it shows, and no other.
 //! - A read of one sub-agent shows exactly its messages, its launch and its
 //!   reports.
+//! - When exact search finds a marker in a message, a read of that message
+//!   alone with `--match <marker>` reports a hit.
 
-use crate::agent::protocol::{ProtocolOptions, ReadRequest, format_outline, format_read};
+use crate::agent::protocol::{
+    ProtocolOptions, ReadRequest, ReadSlice, format_outline, format_read,
+};
 use crate::agent::refs::{
     AgentConversationKey, MessageRange, parse_read_ref, resolved_conversation_for_key,
 };
+use crate::agent::retrieval::{
+    AgentRetrievalOptions, AgentTranscriptSearchTarget, retrieve_agent_hits_for_target,
+};
+use crate::agent::search::exact_phrase_query;
 use crate::agent::test_support::{
     PositionalRecord, atom, outline_records, read_records, segment_records,
 };
@@ -433,6 +441,67 @@ fn every_agents_read_with_tools_and_subagents_shows_each_call_and_subagent_marke
         .collect();
 
     assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+}
+
+/// Each message `agent search` finds a marker of `session` in, with the
+/// record of that message's read alone with every flag and
+/// `--match <marker>`, when that read doesn't report a hit.
+fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<String> {
+    let row = &session.row;
+    let transcript =
+        AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
+    let key = key_of_listed(row);
+    let resolved = resolved_conversation_for_key(std::slice::from_ref(&key), &key);
+    session
+        .markers
+        .iter()
+        .flat_map(|marker| {
+            retrieve_agent_hits_for_target(
+                AgentTranscriptSearchTarget::whole(&transcript, None, None),
+                &exact_phrase_query(marker.text),
+                AgentRetrievalOptions {
+                    limit: usize::MAX,
+                    ..AgentRetrievalOptions::default()
+                },
+            )
+            .into_iter()
+            .map(move |hit| (marker, hit.focus_range.start))
+        })
+        .filter_map(|(marker, ordinal)| {
+            let output = format_read(
+                &[ReadRequest {
+                    resolved: &resolved,
+                    transcript: &transcript,
+                    range: Some(MessageRange::single(ordinal)),
+                    subagent: None,
+                    call: None,
+                }],
+                None,
+                Some(&ReadSlice::Match {
+                    query: marker.text.to_owned(),
+                    context: 0,
+                }),
+                EVERY_FLAG,
+            )
+            .unwrap();
+            let hits = output
+                .lines()
+                .find(|line| line.contains(" slice=match="))
+                .and_then(|record| atom(record, "hits"));
+            matches!(hits, None | Some("0"))
+                .then(|| format!("{:?} {} in m{ordinal}: {output}", row.source, marker.record))
+        })
+        .collect()
+}
+
+#[test]
+fn every_agents_marker_search_finds_is_hit_in_read_of_its_message_alone() {
+    let unmatched: Vec<String> = every_record_sessions()
+        .iter()
+        .flat_map(markers_a_read_of_their_message_doesnt_match)
+        .collect();
+
+    assert!(unmatched.is_empty(), "{}", unmatched.join("\n"));
 }
 
 #[test]

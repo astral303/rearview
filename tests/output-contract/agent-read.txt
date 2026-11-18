@@ -81,7 +81,7 @@ m7.1 06:00:08 launches=s2 result=m11
 m8 s2 06:00:15
 | SPLICED_SUBAGENT_SENTINEL: the plugin starts from plugin.json.
 m9.1 s2 06:00:16 result=m10
-| tool SubagentHandback input_keys=message
+| tool SubagentHandback input_keys=message (+1 line)
 m10 s2 06:00:16 call=m9.1
 | {"success":false,"message":"Nothing was sent: SubagentHandback is not active for this agent. Write your report as plain text instead."}
 m11 06:00:20 from=s2 call=m7.1
@@ -148,29 +148,29 @@ m31 user 06:30:00
 m32 user 06:31:00
 | [Notice] NOTICE_SENTINEL: safeguards flagged this message; switched model.
 m33.1 06:32:00 result=m34
-| tool ToolSearch input_keys=query
+| tool ToolSearch input_keys=query (+3 lines)
 m35 06:32:02
 | NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 m36 user 06:33:00
 | Fix the tokenizer, then plan the rest
 m37.1 06:33:01 result=m38
-| Edit: /tmp/claude-every-record-fixture/src/lib.rs
+| Edit: /tmp/claude-every-record-fixture/src/lib.rs (+2 lines)
 m38 06:33:02 call=m37.1
 | The file /tmp/claude-every-record-fixture/src/lib.rs has been updated successfully.
 m39.1 06:33:03 result=m40
-| Skill: write-commit-messages
+| Skill: write-commit-messages (+1 line)
 m40 06:33:04 call=m39.1
 | Launching skill: write-commit-messages
 m41.1 06:33:05 result=m42
-| WebFetch: https://example.com/grammar
+| WebFetch: https://example.com/grammar (+1 line)
 m42 06:33:06 call=m41.1
 | The grammar has three token kinds.
 m43.1 06:33:07 result=m44
-| SendMessage: researcher
+| SendMessage: researcher (+1 line)
 m44 06:33:08 call=m43.1
 | Message sent to researcher
 m45.1 06:33:09 result=m46
-| tool ExitPlanMode input_keys=plan
+| tool ExitPlanMode input_keys=plan (+4 lines)
 m46 06:33:10 call=m45.1
 | User has approved your plan.
 $ rearview agent read ch_581699c40efc:m2..m4
@@ -214,10 +214,10 @@ protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m43.1 06:33:07 result=m44
-| SendMessage: researcher
+| SendMessage: researcher (+1 line)
 m44 hidden 06:33:08 tool-results=1
 m45.1 06:33:09 result=m46
-| tool ExitPlanMode input_keys=plan
+| tool ExitPlanMode input_keys=plan (+4 lines)
 m46 hidden 06:33:10 tool-results=1
 $ rearview agent read ch_581699c40efc:m2.1
 --- stdout
@@ -284,7 +284,7 @@ day 2026-09-01
 m8 s2 06:00:15
 | SPLICED_SUBAGENT_SENTINEL: the plugin starts from plugin.json.
 m9.1 s2 06:00:16 result=m10
-| tool SubagentHandback input_keys=message
+| tool SubagentHandback input_keys=message (+1 line)
 m10 s2 06:00:16 call=m9.1
 | {"success":false,"message":"Nothing was sent: SubagentHandback is not active for this agent. Write your report as plain text instead."}
 m11 06:00:20 from=s2 call=m7.1 tool=Agent
@@ -351,29 +351,29 @@ m31 user 06:30:00
 m32 user 06:31:00
 | [Notice] NOTICE_SENTINEL: safeguards flagged this message; switched model.
 m33.1 06:32:00 result=m34
-| tool ToolSearch input_keys=query
+| tool ToolSearch input_keys=query (+3 lines)
 m35 06:32:02
 | NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 m36 user 06:33:00
 | Fix the tokenizer, then plan the rest
 m37.1 06:33:01 result=m38
-| Edit: /tmp/claude-every-record-fixture/src/lib.rs
+| Edit: /tmp/claude-every-record-fixture/src/lib.rs (+2 lines)
 m38 06:33:02 call=m37.1
 | The file /tmp/claude-every-record-fixture/src/lib.rs has been updated successfully.
 m39.1 06:33:03 result=m40
-| Skill: write-commit-messages
+| Skill: write-commit-messages (+1 line)
 m40 06:33:04 call=m39.1
 | Launching skill: write-commit-messages
 m41.1 06:33:05 result=m42
-| WebFetch: https://example.com/grammar
+| WebFetch: https://example.com/grammar (+1 line)
 m42 06:33:06 call=m41.1
 | The grammar has three token kinds.
 m43.1 06:33:07 result=m44
-| SendMessage: researcher
+| SendMessage: researcher (+1 line)
 m44 06:33:08 call=m43.1
 | Message sent to researcher
 m45.1 06:33:09 result=m46
-| tool ExitPlanMode input_keys=plan
+| tool ExitPlanMode input_keys=plan (+4 lines)
 m46 06:33:10 call=m45.1
 | User has approved your plan.
 $ rearview agent read ch_581699c40efc:m9999
@@ -461,7 +461,7 @@ m14.1 06:03:20
 m14.1 result 06:03:20
 | SHELL_OUTPUT_SENTINEL
 m15.1 06:03:21
-| Skill: check-docs
+| Skill: check-docs (+1 line)
 m16 user 06:03:20
 | /mcp-config SLASH_ARGS_SENTINEL
 m17 user 06:03:20
@@ -478,11 +478,11 @@ m22 06:03:21 call=m21.1
 m23 06:03:21
 | Dating the release steps.
 m24.1 06:03:21 result=m25
-| Edit: NOTES.md
+| Edit: NOTES.md (+2 lines)
 m25 06:03:21 call=m24.1
 | Edited NOTES.md
 m26.1 06:03:21 result=m27
-| tool TodoList input_keys=todos
+| tool TodoList input_keys=todos (+8 lines)
 m27 06:03:21 call=m26.1
 | Todo list updated
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
@@ -528,10 +528,10 @@ protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m24.1 06:03:21 result=m25
-| Edit: NOTES.md
+| Edit: NOTES.md (+2 lines)
 m25 hidden 06:03:21 tool-results=1
 m26.1 06:03:21 result=m27
-| tool TodoList input_keys=todos
+| tool TodoList input_keys=todos (+8 lines)
 m27 hidden 06:03:21 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m6.1
@@ -617,7 +617,7 @@ m14.1 06:03:20
 m14.1 result 06:03:20
 | SHELL_OUTPUT_SENTINEL
 m15.1 06:03:21
-| Skill: check-docs
+| Skill: check-docs (+1 line)
 m16 user 06:03:20
 | /mcp-config SLASH_ARGS_SENTINEL
 m17 user 06:03:20
@@ -634,11 +634,11 @@ m22 06:03:21 call=m21.1
 m23 06:03:21
 | Dating the release steps.
 m24.1 06:03:21 result=m25
-| Edit: NOTES.md
+| Edit: NOTES.md (+2 lines)
 m25 06:03:21 call=m24.1
 | Edited NOTES.md
 m26.1 06:03:21 result=m27
-| tool TodoList input_keys=todos
+| tool TodoList input_keys=todos (+8 lines)
 m27 06:03:21 call=m26.1
 | Todo list updated
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
@@ -707,17 +707,17 @@ m4 06:00:04
 m5 06:00:05
 | codex answer searchable
 m6.1 06:00:07 result=m7
-| tool exec
+| tool exec (+1 line)
 m7 06:00:08 call=m6.1
 | tool output searchable
 m8.1 06:00:09 result=m9
-| tool wait input_keys=cell_id
+| tool wait input_keys=cell_id (+3 lines)
 m9 06:00:10 call=m8.1
 | function output searchable
 m10.1 06:00:11
-| tool inter_agent_message input_keys=author,message,recipient
+| tool inter_agent_message input_keys=author,message,recipient (+5 lines)
 m11.1 s2 06:00:11
-| tool inter_agent_message input_keys=author,message,recipient
+| tool inter_agent_message input_keys=author,message,recipient (+9 lines)
 m12 s2 06:00:11
 | TASKED_SUBAGENT_SENTINEL: the notes file lists the release steps.
 m13 user 06:02:00
@@ -756,11 +756,11 @@ m23.1 06:03:04
 m24 user 06:03:05
 | Is the notes file empty?
 m25.1 06:03:06 result=m26
-| tool shell input_keys=command
+| tool shell input_keys=command (+6 lines)
 m27 06:03:08
 | NUMBERED_REPLY_SENTINEL: the command printed nothing.
 m28.1 06:03:09 result=m29
-| spawn_agent: scout (explorer) · fork
+| spawn_agent: scout (explorer) · fork (+1 line)
 | LAUNCH_PROMPT_SENTINEL: list the release steps.
 m29 06:03:10 call=m28.1
 | {"task_name":"/root/scout"}
@@ -773,15 +773,15 @@ m32 06:03:13 call=m31.1
 m33 user 06:03:14
 | Add the release notes
 m34.1 06:03:15 result=m35
-| apply_patch: NOTES.md
+| apply_patch: NOTES.md (+2 lines)
 m34.2 06:03:15 result=m35
-| apply_patch: RELEASE.md
+| apply_patch: RELEASE.md (+1 line)
 m35 06:03:16 call=m34.1..2
 | Done: 2 files added
 m36.1 06:03:17 result=m37
-| send_message: /root/scout
+| send_message: /root/scout (+1 line)
 m38.1 06:03:19 result=m39
-| tool update_plan input_keys=explanation,plan
+| tool update_plan input_keys=explanation,plan (+9 lines)
 m39 06:03:20 call=m38.1
 | Plan updated
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
@@ -827,9 +827,9 @@ protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m36.1 06:03:17 result=m37
-| send_message: /root/scout
+| send_message: /root/scout (+1 line)
 m38.1 06:03:19 result=m39
-| tool update_plan input_keys=explanation,plan
+| tool update_plan input_keys=explanation,plan (+9 lines)
 m39 hidden 06:03:20 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m6.1
@@ -839,6 +839,7 @@ conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-0000000000
 day 2026-08-01
 m6.1 06:00:07 result=m7
 | tool exec
+| "echo TOOL_INPUT_VISIBLE"
 m7 06:00:08 call=m6.1
 | tool output searchable
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
@@ -897,7 +898,7 @@ conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-0000000000
 subagent s2 type=grunt span=m11..m12 : child
 day 2026-08-01
 m11.1 s2 06:00:11
-| tool inter_agent_message input_keys=author,message,recipient
+| tool inter_agent_message input_keys=author,message,recipient (+9 lines)
 m12 s2 06:00:11
 | TASKED_SUBAGENT_SENTINEL: the notes file lists the release steps.
 m13 user 06:02:00
@@ -936,11 +937,11 @@ m23.1 06:03:04
 m24 user 06:03:05
 | Is the notes file empty?
 m25.1 06:03:06 result=m26
-| tool shell input_keys=command
+| tool shell input_keys=command (+6 lines)
 m27 06:03:08
 | NUMBERED_REPLY_SENTINEL: the command printed nothing.
 m28.1 06:03:09 result=m29
-| spawn_agent: scout (explorer) · fork
+| spawn_agent: scout (explorer) · fork (+1 line)
 | LAUNCH_PROMPT_SENTINEL: list the release steps.
 m29 06:03:10 call=m28.1
 | {"task_name":"/root/scout"}
@@ -953,15 +954,15 @@ m32 06:03:13 call=m31.1
 m33 user 06:03:14
 | Add the release notes
 m34.1 06:03:15 result=m35
-| apply_patch: NOTES.md
+| apply_patch: NOTES.md (+2 lines)
 m34.2 06:03:15 result=m35
-| apply_patch: RELEASE.md
+| apply_patch: RELEASE.md (+1 line)
 m35 06:03:16 call=m34.1..2
 | Done: 2 files added
 m36.1 06:03:17 result=m37
-| send_message: /root/scout
+| send_message: /root/scout (+1 line)
 m38.1 06:03:19 result=m39
-| tool update_plan input_keys=explanation,plan
+| tool update_plan input_keys=explanation,plan (+9 lines)
 m39 06:03:20 call=m38.1
 | Plan updated
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
@@ -1047,11 +1048,11 @@ m16 22:04:23 call=m15.1
 m17 user 22:04:24
 | Date the release steps
 m18.1 22:04:25 result=m19
-| edit: notes.txt
+| edit: notes.txt (+2 lines)
 m19 22:04:26 call=m18.1
 | Edited notes.txt
 m20.1 22:04:27 result=m21
-| tool task input_keys=agent,i,solutionSpace,task
+| tool task input_keys=agent,i,solutionSpace,task (+6 lines)
 m21 22:04:28 call=m20.1
 | The dates are right.
 m22 22:04:29
@@ -1095,7 +1096,7 @@ protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m20.1 22:04:27 result=m21
-| tool task input_keys=agent,i,solutionSpace,task
+| tool task input_keys=agent,i,solutionSpace,task (+6 lines)
 m21 hidden 22:04:28 tool-results=1
 m22 22:04:29
 | The release steps are dated.
@@ -1183,11 +1184,11 @@ m16 22:04:23 call=m15.1
 m17 user 22:04:24
 | Date the release steps
 m18.1 22:04:25 result=m19
-| edit: notes.txt
+| edit: notes.txt (+2 lines)
 m19 22:04:26 call=m18.1
 | Edited notes.txt
 m20.1 22:04:27 result=m21
-| tool task input_keys=agent,i,solutionSpace,task
+| tool task input_keys=agent,i,solutionSpace,task (+6 lines)
 m21 22:04:28 call=m20.1
 | The dates are right.
 m22 22:04:29
@@ -1263,13 +1264,13 @@ m16 08:05:00 call=m15.1
 m17 08:05:50
 | Dating the release steps.
 m18.1 08:05:00 result=m19
-| edit: /tmp/opencode-project/NOTES.md
+| edit: /tmp/opencode-project/NOTES.md (+2 lines)
 m19 08:05:00 call=m18.1
 | Edit applied successfully.
 m20.1 08:05:00
-| tool todowrite input_keys=todos
+| tool todowrite input_keys=todos (+10 lines)
 m21.1 08:05:00 result=m22
-| tool context7_resolve-library-id input_keys=libraryName
+| tool context7_resolve-library-id input_keys=libraryName (+3 lines)
 m22 08:05:00 call=m21.1
 | Resolved /example/parser
 $ rearview agent read ch_efbbec792ccc:m2..m4
@@ -1315,9 +1316,9 @@ protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m20.1 08:05:00
-| tool todowrite input_keys=todos
+| tool todowrite input_keys=todos (+10 lines)
 m21.1 08:05:00 result=m22
-| tool context7_resolve-library-id input_keys=libraryName
+| tool context7_resolve-library-id input_keys=libraryName (+3 lines)
 m22 hidden 08:05:00 tool-results=1
 $ rearview agent read ch_efbbec792ccc:m2.1
 --- stdout
@@ -1464,7 +1465,7 @@ m15 19:19:05
 m16 user 19:20:00
 | Date the release steps
 m17.1 19:20:01 result=m18
-| edit: notes.txt
+| edit: notes.txt (+2 lines)
 m18 19:20:02 call=m17.1
 | Successfully replaced 1 block(s) in notes.txt.
 m19 19:20:03
@@ -1509,7 +1510,7 @@ protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m17.1 19:20:01 result=m18
-| edit: notes.txt
+| edit: notes.txt (+2 lines)
 m18 hidden 19:20:02 tool-results=1
 m19 19:20:03
 | The release steps are dated.
@@ -1579,7 +1580,7 @@ day 2024-02-29
 m16 user 19:20:00
 | Date the release steps
 m17.1 19:20:01 result=m18
-| edit: notes.txt
+| edit: notes.txt (+2 lines)
 m18 19:20:02 call=m17.1
 | Successfully replaced 1 block(s) in notes.txt.
 m19 19:20:03
@@ -1649,11 +1650,11 @@ m14 19:00:01 call=m13.1
 m15 19:00:01
 | Dating the release steps.
 m16.1 19:00:01 result=m17
-| search_replace: /tmp/grok-project/notes.md
+| search_replace: /tmp/grok-project/notes.md (+2 lines)
 m17 19:00:01 call=m16.1
 | old_string not found
 m18.1 19:00:01 result=m19
-| tool todo_write input_keys=merge,todos
+| tool todo_write input_keys=merge,todos (+10 lines)
 m19 19:00:01 call=m18.1
 | Updated 1 todo
 $ rearview agent read ch_982349c13ee4:m2..m4
@@ -1695,10 +1696,10 @@ protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
 m16.1 19:00:01 result=m17
-| search_replace: /tmp/grok-project/notes.md
+| search_replace: /tmp/grok-project/notes.md (+2 lines)
 m17 hidden 19:00:01 tool-results=1
 m18.1 19:00:01 result=m19
-| tool todo_write input_keys=merge,todos
+| tool todo_write input_keys=merge,todos (+10 lines)
 m19 hidden 19:00:01 tool-results=1
 $ rearview agent read ch_982349c13ee4:m6.1
 --- stdout
