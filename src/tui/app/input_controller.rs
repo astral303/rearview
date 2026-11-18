@@ -130,7 +130,7 @@ impl App {
     ) -> Option<Action> {
         self.clear_selection_anchor_on_loaded_list();
         match self.dialog_mode {
-            DialogMode::ConfirmDelete => return self.handle_confirm_key(code),
+            DialogMode::ConfirmDelete { .. } => return self.handle_confirm_key(code),
             DialogMode::ActionsMenu { .. } => {
                 return self.handle_actions_menu_key(code, modifiers);
             }

@@ -9,7 +9,7 @@ use crate::tui::viewer::{
     RenderedLine, SearchMatch, ToolDisplayMode, ToolOutputId,
 };
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Result of running the TUI
@@ -29,8 +29,9 @@ pub enum Action {
 pub enum DialogMode {
     /// No dialog shown
     None,
-    /// Confirming deletion of the selected conversation
-    ConfirmDelete,
+    /// Confirming deletion of the session at `session`, the one the prompt
+    /// was opened for
+    ConfirmDelete { session: PathBuf },
     /// Export menu (save to file)
     ExportMenu { selected: usize },
     /// Yank menu (copy to clipboard)
@@ -41,14 +42,37 @@ pub enum DialogMode {
     SemanticDebug,
     /// The filters the load ran under
     ActiveFilters,
-    /// Rename the selected conversation
-    Rename { input: String, cursor: usize },
-    /// The `Ctrl+X` actions menu; `selected` is the row `▶` marks, `None`
-    /// when no action is available
+    /// Rename the session at `session`, the one the name box was opened for
+    Rename {
+        session: PathBuf,
+        input: String,
+        cursor: usize,
+    },
+    /// The `Ctrl+X` actions menu on the session at `session`, the one it was
+    /// opened for, `None` when it opened without a session; `selected` is the
+    /// row `▶` marks, `None` when no action is available
     ActionsMenu {
+        session: Option<PathBuf>,
         selected: Option<SessionAction>,
         availability: MenuAvailability,
     },
+}
+
+impl DialogMode {
+    /// The session the actions menu, the delete prompt or the name box was
+    /// opened for; `None` for every other dialog.
+    pub fn session(&self) -> Option<&Path> {
+        match self {
+            Self::ConfirmDelete { session } | Self::Rename { session, .. } => Some(session),
+            Self::ActionsMenu { session, .. } => session.as_deref(),
+            Self::None
+            | Self::ExportMenu { .. }
+            | Self::YankMenu { .. }
+            | Self::Help { .. }
+            | Self::SemanticDebug
+            | Self::ActiveFilters => None,
+        }
+    }
 }
 
 /// Main application mode

@@ -7,7 +7,7 @@ use crate::history::DisplayEntries;
 use crate::history::provider::{RenamedTitle, TitleAndSummary};
 use crate::tui::list_change::ListChange;
 use crossterm::event::{KeyCode, KeyModifiers};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const EXPORT_OPTIONS: [&str; 4] = [
     "Ledger (formatted)",
@@ -17,13 +17,18 @@ const EXPORT_OPTIONS: [&str; 4] = [
 ];
 
 impl App {
+    /// `y` deletes the session the prompt was opened for; `n` and `Esc` close
+    /// the prompt.
     pub(super) fn handle_confirm_key(&mut self, code: KeyCode) -> Option<Action> {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.dialog_mode = DialogMode::None;
-                let path = self.get_selected_path()?;
-                self.apply_finished_refreshes_before_editing(&path)?;
-                Some(Action::Delete(path))
+                let DialogMode::ConfirmDelete { session } =
+                    std::mem::replace(&mut self.dialog_mode, DialogMode::None)
+                else {
+                    return None;
+                };
+                self.apply_finished_refreshes_before_editing(&session)?;
+                Some(Action::Delete(session))
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.dialog_mode = DialogMode::None;
@@ -121,16 +126,26 @@ impl App {
         }
     }
 
+    /// Open the name box on the session the keys act on.
     pub(super) fn start_rename(&mut self) {
-        let Some(idx) = self.get_selected_conversation_index() else {
+        if let Some(session) = self.session_to_act_on() {
+            self.open_rename(session);
+        }
+    }
+
+    /// Open the name box on the listed session at `session`, filled with its
+    /// title.
+    pub(super) fn open_rename(&mut self, session: PathBuf) {
+        let Some(row) = self.conversations.iter().find(|row| row.path == session) else {
             return;
         };
-        let input = self.conversations[idx]
-            .custom_title
-            .clone()
-            .unwrap_or_default();
+        let input = row.custom_title.clone().unwrap_or_default();
         let cursor = input.chars().count();
-        self.dialog_mode = DialogMode::Rename { input, cursor };
+        self.dialog_mode = DialogMode::Rename {
+            session,
+            input,
+            cursor,
+        };
     }
 
     pub(super) fn handle_rename_key(
@@ -152,12 +167,12 @@ impl App {
                 }
             }
             KeyCode::Right => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode {
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode {
                     *cursor = (*cursor + 1).min(input.chars().count());
                 }
             }
             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode {
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode {
                     input.clear();
                     *cursor = 0;
                 }
@@ -168,12 +183,12 @@ impl App {
                 }
             }
             KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode {
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode {
                     *cursor = input.chars().count();
                 }
             }
             KeyCode::Backspace => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode
                     && *cursor > 0
                     && let Some((byte_pos, _)) = input.char_indices().nth(*cursor - 1)
                 {
@@ -182,7 +197,7 @@ impl App {
                 }
             }
             KeyCode::Delete => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode
                     && *cursor < input.chars().count()
                     && let Some((byte_pos, _)) = input.char_indices().nth(*cursor)
                 {
@@ -190,7 +205,7 @@ impl App {
                 }
             }
             KeyCode::Char(ch) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode {
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode {
                     let byte_pos = input
                         .char_indices()
                         .nth(*cursor)
@@ -205,15 +220,16 @@ impl App {
         None
     }
 
+    /// Ask the background worker to rename the session the name box was
+    /// opened for. The name box stays open until the rename ends.
     pub(super) fn submit_rename(&mut self) {
-        let title = match &self.dialog_mode {
-            DialogMode::Rename { input, .. } => input.trim().to_string(),
+        let (session, title) = match &self.dialog_mode {
+            DialogMode::Rename { session, input, .. } => {
+                (session.clone(), input.trim().to_string())
+            }
             _ => return,
         };
-        let Some(idx) = self
-            .get_selected_path()
-            .and_then(|path| self.apply_finished_refreshes_before_editing(&path))
-        else {
+        let Some(idx) = self.apply_finished_refreshes_before_editing(&session) else {
             self.dialog_mode = DialogMode::None;
             return;
         };

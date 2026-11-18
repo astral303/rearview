@@ -2903,7 +2903,7 @@ fn letter_or_ctrl_letter_in_actions_menu_picks_its_action() {
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
     press_with(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
-    assert_eq!(app.dialog_mode, DialogMode::ConfirmDelete);
+    assert!(matches!(app.dialog_mode, DialogMode::ConfirmDelete { .. }));
 
     app.dialog_mode = DialogMode::None;
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
@@ -2926,7 +2926,7 @@ fn arrows_and_enter_in_actions_menu_pick_selected_action() {
 
     press_with(&mut app, KeyCode::Enter, KeyModifiers::empty());
 
-    assert_eq!(app.dialog_mode, DialogMode::ConfirmDelete);
+    assert!(matches!(app.dialog_mode, DialogMode::ConfirmDelete { .. }));
 }
 
 #[test]
@@ -3040,7 +3040,7 @@ fn ctrl_r_ctrl_f_and_ctrl_x_no_longer_resume_fork_or_delete() {
     assert_eq!(app.dialog_mode, DialogMode::None);
 
     press_with(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
-    assert_ne!(app.dialog_mode, DialogMode::ConfirmDelete);
+    assert!(!matches!(app.dialog_mode, DialogMode::ConfirmDelete { .. }));
 }
 
 #[test]

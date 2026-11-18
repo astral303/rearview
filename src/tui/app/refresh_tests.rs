@@ -32,7 +32,7 @@ fn fingerprint(size: u64) -> CachedFingerprint {
 
 /// A session named `name`, active at `minute` past noon, read from
 /// transcripts of `size` bytes.
-fn session(name: &str, text: &str, minute: u32, size: u64) -> Conversation {
+pub(super) fn session(name: &str, text: &str, minute: u32, size: u64) -> Conversation {
     let mut row = one_message_conversation(
         text,
         chrono::Local
@@ -49,7 +49,7 @@ fn session(name: &str, text: &str, minute: u32, size: u64) -> Conversation {
 }
 
 /// An app listing `rows`, newest first, without any agent's storage.
-fn app_listing(rows: Vec<Conversation>) -> App {
+pub(super) fn app_listing(rows: Vec<Conversation>) -> App {
     app_reading(rows, test_environment(Vec::new(), None))
 }
 
@@ -66,7 +66,7 @@ pub(super) fn selected_name(app: &App) -> Option<&str> {
 }
 
 /// The sender of `app`'s search results, in place of its search worker's.
-fn take_over_search_results(app: &mut App) -> std::sync::mpsc::Sender<SearchResponse> {
+pub(super) fn take_over_search_results(app: &mut App) -> std::sync::mpsc::Sender<SearchResponse> {
     let (results, search_rx) = std::sync::mpsc::channel();
     app.search_rx = search_rx;
     results
@@ -74,7 +74,7 @@ fn take_over_search_results(app: &mut App) -> std::sync::mpsc::Sender<SearchResp
 
 /// Answer `app`'s current search with the rows at `filtered`, through
 /// `results` from [`take_over_search_results`].
-fn answer_search(
+pub(super) fn answer_search(
     app: &mut App,
     results: &std::sync::mpsc::Sender<SearchResponse>,
     filtered: Vec<usize>,
@@ -339,7 +339,7 @@ fn known_sessions_are_listed_rows_and_skipped_sessions() {
 }
 
 /// Hand `app` the outcome of a delete of the session at `path`.
-fn finish_deleting(app: &mut App, path: &Path) {
+pub(super) fn finish_deleting(app: &mut App, path: &Path) {
     app.finish_list_change(crate::tui::list_change::ListChangeOutcome::Deleted {
         path: path.to_path_buf(),
         result: Ok(crate::history::provider::Deleted::just_the_session()),
@@ -438,8 +438,10 @@ fn rename_reads_unreadable_session() {
     assert_shows_the_last_message_preview(&app.conversations()[0]);
 }
 
+/// The name box open on `app`'s first row, holding `Renamed`.
 fn renaming(app: &mut App) {
     app.dialog_mode = DialogMode::Rename {
+        session: app.conversations[0].path.clone(),
         input: "Renamed".to_owned(),
         cursor: 7,
     };
@@ -509,13 +511,14 @@ fn rename_runs_on_background_worker_and_shows_new_title() {
 }
 
 /// An app listing sessions `b` and `a` under the confirmation `dialog` for
-/// `a`, after a list refresh that removed `a` finished behind the dialog.
-fn confirming_for_a_session_a_refresh_removed(dialog: DialogMode) -> App {
+/// `a`, made from `a`'s path, after a list refresh that removed `a` finished
+/// behind the dialog.
+fn confirming_for_a_session_a_refresh_removed(dialog: impl FnOnce(PathBuf) -> DialogMode) -> App {
     let gone = session("a", "a", 5, 1);
     let mut app = app_listing(vec![session("b", "b", 10, 1), gone.clone()]);
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
     app.begin_refresh().unwrap();
-    app.dialog_mode = dialog;
+    app.dialog_mode = dialog(gone.path.clone());
     app.finish_refresh(refresh_found(SessionChanges {
         removed: vec![gone.path],
         ..Default::default()
@@ -525,7 +528,8 @@ fn confirming_for_a_session_a_refresh_removed(dialog: DialogMode) -> App {
 
 #[test]
 fn delete_confirmed_after_refresh_removed_its_session_reports_it_not_found() {
-    let mut app = confirming_for_a_session_a_refresh_removed(DialogMode::ConfirmDelete);
+    let mut app =
+        confirming_for_a_session_a_refresh_removed(|session| DialogMode::ConfirmDelete { session });
 
     let action = app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE, 10);
 
@@ -538,7 +542,8 @@ fn delete_confirmed_after_refresh_removed_its_session_reports_it_not_found() {
 
 #[test]
 fn rename_confirmed_after_refresh_removed_its_session_reports_it_not_found() {
-    let mut app = confirming_for_a_session_a_refresh_removed(DialogMode::Rename {
+    let mut app = confirming_for_a_session_a_refresh_removed(|session| DialogMode::Rename {
+        session,
         input: "Renamed".to_owned(),
         cursor: 7,
     });
@@ -1212,7 +1217,7 @@ fn session_refresh_waits_while_delete_confirmation_is_open() {
     std::fs::remove_file(&a).unwrap();
     app.record_next_step(&a, NextStep::CacheInBackground);
     app.handle_key(KeyCode::Down, KeyModifiers::NONE, 10);
-    app.dialog_mode = DialogMode::ConfirmDelete;
+    app.dialog_mode = DialogMode::ConfirmDelete { session: a.clone() };
 
     assert!(app.begin_session_refresh().is_none());
     assert_eq!(listed_names(&app), ["b", "a"]);

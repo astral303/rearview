@@ -171,7 +171,7 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
     // Render bottom bar: opening label > confirm dialog > status message > hotkeys
     if app.is_opening() {
         render_list_status_bar(frame, app, chunks[2]);
-    } else if *app.dialog_mode() == DialogMode::ConfirmDelete {
+    } else if let DialogMode::ConfirmDelete { .. } = app.dialog_mode() {
         render_confirm_dialog(frame, chunks[2]);
     } else if let Some((msg, shown)) = app.status_message()
         && app.clock().elapsed_since(*shown) < STATUS_TTL
@@ -195,7 +195,7 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         ),
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
         DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
-        DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
+        DialogMode::Rename { input, cursor, .. } => render_rename_dialog(frame, input, *cursor),
         DialogMode::ActionsMenu { selected, .. } => render_actions_menu(frame, app, *selected),
         _ => {}
     }
@@ -637,7 +637,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
 
     // Render dialog overlay if active
     match app.dialog_mode() {
-        DialogMode::ConfirmDelete => render_confirm_dialog(frame, layout.status),
+        DialogMode::ConfirmDelete { .. } => render_confirm_dialog(frame, layout.status),
         DialogMode::ExportMenu { selected } => render_export_menu(frame, *selected, false),
         DialogMode::YankMenu { selected } => render_export_menu(frame, *selected, true),
         DialogMode::Help { scroll } => {
@@ -653,7 +653,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
         }
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
         DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
-        DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
+        DialogMode::Rename { input, cursor, .. } => render_rename_dialog(frame, input, *cursor),
         DialogMode::ActionsMenu { selected, .. } => render_actions_menu(frame, app, *selected),
         DialogMode::None => {}
     }
@@ -3066,6 +3066,7 @@ mod tests {
     fn actions_menu_marks_each_key_letter_and_selected_row() {
         let mut app = semantic_searching_app("query", SemanticProgress::Complete);
         app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
+            session: None,
             selected: Some(SessionAction::Delete),
             availability: MenuAvailability::read(|_| ActionAvailability::Available),
         });
@@ -3107,6 +3108,7 @@ mod tests {
     fn actions_menu_shows_loading_fork_in_grey_in_place_of_fork() {
         let mut app = semantic_searching_app("query", SemanticProgress::Complete);
         app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
+            session: None,
             selected: Some(SessionAction::Resume),
             availability: MenuAvailability::read(|action| match action {
                 SessionAction::Fork => ActionAvailability::Loading,

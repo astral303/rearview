@@ -290,7 +290,7 @@ impl App {
     fn is_confirming_a_list_change(&self) -> bool {
         matches!(
             self.dialog_mode,
-            DialogMode::Rename { .. } | DialogMode::ConfirmDelete
+            DialogMode::Rename { .. } | DialogMode::ConfirmDelete { .. }
         )
     }
 
@@ -833,5 +833,6 @@ impl App {
         self.selection_anchor = selected_path.map(SelectionAnchor::Kept);
         self.select_anchor_or_first();
         self.rerun_query();
+        self.close_dialog_of_unlisted_session();
     }
 }

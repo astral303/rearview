@@ -1,4 +1,4 @@
-use super::{App, AppMode};
+use super::{App, AppMode, DialogMode};
 use crate::error::AppError;
 use crate::history::provider::Deleted;
 use crate::history::{Conversation, ExcludedProjects, Workspace};
@@ -161,11 +161,6 @@ impl App {
             .map(|&idx| self.conversations[idx].path.clone())
     }
 
-    pub(crate) fn get_selected_source(&self) -> Option<crate::history::Source> {
-        self.get_selected_conversation_index()
-            .map(|index| self.conversations[index].source)
-    }
-
     pub(crate) fn has_multiple_sources(&self) -> bool {
         let sources = self
             .conversations
@@ -276,6 +271,19 @@ impl App {
         }
 
         self.refresh_search_data();
+        self.close_dialog_of_unlisted_session();
+    }
+
+    /// Close the actions menu, the delete prompt or the name box once the
+    /// session it was opened for is no longer listed.
+    pub(super) fn close_dialog_of_unlisted_session(&mut self) {
+        let is_unlisted = self
+            .dialog_mode
+            .session()
+            .is_some_and(|session| !self.conversations.iter().any(|row| row.path == session));
+        if is_unlisted {
+            self.dialog_mode = DialogMode::None;
+        }
     }
 }
 

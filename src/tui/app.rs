@@ -1337,3 +1337,6 @@ mod viewer_tail_tests;
 
 #[cfg(test)]
 mod shown_name_tests;
+
+#[cfg(test)]
+mod delete_tests;

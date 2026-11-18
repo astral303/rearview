@@ -1,8 +1,9 @@
-use super::{Action, App, DialogMode, ForkRead};
+use super::{Action, App, AppMode, DialogMode, ForkRead};
 use crate::history::Source;
 use crate::tui::actions_menu::{self, ActionAvailability, MenuAvailability, SessionAction};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 /// This rearview's work on the list that rename and delete wait for.
@@ -34,7 +35,8 @@ impl ListWork {
 }
 
 impl App {
-    /// True when `action` is available on the selected or open session.
+    /// True when `action` is available on the session the open menu acts on,
+    /// or on the session the keys act on while no menu is open.
     pub fn is_action_available(&self, action: SessionAction) -> bool {
         self.action_availability(action) == ActionAvailability::Available
     }
@@ -44,23 +46,44 @@ impl App {
     pub fn action_availability(&self, action: SessionAction) -> ActionAvailability {
         match &self.dialog_mode {
             DialogMode::ActionsMenu { availability, .. } => availability.of(action),
-            _ => self.read_availability(action),
+            _ => self.read_availability(self.session_to_act_on().as_deref(), action),
         }
     }
 
-    /// The availability of `action` on the selected or open session, without
-    /// waiting for a `fork` declaration that has yet to be read. A file opened
-    /// directly offers Rename alone, and only when its agent stores it:
-    /// renaming writes to the file, and a copy elsewhere must stay unchanged.
-    /// Rename and delete wait for this rearview's work on the list (see
+    /// The session the actions menu, the delete prompt and the name box open
+    /// for: the open session in the viewer, the selected row's in the list.
+    pub(super) fn session_to_act_on(&self) -> Option<PathBuf> {
+        match &self.app_mode {
+            AppMode::View(state) => Some(state.conversation_path.clone()),
+            AppMode::List => self.get_selected_path(),
+        }
+    }
+
+    /// The agent of the listed session at `session`.
+    fn listed_source(&self, session: &Path) -> Option<Source> {
+        self.conversations
+            .iter()
+            .find(|row| row.path == session)
+            .map(|row| row.source)
+    }
+
+    /// The availability of `action` on `session`, without waiting for a
+    /// `fork` declaration that has yet to be read. A file opened directly
+    /// offers Rename alone, and only when its agent stores it: renaming
+    /// writes to the file, and a copy elsewhere must stay unchanged. Rename
+    /// and delete wait for this rearview's work on the list (see
     /// [`Self::rename_and_delete_wait`]).
-    fn read_availability(&self, action: SessionAction) -> ActionAvailability {
+    fn read_availability(
+        &self,
+        session: Option<&Path>,
+        action: SessionAction,
+    ) -> ActionAvailability {
         if matches!(action, SessionAction::Delete | SessionAction::Rename)
-            && let Some(work) = self.rename_and_delete_wait()
+            && let Some(work) = self.rename_and_delete_wait(session)
         {
             return ActionAvailability::Waiting(work.menu_reason());
         }
-        let Some(source) = self.get_selected_source() else {
+        let Some(source) = session.and_then(|session| self.listed_source(session)) else {
             return ActionAvailability::Unavailable;
         };
         if self.single_file_mode
@@ -85,12 +108,12 @@ impl App {
         }
     }
 
-    /// This rearview's work on the list that rename and delete of the
-    /// selected or open session wait for: the launch, a list refresh, or the
-    /// running refresh of that session, while it reads or writes the cache.
-    /// `None` while that work waits for another rearview. A finished
-    /// refresh is applied before they act.
-    fn rename_and_delete_wait(&self) -> Option<ListWork> {
+    /// This rearview's work on the list that rename and delete of `session`
+    /// wait for: the launch, a list refresh, or the running refresh of that
+    /// session, while it reads or writes the cache. `None` while that work
+    /// waits for another rearview. A finished refresh is applied before they
+    /// act.
+    fn rename_and_delete_wait(&self, session: Option<&Path>) -> Option<ListWork> {
         if self.cache_wait.is_some() {
             return None;
         }
@@ -100,9 +123,8 @@ impl App {
         if self.store.is_list_refresh_running() {
             return Some(ListWork::Refreshing);
         }
-        let path = self.get_selected_path()?;
         self.store
-            .is_in_running_session_refresh(&path)
+            .is_in_running_session_refresh(session?)
             .then_some(ListWork::RefreshingSession)
     }
 
@@ -126,12 +148,17 @@ impl App {
         };
         let source = read.source;
         self.fork_read = None;
-        if self.get_selected_source() != Some(source) {
+        let menu_source = self
+            .dialog_mode
+            .session()
+            .and_then(|session| self.listed_source(session));
+        if menu_source != Some(source) {
             return;
         }
         if let DialogMode::ActionsMenu {
             selected,
             availability,
+            ..
         } = &mut self.dialog_mode
         {
             availability.set(
@@ -165,9 +192,10 @@ impl App {
             return Some(None);
         }
         if self.keys.rename.matches(code, modifiers) {
+            let session = self.session_to_act_on();
             if self.is_action_available(SessionAction::Rename) {
                 self.start_rename();
-            } else if let Some(work) = self.rename_and_delete_wait() {
+            } else if let Some(work) = self.rename_and_delete_wait(session.as_deref()) {
                 match work {
                     ListWork::Loading => self.set_status_until_loaded(work.rename_status()),
                     ListWork::Refreshing | ListWork::RefreshingSession => {
@@ -180,18 +208,24 @@ impl App {
         None
     }
 
-    /// Open the menu with its first available action selected. Draws, keys
-    /// and clicks read the availability it reads here. A `fork` declaration
-    /// that has yet to be read is read on a background thread, so the menu
-    /// opens without waiting.
+    /// Open the menu on the session the keys act on, with its first
+    /// available action selected. Draws, keys and clicks read the
+    /// availability it reads here. A `fork` declaration that has yet to be
+    /// read is read on a background thread, so the menu opens without
+    /// waiting.
     pub(super) fn open_actions_menu(&mut self) {
-        let availability = MenuAvailability::read(|action| self.read_availability(action));
+        let session = self.session_to_act_on();
+        let availability =
+            MenuAvailability::read(|action| self.read_availability(session.as_deref(), action));
         if availability.of(SessionAction::Fork) == ActionAvailability::Loading
-            && let Some(source) = self.get_selected_source()
+            && let Some(source) = session
+                .as_deref()
+                .and_then(|session| self.listed_source(session))
         {
             self.start_fork_read(source);
         }
         self.dialog_mode = DialogMode::ActionsMenu {
+            session,
             selected: availability.first_available(),
             availability,
         };
@@ -297,17 +331,24 @@ impl App {
         }
     }
 
+    /// Run `action` on the session the menu was opened for.
     fn run_session_action(&mut self, action: SessionAction) -> Option<Action> {
-        self.dialog_mode = DialogMode::None;
+        let DialogMode::ActionsMenu {
+            session: Some(session),
+            ..
+        } = std::mem::replace(&mut self.dialog_mode, DialogMode::None)
+        else {
+            return None;
+        };
         match action {
-            SessionAction::Resume => self.get_selected_path().map(Action::Resume),
-            SessionAction::Fork => self.get_selected_path().map(Action::ForkResume),
+            SessionAction::Resume => Some(Action::Resume(session)),
+            SessionAction::Fork => Some(Action::ForkResume(session)),
             SessionAction::Delete => {
-                self.dialog_mode = DialogMode::ConfirmDelete;
+                self.dialog_mode = DialogMode::ConfirmDelete { session };
                 None
             }
             SessionAction::Rename => {
-                self.start_rename();
+                self.open_rename(session);
                 None
             }
         }
