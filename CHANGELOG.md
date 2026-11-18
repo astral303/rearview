@@ -117,6 +117,8 @@
 - Fix confirming a delete (`y`) deleting a session the user didn't choose. The
   actions menu (`Ctrl+X`), the delete prompt and the name box now act on the
   session they were opened for, and close when it is removed from the list.
+- Fix the list's selection moving to another session when a delete or a
+  refresh removed or added rows above it. It now stays on its session.
 - Fix search missing text the viewer shows in tool calls, thinking and
   sub-agent transcripts. The session list missed all three, and the list and
   `agent search` both missed a tool call's body, such as an edit's diff, a

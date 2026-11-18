@@ -19,6 +19,13 @@ pub(super) enum SelectionAnchor {
     SelectedWhileLoading(PathBuf),
 }
 
+/// The selected session before the shown rows change, and how many shown
+/// rows above it stay.
+pub(super) struct SelectionBeforeChange {
+    path: PathBuf,
+    rows_above_kept: usize,
+}
+
 impl SelectionAnchor {
     fn path(&self) -> &Path {
         match self {
@@ -234,12 +241,13 @@ impl App {
         self.set_status(format!("Failed to delete: {error}"));
     }
 
-    /// Remove the row of the session at `path`. The selection keeps its
-    /// position, or moves to the last row.
+    /// Remove the row of the session at `path`, keeping the selection on its
+    /// session (see [`Self::reselect_after_change`]).
     fn remove_from_list(&mut self, path: &Path) {
         let Some(conv_idx) = self.conversations.iter().position(|row| row.path == path) else {
             return;
         };
+        let selection = self.selection_before_change(|index| index != conv_idx);
 
         self.conversations.remove(conv_idx);
 
@@ -261,17 +269,41 @@ impl App {
             }
         }
 
-        if self.filtered.is_empty() {
-            self.selected = None;
-        } else if self
-            .selected
-            .is_some_and(|selected| selected >= self.filtered.len())
-        {
-            self.selected = Some(self.filtered.len() - 1);
+        if let Some(selection) = selection {
+            self.reselect_after_change(selection);
         }
 
         self.refresh_search_data();
         self.close_dialog_of_unlisted_session();
+    }
+
+    /// The selected session before the shown rows change, and how many shown
+    /// rows above it stay: those whose conversation index `stays` holds for.
+    pub(super) fn selection_before_change(
+        &self,
+        stays: impl Fn(usize) -> bool,
+    ) -> Option<SelectionBeforeChange> {
+        let selected = self.selected?;
+        Some(SelectionBeforeChange {
+            path: self.get_selected_path()?,
+            rows_above_kept: self.filtered[..selected]
+                .iter()
+                .filter(|&&index| stays(index))
+                .count(),
+        })
+    }
+
+    /// Select `before`'s session while the list shows it. Otherwise select
+    /// the row that took its place, or the last row when it was last.
+    pub(super) fn reselect_after_change(&mut self, before: SelectionBeforeChange) {
+        let kept = self
+            .filtered
+            .iter()
+            .position(|&index| self.conversations[index].path == before.path);
+        self.selected = kept.or_else(|| {
+            let last = self.filtered.len().checked_sub(1)?;
+            Some(before.rows_above_kept.min(last))
+        });
     }
 
     /// Close the actions menu, the delete prompt or the name box once the

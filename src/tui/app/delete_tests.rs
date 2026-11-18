@@ -7,6 +7,7 @@ use super::refresh_tests::{
     take_over_search_results,
 };
 use super::*;
+use crate::history::{RefreshOutcome, SessionChanges, UpdatedSession};
 use crate::tui::list_change::ListChange;
 
 /// An app listing sessions `c`, `b` and `a`, newest first.
@@ -159,6 +160,94 @@ fn menu_prompt_and_name_box_close_when_their_session_leaves_list() {
             "{dialog} closes once its session leaves the list"
         );
     }
+}
+
+/// Apply a list refresh that found `changes` to `app`.
+fn refresh_finding(app: &mut App, changes: SessionChanges) {
+    app.begin_refresh().expect("the refresh begins");
+    app.finish_refresh(Ok(RefreshOutcome::Changes(Box::new(changes))));
+}
+
+fn new_row(row: Conversation) -> UpdatedSession {
+    UpdatedSession {
+        row,
+        replaces_listed_row: false,
+        next: crate::history::NextStep::Settled,
+    }
+}
+
+#[test]
+fn selection_stays_on_its_session_when_a_delete_removes_a_row_above_it() {
+    let mut app = three_sessions();
+    press(&mut app, KeyCode::Down);
+    let c = path_of(&app, "c");
+
+    finish_deleting(&mut app, &c);
+
+    assert_eq!(selected_name(&app), Some("b"));
+}
+
+#[test]
+fn selection_stays_on_its_session_when_a_refresh_adds_or_removes_rows_above_it() {
+    let mut app = three_sessions();
+    press(&mut app, KeyCode::Down);
+    let c = path_of(&app, "c");
+
+    refresh_finding(
+        &mut app,
+        SessionChanges {
+            updated: vec![new_row(session("d", "d", 20, 1))],
+            ..Default::default()
+        },
+    );
+    assert_eq!(listed_names(&app), ["d", "c", "b", "a"]);
+    assert_eq!(selected_name(&app), Some("b"), "a row added above");
+
+    refresh_finding(
+        &mut app,
+        SessionChanges {
+            removed: vec![c],
+            ..Default::default()
+        },
+    );
+    assert_eq!(listed_names(&app), ["d", "b", "a"]);
+    assert_eq!(selected_name(&app), Some("b"), "a row removed above");
+}
+
+#[test]
+fn removed_selected_session_passes_selection_to_row_taking_its_place() {
+    let mut app = three_sessions();
+    press(&mut app, KeyCode::Down);
+    let b = path_of(&app, "b");
+
+    refresh_finding(
+        &mut app,
+        SessionChanges {
+            removed: vec![b],
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(listed_names(&app), ["c", "a"]);
+    assert_eq!(selected_name(&app), Some("a"));
+}
+
+#[test]
+fn removed_last_selected_session_passes_selection_to_new_last_row() {
+    let mut app = three_sessions();
+    press(&mut app, KeyCode::End);
+    let a = path_of(&app, "a");
+
+    refresh_finding(
+        &mut app,
+        SessionChanges {
+            removed: vec![a],
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(listed_names(&app), ["c", "b"]);
+    assert_eq!(selected_name(&app), Some("b"));
 }
 
 #[test]
