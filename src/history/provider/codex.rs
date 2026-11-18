@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 26,
+            schema_version: 27,
         }
     }
 
@@ -1094,7 +1094,7 @@ pub(super) mod tests {
                     line(
                         9,
                         "response_item",
-                        json!({"type": "function_call", "id": "fc_spawn", "name": "spawn_agent", "arguments": "{\"task_name\":\"scout\",\"agent_type\":\"explorer\",\"message\":\"LAUNCH_PROMPT_SENTINEL: list the release steps.\"}", "call_id": "call_spawn"}),
+                        json!({"type": "function_call", "id": "fc_spawn", "name": "spawn_agent", "arguments": "{\"task_name\":\"scout\",\"agent_type\":\"explorer\",\"service_tier\":\"flex\",\"message\":\"LAUNCH_PROMPT_SENTINEL: list the release steps.\"}", "call_id": "call_spawn"}),
                     ),
                     line(
                         10,
@@ -1126,15 +1126,37 @@ pub(super) mod tests {
                     line(
                         15,
                         "response_item",
-                        json!({"type": "custom_tool_call", "id": "ctc_patch", "status": "completed", "call_id": "call_patch", "name": "apply_patch", "input": "*** Begin Patch\n*** Add File: NOTES.md\n+# Notes\n*** Add File: RELEASE.md\n+# Release\n*** End Patch"}),
+                        json!({"type": "custom_tool_call", "id": "ctc_patch", "status": "completed", "call_id": "call_patch", "name": "apply_patch", "input": "*** Begin Patch\n*** Add File: NOTES.md\n+# Notes\n+PATCH_SENTINEL: the release steps\n*** Add File: RELEASE.md\n+# Release\n*** End Patch"}),
                     ),
                     line(
                         16,
                         "response_item",
                         json!({"type": "custom_tool_call_output", "id": "ctco_patch", "call_id": "call_patch", "output": [{"type": "input_text", "text": "Done: 2 files added"}]}),
                     ),
+                    line(
+                        17,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_send", "name": "send_message", "arguments": "{\"target\":\"/root/scout\",\"message\":\"SEND_MESSAGE_SENTINEL: add the dates\"}", "call_id": "call_send"}),
+                    ),
+                    line(
+                        18,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_send", "call_id": "call_send", "output": ""}),
+                    ),
+                    line(
+                        19,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_plan", "name": "update_plan", "arguments": "{\"explanation\":\"Ship the notes\",\"plan\":[{\"step\":\"PLAN_STEP_SENTINEL: date the notes\",\"status\":\"in_progress\"}]}", "call_id": "call_plan"}),
+                    ),
+                    line(
+                        20,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_plan", "call_id": "call_plan", "output": "Plan updated"}),
+                    ),
                 ],
             );
+            const PATCH_RUN: &str =
+                "Edited 2 files, messaged 1 agent, updated the task list 1 time";
             AgentSession::new(
                 Source::Codex,
                 session,
@@ -1143,27 +1165,34 @@ pub(super) mod tests {
                     fixture("subagent-without-user-text.jsonl"),
                 ],
                 vec![
-                    Marker::searched("user text", "active codex question"),
-                    Marker::searched("assistant text", "codex answer searchable"),
-                    Marker::searched("thinking", "reasoning summary visible"),
-                    Marker::unsearched("tool call", "TOOL_INPUT_VISIBLE"),
-                    Marker::searched("tool result", "tool output searchable"),
+                    Marker::shown("user text", "active codex question"),
+                    Marker::shown("assistant text", "codex answer searchable"),
+                    Marker::shown("thinking", "reasoning summary visible"),
+                    Marker::shown("tool call", "TOOL_INPUT_VISIBLE"),
+                    Marker::shown("tool result", "tool output searchable"),
                     Marker::in_call_or_subagent("sub-agent message", "child answer searchable"),
                     Marker::in_call_or_subagent(
                         "message of a sub-agent without user text",
                         "TASKED_SUBAGENT_SENTINEL",
                     ),
-                    Marker::searched("interrupted-turn notice", "Conversation interrupted"),
-                    Marker::searched("goal", "GOAL_SENTINEL"),
+                    Marker::shown("interrupted-turn notice", "Conversation interrupted"),
+                    Marker::shown("goal", "GOAL_SENTINEL"),
                     Marker::in_call_or_subagent("web search", "WEB_SEARCH_SENTINEL")
                         .in_summary_row("Fetched 1 URL, searched the web 2 times"),
                     Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
+                        .in_summary_row("Started 1 agent"),
+                    Marker::shown("launch setting", "service_tier: flex")
                         .in_summary_row("Started 1 agent"),
                     Marker::in_call_or_subagent(
                         "exec script's shell command",
                         "EXEC_COMMAND_SENTINEL",
                     )
                     .in_summary_row("Ran 1 shell command"),
+                    Marker::shown("patch", "PATCH_SENTINEL").in_summary_row(PATCH_RUN),
+                    Marker::shown("plan update", "PLAN_STEP_SENTINEL"),
+                    Marker::shown("inter-agent message", "INTER_AGENT_TASK_TEXT"),
+                    Marker::shown("message to an agent", "SEND_MESSAGE_SENTINEL")
+                        .in_summary_row(PATCH_RUN),
                 ],
             )
             .with_hidden(&[

@@ -15,8 +15,8 @@ query text=Sentinel hits=0
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 $ rearview agent within ch_581699c40efc the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=14 tz=-04:00 omitted-lines=29
-query text=the hits=14
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=20 tz=-04:00 omitted-lines=41
+query text=the hits=20
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 continue within ref=ch_581699c40efc action=narrow-query-or-increase-budget
 $ rearview agent within ch_0b26e45343df answer
@@ -49,8 +49,8 @@ conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-00
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent within ch_0b26e45343df the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=5 tz=-04:00 warnings=1 warning-records=1 omitted-lines=12
-query text=the hits=5
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=8 tz=-04:00 warnings=1 warning-records=1 omitted-lines=18
+query text=the hits=8
 continue within ref=ch_0b26e45343df action=narrow-query-or-increase-budget
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent within ch_74aec3f6df49 answer
@@ -85,8 +85,8 @@ conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-0000000000
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_74aec3f6df49 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=7 tz=-04:00 warnings=1 warning-records=1 omitted-lines=16
-query text=the hits=7
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=10 tz=-04:00 warnings=1 warning-records=1 omitted-lines=22
+query text=the hits=10
 continue within ref=ch_74aec3f6df49 action=narrow-query-or-increase-budget
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_974c3840e189 answer
@@ -116,8 +116,8 @@ query text=Sentinel hits=0
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 $ rearview agent within ch_974c3840e189 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=3 tz=-05:00 omitted-lines=7
-query text=the hits=3
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=8 tz=-05:00 omitted-lines=17
+query text=the hits=8
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 continue within ref=ch_974c3840e189 action=narrow-query-or-increase-budget
 $ rearview agent within ch_efbbec792ccc answer
@@ -140,8 +140,8 @@ query text=Sentinel hits=0
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 $ rearview agent within ch_efbbec792ccc the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=6 tz=-04:00 omitted-lines=13
-query text=the hits=6
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=9 tz=-04:00 omitted-lines=19
+query text=the hits=9
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 continue within ref=ch_efbbec792ccc action=narrow-query-or-increase-budget
 $ rearview agent within ch_f04d3718e406 answer
@@ -169,8 +169,8 @@ query text=Sentinel hits=0
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 $ rearview agent within ch_f04d3718e406 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=3 tz=-05:00 omitted-lines=7
-query text=the hits=3
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=6 tz=-05:00 omitted-lines=13
+query text=the hits=6
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 continue within ref=ch_f04d3718e406 action=narrow-query-or-increase-budget
 $ rearview agent within ch_982349c13ee4 answer
@@ -200,8 +200,8 @@ query text=Sentinel hits=0
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 $ rearview agent within ch_982349c13ee4 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=3 tz=-05:00 omitted-lines=7
-query text=the hits=3
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=6 tz=-05:00 omitted-lines=13
+query text=the hits=6
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 continue within ref=ch_982349c13ee4 action=narrow-query-or-increase-budget
 $ rearview agent within ch_581699c40efc the --after 2026-09-01T06:00:30 --before 2026-09-01T06:05
@@ -210,14 +210,14 @@ protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=4 tz=
 query text=the hits=4
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 title project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ... Agent "Background check" finished
-hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_9b62236225d2c363 source=lexical score=4.024390 focus=m16..m16 at=2026-09-01T06:02:02 | QUEUED_PROMPT_SENTINEL: and run the tests
-read ref=ch_581699c40efc:m15..m17 focus=m16..m16 tools=false tool-results=false thinking=false subagents=false
-hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_95f885354e3a3b80 source=lexical score=4.015385 focus=m10..m10 at=2026-09-01T06:00:30 | FORKED_SUBAGENT_SENTINEL: the plugin's tests cover how it starts.
-read ref=ch_581699c40efc:m9..m11 focus=m10..m10 tools=false tool-results=false thinking=false subagents=true
-hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_bd3244691214c294 source=lexical score=4.013333 focus=m26..m26 at=2026-09-01T06:02:07 | [Hook] UserPromptSubmit: HOOK_ROW_SENTINEL: run the tests before you finish
-read ref=ch_581699c40efc:m25..m27 focus=m26..m26 tools=false tool-results=false thinking=false subagents=false
-hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_fe37f6fb3610a863 source=lexical score=4.011765 focus=m11..m11 at=2026-09-01T06:01:00 | Agent "Background check" finished TASK_REPORT_SENTINEL: the background check passed.
-read ref=ch_581699c40efc:m10..m12 focus=m11..m11 tools=false tool-results=false thinking=false subagents=false
+hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_9b62236225d2c363 source=lexical score=4.024390 focus=m18..m18 at=2026-09-01T06:02:02 | QUEUED_PROMPT_SENTINEL: and run the tests
+read ref=ch_581699c40efc:m17..m19 focus=m18..m18 tools=false tool-results=false thinking=false subagents=false
+hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_95f885354e3a3b80 source=lexical score=4.015385 focus=m12..m12 at=2026-09-01T06:00:30 | FORKED_SUBAGENT_SENTINEL: the plugin's tests cover how it starts.
+read ref=ch_581699c40efc:m11..m13 focus=m12..m12 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_bd3244691214c294 source=lexical score=4.013333 focus=m28..m28 at=2026-09-01T06:02:07 | [Hook] UserPromptSubmit: HOOK_ROW_SENTINEL: run the tests before you finish
+read ref=ch_581699c40efc:m27..m29 focus=m28..m28 tools=false tool-results=false thinking=false subagents=false
+hit project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc anchors=ma_fe37f6fb3610a863 source=lexical score=4.011765 focus=m13..m13 at=2026-09-01T06:01:00 | Agent "Background check" finished TASK_REPORT_SENTINEL: the background check passed.
+read ref=ch_581699c40efc:m12..m14 focus=m13..m13 tools=false tool-results=false thinking=false subagents=false
 $ rearview agent within ch_74aec3f6df49 the --after 2026-08-01T06:01 --before 2026-08-01T06:02
 --- stdout
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=0 tz=-04:00 warnings=1 warning-records=1

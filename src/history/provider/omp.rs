@@ -275,7 +275,7 @@ impl SessionStorage for OmpStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "omp",
-            schema_version: 19,
+            schema_version: 20,
         }
     }
 
@@ -442,6 +442,12 @@ pub(super) mod tests {
                     r#"{"type":"message","id":"bash-u","parentId":"empty-r","timestamp":"2026-01-02T03:04:21.000Z","message":{"role":"user","content":[{"type":"text","text":"Show the last commit"}]}}"#,
                     r#"{"type":"message","id":"bash-a","parentId":"bash-u","timestamp":"2026-01-02T03:04:22.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_bash","name":"bash","arguments":{"command":"git log -1 OMP_COMMAND_SENTINEL","i":"show the last commit"}}]}}"#,
                     r#"{"type":"message","id":"bash-t","parentId":"bash-a","timestamp":"2026-01-02T03:04:23.000Z","message":{"role":"toolResult","toolCallId":"call_bash","toolName":"bash","content":[{"type":"text","text":"commit a1b2c3d"}]}}"#,
+                    r#"{"type":"message","id":"edit-u","parentId":"bash-t","timestamp":"2026-01-02T03:04:24.000Z","message":{"role":"user","content":[{"type":"text","text":"Date the release steps"}]}}"#,
+                    r#"{"type":"message","id":"edit-a","parentId":"edit-u","timestamp":"2026-01-02T03:04:25.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_edit","name":"edit","arguments":{"input":"[notes.txt#A1B2]\nINS.POST 3:\n+EDIT_DIFF_SENTINEL: the dated release steps","i":"date the release steps"}}]}}"#,
+                    r#"{"type":"message","id":"edit-t","parentId":"edit-a","timestamp":"2026-01-02T03:04:26.000Z","message":{"role":"toolResult","toolCallId":"call_edit","toolName":"edit","content":[{"type":"text","text":"Edited notes.txt"}]}}"#,
+                    r#"{"type":"message","id":"task-a","parentId":"edit-t","timestamp":"2026-01-02T03:04:27.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_task","name":"task","arguments":{"agent":"explore","task":"TASK_PROMPT_SENTINEL: check the dates","solutionSpace":"the notes file","i":"check the dates"}}]}}"#,
+                    r#"{"type":"message","id":"task-t","parentId":"task-a","timestamp":"2026-01-02T03:04:28.000Z","message":{"role":"toolResult","toolCallId":"call_task","toolName":"task","content":[{"type":"text","text":"The dates are right."}]}}"#,
+                    r#"{"type":"message","id":"task-r","parentId":"task-t","timestamp":"2026-01-02T03:04:29.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The release steps are dated."}]}}"#,
                 ]
                 .map(str::to_owned),
             );
@@ -450,16 +456,19 @@ pub(super) mod tests {
                 session,
                 vec![fixtures.join("subagent.jsonl")],
                 vec![
-                    Marker::searched("user text", "OMP active question"),
-                    Marker::searched("assistant text", "OMP active answer"),
-                    Marker::searched("thinking", "OMP private reasoning"),
+                    Marker::shown("user text", "OMP active question"),
+                    Marker::shown("assistant text", "OMP active answer"),
+                    Marker::shown("thinking", "OMP private reasoning"),
                     Marker::in_call_or_subagent(
                         "sub-agent message",
                         "OMP sub-agent answer searchable",
                     ),
-                    Marker::searched("/clear boundary", "Context cleared"),
+                    Marker::shown("/clear boundary", "Context cleared"),
                     Marker::in_call_or_subagent("tool call", "OMP_COMMAND_SENTINEL")
                         .in_summary_row("Ran 1 shell command"),
+                    Marker::shown("edit diff", "EDIT_DIFF_SENTINEL")
+                        .in_summary_row("Edited 1 file, called 1 tool"),
+                    Marker::shown("sub-agent task's prompt", "TASK_PROMPT_SENTINEL"),
                 ],
             )
             .with_hidden(&[("abandoned branch's prompt", "OMP_ABANDONED_SENTINEL")])

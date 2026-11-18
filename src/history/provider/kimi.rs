@@ -353,7 +353,7 @@ impl SessionStorage for KimiStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "kimi",
-            schema_version: 18,
+            schema_version: 19,
         }
     }
 
@@ -1014,6 +1014,33 @@ pub(super) mod tests {
                         "type": "tool.result", "toolCallId": "Agent_9",
                         "result": {"output": "The notes list the release steps."}
                     })),
+                    event(json!({
+                        "type": "content.part",
+                        "part": {"type": "text", "text": "Dating the release steps."}
+                    })),
+                    event(json!({
+                        "type": "tool.call", "toolCallId": "Edit_9", "name": "Edit",
+                        "args": {
+                            "path": "NOTES.md",
+                            "old_string": "the release steps",
+                            "new_string": "EDIT_DIFF_SENTINEL: the dated release steps",
+                            "replace_all": false
+                        }
+                    })),
+                    event(json!({
+                        "type": "tool.result", "toolCallId": "Edit_9",
+                        "result": {"output": "Edited NOTES.md"}
+                    })),
+                    event(json!({
+                        "type": "tool.call", "toolCallId": "TodoList_9", "name": "TodoList",
+                        "args": {"todos": [
+                            {"title": "TODO_SENTINEL: date the notes", "status": "in_progress"}
+                        ]}
+                    })),
+                    event(json!({
+                        "type": "tool.result", "toolCallId": "TodoList_9",
+                        "result": {"output": "Todo list updated"}
+                    })),
                 ],
             );
             AgentSession::new(
@@ -1021,28 +1048,31 @@ pub(super) mod tests {
                 wire,
                 vec![fixture("subagent-wire.jsonl")],
                 vec![
-                    Marker::searched("user text", "active kimi question"),
-                    Marker::searched("assistant text", "kimi answer searchable"),
-                    Marker::searched("thinking", "THINKING_VISIBLE"),
+                    Marker::shown("user text", "active kimi question"),
+                    Marker::shown("assistant text", "kimi answer searchable"),
+                    Marker::shown("thinking", "THINKING_VISIBLE"),
                     Marker::in_call_or_subagent("tool call", "TOOL_INPUT_VISIBLE")
                         .in_summary_row("Ran 1 shell command"),
-                    Marker::searched("tool result", "kimi tool output searchable")
+                    Marker::shown("tool result", "kimi tool output searchable")
                         .in_summary_row("Ran 1 shell command"),
                     Marker::in_call_or_subagent(
                         "sub-agent message",
                         "kimi child answer searchable",
                     ),
-                    Marker::searched("task notice", "TASK_NOTICE_SENTINEL"),
-                    Marker::searched("hook output", "HOOK_RESULT_SENTINEL"),
-                    Marker::searched("blocking hook output", "BLOCKED_HOOK_SENTINEL"),
-                    Marker::searched("scheduled reminder", "SCHEDULED_SENTINEL"),
+                    Marker::shown("task notice", "TASK_NOTICE_SENTINEL"),
+                    Marker::shown("hook output", "HOOK_RESULT_SENTINEL"),
+                    Marker::shown("blocking hook output", "BLOCKED_HOOK_SENTINEL"),
+                    Marker::shown("scheduled reminder", "SCHEDULED_SENTINEL"),
                     Marker::in_call_or_subagent("user's shell command", "SHELL_COMMAND_SENTINEL"),
-                    Marker::searched("user's shell command output", "SHELL_OUTPUT_SENTINEL"),
-                    Marker::unsearched("model-run skill call", "MODEL_SKILL_ARGS_SENTINEL")
+                    Marker::shown("user's shell command output", "SHELL_OUTPUT_SENTINEL"),
+                    Marker::shown("model-run skill call", "MODEL_SKILL_ARGS_SENTINEL")
                         .in_summary_row("Loaded 1 skill"),
-                    Marker::searched("user-run slash command", "/mcp-config SLASH_ARGS_SENTINEL"),
+                    Marker::shown("user-run slash command", "/mcp-config SLASH_ARGS_SENTINEL"),
                     Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
+                    Marker::shown("edit diff", "EDIT_DIFF_SENTINEL")
+                        .in_summary_row("Edited 1 file, updated the task list 1 time"),
+                    Marker::shown("todo list", "TODO_SENTINEL"),
                 ],
             )
             .with_hidden(&[

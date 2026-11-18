@@ -17,7 +17,9 @@ use crate::log_entry::{
     agent_progress_identity, labeled_metadata_text, parse_agent_progress, progress_launch_call,
     progress_timestamp,
 };
-use crate::tool_format::{ToolCallHeader, launch_prompt, tool_call_header};
+use crate::tool_format::{
+    ToolCallBody, ToolCallHeader, launch_prompt, tool_call_body, tool_call_header,
+};
 use crate::tui::viewer::local_command_output;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -1085,17 +1087,34 @@ fn non_empty_text(text: &str) -> Option<String> {
 }
 
 /// A tool call as search reads it, terminal codes stripped: the header the
-/// viewer shows, with every line of a shell command, then the whole
-/// [`launch_prompt`]. When the header's value is empty, as for a call the
-/// viewer shows as raw input, the header is the call's name and input keys.
+/// viewer shows, with every line of a shell command, then the body as
+/// [`ToolCallBody::searched`] reads it. When the header's value is empty, as
+/// for input the viewer shows as JSON, the header is the call's name and
+/// input keys.
 pub(crate) fn tool_call_text(name: &str, tool: Tool, input: &Value) -> String {
     let header = tool_call_header(name, tool, input);
-    let text = if header.value.trim().is_empty() {
+    let header_text = if header.value.trim().is_empty() {
         name_and_input_keys(name, input, MAX_AGENT_SEGMENT_CHARS)
     } else {
         format!("{}{}", header.prefix, header.value)
     };
-    with_launch_prompt(sanitize_agent_text(&text), tool, input)
+    let mut text = sanitize_agent_text(&header_text);
+    if let Some(body) = tool_call_body(tool, input)
+        .map(ToolCallBody::searched)
+        .and_then(|body| shown_body_text(&body))
+    {
+        text.push('\n');
+        text.push_str(&body);
+    }
+    text
+}
+
+/// `text` without terminal codes or trailing line breaks, as a call's body
+/// shows it; `None` when blank.
+fn shown_body_text(text: &str) -> Option<String> {
+    let mut text = sanitize_agent_text(text);
+    text.truncate(text.trim_end_matches(['\r', '\n']).len());
+    unless_blank(text)
 }
 
 /// The lines of a shell command that `agent read` shows.
@@ -1106,9 +1125,10 @@ pub(crate) enum CommandLines {
     All,
 }
 
-/// A tool call as `agent read` shows it: [`tool_call_text`] with the header
-/// on one line, truncated to a search segment. With [`CommandLines::All`], a
-/// shell command shows every line, untruncated.
+/// A tool call as `agent read` shows it: the header of [`tool_call_text`] on
+/// one line, truncated to a search segment, then the whole [`launch_prompt`].
+/// Any other body is left out. With [`CommandLines::All`], a shell command
+/// shows every line, untruncated.
 pub(crate) fn tool_call_read_text(
     name: &str,
     tool: Tool,
@@ -1838,9 +1858,10 @@ mod tests {
         }];
 
         let text = agent_search_parts_from_blocks(AgentMessageRole::Assistant, &blocks).join(" ");
+        let header_line = text.lines().next().unwrap();
 
-        assert!(text.chars().count() <= MAX_AGENT_SEGMENT_CHARS);
-        assert!(text.starts_with("tool Bash input_keys="));
+        assert!(header_line.chars().count() <= MAX_AGENT_SEGMENT_CHARS);
+        assert!(header_line.starts_with("tool Bash input_keys="));
     }
 
     fn shell_input(command: &str) -> Value {
@@ -1902,17 +1923,151 @@ mod tests {
         );
     }
 
+    fn message_ending_in_line_break() -> Value {
+        serde_json::json!({"recipient": "lexer", "message": "check the lexer\n"})
+    }
+
     #[test]
-    fn call_viewer_shows_as_raw_input_reads_as_its_name_and_input_keys() {
+    fn search_reads_body_without_its_trailing_line_break() {
+        assert_eq!(
+            tool_call_text(
+                "SendMessage",
+                Tool::AgentMessage,
+                &message_ending_in_line_break()
+            ),
+            "SendMessage: lexer\ncheck the lexer"
+        );
+    }
+
+    #[test]
+    fn read_shows_call_viewer_shows_as_raw_input_as_its_name_and_input_keys() {
         let input = serde_json::json!({"todos": [{"content": "ship it"}]});
 
-        for text in [
-            tool_call_read_text("TodoWrite", Tool::Other, &input, CommandLines::FirstLine),
-            tool_call_read_text("TodoWrite", Tool::Other, &input, CommandLines::All),
-            tool_call_text("TodoWrite", Tool::Other, &input),
-        ] {
-            assert_eq!(text, "tool TodoWrite input_keys=todos");
+        for lines in [CommandLines::FirstLine, CommandLines::All] {
+            assert_eq!(
+                tool_call_read_text("TodoWrite", Tool::Other, &input, lines),
+                "tool TodoWrite input_keys=todos"
+            );
         }
+    }
+
+    #[test]
+    fn search_reads_call_with_input_shown_as_json_as_its_name_and_input_keys_then_its_json() {
+        let input = serde_json::json!({"todos": [
+            {"content": "ship it", "done": false, "note": null, "priority": 2}
+        ]});
+
+        assert_eq!(
+            tool_call_text("TodoWrite", Tool::Other, &input),
+            [
+                "tool TodoWrite input_keys=todos",
+                "{",
+                "\"todos\": [",
+                "{",
+                "\"content\": \"ship it\",",
+                "\"done\": false,",
+                "\"note\": null,",
+                "\"priority\": 2",
+                "}",
+                "]",
+                "}",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn search_reads_call_header_then_body_and_read_shows_header_alone() {
+        let edit = serde_json::json!({
+            "file_path": "src/lib.rs",
+            "old_string": "old line",
+            "new_string": "new line"
+        });
+
+        assert_eq!(
+            tool_call_text("Edit", Tool::Edit, &edit),
+            "Edit: src/lib.rs\n-old line\n+new line"
+        );
+        for lines in [CommandLines::FirstLine, CommandLines::All] {
+            assert_eq!(
+                tool_call_read_text("Edit", Tool::Edit, &edit, lines),
+                "Edit: src/lib.rs"
+            );
+        }
+    }
+
+    /// The messages `query` finds in a session of one user message, then a
+    /// call of `tool_name` with `input`.
+    fn messages_found_in_call(tool_name: &str, input: Value, query: &str) -> Vec<usize> {
+        use crate::agent::retrieval::{
+            AgentRetrievalOptions, AgentTranscriptSearchTarget, retrieve_agent_hits_for_target,
+        };
+        let content = [
+            user("Plan the parser fix"),
+            reply_record(serde_json::json!({
+                "type": "tool_use", "id": "toolu_call", "name": tool_name, "input": input
+            })),
+        ]
+        .join("\n");
+        let transcript = parse(&content);
+        retrieve_agent_hits_for_target(
+            AgentTranscriptSearchTarget::whole(&transcript, None, None),
+            query,
+            AgentRetrievalOptions::default(),
+        )
+        .iter()
+        .map(|hit| hit.focus_range.start)
+        .collect()
+    }
+
+    #[test]
+    fn search_finds_word_after_line_break_in_value_of_input_shown_as_json_unquoted_and_quoted_across_break()
+     {
+        let input = serde_json::json!({"plan": "Read the grammar\nRewrite the tokenizer"});
+
+        for query in ["Rewrite", "\"grammar Rewrite\""] {
+            assert_eq!(
+                messages_found_in_call("ExitPlanMode", input.clone(), query),
+                [2],
+                "{query} finds the plan call's message"
+            );
+        }
+    }
+
+    fn update_plan_input() -> Value {
+        serde_json::json!({
+            "explanation": "Ship the notes",
+            "plan": [{"step": "Date the notes", "status": "in_progress"}]
+        })
+    }
+
+    #[test]
+    fn search_finds_nested_key_of_input_shown_as_json() {
+        assert_eq!(
+            messages_found_in_call("update_plan", update_plan_input(), "status"),
+            [2],
+            "a key the viewer shows inside the plan finds the call's message"
+        );
+    }
+
+    #[test]
+    fn quoted_phrase_across_two_values_of_input_shown_as_json_doesnt_match() {
+        assert_eq!(
+            messages_found_in_call("update_plan", update_plan_input(), "\"notes in_progress\""),
+            Vec::<usize>::new(),
+            "the explanation's last word and the step's status are apart in the viewer's JSON"
+        );
+    }
+
+    #[test]
+    fn line_of_input_shown_as_json_without_escapes_is_in_search_text_as_a_phrase() {
+        let text = tool_call_text("update_plan", Tool::Other, &update_plan_input());
+
+        assert!(
+            crate::search::literal::Literal::new("\"status\": \"in_progress\"".to_owned())
+                .matches(&text),
+            "the search text contains the line the viewer shows: {text}"
+        );
     }
 
     #[test]

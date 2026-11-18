@@ -2,7 +2,7 @@
 //! holds every segment an opened session's search reads, so exact search
 //! never skips a session it would match. Checked over each registered agent's
 //! every-record session, and over text, thinking and tool results longer than
-//! a search segment. The cached text also holds each searched marker of the
+//! a search segment. The cached text also holds each marker of the
 //! every-record sessions. It does not hold any of their hidden markers.
 
 use crate::agent::retrieval::segment_texts;
@@ -75,7 +75,7 @@ fn every_agents_cached_text_holds_each_segment_opened_session_searches() {
 }
 
 #[test]
-fn every_agents_cached_text_holds_each_searched_marker() {
+fn every_agents_cached_text_holds_each_marker() {
     let gaps: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(|session| {
@@ -83,7 +83,6 @@ fn every_agents_cached_text_holds_each_searched_marker() {
             session
                 .markers
                 .iter()
-                .filter(|marker| marker.is_searched)
                 .filter(|marker| !Literal::new(marker.text.to_owned()).matches(&cached))
                 .map(|marker| format!("{:?}: {}", session.row.source, marker.record))
                 .collect::<Vec<_>>()
@@ -92,7 +91,7 @@ fn every_agents_cached_text_holds_each_searched_marker() {
 
     assert!(
         gaps.is_empty(),
-        "the cached text holds each searched marker:\n{}",
+        "the cached text holds each marker:\n{}",
         gaps.join("\n")
     );
 }

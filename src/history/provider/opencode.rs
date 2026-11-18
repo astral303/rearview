@@ -461,7 +461,7 @@ impl SessionStorage for OpenCodeStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "opencode",
-            schema_version: 16,
+            schema_version: 17,
         }
     }
 
@@ -1058,6 +1058,70 @@ pub(super) mod tests {
                         },
                     }),
                 ),
+                (
+                    "prt_more_0005",
+                    1755000350000i64,
+                    json!({
+                        "type": "text",
+                        "text": "Dating the release steps.",
+                        "time": { "start": 1755000350000i64, "end": 1755000351000i64 },
+                    }),
+                ),
+                (
+                    "prt_more_0006",
+                    1755000360000i64,
+                    json!({
+                        "type": "tool",
+                        "tool": "edit",
+                        "callID": "call_edit",
+                        "state": {
+                            "status": "completed",
+                            "input": {
+                                "filePath": "/tmp/opencode-project/NOTES.md",
+                                "oldString": "the release steps",
+                                "newString": "EDIT_DIFF_SENTINEL: the dated release steps",
+                            },
+                            "output": "Edit applied successfully.",
+                            "time": { "start": 1755000360000i64, "end": 1755000361000i64 },
+                        },
+                    }),
+                ),
+                // An aborted call: a completed call's output repeats the list.
+                (
+                    "prt_more_0007",
+                    1755000370000i64,
+                    json!({
+                        "type": "tool",
+                        "tool": "todowrite",
+                        "callID": "call_todo",
+                        "state": {
+                            "status": "error",
+                            "input": { "todos": [{
+                                "content": "TODO_SENTINEL: date the notes",
+                                "status": "in_progress",
+                                "priority": "high",
+                                "id": "1",
+                            }] },
+                            "error": "Tool execution aborted",
+                            "time": { "start": 1755000370000i64, "end": 1755000371000i64 },
+                        },
+                    }),
+                ),
+                (
+                    "prt_more_0008",
+                    1755000380000i64,
+                    json!({
+                        "type": "tool",
+                        "tool": "context7_resolve-library-id",
+                        "callID": "call_mcp",
+                        "state": {
+                            "status": "completed",
+                            "input": { "libraryName": "MCP_INPUT_SENTINEL parser" },
+                            "output": "Resolved /example/parser",
+                            "time": { "start": 1755000380000i64, "end": 1755000381000i64 },
+                        },
+                    }),
+                ),
             ] {
                 fixture::insert_part(
                     &connection,
@@ -1105,16 +1169,21 @@ pub(super) mod tests {
                 session_ref(&database, "ses_standard"),
                 vec![session_ref(&database, "ses_subagent")],
                 vec![
-                    Marker::searched("user text", "find the fixture defect"),
-                    Marker::searched("assistant text", "the defect hides in lib.rs"),
-                    Marker::searched("thinking", "considering the fixture layout"),
+                    Marker::shown("user text", "find the fixture defect"),
+                    Marker::shown("assistant text", "the defect hides in lib.rs"),
+                    Marker::shown("thinking", "considering the fixture layout"),
                     Marker::in_call_or_subagent("tool call", "/tmp/opencode-project/lib.rs"),
-                    Marker::searched("tool result", "fn defect() {}"),
+                    Marker::shown("tool result", "fn defect() {}"),
                     Marker::in_call_or_subagent("directory listing", "OPENCODE_LIST_SENTINEL")
                         .in_summary_row("Listed 1 directory, ran 1 shell command"),
                     Marker::in_call_or_subagent("sub-agent message", "sub-agent answer"),
                     Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
+                    Marker::shown("edit diff", "EDIT_DIFF_SENTINEL").in_summary_row(
+                        "Edited 1 file, updated the task list 1 time, called 1 tool",
+                    ),
+                    Marker::shown("todo list", "TODO_SENTINEL"),
+                    Marker::shown("MCP call", "MCP_INPUT_SENTINEL"),
                 ],
             )
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 14)

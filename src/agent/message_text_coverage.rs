@@ -1,5 +1,5 @@
-//! Each message's slice of the cached search texts holds the markers
-//! `agent read` shows in that message, and no other message's markers.
+//! Each message's slice of the cached search texts contains the markers
+//! search reads in that message's parts, and no other message's markers.
 //! Checked over each registered agent's every-record session, read with its
 //! sub-agent transcripts, and over a Codex sub-agent's handed-back report.
 
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-fn messages_holding_in_cache(row: &Conversation, literal: &Literal) -> BTreeSet<usize> {
+fn messages_containing_in_cache(row: &Conversation, literal: &Literal) -> BTreeSet<usize> {
     (1..=row.message_count)
         .filter(|ordinal| {
             row.texts_of(&[MessageRange::single(*ordinal)])
@@ -23,7 +23,7 @@ fn messages_holding_in_cache(row: &Conversation, literal: &Literal) -> BTreeSet<
         .collect()
 }
 
-fn messages_holding_in_agent_read(
+fn messages_containing_in_search_text(
     transcript: &AgentTranscript,
     literal: &Literal,
 ) -> BTreeSet<usize> {
@@ -42,7 +42,7 @@ fn messages_holding_in_agent_read(
 }
 
 #[test]
-fn each_markers_cached_text_is_in_message_agent_read_shows_it_in() {
+fn each_markers_cached_text_is_in_message_search_reads_it_in() {
     let misplaced: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(|session| {
@@ -53,14 +53,13 @@ fn each_markers_cached_text_is_in_message_agent_read_shows_it_in() {
             session
                 .markers
                 .iter()
-                .filter(|marker| marker.is_searched)
                 .filter_map(|marker| {
                     let literal = Literal::new(marker.text.to_owned());
-                    let cached = messages_holding_in_cache(row, &literal);
-                    let shown = messages_holding_in_agent_read(&transcript, &literal);
-                    (cached != shown).then(|| {
+                    let cached = messages_containing_in_cache(row, &literal);
+                    let searched = messages_containing_in_search_text(&transcript, &literal);
+                    (cached != searched).then(|| {
                         format!(
-                            "{:?} {}: cached in {cached:?}, agent read shows it in {shown:?}",
+                            "{:?} {}: cached in {cached:?}, search reads it in {searched:?}",
                             row.source, marker.record
                         )
                     })
@@ -145,10 +144,10 @@ fn codex_session_with_a_handed_back_report(directory: &Path) -> (PathBuf, PathBu
     (parent, scout)
 }
 
-/// `agent read` shows the report in the session's message alone: the reader
-/// folds the scout's copy into a delivered `final_answer` call.
+/// Search reads the report in the session's message alone: the reader folds
+/// the scout's copy into a delivered `final_answer` call.
 #[test]
-fn codex_sub_agents_handed_back_report_is_cached_only_where_agent_read_shows_it() {
+fn codex_sub_agents_handed_back_report_is_cached_only_where_search_reads_it() {
     let directory = tempfile::tempdir().unwrap();
     let (parent, scout) = codex_session_with_a_handed_back_report(directory.path());
     let subagents = [scout];
@@ -157,8 +156,8 @@ fn codex_sub_agents_handed_back_report_is_cached_only_where_agent_read_shows_it(
         AgentTranscript::load_cached_for_test(Source::Codex, &parent, &subagents).unwrap();
     let report = Literal::new(SCOUT_REPORT.to_owned());
 
-    let shown = messages_holding_in_agent_read(&transcript, &report);
+    let searched = messages_containing_in_search_text(&transcript, &report);
 
-    assert_eq!(shown.len(), 1, "{transcript:#?}");
-    assert_eq!(messages_holding_in_cache(&row, &report), shown);
+    assert_eq!(searched.len(), 1, "{transcript:#?}");
+    assert_eq!(messages_containing_in_cache(&row, &report), searched);
 }

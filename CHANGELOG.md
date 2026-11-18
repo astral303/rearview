@@ -109,8 +109,10 @@
 
 #### All agents
 
-- Fix the session list's search missing text in tool calls, thinking and
-  sub-agent transcripts.
+- Fix search missing text the viewer shows in tool calls, thinking and
+  sub-agent transcripts. The session list missed all three, and the list and
+  `agent search` both missed a tool call's body, such as an edit's diff, a
+  skill's arguments or a plan.
 - Fix one unreadable directory hiding all of an agent's sessions from the list
   and agent commands (Codex, Grok Build, Kimi Code, OMP and Pi). Its cached
   sessions now stay listed and readable, agent commands report the directory

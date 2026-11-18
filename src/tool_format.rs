@@ -205,10 +205,20 @@ impl ToolCallBody<'_> {
             Self::RawInput(input) => raw_input_body(input),
         }
     }
+
+    /// The body as search reads it: text as the viewer shows it, and input
+    /// the viewer shows as JSON as [`unindented_json_with_decoded_strings`]
+    /// writes it.
+    pub fn searched(self) -> String {
+        match self {
+            Self::Text(body) => body.text,
+            Self::RawInput(input) => unindented_json_with_decoded_strings(input),
+        }
+    }
 }
 
 /// The body of a call whose header names it: a diff, a prompt, a message,
-/// or the raw input of a call [`tool_call_header`] has no layout for. A shell
+/// or the input of a call [`tool_call_header`] has no layout for. A shell
 /// command's later lines are not a body here: its header holds them.
 pub fn tool_call_body(tool: Tool, input: &Value) -> Option<ToolCallBody<'_>> {
     if lacks_header_field(tool, input) {
@@ -459,6 +469,56 @@ fn raw_input_body(input: &Value) -> Option<ToolBody> {
     serde_json::to_string_pretty(input)
         .ok()
         .map(ToolBody::plain)
+}
+
+/// `input` in the lines [`raw_input_body`] lays it out in, unindented, each
+/// key and string written between its quotes as its characters: a line break
+/// as a line break, and `\"` as `"`. A query then matches the word after a
+/// line break as a word's start.
+/// Indentation would make the list's context line differ between a cached
+/// session, whose texts keep runs of whitespace, and a parsed one, whose
+/// texts collapse them.
+fn unindented_json_with_decoded_strings(input: &Value) -> String {
+    let mut json = String::new();
+    push_unindented_json(input, &mut json);
+    json
+}
+
+fn push_unindented_json(value: &Value, json: &mut String) {
+    match value {
+        Value::String(text) => push_quoted(text, json),
+        Value::Array(items) if !items.is_empty() => {
+            json.push('[');
+            for (index, item) in items.iter().enumerate() {
+                json.push_str(separator_before_item(index));
+                push_unindented_json(item, json);
+            }
+            json.push_str("\n]");
+        }
+        Value::Object(fields) if !fields.is_empty() => {
+            json.push('{');
+            for (index, (key, field)) in fields.iter().enumerate() {
+                json.push_str(separator_before_item(index));
+                push_quoted(key, json);
+                json.push_str(": ");
+                push_unindented_json(field, json);
+            }
+            json.push_str("\n}");
+        }
+        scalar_or_empty => json.push_str(&scalar_or_empty.to_string()),
+    }
+}
+
+/// The line break before item `index` of an array or object, with the comma
+/// that ends the item before it.
+fn separator_before_item(index: usize) -> &'static str {
+    if index == 0 { "\n" } else { ",\n" }
+}
+
+fn push_quoted(text: &str, json: &mut String) {
+    json.push('"');
+    json.push_str(text);
+    json.push('"');
 }
 
 #[cfg(test)]
@@ -890,6 +950,38 @@ mod tests {
             body_text(&result)
                 .unwrap()
                 .contains("\"plan\": \"- step one\"")
+        );
+    }
+
+    #[test]
+    fn search_reads_input_shown_as_json_without_escapes_as_viewers_lines_unindented() {
+        let input = json!({
+            "todos": [{"content": "ship it", "done": false, "note": null, "priority": 2}],
+            "merge": true,
+            "labels": [],
+            "settings": {},
+        });
+        let viewers_lines_unindented = raw_input_body(&input)
+            .unwrap()
+            .text
+            .lines()
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            ToolCallBody::RawInput(&input).searched(),
+            viewers_lines_unindented
+        );
+    }
+
+    #[test]
+    fn search_reads_each_string_escape_of_input_shown_as_json_as_its_character() {
+        let input = json!({"plan": "Read \"the\" grammar\nRewrite C:\\src\tnow\u{1b}"});
+
+        assert_eq!(
+            ToolCallBody::RawInput(&input).searched(),
+            "{\n\"plan\": \"Read \"the\" grammar\nRewrite C:\\src\tnow\u{1b}\"\n}"
         );
     }
 

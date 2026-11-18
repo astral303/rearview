@@ -917,13 +917,28 @@ the list and in `agent search`, read both.
 `agent read` shows a tool call as the header the viewer shows for it, such as
 `Bash: cargo test`. A read of several messages shows a shell command's first
 non-empty line and counts the others, `Bash: cd src (+4 lines)`; a read of
-one message shows every line, and `agent search` reads every line. When the
-header's value is empty, as for a call the viewer shows as raw input, the
-call's name and input keys replace it. A call that launches a sub-agent (`Tool::Agent`) adds its whole launch
-prompt, the body the viewer shows for it. Each agent with sub-agents maps its
-launching tool to `Tool::Agent`, except OMP: its `task` calls show their input
-as JSON. A Codex `spawn_agent` message is read only when Codex did not encrypt
-it.
+one message shows every line. When the header's value is empty, as for a call
+whose input the viewer shows as JSON, the call's name and input keys replace
+it. A call that launches a sub-agent (`Tool::Agent`) adds its whole launch
+prompt, the body the viewer shows for it; `agent read` doesn't show any other
+body. Each
+agent with sub-agents maps its launching tool to `Tool::Agent`, except OMP: its
+`task` calls show their input as JSON. A Codex `spawn_agent` message is read
+only when Codex did not encrypt it.
+
+Search, in the list and in `agent search`, reads a call as that header, with
+every line of a shell command, then the call's body:
+`tool_format::tool_call_body` decides the body for the viewer and for search.
+An edit's diff, a skill's arguments, a web fetch's prompt, a message to an
+agent, an undelivered report, and a launch's prompt and settings are read as
+the viewer shows them, whole. Input the viewer shows as JSON, such as a plan, a
+todo list or an unmapped tool's input, is read as the lines of that JSON,
+unindented, with the escapes of each key and string decoded: a line break in a
+value reads as a line break, and `\"` reads as `"`. A query then matches the
+word after a line break in a value, and a quoted phrase doesn't match across
+two values: a key or punctuation stands between them. Search reads a run of
+whitespace as one space, and the unindented lines match what the indented ones
+would.
 
 The viewer, export and agent CLI read the sub-agent paths from the row, then
 read the session through `format::view_projection`, which parses each sub-agent

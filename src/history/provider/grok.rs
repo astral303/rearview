@@ -518,7 +518,7 @@ impl SessionStorage for GrokStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "grok",
-            schema_version: 10,
+            schema_version: 11,
         }
     }
 
@@ -1041,6 +1041,36 @@ pub(super) mod tests {
                 "completed",
                 json!({"type": "Text", "text": "Subagent started in background."}),
             ));
+            records.push(reply(1_750, "Dating the release steps.", "p1"));
+            // A failed edit: an applied edit's result repeats the diff.
+            records.extend(call(
+                1_800,
+                "edit-1",
+                "search_replace",
+                "edit",
+                json!({
+                    "file_path": "/tmp/grok-project/notes.md",
+                    "old_string": "the steps",
+                    "new_string": "EDIT_DIFF_SENTINEL: the dated steps",
+                    "replace_all": false,
+                }),
+                "failed",
+                json!({"type": "SearchReplace", "NoMatchesFound": {
+                    "message": "old_string not found",
+                    "file_path": "/tmp/grok-project/notes.md",
+                }}),
+            ));
+            records.extend(call(
+                1_900,
+                "todo-1",
+                "todo_write",
+                "other",
+                json!({"merge": true, "todos": [
+                    {"id": "1", "content": "TODO_SENTINEL: date the notes", "status": "in_progress"}
+                ]}),
+                "completed",
+                json!({"type": "Todo", "TodosUpdated": {"summary_for_prompt": "Updated 1 todo"}}),
+            ));
             let session = write_grok_session(
                 &sessions,
                 PROJECT_DIR,
@@ -1055,12 +1085,12 @@ pub(super) mod tests {
                 session,
                 vec![child],
                 vec![
-                    Marker::searched("user text", "active grok question"),
-                    Marker::searched("assistant text", "grok answer searchable"),
-                    Marker::searched("thinking", "GROK_THINKING_VISIBLE"),
+                    Marker::shown("user text", "active grok question"),
+                    Marker::shown("assistant text", "grok answer searchable"),
+                    Marker::shown("thinking", "GROK_THINKING_VISIBLE"),
                     Marker::in_call_or_subagent("tool call", "GROK_TOOL_INPUT_VISIBLE")
                         .in_summary_row(CALLS),
-                    Marker::searched("tool result", "grok tool output searchable")
+                    Marker::shown("tool result", "grok tool output searchable")
                         .in_summary_row(CALLS),
                     Marker::in_call_or_subagent(
                         "sub-agent message",
@@ -1070,6 +1100,9 @@ pub(super) mod tests {
                         .in_summary_row(CALLS),
                     Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
+                    Marker::shown("edit diff", "EDIT_DIFF_SENTINEL")
+                        .in_summary_row("Edited 1 file, updated the task list 1 time"),
+                    Marker::shown("todo list", "TODO_SENTINEL"),
                 ],
             )
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 12)

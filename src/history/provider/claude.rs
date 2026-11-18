@@ -221,7 +221,7 @@ impl SessionStorage for ClaudeStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "claude",
-            schema_version: 19,
+            schema_version: 20,
         }
     }
 
@@ -942,19 +942,20 @@ pub(crate) mod tests {
             const FIRST_RUN: &str = "Ran 1 shell command, started 1 agent";
             const ATTACHMENTS: &str = "Listed 1 directory, read 2 files, referenced 2 files";
             const HOOKED_CALLS: &str = "Ran 2 shell commands";
+            const EDIT_RUN: &str =
+                "Edited 1 file, loaded 1 skill, messaged 1 agent, fetched 1 URL, called 1 tool";
             AgentSession::new(
                 Source::Claude,
                 session,
                 subagents,
                 vec![
-                    Marker::searched("user text", "USER_TEXT_SENTINEL"),
-                    Marker::searched("assistant text", "ASSISTANT_TEXT_SENTINEL"),
-                    Marker::searched("thinking", "THINKING_SENTINEL"),
+                    Marker::shown("user text", "USER_TEXT_SENTINEL"),
+                    Marker::shown("assistant text", "ASSISTANT_TEXT_SENTINEL"),
+                    Marker::shown("thinking", "THINKING_SENTINEL"),
                     Marker::in_call_or_subagent("tool call", "TOOL_CALL_SENTINEL")
                         .in_summary_row(FIRST_RUN),
-                    Marker::searched("tool result", "TOOL_RESULT_SENTINEL")
-                        .in_summary_row(FIRST_RUN),
-                    Marker::searched("task report", "TASK_REPORT_SENTINEL"),
+                    Marker::shown("tool result", "TOOL_RESULT_SENTINEL").in_summary_row(FIRST_RUN),
+                    Marker::shown("task report", "TASK_REPORT_SENTINEL"),
                     Marker::in_call_or_subagent(
                         "sub-agent transcript message",
                         "SPLICED_SUBAGENT_SENTINEL",
@@ -969,28 +970,37 @@ pub(crate) mod tests {
                     ),
                     Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
-                    Marker::searched("slash command", "/model SLASH_COMMAND_SENTINEL"),
-                    Marker::searched("slash command output", "SLASH_OUTPUT_SENTINEL"),
-                    Marker::searched(
+                    Marker::shown("slash command", "/model SLASH_COMMAND_SENTINEL"),
+                    Marker::shown("slash command output", "SLASH_OUTPUT_SENTINEL"),
+                    Marker::shown(
                         "failed slash command's error",
                         "FAILED_SLASH_COMMAND_SENTINEL",
                     ),
-                    Marker::searched("queued prompt", "QUEUED_PROMPT_SENTINEL"),
-                    Marker::searched("attached directory", "DIRECTORY_LISTING_SENTINEL")
+                    Marker::shown("queued prompt", "QUEUED_PROMPT_SENTINEL"),
+                    Marker::shown("attached directory", "DIRECTORY_LISTING_SENTINEL")
                         .in_summary_row(ATTACHMENTS),
-                    Marker::searched("attached file", "ATTACHED_FILE_SENTINEL")
+                    Marker::shown("attached file", "ATTACHED_FILE_SENTINEL")
                         .in_summary_row(ATTACHMENTS),
                     Marker::in_call_or_subagent("file reference", "REFERENCE_SENTINEL")
                         .in_summary_row(ATTACHMENTS),
-                    Marker::searched("hook message", "HOOK_MESSAGE_SENTINEL")
+                    Marker::shown("hook message", "HOOK_MESSAGE_SENTINEL")
                         .in_summary_row(HOOKED_CALLS),
-                    Marker::searched("hook error", "HOOK_ERROR_SENTINEL")
-                        .in_summary_row(HOOKED_CALLS),
-                    Marker::searched("hook with no call", "HOOK_ROW_SENTINEL"),
-                    Marker::searched("Stop hook error", "STOP_HOOK_ERROR_SENTINEL"),
-                    Marker::searched("IDE diagnostics", "DIAGNOSTICS_SENTINEL"),
-                    Marker::searched("session recap", "RECAP_SENTINEL"),
-                    Marker::searched("notice", "NOTICE_SENTINEL"),
+                    Marker::shown("hook error", "HOOK_ERROR_SENTINEL").in_summary_row(HOOKED_CALLS),
+                    Marker::shown("hook with no call", "HOOK_ROW_SENTINEL"),
+                    Marker::shown("Stop hook error", "STOP_HOOK_ERROR_SENTINEL"),
+                    Marker::shown("IDE diagnostics", "DIAGNOSTICS_SENTINEL"),
+                    Marker::shown("session recap", "RECAP_SENTINEL"),
+                    Marker::shown("notice", "NOTICE_SENTINEL"),
+                    Marker::shown("edit diff", "EDIT_DIFF_SENTINEL").in_summary_row(EDIT_RUN),
+                    Marker::shown("undelivered report", "UNDELIVERED_REPORT_SENTINEL")
+                        .in_summary_row("Handed back 1 report"),
+                    Marker::shown("skill call's arguments", "SKILL_ARGS_SENTINEL")
+                        .in_summary_row(EDIT_RUN),
+                    Marker::shown("web fetch's prompt", "WEB_FETCH_PROMPT_SENTINEL")
+                        .in_summary_row(EDIT_RUN),
+                    Marker::shown("message to an agent", "AGENT_MESSAGE_SENTINEL")
+                        .in_summary_row(EDIT_RUN),
+                    Marker::shown("plan call's input shown as JSON", "PLAN_SENTINEL"),
                 ],
             )
             .with_hidden(&[
@@ -1010,11 +1020,12 @@ pub(crate) mod tests {
                     "FORK_CALL_COPY_SENTINEL",
                 ),
             ])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 33)
-            // 90 input and 15 output in the Explore sub-agent's reply, 40 and
-            // 12 in the fork's. The fork's copy of its launching `Agent` call,
-            // 350 input and 25 output, does not count: the view drops it.
-            .with_subagent_tokens(157)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 35)
+            // 90 input and 15 output in the Explore sub-agent's reply, 20 and
+            // 18 in its undelivered report, 40 and 12 in the fork's reply. The
+            // fork's copy of its launching `Agent` call, 350 input and 25
+            // output, does not count: the view drops it.
+            .with_subagent_tokens(195)
         }
 
         /// The fixture is a project folder: the session and its
