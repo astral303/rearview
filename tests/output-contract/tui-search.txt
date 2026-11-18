@@ -2,22 +2,22 @@
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ❯ answer                                                                                                                                                 1/6 │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ CDX  · project                                                                                                                35 msgs · 3m · Aug 01, 06:03 │
+│ ▌ CDX  · project                                                                                                                39 msgs · 3m · Aug 01, 06:03 │
 │ ▌ active codex question codex answer searchable tool output searcha…legated task searchable closing answer [Notice] Conversation interrup…                   │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ OMP  · omp-project · Updated OMP title                                                                                             16 msgs · Jan 01, 22:04 │
+│ ▌ OMP  · omp-project · Updated OMP title                                                                                             22 msgs · Jan 01, 22:04 │
 │ ▌ Updated OMP title OMP root question OMP root answer OMP active question OMP active answer [/clear] Context cleared Is the build clean?…                    │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ KIMI · kimi-project · kimi title                                                                                              22 msgs · 3m · Aug 06, 06:03 │
+│ ▌ KIMI · kimi-project · kimi title                                                                                              27 msgs · 3m · Aug 06, 06:03 │
 │ ▌ kimi title active kimi question kimi answer searchable kimi tool output searchable steer follow-up question f…                                             │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ GROK · grok-project · summary text                                                                                                 14 msgs · Dec 31, 19:00 │
-│ ▌ NUMBERED_REPLY_SENTINEL: the command printed nothing. ... grok answer searchable ... active grok question                                                  │
+│ ▌ GROK · grok-project · summary text                                                                                                 19 msgs · Dec 31, 19:00 │
+│ ▌ Dating the release steps. ... NUMBERED_REPLY_SENTINEL: the command printed nothing. ... grok answer searchable                                             │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ OC   · opencode-project · fixture generated title                                                                             16 msgs · 3m · Aug 12, 08:05 │
-│ ▌ …othing. The notes list the release steps. sub-agent task sub-agent answer read: /tmp/opencode-project/README.md considering the fixture layou…            │
+│ ▌ OC   · opencode-project · fixture generated title                                                                             22 msgs · 3m · Aug 12, 08:05 │
+│ ▌ …ed successfully. Resolved /example/parser sub-agent task sub-agent answer read: /tmp/opencode-project/README.md considering the fixture layou…            │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ Pi   · pi-v3 · Final Pi title                                                                                                15 msgs · 18m · Feb 29, 19:19 │
+│ ▌ Pi   · pi-v3 · Final Pi title                                                                                                19 msgs · 19m · Feb 29, 19:20 │
 │ ▌ Final Pi title active root question root answer Error: tool output searchable [Image: image/jpeg] bash output searc…                                       │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
 │                                                                                                                                                              │
@@ -51,19 +51,19 @@
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ❯ tool output                                                                                                                                            1/5 │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ CDX  · project                                                                                                                35 msgs · 3m · Aug 01, 06:03 │
+│ ▌ CDX  · project                                                                                                                39 msgs · 3m · Aug 01, 06:03 │
 │ ▌ …ion codex answer searchable tool output searchable function output searchable follow-up question shell output searchable wc: no such file…                │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ KIMI · kimi-project · kimi title                                                                                              22 msgs · 3m · Aug 06, 06:03 │
+│ ▌ KIMI · kimi-project · kimi title                                                                                              27 msgs · 3m · Aug 06, 06:03 │
 │ ▌ …kimi answer searchable kimi tool output searchable steer follow-up q…ENTINEL: check the build. SHELL_OUTPUT_SENTINEL /mcp-config SLASH_ARG…               │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ Pi   · pi-v3 · Final Pi title                                                                                                15 msgs · 18m · Feb 29, 19:19 │
-│ ▌ …e active root question root answer Error: tool output searchable [Image: image/jpeg] bash output searchable Exit code: 1 [notice] visible cus…            │
-│──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ GROK · grok-project · summary text                                                                                                 14 msgs · Dec 31, 19:00 │
+│ ▌ GROK · grok-project · summary text                                                                                                 19 msgs · Dec 31, 19:00 │
 │ ▌ summary text active grok question grok answer searchable grok tool output searchable a.rs b.rs NUMBERED_REPLY_SENTINEL: the command printe…                │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ CC   · claude-every-record-fixture                                                                                           33 msgs · 32m · Sep 01, 06:32 │
+│ ▌ Pi   · pi-v3 · Final Pi title                                                                                                19 msgs · 19m · Feb 29, 19:20 │
+│ ▌ …e active root question root answer Error: tool output searchable [Image: image/jpeg] bash output searchable Exit code: 1 [notice] visible cus…            │
+│──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
+│ ▌ CC   · claude-every-record-fixture                                                                                           46 msgs · 33m · Sep 01, 06:33 │
 │ ▌ …NTINEL: listing the files first. TOOL_RESULT_SENTINEL plugin.json The…NEL SLASH_OUTPUT_SENTINEL: set model to Opus 5…                                     │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
 │                                                                                                                                                              │
@@ -100,20 +100,20 @@
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ❯ "answer searchable"                                                                                                                                    1/4 │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ KIMI · kimi-project · kimi title                                                                                              22 msgs · 3m · Aug 06, 06:03 │
+│ ▌ KIMI · kimi-project · kimi title                                                                                              27 msgs · 3m · Aug 06, 06:03 │
 │ ▌ kimi title active kimi question kimi answer searchable kimi tool output searchable steer follow-up question final…                                         │
 │ ▌                                                                                                                                                            │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ CDX  · project                                                                                                                35 msgs · 3m · Aug 01, 06:03 │
+│ ▌ CDX  · project                                                                                                                39 msgs · 3m · Aug 01, 06:03 │
 │ ▌ active codex question codex answer searchable tool output searchable function output searchable follow-up…                                                 │
 │ ▌                                                                                                                                                            │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ OMP  · omp-project · Updated OMP title                                                                                             16 msgs · Jan 01, 22:04 │
-│ ▌ …mit commit a1b2c3d OMP sub-agent task question OMP sub-agent answer searchable OMP private reasoning read: notes.txt ran true bash: git…                  │
+│ ▌ OMP  · omp-project · Updated OMP title                                                                                             22 msgs · Jan 01, 22:04 │
+│ ▌ …ase steps are dated. OMP sub-agent task question OMP sub-agent answer searchable OMP private reasoning read: notes.txt ran true bash: git…                │
 │ ▌                                                                                                                                                            │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ GROK · grok-project · summary text                                                                                                 14 msgs · Dec 31, 19:00 │
-│ ▌ NUMBERED_REPLY_SENTINEL: the command printed nothing. ... grok answer searchable ... active grok question                                                  │
+│ ▌ GROK · grok-project · summary text                                                                                                 19 msgs · Dec 31, 19:00 │
+│ ▌ Dating the release steps. ... NUMBERED_REPLY_SENTINEL: the command printed nothing. ... grok answer searchable                                             │
 │ ▌                                                                                                                                                            │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
 │                                                                                                                                                              │
@@ -149,8 +149,8 @@
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ❯ SPLICED_SUBAGENT_SENTINEL                                                                                                                              1/1 │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ CC   · claude-every-record-fixture                                                                                           33 msgs · 32m · Sep 01, 06:32 │
-│ ▌ …INLINE_SUBAGENT_SENTINEL: the README describes the plugin. SPLICED_SUBAGENT_SENTINEL: the plugin starts from plugin.json. FORKED_SUBAGENT_SENTIN…         │
+│ ▌ CC   · claude-every-record-fixture                                                                                           46 msgs · 33m · Sep 01, 06:33 │
+│ ▌ …INLINE_SUBAGENT_SENTINEL: the README describes the plugin. SPLICED_SUBAGENT_SENTINEL: the plugin starts from plugin.json. {"success":false,"mess…         │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
 │                                                                                                                                                              │
 │                                                                                                                                                              │

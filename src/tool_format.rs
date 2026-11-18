@@ -142,7 +142,11 @@ pub fn format_tool_call(
     if header.value_is_command {
         return format_shell(header.prefix, &header.value, max_width);
     }
-    FormattedToolCall::named(header.prefix, header.value, tool_body(tool, input))
+    FormattedToolCall::named(
+        header.prefix,
+        header.value,
+        tool_call_body(tool, input).and_then(ToolCallBody::shown),
+    )
 }
 
 /// The header of a call, built without its body.
@@ -183,15 +187,46 @@ pub fn tool_call_header(name: &str, tool: Tool, input: &Value) -> ToolCallHeader
     }
 }
 
+/// The body of a call whose header names it, as [`tool_call_body`] finds it.
+pub enum ToolCallBody<'a> {
+    /// A diff, a prompt, a message, or a launch's settings as `key: value`
+    /// lines; the viewer shows it as this text.
+    Text(ToolBody),
+    /// The input of a call [`tool_call_header`] has no layout for, or that
+    /// lacks its header field. The viewer shows it as pretty JSON.
+    RawInput(&'a Value),
+}
+
+impl ToolCallBody<'_> {
+    /// The body as the viewer shows it.
+    fn shown(self) -> Option<ToolBody> {
+        match self {
+            Self::Text(body) => Some(body),
+            Self::RawInput(input) => raw_input_body(input),
+        }
+    }
+
+    /// The body as search reads it: text as the viewer shows it, and input
+    /// the viewer shows as JSON as [`unindented_json_with_decoded_strings`]
+    /// writes it.
+    pub fn searched(self) -> String {
+        match self {
+            Self::Text(body) => body.text,
+            Self::RawInput(input) => unindented_json_with_decoded_strings(input),
+        }
+    }
+}
+
 /// The body of a call whose header names it: a diff, a prompt, a message,
-/// or the raw input of a call [`tool_call_header`] has no layout for.
-fn tool_body(tool: Tool, input: &Value) -> Option<ToolBody> {
+/// or the input of a call [`tool_call_header`] has no layout for. A shell
+/// command's later lines are not a body here: its header holds them.
+pub fn tool_call_body(tool: Tool, input: &Value) -> Option<ToolCallBody<'_>> {
     if lacks_header_field(tool, input) {
-        return raw_input_body(input);
+        return Some(ToolCallBody::RawInput(input));
     }
     let plain_field =
         |key: &str| string_field(input, key).map(|text| ToolBody::plain(text.to_owned()));
-    match tool {
+    let text = match tool {
         Tool::Edit => edit_body(input),
         Tool::Skill => plain_field("args"),
         Tool::Agent => agent_body(input),
@@ -199,7 +234,9 @@ fn tool_body(tool: Tool, input: &Value) -> Option<ToolBody> {
         Tool::AgentReport if is_delivered_report(input) => None,
         Tool::AgentReport => plain_field("message"),
         Tool::WebFetch => plain_field("prompt"),
-        Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => raw_input_body(input),
+        Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => {
+            return Some(ToolCallBody::RawInput(input));
+        }
         Tool::Shell
         | Tool::UserShell
         | Tool::Read
@@ -209,7 +246,8 @@ fn tool_body(tool: Tool, input: &Value) -> Option<ToolBody> {
         | Tool::DirectoryListing
         | Tool::FileReference
         | Tool::WebSearch => None,
-    }
+    };
+    text.map(ToolCallBody::Text)
 }
 
 fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
@@ -431,6 +469,56 @@ fn raw_input_body(input: &Value) -> Option<ToolBody> {
     serde_json::to_string_pretty(input)
         .ok()
         .map(ToolBody::plain)
+}
+
+/// `input` in the lines [`raw_input_body`] lays it out in, unindented, each
+/// key and string written between its quotes as its characters: a line break
+/// as a line break, and `\"` as `"`. A query then matches the word after a
+/// line break as a word's start.
+/// Indentation would make the list's context line differ between a cached
+/// session, whose texts keep runs of whitespace, and a parsed one, whose
+/// texts collapse them.
+fn unindented_json_with_decoded_strings(input: &Value) -> String {
+    let mut json = String::new();
+    push_unindented_json(input, &mut json);
+    json
+}
+
+fn push_unindented_json(value: &Value, json: &mut String) {
+    match value {
+        Value::String(text) => push_quoted(text, json),
+        Value::Array(items) if !items.is_empty() => {
+            json.push('[');
+            for (index, item) in items.iter().enumerate() {
+                json.push_str(separator_before_item(index));
+                push_unindented_json(item, json);
+            }
+            json.push_str("\n]");
+        }
+        Value::Object(fields) if !fields.is_empty() => {
+            json.push('{');
+            for (index, (key, field)) in fields.iter().enumerate() {
+                json.push_str(separator_before_item(index));
+                push_quoted(key, json);
+                json.push_str(": ");
+                push_unindented_json(field, json);
+            }
+            json.push_str("\n}");
+        }
+        scalar_or_empty => json.push_str(&scalar_or_empty.to_string()),
+    }
+}
+
+/// The line break before item `index` of an array or object, with the comma
+/// that ends the item before it.
+fn separator_before_item(index: usize) -> &'static str {
+    if index == 0 { "\n" } else { ",\n" }
+}
+
+fn push_quoted(text: &str, json: &mut String) {
+    json.push('"');
+    json.push_str(text);
+    json.push('"');
 }
 
 #[cfg(test)]
@@ -862,6 +950,38 @@ mod tests {
             body_text(&result)
                 .unwrap()
                 .contains("\"plan\": \"- step one\"")
+        );
+    }
+
+    #[test]
+    fn search_reads_input_shown_as_json_without_escapes_as_viewers_lines_unindented() {
+        let input = json!({
+            "todos": [{"content": "ship it", "done": false, "note": null, "priority": 2}],
+            "merge": true,
+            "labels": [],
+            "settings": {},
+        });
+        let viewers_lines_unindented = raw_input_body(&input)
+            .unwrap()
+            .text
+            .lines()
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            ToolCallBody::RawInput(&input).searched(),
+            viewers_lines_unindented
+        );
+    }
+
+    #[test]
+    fn search_reads_each_string_escape_of_input_shown_as_json_as_its_character() {
+        let input = json!({"plan": "Read \"the\" grammar\nRewrite C:\\src\tnow\u{1b}"});
+
+        assert_eq!(
+            ToolCallBody::RawInput(&input).searched(),
+            "{\n\"plan\": \"Read \"the\" grammar\nRewrite C:\\src\tnow\u{1b}\"\n}"
         );
     }
 

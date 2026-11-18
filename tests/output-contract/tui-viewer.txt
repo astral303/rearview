@@ -39,6 +39,10 @@
 
    Claude │ NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 
+      You │ Fix the tokenizer, then plan the rest
+
+   Claude │ Edited 1 file, loaded 1 skill, messaged 1 agent, fetched 1 URL, called 1 tool
+
 === viewer, tools summary, thinking hidden: kimi wire.jsonl
       You │ active kimi question
 
@@ -71,6 +75,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
      Kimi │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
 
      Kimi │ Started 1 agent
+
+     Kimi │ Dating the release steps.
+
+     Kimi │ Edited 1 file, updated the task list 1 time
 
 === viewer, tools summary, thinking hidden: codex rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl
       You │ active codex question
@@ -107,7 +115,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
       You │ Add the release notes
 
-    Codex │ Edited 2 files
+    Codex │ Edited 2 files, messaged 1 agent, updated the task list 1 time
 
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
@@ -134,6 +142,12 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
       OMP │ Ran 1 shell command
 
+      You │ Date the release steps
+
+      OMP │ Edited 1 file, called 1 tool
+
+      OMP │ The release steps are dated.
+
 === viewer, tools summary, thinking hidden: opencode ses_standard.jsonl
       You │ The user made the following comment regarding lines 40 through 68 of errorHandler.ts: COMMENT_SENTINEL this looks messy
           │
@@ -148,6 +162,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
  OpenCode │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
 
  OpenCode │ Started 1 agent
+
+ OpenCode │ Dating the release steps.
+
+ OpenCode │ Edited 1 file, updated the task list 1 time, called 1 tool
 
 === viewer, tools summary, thinking hidden: pi v3-branched.jsonl
       You │ active root question
@@ -174,6 +192,12 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
        Pi │ NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
 
+      You │ Date the release steps
+
+       Pi │ Edited 1 file
+
+       Pi │ The release steps are dated.
+
 === viewer, tools summary, thinking hidden: grok updates.jsonl
       You │ active grok question
 
@@ -184,6 +208,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
      Grok │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
 
      Grok │ Started 1 agent
+
+     Grok │ Dating the release steps.
+
+     Grok │ Edited 1 file, updated the task list 1 time
 
 === viewer, tools in full, thinking shown: claude 5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl
       You │ Warmup
@@ -212,6 +240,12 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ LAUNCH_PROMPT_SENTINEL: check how the plugin starts
    │
  ↳Explore │ SPLICED_SUBAGENT_SENTINEL: the plugin starts from plugin.json.
+   │
+ ↳Explore │ SubagentHandback:
+   │      │
+   │      │ UNDELIVERED_REPORT_SENTINEL: the plugin starts from plugin.json.
+   │
+   Result │ {"success":false,"message":"Nothing was sent: SubagentHandback is not active for this agent. Write your report as plain text instead."}
    ↓
    Result ┐ The plugin starts from plugin.json.
 
@@ -285,6 +319,41 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
    Claude │ NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 
+      You │ Fix the tokenizer, then plan the rest
+
+   Claude │ Edit: /tmp/claude-every-record-fixture/src/lib.rs
+          │
+          │ -let tokens = split(line);
+   ┌──────┘ +let tokens = EDIT_DIFF_SENTINEL(line);
+   ↓
+   Result ┐ The file /tmp/claude-every-record-fixture/src/lib.rs has been updated successfully.
+
+   Claude │ Skill: write-commit-messages
+          │
+   ┌──────┘ SKILL_ARGS_SENTINEL: amend the subject
+   ↓
+   Result ┐ Launching skill: write-commit-messages
+
+   Claude │ WebFetch: https://example.com/grammar
+          │
+   ┌──────┘ WEB_FETCH_PROMPT_SENTINEL: list the token kinds
+   ↓
+   Result ┐ The grammar has three token kinds.
+
+   Claude │ SendMessage: researcher
+          │
+   ┌──────┘ AGENT_MESSAGE_SENTINEL: check the lexer too
+   ↓
+   Result ┐ Message sent to researcher
+
+   Claude │ ExitPlanMode:
+          │
+          │ {
+          │   "plan": "Read the grammar\nPLAN_SENTINEL: rewrite the tokenizer"
+   ┌──────┘ }
+   ↓
+   Result ┐ User has approved your plan.
+
 === viewer, tools in full, thinking shown: kimi wire.jsonl
       You │ active kimi question
 
@@ -335,6 +404,28 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
    ↓
    Result ┐ The notes list the release steps.
+
+     Kimi │ Dating the release steps.
+
+     Kimi │ Edit: NOTES.md
+          │
+          │ -the release steps
+   ┌──────┘ +EDIT_DIFF_SENTINEL: the dated release steps
+   ↓
+   Result ┐ Edited NOTES.md
+
+     Kimi │ TodoList:
+          │
+          │ {
+          │   "todos": [
+          │     {
+          │       "status": "in_progress",
+          │       "title": "TODO_SENTINEL: date the notes"
+          │     }
+          │   ]
+   ┌──────┘ }
+   ↓
+   Result ┐ Todo list updated
 
 === viewer, tools in full, thinking shown: codex rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl
       You │ active codex question
@@ -427,6 +518,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ spawn_agent: scout (explorer) · fork
           │
+          │ service_tier: flex
    ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
    ↓
    Result ┐ /root/scout
@@ -441,13 +533,34 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ apply_patch: NOTES.md
           │
-   ┌──────┘ +# Notes
+          │ +# Notes
+   ┌──────┘ +PATCH_SENTINEL: the release steps
    │
    │Codex │ apply_patch: RELEASE.md
    │      │
    │      │ +# Release
    ↓
    Result ┐ Done: 2 files added
+
+    Codex │ send_message: /root/scout
+          │
+   ┌──────┘ SEND_MESSAGE_SENTINEL: add the dates
+   ↓
+   Result ┐
+
+    Codex │ update_plan:
+          │
+          │ {
+          │   "explanation": "Ship the notes",
+          │   "plan": [
+          │     {
+          │       "status": "in_progress",
+          │       "step": "PLAN_STEP_SENTINEL: date the notes"
+          │     }
+          │   ]
+   ┌──────┘ }
+   ↓
+   Result ┐ Plan updated
 
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question
@@ -485,6 +598,28 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ↓
    Result ┐ commit a1b2c3d
 
+      You │ Date the release steps
+
+      OMP │ edit: notes.txt
+          │
+          │ INS.POST 3:
+   ┌──────┘ +EDIT_DIFF_SENTINEL: the dated release steps
+   ↓
+   Result ┐ Edited notes.txt
+
+      OMP │ task:
+          │
+          │ {
+          │   "agent": "explore",
+          │   "i": "check the dates",
+          │   "solutionSpace": "the notes file",
+          │   "task": "TASK_PROMPT_SENTINEL: check the dates"
+   ┌──────┘ }
+   ↓
+   Result ┐ The dates are right.
+
+      OMP │ The release steps are dated.
+
 === viewer, tools in full, thinking shown: opencode ses_standard.jsonl
       You │ The user made the following comment regarding lines 40 through 68 of errorHandler.ts: COMMENT_SENTINEL this looks messy
           │
@@ -521,6 +656,36 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
    ↓
    Result ┐ The notes list the release steps.
+
+ OpenCode │ Dating the release steps.
+
+ OpenCode │ edit: /tmp/opencode-project/NOTES.md
+          │
+          │ -the release steps
+   ┌──────┘ +EDIT_DIFF_SENTINEL: the dated release steps
+   ↓
+   Result ┐ Edit applied successfully.
+
+ OpenCode │ todowrite:
+          │
+          │ {
+          │   "todos": [
+          │     {
+          │       "content": "TODO_SENTINEL: date the notes",
+          │       "id": "1",
+          │       "priority": "high",
+          │       "status": "in_progress"
+          │     }
+          │   ]
+          │ }
+
+ OpenCode │ context7_resolve-library-id:
+          │
+          │ {
+          │   "libraryName": "MCP_INPUT_SENTINEL parser"
+   ┌──────┘ }
+   ↓
+   Result ┐ Resolved /example/parser
 
 === viewer, tools in full, thinking shown: pi v3-branched.jsonl
       You │ active root question
@@ -564,6 +729,17 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
        Pi │ NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
 
+      You │ Date the release steps
+
+       Pi │ edit: notes.txt
+          │
+          │ -the release steps
+   ┌──────┘ +EDIT_DIFF_SENTINEL: the dated release steps
+   ↓
+   Result ┐ Successfully replaced 1 block(s) in notes.txt.
+
+       Pi │ The release steps are dated.
+
 === viewer, tools in full, thinking shown: grok updates.jsonl
       You │ active grok question
 
@@ -595,4 +771,28 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
    ↓
    Result ┐ Subagent started in background.
+
+     Grok │ Dating the release steps.
+
+     Grok │ search_replace: /tmp/grok-project/notes.md
+          │
+          │ -the steps
+   ┌──────┘ +EDIT_DIFF_SENTINEL: the dated steps
+   ↓
+   Result ┐ old_string not found
+
+     Grok │ todo_write:
+          │
+          │ {
+          │   "merge": true,
+          │   "todos": [
+          │     {
+          │       "content": "TODO_SENTINEL: date the notes",
+          │       "id": "1",
+          │       "status": "in_progress"
+          │     }
+          │   ]
+   ┌──────┘ }
+   ↓
+   Result ┐ Updated 1 todo
 

@@ -66,9 +66,10 @@ pub struct CallRecord<'e> {
 pub enum CallCopy {
     /// Part of the call's lines: a budget or a slice cut them.
     Truncated,
-    /// The header a read of several messages shows, its command shortened:
+    /// The form `agent read` prints when it reads several messages: the
+    /// call's line, plus `(+N lines)` for the lines it leaves out:
     /// `Bash: cd src (+1 line)`.
-    Abbreviated,
+    Collapsed,
     /// Every line of the call.
     Whole,
 }
@@ -414,7 +415,7 @@ impl<'e> Repeats<'e> {
     /// Record `call`, shown as `copy`, as its owner's first copy of its name
     /// and input, or return the address of an earlier copy of that owner's
     /// showing at least as much. A copy showing more replaces the first, so
-    /// a call shown whole never names an abbreviated copy.
+    /// a call shown whole never names a collapsed copy.
     fn record_first_call_copy(
         &mut self,
         call: &CallRecord<'e>,

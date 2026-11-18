@@ -553,8 +553,7 @@ the Codex home directory.
 
 User and assistant messages and tool output are searchable. System and
 developer messages, injected environment context, compaction records, and
-telemetry are omitted. Inter-agent messages appear as tool calls but are not
-searched.
+telemetry are omitted.
 
 Codex stores thread names in `session_index.jsonl`. A rename in either Codex or
 `rearview` is visible in both. A forked session also shows the turns before

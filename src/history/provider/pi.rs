@@ -158,7 +158,7 @@ impl SessionStorage for PiStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "pi",
-            schema_version: 17,
+            schema_version: 18,
         }
     }
 
@@ -332,6 +332,10 @@ pub(super) mod tests {
                     r#"{"type":"message","id":"empty-b","parentId":"empty-t","timestamp":"2024-03-01T00:19:03.000Z","message":{"role":"bashExecution","command":"true","output":""}}"#,
                     r#"{"type":"custom_message","id":"empty-m","parentId":"empty-b","timestamp":"2024-03-01T00:19:04.000Z","customType":"note","content":"","display":true}"#,
                     r#"{"type":"message","id":"empty-r","parentId":"empty-m","timestamp":"2024-03-01T00:19:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty."}]}}"#,
+                    r#"{"type":"message","id":"edit-u","parentId":"empty-r","timestamp":"2024-03-01T00:20:00.000Z","message":{"role":"user","content":"Date the release steps"}}"#,
+                    r#"{"type":"message","id":"edit-a","parentId":"edit-u","timestamp":"2024-03-01T00:20:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_edit","name":"edit","arguments":{"path":"notes.txt","edits":[{"oldText":"the release steps","newText":"EDIT_DIFF_SENTINEL: the dated release steps"}]}}]}}"#,
+                    r#"{"type":"message","id":"edit-t","parentId":"edit-a","timestamp":"2024-03-01T00:20:02.000Z","message":{"role":"toolResult","toolCallId":"call_edit","toolName":"edit","content":[{"type":"text","text":"Successfully replaced 1 block(s) in notes.txt."}]}}"#,
+                    r#"{"type":"message","id":"edit-r","parentId":"edit-t","timestamp":"2024-03-01T00:20:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The release steps are dated."}]}}"#,
                 ]
                 .map(str::to_owned),
             );
@@ -341,18 +345,20 @@ pub(super) mod tests {
                 session,
                 Vec::new(),
                 vec![
-                    Marker::searched("user text", "active root question"),
-                    Marker::searched("assistant text", "root answer"),
-                    Marker::searched("thinking", "private reasoning"),
+                    Marker::shown("user text", "active root question"),
+                    Marker::shown("assistant text", "root answer"),
+                    Marker::shown("thinking", "private reasoning"),
                     Marker::in_call_or_subagent("tool call", "README.md")
                         .in_summary_row("Read 1 file"),
-                    Marker::searched("tool result", "tool output searchable"),
-                    Marker::searched("user's shell command output", "bash output searchable"),
-                    Marker::searched("custom message", "visible custom searchable"),
+                    Marker::shown("tool result", "tool output searchable"),
+                    Marker::shown("user's shell command output", "bash output searchable"),
+                    Marker::shown("custom message", "visible custom searchable"),
                     Marker::in_call_or_subagent("powershell call", "POWERSHELL_SENTINEL")
                         .in_summary_row(LISTING_RUN),
                     Marker::in_call_or_subagent("directory listing", "LS_SENTINEL_DIR")
                         .in_summary_row(LISTING_RUN),
+                    Marker::shown("edit diff", "EDIT_DIFF_SENTINEL")
+                        .in_summary_row("Edited 1 file"),
                 ],
             )
             .with_hidden(&[

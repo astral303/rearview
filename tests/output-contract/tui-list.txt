@@ -1,26 +1,26 @@
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ ❯                                                                                                                                                        1/7 │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ CC   · claude-every-record-fixture                                                                                           33 msgs · 32m · Sep 01, 06:32 │
-│ ▌ NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module. ... Found 1 new diagnostic issue in 1 file ... QUEUED_PROMPT_SENTINEL: and run the… │
+│ ▌ CC   · claude-every-record-fixture                                                                                           46 msgs · 33m · Sep 01, 06:33 │
+│ ▌ Fix the tokenizer, then plan the rest ... NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module. ... Found 1 new diagnostic issue in 1 fi… │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ KIMI · kimi-project · kimi title                                                                                              22 msgs · 3m · Aug 06, 06:03 │
-│ ▌ NUMBERED_REPLY_SENTINEL: the command printed nothing. ... Is the notes file empty? ... /mcp-config SLASH_ARGS_SENTINEL                                     │
+│ ▌ KIMI · kimi-project · kimi title                                                                                              27 msgs · 3m · Aug 06, 06:03 │
+│ ▌ Dating the release steps. ... NUMBERED_REPLY_SENTINEL: the command printed nothing. ... Is the notes file empty?                                           │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ CDX  · project                                                                                                                35 msgs · 3m · Aug 01, 06:03 │
+│ ▌ CDX  · project                                                                                                                39 msgs · 3m · Aug 01, 06:03 │
 │ ▌ Add the release notes ... Show the last commit ... NUMBERED_REPLY_SENTINEL: the command printed nothing.                                                   │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ OMP  · omp-project · Updated OMP title                                                                                             16 msgs · Jan 01, 22:04 │
-│ ▌ Show the last commit ... NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty. ... Is the build clean?                                  │
+│ ▌ OMP  · omp-project · Updated OMP title                                                                                             22 msgs · Jan 01, 22:04 │
+│ ▌ The release steps are dated. ... Date the release steps ... Show the last commit                                                                           │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ OC   · opencode-project · fixture generated title                                                                             16 msgs · 3m · Aug 12, 08:05 │
-│ ▌ NUMBERED_REPLY_SENTINEL: the command printed nothing. ... the defect hides in lib.rs ... The user made the following comment regarding lines 40 through 6… │
+│ ▌ OC   · opencode-project · fixture generated title                                                                             22 msgs · 3m · Aug 12, 08:05 │
+│ ▌ Dating the release steps. ... NUMBERED_REPLY_SENTINEL: the command printed nothing. ... the defect hides in lib.rs                                         │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ Pi   · pi-v3 · Final Pi title                                                                                                15 msgs · 18m · Feb 29, 19:19 │
-│ ▌ NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty. ... Is the build clean? ... List the source directory                             │
+│ ▌ Pi   · pi-v3 · Final Pi title                                                                                                19 msgs · 19m · Feb 29, 19:20 │
+│ ▌ The release steps are dated. ... Date the release steps ... NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.                       │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ GROK · grok-project · summary text                                                                                                 14 msgs · Dec 31, 19:00 │
-│ ▌ NUMBERED_REPLY_SENTINEL: the command printed nothing. ... grok answer searchable ... active grok question                                                  │
+│ ▌ GROK · grok-project · summary text                                                                                                 19 msgs · Dec 31, 19:00 │
+│ ▌ Dating the release steps. ... NUMBERED_REPLY_SENTINEL: the command printed nothing. ... grok answer searchable                                             │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
 │                                                                                                                                                              │
 │                                                                                                                                                              │

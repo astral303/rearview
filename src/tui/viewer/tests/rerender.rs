@@ -664,13 +664,13 @@ fn every_agents_outputs_render_in_place_as_in_whole_render() {
     // Every agent's session has a tool run that a click toggles in summary
     // mode.
     let expected = [
-        ("Claude", 44),
-        ("Codex", 88),
-        ("OpenCode", 28),
-        ("Kimi", 40),
-        ("Grok", 16),
-        ("Pi", 32),
-        ("Omp", 24),
+        ("Claude", 56),
+        ("Codex", 96),
+        ("OpenCode", 44),
+        ("Kimi", 56),
+        ("Grok", 32),
+        ("Pi", 40),
+        ("Omp", 40),
     ]
     .map(|(name, count)| (name.to_owned(), count));
     assert_eq!(

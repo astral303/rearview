@@ -17,7 +17,9 @@ use crate::log_entry::{
     agent_progress_identity, labeled_metadata_text, parse_agent_progress, progress_launch_call,
     progress_timestamp,
 };
-use crate::tool_format::{ToolCallHeader, launch_prompt, tool_call_header};
+use crate::tool_format::{
+    ToolCallBody, ToolCallHeader, launch_prompt, tool_call_body, tool_call_header,
+};
 use crate::tui::viewer::local_command_output;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -1085,48 +1087,126 @@ fn non_empty_text(text: &str) -> Option<String> {
 }
 
 /// A tool call as search reads it, terminal codes stripped: the header the
-/// viewer shows, with every line of a shell command, then the whole
-/// [`launch_prompt`]. When the header's value is empty, as for a call the
-/// viewer shows as raw input, the header is the call's name and input keys.
+/// viewer shows, with every line of a shell command, then the body as
+/// [`ToolCallBody::searched`] reads it. When the header's value is empty, as
+/// for input the viewer shows as JSON, the header is the call's name and
+/// input keys.
 pub(crate) fn tool_call_text(name: &str, tool: Tool, input: &Value) -> String {
     let header = tool_call_header(name, tool, input);
-    let text = if header.value.trim().is_empty() {
+    let header_text = if header.value.trim().is_empty() {
         name_and_input_keys(name, input, MAX_AGENT_SEGMENT_CHARS)
     } else {
         format!("{}{}", header.prefix, header.value)
     };
-    with_launch_prompt(sanitize_agent_text(&text), tool, input)
+    let text = sanitize_agent_text(&header_text);
+    let body = tool_call_body(tool, input).and_then(searched_body);
+    with_body(text, body.as_deref())
 }
 
-/// The lines of a shell command that `agent read` shows.
+/// `body` as search reads it; `None` when blank.
+fn searched_body(body: ToolCallBody<'_>) -> Option<String> {
+    shown_body_text(&body.searched())
+}
+
+/// `text` without terminal codes or trailing line breaks, as a call's body
+/// shows it; `None` when blank.
+fn shown_body_text(text: &str) -> Option<String> {
+    let mut text = sanitize_agent_text(text);
+    text.truncate(text.trim_end_matches(['\r', '\n']).len());
+    unless_blank(text)
+}
+
+fn with_body(mut header: String, body: Option<&str>) -> String {
+    if let Some(body) = body {
+        header.push('\n');
+        header.push_str(body);
+    }
+    header
+}
+
+/// The form of a tool call that `agent read` prints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CommandLines {
-    /// The first non-empty line, then a count of the others.
-    FirstLine,
-    All,
+pub(crate) enum CallLines {
+    /// The form `agent read` prints when it reads several messages: the
+    /// header on one line, plus `(+N lines)` for the lines it leaves out,
+    /// then a launch's prompt.
+    Collapsed,
+    /// The form `agent read` prints for one message or one call: the
+    /// header, with every line of a shell command, then the body.
+    Whole,
 }
 
-/// A tool call as `agent read` shows it: [`tool_call_text`] with the header
-/// on one line, truncated to a search segment. With [`CommandLines::All`], a
-/// shell command shows every line, untruncated.
+/// A tool call in the form `agent read` prints, built once for the read.
+#[derive(Clone, Debug)]
+pub(crate) struct CallReadText {
+    /// The call's lines in that form.
+    pub(crate) text: String,
+    /// True when `text` differs from the whole call.
+    pub(crate) is_collapsed: bool,
+    /// The lines of the whole call, which `--lines` numbers.
+    pub(crate) whole_lines: usize,
+}
+
+/// A tool call in the form `lines` names. The whole body is the one
+/// [`tool_call_text`] reads; `(+N lines)` counts the lines of the whole call
+/// the collapsed form leaves out: `Edit: src/lib.rs (+2 lines)`. A header
+/// line is truncated to a search segment; a whole command and a body are
+/// not.
 pub(crate) fn tool_call_read_text(
     name: &str,
     tool: Tool,
     input: &Value,
-    lines: CommandLines,
-) -> String {
+    lines: CallLines,
+) -> CallReadText {
     let header = tool_call_header(name, tool, input);
-    let shown =
-        if lines == CommandLines::All && header.value_is_command && !header.value.trim().is_empty()
-        {
-            sanitize_agent_text(&whole_command(&header))
-        } else {
-            truncate_chars(
-                &sanitize_agent_text(&tool_call_line(&header, name, input)),
-                MAX_AGENT_SEGMENT_CHARS,
-            )
-        };
-    with_launch_prompt(shown, tool, input)
+    let header_line = tool_call_line(&header, name, input);
+    let whole_header = if header.value_is_command && !header.value.trim().is_empty() {
+        sanitize_agent_text(&whole_command(&header))
+    } else {
+        within_segment(&header_line)
+    };
+    let body = tool_call_body(tool, input).and_then(searched_body);
+    let whole = with_body(whole_header, body.as_deref());
+    let whole_lines = line_count(&whole);
+    match lines {
+        CallLines::Whole => CallReadText {
+            text: whole,
+            is_collapsed: false,
+            whole_lines,
+        },
+        CallLines::Collapsed => {
+            let prompt = launch_prompt(tool, input).and_then(shown_body_text);
+            let shown_lines = 1 + prompt.as_deref().map_or(0, line_count);
+            let header = within_segment(&with_line_count(
+                header_line,
+                whole_lines.saturating_sub(shown_lines),
+            ));
+            let text = with_body(header, prompt.as_deref());
+            CallReadText {
+                is_collapsed: text != whole,
+                text,
+                whole_lines,
+            }
+        }
+    }
+}
+
+/// The lines `--lines` counts in `text`.
+fn line_count(text: &str) -> usize {
+    text.split('\n').count()
+}
+
+fn within_segment(line: &str) -> String {
+    truncate_chars(&sanitize_agent_text(line), MAX_AGENT_SEGMENT_CHARS)
+}
+
+/// `line`, then `(+1 line)` or `(+N lines)` when it leaves out lines.
+fn with_line_count(line: String, left_out: usize) -> String {
+    match left_out {
+        0 => line,
+        1 => format!("{line} (+1 line)"),
+        left_out => format!("{line} (+{left_out} lines)"),
+    }
 }
 
 const COMMAND_CONTINUATION_INDENT: &str = "  ";
@@ -1146,15 +1226,8 @@ fn whole_command(header: &ToolCallHeader) -> String {
     text
 }
 
-fn with_launch_prompt(header: String, tool: Tool, input: &Value) -> String {
-    match launch_prompt(tool, input) {
-        Some(prompt) => format!("{header}\n{}", sanitize_agent_text(prompt)),
-        None => header,
-    }
-}
-
 /// The call's header on one line. A shell command shows its first non-empty
-/// line and counts the others: `Bash: cd src (+4 lines)`.
+/// line.
 fn tool_call_line(header: &ToolCallHeader, name: &str, input: &Value) -> String {
     if header.value.trim().is_empty() {
         return name_and_input_keys(name, input, MAX_AGENT_SEGMENT_CHARS);
@@ -1171,11 +1244,7 @@ fn tool_call_line(header: &ToolCallHeader, name: &str, input: &Value) -> String 
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or_default();
-    match header.value.lines().count() - 1 {
-        0 => format!("{}{shown}", header.prefix),
-        1 => format!("{}{shown} (+1 line)", header.prefix),
-        hidden => format!("{}{shown} (+{hidden} lines)", header.prefix),
-    }
+    format!("{}{shown}", header.prefix)
 }
 
 /// `tool NAME input_keys=KEY,KEY`, within `max_chars`.
@@ -1838,26 +1907,31 @@ mod tests {
         }];
 
         let text = agent_search_parts_from_blocks(AgentMessageRole::Assistant, &blocks).join(" ");
+        let header_line = text.lines().next().unwrap();
 
-        assert!(text.chars().count() <= MAX_AGENT_SEGMENT_CHARS);
-        assert!(text.starts_with("tool Bash input_keys="));
+        assert!(header_line.chars().count() <= MAX_AGENT_SEGMENT_CHARS);
+        assert!(header_line.starts_with("tool Bash input_keys="));
     }
 
     fn shell_input(command: &str) -> Value {
         serde_json::json!({"command": command, "description": "Run the checks"})
     }
 
+    fn read_text(name: &str, tool: Tool, input: &Value, lines: CallLines) -> String {
+        tool_call_read_text(name, tool, input, lines).text
+    }
+
     #[test]
     fn agent_read_shows_tool_calls_header_on_one_line() {
         let grep = serde_json::json!({"pattern": "first\nsecond", "path": "src"});
 
-        for lines in [CommandLines::FirstLine, CommandLines::All] {
+        for lines in [CallLines::Collapsed, CallLines::Whole] {
             assert_eq!(
-                tool_call_read_text("Bash", Tool::Shell, &shell_input("cargo test"), lines),
+                read_text("Bash", Tool::Shell, &shell_input("cargo test"), lines),
                 "Bash: cargo test"
             );
             assert_eq!(
-                tool_call_read_text("Grep", Tool::Grep, &grep, lines),
+                read_text("Grep", Tool::Grep, &grep, lines),
                 r#"Grep: "first second" in src"#
             );
         }
@@ -1866,11 +1940,11 @@ mod tests {
     #[test]
     fn read_of_several_messages_shows_commands_first_non_empty_line_and_counts_others() {
         let read = |command| {
-            tool_call_read_text(
+            read_text(
                 "Bash",
                 Tool::Shell,
                 &shell_input(command),
-                CommandLines::FirstLine,
+                CallLines::Collapsed,
             )
         };
 
@@ -1880,11 +1954,13 @@ mod tests {
             "Bash: cd src (+2 lines)"
         );
         assert_eq!(read("\ncargo test"), "Bash: cargo test (+1 line)");
+        assert_eq!(read("cd src\n\ncargo test"), "Bash: cd src (+2 lines)");
+        assert_eq!(read("cd src\n"), "Bash: cd src");
     }
 
     #[test]
     fn one_message_read_shows_command_whole_and_untruncated() {
-        let read = |command| tool_call_read_text("Bash", Tool::Shell, &command, CommandLines::All);
+        let read = |command| read_text("Bash", Tool::Shell, &command, CallLines::Whole);
         let long = "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2);
 
         assert_eq!(
@@ -1902,17 +1978,273 @@ mod tests {
         );
     }
 
-    #[test]
-    fn call_viewer_shows_as_raw_input_reads_as_its_name_and_input_keys() {
-        let input = serde_json::json!({"todos": [{"content": "ship it"}]});
+    fn message_ending_in_line_break() -> Value {
+        serde_json::json!({"recipient": "lexer", "message": "check the lexer\n"})
+    }
 
-        for text in [
-            tool_call_read_text("TodoWrite", Tool::Other, &input, CommandLines::FirstLine),
-            tool_call_read_text("TodoWrite", Tool::Other, &input, CommandLines::All),
+    #[test]
+    fn search_reads_body_without_its_trailing_line_break() {
+        assert_eq!(
+            tool_call_text(
+                "SendMessage",
+                Tool::AgentMessage,
+                &message_ending_in_line_break()
+            ),
+            "SendMessage: lexer\ncheck the lexer"
+        );
+    }
+
+    #[test]
+    fn read_shows_call_with_input_shown_as_json_as_its_name_and_input_keys_then_its_json() {
+        let input = serde_json::json!({"todos": [{"content": "ship it"}]});
+        let read = |lines| read_text("TodoWrite", Tool::Other, &input, lines);
+
+        assert_eq!(
+            read(CallLines::Whole),
+            "tool TodoWrite input_keys=todos\n{\n\"todos\": [\n{\n\"content\": \"ship it\"\n}\n]\n}"
+        );
+        assert_eq!(
+            read(CallLines::Collapsed),
+            "tool TodoWrite input_keys=todos (+7 lines)"
+        );
+    }
+
+    #[test]
+    fn search_reads_call_with_input_shown_as_json_as_its_name_and_input_keys_then_its_json() {
+        let input = serde_json::json!({"todos": [
+            {"content": "ship it", "done": false, "note": null, "priority": 2}
+        ]});
+
+        assert_eq!(
             tool_call_text("TodoWrite", Tool::Other, &input),
-        ] {
-            assert_eq!(text, "tool TodoWrite input_keys=todos");
+            [
+                "tool TodoWrite input_keys=todos",
+                "{",
+                "\"todos\": [",
+                "{",
+                "\"content\": \"ship it\",",
+                "\"done\": false,",
+                "\"note\": null,",
+                "\"priority\": 2",
+                "}",
+                "]",
+                "}",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn search_and_whole_read_show_call_header_then_body_and_collapsed_read_counts_body_lines() {
+        let edit = serde_json::json!({
+            "file_path": "src/lib.rs",
+            "old_string": "old line",
+            "new_string": "new line"
+        });
+
+        assert_eq!(
+            tool_call_text("Edit", Tool::Edit, &edit),
+            "Edit: src/lib.rs\n-old line\n+new line"
+        );
+        assert_eq!(
+            read_text("Edit", Tool::Edit, &edit, CallLines::Whole),
+            "Edit: src/lib.rs\n-old line\n+new line"
+        );
+        assert_eq!(
+            read_text("Edit", Tool::Edit, &edit, CallLines::Collapsed),
+            "Edit: src/lib.rs (+2 lines)"
+        );
+    }
+
+    #[test]
+    fn whole_read_of_call_with_body_is_its_search_text() {
+        let calls = [
+            (
+                "Skill",
+                Tool::Skill,
+                serde_json::json!({"skill": "review", "args": "--strict\nsrc/lib.rs"}),
+            ),
+            ("update_plan", Tool::Other, update_plan_input()),
+            ("spawn_agent", Tool::Agent, launch_with_settings()),
+            (
+                "Task",
+                Tool::Agent,
+                serde_json::json!({"description": "scout", "prompt": "List the modules."}),
+            ),
+        ];
+
+        for (name, tool, input) in calls {
+            assert_eq!(
+                read_text(name, tool, &input, CallLines::Whole),
+                tool_call_text(name, tool, &input),
+                "a read of {name} alone shows the text search reads"
+            );
         }
+    }
+
+    fn launch_with_settings() -> Value {
+        serde_json::json!({
+            "description": "scout",
+            "prompt": "List the modules.\nName each one's owner.",
+            "launch": {"model": "gpt-5", "fork_turns": "none", "service_tier": "flex", "depth": 2},
+        })
+    }
+
+    #[test]
+    fn read_shows_launch_settings_then_prompt_and_collapsed_read_counts_settings_alone() {
+        let read = |lines| read_text("spawn_agent", Tool::Agent, &launch_with_settings(), lines);
+
+        assert_eq!(
+            read(CallLines::Whole),
+            "spawn_agent: scout · gpt-5\ndepth: 2\nservice_tier: flex\nList the modules.\nName each one's owner."
+        );
+        assert_eq!(
+            read(CallLines::Collapsed),
+            "spawn_agent: scout · gpt-5 (+2 lines)\nList the modules.\nName each one's owner."
+        );
+    }
+
+    #[test]
+    fn launch_without_settings_shows_its_prompt_whole_in_either_read() {
+        let input = serde_json::json!({"description": "scout", "prompt": "List the modules.\nName each one's owner."});
+
+        for lines in [CallLines::Collapsed, CallLines::Whole] {
+            assert_eq!(
+                read_text("Task", Tool::Agent, &input, lines),
+                "Task: scout\nList the modules.\nName each one's owner."
+            );
+        }
+    }
+
+    /// Codex's default `spawn_agent`, without `task_name`: the viewer shows
+    /// its input as JSON.
+    #[test]
+    fn launch_with_input_shown_as_json_shows_its_prompt_in_collapsed_read_and_counts_the_rest() {
+        let input = serde_json::json!({
+            "launch": {"agent_type": "explorer", "fork_context": true},
+            "prompt": "two\nlines",
+        });
+
+        let whole = tool_call_read_text("spawn_agent", Tool::Agent, &input, CallLines::Whole);
+        let collapsed =
+            tool_call_read_text("spawn_agent", Tool::Agent, &input, CallLines::Collapsed);
+
+        assert_eq!(
+            whole.text,
+            [
+                "tool spawn_agent input_keys=launch,prompt",
+                "{",
+                "\"launch\": {",
+                "\"agent_type\": \"explorer\",",
+                "\"fork_context\": true",
+                "},",
+                "\"prompt\": \"two",
+                "lines\"",
+                "}",
+            ]
+            .join("\n")
+        );
+        assert_eq!(
+            collapsed.text,
+            "tool spawn_agent input_keys=launch,prompt (+6 lines)\ntwo\nlines"
+        );
+        assert_eq!(
+            whole.whole_lines - line_count(&collapsed.text),
+            6,
+            "the count is the lines the collapsed read leaves out"
+        );
+    }
+
+    #[test]
+    fn body_ending_in_line_break_counts_and_shows_its_lines_without_it() {
+        let read = |lines| {
+            read_text(
+                "SendMessage",
+                Tool::AgentMessage,
+                &message_ending_in_line_break(),
+                lines,
+            )
+        };
+
+        assert_eq!(read(CallLines::Collapsed), "SendMessage: lexer (+1 line)");
+        assert_eq!(
+            read(CallLines::Whole),
+            "SendMessage: lexer\ncheck the lexer"
+        );
+    }
+
+    /// The messages `query` finds in a session of one user message, then a
+    /// call of `tool_name` with `input`.
+    fn messages_found_in_call(tool_name: &str, input: Value, query: &str) -> Vec<usize> {
+        use crate::agent::retrieval::{
+            AgentRetrievalOptions, AgentTranscriptSearchTarget, retrieve_agent_hits_for_target,
+        };
+        let content = [
+            user("Plan the parser fix"),
+            reply_record(serde_json::json!({
+                "type": "tool_use", "id": "toolu_call", "name": tool_name, "input": input
+            })),
+        ]
+        .join("\n");
+        let transcript = parse(&content);
+        retrieve_agent_hits_for_target(
+            AgentTranscriptSearchTarget::whole(&transcript, None, None),
+            query,
+            AgentRetrievalOptions::default(),
+        )
+        .iter()
+        .map(|hit| hit.focus_range.start)
+        .collect()
+    }
+
+    #[test]
+    fn search_finds_word_after_line_break_in_value_of_input_shown_as_json_unquoted_and_quoted_across_break()
+     {
+        let input = serde_json::json!({"plan": "Read the grammar\nRewrite the tokenizer"});
+
+        for query in ["Rewrite", "\"grammar Rewrite\""] {
+            assert_eq!(
+                messages_found_in_call("ExitPlanMode", input.clone(), query),
+                [2],
+                "{query} finds the plan call's message"
+            );
+        }
+    }
+
+    fn update_plan_input() -> Value {
+        serde_json::json!({
+            "explanation": "Ship the notes",
+            "plan": [{"step": "Date the notes", "status": "in_progress"}]
+        })
+    }
+
+    #[test]
+    fn search_finds_nested_key_of_input_shown_as_json() {
+        assert_eq!(
+            messages_found_in_call("update_plan", update_plan_input(), "status"),
+            [2],
+            "a key the viewer shows inside the plan finds the call's message"
+        );
+    }
+
+    #[test]
+    fn quoted_phrase_across_two_values_of_input_shown_as_json_doesnt_match() {
+        assert_eq!(
+            messages_found_in_call("update_plan", update_plan_input(), "\"notes in_progress\""),
+            Vec::<usize>::new(),
+            "the explanation's last word and the step's status are apart in the viewer's JSON"
+        );
+    }
+
+    #[test]
+    fn line_of_input_shown_as_json_without_escapes_is_in_search_text_as_a_phrase() {
+        let text = tool_call_text("update_plan", Tool::Other, &update_plan_input());
+
+        assert!(
+            crate::search::literal::Literal::new("\"status\": \"in_progress\"".to_owned())
+                .matches(&text),
+            "the search text contains the line the viewer shows: {text}"
+        );
     }
 
     #[test]
@@ -1920,7 +2252,7 @@ mod tests {
      {
         let command = shell_input(&"x".repeat(MAX_AGENT_SEGMENT_CHARS * 2));
 
-        let read = tool_call_read_text("Bash", Tool::Shell, &command, CommandLines::FirstLine);
+        let read = read_text("Bash", Tool::Shell, &command, CallLines::Collapsed);
         let searched = tool_call_text("Bash", Tool::Shell, &command);
 
         assert_eq!(read.chars().count(), MAX_AGENT_SEGMENT_CHARS);

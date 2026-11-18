@@ -1,9 +1,9 @@
 //! The session list's search over each registered agent's every-record
-//! session, read from a session cache into memory. It finds each searched
-//! marker, as `agent search` does, unquoted and quoted: in the dialogue, a
-//! tool call's header, thinking or a sub-agent's text. Neither finds a hidden
-//! marker or a marker in a call's body. A found marker's context line shows
-//! the marker, and a query the dialogue matches shows the dialogue.
+//! session, read from a session cache into memory. It finds each marker, as
+//! `agent search` does, unquoted and quoted: in the dialogue, a tool call's
+//! header or body, thinking or a sub-agent's text. Neither finds a hidden
+//! marker. A found marker's context line shows the marker, and a query
+//! the dialogue matches shows the dialogue.
 
 use crate::history::Conversation;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
@@ -71,12 +71,12 @@ fn quoted(text: &str) -> String {
 }
 
 #[test]
-fn session_list_search_and_agent_search_find_each_searched_marker_and_no_other() {
+fn session_list_search_and_agent_search_find_each_marker_and_no_hidden_one() {
     let mut gaps = Vec::new();
     for session in every_record_sessions() {
         let listed = ListedSession::of(&session);
         let source = session.row.source;
-        for marker in session.markers.iter().filter(|marker| marker.is_searched) {
+        for marker in &session.markers {
             for query in [marker.text.to_owned(), quoted(marker.text)] {
                 if !listed.is_found_by_list_search(&query) {
                     gaps.push(format!(
@@ -92,37 +92,34 @@ fn session_list_search_and_agent_search_find_each_searched_marker_and_no_other()
                 }
             }
         }
-        let unsearched = session
-            .markers
-            .iter()
-            .filter(|marker| !marker.is_searched)
-            .map(|marker| (marker.record, marker.text));
-        for (record, text) in unsearched.chain(session.hidden.iter().copied()) {
+        for (record, text) in session.hidden {
             let query = quoted(text);
             if listed.is_found_by_list_search(&query) {
-                gaps.push(format!("{source:?}: the list finds the {record}"));
+                gaps.push(format!("{source:?}: the list finds the hidden {record}"));
             }
             if listed.is_found_by_agent_search(&query) {
-                gaps.push(format!("{source:?}: `agent search` finds the {record}"));
+                gaps.push(format!(
+                    "{source:?}: `agent search` finds the hidden {record}"
+                ));
             }
         }
     }
 
     assert!(
         gaps.is_empty(),
-        "both searches find each searched marker, and neither finds another:\n{}",
+        "both searches find each marker, and neither finds a hidden one:\n{}",
         gaps.join("\n")
     );
 }
 
 #[test]
-fn context_line_shows_each_searched_marker_the_preview_doesnt_show() {
+fn context_line_shows_each_marker_the_preview_doesnt_show() {
     let mut gaps = Vec::new();
     let mut lines = 0;
     for session in every_record_sessions() {
         let listed = ListedSession::of(&session);
         let row = &listed.rows[0];
-        for marker in session.markers.iter().filter(|marker| marker.is_searched) {
+        for marker in &session.markers {
             let literal = Literal::new(marker.text.to_owned());
             match listed.context_line(&quoted(marker.text)) {
                 Some(line) if literal.matches(&line) => lines += 1,

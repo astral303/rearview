@@ -152,49 +152,37 @@ pub(crate) struct FixtureIds {
 }
 
 /// One record kind in a fixture session and its marker text. Every output
-/// shows it.
+/// shows it, and the session list's search and `agent search` both find it.
 pub(crate) struct Marker {
     pub(crate) record: &'static str,
     pub(crate) text: &'static str,
-    /// True when the session list's search and `agent search` both find the
-    /// marker; false when neither does.
-    pub(crate) is_searched: bool,
     /// True for a marker in a call's header, a launch prompt or a sub-agent's
     /// message: `agent read --tools --subagents` shows it.
     pub(crate) is_in_call_or_subagent: bool,
-    /// The summary-mode row of the run holding the marker's call; `None` for a
-    /// marker outside a call, or in a `Tool::Other` call: such a call shows
-    /// its input as JSON.
+    /// The summary-mode row of the run containing the marker's call. The
+    /// tests check that row, and that the outputs don't show the marker
+    /// beside a JSON key. `None` skips both checks, as for a marker outside a
+    /// call or in input the viewer shows as JSON.
     pub(crate) summary_row: Option<&'static str>,
 }
 
 impl Marker {
-    /// A marker both searches find.
-    pub(crate) fn searched(record: &'static str, text: &'static str) -> Self {
+    /// A marker outside a call's header, a launch prompt and a sub-agent's
+    /// message, such as in a call's body.
+    pub(crate) fn shown(record: &'static str, text: &'static str) -> Self {
         Self {
             record,
             text,
-            is_searched: true,
             is_in_call_or_subagent: false,
             summary_row: None,
         }
     }
 
-    /// A marker both searches find, in a call's header, a launch prompt or a
-    /// sub-agent's message.
+    /// A marker in a call's header, a launch prompt or a sub-agent's message.
     pub(crate) fn in_call_or_subagent(record: &'static str, text: &'static str) -> Self {
         Self {
             is_in_call_or_subagent: true,
-            ..Self::searched(record, text)
-        }
-    }
-
-    /// A marker in a call's body: the viewer shows it, and neither search
-    /// finds it.
-    pub(crate) fn unsearched(record: &'static str, text: &'static str) -> Self {
-        Self {
-            is_searched: false,
-            ..Self::searched(record, text)
+            ..Self::shown(record, text)
         }
     }
 

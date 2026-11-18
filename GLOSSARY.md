@@ -6,6 +6,7 @@ identifiers.
 | Term | Meaning | Replaces |
 |---|---|---|
 | agent | A coding agent whose sessions rearview reads, such as Claude Code or Codex. In code, an agent's provider reads its sessions; see [PROVIDERS.md](PROVIDERS.md). | |
+| collapsed | Shown as one row or line that stands for more. The viewer shows a collapsed tool run as one row. `agent read` of several messages prints a collapsed tool call: the call's line, plus `(+N lines)` for the lines it leaves out. Expanding the run, or reading the call's message alone, shows the rest. | |
 | ignored | Skipped and reported: `Codex │ 12 ignored: compressed sessions unsupported`. | not read, unread |
 | limit | The most a count, size or length may reach: a line limit, a budget. | cap, bound |
 | low space | A cache's drive holding less free space than the 1 GB a write to the session cache or the passage store needs; `low_space` in identifiers. The session cache stops and is deleted; the passage store skips the write. "Low on space" is its predicate form: the drive is low on space. | short of space |

@@ -2044,9 +2044,7 @@ fn output_text(payload: &Map<String, Value>) -> String {
 
 /// A message between agents of a multi-agent run. A sub-agent's final answer
 /// reads as a task report: the report the sub-agent hands back. Any other
-/// message is modelled as a tool call, the same treatment Claude's Task
-/// dispatches get: visible in the viewer, absent from the search index, while
-/// the sub-agent's own transcript carries the searchable content.
+/// message is a tool call whose input the viewer shows as JSON.
 fn inter_agent_message(
     payload: &Map<String, Value>,
     timestamp: Option<String>,

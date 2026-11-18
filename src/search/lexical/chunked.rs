@@ -1,4 +1,4 @@
-//! Matches the search texts held in memory in chunks of about equal size
+//! Matches the search texts held in memory in chunks of about equal cost
 //! across threads, whichever session holds them, then adds each session's
 //! counts together, so one large session doesn't keep one thread busy while
 //! the others wait.
@@ -12,9 +12,21 @@ use std::ops::Range;
 /// Chunks per thread: texts differ in size, so more chunks than threads
 /// keep every thread busy until the last chunk ends.
 const CHUNKS_PER_THREAD: usize = 4;
-/// The least text a chunk holds, so a search of little text is not split
+/// The least cost a chunk holds, so a search of little text is not split
 /// into chunks costing more to schedule than to match.
-const MIN_CHUNK_BYTES: usize = 256 * 1024;
+const MIN_CHUNK_COST: usize = 256 * 1024;
+/// A text's cost beyond its bytes, in bytes: counting a text of a few bytes
+/// takes about as long as scanning 200 to 400 bytes of a long one, as
+/// measured with the list's search counting words and quoted text over
+/// sessions of long texts and of very short ones. Without it, a session of
+/// many short texts fits in one chunk and keeps one thread busy after the
+/// others finish.
+const COST_PER_TEXT: usize = 256;
+
+/// The cost of counting a text of `length` bytes, in bytes.
+fn text_cost(length: usize) -> usize {
+    length + COST_PER_TEXT
+}
 
 impl Counts {
     /// Adds `other`, the counts of other texts of the same session, as
@@ -40,28 +52,29 @@ pub(super) fn count_held(
     sessions: &[(usize, &SessionSearchTexts)],
     query: &RawQuery<'_>,
 ) -> HashMap<usize, Counts> {
-    let total_bytes: usize = sessions
+    let total_cost: usize = sessions
         .iter()
-        .map(|(_, texts)| texts.text_lengths().sum::<usize>())
+        .flat_map(|(_, texts)| texts.text_lengths())
+        .map(text_cost)
         .sum();
-    let chunk_bytes =
-        (total_bytes / (rayon::current_num_threads() * CHUNKS_PER_THREAD)).max(MIN_CHUNK_BYTES);
-    count_in_chunks(sessions, query, chunk_bytes)
+    let chunk_cost =
+        (total_cost / (rayon::current_num_threads() * CHUNKS_PER_THREAD)).max(MIN_CHUNK_COST);
+    count_in_chunks(sessions, query, chunk_cost)
 }
 
-/// [`count_held`], each chunk holding at least `chunk_bytes` of text, or the
-/// rest.
+/// [`count_held`], each chunk holding texts costing at least `chunk_cost`,
+/// or the rest.
 fn count_in_chunks(
     sessions: &[(usize, &SessionSearchTexts)],
     query: &RawQuery<'_>,
-    chunk_bytes: usize,
+    chunk_cost: usize,
 ) -> HashMap<usize, Counts> {
     let matcher = query.matcher();
     let mut counts: HashMap<usize, Counts> = sessions
         .iter()
         .map(|(index, _)| (*index, matcher.counts()))
         .collect();
-    let chunk_counts = chunks(sessions, chunk_bytes)
+    let chunk_counts = chunks(sessions, chunk_cost)
         .into_par_iter()
         .map(|chunk| {
             let mut matcher = query.matcher();
@@ -95,29 +108,29 @@ struct Run<'t> {
     positions: Range<usize>,
 }
 
-/// The texts of `sessions` in order, cut into chunks once each holds
-/// `chunk_bytes` of text.
+/// The texts of `sessions` in order, split into chunks once each contains
+/// texts costing `chunk_cost`.
 fn chunks<'t>(
     sessions: &[(usize, &'t SessionSearchTexts)],
-    chunk_bytes: usize,
+    chunk_cost: usize,
 ) -> Vec<Vec<Run<'t>>> {
     let mut chunks = Vec::new();
     let mut chunk = Vec::new();
-    let mut bytes = 0;
+    let mut cost = 0;
     for &(index, texts) in sessions {
         let mut start = 0;
         let lengths = texts.text_lengths();
         let count = lengths.len();
         for (position, length) in lengths.enumerate() {
-            bytes += length;
-            if bytes >= chunk_bytes {
+            cost += text_cost(length);
+            if cost >= chunk_cost {
                 chunk.push(Run {
                     index,
                     texts,
                     positions: start..position + 1,
                 });
                 chunks.push(std::mem::take(&mut chunk));
-                bytes = 0;
+                cost = 0;
                 start = position + 1;
             }
         }
@@ -185,16 +198,58 @@ mod tests {
             (&vec![PREFIX_LIMIT, 1, 0], ADJACENCY_LIMIT),
             "the session's counts reach their limits"
         );
-        for chunk_bytes in [1, 5, 12, 30] {
+        for chunk_cost in [1, 5, 12, 30, COST_PER_TEXT + 30, 3 * COST_PER_TEXT] {
             assert!(
-                chunks(&sessions, chunk_bytes).len() > 1,
-                "the session spans several chunks of {chunk_bytes} bytes"
+                chunks(&sessions, chunk_cost).len() > 1,
+                "the session spans several chunks costing {chunk_cost}"
             );
             assert_eq!(
-                summary(&count_in_chunks(&sessions, &query, chunk_bytes)[&7]),
+                summary(&count_in_chunks(&sessions, &query, chunk_cost)[&7]),
                 one_thread,
-                "chunks of {chunk_bytes} bytes give one thread's counts"
+                "chunks costing {chunk_cost} give one thread's counts"
             );
+        }
+    }
+
+    #[test]
+    fn sessions_of_short_texts_spread_over_chunks_by_their_count_and_count_as_one_thread_does() {
+        let short_texts = |word: &str| {
+            (0..12)
+                .map(|hour| claude_user_record(&format!("{word} {hour}"), october(1, hour)))
+                .collect::<Vec<_>>()
+        };
+        let cached = cached_claude_sessions(&[
+            ("first", short_texts("needle")),
+            ("second", short_texts("haystack needle")),
+        ]);
+        let held = cached
+            .rows
+            .iter()
+            .map(|row| SessionSearchTexts::read(row.cached_session.as_ref().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        let sessions = [(0, &held[0]), (1, &held[1])];
+        let bytes: usize = held.iter().flat_map(|texts| texts.text_lengths()).sum();
+        let chunk_cost = 4 * COST_PER_TEXT;
+        assert!(
+            bytes < chunk_cost && chunks(&sessions, chunk_cost).len() > 2,
+            "{bytes} bytes of text, less than one chunk's cost, spread over several chunks by their count"
+        );
+
+        let literals = [Literal::new("needle 1".to_owned())];
+        let pairs = ["haystack needle".to_owned()];
+        for query in [
+            RawQuery::new(&["needle", "haystack"], &pairs, &[]),
+            RawQuery::new(&[], &[], &literals),
+        ] {
+            let one_thread = count_in_chunks(&sessions, &query, usize::MAX);
+            let spread = count_in_chunks(&sessions, &query, chunk_cost);
+            for index in [0, 1] {
+                assert_eq!(
+                    summary(&spread[&index]),
+                    summary(&one_thread[&index]),
+                    "session {index} counts as one thread counts it"
+                );
+            }
         }
     }
 }

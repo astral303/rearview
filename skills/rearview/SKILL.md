@@ -179,5 +179,5 @@ then a bounded read. Use `--tools`, `--tool-results`, `--thinking`, or
 `--subagents` only when that content is relevant. `read` reports what
 they hide as `hidden-<flag>=` atoms and `hidden` records. `--tools`
 shows each tool call's command, file or pattern, such as `Bash: cargo test`;
-`(+N lines)` counts the command's other lines: search matches them, and
+`(+N lines)` counts the call's other lines: search matches them, and
 `read ch_1234abcd5678:m7.2` shows them.
