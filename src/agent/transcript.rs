@@ -1117,35 +1117,39 @@ fn shown_body_text(text: &str) -> Option<String> {
     unless_blank(text)
 }
 
-/// The lines of a shell command that `agent read` shows.
+/// The lines of a tool call that `agent read` shows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CommandLines {
-    /// The first non-empty line, then a count of the others.
-    FirstLine,
-    All,
+pub(crate) enum CallLines {
+    /// As a read of several messages shows it: a shell command's first
+    /// non-empty line, then a count of the others.
+    Collapsed,
+    /// As a read of one message or one call shows it: every line of a shell
+    /// command.
+    Whole,
 }
 
 /// A tool call as `agent read` shows it: the header of [`tool_call_text`] on
 /// one line, truncated to a search segment, then the whole [`launch_prompt`].
-/// Any other body is left out. With [`CommandLines::All`], a shell command
+/// Any other body is left out. With [`CallLines::Whole`], a shell command
 /// shows every line, untruncated.
 pub(crate) fn tool_call_read_text(
     name: &str,
     tool: Tool,
     input: &Value,
-    lines: CommandLines,
+    lines: CallLines,
 ) -> String {
     let header = tool_call_header(name, tool, input);
-    let shown =
-        if lines == CommandLines::All && header.value_is_command && !header.value.trim().is_empty()
-        {
-            sanitize_agent_text(&whole_command(&header))
-        } else {
-            truncate_chars(
-                &sanitize_agent_text(&tool_call_line(&header, name, input)),
-                MAX_AGENT_SEGMENT_CHARS,
-            )
-        };
+    let shown = if lines == CallLines::Whole
+        && header.value_is_command
+        && !header.value.trim().is_empty()
+    {
+        sanitize_agent_text(&whole_command(&header))
+    } else {
+        truncate_chars(
+            &sanitize_agent_text(&tool_call_line(&header, name, input)),
+            MAX_AGENT_SEGMENT_CHARS,
+        )
+    };
     with_launch_prompt(shown, tool, input)
 }
 
@@ -1872,7 +1876,7 @@ mod tests {
     fn agent_read_shows_tool_calls_header_on_one_line() {
         let grep = serde_json::json!({"pattern": "first\nsecond", "path": "src"});
 
-        for lines in [CommandLines::FirstLine, CommandLines::All] {
+        for lines in [CallLines::Collapsed, CallLines::Whole] {
             assert_eq!(
                 tool_call_read_text("Bash", Tool::Shell, &shell_input("cargo test"), lines),
                 "Bash: cargo test"
@@ -1891,7 +1895,7 @@ mod tests {
                 "Bash",
                 Tool::Shell,
                 &shell_input(command),
-                CommandLines::FirstLine,
+                CallLines::Collapsed,
             )
         };
 
@@ -1905,7 +1909,7 @@ mod tests {
 
     #[test]
     fn one_message_read_shows_command_whole_and_untruncated() {
-        let read = |command| tool_call_read_text("Bash", Tool::Shell, &command, CommandLines::All);
+        let read = |command| tool_call_read_text("Bash", Tool::Shell, &command, CallLines::Whole);
         let long = "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2);
 
         assert_eq!(
@@ -1943,7 +1947,7 @@ mod tests {
     fn read_shows_call_viewer_shows_as_raw_input_as_its_name_and_input_keys() {
         let input = serde_json::json!({"todos": [{"content": "ship it"}]});
 
-        for lines in [CommandLines::FirstLine, CommandLines::All] {
+        for lines in [CallLines::Collapsed, CallLines::Whole] {
             assert_eq!(
                 tool_call_read_text("TodoWrite", Tool::Other, &input, lines),
                 "tool TodoWrite input_keys=todos"
@@ -1988,7 +1992,7 @@ mod tests {
             tool_call_text("Edit", Tool::Edit, &edit),
             "Edit: src/lib.rs\n-old line\n+new line"
         );
-        for lines in [CommandLines::FirstLine, CommandLines::All] {
+        for lines in [CallLines::Collapsed, CallLines::Whole] {
             assert_eq!(
                 tool_call_read_text("Edit", Tool::Edit, &edit, lines),
                 "Edit: src/lib.rs"
@@ -2075,7 +2079,7 @@ mod tests {
      {
         let command = shell_input(&"x".repeat(MAX_AGENT_SEGMENT_CHARS * 2));
 
-        let read = tool_call_read_text("Bash", Tool::Shell, &command, CommandLines::FirstLine);
+        let read = tool_call_read_text("Bash", Tool::Shell, &command, CallLines::Collapsed);
         let searched = tool_call_text("Bash", Tool::Shell, &command);
 
         assert_eq!(read.chars().count(), MAX_AGENT_SEGMENT_CHARS);

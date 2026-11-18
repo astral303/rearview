@@ -16,7 +16,7 @@ use crate::agent::time_span::{
     Day, DayRecords, RangeSpans, RecordTime, TimeSpan, output_offset, time_atoms, tz_atom,
 };
 use crate::agent::transcript::{
-    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, CommandLines,
+    AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, CallLines,
     tool_call_read_text,
 };
 use crate::agent::visibility::ContentVisibility;
@@ -147,13 +147,13 @@ impl ReadRequest<'_> {
             .is_some_and(|message| message.parent_tool_use_id.is_some())
     }
 
-    /// Every line of each command for a call read alone, or in a read of
-    /// one message (`one_message`); each command's first line otherwise.
-    fn command_lines(&self, one_message: bool) -> CommandLines {
+    /// Each call whole when read alone, or in a read of one message
+    /// (`one_message`); collapsed otherwise.
+    fn call_lines(&self, one_message: bool) -> CallLines {
         if one_message || self.call.is_some() {
-            CommandLines::All
+            CallLines::Whole
         } else {
-            CommandLines::FirstLine
+            CallLines::Collapsed
         }
     }
 
@@ -334,7 +334,7 @@ impl<'a> RenderedMessage<'a> {
                 BlockOwner::Call(call) => {
                     let call = &content.calls[call];
                     let copy = if repeatable {
-                        call.header_copy
+                        call.copy
                     } else {
                         CallCopy::Truncated
                     };
@@ -537,7 +537,7 @@ impl<'a> MessageContent<'a> {
         let mut calls_then_their_results = calls
             .iter()
             .enumerate()
-            .map(|(index, call)| (call.address, BlockOwner::Call(index), call.header.clone()))
+            .map(|(index, call)| (call.address, BlockOwner::Call(index), call.text.clone()))
             .chain(results.iter().enumerate().map(|(index, result)| {
                 (
                     result.call.address,
@@ -703,14 +703,14 @@ struct ContentBlock {
 }
 
 /// The map from the lines of a message's content to the numbering `--lines`
-/// reads: the lines of a one-message read, each command whole.
+/// reads: the lines of a one-message read, each call whole.
 #[derive(Clone, Debug)]
 enum LineNumbering {
     /// Line `i` of the content is line `i + 1`.
     Own,
-    /// The content shows a command's first line alone, as a read of several
-    /// messages does: a call's header has fewer lines than `--lines` counts.
-    CommandsShortened,
+    /// The content shows each call collapsed, as a read of several
+    /// messages does: a call has fewer lines than `--lines` counts.
+    CallsCollapsed,
     /// The line each line of part of the content shows, as a slice or a call
     /// read alone shows it; `None` for a `...` between a slice's runs.
     Part(Vec<Option<usize>>),
@@ -718,8 +718,8 @@ enum LineNumbering {
 
 impl LineNumbering {
     /// The first and last line, in the numbering `--lines` reads, of the
-    /// content from its line `first_omitted` on. A call's header shortened
-    /// in the content is reread whole.
+    /// content from its line `first_omitted` on. A call collapsed in the
+    /// content is reread whole.
     fn reread_lines(&self, content: &MessageContent<'_>, first_omitted: usize) -> (usize, usize) {
         match self {
             Self::Own => (first_omitted + 1, content.text.split('\n').count()),
@@ -731,7 +731,7 @@ impl LineNumbering {
                     .unwrap_or(last);
                 (first, last)
             }
-            Self::CommandsShortened => {
+            Self::CallsCollapsed => {
                 let mut next_line = 1;
                 let mut first = None;
                 for block in &content.blocks {
@@ -743,7 +743,7 @@ impl LineNumbering {
                         });
                     }
                     next_line += match block.owner {
-                        BlockOwner::Call(call) => content.calls[call].whole_header_lines(),
+                        BlockOwner::Call(call) => content.calls[call].whole_lines(),
                         _ => block.lines,
                     };
                 }
@@ -767,9 +767,11 @@ struct Omission {
 struct ShownCall<'a> {
     address: CallAddress,
     time: Option<TimeSpan>,
-    header: String,
-    /// `Abbreviated` when `header` shortens a command, `Whole` otherwise.
-    header_copy: CallCopy,
+    /// The call's lines as the read shows them.
+    text: String,
+    /// `Collapsed` when `text` leaves out lines of the call, `Whole`
+    /// otherwise.
+    copy: CallCopy,
     name: &'a str,
     tool: Tool,
     input: &'a Value,
@@ -795,10 +797,9 @@ impl ShownCall<'_> {
         }
     }
 
-    /// The lines of the header as a one-message read shows it, each line of
-    /// a command.
-    fn whole_header_lines(&self) -> usize {
-        tool_call_read_text(self.name, self.tool, self.input, CommandLines::All)
+    /// The lines of the call as a one-message read shows it.
+    fn whole_lines(&self) -> usize {
+        tool_call_read_text(self.name, self.tool, self.input, CallLines::Whole)
             .split('\n')
             .count()
     }
@@ -1192,7 +1193,7 @@ pub fn format_read_with_warnings(
         header_options = header_options.showing(request_options.visibility());
         let shape = ReadShape {
             options: request_options,
-            commands: request.command_lines(one_message),
+            call_lines: request.call_lines(one_message),
             slice,
             anchors: one_message && request.call.is_none(),
             zone,
@@ -1533,7 +1534,7 @@ impl<'a> OutlineMessages<'a> {
                     message,
                     &index.links,
                     options,
-                    CommandLines::FirstLine,
+                    CallLines::Collapsed,
                     zone,
                 )?;
                 rendered.name_subagents(&index.subagents);
@@ -1884,7 +1885,7 @@ fn tail_messages<'a>(
                 message,
                 links,
                 shape.options,
-                CommandLines::FirstLine,
+                CallLines::Collapsed,
                 shape.zone,
             )
             .is_some()
@@ -1914,7 +1915,7 @@ fn reads_one_message(requests: &[ReadRequest<'_>]) -> bool {
 /// The options a read renders each message with.
 struct ReadShape<'s> {
     options: ProtocolOptions,
-    commands: CommandLines,
+    call_lines: CallLines,
     slice: Option<&'s ReadSlice>,
     /// True for a one-message read: its record carries `anchor=`.
     anchors: bool,
@@ -1963,7 +1964,7 @@ fn read_entries<'a>(
             message,
             &index.links,
             options,
-            shape.commands,
+            shape.call_lines,
             shape.zone,
         ) {
             Some(mut rendered) => {
@@ -2113,21 +2114,21 @@ fn shown_message<'a>(
     message: &'a AgentMessage,
     links: &CallLinks<'a>,
     options: ProtocolOptions,
-    commands: CommandLines,
+    call_lines: CallLines,
     zone: Zone,
 ) -> Option<RenderedMessage<'a>> {
     if !is_in_window(message, options.window) {
         return None;
     }
-    render_message_with_commands(conversation, message, links, options, commands, zone)
+    render_message(conversation, message, links, options, call_lines, zone)
 }
 
-fn render_message_with_commands<'a>(
+fn render_message<'a>(
     conversation: &'a ResolvedConversation,
     message: &'a AgentMessage,
     links: &CallLinks<'a>,
     options: ProtocolOptions,
-    commands: CommandLines,
+    call_lines: CallLines,
     zone: Zone,
 ) -> Option<RenderedMessage<'a>> {
     let visibility = options.visibility();
@@ -2178,13 +2179,13 @@ fn render_message_with_commands<'a>(
                 input,
                 source,
             } => {
-                let header = tool_call_read_text(name, *tool, input, commands);
-                let header_copy = if commands == CommandLines::All
-                    || header == tool_call_read_text(name, *tool, input, CommandLines::All)
+                let text = tool_call_read_text(name, *tool, input, call_lines);
+                let copy = if call_lines == CallLines::Whole
+                    || text == tool_call_read_text(name, *tool, input, CallLines::Whole)
                 {
                     CallCopy::Whole
                 } else {
-                    CallCopy::Abbreviated
+                    CallCopy::Collapsed
                 };
                 Some(ShownCall {
                     address: CallAddress {
@@ -2192,8 +2193,8 @@ fn render_message_with_commands<'a>(
                         number,
                     },
                     time: source.timestamp.as_deref().and_then(TimeSpan::of_timestamp),
-                    header,
-                    header_copy,
+                    text,
+                    copy,
                     name,
                     tool: *tool,
                     input,
@@ -2204,7 +2205,7 @@ fn render_message_with_commands<'a>(
             }
             _ => None,
         })
-        .filter(|call| !call.header.trim().is_empty())
+        .filter(|call| !call.text.trim().is_empty())
         .collect::<Vec<_>>();
     let body = body
         .into_iter()
@@ -2213,9 +2214,9 @@ fn render_message_with_commands<'a>(
         .join("\n");
     results.retain(|result| !result.text.trim().is_empty());
     answered.dedup();
-    let numbering = match commands {
-        CommandLines::All => LineNumbering::Own,
-        CommandLines::FirstLine => LineNumbering::CommandsShortened,
+    let numbering = match call_lines {
+        CallLines::Whole => LineNumbering::Own,
+        CallLines::Collapsed => LineNumbering::CallsCollapsed,
     };
     (!body.is_empty() || !calls.is_empty() || !results.is_empty()).then(|| {
         let content = MessageContent::new(body, calls, results, numbering);
@@ -3249,7 +3250,7 @@ mod tests {
                     message,
                     &links,
                     options(),
-                    CommandLines::FirstLine,
+                    CallLines::Collapsed,
                     Zone::System,
                 )
             })
@@ -6573,17 +6574,12 @@ mod tests {
         };
         let links = CallLinks::of(transcript);
         let one_message = range.is_some_and(|range| range.is_single());
-        let commands = if one_message {
-            CommandLines::All
-        } else {
-            CommandLines::FirstLine
-        };
         let rendered = shown_message(
             request.resolved,
             &transcript.messages[0],
             &links,
             options,
-            commands,
+            request.call_lines(one_message),
             Zone::System,
         )
         .unwrap();
@@ -6680,7 +6676,7 @@ mod tests {
             &transcript.messages[0],
             &links,
             with_tools,
-            CommandLines::FirstLine,
+            CallLines::Collapsed,
             Zone::System,
         )
         .unwrap();
@@ -7690,7 +7686,7 @@ mod tests {
                         &transcript.messages[0],
                         &links,
                         options,
-                        CommandLines::FirstLine,
+                        CallLines::Collapsed,
                         Zone::System,
                     )
                     .unwrap();
@@ -7757,7 +7753,7 @@ mod tests {
             &transcript.messages[0],
             &links,
             call_flags()[0],
-            CommandLines::FirstLine,
+            CallLines::Collapsed,
             Zone::System,
         )
         .unwrap();
@@ -8300,7 +8296,7 @@ mod tests {
     }
 
     #[test]
-    fn call_read_alone_doesnt_repeat_abbreviated_copy() {
+    fn call_read_alone_doesnt_repeat_collapsed_copy() {
         let transcript = one_command_run_twice();
         let resolved = resolved("session.jsonl");
         let first_run = ReadRequest {
@@ -8330,7 +8326,7 @@ mod tests {
     }
 
     #[test]
-    fn abbreviated_call_repeats_copy_read_alone() {
+    fn collapsed_call_repeats_copy_read_alone() {
         let transcript = one_command_run_twice();
         let resolved = resolved("session.jsonl");
         let first_call = ReadRequest {
