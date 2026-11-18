@@ -136,7 +136,7 @@ impl App {
     /// Open the name box on the listed session at `session`, filled with its
     /// title.
     pub(super) fn open_rename(&mut self, session: PathBuf) {
-        let Some(row) = self.conversations.iter().find(|row| row.path == session) else {
+        let Some(row) = self.listed_row(&session) else {
             return;
         };
         let input = row.custom_title.clone().unwrap_or_default();

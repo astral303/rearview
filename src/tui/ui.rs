@@ -1476,17 +1476,12 @@ fn centered_modal_area(area: Rect, preferred_width: u16, preferred_height: u16) 
 }
 
 /// `Delete "<title>"? (y/n)` for the session at `session`, its title
-/// shortened to fit `area`.
+/// truncated to fit `area`.
 fn render_confirm_dialog(frame: &mut Frame, app: &App, session: &Path, area: Rect) {
     const QUESTION_START: &str = "Delete \"";
     const QUESTION_END: &str = "\"? ";
     const ANSWERS: &str = "(y/n)";
-    let title = app
-        .conversations()
-        .iter()
-        .find(|row| row.path == session)
-        .map(row_title)
-        .unwrap_or_default();
+    let title = app.listed_row(session).map(row_title).unwrap_or_default();
     let title_width = usize::from(area.width)
         .saturating_sub(1 + QUESTION_START.width() + QUESTION_END.width() + ANSWERS.width());
     let question = format!(
@@ -1502,8 +1497,8 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, session: &Path, area: Rec
     frame.render_widget(paragraph, area);
 }
 
-/// The title `row` shows: its custom title, else its summary, else its
-/// preview.
+/// The title the delete prompt names `row`'s session by: its custom title,
+/// else its summary, else its preview.
 fn row_title(row: &Conversation) -> String {
     [&row.custom_title, &row.summary]
         .into_iter()
@@ -1989,10 +1984,10 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
 
     let list = List::new(visible_items);
     frame.render_widget(list, area);
+    let lines_above_separator = lines_per_item as u16 - 1;
     for relative_idx in deleting_rows {
         let top = area.y + (relative_idx * lines_per_item) as u16;
-        // The row's lines without its separator.
-        let row = Rect::new(area.x, top, area.width, lines_per_item as u16 - 1).intersection(area);
+        let row = Rect::new(area.x, top, area.width, lines_above_separator).intersection(area);
         dim_area(frame, row);
     }
 }

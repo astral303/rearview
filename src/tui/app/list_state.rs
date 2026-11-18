@@ -3,11 +3,15 @@ use crate::clock::Moment;
 use crate::error::AppError;
 use crate::history::provider::Deleted;
 use crate::history::{Conversation, ExcludedProjects, Workspace};
-use crate::tui::list_change::{ListChange, ListChangeOutcome};
+use crate::tui::list_change::{DeleteStages, ListChange, ListChangeOutcome};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const LIST_PAGE_ROWS: isize = 10;
+
+/// A delete at least this long records its stages in the debug log.
+const SLOW_DELETE_THRESHOLD: Duration = Duration::from_secs(1);
 
 /// The session the list's selection stays on while the rows change.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +281,11 @@ impl App {
             .map(|&idx| self.conversations[idx].path.clone())
     }
 
+    /// The listed row of the session at `path`.
+    pub fn listed_row(&self, path: &Path) -> Option<&Conversation> {
+        self.conversations.iter().find(|row| row.path == path)
+    }
+
     pub(crate) fn has_multiple_sources(&self) -> bool {
         let sources = self
             .conversations
@@ -286,30 +295,24 @@ impl App {
         sources.len() > 1
     }
 
-    #[cfg(test)]
-    pub(super) fn get_selected_conversation_index(&self) -> Option<usize> {
-        self.selected
-            .and_then(|sel| self.filtered.get(sel))
-            .copied()
-    }
-
     /// Ask the background worker to delete the listed session at `path`, and
     /// show its row as deleting until the delete ends: greyed, and passed
     /// over by the selection. A viewer of the session closes, so the list
     /// shows the row.
     pub(crate) fn request_delete(&mut self, path: &Path) {
-        let Some(row) = self.conversations.iter().find(|row| row.path == path) else {
+        let Some(source) = self.listed_row(path).map(|row| row.source) else {
             let _ = crate::debug_log::log_debug(
                 &format!("No listed session to delete at {}", path.display()),
                 self.clock(),
             );
             return;
         };
-        self.list_changes.push_back(ListChange::Delete {
-            source: row.source,
-            path: path.to_path_buf(),
-        });
         let now = self.clock().now();
+        self.list_changes.push_back(ListChange::Delete {
+            source,
+            path: path.to_path_buf(),
+            confirmed_at: now,
+        });
         self.deleting.add(path.to_path_buf(), now);
         if self.is_viewing(path) {
             self.exit_view_mode();
@@ -341,7 +344,16 @@ impl App {
                 title,
                 result,
             } => self.finish_rename(&path, &title, result),
-            ListChangeOutcome::Deleted { path, result } => self.finish_delete(&path, result),
+            ListChangeOutcome::Deleted {
+                path,
+                result,
+                stages,
+            } => {
+                let update_started_at = self.clock().now();
+                self.finish_delete(&path, result);
+                let list_update = self.clock().elapsed_since(update_started_at);
+                self.log_slow_delete(&path, stages, list_update);
+            }
         }
     }
 
@@ -366,6 +378,32 @@ impl App {
                 self.report_delete_failure(&error);
             }
         }
+    }
+
+    /// Record in the debug log the time each stage of a delete of the session
+    /// at `path` took, when the delete took [`SLOW_DELETE_THRESHOLD`] or
+    /// longer from the user's `y`: `stages` in the queue and on the
+    /// background worker, then `list_update`.
+    fn log_slow_delete(&self, path: &Path, stages: DeleteStages, list_update: Duration) {
+        let total =
+            stages.queue + stages.ownership + stages.write_batch + stages.provider + list_update;
+        if total < SLOW_DELETE_THRESHOLD {
+            return;
+        }
+        let _ = crate::debug_log::log_debug(
+            &format!(
+                "Slow delete of {}: {} ms: queue {} ms, refresh ownership {} ms, \
+                 write batch {} ms, provider {} ms, list update {} ms",
+                path.display(),
+                total.as_millis(),
+                stages.queue.as_millis(),
+                stages.ownership.as_millis(),
+                stages.write_batch.as_millis(),
+                stages.provider.as_millis(),
+                list_update.as_millis(),
+            ),
+            self.clock(),
+        );
     }
 
     pub(crate) fn report_delete_failure(&mut self, error: &AppError) {
@@ -435,7 +473,7 @@ impl App {
         let is_unlisted = self
             .dialog_mode
             .session()
-            .is_some_and(|session| !self.conversations.iter().any(|row| row.path == session));
+            .is_some_and(|session| self.listed_row(session).is_none());
         if is_unlisted {
             self.dialog_mode = DialogMode::None;
         }

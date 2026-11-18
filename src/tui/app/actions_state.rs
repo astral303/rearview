@@ -61,10 +61,7 @@ impl App {
 
     /// The agent of the listed session at `session`.
     fn listed_source(&self, session: &Path) -> Option<Source> {
-        self.conversations
-            .iter()
-            .find(|row| row.path == session)
-            .map(|row| row.source)
+        self.listed_row(session).map(|row| row.source)
     }
 
     /// The availability of `action` on `session`, without waiting for a

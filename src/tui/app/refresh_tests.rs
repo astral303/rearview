@@ -61,8 +61,9 @@ pub(super) fn listed_names(app: &App) -> Vec<&str> {
 }
 
 pub(super) fn selected_name(app: &App) -> Option<&str> {
-    app.get_selected_conversation_index()
-        .map(|index| app.conversations()[index].session_id.as_str())
+    app.selected()
+        .and_then(|row| app.filtered().get(row))
+        .map(|&index| app.conversations()[index].session_id.as_str())
 }
 
 /// The sender of `app`'s search results, in place of its search worker's.
@@ -343,6 +344,7 @@ pub(super) fn finish_deleting(app: &mut App, path: &Path) {
     app.finish_list_change(crate::tui::list_change::ListChangeOutcome::Deleted {
         path: path.to_path_buf(),
         result: Ok(crate::history::provider::Deleted::just_the_session()),
+        stages: crate::tui::list_change::DeleteStages::default(),
     });
 }
 
@@ -570,7 +572,7 @@ pub(super) fn serve_list_change(app: &mut App) {
             crate::history::Patience::UntilAcquired,
             Arc::default(),
         );
-        let outcome = change.make(&operation);
+        let outcome = change.make(&operation, environment.clock().as_ref());
         operation.finish().fail_if_low_space().unwrap();
         outcome
     })

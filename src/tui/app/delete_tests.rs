@@ -8,7 +8,7 @@ use super::refresh_tests::{
 };
 use super::*;
 use crate::history::{RefreshOutcome, SessionChanges, UpdatedSession};
-use crate::tui::list_change::ListChange;
+use crate::tui::list_change::{ListChange, ListChangeOutcome};
 
 /// An app listing sessions `c`, `b` and `a`, newest first.
 fn three_sessions() -> App {
@@ -286,19 +286,24 @@ fn serve_every_list_change(app: &mut App) -> Vec<PathBuf> {
         served.push(match &change {
             ListChange::Rename { path, .. } | ListChange::Delete { path, .. } => path.clone(),
         });
-        let environment = app.environment.clone();
-        let outcome = std::thread::spawn(move || {
-            let operation =
-                crate::history::environment::test_support::waiting_operation(&environment);
-            let outcome = change.make(&operation);
-            operation.finish().fail_if_low_space().unwrap();
-            outcome
-        })
-        .join()
-        .unwrap();
+        let outcome = make_as_worker(app, change);
         app.finish_list_change(outcome);
     }
     served
+}
+
+/// Make `change` in `app`'s environment on a thread of its own, as the
+/// worker makes it.
+fn make_as_worker(app: &App, change: ListChange) -> ListChangeOutcome {
+    let environment = app.environment.clone();
+    std::thread::spawn(move || {
+        let operation = crate::history::environment::test_support::waiting_operation(&environment);
+        let outcome = change.make(&operation, environment.clock().as_ref());
+        operation.finish().fail_if_low_space().unwrap();
+        outcome
+    })
+    .join()
+    .unwrap()
 }
 
 /// The Codex thread ID numbered `number`, which the rollout's file name
@@ -400,6 +405,7 @@ fn fail_deleting(app: &mut App, path: &std::path::Path) {
     app.finish_list_change(crate::tui::list_change::ListChangeOutcome::Deleted {
         path: path.to_path_buf(),
         result: Err(crate::error::AppError::DeleteRefused("refused".to_owned())),
+        stages: crate::tui::list_change::DeleteStages::default(),
     });
 }
 
@@ -580,6 +586,26 @@ fn bar_shows_deleting_for_single_session_and_count_for_multiple() {
     assert_eq!(app.deleting_status_text(), None);
 }
 
+#[test]
+fn delete_records_its_wait_in_the_queue_from_y() {
+    let clock = Arc::new(crate::clock::TestClock::default());
+    let mut app = three_sessions_on(&clock);
+    confirm_delete_of_named(&mut app, "b");
+    clock.advance(std::time::Duration::from_secs(2));
+
+    let change = app.begin_list_change().expect("the delete is queued");
+    let outcome = make_as_worker(&app, change);
+
+    let ListChangeOutcome::Deleted { stages, .. } = outcome else {
+        panic!("the delete ends with a delete's outcome");
+    };
+    assert_eq!(
+        stages.queue,
+        std::time::Duration::from_secs(2),
+        "the queue stage counts from y until the worker begins the delete"
+    );
+}
+
 /// Every character of the frame `app` draws `width` columns wide, row
 /// after row.
 fn drawn_rows(app: &App, width: u16) -> Vec<String> {
@@ -599,7 +625,7 @@ fn drawn_rows(app: &App, width: u16) -> Vec<String> {
 }
 
 #[test]
-fn prompt_names_session_by_its_title_shortened_to_fit() {
+fn prompt_names_session_by_its_title_truncated_to_fit() {
     let mut row = session("b", "b", 10, 1);
     row.custom_title = Some("Plan the release of the migration tool".to_owned());
     let mut app = app_listing(vec![row]);

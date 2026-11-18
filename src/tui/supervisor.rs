@@ -149,7 +149,7 @@ impl TaskSupervisor {
         self.change = Some((received, change.stopped()));
         self.run(Box::new(move || {
             let operation = operation(&environment);
-            let changed = change.make(&operation);
+            let changed = change.make(&operation, environment.clock().as_ref());
             // Ignore the operation's end: the change's own outcome carries
             // the error of a write that stopped it, low space included.
             let _ = operation.finish();
