@@ -27,6 +27,10 @@
     ` · N sessions unreadable` counts sessions whose texts could not be read.
   - Reading those texts takes about 5–6x as long as before. The list loads
     faster, and becomes searchable about 1.2x sooner after launch.
+- Speed up the session list's search for lowercase quoted text containing `k`
+  or `i` about 2–3x per keystroke when a result contains a Kelvin sign
+  (U+212A) or a dotted capital I (`İ`) (on one example corpus). Sessions
+  without either character aren't searched faster.
 - Open a large session about 2.5x faster (on one example corpus), and keep the
   list and its search drawing while it opens. Reading an open session again
   after a refresh no longer freezes the viewer.
