@@ -142,7 +142,11 @@ pub fn format_tool_call(
     if header.value_is_command {
         return format_shell(header.prefix, &header.value, max_width);
     }
-    FormattedToolCall::named(header.prefix, header.value, tool_body(tool, input))
+    FormattedToolCall::named(
+        header.prefix,
+        header.value,
+        tool_call_body(tool, input).and_then(ToolCallBody::shown),
+    )
 }
 
 /// The header of a call, built without its body.
@@ -183,15 +187,36 @@ pub fn tool_call_header(name: &str, tool: Tool, input: &Value) -> ToolCallHeader
     }
 }
 
+/// The body of a call whose header names it, as [`tool_call_body`] finds it.
+pub enum ToolCallBody<'a> {
+    /// A diff, a prompt, a message, or a launch's settings as `key: value`
+    /// lines; the viewer shows it as this text.
+    Text(ToolBody),
+    /// The input of a call [`tool_call_header`] has no layout for, or that
+    /// lacks its header field. The viewer shows it as pretty JSON.
+    RawInput(&'a Value),
+}
+
+impl ToolCallBody<'_> {
+    /// The body as the viewer shows it.
+    fn shown(self) -> Option<ToolBody> {
+        match self {
+            Self::Text(body) => Some(body),
+            Self::RawInput(input) => raw_input_body(input),
+        }
+    }
+}
+
 /// The body of a call whose header names it: a diff, a prompt, a message,
-/// or the raw input of a call [`tool_call_header`] has no layout for.
-fn tool_body(tool: Tool, input: &Value) -> Option<ToolBody> {
+/// or the raw input of a call [`tool_call_header`] has no layout for. A shell
+/// command's later lines are not a body here: its header holds them.
+pub fn tool_call_body(tool: Tool, input: &Value) -> Option<ToolCallBody<'_>> {
     if lacks_header_field(tool, input) {
-        return raw_input_body(input);
+        return Some(ToolCallBody::RawInput(input));
     }
     let plain_field =
         |key: &str| string_field(input, key).map(|text| ToolBody::plain(text.to_owned()));
-    match tool {
+    let text = match tool {
         Tool::Edit => edit_body(input),
         Tool::Skill => plain_field("args"),
         Tool::Agent => agent_body(input),
@@ -199,7 +224,9 @@ fn tool_body(tool: Tool, input: &Value) -> Option<ToolBody> {
         Tool::AgentReport if is_delivered_report(input) => None,
         Tool::AgentReport => plain_field("message"),
         Tool::WebFetch => plain_field("prompt"),
-        Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => raw_input_body(input),
+        Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => {
+            return Some(ToolCallBody::RawInput(input));
+        }
         Tool::Shell
         | Tool::UserShell
         | Tool::Read
@@ -209,7 +236,8 @@ fn tool_body(tool: Tool, input: &Value) -> Option<ToolBody> {
         | Tool::DirectoryListing
         | Tool::FileReference
         | Tool::WebSearch => None,
-    }
+    };
+    text.map(ToolCallBody::Text)
 }
 
 fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
