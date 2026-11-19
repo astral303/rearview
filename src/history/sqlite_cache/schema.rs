@@ -120,8 +120,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- then missing.
     entries_error TEXT,
     -- A number no earlier write of any session in this database carried,
-    -- from the `last_generation` meta counter. Every write gives the row a
-    -- new one, so a reader holding the old number sees the copy change.
+    -- from the `last_generation` meta counter, also across a rebuild (see
+    -- `numbering_start`). Every write gives the row a new one, so a reader
+    -- holding the old number sees the copy change.
     generation INTEGER NOT NULL,
     UNIQUE (storage, root, cache_key)
 );

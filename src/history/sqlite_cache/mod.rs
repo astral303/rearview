@@ -1072,16 +1072,38 @@ fn is_storage_current(connection: &Connection, storage: SessionCache) -> Result<
     )
 }
 
-/// The next generation for a session row: one more than the last, counted
-/// from 1 again once a rebuild or a low-space deletion drops `meta`.
+/// The next generation for a session row: one more than the last. Once a
+/// rebuild or a low-space deletion drops `meta`, starts a numbering at
+/// [`numbering_start`].
 fn next_generation(connection: &Connection) -> Result<i64> {
     Ok(connection.query_row(
-        "INSERT INTO meta (key, value) VALUES ('last_generation', '1') \
+        "INSERT INTO meta (key, value) VALUES ('last_generation', ?1) \
          ON CONFLICT (key) DO UPDATE SET value = CAST(value AS INTEGER) + 1 \
          RETURNING CAST(value AS INTEGER)",
-        [],
+        [numbering_start().to_string()],
         |row| row.get(0),
     )?)
+}
+
+/// The low bits of a generation that count the writes of its numbering.
+/// The bits above name the numbering: the millisecond it started.
+const NUMBERING_WRITE_BITS: u32 = 20;
+
+/// The first generation of a numbering starting now. A reader holding a
+/// generation of an earlier numbering doesn't find it again: numberings
+/// started in different milliseconds don't share a generation, and a later
+/// numbering's generations are greater unless the clock went back.
+fn numbering_start() -> i64 {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    (i64::try_from(started).unwrap_or(0) << NUMBERING_WRITE_BITS) | 1
+}
+
+/// True when the generations `first` and `second` are of one numbering:
+/// the writes between two starts of the generation counter.
+pub(crate) fn is_one_numbering(first: i64, second: i64) -> bool {
+    first >> NUMBERING_WRITE_BITS == second >> NUMBERING_WRITE_BITS
 }
 
 /// The keys `row` is stored under: the rows of the roots its files are

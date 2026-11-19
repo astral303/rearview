@@ -7,7 +7,8 @@ use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
     CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScannedCopy, ScannedRow,
-    SearchField, SessionKey, StoredAppend, TextVisitor, scan_search_texts_in_waves,
+    SearchField, SessionKey, StoredAppend, TextVisitor, is_one_numbering,
+    scan_search_texts_in_waves,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -80,6 +81,13 @@ impl SessionSearchTexts {
             } => Arc::new(held.with_append(generation, &append, texts)),
             CopyTexts::Whole { generation, texts } => Arc::new(laid_out(generation, vec![texts])),
         })
+    }
+
+    /// True when [`Self::read_after`] of the copy `generation` can merge an
+    /// append into these texts: their copy is of `generation`'s numbering.
+    /// A copy of another numbering, as after a rebuild, is read whole.
+    fn can_start_reread_of(&self, generation: i64) -> bool {
+        is_one_numbering(self.copy_generation, generation)
     }
 
     /// Merges `added` into these texts: `append` wrote `added` in the copy
@@ -564,8 +572,9 @@ impl std::fmt::Display for ReadFailure {
 
 /// The copies of the list's rows whose texts are to be read, and how.
 pub(crate) enum CopiesToRead {
-    /// Every row's copy, none with held texts an appended reread starts
-    /// from: at launch. One scan of the cache reads them, in waves.
+    /// Every row's copy, when no session has held texts for an appended
+    /// reread: at launch and after a cache rebuild. One scan of the cache
+    /// reads them, in waves.
     EveryRow(Vec<CachedSession>),
     /// The changed rows' copies, each session read on its own.
     EachSession {
@@ -784,9 +793,12 @@ impl SearchTextsInMemory {
     }
 
     /// Keeps the texts of the sessions `conversations` list and drops the
-    /// rest. Returns the copies whose texts are neither held nor being read,
-    /// now marked as being read: copies new to their rows, and copies whose
-    /// read missed; with the texts held of their sessions.
+    /// rest. Marks each copy new to its row, or with a missed read, as being
+    /// read, and returns those copies. An appended reread starts from a
+    /// session's held texts only when their copy is of the row's numbering
+    /// of generations ([`SessionSearchTexts::can_start_reread_of`]). After a
+    /// rebuild, every changed row reads its copy whole, and when every row
+    /// changed, in one scan.
     pub(crate) fn keep_copies_of<C: Borrow<Conversation>>(
         &mut self,
         conversations: &[C],
@@ -812,7 +824,10 @@ impl SearchTextsInMemory {
                 held => {
                     copies.push(cached.clone());
                     let texts = held.and_then(|held| held.texts);
-                    if let Some(texts) = &texts {
+                    if let Some(texts) = texts
+                        .as_ref()
+                        .filter(|texts| texts.texts.can_start_reread_of(generation))
+                    {
                         held_texts.insert(session.clone(), Arc::clone(&texts.texts));
                     }
                     HeldSession {
@@ -836,10 +851,11 @@ impl SearchTextsInMemory {
         }
     }
 
-    /// Holds the texts of `read`, a read of `copy`, when they are newer than
-    /// the texts its session holds. A read of the copy the row reads ends that read;
-    /// the session stays being read after a read of an earlier copy. A failed
-    /// read keeps the texts held before it.
+    /// Holds the texts of `read`, a read of `copy`. A read of the row's copy
+    /// always replaces the session's texts and ends the session's read, also
+    /// after a rebuild numbered the copy below the texts held. A read of an
+    /// earlier copy replaces only older texts, and the session stays being
+    /// read. A failed read keeps the texts held before it.
     pub(crate) fn finish_read(&mut self, copy: CopyKey, read: TextsReadResult) {
         let Some(held) = self.by_session.get_mut(&copy.session) else {
             return;
@@ -849,20 +865,23 @@ impl SearchTextsInMemory {
             return;
         }
         match read {
-            Ok(texts) => {
-                if held
-                    .texts
-                    .as_ref()
-                    .is_some_and(|held| held.requested_generation > copy.generation)
-                {
-                    return;
-                }
+            Ok(texts) if is_row_copy => {
                 held.texts = Some(HeldTexts {
                     requested_generation: copy.generation,
                     texts,
                 });
-                if is_row_copy {
-                    held.read = CopyReadState::Held;
+                held.read = CopyReadState::Held;
+            }
+            Ok(texts) => {
+                if held
+                    .texts
+                    .as_ref()
+                    .is_none_or(|held| held.requested_generation <= copy.generation)
+                {
+                    held.texts = Some(HeldTexts {
+                        requested_generation: copy.generation,
+                        texts,
+                    });
                 }
             }
             Err(failure) if is_row_copy => held.read = CopyReadState::Missed(failure),

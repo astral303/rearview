@@ -908,6 +908,84 @@ fn session_read_again_counts_as_updating_until_its_read_ends() {
 }
 
 #[test]
+fn session_appended_after_generations_restart_holds_whole_reads_texts_and_stops_updating() {
+    use crate::history::sqlite_cache::tests::{GenerationsRestart, restart_generations};
+    for restart in [GenerationsRestart::SetBack, GenerationsRestart::Dropped] {
+        let home = ClaudeHome::new();
+        let a = home.write("a", 5, &["first question", "second question"]);
+        home.write("b", 10, &["other"]);
+        let (_cache, environment) = caching_environment(&home);
+        let first = cached_rows(&home, &environment);
+        let mut texts = SearchTextsInMemory::default();
+        read_missing(&mut texts, &first);
+        restart_generations(copy_of(&first, "a"), restart);
+
+        home.append(&a, 6, "third question");
+        let appended = cached_rows(&home, &environment);
+        let held = reread(&mut texts, &appended, "a");
+
+        assert_eq!(
+            held.joined(),
+            whole_read(&appended, "a").joined(),
+            "{restart:?}: the reread holds a whole read's texts of the new copy"
+        );
+        assert_eq!(
+            texts.sessions_updating(),
+            0,
+            "{restart:?}: the session stops updating once its read ends"
+        );
+        assert_eq!(
+            found(&appended, &texts, "third"),
+            ["a"],
+            "{restart:?}: search reads the new copy's texts"
+        );
+    }
+}
+
+#[test]
+fn every_row_changed_after_generations_restart_is_read_in_one_scan() {
+    use crate::history::sqlite_cache::tests::{GenerationsRestart, restart_generations};
+    for restart in [GenerationsRestart::SetBack, GenerationsRestart::Dropped] {
+        let home = ClaudeHome::new();
+        let a = home.write("a", 5, &["first question"]);
+        let b = home.write("b", 10, &["other"]);
+        let (_cache, environment) = caching_environment(&home);
+        let first = cached_rows(&home, &environment);
+        let mut texts = SearchTextsInMemory::default();
+        read_missing(&mut texts, &first);
+        restart_generations(copy_of(&first, "a"), restart);
+
+        home.append(&a, 6, "second question");
+        home.append(&b, 11, "another");
+        let changed = cached_rows(&home, &environment);
+        let reading = texts.keep_copies_of(&changed);
+        let while_reading = texts.sessions_updating();
+        for (copy, read) in reading.read() {
+            texts.finish_read(copy, read);
+        }
+
+        assert!(
+            matches!(reading, CopiesToRead::EveryRow(_)),
+            "{restart:?}: the copies are read in one scan of every row"
+        );
+        assert_eq!(
+            (while_reading, texts.sessions_updating()),
+            (2, 0),
+            "{restart:?}: both sessions update until their reads end"
+        );
+        for name in ["a", "b"] {
+            assert_eq!(
+                texts
+                    .get(row(&changed, name))
+                    .map(|held| held.joined().clone()),
+                Some(whole_read(&changed, name).joined().clone()),
+                "{restart:?}: {name} holds a whole read's texts of its new copy"
+            );
+        }
+    }
+}
+
+#[test]
 fn search_bar_shows_session_the_worker_reads_again_until_its_read_ends() {
     let home = ClaudeHome::new();
     let a = home.write("a", 5, &["needle"]);

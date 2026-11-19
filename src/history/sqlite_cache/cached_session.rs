@@ -234,7 +234,8 @@ impl HeldCopy<'_> {
                 Currency::Current
             }
             Publication::Published { generation } if self.generation > *generation => adopted()?,
-            // A copy before the row's own: the cache was rebuilt since.
+            // A copy before the row's own: the cache was rebuilt since, and
+            // the clock went back before its counter started.
             Publication::Published { .. } => Currency::Older,
             Publication::Unpublished { .. } if !holds_discovered => Currency::Older,
             Publication::Unpublished { .. } => adopted()?,
