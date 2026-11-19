@@ -332,15 +332,15 @@ summary mode.
 ### Navigate and copy messages
 
 You can navigate by focusing on one message, one tool call or one block of a
-message's text at a time. A teal `▌` marks the rows in focus, and they get a
-light background. Inside an expanded tool run, the focused call carries the `▌`
-marker, and the rest of the run carries a dim `▏`. Inside a message, the
-focused block carries the `▌`, and the rest of the message the `▏`.
+message's text at a time. The rows in focus have a light background and a teal
+`▌` mark beside them. Inside an expanded tool run, the focused call has the `▌`
+mark and the rest of the run a dim `▏`. Inside a message, the focused block has
+the `▌` mark and the rest of the message the `▏`.
 
 - `J`/`K` or `]`/`[` enter message navigation and step between messages. In an
   expanded run, they step directly between a message and the nearest call; they
-  do not stop on the whole run. Entering from above selects the first call, and
-  entering from below selects the last. One `K` reverses one `J` at every step.
+  do not stop on the whole run. Entering from above focuses the first call, and
+  entering from below focuses the last. One `K` reverses one `J` at every step.
   Once `→` has focused a block, they step between the message's blocks, and
   inside a list between its items; past the first or last block they step to
   the neighbouring message.
