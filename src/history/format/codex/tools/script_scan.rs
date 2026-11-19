@@ -1,7 +1,7 @@
 //! One pass over an `exec` script's JavaScript source that finds its tool
-//! calls. It skips comments, string literals, template literals and regular
-//! expression literals; a template literal's `${…}` is source and is
-//! scanned.
+//! calls, its `const`, `let` and `var` declarations and its assignments. It
+//! skips comments, string literals, template literals and regular expression
+//! literals; a template literal's `${…}` is source and is scanned.
 //!
 //! Each find carries a depth: the count of the brackets and brace-less
 //! bodies around it that can run it more than once or not at all. Counted:
@@ -29,13 +29,29 @@ pub(super) struct ScriptScan<'a> {
     /// `tools[name](…)` or `const call = tools.write_stdin`: it may call
     /// tools the scan can't name.
     pub(super) names_tools_otherwise: bool,
+    pub(super) declarations: Vec<Declaration<'a>>,
+    /// The names assigned outside a declaration, as in `name = …` or
+    /// `name += …`, once per assignment.
+    pub(super) assigned: Vec<&'a str>,
 }
 
 pub(super) struct ScriptCall<'a> {
     pub(super) name: &'a str,
     pub(super) depth: usize,
-    pub(super) script_before: &'a str,
+    /// The call's offset in the source.
+    pub(super) offset: usize,
     /// The script after the call's opening parenthesis.
+    pub(super) rest_of_script: &'a str,
+}
+
+/// A name a `const`, `let` or `var` declares; the first, when it declares
+/// several.
+pub(super) struct Declaration<'a> {
+    pub(super) name: &'a str,
+    pub(super) depth: usize,
+    /// The declaration's offset in the source.
+    pub(super) offset: usize,
+    /// The script after the declared name.
     pub(super) rest_of_script: &'a str,
 }
 
@@ -47,6 +63,7 @@ pub(super) fn scan(source: &str) -> ScriptScan<'_> {
         frames: vec![Frame::new(FrameKind::TopLevel, false)],
         previous: Previous::Nothing,
         awaits_condition: false,
+        awaits_declared_name: false,
         found: ScriptScan::default(),
     };
     scanner.run();
@@ -118,6 +135,7 @@ enum Previous<'a> {
 }
 
 const CONDITION_KEYWORDS: [&str; 6] = ["if", "for", "while", "switch", "catch", "with"];
+const DECLARATION_KEYWORDS: [&str; 3] = ["const", "let", "var"];
 /// Keywords after which an expression starts, so a `/` opens a regular
 /// expression literal.
 const EXPRESSION_KEYWORDS: [&str; 13] = [
@@ -135,6 +153,11 @@ const EXPRESSION_KEYWORDS: [&str; 13] = [
     "else",
     "await",
 ];
+/// Longest first, so `>>>=` is not read as `>>=`.
+const ASSIGNMENT_OPERATORS: [&str; 16] = [
+    ">>>=", "**=", "<<=", ">>=", "&&=", "||=", "??=", "+=", "-=", "*=", "/=", "%=", "&=", "|=",
+    "^=", "=",
+];
 
 static DOT_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\.\s*(\w+)\s*\(").unwrap());
 static BRACKET_CALL: LazyLock<Regex> =
@@ -150,6 +173,7 @@ struct Scanner<'a> {
     /// After a condition keyword, until its parenthesis; `for await (` keeps
     /// it across `await`.
     awaits_condition: bool,
+    awaits_declared_name: bool,
     found: ScriptScan<'a>,
 }
 
@@ -222,6 +246,9 @@ impl<'a> Scanner<'a> {
             self.top_mut().control_body = ControlBody::Open;
         }
         let is_word = is_word_byte(byte);
+        if self.awaits_declared_name && !is_word {
+            self.awaits_declared_name = false;
+        }
         if self.awaits_condition && byte != b'(' && !is_word {
             self.awaits_condition = false;
         }
@@ -422,6 +449,7 @@ impl<'a> Scanner<'a> {
             .map_or(self.bytes.len(), |length| start + length);
         let word = &self.source[start..end];
         self.position = end;
+        let awaited_declared_name = std::mem::take(&mut self.awaits_declared_name);
         if word.as_bytes()[0].is_ascii_digit() {
             self.previous = Previous::Value;
             return;
@@ -440,6 +468,17 @@ impl<'a> Scanner<'a> {
             self.awaits_condition = true;
         } else if matches!(word, "else" | "do") {
             self.top_mut().control_body = ControlBody::AwaitingStart;
+        } else if DECLARATION_KEYWORDS.contains(&word) {
+            self.awaits_declared_name = true;
+        } else if awaited_declared_name {
+            self.found.declarations.push(Declaration {
+                name: word,
+                depth: self.depth(),
+                offset: start,
+                rest_of_script: &self.source[end..],
+            });
+        } else if starts_with_assignment(&self.source[end..]) {
+            self.found.assigned.push(word);
         }
     }
 
@@ -463,7 +502,7 @@ impl<'a> Scanner<'a> {
         self.found.calls.push(ScriptCall {
             name,
             depth: self.depth(),
-            script_before: &self.source[..start],
+            offset: start,
             rest_of_script: &rest[after_parenthesis..],
         });
         self.position += after_parenthesis - 1;
@@ -475,6 +514,16 @@ impl<'a> Scanner<'a> {
 /// ends inside a character.
 fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || !byte.is_ascii()
+}
+
+/// True when `text` opens with an assignment, `=` or a compound one such as
+/// `+=`, after whitespace; `==` and `=>` are not.
+fn starts_with_assignment(text: &str) -> bool {
+    let text = text.trim_start();
+    ASSIGNMENT_OPERATORS.iter().any(|operator| {
+        text.strip_prefix(operator)
+            .is_some_and(|after| *operator != "=" || !after.starts_with(['=', '>']))
+    })
 }
 
 #[cfg(test)]
@@ -569,5 +618,25 @@ mod tests {
                 "{source} doesn't name the `tools` global"
             );
         }
+    }
+
+    #[test]
+    fn declarations_carry_their_depth_and_assignments_their_name() {
+        let found = scan(
+            "const patch = \"a\";\nfunction f() { let patch = 'b'; }\npatch += \"c\";\nother = patch;\nif (patch == other) {}\nconst g = x => x;",
+        );
+        assert_eq!(
+            found
+                .declarations
+                .iter()
+                .map(|declaration| (declaration.name, declaration.depth))
+                .collect::<Vec<_>>(),
+            [("patch", 0), ("patch", 1), ("g", 0)]
+        );
+        assert_eq!(
+            found.assigned,
+            ["patch", "other"],
+            "`==` and `=>` don't assign"
+        );
     }
 }

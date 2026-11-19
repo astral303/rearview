@@ -130,7 +130,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
           │ [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
           │ </send_user_message_question_reply>
 
-    Codex │ Ran 2 scripts
+    Codex │ Ran 2 scripts, edited 1 file, waited 3 times, updated the task list 1 time
 
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
@@ -557,17 +557,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
           │
           │ SEND_MESSAGE_SENTINEL: add the dates
 
-    Codex │ update_plan:
+    Codex │ update_plan
           │
-          │ {
-          │   "explanation": "Ship the notes",
-          │   "plan": [
-          │     {
-          │       "status": "in_progress",
-          │       "step": "PLAN_STEP_SENTINEL: date the notes"
-          │     }
-          │   ]
-   ┌──────┘ }
+          │ Ship the notes
+   ┌──────┘ ▸ PLAN_STEP_SENTINEL: date the notes
    ↓
    Result ┐ Plan updated
 
@@ -618,6 +611,38 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ text(r.content[0].text);
    ↓
    Result ┐ src/lib.rs:12
+
+    Codex ┤ exec: poll session 24279 · up to 50s
+   ↓
+   Result ┐ Process running with session ID 24279
+
+    Codex ┤ exec: send to session 72867: TYPED_INPUT_SENTINEL⏎ · up to 10s
+   ↓
+   Result ┐ Process exited with code 0
+
+    Codex │ write_stdin: send to session 72868 · 2 lines · up to 5s
+          │
+          │ import json⏎
+   ┌──────┘ print(TYPED_LINES_SENTINEL)⏎
+   ↓
+   Result ┐ >>> >>>
+
+    Codex │ exec: update_plan
+          │
+          │ PLAN_EXPLANATION_SENTINEL: one step left
+          │ ✓ Read the notes
+          │ ▸ SCRIPT_PLAN_STEP_SENTINEL: date them
+   ┌──────┘ · Ship
+   ↓
+   Result ┐ Plan updated
+
+    Codex │ exec: NOTES.md
+          │
+          │ @@
+          │ -# Notes
+   ┌──────┘ +# Notes, PATCH_VARIABLE_SENTINEL
+   ↓
+   Result ┐ Done: 1 file updated
 
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question

@@ -239,7 +239,21 @@
     breaks: `exec: update_plan, exec_command · yields after 1m · output ≤
     14,000 tokens`. The last two parts are the settings of the script's
     `// @exec:` comment.
-  - Summary mode now counts such a script under `Ran N scripts`.
+  - A script that only polls a running command, or types into it, now shows
+    `exec: poll session 24279 · up to 50s` or
+    `exec: send to session 72867: ^C · up to 10s`. Typed text of several
+    lines shows one row per line.
+  - A script that only updates the plan now shows the explanation and the
+    steps, marked `✓`, `▸` or `·`.
+  - A script that only applies a patch from a variable now shows one edit per
+    file.
+  - Summary mode now counts a script shown as its tools and source under
+    `Ran N scripts`.
+- Fix `update_plan` and `write_stdin` calls made outside `exec` showing as
+  raw JSON. They now show the same plan, poll and typed text under their own
+  names.
+- Fix an `exec` script whose command or path is built from several parts
+  showing the first part as its header. It now shows its tools and source.
 - Fix the user's answer to a question Codex asked while it kept working
   (`request_user_input_async`) missing from the viewer, exports, `agent read`
   and search. It now shows as the user's message, the question quoted above

@@ -653,7 +653,7 @@ $ rearview agent read ch_0b26e45343df:s99
 protocol agent-error kind=not-found ref=ch_0b26e45343df detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_74aec3f6df49
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=22 hidden-tool-results=15 hidden-thinking=1 hidden-subagents=4 warnings=1 warning-records=1
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=27 hidden-tool-results=20 hidden-thinking=1 hidden-subagents=4 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 subagent s2 type=grunt span=m11..m12 : child
@@ -701,7 +701,7 @@ m49 user 06:03:28
 | user: <send_user_message_question_reply>
 | [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
 | </send_user_message_question_reply>
-m50..m53 hidden 06:03:29..06:03:32 tools=2 tool-results=2
+m50..m63 hidden 06:03:29..06:03:40 tools=7 tool-results=7
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
@@ -800,7 +800,7 @@ m37 06:03:16 call=m36.1..2
 m38.1 06:03:17 result=m39
 | send_message: /root/scout (+1 line)
 m40.1 06:03:19 result=m41
-| tool update_plan input_keys=explanation,plan (+9 lines)
+| update_plan (+2 lines)
 m41 06:03:20 call=m40.1
 | Plan updated
 m42.1 06:03:21
@@ -835,6 +835,25 @@ m52.1 06:03:31 result=m53
 | exec: mcp__ide__find_definition (+2 lines)
 m53 06:03:32 call=m52.1
 | src/lib.rs:12
+m54.1 06:03:33 result=m55
+| exec: poll session 24279 · up to 50s
+m55 06:03:34 call=m54.1
+| Process running with session ID 24279
+m56.1 06:03:35 result=m57
+| exec: send to session 72867: TYPED_INPUT_SENTINEL⏎ · up to 10s
+m57 06:03:36 call=m56.1
+| Process exited with code 0
+m58.1 06:03:36 result=m59
+| write_stdin: send to session 72868 · 2 lines · up to 5s (+2 lines)
+m59 06:03:36 call=m58.1
+| >>> >>> 
+m60.1 06:03:37 result=m61
+| exec: update_plan (+4 lines)
+m61 06:03:38 call=m60.1 same=m41
+m62.1 06:03:39 result=m63
+| exec: NOTES.md (+3 lines)
+m63 06:03:40 call=m62.1
+| Done: 1 file updated
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m2..m4
 --- stdout
@@ -859,7 +878,7 @@ m3 s1 06:00:03 slice=match=the context=3 hits=0 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tail 3
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=2 hidden-tool-results=2 warnings=1 warning-records=1
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=7 hidden-tool-results=7 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m47 user 06:03:26
@@ -875,19 +894,19 @@ m49 user 06:03:28
 | user: <send_user_message_question_reply>
 | [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
 | </send_user_message_question_reply>
-m50..m53 hidden 06:03:29..06:03:32 tools=2 tool-results=2
+m50..m63 hidden 06:03:29..06:03:40 tools=7 tool-results=7
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --subagents --tail 2
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
-m50.1 06:03:29 result=m51
-| exec: update_plan, exec_command · yields after 1m · output ≤ 14,000 tokens (+2 lines)
-m51 hidden 06:03:30 tool-results=1
-m52.1 06:03:31 result=m53
-| exec: mcp__ide__find_definition (+2 lines)
-m53 hidden 06:03:32 tool-results=1
+m60.1 06:03:37 result=m61
+| exec: update_plan (+4 lines)
+m61 hidden 06:03:38 tool-results=1
+m62.1 06:03:39 result=m63
+| exec: NOTES.md (+3 lines)
+m63 hidden 06:03:40 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m6.1
 --- stdout
@@ -935,7 +954,7 @@ continue read refs=ch_74aec3f6df49:m1..m3 tools=false tool-results=false thinkin
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 policy=text omit=m11..m53 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
+protocol agent-read cut=tail chars=900 policy=text omit=m11..m63 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -946,9 +965,9 @@ m4 hidden 06:00:04 thinking=1
 m5 06:00:05
 | codex answer searchable
 m6..m10 hidden 06:00:07..06:00:11 tools=3 tool-results=2
-continue read refs=ch_74aec3f6df49:m11..m53 tools=true tool-results=true thinking=false subagents=true
+continue read refs=ch_74aec3f6df49:m11..m63 tools=true tool-results=true thinking=false subagents=true
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
-$ rearview agent read ch_74aec3f6df49:m11..m53 --tools --tool-results --subagents
+$ rearview agent read ch_74aec3f6df49:m11..m63 --tools --tool-results --subagents
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+tool-results+subagents omit=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
@@ -1024,7 +1043,7 @@ m37 06:03:16 call=m36.1..2
 m38.1 06:03:17 result=m39
 | send_message: /root/scout (+1 line)
 m40.1 06:03:19 result=m41
-| tool update_plan input_keys=explanation,plan (+9 lines)
+| update_plan (+2 lines)
 m41 06:03:20 call=m40.1
 | Plan updated
 m42.1 06:03:21
@@ -1059,10 +1078,29 @@ m52.1 06:03:31 result=m53
 | exec: mcp__ide__find_definition (+2 lines)
 m53 06:03:32 call=m52.1
 | src/lib.rs:12
+m54.1 06:03:33 result=m55
+| exec: poll session 24279 · up to 50s
+m55 06:03:34 call=m54.1
+| Process running with session ID 24279
+m56.1 06:03:35 result=m57
+| exec: send to session 72867: TYPED_INPUT_SENTINEL⏎ · up to 10s
+m57 06:03:36 call=m56.1
+| Process exited with code 0
+m58.1 06:03:36 result=m59
+| write_stdin: send to session 72868 · 2 lines · up to 5s (+2 lines)
+m59 06:03:36 call=m58.1
+| >>> >>> 
+m60.1 06:03:37 result=m61
+| exec: update_plan (+4 lines)
+m61 06:03:38 call=m60.1 same=m41
+m62.1 06:03:39 result=m63
+| exec: NOTES.md (+3 lines)
+m63 06:03:40 call=m62.1
+| Done: 1 file updated
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m53
+protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m63
 $ rearview agent read ch_74aec3f6df49:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end

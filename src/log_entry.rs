@@ -255,6 +255,11 @@ pub enum Tool {
     /// Questions the agent put to the user. Its canonical input is
     /// `questions`, a list of `{title, options}`, each option a string.
     UserQuestion,
+    /// An update to the agent's task list. A reader that lays it out writes
+    /// `steps`, a list of `{text, status}` with the status `pending`,
+    /// `in_progress` or `completed`, and may add an `explanation` and the
+    /// `calls` of the script that made the update; any other input shows as
+    /// it is.
     TaskList,
     WebFetch,
     WebSearch,
