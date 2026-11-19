@@ -160,6 +160,7 @@ pub fn tool_call_header(name: &str, tool: Tool, input: &Value) -> ToolCallHeader
     let field = |key: &str| string_field(input, key).unwrap_or("").to_owned();
     match tool {
         Tool::Shell => ToolCallHeader::command(name_prefix(name), input),
+        Tool::Script => ToolCallHeader::named(name_prefix(name), script_header(input)),
         // The user ran it, so there is no tool to name: the header completes
         // the sentence its author label opens, `You ran …`.
         Tool::UserShell => ToolCallHeader::command("ran ".to_owned(), input),
@@ -239,6 +240,7 @@ pub fn tool_call_body(tool: Tool, input: &Value) -> Option<ToolCallBody<'_>> {
     let plain_field =
         |key: &str| string_field(input, key).map(|text| ToolBody::plain(text.to_owned()));
     let text = match tool {
+        Tool::Script => plain_field("source"),
         Tool::Edit => edit_body(input),
         Tool::Skill => plain_field("args"),
         Tool::Agent => agent_body(input),
@@ -285,6 +287,7 @@ fn lacks_header_field(tool: Tool, input: &Value) -> bool {
 fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
     match tool {
         Tool::Shell | Tool::UserShell => Some("command"),
+        Tool::Script => Some("source"),
         Tool::Read | Tool::Edit | Tool::Write | Tool::FileReference => Some("file_path"),
         Tool::Grep | Tool::Glob => Some("pattern"),
         Tool::Skill => Some("skill"),
@@ -500,6 +503,46 @@ fn received_message_header(input: &Value) -> String {
     header
 }
 
+/// The tools a script calls, or `script` when it doesn't call a tool, then
+/// its settings: `update_plan, exec_command · yields after 1m · output ≤
+/// 14,000 tokens`.
+fn script_header(input: &Value) -> String {
+    let calls: Vec<&str> = input
+        .get("calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut header = if calls.is_empty() {
+        "script".to_owned()
+    } else {
+        calls.join(", ")
+    };
+    if let Some(yield_after_ms) = input.get("yield_after_ms").and_then(Value::as_u64) {
+        let duration = format_duration(Duration::from_millis(yield_after_ms));
+        header.push_str(&format!(" · yields after {duration}"));
+    }
+    if let Some(tokens) = input.get("max_output_tokens").and_then(Value::as_u64) {
+        let tokens = with_thousands_separators(tokens);
+        header.push_str(&format!(" · output ≤ {tokens} tokens"));
+    }
+    header
+}
+
+/// `14000` as `14,000`.
+fn with_thousands_separators(count: u64) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 /// The command's first line is the header's value and its later lines the
 /// body. With a width, every line wraps at the width less the prefix.
 fn format_shell(prefix: String, command: &str, max_width: usize) -> FormattedToolCall {
@@ -673,6 +716,7 @@ mod tests {
     fn every_layout_falls_back_without_its_header_field() {
         for tool in [
             Tool::Shell,
+            Tool::Script,
             Tool::Read,
             Tool::Edit,
             Tool::Write,
@@ -898,6 +942,64 @@ mod tests {
         let input = json!({"sender": "/root", "message": "Map the callers."});
         let result = format_tool_call("inter_agent_message", Tool::ReceivedMessage, &input, 80);
         assert_eq!(result.header(), "inter_agent_message: from /root");
+    }
+
+    fn header_of_script(input: Value) -> String {
+        format_tool_call("exec", Tool::Script, &input, 80).header()
+    }
+
+    #[test]
+    fn script_header_names_its_tools_then_each_setting_it_ran_under() {
+        let source = "text(1);";
+        assert_eq!(
+            header_of_script(json!({"source": source, "calls": ["update_plan", "exec_command"]})),
+            "exec: update_plan, exec_command"
+        );
+        assert_eq!(
+            header_of_script(json!({"source": source, "calls": [], "yield_after_ms": 90_000})),
+            "exec: script · yields after 1m 30s"
+        );
+        assert_eq!(
+            header_of_script(
+                json!({"source": source, "calls": ["mcp__ide__find"], "max_output_tokens": 1_800})
+            ),
+            "exec: mcp__ide__find · output ≤ 1,800 tokens"
+        );
+        assert_eq!(
+            header_of_script(json!({
+                "source": source,
+                "calls": ["update_plan"],
+                "yield_after_ms": 60_000,
+                "max_output_tokens": 14_000,
+            })),
+            "exec: update_plan · yields after 1m · output ≤ 14,000 tokens"
+        );
+    }
+
+    #[test]
+    fn script_body_is_its_source_with_its_line_breaks() {
+        let source = "const r = await tools.exec_command({ cmd });\ntext(r.output);";
+        let result = format_tool_call(
+            "exec",
+            Tool::Script,
+            &json!({"source": source, "calls": ["exec_command"]}),
+            80,
+        );
+        assert_eq!(body_text(&result), Some(source));
+        assert_eq!(body_kind(&result), Some(ToolBodyKind::Plain));
+    }
+
+    #[test]
+    fn token_counts_group_their_digits_in_threes() {
+        for (count, grouped) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (14_000, "14,000"),
+            (1_234_567, "1,234,567"),
+        ] {
+            assert_eq!(with_thousands_separators(count), grouped);
+        }
     }
 
     #[test]

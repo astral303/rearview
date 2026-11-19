@@ -232,6 +232,14 @@
 
 #### Codex
 
+- Fix an `exec` script showing as one escaped JSON string in the viewer and
+  exports (25% of `exec` calls in one example corpus). `agent read` and search
+  print the new headers and bodies too.
+  - A script now shows the tools it calls, then its source with its line
+    breaks: `exec: update_plan, exec_command · yields after 1m · output ≤
+    14,000 tokens`. The last two parts are the settings of the script's
+    `// @exec:` comment.
+  - Summary mode now counts such a script under `Ran N scripts`.
 - Fix the user's answer to a question Codex asked while it kept working
   (`request_user_input_async`) missing from the viewer, exports, `agent read`
   and search. It now shows as the user's message, the question quoted above

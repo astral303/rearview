@@ -85,7 +85,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ codex answer searchable
 
-    Codex │ Received 1 message, waited 1 time, called 1 tool
+    Codex │ Ran 1 script, received 1 message, waited 1 time
 
       You │ follow-up question
 
@@ -129,6 +129,8 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
       You │ user: <send_user_message_question_reply>
           │ [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
           │ </send_user_message_question_reply>
+
+    Codex │ Ran 2 scripts
 
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
@@ -451,9 +453,9 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ codex answer searchable
 
-    Codex │ exec:
+    Codex │ exec: script
           │
-   ┌──────┘ "echo TOOL_INPUT_VISIBLE"
+   ┌──────┘ echo TOOL_INPUT_VISIBLE
    ↓
    Result ┐ tool output searchable
 
@@ -601,6 +603,21 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
       You │ user: <send_user_message_question_reply>
           │ [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
           │ </send_user_message_question_reply>
+
+    Codex │ exec: update_plan, exec_command · yields after 1m · output ≤ 14,000 tokens
+          │
+          │ const r = await Promise.allSettled([tools.update_plan({plan:[{step:"SCRIPT_SOURCE_SENTINEL: date the notes",status:"in_progress"}]}),
+          │ tools.exec_command({cmd:"git status"})]);
+   ┌──────┘ text(JSON.stringify(r));
+   ↓
+   Result ┐ Script completed
+
+    Codex │ exec: mcp__ide__find_definition
+          │
+          │ const r = await tools.mcp__ide__find_definition({symbol: "MCP_SCRIPT_SENTINEL"});
+   ┌──────┘ text(r.content[0].text);
+   ↓
+   Result ┐ src/lib.rs:12
 
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question

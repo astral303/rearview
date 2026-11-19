@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 29,
+            schema_version: 30,
         }
     }
 
@@ -1208,10 +1208,33 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "message", "id": "msg_quoted_answer", "role": "user", "content": [{"type": "input_text", "text": "user: <send_user_message_question_reply>\n[{\"answer\":\"QUOTED_ENVELOPE_SENTINEL\",\"question\":\"Ship it?\",\"questionItemId\":\"call_other\"}]\n</send_user_message_question_reply>"}]}),
                     ),
+                    // A script with a control comment that calls two tools,
+                    // then one without a control comment.
+                    line(
+                        29,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_script", "status": "completed", "call_id": "call_script", "name": "exec", "input": "// @exec: {\"yield_time_ms\":60000,\"max_output_tokens\":14000}\nconst r = await Promise.allSettled([tools.update_plan({plan:[{step:\"SCRIPT_SOURCE_SENTINEL: date the notes\",status:\"in_progress\"}]}), tools.exec_command({cmd:\"git status\"})]);\ntext(JSON.stringify(r));"}),
+                    ),
+                    line(
+                        30,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_script", "call_id": "call_script", "output": [{"type": "input_text", "text": "Script completed"}]}),
+                    ),
+                    line(
+                        31,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_mcp_script", "status": "completed", "call_id": "call_mcp_script", "name": "exec", "input": "const r = await tools.mcp__ide__find_definition({symbol: \"MCP_SCRIPT_SENTINEL\"});\ntext(r.content[0].text);"}),
+                    ),
+                    line(
+                        32,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_mcp_script", "call_id": "call_mcp_script", "output": [{"type": "input_text", "text": "src/lib.rs:12"}]}),
+                    ),
                 ],
             );
             const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time";
             const LAUNCH_RUN: &str = "Started 2 agents";
+            const SCRIPT_RUN: &str = "Ran 2 scripts";
             AgentSession::new(
                 Source::Codex,
                 session,
@@ -1256,7 +1279,7 @@ pub(super) mod tests {
                     Marker::shown("patch", "PATCH_SENTINEL").in_summary_row(PATCH_RUN),
                     Marker::shown("plan update", "PLAN_STEP_SENTINEL"),
                     Marker::shown("readable message from an agent", "INTER_AGENT_TASK_TEXT")
-                        .in_summary_row("Received 1 message, waited 1 time, called 1 tool"),
+                        .in_summary_row("Ran 1 script, received 1 message, waited 1 time"),
                     Marker::in_call_or_subagent(
                         "encrypted message from an agent",
                         "RECEIVED_FROM_SENTINEL",
@@ -1279,6 +1302,15 @@ pub(super) mod tests {
                     Marker::shown("quoted reply envelope", "QUOTED_ENVELOPE_SENTINEL"),
                     Marker::shown("message to an agent", "SEND_MESSAGE_SENTINEL")
                         .in_summary_row(PATCH_RUN),
+                    Marker::in_call_or_subagent(
+                        "script's tools and settings",
+                        "exec: update_plan, exec_command · yields after 1m · output ≤ 14,000 tokens",
+                    )
+                    .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("script's source", "SCRIPT_SOURCE_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("source of a script without settings", "MCP_SCRIPT_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
                 ],
             )
             .with_hidden(&[

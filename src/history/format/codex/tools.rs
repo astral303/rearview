@@ -1,13 +1,19 @@
 //! Codex's tool calls mapped onto the canonical [`Tool`] set.
 //!
 //! `exec` runs a JavaScript script in which tool calls read `tools.<name>(…)`.
-//! The script is not parsed: its first such call names the tool, and the
-//! strings the header needs are read out of the argument text by key, whether
-//! the argument is JSON (`{"command":"…"}`) or a bare object literal
-//! (`{ cmd: "…" }`).
+//! [`script_scan`] finds those calls outside comments and literals; the
+//! source is not parsed further. A layout reads literal values out of a
+//! call's argument text by key, whether the argument is JSON
+//! (`{"command":"…"}`) or a bare object literal (`{ cmd: "…" }`). The first
+//! call names the layout of a shell command, an edit, a web search or fetch,
+//! an agent launch or message, or an image read. Any other script is a
+//! [`Tool::Script`]: its source and the tools it calls.
+
+mod script_scan;
 
 use crate::log_entry::{ContentBlock, Tool};
 use regex::Regex;
+use script_scan::ScriptCall;
 use serde_json::{Map, Value, json};
 use std::sync::LazyLock;
 
@@ -39,7 +45,7 @@ struct CanonicalCall {
 fn canonical_calls(name: &str, input: &Value) -> Vec<CanonicalCall> {
     let input = &without_encrypted_payloads(input);
     let calls = match name {
-        "exec" => input.as_str().and_then(script_calls),
+        "exec" => input.as_str().map(script_calls),
         "apply_patch" => patch_text(input).map(patch_edits),
         "run" | "web__run" => Some(web_calls(input)),
         "sleep" => sleep_call(input).map(|call| vec![call]),
@@ -188,25 +194,111 @@ fn has_header_string(header_keys: &[(&str, &str)], input: &Value) -> bool {
             .any(|(_, canonical_key)| input.get(canonical_key).is_some_and(Value::is_string))
 }
 
-fn script_calls(script: &str) -> Option<Vec<CanonicalCall>> {
-    let call = first_script_call(script)?;
+fn script_calls(input: &str) -> Vec<CanonicalCall> {
+    let script = ExecScript::parse(input);
+    let calls = script_scan::scan(script.source).calls;
+    calls
+        .first()
+        .and_then(first_call_layout)
+        .filter(|layout| !layout.is_empty())
+        .unwrap_or_else(|| vec![script.into_call(&calls)])
+}
+
+/// The calls the layout of `call`, a script's first call, shows; `None` when
+/// that call has no layout.
+fn first_call_layout(call: &ScriptCall<'_>) -> Option<Vec<CanonicalCall>> {
     match call.name {
         "apply_patch" => script_patch(call.rest_of_script).map(|patch| patch_edits(&patch)),
         "run" | "web__run" => script_web_call(call.rest_of_script).map(|call| vec![call]),
-        name => script_function_call(name, call.rest_of_script, script).map(|call| vec![call]),
+        name => script_function_call(name, call.rest_of_script).map(|call| vec![call]),
     }
 }
 
-fn script_function_call(name: &str, rest_of_script: &str, script: &str) -> Option<CanonicalCall> {
-    let mapping = tool_mapping(name);
-    if mapping.tool == Tool::Other {
-        return None;
+/// Codex's `exec` input split as Codex splits it: an optional control
+/// comment on the first line, `// @exec:` then a JSON object of settings,
+/// and the source after it.
+struct ExecScript<'a> {
+    source: &'a str,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<u64>,
+}
+
+const CONTROL_COMMENT_PREFIX: &str = "// @exec:";
+/// The largest integer JavaScript holds exactly. Codex rejects a setting
+/// above it.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+impl<'a> ExecScript<'a> {
+    /// A control comment Codex rejects stays in the source: Codex refused
+    /// that script, and its result shows why.
+    fn parse(input: &'a str) -> Self {
+        Self::with_control_comment(input).unwrap_or(Self {
+            source: input,
+            yield_time_ms: None,
+            max_output_tokens: None,
+        })
     }
-    if mapping.header_keys.is_empty() {
-        return Some(CanonicalCall {
-            tool: mapping.tool,
-            input: Value::String(script.to_owned()),
-        });
+
+    /// `None` unless the first line is a control comment Codex accepts: a
+    /// JSON object of `yield_time_ms` and `max_output_tokens`, each a safe
+    /// integer or null, followed by source.
+    fn with_control_comment(input: &'a str) -> Option<Self> {
+        let (first_line, source) = input.split_once('\n')?;
+        let settings = first_line
+            .trim_start()
+            .strip_prefix(CONTROL_COMMENT_PREFIX)?;
+        if source.trim().is_empty() {
+            return None;
+        }
+        let settings: Map<String, Value> = serde_json::from_str(settings.trim()).ok()?;
+        let mut script = Self {
+            source,
+            yield_time_ms: None,
+            max_output_tokens: None,
+        };
+        for (key, value) in settings {
+            let value = match value {
+                Value::Null => None,
+                number => Some(number.as_u64().filter(|value| *value <= MAX_SAFE_INTEGER)?),
+            };
+            match key.as_str() {
+                "yield_time_ms" => script.yield_time_ms = value,
+                "max_output_tokens" => script.max_output_tokens = value,
+                _ => return None,
+            }
+        }
+        Some(script)
+    }
+
+    /// The script as its source, the tools `calls` name in order of first
+    /// use, and the control comment's settings.
+    fn into_call(self, calls: &[ScriptCall<'_>]) -> CanonicalCall {
+        let mut called: Vec<&str> = Vec::new();
+        for call in calls {
+            if !called.contains(&call.name) {
+                called.push(call.name);
+            }
+        }
+        let mut input = json!({ "source": self.source, "calls": called });
+        if let Some(yield_time_ms) = self.yield_time_ms {
+            input["yield_after_ms"] = Value::from(yield_time_ms);
+        }
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            input["max_output_tokens"] = Value::from(max_output_tokens);
+        }
+        CanonicalCall {
+            tool: Tool::Script,
+            input,
+        }
+    }
+}
+
+/// A call whose header reads strings out of its argument; `None` for a tool
+/// without such a header, such as a wait.
+fn script_function_call(name: &str, rest_of_script: &str) -> Option<CanonicalCall> {
+    let mapping = tool_mapping(name);
+    if mapping.tool == Tool::Other || mapping.header_keys.is_empty() {
+        return None;
     }
     let input: Map<String, Value> = mapping
         .header_keys
@@ -378,21 +470,6 @@ fn script_web_call(rest_of_script: &str) -> Option<CanonicalCall> {
         return Some(web_fetch(&url));
     }
     None
-}
-
-struct ScriptCall<'a> {
-    name: &'a str,
-    rest_of_script: &'a str,
-}
-
-static FIRST_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"tools\.(\w+)\s*\(").unwrap());
-
-fn first_script_call(script: &str) -> Option<ScriptCall<'_>> {
-    let call = FIRST_CALL.captures(script)?;
-    Some(ScriptCall {
-        name: call.get(1)?.as_str(),
-        rest_of_script: &script[call.get(0)?.end()..],
-    })
 }
 
 const STRING_LITERAL: &str = r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`"#;
@@ -793,26 +870,132 @@ mod tests {
         );
     }
 
+    /// A script shown as its tools and source, without control comment
+    /// settings.
+    fn script(source: &str, calls: &[&str]) -> (Tool, Value) {
+        (Tool::Script, json!({"source": source, "calls": calls}))
+    }
+
     #[test]
-    fn exec_script_with_no_recognizable_call_stays_other() {
-        for script in [
-            "echo TOOL_INPUT_VISIBLE",
-            "const now = await tools.clock__curr_time({});",
-            "await tools.exec_command({ cmd: command })",
-            "await tools.exec_command(",
+    fn exec_script_without_header_from_its_first_call_is_its_tools_and_source() {
+        for (source, calls) in [
+            ("echo TOOL_INPUT_VISIBLE", &[][..]),
+            (
+                "const now = await tools.clock__curr_time({});",
+                &["clock__curr_time"],
+            ),
+            (
+                "await tools.exec_command({ cmd: command })",
+                &["exec_command"],
+            ),
+            ("await tools.exec_command(", &["exec_command"]),
+            (
+                "await tools.wait_agent({ agent_ids: [\"scout\"] })",
+                &["wait_agent"],
+            ),
         ] {
-            let (tool, input) = single("exec", json!(script));
-            assert_eq!(tool, Tool::Other, "{script}");
-            assert_eq!(input, json!(script));
+            assert_eq!(single("exec", json!(source)), script(source, calls));
         }
     }
 
     #[test]
-    fn exec_waits_and_plan_updates_keep_script_as_input() {
+    fn exec_script_names_its_tools_once_each_in_order_of_first_use() {
+        let source = "const r = await Promise.allSettled([tools.update_plan({ plan: [] }), tools.exec_command({ cmd }), tools.update_plan({ plan: [] })]);\nawait tools.mcp__ide__find({ symbol: \"a\" });";
+        assert_eq!(
+            single("exec", json!(source)),
+            script(source, &["update_plan", "exec_command", "mcp__ide__find"])
+        );
+    }
+
+    #[test]
+    fn exec_script_names_its_calls_outside_comments_and_literals() {
+        for (source, calls) in [
+            (
+                "// await tools.exec_command({ cmd: \"git push\" })\ntext(\"not yet\");",
+                &[][..],
+            ),
+            (
+                "/* tools.update_plan({ plan: [] }) */ text('tools.exec_command({ cmd: \"ls\" })');",
+                &[],
+            ),
+            (
+                "text(`${await tools.mcp__ide__find({ symbol: \"a\" })} and tools.exec_command(`);",
+                &["mcp__ide__find"],
+            ),
+            (
+                "const r = await tools[\"mcp__ide__find\"]({ symbol: \"a\" });",
+                &["mcp__ide__find"],
+            ),
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                script(source, calls),
+                "the header names {calls:?} alone"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_name_inside_another_word_isnt_a_call() {
+        let source = "const py = \"for a, b in itertools.zip_longest(x, y): pass\";\nawait tools.exec_command({ cmd: py });";
+        assert_eq!(
+            single("exec", json!(source)),
+            script(source, &["exec_command"])
+        );
+    }
+
+    #[test]
+    fn control_comment_leaves_source_and_its_settings_are_read() {
+        let source = "text(load(\"skill\").length);";
+        let with_comment = format!(
+            "  // @exec: {{\"yield_time_ms\": 60000, \"max_output_tokens\": 14000}}\n{source}"
+        );
+        assert_eq!(
+            single("exec", json!(with_comment)),
+            (
+                Tool::Script,
+                json!({"source": source, "calls": [], "yield_after_ms": 60000, "max_output_tokens": 14000})
+            )
+        );
+        let null_setting = format!("// @exec: {{\"max_output_tokens\": null}}\n{source}");
+        assert_eq!(single("exec", json!(null_setting)), script(source, &[]));
+        let largest_safe_integer =
+            format!("// @exec: {{\"max_output_tokens\": 9007199254740991}}\n{source}");
+        assert_eq!(
+            single("exec", json!(largest_safe_integer)),
+            (
+                Tool::Script,
+                json!({"source": source, "calls": [], "max_output_tokens": 9_007_199_254_740_991_u64})
+            )
+        );
+    }
+
+    #[test]
+    fn control_comment_codex_rejects_stays_in_source() {
+        for input in [
+            "// @exec: {\"timeout_ms\": 1000}\ntext(1);",
+            "// @exec: {\"yield_time_ms\": \"1s\"}\ntext(1);",
+            "// @exec: {\"yield_time_ms\": -1}\ntext(1);",
+            "// @exec: {\"max_output_tokens\": 9007199254740992}\ntext(1);",
+            "// @exec: [1000]\ntext(1);",
+            "// @exec: {yield_time_ms: 1000}\ntext(1);",
+            "// @exec: {\"yield_time_ms\": 1000}\n  \n",
+            "// @exec: {\"yield_time_ms\": 1000}",
+        ] {
+            assert_eq!(
+                single("exec", json!(input)),
+                script(input, &[]),
+                "the control comment Codex rejects stays in the source"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_waits_and_plan_updates_are_their_tools_and_source() {
         let plan = "await tools.update_plan({ plan: [{ step: \"a\", status: \"in_progress\" }] });";
-        assert_eq!(single("exec", json!(plan)), (Tool::TaskList, json!(plan)));
+        assert_eq!(single("exec", json!(plan)), script(plan, &["update_plan"]));
         let stdin = "await tools.write_stdin({ session_id: shell.session_id, chars: \"\" });";
-        assert_eq!(single("exec", json!(stdin)), (Tool::Wait, json!(stdin)));
+        assert_eq!(single("exec", json!(stdin)), script(stdin, &["write_stdin"]));
     }
 
     #[test]
@@ -888,6 +1071,6 @@ mod tests {
             (Tool::WebFetch, json!({"url": "https://example.com/docs"}))
         );
         let find = "await tools.web__run({ find: [{ ref_id: \"turn0search0\", pattern: \"x\" }] })";
-        assert_eq!(single("exec", json!(find)), (Tool::Other, json!(find)));
+        assert_eq!(single("exec", json!(find)), script(find, &["web__run"]));
     }
 }
