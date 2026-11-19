@@ -39,6 +39,7 @@ fn canonical_calls(name: &str, input: &Value) -> Vec<CanonicalCall> {
         "exec" => input.as_str().and_then(script_calls),
         "apply_patch" => patch_text(input).map(patch_edits),
         "run" | "web__run" => Some(web_calls(input)),
+        "sleep" => sleep_call(input).map(|call| vec![call]),
         _ => function_call(name, input).map(|call| vec![call]),
     };
     calls.filter(|calls| !calls.is_empty()).unwrap_or_else(|| {
@@ -103,6 +104,18 @@ fn function_call(name: &str, input: &Value) -> Option<CanonicalCall> {
         tool: mapping.tool,
         input,
     })
+}
+
+/// A `sleep` call as a wait for its `duration_ms`; `None` unless that is a
+/// non-negative integer.
+fn sleep_call(input: &Value) -> Option<CanonicalCall> {
+    input
+        .get("duration_ms")
+        .is_some_and(Value::is_u64)
+        .then(|| CanonicalCall {
+            tool: Tool::Wait,
+            input: input.clone(),
+        })
 }
 
 /// Move every `spawn_agent` argument but the task name and the message under
@@ -489,6 +502,10 @@ mod tests {
             ("list_agents", json!({}), Tool::Other),
             ("interrupt_agent", json!({"target": "scout"}), Tool::Other),
             ("request_user_input", json!({"questions": []}), Tool::Other),
+            ("sleep", json!({"duration_ms": 60000}), Tool::Wait),
+            ("sleep", json!({"duration_ms": "1m"}), Tool::Other),
+            ("sleep", json!({"duration_ms": 1.5}), Tool::Other),
+            ("sleep", json!({"duration_ms": -1}), Tool::Other),
             ("ide__find_references", json!({"file": "a.rs"}), Tool::Other),
         ];
         for (name, input, tool) in expected {

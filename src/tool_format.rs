@@ -5,8 +5,10 @@
 //! The layout is chosen by the call's canonical [`Tool`]; the header always
 //! opens with the provider's own tool name.
 
+use crate::duration::format_duration;
 use crate::log_entry::{DELIVERED_REPORT_KEY, Tool, replacement_diff};
 use serde_json::Value;
+use std::time::Duration;
 
 /// Formatted tool call representation
 pub struct FormattedToolCall {
@@ -183,11 +185,13 @@ pub fn tool_call_header(name: &str, tool: Tool, input: &Value) -> ToolCallHeader
         Tool::AgentReport => ToolCallHeader::named(format!("{name}:"), String::new()),
         Tool::WebFetch => ToolCallHeader::named(name_prefix(name), field("url")),
         Tool::WebSearch => web_search_header(name, input),
+        Tool::Wait => match wait_duration(input) {
+            Some(duration) => ToolCallHeader::named(name_prefix(name), format_duration(duration)),
+            None => ToolCallHeader::raw_input(name),
+        },
         // `ResultReceipt` reaches no header; the raw input keeps the match
         // exhaustive.
-        Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => {
-            ToolCallHeader::raw_input(name)
-        }
+        Tool::TaskList | Tool::ResultReceipt | Tool::Other => ToolCallHeader::raw_input(name),
     }
 }
 
@@ -238,6 +242,7 @@ pub fn tool_call_body(tool: Tool, input: &Value) -> Option<ToolCallBody<'_>> {
         Tool::AgentReport if is_delivered_report(input) => None,
         Tool::AgentReport => plain_field("message"),
         Tool::WebFetch => plain_field("prompt"),
+        Tool::Wait if wait_duration(input).is_some() => None,
         Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => {
             return Some(ToolCallBody::RawInput(input));
         }
@@ -388,6 +393,15 @@ fn launch_body(launch: &serde_json::Map<String, Value>, prompt: Option<&str>) ->
 
 fn is_delivered_report(input: &Value) -> bool {
     input.get(DELIVERED_REPORT_KEY).and_then(Value::as_bool) == Some(true)
+}
+
+/// The length of a wait for a set time: its `duration_ms`. `None` for a
+/// wait on something else, such as a process or an agent.
+fn wait_duration(input: &Value) -> Option<Duration> {
+    input
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
 }
 
 /// `new task from /root`, or `from /root` without a kind, then
@@ -802,6 +816,24 @@ mod tests {
         let input = json!({"sender": "/root", "message": "Map the callers."});
         let result = format_tool_call("inter_agent_message", Tool::ReceivedMessage, &input, 80);
         assert_eq!(result.header(), "inter_agent_message: from /root");
+    }
+
+    #[test]
+    fn wait_for_set_time_shows_its_duration_without_body() {
+        let result = format_tool_call("sleep", Tool::Wait, &json!({"duration_ms": 90_000}), 80);
+        assert_eq!(result.header(), "sleep: 1m 30s");
+        assert_eq!(body_text(&result), None);
+    }
+
+    #[test]
+    fn wait_on_something_else_shows_its_name_and_input() {
+        let input = json!({"session_id": 1, "chars": ""});
+        let result = format_tool_call("write_stdin", Tool::Wait, &input, 80);
+        assert_eq!(result.header(), "write_stdin:");
+        assert_eq!(
+            body_text(&result),
+            Some(serde_json::to_string_pretty(&input).unwrap().as_str())
+        );
     }
 
     #[test]

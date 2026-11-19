@@ -115,7 +115,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
       You │ Add the release notes
 
-    Codex │ Edited 2 files, messaged 1 agent, received 1 message, updated the task list 1 time
+    Codex │ Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, updated the task list 1 time
 
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
@@ -559,6 +559,11 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    Result ┐ Plan updated
 
     Codex │ inter_agent_message: message from /root/RECEIVED_FROM_SENTINEL · text encrypted by Codex
+
+    Codex ┤ sleep: 45s
+   ↓
+   Result ┐ Wall time: 12.1 seconds
+          │ Sleep interrupted by new input.
 
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question

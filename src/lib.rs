@@ -18,6 +18,7 @@ mod debug;
 mod debug_log;
 mod display;
 mod dropped_records_cli;
+mod duration;
 mod error;
 mod free_space;
 mod history;

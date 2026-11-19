@@ -653,7 +653,7 @@ $ rearview agent read ch_0b26e45343df:s99
 protocol agent-error kind=not-found ref=ch_0b26e45343df detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_74aec3f6df49
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=18 hidden-tool-results=11 hidden-thinking=1 hidden-subagents=4 warnings=1 warning-records=1
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=19 hidden-tool-results=12 hidden-thinking=1 hidden-subagents=4 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 subagent s2 type=grunt span=m11..m12 : child
@@ -687,7 +687,7 @@ m32 user 06:03:11
 m33..m34 hidden 06:03:12..06:03:13 tools=1 tool-results=1
 m35 user 06:03:14
 | Add the release notes
-m36..m42 hidden 06:03:15..06:03:21 tools=5 tool-results=2
+m36..m44 hidden 06:03:15..06:03:23 tools=6 tool-results=3
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
@@ -791,6 +791,11 @@ m41 06:03:20 call=m40.1
 | Plan updated
 m42.1 06:03:21
 | inter_agent_message: message from /root/RECEIVED_FROM_SENTINEL · text encrypted by Codex
+m43.1 06:03:22 result=m44
+| sleep: 45s
+m44 06:03:23 call=m43.1
+| Wall time: 12.1 seconds
+| Sleep interrupted by new input.
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m2..m4
 --- stdout
@@ -815,7 +820,7 @@ m3 s1 06:00:03 slice=match=the context=3 hits=0 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tail 3
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=8 hidden-tool-results=5 warnings=1 warning-records=1
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=9 hidden-tool-results=6 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m27 06:03:08
@@ -826,18 +831,18 @@ m32 user 06:03:11
 m33..m34 hidden 06:03:12..06:03:13 tools=1 tool-results=1
 m35 user 06:03:14
 | Add the release notes
-m36..m42 hidden 06:03:15..06:03:21 tools=5 tool-results=2
+m36..m44 hidden 06:03:15..06:03:23 tools=6 tool-results=3
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --subagents --tail 2
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=1 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
-m40.1 06:03:19 result=m41
-| tool update_plan input_keys=explanation,plan (+9 lines)
-m41 hidden 06:03:20 tool-results=1
 m42.1 06:03:21
 | inter_agent_message: message from /root/RECEIVED_FROM_SENTINEL · text encrypted by Codex
+m43.1 06:03:22 result=m44
+| sleep: 45s
+m44 hidden 06:03:23 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m6.1
 --- stdout
@@ -885,7 +890,7 @@ continue read refs=ch_74aec3f6df49:m1..m3 tools=false tool-results=false thinkin
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 policy=text omit=m11..m42 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
+protocol agent-read cut=tail chars=900 policy=text omit=m11..m44 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -896,9 +901,9 @@ m4 hidden 06:00:04 thinking=1
 m5 06:00:05
 | codex answer searchable
 m6..m10 hidden 06:00:07..06:00:11 tools=3 tool-results=2
-continue read refs=ch_74aec3f6df49:m11..m42 tools=true tool-results=true thinking=false subagents=true
+continue read refs=ch_74aec3f6df49:m11..m44 tools=true tool-results=true thinking=false subagents=true
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
-$ rearview agent read ch_74aec3f6df49:m11..m42 --tools --tool-results --subagents
+$ rearview agent read ch_74aec3f6df49:m11..m44 --tools --tool-results --subagents
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+tool-results+subagents omit=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
@@ -979,10 +984,15 @@ m41 06:03:20 call=m40.1
 | Plan updated
 m42.1 06:03:21
 | inter_agent_message: message from /root/RECEIVED_FROM_SENTINEL · text encrypted by Codex
+m43.1 06:03:22 result=m44
+| sleep: 45s
+m44 06:03:23 call=m43.1
+| Wall time: 12.1 seconds
+| Sleep interrupted by new input.
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m42
+protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m44
 $ rearview agent read ch_74aec3f6df49:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end

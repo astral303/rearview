@@ -170,13 +170,14 @@ impl TaskUsage {
         format!(
             "{} tokens · {tool_calls} · {}",
             crate::tui::format_tokens(self.tokens),
-            format_duration(self.duration_ms)
+            format_largest_unit_and_next(self.duration_ms)
         )
     }
 }
 
-/// `1h 4m`, `3m 5s` or `12s`: the two largest units that are not both zero.
-fn format_duration(duration_ms: u64) -> String {
+/// `1h 4m`, `3m 5s`, `2m 0s` or `12s`: the largest unit that is not zero
+/// and the unit after it, in whole seconds.
+fn format_largest_unit_and_next(duration_ms: u64) -> String {
     let seconds = duration_ms / 1_000;
     let (hours, minutes, seconds) = (seconds / 3_600, seconds / 60 % 60, seconds % 60);
     if hours > 0 {
@@ -488,8 +489,8 @@ mod tests {
             .line(),
             "950 tokens · 1 tool call · 12s"
         );
-        assert_eq!(format_duration(3_840_000), "1h 4m");
-        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_largest_unit_and_next(3_840_000), "1h 4m");
+        assert_eq!(format_largest_unit_and_next(0), "0s");
     }
 
     #[test]

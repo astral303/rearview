@@ -1170,9 +1170,19 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "agent_message", "id": "amsg_from_sender", "author": "/root/RECEIVED_FROM_SENTINEL", "recipient": "/root", "content": [{"type": "input_text", "text": "Message Type: MESSAGE\nTask name: /root\nSender: /root/RECEIVED_FROM_SENTINEL\nPayload:\n"}, {"type": "encrypted_content", "encrypted_content": "ENCRYPTED_SENTINEL_4"}]}),
                     ),
+                    line(
+                        22,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_sleep", "name": "sleep", "namespace": "clock", "arguments": "{\"duration_ms\":45000}", "call_id": "call_sleep"}),
+                    ),
+                    line(
+                        23,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_sleep", "call_id": "call_sleep", "output": "Wall time: 12.1 seconds\nSleep interrupted by new input."}),
+                    ),
                 ],
             );
-            const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, updated the task list 1 time";
+            const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, updated the task list 1 time";
             const LAUNCH_RUN: &str = "Started 2 agents";
             AgentSession::new(
                 Source::Codex,
@@ -1224,6 +1234,8 @@ pub(super) mod tests {
                         "RECEIVED_FROM_SENTINEL",
                     )
                     .in_summary_row(PATCH_RUN),
+                    Marker::in_call_or_subagent("sleep's duration", "sleep: 45s")
+                        .in_summary_row(PATCH_RUN),
                     Marker::shown("message to an agent", "SEND_MESSAGE_SENTINEL")
                         .in_summary_row(PATCH_RUN),
                 ],
