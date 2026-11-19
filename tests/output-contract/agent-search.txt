@@ -7,7 +7,7 @@ groups count=6
 conversation rank=1 project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 score=4.090909 hits=1 total=1 : Final Pi title
 hit project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 anchors=ma_0763fac584b77a74 source=lexical score=4.090909 focus=m2..m2 at=2024-02-29T19:02:00 | private reasoning root answer read: README.md
 read ref=ch_f04d3718e406:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false
-conversation rank=2 project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 score=4.071429 hits=2 total=3 : active codex question ... codex answer searchable ... follow-up question
+conversation rank=2 project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 score=4.071429 hits=2 total=5 : active codex question ... codex answer searchable ... follow-up question
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_7100872509cb233e source=lexical score=4.071429 focus=m18..m18 at=2026-08-01T06:02:30-04:00 | closing answer
 read ref=ch_74aec3f6df49:m17..m19 focus=m18..m18 tools=false tool-results=false thinking=false subagents=false
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4f60426316166883 source=lexical score=4.043478 focus=m3..m3 at=2026-08-01T06:00:03-04:00 | child answer searchable
@@ -356,7 +356,7 @@ protocol agent-search mode=lexical cut=none chars=6000 policy=per-hit groups=2 h
 query text=question hits=4
 sessions matched=2 offset=0 searched=2 failed=0
 groups count=2
-conversation rank=1 project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 score=4.055556 hits=2 total=3 : active codex question ... codex answer searchable ... follow-up question
+conversation rank=1 project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 score=4.055556 hits=2 total=6 : active codex question ... codex answer searchable ... follow-up question
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4b123428b81950de source=lexical score=4.055556 focus=m13..m13 at=2026-08-01T06:02:00 | follow-up question
 read ref=ch_74aec3f6df49:m12..m14 focus=m13..m13 tools=false tool-results=false thinking=false subagents=false
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_b381c31a261bdba3 source=lexical score=4.052632 focus=m2..m2 at=2026-08-01T06:00:03 | child task question

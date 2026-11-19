@@ -7,8 +7,8 @@
 │ ▌ KIMI · kimi-project · kimi title                                                                                              27 msgs · 3m · Aug 06, 06:03 │
 │ ▌ Dating the release steps. ... NUMBERED_REPLY_SENTINEL: the command printed nothing. ... Is the notes file empty?                                           │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
-│ ▌ CDX  · project                                                                                                                41 msgs · 3m · Aug 01, 06:03 │
-│ ▌ Add the release notes ... Show the last commit ... NUMBERED_REPLY_SENTINEL: the command printed nothing.                                                   │
+│ ▌ CDX  · project                                                                                                                49 msgs · 3m · Aug 01, 06:03 │
+│ ▌ user: [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}] ... Keep recording once warm? Yes, until I stop it. TYP… │
 │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│
 │ ▌ OMP  · omp-project · Updated OMP title                                                                                             22 msgs · Jan 01, 22:04 │
 │ ▌ The release steps are dated. ... Date the release steps ... Show the last commit                                                                           │

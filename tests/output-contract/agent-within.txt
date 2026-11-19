@@ -55,8 +55,8 @@ continue within ref=ch_0b26e45343df action=narrow-query-or-increase-budget
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent within ch_74aec3f6df49 answer
 --- stdout
-protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=3 tz=-04:00 warnings=1 warning-records=1
-query text=answer hits=3
+protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=5 tz=-04:00 warnings=1 warning-records=1
+query text=answer hits=5
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 title project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 : active codex question ... codex answer searchable ... follow-up question
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_7100872509cb233e source=lexical score=4.071429 focus=m18..m18 at=2026-08-01T06:02:30 | closing answer
@@ -65,6 +65,10 @@ hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch
 read ref=ch_74aec3f6df49:m2..m4 focus=m3..m3 tools=false tool-results=false thinking=false subagents=true
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_eb1c272f9dd484f3 source=lexical score=4.043478 focus=m5..m5 at=2026-08-01T06:00:05 | codex answer searchable
 read ref=ch_74aec3f6df49:m4..m6 focus=m5..m5 tools=false tool-results=false thinking=false subagents=false
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4e7b5a1be4214e7a source=lexical score=4.010870 focus=m48..m48 at=2026-08-01T06:03:27 | > Keep recording once warm? Yes, until I stop it. TYPED_ANSWER_SENTINEL: then save the log.
+read ref=ch_74aec3f6df49:m47..m49 focus=m48..m48 tools=false tool-results=false thinking=false subagents=false
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_0a4fc9eaa358ccd0 source=lexical score=4.005952 focus=m49..m49 at=2026-08-01T06:03:28 | user: <send_user_message_question_reply> [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}] </send_user_message_questio
+read ref=ch_74aec3f6df49:m48..m49 focus=m49..m49 tools=false tool-results=false thinking=false subagents=false
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_74aec3f6df49 searchable --top 2
 --- stdout
@@ -85,8 +89,8 @@ conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-0000000000
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_74aec3f6df49 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=11 tz=-04:00 warnings=1 warning-records=1 omitted-lines=24
-query text=the hits=11
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=13 tz=-04:00 warnings=1 warning-records=1 omitted-lines=28
+query text=the hits=13
 continue within ref=ch_74aec3f6df49 action=narrow-query-or-increase-budget
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_974c3840e189 answer

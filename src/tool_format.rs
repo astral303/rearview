@@ -5,8 +5,10 @@
 //! The layout is chosen by the call's canonical [`Tool`]; the header always
 //! opens with the provider's own tool name.
 
+use crate::duration::format_duration;
 use crate::log_entry::{DELIVERED_REPORT_KEY, Tool, replacement_diff};
 use serde_json::Value;
+use std::time::Duration;
 
 /// Formatted tool call representation
 pub struct FormattedToolCall {
@@ -174,17 +176,26 @@ pub fn tool_call_header(name: &str, tool: Tool, input: &Value) -> ToolCallHeader
         Tool::Skill => ToolCallHeader::named(name_prefix(name), field("skill")),
         Tool::Agent => agent_header(name, input),
         Tool::AgentMessage => ToolCallHeader::named(name_prefix(name), field("recipient")),
+        Tool::ReceivedMessage => {
+            ToolCallHeader::named(name_prefix(name), received_message_header(input))
+        }
         Tool::AgentReport if is_delivered_report(input) => {
             ToolCallHeader::named(name_prefix(name), "report delivered".to_owned())
         }
         Tool::AgentReport => ToolCallHeader::named(format!("{name}:"), String::new()),
         Tool::WebFetch => ToolCallHeader::named(name_prefix(name), field("url")),
         Tool::WebSearch => web_search_header(name, input),
+        Tool::Wait => match wait_duration(input) {
+            Some(duration) => ToolCallHeader::named(name_prefix(name), format_duration(duration)),
+            None => ToolCallHeader::raw_input(name),
+        },
+        Tool::UserQuestion => ToolCallHeader::named(
+            name_prefix(name),
+            question_count(asked_questions(input).map_or(0, |questions| questions.len())),
+        ),
         // `ResultReceipt` reaches no header; the raw input keeps the match
         // exhaustive.
-        Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => {
-            ToolCallHeader::raw_input(name)
-        }
+        Tool::TaskList | Tool::ResultReceipt | Tool::Other => ToolCallHeader::raw_input(name),
     }
 }
 
@@ -231,10 +242,14 @@ pub fn tool_call_body(tool: Tool, input: &Value) -> Option<ToolCallBody<'_>> {
         Tool::Edit => edit_body(input),
         Tool::Skill => plain_field("args"),
         Tool::Agent => agent_body(input),
-        Tool::AgentMessage => plain_field("message"),
+        Tool::AgentMessage | Tool::ReceivedMessage => plain_field("message"),
         Tool::AgentReport if is_delivered_report(input) => None,
         Tool::AgentReport => plain_field("message"),
         Tool::WebFetch => plain_field("prompt"),
+        Tool::Wait if wait_duration(input).is_some() => None,
+        Tool::UserQuestion => {
+            asked_questions(input).map(|questions| ToolBody::plain(questions_text(&questions)))
+        }
         Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => {
             return Some(ToolCallBody::RawInput(input));
         }
@@ -261,7 +276,10 @@ fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
 /// under `input` instead of `file_path`); the name plus the input then shows
 /// more than an empty header.
 fn lacks_header_field(tool: Tool, input: &Value) -> bool {
-    header_field(tool, input).is_some_and(|key| string_field(input, key).is_none())
+    match tool {
+        Tool::UserQuestion => asked_questions(input).is_none(),
+        _ => header_field(tool, input).is_some_and(|key| string_field(input, key).is_none()),
+    }
 }
 
 fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
@@ -274,16 +292,89 @@ fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
         Tool::Agent if launch_settings(input).is_some() => None,
         Tool::Agent => Some("description"),
         Tool::AgentMessage => Some("recipient"),
+        Tool::ReceivedMessage => Some("sender"),
         Tool::AgentReport if is_delivered_report(input) => None,
         Tool::AgentReport => Some("message"),
         Tool::WebFetch => Some("url"),
         Tool::WebSearch => Some("query"),
+        // Its header reads a list of questions, which `lacks_header_field`
+        // checks.
+        Tool::UserQuestion => None,
         Tool::DirectoryListing
         | Tool::Wait
         | Tool::TaskList
         | Tool::ResultReceipt
         | Tool::Other => None,
     }
+}
+
+/// One question of a [`Tool::UserQuestion`] call: its title and the answers
+/// it offers, if any.
+pub(crate) struct AskedQuestion<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) options: Vec<&'a str>,
+}
+
+/// The questions of a [`Tool::UserQuestion`] call; `None` unless `questions`
+/// is a non-empty list of objects, each with a string `title`.
+pub(crate) fn asked_questions(input: &Value) -> Option<Vec<AskedQuestion<'_>>> {
+    let questions = input.get("questions")?.as_array()?;
+    if questions.is_empty() {
+        return None;
+    }
+    questions
+        .iter()
+        .map(|question| {
+            Some(AskedQuestion {
+                title: string_field(question, "title")?,
+                options: question
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn question_count(count: usize) -> String {
+    match count {
+        1 => "1 question".to_owned(),
+        count => format!("{count} questions"),
+    }
+}
+
+/// Each title, numbered when there are several, then its options as bullets;
+/// a blank line between questions. A numbered title's later lines hang
+/// under its text, not under its number.
+fn questions_text(questions: &[AskedQuestion<'_>]) -> String {
+    let numbered = questions.len() > 1;
+    questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let number = if numbered {
+                format!("{}. ", index + 1)
+            } else {
+                String::new()
+            };
+            let hanging_indent = " ".repeat(number.len());
+            let mut title_lines = question.title.lines();
+            let first_line = title_lines.next().unwrap_or_default();
+            let mut lines = vec![format!("{number}{first_line}")];
+            lines.extend(title_lines.map(|line| format!("{hanging_indent}{line}")));
+            lines.extend(
+                question
+                    .options
+                    .iter()
+                    .map(|option| format!("  • {option}")),
+            );
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn name_prefix(name: &str) -> String {
@@ -384,6 +475,29 @@ fn launch_body(launch: &serde_json::Map<String, Value>, prompt: Option<&str>) ->
 
 fn is_delivered_report(input: &Value) -> bool {
     input.get(DELIVERED_REPORT_KEY).and_then(Value::as_bool) == Some(true)
+}
+
+/// The length of a wait for a set time: its `duration_ms`. `None` for a
+/// wait on something else, such as a process or an agent.
+fn wait_duration(input: &Value) -> Option<Duration> {
+    input
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+}
+
+/// `new task from /root`, or `from /root` without a kind, then
+/// ` · text encrypted by Codex` when the text is unreadable.
+fn received_message_header(input: &Value) -> String {
+    let sender = string_field(input, "sender").unwrap_or("");
+    let mut header = match string_field(input, "kind") {
+        Some(kind) => format!("{kind} from {sender}"),
+        None => format!("from {sender}"),
+    };
+    if let Some(agent) = string_field(input, "encrypted_by") {
+        header.push_str(&format!(" · text encrypted by {agent}"));
+    }
+    header
 }
 
 /// The command's first line is the header's value and its later lines the
@@ -567,6 +681,7 @@ mod tests {
             Tool::Skill,
             Tool::Agent,
             Tool::AgentMessage,
+            Tool::ReceivedMessage,
             Tool::AgentReport,
             Tool::WebFetch,
             Tool::WebSearch,
@@ -757,6 +872,97 @@ mod tests {
         let result = format_tool_call("SendMessage", Tool::AgentMessage, &input, 80);
         assert_eq!(result.header(), "SendMessage: worker-1");
         assert_eq!(body_text(&result), Some("How far along are you?"));
+    }
+
+    #[test]
+    fn received_message_names_its_kind_and_sender_and_carries_readable_text() {
+        let input = json!({"kind": "new task", "sender": "/root", "message": "Map the callers."});
+        let result = format_tool_call("inter_agent_message", Tool::ReceivedMessage, &input, 80);
+        assert_eq!(result.header(), "inter_agent_message: new task from /root");
+        assert_eq!(body_text(&result), Some("Map the callers."));
+    }
+
+    #[test]
+    fn encrypted_received_message_is_one_header_line() {
+        let input = json!({"kind": "message", "sender": "/root/scout", "encrypted_by": "Codex"});
+        let result = format_tool_call("inter_agent_message", Tool::ReceivedMessage, &input, 80);
+        assert_eq!(
+            result.header(),
+            "inter_agent_message: message from /root/scout · text encrypted by Codex"
+        );
+        assert_eq!(body_text(&result), None);
+    }
+
+    #[test]
+    fn received_message_without_kind_names_its_sender_alone() {
+        let input = json!({"sender": "/root", "message": "Map the callers."});
+        let result = format_tool_call("inter_agent_message", Tool::ReceivedMessage, &input, 80);
+        assert_eq!(result.header(), "inter_agent_message: from /root");
+    }
+
+    #[test]
+    fn wait_for_set_time_shows_its_duration_without_body() {
+        let result = format_tool_call("sleep", Tool::Wait, &json!({"duration_ms": 90_000}), 80);
+        assert_eq!(result.header(), "sleep: 1m 30s");
+        assert_eq!(body_text(&result), None);
+    }
+
+    #[test]
+    fn wait_on_something_else_shows_its_name_and_input() {
+        let input = json!({"session_id": 1, "chars": ""});
+        let result = format_tool_call("write_stdin", Tool::Wait, &input, 80);
+        assert_eq!(result.header(), "write_stdin:");
+        assert_eq!(
+            body_text(&result),
+            Some(serde_json::to_string_pretty(&input).unwrap().as_str())
+        );
+    }
+
+    #[test]
+    fn question_call_counts_its_questions_and_lists_each_title_and_option() {
+        let input = json!({"questions": [
+            {"title": "Is the firmware session still running?", "options": ["Yes", "No"]},
+        ]});
+        let result = format_tool_call("request_user_input_async", Tool::UserQuestion, &input, 80);
+        assert_eq!(result.header(), "request_user_input_async: 1 question");
+        assert_eq!(
+            body_text(&result),
+            Some("Is the firmware session still running?\n  • Yes\n  • No")
+        );
+    }
+
+    #[test]
+    fn several_questions_are_numbered_and_one_without_options_shows_its_title_alone() {
+        let input = json!({"questions": [
+            {"title": "Which profile?", "options": ["warm idle", "cold start"]},
+            {"title": "Keep recording\nonce warm?"},
+        ]});
+        let result = format_tool_call("request_user_input_async", Tool::UserQuestion, &input, 80);
+        assert_eq!(result.header(), "request_user_input_async: 2 questions");
+        assert_eq!(
+            body_text(&result),
+            Some(
+                "1. Which profile?\n  • warm idle\n  • cold start\n\n2. Keep recording\n   once warm?"
+            )
+        );
+    }
+
+    #[test]
+    fn question_call_without_titled_questions_shows_its_name_and_input() {
+        for input in [
+            json!({"questions": []}),
+            json!({"questions": [{"options": ["Yes"]}]}),
+            json!({"arguments": "not json"}),
+        ] {
+            let result =
+                format_tool_call("request_user_input_async", Tool::UserQuestion, &input, 80);
+            assert_eq!(result.header(), "request_user_input_async:", "{input}");
+            assert_eq!(
+                body_text(&result),
+                Some(serde_json::to_string_pretty(&input).unwrap().as_str()),
+                "{input}"
+            );
+        }
     }
 
     #[test]

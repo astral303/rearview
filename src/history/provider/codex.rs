@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 28,
+            schema_version: 29,
         }
     }
 
@@ -1165,10 +1165,52 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "function_call_output", "id": "fco_plan", "call_id": "call_plan", "output": "Plan updated"}),
                     ),
+                    line(
+                        21,
+                        "response_item",
+                        json!({"type": "agent_message", "id": "amsg_from_sender", "author": "/root/RECEIVED_FROM_SENTINEL", "recipient": "/root", "content": [{"type": "input_text", "text": "Message Type: MESSAGE\nTask name: /root\nSender: /root/RECEIVED_FROM_SENTINEL\nPayload:\n"}, {"type": "encrypted_content", "encrypted_content": "ENCRYPTED_SENTINEL_4"}]}),
+                    ),
+                    line(
+                        22,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_sleep", "name": "sleep", "namespace": "clock", "arguments": "{\"duration_ms\":45000}", "call_id": "call_sleep"}),
+                    ),
+                    line(
+                        23,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_sleep", "call_id": "call_sleep", "output": "Wall time: 12.1 seconds\nSleep interrupted by new input."}),
+                    ),
+                    line(
+                        24,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_question", "name": "request_user_input_async", "arguments": "{\"questions\":[{\"title\":\"QUESTION_TITLE_SENTINEL: which profile?\",\"options\":[\"warm idle\",\"QUESTION_OPTION_SENTINEL\"]},{\"title\":\"Keep recording once warm?\"}]}", "call_id": "call_question"}),
+                    ),
+                    line(
+                        25,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_question", "call_id": "call_question", "output": "{\"accepted\":true}"}),
+                    ),
+                    // The two questions answered in separate messages.
+                    line(
+                        26,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_answer_1", "role": "user", "content": [{"type": "input_text", "text": "<send_user_message_question_reply>\n[{\"answer\":\"PICKED_OPTION_SENTINEL: warm idle\",\"question\":\"QUESTION_TITLE_SENTINEL: which profile?\",\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"call_question\\\",0]\"}]\n</send_user_message_question_reply>"}]}),
+                    ),
+                    line(
+                        27,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_answer_2", "role": "user", "content": [{"type": "input_text", "text": "<send_user_message_question_reply>\n[{\"answer\":\"Yes, until I stop it.\\nTYPED_ANSWER_SENTINEL: then save the log.\",\"question\":\"Keep recording once warm?\",\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"call_question\\\",1]\"}]\n</send_user_message_question_reply>"}]}),
+                    ),
+                    // An envelope quoted after other text, as a parent passes
+                    // one on to a sub-agent.
+                    line(
+                        28,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_quoted_answer", "role": "user", "content": [{"type": "input_text", "text": "user: <send_user_message_question_reply>\n[{\"answer\":\"QUOTED_ENVELOPE_SENTINEL\",\"question\":\"Ship it?\",\"questionItemId\":\"call_other\"}]\n</send_user_message_question_reply>"}]}),
+                    ),
                 ],
             );
-            const PATCH_RUN: &str =
-                "Edited 2 files, messaged 1 agent, updated the task list 1 time";
+            const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time";
             const LAUNCH_RUN: &str = "Started 2 agents";
             AgentSession::new(
                 Source::Codex,
@@ -1213,7 +1255,28 @@ pub(super) mod tests {
                     .in_summary_row("Ran 1 shell command"),
                     Marker::shown("patch", "PATCH_SENTINEL").in_summary_row(PATCH_RUN),
                     Marker::shown("plan update", "PLAN_STEP_SENTINEL"),
-                    Marker::shown("inter-agent message", "INTER_AGENT_TASK_TEXT"),
+                    Marker::shown("readable message from an agent", "INTER_AGENT_TASK_TEXT")
+                        .in_summary_row("Received 1 message, waited 1 time, called 1 tool"),
+                    Marker::in_call_or_subagent(
+                        "encrypted message from an agent",
+                        "RECEIVED_FROM_SENTINEL",
+                    )
+                    .in_summary_row(PATCH_RUN),
+                    Marker::in_call_or_subagent("sleep's duration", "sleep: 45s")
+                        .in_summary_row(PATCH_RUN),
+                    Marker::in_call_or_subagent(
+                        "question count",
+                        "request_user_input_async: 2 questions",
+                    )
+                    .in_summary_row(PATCH_RUN),
+                    Marker::shown("question's title", "QUESTION_TITLE_SENTINEL")
+                        .in_summary_row(PATCH_RUN),
+                    Marker::shown("question's option", "QUESTION_OPTION_SENTINEL")
+                        .in_summary_row(PATCH_RUN),
+                    Marker::shown("question shown to the user", "shown to the user"),
+                    Marker::shown("answer to a question", "PICKED_OPTION_SENTINEL"),
+                    Marker::shown("typed answer to a question", "TYPED_ANSWER_SENTINEL"),
+                    Marker::shown("quoted reply envelope", "QUOTED_ENVELOPE_SENTINEL"),
                     Marker::shown("message to an agent", "SEND_MESSAGE_SENTINEL")
                         .in_summary_row(PATCH_RUN),
                 ],

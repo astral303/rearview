@@ -34,8 +34,8 @@ use crate::history::provider::{
 use crate::history::task_notification::ReportSender;
 use crate::history::{Admitted, ParsePermit, Source, TaskReport, TranscriptEntries};
 use crate::log_entry::{
-    AssistantMessage, ContentBlock, DELIVERED_REPORT_KEY, LogEntry, NOTICE_LABEL, SubagentIdentity,
-    TokenUsage, Tool, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, DELIVERED_REPORT_KEY, LogEntry, NOTICE_LABEL, QuotedAnswer,
+    SubagentIdentity, TokenUsage, Tool, UserContent, UserMessage,
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, FixedOffset};
@@ -948,18 +948,26 @@ fn parse_thread(
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RecordState {
     last_shown: LastShown,
+    /// The ids of the question calls whose result is still to come.
+    question_calls: BTreeSet<String>,
     own_history: OwnHistory,
 }
 
 impl RecordState {
     /// The state before the first record of the rollout `header` opens.
     fn at_start(header: &RolloutHeader) -> Self {
+        Self::before_records(match header.own_history_start {
+            Some(boundary) => OwnHistory::Pending { boundary },
+            None => OwnHistory::Started,
+        })
+    }
+
+    /// The state before any record is read.
+    fn before_records(own_history: OwnHistory) -> Self {
         Self {
             last_shown: LastShown::default(),
-            own_history: match header.own_history_start {
-                Some(boundary) => OwnHistory::Pending { boundary },
-                None => OwnHistory::Started,
-            },
+            question_calls: BTreeSet::new(),
+            own_history,
         }
     }
 }
@@ -1056,7 +1064,7 @@ impl ThreadProjection {
             let read = self.read_earlier(admitted.admit_linked(&rollout.path), &rollout, parallel);
             if let Err(unread) = read {
                 self.entries.clear();
-                self.state.last_shown = LastShown::default();
+                self.state = RecordState::before_records(self.state.own_history);
                 self.started = None;
                 self.earlier_turns = unread;
                 continue;
@@ -1180,12 +1188,9 @@ impl ThreadProjection {
             // The first own record: what was read so far is the parent's
             // history, its last model and goal included.
             self.entries.clear();
-            self.state = RecordState {
-                last_shown: LastShown::default(),
-                own_history: OwnHistory::Started,
-            };
+            self.state = RecordState::before_records(OwnHistory::Started);
         }
-        if let Some(entry) = normalize_line(object, &mut self.state.last_shown, &mut self.dropped) {
+        if let Some(entry) = normalize_line(object, &mut self.state, &mut self.dropped) {
             let record = RecordLine {
                 transcript: transcript.clone(),
                 line,
@@ -1747,7 +1752,7 @@ fn parse_record(line: &str) -> Option<Value> {
 
 fn normalize_line(
     object: &Map<String, Value>,
-    last_shown: &mut LastShown,
+    state: &mut RecordState,
     dropped: &mut DroppedRecords,
 ) -> Option<LogEntry> {
     let timestamp = object
@@ -1756,8 +1761,11 @@ fn normalize_line(
         .map(str::to_owned);
     let payload = object.get("payload")?.as_object()?;
     let kind = object.get("type").and_then(Value::as_str);
+    let last_shown = &mut state.last_shown;
     match kind {
-        Some("response_item") => normalize_response_item(payload, timestamp, dropped),
+        Some("response_item") => {
+            normalize_response_item(payload, timestamp, &mut state.question_calls, dropped)
+        }
         Some("compacted") => compaction_summary(payload, timestamp),
         Some("turn_context") => model_change(payload, timestamp, &mut last_shown.model),
         Some("event_msg") => event_message(payload, timestamp, &mut last_shown.goal, dropped),
@@ -1782,28 +1790,38 @@ fn normalize_line(
 fn normalize_response_item(
     payload: &Map<String, Value>,
     timestamp: Option<String>,
+    question_calls: &mut BTreeSet<String>,
     dropped: &mut DroppedRecords,
 ) -> Option<LogEntry> {
     let kind = payload.get("type").and_then(Value::as_str);
-    match kind {
+    let entry = match kind {
         Some("message") => normalize_message(payload, timestamp, dropped),
         Some("reasoning") => reasoning_summary(payload, timestamp),
-        Some("custom_tool_call") => tool_call(payload, payload.get("input").cloned(), timestamp),
+        Some("custom_tool_call") => {
+            Some(tool_call(payload, payload.get("input").cloned(), timestamp))
+        }
         Some("function_call") => {
             let arguments = payload.get("arguments").and_then(Value::as_str);
             let input = arguments.map(|raw| {
                 serde_json::from_str(raw).unwrap_or_else(|_| json!({ "arguments": raw }))
             });
-            tool_call(payload, input, timestamp)
+            Some(tool_call(payload, input, timestamp))
         }
-        Some("custom_tool_call_output" | "function_call_output") => tool_result(payload, timestamp),
+        Some("custom_tool_call_output" | "function_call_output") => {
+            Some(tool_result(payload, timestamp, question_calls))
+        }
         Some("agent_message") => inter_agent_message(payload, timestamp),
         Some("web_search_call") => web_search_call(payload, timestamp),
         _ => {
             dropped.unrecognised("response_item.type", kind);
             None
         }
+    };
+    if let Some(entry) = &entry {
+        record_question_calls(entry, question_calls);
+        remove_answered_question_calls(entry, question_calls);
     }
+    entry
 }
 
 fn normalize_message(
@@ -1822,6 +1840,16 @@ fn normalize_message(
                 && let Some(command) = UserShellCommand::parse(text)
             {
                 return Some(user_shell_command_entry(payload, &command, timestamp));
+            }
+            // An answer to a question is one complete XML element too.
+            if let [text] = texts.as_slice()
+                && let Some(json) = question_reply_envelope(text)
+            {
+                let Some(replies) = question_replies(json) else {
+                    dropped.failed("send_user_message_question_reply");
+                    return None;
+                };
+                return Some(question_answer_entry(&replies, timestamp));
             }
             let typed_by_the_user = texts
                 .into_iter()
@@ -1872,6 +1900,93 @@ fn normalize_message(
             dropped.unrecognised("message.role", role);
             None
         }
+    }
+}
+
+/// The user's answer to one question of a question call, as Codex's reply
+/// envelope records it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionReply {
+    /// `["request_user_input_async","<call id>",<question index>]` as a JSON
+    /// string, or the call id alone in an older reply.
+    question_item_id: String,
+    /// The question's title, truncated to 512 bytes, its line breaks as
+    /// spaces.
+    question: String,
+    answer: String,
+}
+
+impl QuestionReply {
+    fn call_id(&self) -> String {
+        match serde_json::from_str::<Value>(&self.question_item_id) {
+            Ok(Value::Array(parts)) if parts.len() == 3 => parts[1]
+                .as_str()
+                .unwrap_or(&self.question_item_id)
+                .to_owned(),
+            _ => self.question_item_id.clone(),
+        }
+    }
+}
+
+const QUESTION_REPLY_OPEN: &str = "<send_user_message_question_reply>";
+const QUESTION_REPLY_CLOSE: &str = "</send_user_message_question_reply>";
+
+/// The JSON inside Codex's reply envelope, when a message's text is nothing
+/// but the envelope. Text before the envelope, as when an agent quotes one,
+/// keeps the message as text.
+fn question_reply_envelope(text: &str) -> Option<&str> {
+    text.trim()
+        .strip_prefix(QUESTION_REPLY_OPEN)?
+        .strip_suffix(QUESTION_REPLY_CLOSE)
+}
+
+/// The replies an envelope's JSON holds, one reply or a list; `None` for
+/// JSON of another shape and for an empty list.
+fn question_replies(json: &str) -> Option<Vec<QuestionReply>> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Replies {
+        Several(Vec<QuestionReply>),
+        One(QuestionReply),
+    }
+    let replies = match serde_json::from_str::<Replies>(json).ok()? {
+        Replies::Several(replies) => replies,
+        Replies::One(reply) => vec![reply],
+    };
+    (!replies.is_empty()).then_some(replies)
+}
+
+/// The user's message answering a question call: each reply as a quote of
+/// its question and the answer. The message names the call when every reply
+/// names the same one.
+fn question_answer_entry(replies: &[QuestionReply], timestamp: Option<String>) -> LogEntry {
+    let call_ids: BTreeSet<String> = replies.iter().map(QuestionReply::call_id).collect();
+    let source_tool_use_id = match call_ids.len() {
+        1 => call_ids.into_iter().next(),
+        _ => None,
+    };
+    let blocks = replies
+        .iter()
+        .map(|reply| ContentBlock::Text {
+            text: QuotedAnswer {
+                question: &reply.question,
+                answer: &reply.answer,
+            }
+            .text(),
+        })
+        .collect();
+    LogEntry::User {
+        message: UserMessage {
+            role: "user".to_owned(),
+            content: UserContent::Blocks(blocks),
+        },
+        timestamp,
+        uuid: None,
+        cwd: None,
+        parent_tool_use_id: None,
+        source_tool_use_id,
+        usage: None,
     }
 }
 
@@ -1985,11 +2100,49 @@ fn tool_call(
     payload: &Map<String, Value>,
     input: Option<Value>,
     timestamp: Option<String>,
-) -> Option<LogEntry> {
+) -> LogEntry {
     let call_id = string_field(payload, "call_id").unwrap_or_else(|| "unknown".to_owned());
     let name = string_field(payload, "name").unwrap_or_else(|| "unknown".to_owned());
     let blocks = tools::tool_use_blocks(&call_id, &name, &input.unwrap_or_else(|| json!({})));
-    Some(assistant_entry(payload, blocks, timestamp))
+    assistant_entry(payload, blocks, timestamp)
+}
+
+/// Add the id of each question call `entry` makes to `question_calls`, for
+/// its result to find.
+fn record_question_calls(entry: &LogEntry, question_calls: &mut BTreeSet<String>) {
+    for block in entry.content_blocks() {
+        if let ContentBlock::ToolUse {
+            id,
+            tool: Tool::UserQuestion,
+            ..
+        } = block
+        {
+            question_calls.insert(id.clone());
+        }
+    }
+}
+
+/// Remove from `question_calls` each call a result in `entry` answers.
+fn remove_answered_question_calls(entry: &LogEntry, question_calls: &mut BTreeSet<String>) {
+    for block in entry.content_blocks() {
+        if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+            question_calls.remove(tool_use_id);
+        }
+    }
+}
+
+/// The result Codex returns once it shows the user a question.
+const QUESTION_SHOWN_RESULT: &str = r#"{"accepted":true}"#;
+
+/// `shown to the user` for the result Codex returns once it shows the user a
+/// question; any other result as Codex wrote it. The user answers in a later
+/// message.
+fn question_result_text(text: String) -> String {
+    if text.trim() == QUESTION_SHOWN_RESULT {
+        "shown to the user".to_owned()
+    } else {
+        text
+    }
 }
 
 /// The model's web search through Codex's built-in tool. The call has no
@@ -2003,9 +2156,15 @@ fn web_search_call(payload: &Map<String, Value>, timestamp: Option<String>) -> O
 
 /// Reads a tool-result payload into a user entry. With no `call_id` the result
 /// answers no call: it takes the item's own `id`, or `"unknown"` when the
-/// payload carries neither, and keeps the tool name the payload gives.
-fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
-    let text = tool_result_text(&Value::String(output_text(payload))).unwrap_or_default();
+/// payload carries neither, and keeps the tool name the payload gives. The
+/// result of a call in `question_calls` reads as [`question_result_text`]
+/// writes it.
+fn tool_result(
+    payload: &Map<String, Value>,
+    timestamp: Option<String>,
+    question_calls: &BTreeSet<String>,
+) -> LogEntry {
+    let mut text = tool_result_text(&Value::String(output_text(payload))).unwrap_or_default();
     // The id and the name are decided together: with no `call_id` the result
     // answers no call, so it takes the item's own id and the tool it names.
     let (tool_use_id, standalone_tool_name) = match string_field(payload, "call_id") {
@@ -2015,7 +2174,10 @@ fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Optio
             string_field(payload, "name"),
         ),
     };
-    Some(LogEntry::User {
+    if question_calls.contains(&tool_use_id) {
+        text = question_result_text(text);
+    }
+    LogEntry::User {
         message: UserMessage {
             role: "user".to_owned(),
             content: UserContent::Blocks(vec![ContentBlock::ToolResult {
@@ -2030,7 +2192,7 @@ fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Optio
         parent_tool_use_id: None,
         source_tool_use_id: None,
         usage: None,
-    })
+    }
 }
 
 /// A tool result's output: one string, or the text of content blocks typed
@@ -2044,13 +2206,15 @@ fn output_text(payload: &Map<String, Value>) -> String {
 
 /// A message between agents of a multi-agent run. A sub-agent's final answer
 /// reads as a task report: the report the sub-agent hands back. Any other
-/// message is a tool call whose input the viewer shows as JSON.
+/// message reads as a message the recipient received.
 fn inter_agent_message(
     payload: &Map<String, Value>,
     timestamp: Option<String>,
 ) -> Option<LogEntry> {
     let text = block_texts(payload.get("content")).join("\n");
-    if let Some(report) = final_answer_report(&text, string_field(payload, "author").as_deref()) {
+    let parsed = InterAgentText::parse(&text);
+    let author = string_field(payload, "author");
+    if let Some(report) = final_answer_report(&parsed, author.as_deref()) {
         return Some(LogEntry::User {
             message: UserMessage {
                 role: "user".to_owned(),
@@ -2064,39 +2228,92 @@ fn inter_agent_message(
             usage: None,
         });
     }
+    let mut input = Map::new();
+    if let Some(message_type) = parsed.message_type {
+        input.insert("kind".to_owned(), json!(message_kind(message_type)));
+    }
+    if let Some(author) = author {
+        input.insert("sender".to_owned(), json!(author));
+    }
+    let message = trim_blank_lines(parsed.payload);
+    if !message.is_empty() {
+        input.insert("message".to_owned(), json!(message));
+    }
+    if has_encrypted_block(payload.get("content")) {
+        input.insert("encrypted_by".to_owned(), json!("Codex"));
+    }
     let block = ContentBlock::ToolUse {
         id: string_field(payload, "id").unwrap_or_else(|| "inter_agent".to_owned()),
         name: "inter_agent_message".to_owned(),
-        tool: Tool::Other,
-        input: json!({
-            "author": string_field(payload, "author"),
-            "recipient": string_field(payload, "recipient"),
-            "message": text,
-        }),
+        tool: Tool::ReceivedMessage,
+        input: Value::Object(input),
     };
     Some(assistant_entry(payload, vec![block], timestamp))
 }
 
-/// The first line of a sub-agent's final answer; header lines follow, then
-/// `Payload:` on a line of its own and the report.
-const FINAL_ANSWER_TYPE: &str = "Message Type: FINAL_ANSWER";
-const FINAL_ANSWER_PAYLOAD: &str = "Payload:";
+/// The text of a message between agents. Codex writes a `Message Type:` line,
+/// more header lines, `Payload:` on a line of its own, then the payload.
+/// Text without that header is all payload.
+struct InterAgentText<'a> {
+    /// The type as Codex writes it: `NEW_TASK`, `MESSAGE`, `FINAL_ANSWER`.
+    message_type: Option<&'a str>,
+    payload: &'a str,
+}
+
+const MESSAGE_TYPE_LABEL: &str = "Message Type: ";
+const PAYLOAD_LINE: &str = "Payload:";
+
+impl<'a> InterAgentText<'a> {
+    fn parse(text: &'a str) -> Self {
+        Self::with_header(text).unwrap_or(Self {
+            message_type: None,
+            payload: text,
+        })
+    }
+
+    fn with_header(text: &'a str) -> Option<Self> {
+        let mut lines = text.split_inclusive('\n');
+        let first_line = lines.next()?;
+        let message_type = first_line.trim_end().strip_prefix(MESSAGE_TYPE_LABEL)?;
+        let mut payload_start = first_line.len();
+        for line in lines {
+            payload_start += line.len();
+            if line.trim_end() == PAYLOAD_LINE {
+                return Some(Self {
+                    message_type: Some(message_type),
+                    payload: &text[payload_start..],
+                });
+            }
+        }
+        None
+    }
+}
+
+/// A message type as the row reads it: `NEW_TASK` as `new task`.
+fn message_kind(message_type: &str) -> String {
+    message_type.to_lowercase().replace('_', " ")
+}
+
+/// True when `content` holds an `encrypted_content` block: Codex stored the
+/// message's text encrypted.
+fn has_encrypted_block(content: Option<&Value>) -> bool {
+    content.and_then(Value::as_array).is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("encrypted_content"))
+    })
+}
 
 /// The report a final answer carries, named by the task of the sub-agent that
 /// wrote it: the last segment of its agent path (`/root/scout` is `scout`),
 /// the name its `spawn_agent` row shows. The agent path is its sender.
-fn final_answer_report(text: &str, author: Option<&str>) -> Option<TaskReport> {
-    let mut lines = text.split_inclusive('\n');
-    if lines.next()?.trim_end() != FINAL_ANSWER_TYPE {
+fn final_answer_report(text: &InterAgentText<'_>, author: Option<&str>) -> Option<TaskReport> {
+    if text.message_type != Some("FINAL_ANSWER") {
         return None;
     }
-    lines
-        .by_ref()
-        .find(|line| line.trim_end() == FINAL_ANSWER_PAYLOAD)?;
-    let report: String = lines.collect();
     let task = author.and_then(task_name);
     Some(
-        TaskReport::handed_back(task, &report).sent_by(ReportSender {
+        TaskReport::handed_back(task, text.payload).sent_by(ReportSender {
             task_id: author.map(str::to_owned),
             launch_call: None,
         }),
@@ -2339,8 +2556,10 @@ fn string_field(payload: &Map<String, Value>, name: &str) -> Option<String> {
 /// `<tag>…</tag>` wrapper, a bare placeholder tag, or the AGENTS.md pair — so
 /// the test is structural rather than a list of tag names that would go stale.
 /// The known cost: a prompt that is one complete XML element and nothing else
-/// is misread as context, as is a `<user_shell_command>` record of a command
-/// the user ran through the agent.
+/// is misread as context. `normalize_message` reads two such elements before
+/// this test: a `<user_shell_command>` record of a command the user ran
+/// through the agent, and a `<send_user_message_question_reply>` envelope of
+/// the user's answers.
 fn is_injected_context(text: &str) -> bool {
     let text = text.trim();
     if text.starts_with("# AGENTS.md instructions") && text.ends_with("</INSTRUCTIONS>") {
@@ -3152,7 +3371,7 @@ mod tests {
         let record: Value = serde_json::from_str(line).unwrap();
         normalize_line(
             record.as_object().unwrap(),
-            &mut LastShown::default(),
+            &mut RecordState::before_records(OwnHistory::Started),
             &mut DroppedRecords::default(),
         )
     }
@@ -3520,17 +3739,281 @@ mod tests {
         assert_eq!(other_offset, [false, true]);
     }
 
-    #[test]
-    fn message_between_agents_that_is_not_final_answer_stays_call() {
-        let message = FINAL_ANSWER.replace("Message Type: FINAL_ANSWER", "Message Type: MESSAGE");
-
-        let Some(LogEntry::Assistant { message, .. }) = normalized(&message) else {
-            panic!("any other message reads as an assistant call");
+    /// The text of the result of the call `name` makes with `arguments`,
+    /// when Codex returns `output`, as the two records read in order.
+    fn result_of(name: &str, arguments: &str, output: &str) -> String {
+        let mut state = RecordState::before_records(OwnHistory::Started);
+        let mut read = |payload: Value| {
+            let record = json!({"timestamp": "2026-08-01T02:01:16Z", "type": "response_item", "payload": payload});
+            normalize_line(
+                record.as_object().unwrap(),
+                &mut state,
+                &mut DroppedRecords::default(),
+            )
         };
-        assert!(
-            matches!(&message.content[..], [ContentBlock::ToolUse { name, .. }] if name == "inter_agent_message"),
-            "{:?}",
-            message.content
+        read(
+            json!({"type": "function_call", "call_id": "call_1", "name": name, "arguments": arguments}),
+        );
+        let result =
+            read(json!({"type": "function_call_output", "call_id": "call_1", "output": output}));
+        match result.as_ref().map(LogEntry::content_blocks) {
+            Some(
+                [
+                    ContentBlock::ToolResult {
+                        content: Some(Value::String(text)),
+                        ..
+                    },
+                ],
+            ) => text.clone(),
+            other => panic!("one result, got {other:?}"),
+        }
+    }
+
+    /// A user message of `text`.
+    fn user_message(text: &str) -> String {
+        json!({
+            "timestamp": "2026-08-01T02:02:05Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+        })
+        .to_string()
+    }
+
+    /// The texts and the call the user message `text` reads as names.
+    fn read_user_message(text: &str) -> Option<(Vec<String>, Option<String>)> {
+        let LogEntry::User {
+            message,
+            source_tool_use_id,
+            ..
+        } = normalized(&user_message(text))?
+        else {
+            panic!("a user message reads as a user entry");
+        };
+        let texts = match message.content {
+            UserContent::Blocks(blocks) => blocks
+                .into_iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => text,
+                    other => panic!("text blocks alone, got {other:?}"),
+                })
+                .collect(),
+            UserContent::String(text) => vec![text],
+        };
+        Some((texts, source_tool_use_id))
+    }
+
+    fn reply(call_id: &str, index: usize, question: &str, answer: &str) -> Value {
+        json!({
+            "answer": answer,
+            "question": question,
+            "questionItemId": json!(["request_user_input_async", call_id, index]).to_string(),
+        })
+    }
+
+    fn envelope(replies: Value) -> String {
+        format!(
+            "<send_user_message_question_reply>\n{replies}\n</send_user_message_question_reply>"
+        )
+    }
+
+    #[test]
+    fn answer_to_question_reads_as_quote_and_answer_naming_its_call() {
+        let text = envelope(json!([reply(
+            "call_q",
+            0,
+            "Is it running?",
+            "Yes\nsince noon"
+        )]));
+
+        assert_eq!(
+            read_user_message(&text),
+            Some((
+                vec!["> Is it running?\n\nYes\nsince noon".to_owned()],
+                Some("call_q".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn answers_to_several_questions_read_as_one_block_each() {
+        let one_call = envelope(json!([
+            reply("call_q", 0, "Which profile?", "warm idle"),
+            reply("call_q", 1, "Keep recording?", "Yes"),
+        ]));
+
+        let expected_texts = vec![
+            "> Which profile?\n\nwarm idle".to_owned(),
+            "> Keep recording?\n\nYes".to_owned(),
+        ];
+        assert_eq!(
+            read_user_message(&one_call),
+            Some((expected_texts, Some("call_q".to_owned())))
+        );
+    }
+
+    #[test]
+    fn answers_to_two_calls_dont_name_either() {
+        let two_calls = envelope(json!([
+            reply("call_q", 0, "Which profile?", "warm idle"),
+            reply("call_r", 0, "Ship it?", "No"),
+        ]));
+
+        assert_eq!(
+            read_user_message(&two_calls).map(|(_, call)| call),
+            Some(None),
+            "answers to two calls name neither"
+        );
+    }
+
+    #[test]
+    fn answer_as_one_reply_with_plain_id_names_that_id() {
+        let text =
+            envelope(json!({"answer": "Yes", "question": "Ship it?", "questionItemId": "call_q"}));
+
+        assert_eq!(
+            read_user_message(&text),
+            Some((
+                vec!["> Ship it?\n\nYes".to_owned()],
+                Some("call_q".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn quoted_envelope_stays_text_and_malformed_one_is_dropped() {
+        let quoted = format!(
+            "user: {}",
+            envelope(json!([reply("call_q", 0, "Ship it?", "Yes")]))
+        );
+        assert_eq!(
+            read_user_message(&quoted),
+            Some((vec![quoted.clone()], None))
+        );
+        assert_eq!(read_user_message(&envelope(json!({"answer": "Yes"}))), None);
+    }
+
+    #[test]
+    fn malformed_reply_envelope_counts_as_failed_record() {
+        let record: Value =
+            serde_json::from_str(&user_message(&envelope(json!({"answer": "Yes"})))).unwrap();
+        let mut dropped = DroppedRecords::counting();
+
+        let entry = normalize_line(
+            record.as_object().unwrap(),
+            &mut RecordState::before_records(OwnHistory::Started),
+            &mut dropped,
+        );
+
+        assert!(entry.is_none(), "the malformed envelope is dropped");
+        assert_eq!(
+            dropped.counts().collect::<Vec<_>>(),
+            [(
+                None,
+                "send_user_message_question_reply",
+                DropOutcome::Failed,
+                1
+            )]
+        );
+    }
+
+    const QUESTION_ARGUMENTS: &str =
+        r#"{"questions":[{"title":"Ship it?","options":["Yes","No"]}]}"#;
+
+    #[test]
+    fn accepted_question_reads_as_shown_to_the_user() {
+        assert_eq!(
+            result_of(
+                "request_user_input_async",
+                QUESTION_ARGUMENTS,
+                r#"{"accepted":true}"#
+            ),
+            "shown to the user"
+        );
+    }
+
+    #[test]
+    fn question_calls_error_and_other_calls_acceptance_keep_their_text() {
+        assert_eq!(
+            result_of(
+                "request_user_input_async",
+                r#"{"questions":[]}"#,
+                "questions must not be empty"
+            ),
+            "questions must not be empty"
+        );
+        assert_eq!(
+            result_of("list_agents", "{}", r#"{"accepted":true}"#),
+            r#"{"accepted":true}"#
+        );
+    }
+
+    /// The tool and input of the one call `line` reads as.
+    fn received_message(line: &str) -> (Tool, Value) {
+        let Some(LogEntry::Assistant { message, .. }) = normalized(line) else {
+            panic!("a message that is not a final answer reads as an assistant call");
+        };
+        match &message.content[..] {
+            [ContentBlock::ToolUse { tool, input, .. }] => (*tool, input.clone()),
+            other => panic!("one call, got {other:?}"),
+        }
+    }
+
+    /// An `agent_message` record from `author` holding `content`.
+    fn agent_message_record(author: &str, content: Value) -> String {
+        json!({
+            "timestamp": "2026-08-01T02:01:16.169Z",
+            "type": "response_item",
+            "payload": {"type": "agent_message", "id": "amsg_1", "author": author,
+                        "recipient": "/root/scout", "content": content},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn encrypted_message_between_agents_reads_as_its_kind_and_sender() {
+        for (message_type, kind) in [("NEW_TASK", "new task"), ("MESSAGE", "message")] {
+            let record = agent_message_record(
+                "/root",
+                json!([
+                    {"type": "input_text", "text": format!("Message Type: {message_type}\nTask name: /root/scout\nSender: /root\nPayload:\n")},
+                    {"type": "encrypted_content", "encrypted_content": "gAAAAABqyYK5mgJha4X0Hf"},
+                ]),
+            );
+
+            assert_eq!(
+                received_message(&record),
+                (
+                    Tool::ReceivedMessage,
+                    json!({"kind": kind, "sender": "/root", "encrypted_by": "Codex"})
+                ),
+                "{message_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn readable_message_between_agents_carries_its_payload() {
+        let record = agent_message_record(
+            "/root",
+            json!([{"type": "input_text", "text": "Message Type: NEW_TASK\nTask name: /root/scout\nSender: /root\nPayload:\nMap every caller.\nReport the slow ones."}]),
+        );
+
+        assert_eq!(
+            received_message(&record).1,
+            json!({"kind": "new task", "sender": "/root", "message": "Map every caller.\nReport the slow ones."})
+        );
+    }
+
+    #[test]
+    fn message_between_agents_without_header_is_all_payload() {
+        let record = agent_message_record(
+            "/root",
+            json!([{"type": "input_text", "text": "Map every caller."}]),
+        );
+
+        assert_eq!(
+            received_message(&record).1,
+            json!({"sender": "/root", "message": "Map every caller."})
         );
     }
 

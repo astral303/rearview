@@ -85,7 +85,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ codex answer searchable
 
-    Codex │ Waited 1 time, called 2 tools
+    Codex │ Received 1 message, waited 1 time, called 1 tool
 
       You │ follow-up question
 
@@ -115,7 +115,20 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
       You │ Add the release notes
 
-    Codex │ Edited 2 files, messaged 1 agent, updated the task list 1 time
+    Codex │ Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time
+
+      You │ > QUESTION_TITLE_SENTINEL: which profile?
+          │
+          │ PICKED_OPTION_SENTINEL: warm idle
+
+      You │ > Keep recording once warm?
+          │
+          │ Yes, until I stop it.
+          │ TYPED_ANSWER_SENTINEL: then save the log.
+
+      You │ user: <send_user_message_question_reply>
+          │ [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
+          │ </send_user_message_question_reply>
 
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
@@ -452,21 +465,11 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ↓
    Result ┐ function output searchable
 
-    Codex │ inter_agent_message:
+    Codex │ inter_agent_message: new task from /root
           │
-          │ {
-          │   "author": "/root",
-          │   "message": "INTER_AGENT_TASK_TEXT",
-          │   "recipient": "/root/child"
-          │ }
+          │ INTER_AGENT_TASK_TEXT
 
-↳Fixture³ │ inter_agent_message:
-          │
-          │ {
-          │   "author": "/root",
-          │   "message": "Message Type: NEW_TASK\nTask name: /root/child\nSender: /root\nPayload:\n",
-          │   "recipient": "/root/child"
-          │ }
+↳Fixture³ │ inter_agent_message: new task from /root · text encrypted by Codex
 
 ↳Fixture³ │ TASKED_SUBAGENT_SENTINEL: the notes file lists the release steps.
 
@@ -550,9 +553,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ send_message: /root/scout
           │
-   ┌──────┘ SEND_MESSAGE_SENTINEL: add the dates
-   ↓
-   Result ┐
+          │ SEND_MESSAGE_SENTINEL: add the dates
 
     Codex │ update_plan:
           │
@@ -567,6 +568,39 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ }
    ↓
    Result ┐ Plan updated
+
+    Codex │ inter_agent_message: message from /root/RECEIVED_FROM_SENTINEL · text encrypted by Codex
+
+    Codex ┤ sleep: 45s
+   ↓
+   Result ┐ Wall time: 12.1 seconds
+          │ Sleep interrupted by new input.
+
+    Codex │ request_user_input_async: 2 questions
+          │
+          │ 1. QUESTION_TITLE_SENTINEL: which profile?
+          │   • warm idle
+          │   • QUESTION_OPTION_SENTINEL
+          │
+   ┌──────┘ 2. Keep recording once warm?
+   ↓
+   Result ┐ shown to the user
+   Answer │ 1. PICKED_OPTION_SENTINEL: warm idle · 2s later
+          │ 2. Yes, until I stop it.
+          │    TYPED_ANSWER_SENTINEL: then save the log. · 3s later
+
+      You │ > QUESTION_TITLE_SENTINEL: which profile?
+          │
+          │ PICKED_OPTION_SENTINEL: warm idle
+
+      You │ > Keep recording once warm?
+          │
+          │ Yes, until I stop it.
+          │ TYPED_ANSWER_SENTINEL: then save the log.
+
+      You │ user: <send_user_message_question_reply>
+          │ [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
+          │ </send_user_message_question_reply>
 
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question

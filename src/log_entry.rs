@@ -23,7 +23,8 @@ pub enum LogEntry {
         #[serde(default, rename = "parent_tool_use_id")]
         parent_tool_use_id: Option<String>,
         /// The call this message answers. Claude Code sets it to the `Skill`
-        /// call on the skill text it records after loading a skill.
+        /// call on the skill text it records after loading a skill; the
+        /// Codex reader, to the question call a user's answer names.
         #[serde(
             default,
             rename = "sourceToolUseID",
@@ -237,9 +238,17 @@ pub enum Tool {
     Skill,
     Agent,
     AgentMessage,
+    /// A message another agent sent this one. Its canonical input names the
+    /// sender as `sender`, and may carry the message's `kind`, its readable
+    /// `message`, and `encrypted_by`, the agent that stored the text
+    /// encrypted.
+    ReceivedMessage,
     /// A sub-agent handing its report back to the agent that launched it.
     AgentReport,
     Wait,
+    /// Questions the agent put to the user. Its canonical input is
+    /// `questions`, a list of `{title, options}`, each option a string.
+    UserQuestion,
     TaskList,
     WebFetch,
     WebSearch,
@@ -302,8 +311,10 @@ impl Tool {
             Tool::Skill => (65, "loaded", "skill", "skills"),
             Tool::Agent => (70, "started", "agent", "agents"),
             Tool::AgentMessage => (80, "messaged", "agent", "agents"),
+            Tool::ReceivedMessage => (82, "received", "message", "messages"),
             Tool::AgentReport => (85, "handed back", "report", "reports"),
             Tool::Wait => (90, "waited", "time", "times"),
+            Tool::UserQuestion => (95, "asked the user", "time", "times"),
             Tool::TaskList => (100, "updated the task list", "time", "times"),
             Tool::WebFetch => (110, "fetched", "URL", "URLs"),
             Tool::WebSearch => (120, "searched the web", "time", "times"),
@@ -316,6 +327,45 @@ impl Tool {
             noun,
             plural_noun,
         }
+    }
+}
+
+/// The user's answer to a question an agent asked, as a text block of the
+/// user's message holds it: the question as a one-line quote, a blank line,
+/// then the answer. Codex writes this form itself when the question's id is
+/// over 512 bytes.
+pub struct QuotedAnswer<'a> {
+    pub question: &'a str,
+    pub answer: &'a str,
+}
+
+/// The most bytes of a question's title Codex quotes in an answer.
+const QUOTED_QUESTION_BYTE_LIMIT: usize = 512;
+
+impl<'a> QuotedAnswer<'a> {
+    pub fn text(&self) -> String {
+        format!(
+            "> {}\n\n{}",
+            Self::quoted_question(self.question),
+            self.answer
+        )
+    }
+
+    /// `title` as Codex quotes it in an answer: truncated to 512 bytes at a
+    /// character boundary, its line breaks as spaces.
+    pub fn quoted_question(title: &str) -> String {
+        let end = title.floor_char_boundary(QUOTED_QUESTION_BYTE_LIMIT);
+        title[..end].replace(['\n', '\r'], " ")
+    }
+
+    /// The question and the answer of a text of the shape [`Self::text`]
+    /// writes: a `> ` line, a blank line, then the answer. `None` for text of
+    /// another shape. A message the user typed can have this shape too:
+    /// read it as an answer only on a message whose `source_tool_use_id`
+    /// names a question call.
+    pub fn parse(text: &'a str) -> Option<Self> {
+        let (question, answer) = text.strip_prefix("> ")?.split_once("\n\n")?;
+        (!question.contains('\n')).then_some(Self { question, answer })
     }
 }
 
@@ -712,6 +762,40 @@ mod tests {
     }
 
     #[test]
+    fn quoted_answer_reads_back_as_its_question_and_answer() {
+        let written = QuotedAnswer {
+            question: "Which profile\nfor the cool start?",
+            answer: "warm idle\n\nthen cold",
+        }
+        .text();
+
+        let read = QuotedAnswer::parse(&written).expect("the text a quoted answer wrote");
+        assert_eq!(
+            (read.question, read.answer),
+            (
+                "Which profile for the cool start?",
+                "warm idle\n\nthen cold"
+            )
+        );
+        assert!(QuotedAnswer::parse("a typed reply\n\nwithout a quote").is_none());
+    }
+
+    #[test]
+    fn answer_starting_with_quote_reads_back_whole() {
+        let written = QuotedAnswer {
+            question: "Which profile?",
+            answer: "> warm idle\n\n> cold start",
+        }
+        .text();
+
+        let read = QuotedAnswer::parse(&written).expect("the text a quoted answer wrote");
+        assert_eq!(
+            (read.question, read.answer),
+            ("Which profile?", "> warm idle\n\n> cold start")
+        );
+    }
+
+    #[test]
     fn extract_text_from_blocks_only_text() {
         let blocks = vec![
             ContentBlock::Text {
@@ -875,5 +959,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn quoted_question_is_truncated_at_character_boundary_with_line_breaks_as_spaces() {
+        let title = format!("{}é\nrest", "x".repeat(511));
+
+        assert_eq!(
+            QuotedAnswer::quoted_question(&title),
+            "x".repeat(511),
+            "the two-byte `é` would end past byte 512"
+        );
+        assert_eq!(
+            QuotedAnswer::quoted_question("Keep recording\r\nonce warm?"),
+            "Keep recording  once warm?"
+        );
     }
 }

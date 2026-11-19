@@ -193,7 +193,7 @@ fn render_entry_alone<'a>(
         entry_index,
         entry,
         options,
-        &conversation.roster,
+        &conversation.links,
         &call_ranges,
     );
     let range = message_range_excluding_trailing_blank(&lines, 0, lines.len(), entry_index)?;
@@ -220,7 +220,7 @@ fn render_run_alone<'a>(
         .ok()?;
     let mut stepper = RenderStepper::replaying_run_from(
         entries,
-        &conversation.roster,
+        &conversation.links,
         &conversation.lanes,
         options,
         first,

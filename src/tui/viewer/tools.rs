@@ -1,3 +1,4 @@
+use crate::duration::format_duration;
 use crate::history::TaskReport;
 use crate::history::format::trim_blank_lines;
 use crate::log_entry::Tool;
@@ -9,6 +10,7 @@ use super::ledger::{
     LedgerRow, NameCol, RowContent, WrappedRow, push_row, render_ledger_block_styled_dimmed,
     render_truncation_indicator, wrap_row, wrap_row_indented,
 };
+use super::links::ShownAnswer;
 use super::markdown::render_markdown_to_lines;
 use super::timing::TimingSlot;
 use super::*;
@@ -164,6 +166,9 @@ pub(super) struct ToolResultRenderSpec<'a> {
     /// The tool a standalone result names for itself. A result answering a
     /// call sits under it and is labelled `Result`.
     pub standalone_tool_name: Option<&'a str>,
+    /// The user's answers to the question the call asked, shown under the
+    /// result as its `Answer` row.
+    pub answers: Option<&'a [ShownAnswer]>,
     pub dimmed: bool,
     pub content_width: usize,
     pub timing: TimingSlot<'a>,
@@ -486,6 +491,7 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
     let ToolResultRenderSpec {
         text,
         standalone_tool_name,
+        answers,
         dimmed,
         content_width,
         timing,
@@ -580,6 +586,78 @@ pub(super) fn render_tool_result(lines: &mut Vec<RenderedLine>, spec: &ToolResul
             "",
         );
     }
+
+    if let Some(answers) = answers {
+        render_answers(lines, answers, spec, id, truncation.clickable);
+    }
+}
+
+/// The `Answer` row under a question's result: the rows of each of
+/// `answers`, in the result's block.
+fn render_answers(
+    lines: &mut Vec<RenderedLine>,
+    answers: &[ShownAnswer],
+    spec: &ToolResultRenderSpec<'_>,
+    tool_output_id: Option<&ToolOutputId>,
+    clickable: bool,
+) {
+    let rows = answers
+        .iter()
+        .flat_map(|answer| answer_rows(answer, spec.content_width));
+    for (index, row) in rows.enumerate() {
+        let name = if index == 0 {
+            NameCol::Label {
+                text: "Answer",
+                color: th().tool_text,
+                bold: false,
+                dimmed: spec.dimmed,
+            }
+        } else {
+            NameCol::BlankPlain
+        };
+        let style = LineStyle {
+            dimmed: spec.dimmed,
+            ..Default::default()
+        };
+        push_row(
+            lines,
+            LedgerRow {
+                timing: spec.timing.continuation(),
+                name,
+                separator_dimmed: spec.dimmed,
+                tool_output_id,
+                clickable,
+            },
+            RowContent::wrapped(vec![(row.text, style)], row.wrap),
+        );
+    }
+}
+
+/// One answer's rows at `content_width`: its number, then its lines, the
+/// last followed by the delay (`· 35s later`). Later lines and wrapped rows
+/// hang under the text, not under the number.
+fn answer_rows(answer: &ShownAnswer, content_width: usize) -> Vec<WrappedRow> {
+    let number = answer
+        .number
+        .map(|number| format!("{number}. "))
+        .unwrap_or_default();
+    let hanging_indent = " ".repeat(number.width());
+    let mut text = answer.text.clone();
+    if let Some(delay) = answer.delay {
+        text.push_str(&format!(" · {} later", format_duration(delay)));
+    }
+    let mut text_lines = text.lines();
+    let first_line = text_lines.next().unwrap_or_default();
+    let mut rows = wrap_row_indented(first_line, content_width, &number, &hanging_indent);
+    for line in text_lines {
+        rows.extend(wrap_row_indented(
+            line,
+            content_width,
+            &hanging_indent,
+            &hanging_indent,
+        ));
+    }
+    rows
 }
 
 pub(super) struct TaskReportRenderSpec<'a> {

@@ -21,11 +21,11 @@ mod entry;
 
 pub(crate) use commands::{local_command_output, user_text};
 mod ledger;
+mod links;
 mod markdown;
 mod output;
 mod relocation;
 mod rerender;
-mod roster;
 mod search_rows;
 mod style;
 mod summary;
@@ -34,13 +34,13 @@ mod timing;
 mod tools;
 
 pub(crate) use days::{session_dates, short_date};
+pub(crate) use links::ConversationLinks;
 pub use output::{LineStyle, RenderedLine};
 pub use relocation::EntryRelocation;
 pub use rerender::{
     MessageInPlace, ReplacedRows, ShownRows, entry_rendering_alone, message_showing,
     render_message_in_place,
 };
-pub(crate) use roster::SubagentRoster;
 #[cfg(test)]
 pub use search_rows::find_matches;
 pub use search_rows::{SearchMatch, find_matches_while, update_matches_in_replaced_rows};
@@ -309,16 +309,16 @@ pub struct RenderableEntry {
 }
 
 /// A conversation as the viewer reads it: its entries and the
-/// `SubagentRoster` built from them.
+/// `ConversationLinks` built from them.
 #[derive(Debug)]
 pub struct ParsedConversation {
     entries: Vec<RenderableEntry>,
     /// Where each displayed entry was read, by its `entry_index`.
     origins: Vec<EntryOrigin>,
-    /// The identities the roster was built from, in record order. The
+    /// The identities the links were built from, in record order. The
     /// displayed entries no longer carry them.
     subagent_identities: Vec<RecordedIdentity>,
-    roster: SubagentRoster,
+    links: ConversationLinks,
     /// The lanes of the top-level calls, which the detail modes draw.
     lanes: Lanes,
     /// The earliest and latest message timestamps, for the header's dates.
@@ -333,7 +333,7 @@ impl ParsedConversation {
             entries: Vec::new(),
             origins: Vec::new(),
             subagent_identities: Vec::new(),
-            roster: SubagentRoster::default(),
+            links: ConversationLinks::default(),
             lanes: Lanes::default(),
             activity_span: None,
         }
@@ -367,10 +367,10 @@ impl ParsedConversation {
     /// whole read of the copy the tail was read from.
     ///
     /// A tail without entries that doesn't replace any entry leaves the
-    /// roster, the lanes and the activity span as they are.
+    /// links, the lanes and the activity span as they are.
     ///
-    /// Otherwise the roster and the lanes are built again from every entry:
-    /// the roster no longer has a replaced entry's identity or calls, and a
+    /// Otherwise the links and the lanes are built again from every entry:
+    /// the links no longer hold a replaced entry's identity or calls, and a
     /// call before the first changed entry answered in the tail opens beside
     /// the calls after it. The activity span is extended with the tail's
     /// times when no entry is replaced, and found again from every entry
@@ -390,7 +390,7 @@ impl ParsedConversation {
                 first_changed,
                 entries: Vec::new(),
                 origins: Vec::new(),
-                roster: None,
+                links: None,
             };
         }
         let kept = self
@@ -417,13 +417,13 @@ impl ParsedConversation {
         reserve_for_tail(&mut self.entries, entries.len());
         self.entries.extend(entries);
 
-        let roster = roster_of_conversation(&self.subagent_identities, &self.entries);
-        self.lanes = Lanes::of(top_level_tool_blocks(&self.entries));
+        let links = links_of_conversation(&self.subagent_identities, &self.entries);
+        self.lanes = Lanes::of(top_level_tool_blocks(&self.entries), &links);
         ReplacedEntries {
             first_changed,
             entries: replaced_entries,
             origins: replaced_origins,
-            roster: Some(std::mem::replace(&mut self.roster, roster)),
+            links: Some(std::mem::replace(&mut self.links, links)),
         }
     }
 }
@@ -479,14 +479,14 @@ impl ConversationTail {
 
 /// The values of a conversation that [`ParsedConversation::extend_with`]
 /// replaced: its entries from the first changed entry on with their origins,
-/// and its roster.
+/// and its links.
 #[derive(Debug)]
 pub struct ReplacedEntries {
     first_changed: usize,
     entries: Vec<RenderableEntry>,
     origins: Vec<EntryOrigin>,
-    /// `None` when the extension kept the conversation's roster.
-    roster: Option<SubagentRoster>,
+    /// `None` when the extension kept the conversation's links.
+    links: Option<ConversationLinks>,
 }
 
 impl ReplacedEntries {
@@ -495,13 +495,13 @@ impl ReplacedEntries {
         self.first_changed
     }
 
-    /// The roster of `conversation` before the extension that returned these
+    /// The links of `conversation` before the extension that returned these
     /// entries.
-    pub(crate) fn roster_before<'a>(
+    pub(crate) fn links_before<'a>(
         &'a self,
         conversation: &'a ParsedConversation,
-    ) -> &'a SubagentRoster {
-        self.roster.as_ref().unwrap_or(&conversation.roster)
+    ) -> &'a ConversationLinks {
+        self.links.as_ref().unwrap_or(&conversation.links)
     }
 }
 
@@ -613,19 +613,19 @@ pub fn parse_unattributed_conversation_file(
 
 /// Every entry but file-history snapshots, numbered by its place among the
 /// displayed entries, with each sub-agent's identity recorded in the
-/// `SubagentRoster`.
+/// `ConversationLinks`.
 pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversation {
     let subagent_identities = displayed.subagent_identities;
     let origins = displayed.origins;
     let entries = renderable_entries(displayed.entries, 0);
-    let roster = roster_of_conversation(&subagent_identities, &entries);
-    let lanes = Lanes::of(top_level_tool_blocks(&entries));
+    let links = links_of_conversation(&subagent_identities, &entries);
+    let lanes = Lanes::of(top_level_tool_blocks(&entries), &links);
     let activity_span = extended_activity_span(None, &entries);
     ParsedConversation {
         entries,
         origins,
         subagent_identities,
-        roster,
+        links,
         lanes,
         activity_span,
     }
@@ -646,17 +646,17 @@ fn renderable_entries(entries: Vec<LogEntry>, first_index: usize) -> Vec<Rendera
         .collect()
 }
 
-/// The roster of a conversation: `identities` in record order, then the
-/// agent calls of `entries`.
-fn roster_of_conversation(
+/// The links of a conversation: `identities` in record order, then the
+/// calls and answers of `entries`.
+fn links_of_conversation(
     identities: &[RecordedIdentity],
     entries: &[RenderableEntry],
-) -> SubagentRoster {
-    let mut roster = SubagentRoster::from_recorded(identities);
+) -> ConversationLinks {
+    let mut links = ConversationLinks::from_recorded(identities);
     for parsed in entries {
-        roster.record_agent_calls(&parsed.entry);
+        links.record_entry(&parsed.entry);
     }
-    roster
+    links
 }
 
 /// `span`, the earliest and latest message times of the entries before
@@ -700,7 +700,7 @@ pub fn render_parsed_conversation_while(
 ) -> Option<RenderedConversation> {
     render_entries(
         &conversation.entries,
-        &conversation.roster,
+        &conversation.links,
         &conversation.lanes,
         options,
         keep_going,
@@ -726,7 +726,7 @@ pub fn render_tail_while(
         .partition_point(|parsed| parsed.entry_index < entry_index);
     render_entries_from(
         &conversation.entries,
-        &conversation.roster,
+        &conversation.links,
         &conversation.lanes,
         options,
         first,
@@ -737,24 +737,24 @@ pub fn render_tail_while(
 /// `lanes` are the lanes of `entries`' top-level calls.
 fn render_entries(
     entries: &[RenderableEntry],
-    roster: &SubagentRoster,
+    links: &ConversationLinks,
     lanes: &Lanes,
     options: &RenderOptions,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<RenderedConversation> {
-    render_entries_from(entries, roster, lanes, options, 0, keep_going)
+    render_entries_from(entries, links, lanes, options, 0, keep_going)
 }
 
 /// [`render_entries`] of the entries from the one at `first` on.
 fn render_entries_from(
     entries: &[RenderableEntry],
-    roster: &SubagentRoster,
+    links: &ConversationLinks,
     lanes: &Lanes,
     options: &RenderOptions,
     first: usize,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<RenderedConversation> {
-    let mut stepper = RenderStepper::resuming_at(entries, roster, lanes, options, first);
+    let mut stepper = RenderStepper::resuming_at(entries, links, lanes, options, first);
     for parsed_idx in first..entries.len() {
         if (parsed_idx - first).is_multiple_of(ENTRIES_BETWEEN_STOP_CHECKS) && !keep_going() {
             return None;
@@ -786,7 +786,7 @@ fn render_entries_from(
 /// on.
 struct RenderStepper<'a> {
     entries: &'a [RenderableEntry],
-    roster: &'a SubagentRoster,
+    links: &'a ConversationLinks,
     options: &'a RenderOptions,
     /// The agent a collapsed run of received results borrows; `None`
     /// outside summary mode.
@@ -804,13 +804,13 @@ impl<'a> RenderStepper<'a> {
     /// `lanes` are the lanes of `entries`' top-level calls.
     fn new(
         entries: &'a [RenderableEntry],
-        roster: &'a SubagentRoster,
+        links: &'a ConversationLinks,
         lanes: &'a Lanes,
         options: &'a RenderOptions,
     ) -> Self {
         Self {
             entries,
-            roster,
+            links,
             options,
             session_agent: options
                 .tool_display
@@ -834,12 +834,12 @@ impl<'a> RenderStepper<'a> {
     /// the day of the last stamped entry before it.
     fn resuming_at(
         entries: &'a [RenderableEntry],
-        roster: &'a SubagentRoster,
+        links: &'a ConversationLinks,
         lanes: &'a Lanes,
         options: &'a RenderOptions,
         first: usize,
     ) -> Self {
-        let mut stepper = Self::new(entries, roster, lanes, options);
+        let mut stepper = Self::new(entries, links, lanes, options);
         stepper
             .day_labels
             .resume_after(entries[..first].iter().map(|parsed| &parsed.entry));
@@ -862,7 +862,7 @@ impl<'a> RenderStepper<'a> {
                 &mut self.rendered,
                 &mut self.pending_tool_summary,
                 entries,
-                self.roster,
+                self.links,
                 parsed_idx,
                 self.options,
                 self.session_agent,
@@ -881,7 +881,7 @@ impl<'a> RenderStepper<'a> {
             parsed.entry_index,
             &parsed.entry,
             self.options,
-            self.roster,
+            self.links,
             &self.call_ranges,
         );
         // A tool block without rows still closes its call.
@@ -908,7 +908,7 @@ impl<'a> RenderStepper<'a> {
             &mut self.rendered,
             &mut self.pending_tool_summary,
             self.entries,
-            self.roster,
+            self.links,
             self.options,
         );
     }
@@ -936,12 +936,12 @@ impl<'a> RenderStepper<'a> {
     /// the run, outside its rows.
     fn replaying_run_from(
         entries: &'a [RenderableEntry],
-        roster: &'a SubagentRoster,
+        links: &'a ConversationLinks,
         lanes: &'a Lanes,
         options: &'a RenderOptions,
         first: usize,
     ) -> Self {
-        let mut stepper = Self::new(entries, roster, lanes, options);
+        let mut stepper = Self::new(entries, links, lanes, options);
         stepper
             .day_labels
             .resume_after(entries[..=first].iter().map(|parsed| &parsed.entry));
@@ -1010,7 +1010,7 @@ fn try_extend_or_start_pending_summary(
     rendered: &mut RenderedConversation,
     pending: &mut Option<PendingToolSummary>,
     entries: &[RenderableEntry],
-    roster: &SubagentRoster,
+    links: &ConversationLinks,
     parsed_idx: usize,
     options: &RenderOptions,
     session_agent: Option<&str>,
@@ -1030,7 +1030,7 @@ fn try_extend_or_start_pending_summary(
             rendered,
             pending,
             entries,
-            roster,
+            links,
             options,
             PendingToolSummary::opening(
                 RunAuthor::Agent(agent.map(str::to_string)),
@@ -1055,7 +1055,7 @@ fn try_extend_or_start_pending_summary(
                 rendered,
                 pending,
                 entries,
-                roster,
+                links,
                 options,
                 PendingToolSummary::opening(
                     author,
@@ -1087,7 +1087,7 @@ fn extend_or_start(
     rendered: &mut RenderedConversation,
     pending: &mut Option<PendingToolSummary>,
     entries: &[RenderableEntry],
-    roster: &SubagentRoster,
+    links: &ConversationLinks,
     options: &RenderOptions,
     candidate: PendingToolSummary,
 ) {
@@ -1097,7 +1097,7 @@ fn extend_or_start(
             run.summary.merge(candidate.summary);
         }
         _ => {
-            flush_tool_summary(rendered, pending, entries, roster, options);
+            flush_tool_summary(rendered, pending, entries, links, options);
             *pending = Some(candidate);
         }
     }

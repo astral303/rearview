@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::log_entry::{ContentBlock, LogEntry, Tool, UserContent};
 
+use super::links::ConversationLinks;
 use super::tools::ToolOutputKind;
 use super::{CallArea, CallRange, RenderableEntry};
 
@@ -168,8 +169,22 @@ impl RenderedToolBlock<'_> {
 pub(super) struct Lanes(HashMap<String, usize>);
 
 impl Lanes {
-    pub(super) fn of<'a>(blocks: impl Iterator<Item = ToolBlock<'a>>) -> Self {
-        let blocks: Vec<_> = blocks.collect();
+    /// The lanes of `blocks`. A result the viewer hides is left out: its call
+    /// doesn't get a lane, like a call never answered.
+    pub(super) fn of<'a>(
+        blocks: impl Iterator<Item = ToolBlock<'a>>,
+        links: &ConversationLinks,
+    ) -> Self {
+        let blocks: Vec<_> = blocks
+            .filter(|block| match block {
+                ToolBlock::Result {
+                    tool_use_id,
+                    content,
+                    ..
+                } => !links.hides_result(tool_use_id, *content),
+                ToolBlock::Call { .. } => true,
+            })
+            .collect();
         Self(
             lanes(&blocks)
                 .into_iter()

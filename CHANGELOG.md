@@ -232,6 +232,27 @@
 
 #### Codex
 
+- Fix the user's answer to a question Codex asked while it kept working
+  (`request_user_input_async`) missing from the viewer, exports, `agent read`
+  and search. It now shows as the user's message, the question quoted above
+  the answer.
+  - The viewer also shows the answer under the question, with the delay:
+    `Answer │ warm idle · 49s later`.
+  - In a session with answers, later `agent read` message numbers rise by
+    one per answer message.
+- Fix a question to the user, a message from another agent and `sleep`
+  showing as the call's name over raw JSON in the viewer and exports, and as
+  `tool <name> input_keys=…` in `agent read` and search:
+  - A question now shows `request_user_input_async: 2 questions`, then each
+    question and its options. Its result now shows `shown to the user`, not
+    `{"accepted":true}`.
+  - A message from another agent now shows
+    `inter_agent_message: new task from /root · text encrypted by Codex`.
+    The suffix shows when Codex stored the text encrypted; a readable text
+    shows under the header.
+  - A `sleep` call now shows its duration: `sleep: 1m`.
+- Fix `send_message` and `followup_task` showing an empty `Result` row in the
+  viewer.
 - Fix a sub-agent launch without a task name showing as `spawn_agent` over
   raw JSON. It now shows a header, such as
   `spawn_agent (explorer) · gpt-5.6-sol (high) · fork`, and the prompt, in the

@@ -11,8 +11,8 @@ use super::calls::{CallRanges, RenderedToolBlock};
 use super::commands::user_text;
 use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
+use super::links::{ConversationLinks, ShownAnswer};
 use super::markdown::{apply_thinking_style, render_markdown_to_lines};
-use super::roster::SubagentRoster;
 use super::style::USER_LABEL;
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
@@ -36,7 +36,7 @@ pub(super) fn render_entry<'a>(
     entry_index: usize,
     entry: &'a LogEntry,
     options: &RenderOptions,
-    roster: &SubagentRoster,
+    links: &ConversationLinks,
     call_ranges: &CallRanges<'_>,
 ) -> Vec<RenderedToolBlock<'a>> {
     match entry {
@@ -68,7 +68,7 @@ pub(super) fn render_entry<'a>(
                 parent_id: None,
                 entry_index,
                 options,
-                roster,
+                links,
                 call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
@@ -92,7 +92,7 @@ pub(super) fn render_entry<'a>(
             }
             let parent_id = parent_tool_use_id.as_deref();
             let style = MessageStyle::for_user(
-                parent_id.map(|parent| roster.label(parent)),
+                parent_id.map(|parent| links.label(parent)),
                 &message.content,
             );
             let ctx = EntryCtx {
@@ -100,7 +100,7 @@ pub(super) fn render_entry<'a>(
                 parent_id,
                 entry_index,
                 options,
-                roster,
+                links,
                 call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
@@ -120,7 +120,7 @@ pub(super) fn render_entry<'a>(
             }
             let parent_id = parent_tool_use_id.as_deref();
             let style = MessageStyle::for_assistant(
-                parent_id.map(|parent| roster.label(parent)),
+                parent_id.map(|parent| links.label(parent)),
                 agent.as_deref(),
             );
             let ctx = EntryCtx {
@@ -128,7 +128,7 @@ pub(super) fn render_entry<'a>(
                 parent_id,
                 entry_index,
                 options,
-                roster,
+                links,
                 call_ranges,
             };
             let ts = entry_timestamp(options, timestamp.as_deref());
@@ -265,7 +265,7 @@ struct EntryCtx<'a> {
     parent_id: Option<&'a str>,
     entry_index: usize,
     options: &'a RenderOptions,
-    roster: &'a SubagentRoster,
+    links: &'a ConversationLinks,
     /// The detail modes' call ranges, read for each call's batch position;
     /// empty in summary mode, where each expanded run keeps its own.
     call_ranges: &'a CallRanges<'a>,
@@ -614,6 +614,7 @@ struct ToolResultRenderRow<'a> {
     output_id: ToolOutputId,
     expanded: bool,
     content: String,
+    answers: Option<Vec<ShownAnswer>>,
 }
 
 fn collect_tool_result_rows<'a>(
@@ -630,6 +631,9 @@ fn collect_tool_result_rows<'a>(
         else {
             continue;
         };
+        let Some(content) = ctx.links.result_text(tool_use_id, content.as_ref()) else {
+            continue;
+        };
         let output_id = make_tool_output_id(
             ctx.entry_index,
             ctx.parent_id,
@@ -643,7 +647,8 @@ fn collect_tool_result_rows<'a>(
             block_index,
             expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
             output_id,
-            content: ctx.roster.result_text(tool_use_id, content.as_ref()),
+            content,
+            answers: ctx.links.shown_answers(tool_use_id),
         });
     }
     rows
@@ -660,6 +665,7 @@ fn render_tool_result_row(
         &ToolResultRenderSpec {
             text: &row.content,
             standalone_tool_name: row.standalone_tool_name,
+            answers: row.answers.as_deref(),
             dimmed: ctx.style.is_subagent,
             content_width: ctx.options.content_width,
             timing,
