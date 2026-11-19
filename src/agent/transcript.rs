@@ -260,9 +260,9 @@ impl AgentTranscript {
 
     /// The transcript at `path`, kept at `address`, as the cache under `base`
     /// holds it: its newest copy, with the sub-agents the copy lists, whether
-    /// or not the transcript changed since. Doesn't parse. Fails at once
-    /// with a busy error while the database is exclusively locked, as during
-    /// a rebuild.
+    /// or not the transcript changed since. Doesn't parse. Waits up to the
+    /// session cache's `REBUILD_LOCK_THRESHOLD` for the database's exclusive
+    /// lock, as a rebuild holds it, then fails with a busy error.
     pub fn load_cached_as_is(
         base: &crate::history::CacheBase,
         address: &crate::history::sqlite_cache::SessionAddress,

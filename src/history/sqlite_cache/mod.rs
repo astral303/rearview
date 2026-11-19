@@ -132,9 +132,12 @@ impl ReaderWait {
         }
     }
 
+    /// A reader that doesn't wait for a rebuild still waits up to
+    /// [`observer::REBUILD_LOCK_THRESHOLD`] for a lock: another connection's
+    /// checkpoint on close, or its recovery of the write-ahead log.
     fn busy_timeout(self) -> Duration {
         match self {
-            Self::Waiting(timeout) => timeout,
+            Self::Waiting(timeout) => timeout.max(observer::REBUILD_LOCK_THRESHOLD),
             Self::Interactive => INTERACTIVE_BUSY_TIMEOUT,
         }
     }
@@ -183,6 +186,14 @@ fn drop_session_tables(connection: &Connection) -> rusqlite::Result<()> {
 /// [`is_busy`] for an error as this crate reports it.
 pub(crate) fn is_busy_error(error: &AppError) -> bool {
     matches!(error, AppError::SessionCache(error) if is_busy(error))
+}
+
+/// True for SQLite's `SQLITE_BUSY_RECOVERY`: another connection rebuilds the
+/// write-ahead log's index, as the first connection to open after the
+/// cache's last connection closed does.
+fn is_recovery_error(error: &AppError) -> bool {
+    matches!(error, AppError::SessionCache(rusqlite::Error::SqliteFailure(error, _))
+        if error.extended_code == rusqlite::ffi::SQLITE_BUSY_RECOVERY)
 }
 
 /// A reader connection to a cache base's database. It never creates,
@@ -236,7 +247,8 @@ impl SqliteCache {
         Self::open_waiting_at_most(base, WAITING_BUSY_TIMEOUT)
     }
 
-    /// [`Self::open_waiting`], each statement waiting at most `timeout`.
+    /// [`Self::open_waiting`], each statement waiting for a lock up to the
+    /// longer of `timeout` and [`observer::REBUILD_LOCK_THRESHOLD`].
     pub(crate) fn open_waiting_at_most(
         base: &CacheBase,
         timeout: Duration,

@@ -296,13 +296,18 @@ impl OperationScope {
 /// exclusively locked, as during another rearview's rebuild, wait on `clock`
 /// and publish the rebuild on `status` until the lock is released. Fails on
 /// any other error, and with the busy error once `cancellation` is set.
+///
+/// `read` opens its connection in each attempt. A read that meets the
+/// write-ahead log's recovery tries again at once, without publishing a
+/// wait: the new connection's first read waits for the recovery in SQLite's
+/// busy handler.
 pub(crate) fn read_when_unlocked<T>(
     clock: &dyn crate::clock::Clock,
     status: &WaitStatus,
     cancellation: &Cancellation,
     read: impl FnMut() -> Result<T>,
 ) -> Result<T> {
-    read_while_busy(clock, status, cancellation, read, super::is_busy_error)
+    read_while_busy(clock, status, cancellation, read, |error| Some(error))
 }
 
 /// [`read_when_unlocked`] for a read of one copy: a read error that is the
@@ -313,34 +318,65 @@ pub(crate) fn read_copy_when_unlocked<T>(
     cancellation: &Cancellation,
     read: impl FnMut() -> CopyRead<T>,
 ) -> CopyRead<T> {
-    read_while_busy(
-        clock,
-        status,
-        cancellation,
-        read,
-        |miss| matches!(miss, CopyMiss::ReadError(error) if super::is_busy_error(error)),
-    )
+    read_while_busy(clock, status, cancellation, read, |miss| match miss {
+        CopyMiss::ReadError(error) => Some(error),
+        _ => None,
+    })
 }
 
-/// `read`'s result once it no longer fails with an error `is_busy` names, as
-/// [`read_when_unlocked`] waits.
+/// The lock a read found the database busy with.
+enum BusyLock {
+    /// The write-ahead log's, while another connection rebuilds its index.
+    Recovery,
+    /// Any other: the database's exclusive lock, as another rearview's
+    /// rebuild holds it.
+    Exclusive,
+}
+
+impl BusyLock {
+    /// The lock behind `error`; `None` for an error other than the busy one.
+    fn of(error: &AppError) -> Option<Self> {
+        if !super::is_busy_error(error) {
+            return None;
+        }
+        Some(if super::is_recovery_error(error) {
+            Self::Recovery
+        } else {
+            Self::Exclusive
+        })
+    }
+}
+
+/// `read`'s result once it no longer fails with the busy error, as
+/// [`read_when_unlocked`] waits. `error_of` returns the [`AppError`] inside a
+/// failure of `read`.
 fn read_while_busy<T, E>(
     clock: &dyn crate::clock::Clock,
     status: &WaitStatus,
     cancellation: &Cancellation,
     mut read: impl FnMut() -> std::result::Result<T, E>,
-    is_busy: impl Fn(&E) -> bool,
+    error_of: impl Fn(&E) -> Option<&AppError>,
 ) -> std::result::Result<T, E> {
     // The wait published before this read's, restored once it ends.
     let mut wait_before: Option<Option<OtherRearview>> = None;
     loop {
-        match read() {
-            Err(error) if is_busy(&error) && !cancellation.is_cancelled() => {
+        let result = read();
+        let busy = match &result {
+            Err(failure) if !cancellation.is_cancelled() => {
+                error_of(failure).and_then(BusyLock::of)
+            }
+            _ => None,
+        };
+        match busy {
+            // The next attempt's first read waits for the recovery in
+            // SQLite's busy handler.
+            Some(BusyLock::Recovery) => {}
+            Some(BusyLock::Exclusive) => {
                 wait_before.get_or_insert_with(|| status.current());
                 status.set(Some(OtherRearview::Rebuilding));
                 clock.sleep(UNLOCK_POLL);
             }
-            result => {
+            None => {
                 if let Some(earlier) = wait_before {
                     status.set(earlier);
                 }
@@ -398,7 +434,11 @@ mod tests {
     use crate::history::sqlite_cache::refresh::tests::{
         exclusive_lock, rearview, rearview_on, record_of, record_with_reason, replace_owner,
     };
-    use crate::history::sqlite_cache::{CacheWrite, DriveRunningOut, SqliteCache, apply_writes};
+    use crate::history::sqlite_cache::tests::every_record_copies;
+    use crate::history::sqlite_cache::{
+        CacheWrite, CachedSession, DriveRunningOut, SqliteCache, apply_writes,
+        read_copy_without_waiting,
+    };
 
     fn operation(base: &CacheBase) -> OperationScope {
         OperationScope::new(base, Patience::UntilAcquired, Arc::default())
@@ -696,5 +736,147 @@ mod tests {
             operation.finish().lost_write_permission,
             "a full disk revokes the owner's write permission"
         );
+    }
+
+    /// `copy` read through [`read_copy_when_unlocked`] on `clock`, as an
+    /// agent command reads a copy, its wait published on `status`.
+    fn read_copy_waiting_out_locks(
+        copy: &CachedSession,
+        clock: &TestClock,
+        status: &WaitStatus,
+    ) -> CopyRead<()> {
+        read_copy_when_unlocked(clock, status, &Cancellation::default(), || {
+            read_copy_without_waiting(&copy.base, &copy.address, |_| Ok(()))
+        })
+    }
+
+    /// Copies read on many threads at once after the cache's last connection
+    /// closed, as an agent search reads its hits: the first reader rebuilds
+    /// the write-ahead log's index while the others open. Only a poll moves
+    /// the test clock.
+    #[test]
+    fn parallel_copy_reads_after_last_connection_closed_dont_poll() {
+        const READERS: usize = 16;
+        const ROUNDS: usize = 10;
+        let directory = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(directory.path());
+        let clock = TestClock::default();
+        let status = WaitStatus::default();
+        let started = clock.now();
+
+        for _ in 0..ROUNDS {
+            let together = std::sync::Barrier::new(READERS);
+            std::thread::scope(|scope| {
+                for _ in 0..READERS {
+                    scope.spawn(|| {
+                        together.wait();
+                        for copy in &copies {
+                            let read = read_copy_waiting_out_locks(copy, &clock, &status);
+                            assert!(read.is_ok(), "each copy is read: {read:?}");
+                        }
+                    });
+                }
+            });
+        }
+
+        assert_eq!(
+            clock.elapsed_since(started),
+            Duration::ZERO,
+            "no read polls for a rebuild"
+        );
+    }
+
+    /// When a copy read's first read meets SQLite's exclusive lock held
+    /// briefly, as by a connection closing last through its checkpoint, the
+    /// read waits it out in SQLite's busy handler.
+    #[test]
+    fn copy_read_waits_out_lock_released_during_its_first_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(directory.path());
+        let lock = exclusive_lock(directory.path());
+        test_hooks::at_the_first_busy_wait(move || drop(lock));
+        let clock = TestClock::default();
+        let started = clock.now();
+
+        let read = read_copy_waiting_out_locks(&copies[0], &clock, &WaitStatus::default());
+
+        assert!(read.is_ok(), "the copy is read: {read:?}");
+        assert_eq!(
+            clock.elapsed_since(started),
+            Duration::ZERO,
+            "the read doesn't poll for a rebuild"
+        );
+    }
+
+    /// A read that meets SQLite's write-ahead-log recovery,
+    /// `SQLITE_BUSY_RECOVERY`, after its first read's wait tries again at
+    /// once.
+    #[test]
+    fn read_meeting_wal_recovery_tries_again_without_reporting_rebuild() {
+        let clock = TestClock::default();
+        let status = WaitStatus::default();
+        let started = clock.now();
+        let mut attempts = 0;
+
+        let read = read_when_unlocked(&clock, &status, &Cancellation::default(), || {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(AppError::SessionCache(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY_RECOVERY),
+                    None,
+                )));
+            }
+            Ok(status.current())
+        });
+
+        assert_eq!(
+            read.unwrap(),
+            None,
+            "the second attempt doesn't find a rebuild reported"
+        );
+        assert_eq!(attempts, 2, "the read tries again once");
+        assert_eq!(
+            clock.elapsed_since(started),
+            Duration::ZERO,
+            "the read tries again without polling"
+        );
+    }
+
+    /// The rebuild's lock is released after the read polled twice, each poll
+    /// after the read's busy timeout ran out in SQLite's busy handler.
+    #[test]
+    fn copy_read_behind_rebuild_waits_and_reports_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(directory.path());
+        let rebuild = exclusive_lock(directory.path());
+        let clock = TestClock::default();
+        let status = WaitStatus::default();
+        let started = clock.now();
+
+        let (read, reported) = std::thread::scope(|scope| {
+            let releasing = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while clock.elapsed_since(started) < 2 * UNLOCK_POLL {
+                    assert!(std::time::Instant::now() < deadline, "the read polls");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let reported = status.current();
+                drop(rebuild);
+                reported
+            });
+            let read = read_copy_waiting_out_locks(&copies[0], &clock, &status);
+            (read, releasing.join().unwrap())
+        });
+
+        assert!(
+            read.is_ok(),
+            "the copy is read once the rebuild ends: {read:?}"
+        );
+        assert_eq!(
+            reported,
+            Some(OtherRearview::Rebuilding),
+            "the read reports the rebuild while it waits"
+        );
+        assert_eq!(status.current(), None, "the read's wait ends with it");
     }
 }

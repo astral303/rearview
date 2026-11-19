@@ -366,8 +366,9 @@ impl CachedSession {
     }
 
     /// This session, whose reads wait for another connection's lock as the
-    /// waiting reader does. A session a probe found reads without waiting,
-    /// and would fail at once while a writer commits.
+    /// waiting reader does. A session a probe found waits up to
+    /// [`super::observer::REBUILD_LOCK_THRESHOLD`], and would fail behind a
+    /// lock held longer.
     pub(crate) fn waiting(self) -> Self {
         Self {
             wait: ReaderWait::Waiting(super::WAITING_BUSY_TIMEOUT),
@@ -460,10 +461,10 @@ pub(crate) fn read_copy_waiting<T>(
     )
 }
 
-/// [`SqliteCache::read_copy_at`] in the cache under `base`. The read fails at
-/// once with a busy error while another connection holds an exclusive lock,
-/// as a rebuild does: callers wait through it with
-/// [`super::read_when_unlocked`].
+/// [`SqliteCache::read_copy_at`] in the cache under `base`. The read waits up
+/// to [`super::observer::REBUILD_LOCK_THRESHOLD`] for another connection's
+/// exclusive lock, as a rebuild holds it, then fails with a busy error:
+/// callers wait through it with [`super::read_when_unlocked`].
 pub(crate) fn read_copy_without_waiting<T>(
     base: &CacheBase,
     address: &SessionAddress,
