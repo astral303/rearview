@@ -1,12 +1,22 @@
-use super::{App, AppMode};
+use super::{Action, App, AppMode, DialogMode};
+use crate::clock::Moment;
 use crate::error::AppError;
 use crate::history::provider::Deleted;
 use crate::history::{Conversation, ExcludedProjects, Workspace};
-use crate::tui::list_change::{ListChange, ListChangeOutcome};
+use crate::search::preview::sanitize_preview;
+use crate::tui::list_change::{ChangeKind, DeleteStages, ListChange, ListChangeOutcome};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const LIST_PAGE_ROWS: isize = 10;
+
+/// A delete at least this long records its stages in the debug log.
+const SLOW_DELETE_THRESHOLD: Duration = Duration::from_secs(1);
+
+/// The status when the user resumes, forks or selects a session being
+/// deleted: the TUI stays.
+const SESSION_BEING_DELETED: &str = "Session is being deleted";
 
 /// The session the list's selection stays on while the rows change.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +27,52 @@ pub(super) enum SelectionAnchor {
     /// Selected by the user while the list loads, until the first results
     /// after the load.
     SelectedWhileLoading(PathBuf),
+}
+
+/// The session the selection stays on after a change, while its row is
+/// shown, and the row it falls back to otherwise.
+pub(super) struct SelectionTarget {
+    session: Option<PathBuf>,
+    row: usize,
+}
+
+impl SelectionTarget {
+    /// Row `row`, without a session to stay on.
+    pub(super) fn row(row: usize) -> Self {
+        Self { session: None, row }
+    }
+}
+
+/// The sessions whose confirmed delete is queued or running, and since when
+/// a delete has been in progress without a break.
+#[derive(Default)]
+pub(super) struct DeletingSessions {
+    paths: HashSet<PathBuf>,
+    since: Option<Moment>,
+}
+
+impl DeletingSessions {
+    fn add(&mut self, path: PathBuf, now: Moment) {
+        self.since.get_or_insert(now);
+        self.paths.insert(path);
+    }
+
+    fn remove(&mut self, path: &Path) {
+        self.paths.remove(path);
+        if self.paths.is_empty() {
+            self.since = None;
+        }
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.paths.contains(path)
+    }
+
+    /// The count of sessions being deleted, and since when one has been;
+    /// `None` while none is.
+    pub(super) fn in_progress(&self) -> Option<(usize, Moment)> {
+        Some((self.paths.len(), self.since?))
+    }
 }
 
 impl SelectionAnchor {
@@ -43,19 +99,69 @@ impl App {
 
     pub(super) fn apply_filtered(&mut self, filtered: Vec<usize>) {
         self.filtered = filtered;
-        self.select_anchor_or_first();
+        self.place_selection(self.anchored_target());
         self.settle_selection_made_while_loading();
     }
 
-    /// Select the session the selection is anchored to, when the list shows
-    /// it, else the first row.
-    pub(super) fn select_anchor_or_first(&mut self) {
-        let anchored = self.selection_anchor.as_ref().and_then(|anchor| {
-            self.filtered
-                .iter()
-                .position(|&index| self.conversations[index].path == anchor.path())
-        });
-        self.selected = anchored.or_else(|| (!self.filtered.is_empty()).then_some(0));
+    /// The one write of the selection outside tests. Select `target`'s
+    /// session while its row is selectable; otherwise the selectable row
+    /// nearest that row, or nearest `target`'s fallback row when the
+    /// session is not shown. The selection is `None` only while no shown
+    /// row is selectable.
+    pub(super) fn place_selection(&mut self, target: SelectionTarget) {
+        let row = target
+            .session
+            .as_deref()
+            .and_then(|session| self.shown_row_of(session))
+            .unwrap_or(target.row);
+        self.selected = self.selectable_row_near(row);
+    }
+
+    /// Place the selection again after rows became selectable, stopped being
+    /// selectable or were added below the shown rows: it stays on its
+    /// session while that session can be selected; with nothing selected,
+    /// the first selectable row is selected.
+    pub(super) fn settle_selection(&mut self) {
+        self.place_selection(self.selection_target(|_| true));
+    }
+
+    /// The session the selection is anchored to, else the first row.
+    pub(super) fn anchored_target(&self) -> SelectionTarget {
+        SelectionTarget {
+            session: self
+                .selection_anchor
+                .as_ref()
+                .map(|anchor| anchor.path().to_path_buf()),
+            row: 0,
+        }
+    }
+
+    /// The shown row of the session at `path`.
+    fn shown_row_of(&self, path: &Path) -> Option<usize> {
+        self.filtered
+            .iter()
+            .position(|&index| self.conversations[index].path == path)
+    }
+
+    /// True when shown row `row` can be selected: its session is not being
+    /// deleted.
+    pub(super) fn is_selectable(&self, row: usize) -> bool {
+        self.filtered
+            .get(row)
+            .is_some_and(|&index| !self.deleting.contains(&self.conversations[index].path))
+    }
+
+    /// `row` when it is selectable, else the next selectable row after it,
+    /// else the nearest one before it; `None` when no shown row is
+    /// selectable.
+    pub(super) fn selectable_row_near(&self, row: usize) -> Option<usize> {
+        (row..self.filtered.len())
+            .find(|&row| self.is_selectable(row))
+            .or_else(|| {
+                (0..row.min(self.filtered.len()))
+                    .rev()
+                    .find(|&row| self.is_selectable(row))
+            })
     }
 
     /// Drop the anchor of a selection made while the list loaded when the
@@ -100,7 +206,7 @@ impl App {
     /// Select `row` as the user's choice. While the list loads, anchor the
     /// selection to the row's session, so the load's end keeps it selected.
     fn choose_row(&mut self, row: usize) {
-        self.selected = Some(row);
+        self.place_selection(SelectionTarget::row(row));
         if self.is_loading() {
             self.selection_anchor = self
                 .get_selected_path()
@@ -117,14 +223,17 @@ impl App {
     }
 
     pub(super) fn select_first(&mut self) {
-        if !self.filtered.is_empty() {
-            self.select_row(0);
+        if let Some(row) = self.selectable_row_near(0) {
+            self.select_row(row);
         }
     }
 
     pub(super) fn select_last(&mut self) {
-        if !self.filtered.is_empty() {
-            self.select_row(self.filtered.len() - 1);
+        if let Some(row) = (0..self.filtered.len())
+            .rev()
+            .find(|&row| self.is_selectable(row))
+        {
+            self.select_row(row);
         }
     }
 
@@ -141,18 +250,34 @@ impl App {
     }
 
     /// Move the selection `delta` rows, stopping at the first and last row.
+    /// A row that can't be selected is passed over: the selection lands on
+    /// the next selectable row in the direction of the move, or, with none
+    /// there, on the selectable row nearest the target on the way back.
     pub(super) fn move_selection_by(&mut self, delta: isize) {
         let Some(selected) = self.selected else {
             return;
         };
 
         let max = self.filtered.len().saturating_sub(1);
-        let new_selected = if delta >= 0 {
-            selected.saturating_add(delta as usize).min(max)
+        let landing = if delta >= 0 {
+            let target = selected.saturating_add(delta as usize).min(max);
+            (target..=max)
+                .find(|&row| self.is_selectable(row))
+                .or_else(|| {
+                    (selected..target)
+                        .rev()
+                        .find(|&row| self.is_selectable(row))
+                })
         } else {
-            selected.saturating_sub((-delta) as usize)
+            let target = selected.saturating_sub((-delta) as usize);
+            (0..=target)
+                .rev()
+                .find(|&row| self.is_selectable(row))
+                .or_else(|| (target + 1..=selected).find(|&row| self.is_selectable(row)))
         };
-        self.select_row(new_selected);
+        if let Some(row) = landing {
+            self.select_row(row);
+        }
     }
 
     pub(super) fn get_selected_path(&self) -> Option<PathBuf> {
@@ -161,9 +286,23 @@ impl App {
             .map(|&idx| self.conversations[idx].path.clone())
     }
 
-    pub(crate) fn get_selected_source(&self) -> Option<crate::history::Source> {
-        self.get_selected_conversation_index()
-            .map(|index| self.conversations[index].source)
+    /// The listed row of the session at `path`.
+    pub fn listed_row(&self, path: &Path) -> Option<&Conversation> {
+        self.conversations.iter().find(|row| row.path == path)
+    }
+
+    /// The listed session's custom title, else its summary, else its
+    /// preview; empty when the session at `path` is not listed.
+    pub fn listed_title(&self, path: &Path) -> String {
+        let Some(row) = self.listed_row(path) else {
+            return String::new();
+        };
+        [&row.custom_title, &row.summary]
+            .into_iter()
+            .flatten()
+            .find(|title| !title.is_empty())
+            .cloned()
+            .unwrap_or_else(|| sanitize_preview(&row.preview))
     }
 
     pub(crate) fn has_multiple_sources(&self) -> bool {
@@ -175,31 +314,79 @@ impl App {
         sources.len() > 1
     }
 
-    pub(super) fn get_selected_conversation_index(&self) -> Option<usize> {
-        self.selected
-            .and_then(|sel| self.filtered.get(sel))
-            .copied()
-    }
-
-    /// Ask the background worker to delete the listed session at `path`.
+    /// Ask the background worker to delete the listed session at `path`, and
+    /// show its row as deleting until the delete ends: greyed, and passed
+    /// over by the selection. A viewer of the session closes, so the list
+    /// shows the row.
     pub(crate) fn request_delete(&mut self, path: &Path) {
-        let Some(row) = self.conversations.iter().find(|row| row.path == path) else {
+        let Some(source) = self.listed_row(path).map(|row| row.source) else {
             let _ = crate::debug_log::log_debug(
                 &format!("No listed session to delete at {}", path.display()),
                 self.clock(),
             );
             return;
         };
-        self.list_change = Some(ListChange::Delete {
-            source: row.source,
+        let now = self.clock().now();
+        self.list_changes.push_back(ListChange::Delete {
+            source,
             path: path.to_path_buf(),
+            title: self.listed_title(path),
+            confirmed_at: now,
         });
+        self.deleting.add(path.to_path_buf(), now);
+        if self.is_viewing(path) {
+            self.exit_view_mode();
+        }
+        self.settle_selection();
     }
 
-    /// Hand the background worker the confirmed rename or delete; `None`
-    /// while none waits.
+    /// True when the viewer shows the session at `path`.
+    fn is_viewing(&self, path: &Path) -> bool {
+        matches!(&self.app_mode, AppMode::View(state) if state.conversation_path == path)
+    }
+
+    /// True while the listed session at `path` is being deleted.
+    pub fn is_deleting(&self, path: &Path) -> bool {
+        self.deleting.contains(path)
+    }
+
+    /// Hand the background worker the oldest confirmed rename or delete;
+    /// `None` while none waits.
     pub(crate) fn begin_list_change(&mut self) -> Option<ListChange> {
-        self.list_change.take()
+        self.list_changes.pop_front()
+    }
+
+    /// The kind of each confirmed rename or delete the worker has yet to
+    /// receive, oldest first.
+    pub(crate) fn queued_list_changes(&self) -> impl Iterator<Item = ChangeKind> + '_ {
+        self.list_changes.iter().map(ListChange::kind)
+    }
+
+    /// True when `action` resumes, forks or selects a session being deleted.
+    pub(crate) fn acts_on_session_being_deleted(&self, action: &Action) -> bool {
+        match action {
+            Action::Select(session) | Action::Resume(session) | Action::ForkResume(session) => {
+                self.is_deleting(session)
+            }
+            Action::Delete(_) | Action::Refresh | Action::Quit => false,
+        }
+    }
+
+    /// Report in the bar that the TUI stays: the session to leave with is
+    /// being deleted.
+    pub(crate) fn report_session_being_deleted(&mut self) {
+        self.set_status(SESSION_BEING_DELETED.to_owned());
+    }
+
+    /// Show that leaving waits for the confirmed renames and deletes (see
+    /// [`Self::held_exit_status_text`]). Outside single-file mode the list
+    /// replaces a viewer, so the list's bar and the greyed rows show.
+    pub(crate) fn hold_exit(&mut self) {
+        let now = self.clock().now();
+        self.exit_held_since.get_or_insert(now);
+        if !self.single_file_mode && matches!(self.app_mode, AppMode::View(_)) {
+            self.exit_view_mode();
+        }
     }
 
     /// Show the result of a rename or delete.
@@ -210,18 +397,30 @@ impl App {
                 title,
                 result,
             } => self.finish_rename(&path, &title, result),
-            ListChangeOutcome::Deleted { path, result } => self.finish_delete(&path, result),
+            ListChangeOutcome::Deleted {
+                path,
+                result,
+                stages,
+                ..
+            } => {
+                let update_started_at = self.clock().now();
+                self.finish_delete(&path, result);
+                let list_update = self.clock().elapsed_since(update_started_at);
+                self.log_slow_delete(&path, stages, list_update);
+            }
         }
     }
 
     /// Remove the deleted session at `path` from the list and leave its
-    /// viewer, or report why it could not be deleted.
+    /// viewer, or report why it could not be deleted and show its row as
+    /// before.
     fn finish_delete(&mut self, path: &Path, result: crate::error::Result<Deleted>) {
+        self.deleting.remove(path);
+        self.settle_selection();
         match result {
             Ok(_) => {
                 self.remove_from_list(path);
-                if matches!(&self.app_mode, AppMode::View(state) if state.conversation_path == path)
-                {
+                if self.is_viewing(path) {
                     self.exit_view_mode();
                 }
             }
@@ -235,16 +434,43 @@ impl App {
         }
     }
 
+    /// Record in the debug log the time each stage of a delete of the session
+    /// at `path` took, when the delete took [`SLOW_DELETE_THRESHOLD`] or
+    /// longer from the user's `y`: `stages` in the queue and on the
+    /// background worker, then `list_update`.
+    fn log_slow_delete(&self, path: &Path, stages: DeleteStages, list_update: Duration) {
+        let total =
+            stages.queue + stages.ownership + stages.write_batch + stages.provider + list_update;
+        if total < SLOW_DELETE_THRESHOLD {
+            return;
+        }
+        let _ = crate::debug_log::log_debug(
+            &format!(
+                "Slow delete of {}: {} ms: queue {} ms, refresh ownership {} ms, \
+                 write batch {} ms, provider {} ms, list update {} ms",
+                path.display(),
+                total.as_millis(),
+                stages.queue.as_millis(),
+                stages.ownership.as_millis(),
+                stages.write_batch.as_millis(),
+                stages.provider.as_millis(),
+                list_update.as_millis(),
+            ),
+            self.clock(),
+        );
+    }
+
     pub(crate) fn report_delete_failure(&mut self, error: &AppError) {
         self.set_status(format!("Failed to delete: {error}"));
     }
 
-    /// Remove the row of the session at `path`. The selection keeps its
-    /// position, or moves to the last row.
+    /// Remove the row of the session at `path`, keeping the selection on its
+    /// session (see [`Self::place_selection`]).
     fn remove_from_list(&mut self, path: &Path) {
         let Some(conv_idx) = self.conversations.iter().position(|row| row.path == path) else {
             return;
         };
+        let selection = self.selection_target(|index| index != conv_idx);
 
         self.conversations.remove(conv_idx);
 
@@ -266,16 +492,45 @@ impl App {
             }
         }
 
-        if self.filtered.is_empty() {
-            self.selected = None;
-        } else if self
-            .selected
-            .is_some_and(|selected| selected >= self.filtered.len())
-        {
-            self.selected = Some(self.filtered.len() - 1);
-        }
+        self.place_selection(selection);
 
         self.refresh_search_data();
+        self.close_dialog_of_unlisted_session();
+    }
+
+    /// The selected session before the shown rows change, and the row that
+    /// takes its place once it is gone: the count of shown rows above it
+    /// whose conversation index `stays` holds for. Row 0 when nothing is
+    /// selected.
+    pub(super) fn selection_target(&self, stays: impl Fn(usize) -> bool) -> SelectionTarget {
+        let (Some(selected), Some(session)) = (self.selected, self.get_selected_path()) else {
+            return SelectionTarget::row(0);
+        };
+        SelectionTarget {
+            session: Some(session),
+            row: self.filtered[..selected]
+                .iter()
+                .filter(|&&index| stays(index))
+                .count(),
+        }
+    }
+
+    /// Anchor the selection to the selected session, so the results of the
+    /// query rerun after a change keep it there.
+    pub(super) fn anchor_selection_to_its_session(&mut self) {
+        self.selection_anchor = self.get_selected_path().map(SelectionAnchor::Kept);
+    }
+
+    /// Close the actions menu, the delete prompt or the name box once the
+    /// session it was opened for is no longer listed.
+    pub(super) fn close_dialog_of_unlisted_session(&mut self) {
+        let is_unlisted = self
+            .dialog_mode
+            .session()
+            .is_some_and(|session| self.listed_row(session).is_none());
+        if is_unlisted {
+            self.dialog_mode = DialogMode::None;
+        }
     }
 }
 

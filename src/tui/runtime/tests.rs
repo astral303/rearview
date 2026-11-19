@@ -18,6 +18,7 @@ use crate::tui::app::claude_home::{
     ClaudeHome, admitted_cache, another_rearview, held_open_by_another_rearview,
     two_agents_first_fill,
 };
+use crate::tui::app::delete_tests::codex_sessions_under;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use std::path::{Path, PathBuf};
@@ -2840,5 +2841,294 @@ fn transcript_changed_while_refresh_waits_for_ownership_is_read_again_after_its_
             "newest question"
         ),
         "the message written while the refresh waited shows once that refresh failed"
+    );
+}
+
+/// The TUI launched over `count` Codex sessions written under `home` (see
+/// [`codex_sessions_under`]), with the session cache in `cache` (the test's
+/// own when `None`), ticked on `terminal` until Delete is available on the
+/// selected session.
+fn launched_over_codex_sessions(
+    home: &Path,
+    count: usize,
+    cache: Option<&Path>,
+    terminal: &mut Terminal<TestBackend>,
+) -> Runtime {
+    let (storage, _) = codex_sessions_under(home, count);
+    let mut runtime = launched_in(
+        crate::history::environment::test_support::real_time_environment(vec![storage], cache),
+    );
+    tick_until(&mut runtime, terminal, |app| {
+        !app.is_loading() && app.is_action_available(SessionAction::Delete)
+    });
+    runtime
+}
+
+/// The session of the list's selected row.
+fn selected_session(app: &App) -> PathBuf {
+    let row = app.selected().expect("a row is selected");
+    app.conversations()[app.filtered()[row]].path.clone()
+}
+
+/// The key presses that delete the selected session through the actions
+/// menu.
+fn delete_keys() -> Vec<Event> {
+    vec![
+        key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        key(KeyCode::Char('d'), KeyModifiers::NONE),
+        key(KeyCode::Char('y'), KeyModifiers::NONE),
+    ]
+}
+
+/// Tick `runtime` without terminal input until it leaves the TUI; returns
+/// the action it leaves with.
+fn tick_until_exit(runtime: &mut Runtime, terminal: &mut Terminal<TestBackend>) -> Action {
+    let started = Instant::now();
+    loop {
+        let tick = runtime
+            .tick(terminal, &mut |wait| {
+                std::thread::sleep(wait.min(Duration::from_millis(10)));
+                Ok(Vec::new())
+            })
+            .unwrap();
+        if let Tick::Exit(action) = tick {
+            return action;
+        }
+        assert!(
+            started.elapsed() < BACKGROUND_WORK_LIMIT,
+            "the TUI leaves once the confirmed changes have run"
+        );
+    }
+}
+
+/// The stderr report `runtime` writes after leaving the TUI.
+fn exit_report(runtime: &mut Runtime) -> String {
+    let mut report = Vec::new();
+    runtime.write_exit_report(&mut report).unwrap();
+    String::from_utf8(report).unwrap()
+}
+
+#[test]
+fn quit_while_delete_is_queued_deletes_session_before_leaving() {
+    let home = tempfile::tempdir().unwrap();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_codex_sessions(home.path(), 2, None, &mut terminal);
+    let deleted = selected_session(runtime.app());
+
+    let mut keys = delete_keys();
+    keys.push(key(KeyCode::Esc, KeyModifiers::NONE));
+    let tick = tick_with(&mut runtime, &mut terminal, keys);
+
+    assert!(
+        matches!(tick, Tick::Continue),
+        "the quit waits for the queued delete"
+    );
+    assert!(
+        matches!(tick_until_exit(&mut runtime, &mut terminal), Action::Quit),
+        "the TUI then quits"
+    );
+    assert!(!deleted.exists(), "the delete ran before the TUI left");
+    assert_eq!(
+        exit_report(&mut runtime),
+        "",
+        "the report is empty once every change ran"
+    );
+}
+
+#[test]
+fn delete_failing_while_quit_waits_is_reported_after_leaving() {
+    let home = tempfile::tempdir().unwrap();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_codex_sessions(home.path(), 2, None, &mut terminal);
+    let deleted = selected_session(runtime.app());
+    let title = runtime.app().listed_title(&deleted);
+    let mut keys = delete_keys();
+    keys.push(key(KeyCode::Esc, KeyModifiers::NONE));
+    tick_with(&mut runtime, &mut terminal, keys);
+
+    std::fs::remove_file(&deleted).unwrap();
+    tick_until_exit(&mut runtime, &mut terminal);
+
+    let report = exit_report(&mut runtime);
+    assert!(
+        report.starts_with(&format!("Failed to delete \"{title}\": "))
+            && report.lines().count() == 1,
+        "the report names the session whose delete failed, and the error: {report:?}"
+    );
+}
+
+#[test]
+fn second_quit_while_delete_waits_leaves_at_once_and_reports_it_not_deleted() {
+    let home = tempfile::tempdir().unwrap();
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime =
+        launched_over_codex_sessions(home.path(), 3, Some(cache.path()), &mut terminal);
+    let deleted = selected_session(runtime.app());
+    let _other_rearviews_refresh = another_rearviews_refresh(cache.path());
+    let mut keys = delete_keys();
+    keys.push(key(KeyCode::Esc, KeyModifiers::NONE));
+    tick_with(&mut runtime, &mut terminal, keys);
+    tick_until(
+        &mut runtime,
+        &mut terminal,
+        App::is_waiting_for_another_rearview,
+    );
+    let selected_while_waiting = selected_session(runtime.app());
+    tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![
+            key(KeyCode::Down, KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ],
+    );
+    assert_eq!(
+        selected_session(runtime.app()),
+        selected_while_waiting,
+        "Down doesn't move the selection to the third row while the delete waits"
+    );
+    assert!(
+        matches!(runtime.app().app_mode(), AppMode::List) && !runtime.app().is_opening(),
+        "Enter doesn't open a session while the delete waits"
+    );
+
+    let second_quit = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+    );
+
+    assert!(
+        matches!(second_quit, Tick::Exit(Action::Quit)),
+        "a second quit leaves while the delete waits"
+    );
+    assert_eq!(
+        exit_report(&mut runtime),
+        "Not deleted: 1 session\n",
+        "the report counts the delete not carried out"
+    );
+    assert!(deleted.exists(), "the session is not deleted");
+}
+
+#[test]
+fn resume_from_viewer_while_delete_waits_shows_list_with_delete_in_progress() {
+    let home = tempfile::tempdir().unwrap();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_codex_sessions(home.path(), 2, None, &mut terminal);
+    open_the_selected_session(&mut runtime, &mut terminal);
+    let open = selected_session(runtime.app());
+    let other = runtime
+        .app()
+        .conversations()
+        .iter()
+        .map(|row| row.path.clone())
+        .find(|path| *path != open)
+        .expect("two sessions are listed");
+    runtime.app_mut().request_delete(&other);
+
+    let tick = runtime.begin_exit(Action::Resume(open));
+
+    assert!(
+        matches!(tick, Tick::Continue),
+        "the resume waits for the queued delete"
+    );
+    assert!(
+        matches!(runtime.app().app_mode(), AppMode::List),
+        "the list shows while the delete runs"
+    );
+    assert!(
+        runtime.app().held_exit_status_text().is_some(),
+        "the bar shows that leaving waits for the delete"
+    );
+}
+
+#[test]
+fn leaving_to_resume_session_being_deleted_is_refused_with_reason() {
+    let home = tempfile::tempdir().unwrap();
+    let mut terminal = terminal();
+    let mut runtime = launched_over_codex_sessions(home.path(), 2, None, &mut terminal);
+    let deleted = selected_session(runtime.app());
+    runtime.app_mut().request_delete(&deleted);
+
+    let tick = runtime.begin_exit(Action::Resume(deleted));
+
+    assert!(matches!(tick, Tick::Continue), "the TUI stays");
+    assert_eq!(
+        runtime
+            .app()
+            .status_message()
+            .map(|(message, _)| message.as_str()),
+        Some("Session is being deleted"),
+        "the status reports why"
+    );
+    assert!(runtime.held_exit.is_none(), "the resume is not held");
+}
+
+#[test]
+fn q_leaves_file_opened_directly_while_quit_waits_for_rename() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["first question"]);
+    let cache = admitted_cache();
+    let mut terminal = terminal();
+    let mut runtime = opened_directly(
+        &a,
+        home.environment_with_cache(
+            cache.path(),
+            ProcessIdentity::default(),
+            Arc::new(SystemClock::new()),
+        ),
+    );
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            "first question"
+        ),
+        "the file opened directly shows its messages"
+    );
+    let _other_rearviews_refresh = another_rearviews_refresh(cache.path());
+
+    let quit = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![
+            key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('m'), KeyModifiers::NONE),
+            key(KeyCode::Char('n'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            key(KeyCode::Char('q'), KeyModifiers::NONE),
+        ],
+    );
+    assert!(
+        matches!(quit, Tick::Continue),
+        "the quit waits for the rename"
+    );
+    assert!(
+        ticks_show(
+            &mut runtime,
+            &mut terminal,
+            BACKGROUND_WORK_LIMIT,
+            "Renaming before leaving…"
+        ) && shown_text(&terminal).contains("Esc leaves now"),
+        "the bar shows that leaving waits for the rename"
+    );
+
+    let second_quit = tick_with(
+        &mut runtime,
+        &mut terminal,
+        vec![key(KeyCode::Char('q'), KeyModifiers::NONE)],
+    );
+
+    assert!(
+        matches!(second_quit, Tick::Exit(Action::Quit)),
+        "q, a quit key of the file opened directly, leaves while the rename waits"
+    );
+    assert_eq!(
+        exit_report(&mut runtime),
+        "Not renamed: 1 session\n",
+        "the report counts the rename not carried out"
     );
 }

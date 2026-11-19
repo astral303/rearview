@@ -3,7 +3,6 @@
 //! the sessions that asked for one, to read again and cache. Each outcome
 //! is applied through [`App::apply_finished_refresh`].
 
-use super::list_state::SelectionAnchor;
 use super::session_store::{
     AWAITED_REFRESH_CHECK_INTERVAL, FailedRefresh, FinishedRead, FinishedRefresh, RefreshFailure,
     SessionCopy, UnlistedSession,
@@ -290,7 +289,7 @@ impl App {
     fn is_confirming_a_list_change(&self) -> bool {
         matches!(
             self.dialog_mode,
-            DialogMode::Rename { .. } | DialogMode::ConfirmDelete
+            DialogMode::Rename { .. } | DialogMode::ConfirmDelete { .. }
         )
     }
 
@@ -482,7 +481,6 @@ impl App {
         }
         if !edit.is_empty() {
             self.edit_list(edit);
-            self.selected = Some(0);
         }
     }
 
@@ -764,11 +762,12 @@ impl App {
     }
 
     /// Apply `edit` in one pass: the list stays newest first, the selection
-    /// stays on its session, and only added, replaced and retitled rows get
-    /// new search data. Unchanged rows keep their search data and their
-    /// shared row in the workers' snapshot.
+    /// stays on its session (see [`Self::place_selection`]) and is anchored
+    /// there for the query this reruns, and only added, replaced and
+    /// retitled rows get new search data. Unchanged rows keep their search
+    /// data and their shared row in the workers' snapshot.
     fn edit_list(&mut self, mut edit: ListEdit) {
-        let selected_path = self.get_selected_path();
+        let selection = self.selection_target(|index| !edit.removed.contains(&index));
         let old_rows = std::mem::take(&mut self.conversations);
         let old_count = old_rows.len();
         // Reuse search data only while it matches the rows one to one.
@@ -830,8 +829,9 @@ impl App {
             .iter()
             .filter_map(|&old| new_index_of_old.get(old).copied().flatten())
             .collect();
-        self.selection_anchor = selected_path.map(SelectionAnchor::Kept);
-        self.select_anchor_or_first();
+        self.place_selection(selection);
+        self.anchor_selection_to_its_session();
         self.rerun_query();
+        self.close_dialog_of_unlisted_session();
     }
 }

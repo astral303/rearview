@@ -1,13 +1,12 @@
-use super::list_state::SelectionAnchor;
 use super::session_store::{ReadCause, SessionCopy};
 use super::view_state::DeferredCopy;
 use super::{Action, App, AppMode, DialogMode};
 use crate::error::Result;
 use crate::history::DisplayEntries;
 use crate::history::provider::{RenamedTitle, TitleAndSummary};
-use crate::tui::list_change::ListChange;
+use crate::tui::list_change::{ListChange, rename_failure};
 use crossterm::event::{KeyCode, KeyModifiers};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const EXPORT_OPTIONS: [&str; 4] = [
     "Ledger (formatted)",
@@ -17,13 +16,18 @@ const EXPORT_OPTIONS: [&str; 4] = [
 ];
 
 impl App {
+    /// `y` deletes the session the prompt was opened for; `n` and `Esc` close
+    /// the prompt.
     pub(super) fn handle_confirm_key(&mut self, code: KeyCode) -> Option<Action> {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.dialog_mode = DialogMode::None;
-                let path = self.get_selected_path()?;
-                self.apply_finished_refreshes_before_editing(&path)?;
-                Some(Action::Delete(path))
+                let DialogMode::ConfirmDelete { session } =
+                    std::mem::replace(&mut self.dialog_mode, DialogMode::None)
+                else {
+                    return None;
+                };
+                self.apply_finished_refreshes_before_editing(&session)?;
+                Some(Action::Delete(session))
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.dialog_mode = DialogMode::None;
@@ -121,16 +125,26 @@ impl App {
         }
     }
 
+    /// Open the name box on the session the keys act on.
     pub(super) fn start_rename(&mut self) {
-        let Some(idx) = self.get_selected_conversation_index() else {
+        if let Some(session) = self.session_to_act_on() {
+            self.open_rename(session);
+        }
+    }
+
+    /// Open the name box on the listed session at `session`, filled with its
+    /// title.
+    pub(super) fn open_rename(&mut self, session: PathBuf) {
+        let Some(row) = self.listed_row(&session) else {
             return;
         };
-        let input = self.conversations[idx]
-            .custom_title
-            .clone()
-            .unwrap_or_default();
+        let input = row.custom_title.clone().unwrap_or_default();
         let cursor = input.chars().count();
-        self.dialog_mode = DialogMode::Rename { input, cursor };
+        self.dialog_mode = DialogMode::Rename {
+            session,
+            input,
+            cursor,
+        };
     }
 
     pub(super) fn handle_rename_key(
@@ -152,12 +166,12 @@ impl App {
                 }
             }
             KeyCode::Right => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode {
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode {
                     *cursor = (*cursor + 1).min(input.chars().count());
                 }
             }
             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode {
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode {
                     input.clear();
                     *cursor = 0;
                 }
@@ -168,12 +182,12 @@ impl App {
                 }
             }
             KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode {
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode {
                     *cursor = input.chars().count();
                 }
             }
             KeyCode::Backspace => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode
                     && *cursor > 0
                     && let Some((byte_pos, _)) = input.char_indices().nth(*cursor - 1)
                 {
@@ -182,7 +196,7 @@ impl App {
                 }
             }
             KeyCode::Delete => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode
                     && *cursor < input.chars().count()
                     && let Some((byte_pos, _)) = input.char_indices().nth(*cursor)
                 {
@@ -190,7 +204,7 @@ impl App {
                 }
             }
             KeyCode::Char(ch) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-                if let DialogMode::Rename { input, cursor } = &mut self.dialog_mode {
+                if let DialogMode::Rename { input, cursor, .. } = &mut self.dialog_mode {
                     let byte_pos = input
                         .char_indices()
                         .nth(*cursor)
@@ -205,20 +219,21 @@ impl App {
         None
     }
 
+    /// Ask the background worker to rename the session the name box was
+    /// opened for. The name box stays open until the rename ends.
     pub(super) fn submit_rename(&mut self) {
-        let title = match &self.dialog_mode {
-            DialogMode::Rename { input, .. } => input.trim().to_string(),
+        let (session, title) = match &self.dialog_mode {
+            DialogMode::Rename { session, input, .. } => {
+                (session.clone(), input.trim().to_string())
+            }
             _ => return,
         };
-        let Some(idx) = self
-            .get_selected_path()
-            .and_then(|path| self.apply_finished_refreshes_before_editing(&path))
-        else {
+        let Some(idx) = self.apply_finished_refreshes_before_editing(&session) else {
             self.dialog_mode = DialogMode::None;
             return;
         };
         let row = &self.conversations[idx];
-        self.list_change = Some(ListChange::Rename {
+        self.list_changes.push_back(ListChange::Rename {
             source: row.source,
             path: row.path.clone(),
             title,
@@ -235,14 +250,15 @@ impl App {
                     self.show_renamed_session(idx, title, &renamed);
                 }
             }
-            Err(e) => self.set_status(format!("Failed to rename: {}", e)),
+            Err(error) => self.set_status(rename_failure(&error)),
         }
     }
 
-    /// Show row `idx` renamed to `title`, keeping it selected. `renamed` is
-    /// the place the rename put the title. The row and the open viewer's
-    /// header show the agent's new name at once, and a session refresh reads
-    /// the session again.
+    /// Show row `idx` renamed to `title`; the selection stays on its session.
+    /// `renamed` is the place the rename put the title. The row and the open
+    /// viewer's header show the agent's new name at once, and a session
+    /// refresh reads the session again. The name box closes when it is open
+    /// on this session.
     pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str, renamed: &RenamedTitle) {
         let row = &mut self.conversations[idx];
         let path = row.path.clone();
@@ -262,19 +278,13 @@ impl App {
             state.show_renamed(title, renamed);
         }
         self.store.request_session_refresh(&path);
-        self.dialog_mode = DialogMode::None;
+        if matches!(&self.dialog_mode, DialogMode::Rename { session, .. } if *session == path) {
+            self.dialog_mode = DialogMode::None;
+        }
         self.set_status("Session renamed".to_string());
         self.refresh_search_data();
-        // The search results arrive later; they keep the renamed row selected.
-        self.selection_anchor = Some(SelectionAnchor::Kept(path.clone()));
+        self.anchor_selection_to_its_session();
         self.update_filter();
-        if let Some(new_selected) = self
-            .filtered
-            .iter()
-            .position(|&i| self.conversations[i].path == path)
-        {
-            self.selected = Some(new_selected);
-        }
     }
 
     /// Export the open session as the export menu's `option`. JSONL copies

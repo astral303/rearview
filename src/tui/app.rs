@@ -168,8 +168,14 @@ pub struct App {
     /// A copy or export asked for while the open session's refresh was
     /// pending, run once the refresh finishes
     deferred_copy: Option<view_state::DeferredCopy>,
-    /// A confirmed rename or delete, until the background worker receives it
-    list_change: Option<super::list_change::ListChange>,
+    /// Confirmed renames and deletes in the order confirmed, each until the
+    /// background worker receives it
+    list_changes: std::collections::VecDeque<super::list_change::ListChange>,
+    /// The sessions whose confirmed delete is queued or running
+    deleting: list_state::DeletingSessions,
+    /// When the user chose to leave while confirmed renames or deletes had
+    /// yet to run; the bar then shows that leaving waits for them
+    exit_held_since: Option<Moment>,
     /// The load filters that narrowed this list, named for the user: the
     /// ones it launched with, then the terms the last load or refresh
     /// reported
@@ -283,6 +289,10 @@ const SPINNER_FRAME: Duration = Duration::from_millis(80);
 const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// In the list's bottom bar while a session opens.
 const OPENING_LABEL: &str = "Opening…";
+/// In the bottom bar while leaving waits for renames alone.
+const RENAMING_ACTIVITY: &str = "Renaming";
+/// After the bottom bar's activity while leaving waits for it.
+const LEAVE_NOW_HINT: &str = "Esc leaves now";
 /// Beside the spinner while a search runs.
 const SEARCHING_LABEL: &str = "searching";
 /// In the viewer's mode cell while the rows shown are rendered again.
@@ -299,6 +309,15 @@ const REFRESHING_LABEL: &str = "refreshing";
 /// on, the whole seconds it has run (`⠋ searching 1s`).
 fn spinner_status(label: &str, elapsed: Duration) -> Option<String> {
     spinner_status_counting(label, elapsed, elapsed)
+}
+
+/// The bottom bar's activity while `count` sessions are being deleted:
+/// `Deleting` for one, `Deleting 3 sessions` for several.
+fn deleting_activity(count: usize) -> String {
+    match count {
+        1 => "Deleting".to_owned(),
+        count => format!("Deleting {count} sessions"),
+    }
 }
 
 /// [`spinner_status`] for work running for `elapsed`, showing the whole
@@ -320,7 +339,6 @@ struct AppParts {
     conversations_snapshot: Arc<Vec<Arc<Conversation>>>,
     searchable: Vec<SearchableConversation>,
     filtered: Vec<usize>,
-    selected: Option<usize>,
     loading_state: LoadingState,
     app_mode: AppMode,
     tool_display: ToolDisplayMode,
@@ -349,7 +367,7 @@ impl App {
             conversations: parts.conversations,
             searchable: parts.searchable,
             filtered: parts.filtered,
-            selected: parts.selected,
+            selected: None,
             query: String::new(),
             cursor_pos: 0,
             loading_state: parts.loading_state,
@@ -390,7 +408,9 @@ impl App {
             pending_open: None,
             pending_view_reload: None,
             deferred_copy: None,
-            list_change: None,
+            list_changes: std::collections::VecDeque::new(),
+            deleting: list_state::DeletingSessions::default(),
+            exit_held_since: None,
             active_filters: Vec::new(),
             launch_filter_count: 0,
             missing_earlier_turns,
@@ -482,7 +502,6 @@ impl App {
             false,
             None,
         );
-        let selected = if filtered.is_empty() { None } else { Some(0) };
         let search_worker = spawn_search_worker(environment.clock().clone());
         let conversations_snapshot = Self::conversation_snapshot(&conversations);
 
@@ -491,7 +510,6 @@ impl App {
             conversations,
             searchable,
             filtered,
-            selected,
             loading_state: LoadingState::Ready,
             app_mode: AppMode::List,
             tool_display,
@@ -506,6 +524,7 @@ impl App {
             semantic_search: Self::semantic_search_state(true),
             environment,
         });
+        app.settle_selection();
         app.send_search_data();
         app
     }
@@ -527,7 +546,6 @@ impl App {
             conversations,
             searchable: Vec::new(),
             filtered: Vec::new(),
-            selected: None,
             loading_state: LoadingState::Loading {
                 loaded: 0,
                 progress: None,
@@ -566,7 +584,6 @@ impl App {
             conversations,
             searchable: Vec::new(),
             filtered: Vec::new(),
-            selected: None,
             loading_state: LoadingState::Ready,
             app_mode: AppMode::View(view),
             tool_display,
@@ -661,11 +678,7 @@ impl App {
 
         let new_filtered = self.filter_indices(start_idx..end_idx);
         self.filtered.extend(new_filtered);
-
-        // Select first item if nothing selected yet
-        if self.selected.is_none() && !self.filtered.is_empty() {
-            self.selected = Some(0);
-        }
+        self.settle_selection();
 
         if let LoadingState::Loading { loaded, .. } = &mut self.loading_state {
             *loaded = self.conversations.len();
@@ -701,7 +714,7 @@ impl App {
         self.filtered = (0..self.conversations.len())
             .filter(|&index| shown.contains(&self.conversations[index].path))
             .collect();
-        self.select_anchor_or_first();
+        self.place_selection(self.anchored_target());
 
         self.rebuild_conversations_snapshot();
 
@@ -1083,6 +1096,32 @@ impl App {
         )
     }
 
+    /// The list's bottom bar while deletes are queued or running: `Deleting…`
+    /// for one session, `Deleting 3 sessions…` for several, with the spinner
+    /// and seconds of [`Self::opening_status_text`], counted from when a
+    /// delete was last confirmed with none in progress. `None` while none is.
+    pub fn deleting_status_text(&self) -> Option<String> {
+        let (count, since) = self.deleting.in_progress()?;
+        let label = format!("{}…", deleting_activity(count));
+        Some(spinner_status(&label, self.clock().elapsed_since(since)).unwrap_or(label))
+    }
+
+    /// The bottom bar while leaving waits for confirmed changes:
+    /// `Deleting 3 sessions before leaving… · Esc leaves now`, with the
+    /// count, spinner and seconds of [`Self::deleting_status_text`], then
+    /// `Renaming before leaving…` once only renames are left, its seconds
+    /// counted from the user's quit. `None` until an exit is held.
+    pub fn held_exit_status_text(&self) -> Option<String> {
+        let held_since = self.exit_held_since?;
+        let (activity, since) = match self.deleting.in_progress() {
+            Some((count, since)) => (deleting_activity(count), since),
+            None => (RENAMING_ACTIVITY.to_owned(), held_since),
+        };
+        let label = format!("{activity} before leaving…");
+        let status = spinner_status(&label, self.clock().elapsed_since(since)).unwrap_or(label);
+        Some(format!("{status} · {LEAVE_NOW_HINT}"))
+    }
+
     /// Take the pending open one step, waiting up to `wait` for its read or
     /// its rows: the read starts on `viewer-read`, its rows are rendered on
     /// `viewer-render` for a frame `frame_width` columns wide, and the
@@ -1232,7 +1271,8 @@ impl App {
     }
 
     /// Handle a left-click in list mode: select the conversation under the cursor.
-    /// Returns true if the click landed on a list item.
+    /// Returns true if the click landed on a selectable list item; a click on
+    /// a deleting row does nothing.
     pub fn handle_list_click(&mut self, row: u16, frame_area: Rect) -> bool {
         if !matches!(self.app_mode, AppMode::List) || self.dialog_mode != DialogMode::None {
             return false;
@@ -1266,7 +1306,7 @@ impl App {
         let relative_row = (row - list_y) as usize;
         let relative_idx = relative_row / lines_per_item;
         let new_idx = offset + relative_idx;
-        if relative_idx < items_per_page && new_idx < self.filtered.len() {
+        if relative_idx < items_per_page && self.is_selectable(new_idx) {
             self.clear_selection_anchor_on_loaded_list();
             self.click_row(new_idx);
             true
@@ -1337,3 +1377,6 @@ mod viewer_tail_tests;
 
 #[cfg(test)]
 mod shown_name_tests;
+
+#[cfg(test)]
+pub(crate) mod delete_tests;

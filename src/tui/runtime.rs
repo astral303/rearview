@@ -1,5 +1,6 @@
 use super::app::{Action, App, AppMode, DirectFile, ListScope, RefreshFailure, TuiSearchOptions};
 use super::backend::ShowAfterMove;
+use super::list_change::ChangeKind;
 use super::supervisor::TaskSupervisor;
 use super::ui;
 use crate::config::KeyBindings;
@@ -222,6 +223,16 @@ pub(crate) struct Runtime {
     app: App,
     supervisor: TaskSupervisor,
     refresh_options: RefreshOptions,
+    held_exit: Option<HeldExit>,
+}
+
+/// The exit the user chose while confirmed renames or deletes had yet to
+/// run, held until they have run.
+struct HeldExit {
+    action: Action,
+    /// The report line of each rename or delete that failed while the exit
+    /// was held
+    failures: Vec<String>,
 }
 
 impl Runtime {
@@ -236,19 +247,24 @@ impl Runtime {
     ) -> Self {
         let mut supervisor = TaskSupervisor::start(environment, load_meter);
         supervisor.launch(refresh_options);
-        Self {
-            app,
-            supervisor,
-            refresh_options,
-        }
+        Self::over(app, supervisor, refresh_options)
     }
 
     /// A file opened directly, in `environment`.
     pub(crate) fn single_file(app: App, environment: Environment) -> Self {
+        Self::over(
+            app,
+            TaskSupervisor::start(environment, Arc::default()),
+            RefreshOptions::default(),
+        )
+    }
+
+    fn over(app: App, supervisor: TaskSupervisor, refresh_options: RefreshOptions) -> Self {
         Self {
             app,
-            supervisor: TaskSupervisor::start(environment, Arc::default()),
-            refresh_options: RefreshOptions::default(),
+            supervisor,
+            refresh_options,
+            held_exit: None,
         }
     }
 
@@ -266,6 +282,11 @@ impl Runtime {
     /// terminal events that arrive within the time it is given. The pass
     /// that leaves the TUI, with an action or an error, shuts the background
     /// worker down first.
+    ///
+    /// An exit chosen while confirmed renames or deletes have yet to run is
+    /// held until they have run, in order; meanwhile the terminal's keys are
+    /// ignored but for the quit keys of the screen on show
+    /// ([`App::is_quit_key`]), which leave at once with the held action.
     pub(crate) fn tick<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -285,9 +306,7 @@ impl Runtime {
     ) -> Result<Tick> {
         self.receive_load()?;
         self.receive_refresh()?;
-        if let Some(outcome) = self.supervisor.finished_change() {
-            self.app.finish_list_change(outcome);
-        }
+        self.receive_change();
         if let Some(read) = self.supervisor.finished_direct_file() {
             self.app.finish_direct_file_read(read)?;
         }
@@ -296,6 +315,11 @@ impl Runtime {
         self.app.check_awaited_refresh();
         self.app.check_failed_refreshes();
         self.start_next_job();
+        if !self.has_unfinished_changes()
+            && let Some(held) = &self.held_exit
+        {
+            return Ok(Tick::Exit(held.action.clone()));
+        }
 
         let frame_state = prepare_frame(&mut self.app, terminal);
         self.app
@@ -316,12 +340,99 @@ impl Runtime {
         }
 
         let events = poll(self.poll_timeout())?;
+        if let Some(held) = &self.held_exit {
+            let leaves_at_once = events.iter().any(|event| {
+                matches!(event, Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && self.app.is_quit_key(key.code, key.modifiers))
+            });
+            return Ok(if leaves_at_once {
+                Tick::Exit(held.action.clone())
+            } else {
+                Tick::Continue
+            });
+        }
         Ok(match self.handle_events(&frame_state, events) {
-            EventLoopResult::Return(Some(action)) => Tick::Exit(action),
+            EventLoopResult::Return(Some(action)) => self.begin_exit(action),
             EventLoopResult::Continue | EventLoopResult::Break | EventLoopResult::Return(None) => {
                 Tick::Continue
             }
         })
+    }
+
+    /// Leave with `action` at once while every confirmed rename and delete
+    /// has run; otherwise hold it until they have, showing that leaving
+    /// waits (see [`App::hold_exit`]). Refuse an action on a session being
+    /// deleted.
+    fn begin_exit(&mut self, action: Action) -> Tick {
+        if self.app.acts_on_session_being_deleted(&action) {
+            self.app.report_session_being_deleted();
+            return Tick::Continue;
+        }
+        if !self.has_unfinished_changes() {
+            return Tick::Exit(action);
+        }
+        self.app.hold_exit();
+        self.held_exit = Some(HeldExit {
+            action,
+            failures: Vec::new(),
+        });
+        Tick::Continue
+    }
+
+    /// Hand the app the outcome of the rename or delete that finished, if
+    /// one did; record its failure while an exit is held.
+    fn receive_change(&mut self) {
+        let Some(outcome) = self.supervisor.finished_change() else {
+            return;
+        };
+        if let Some(held) = &mut self.held_exit
+            && let Some(failure) = outcome.failure_report()
+        {
+            held.failures.push(failure);
+        }
+        self.app.finish_list_change(outcome);
+    }
+
+    /// The kind of each confirmed rename or delete that has yet to finish:
+    /// the one running, then those queued.
+    fn unfinished_changes(&self) -> impl Iterator<Item = ChangeKind> + '_ {
+        self.supervisor
+            .running_change()
+            .into_iter()
+            .chain(self.app.queued_list_changes())
+    }
+
+    fn has_unfinished_changes(&self) -> bool {
+        self.unfinished_changes().next().is_some()
+    }
+
+    /// Write to `out` what leaving the TUI left undone: the line of each
+    /// rename or delete that failed while the exit was held, then the count
+    /// of those not carried out, `Not deleted: 2 sessions`. A running change
+    /// counts as not carried out unless it has already succeeded: the
+    /// process can end it part way. Writes nothing when every change ran.
+    pub(crate) fn write_exit_report(&mut self, out: &mut impl io::Write) -> io::Result<()> {
+        for failure in self.held_exit.iter().flat_map(|held| &held.failures) {
+            writeln!(out, "{failure}")?;
+        }
+        let ended_at_exit = self
+            .supervisor
+            .finished_change()
+            .filter(|outcome| !outcome.succeeded())
+            .map(|outcome| outcome.kind());
+        let unfinished: Vec<ChangeKind> = self.unfinished_changes().chain(ended_at_exit).collect();
+        for (kind, label) in [
+            (ChangeKind::Delete, "Not deleted"),
+            (ChangeKind::Rename, "Not renamed"),
+        ] {
+            match unfinished.iter().filter(|&&each| each == kind).count() {
+                0 => {}
+                1 => writeln!(out, "{label}: 1 session")?,
+                count => writeln!(out, "{label}: {count} sessions")?,
+            }
+        }
+        Ok(())
     }
 
     /// The action the TUI exited with, `exit`, and the rows the list holds,
@@ -387,18 +498,23 @@ impl Runtime {
     }
 
     /// Hand the worker its next job once it doesn't run one: a confirmed rename or
-    /// delete first, then the read of a file opened directly, then a
-    /// requested list refresh, then the sessions waiting for a refresh. A
-    /// list refresh also waits until the list applies every finished
-    /// refresh: it compares discovery against the rows the user sees. A
-    /// session refresh does not wait for that.
+    /// delete first, then, unless an exit is held, the read of a file opened
+    /// directly, then a requested list refresh, then the sessions waiting
+    /// for a refresh. A list refresh also waits until the list applies every
+    /// finished refresh: it compares discovery against the rows the user
+    /// sees. A session refresh does not wait for that.
     fn start_next_job(&mut self) {
         if !self.supervisor.can_take_job() {
             return;
         }
         if let Some(change) = self.app.begin_list_change() {
             self.supervisor.change(change);
-        } else if let Some(path) = self.app.begin_direct_file_read() {
+            return;
+        }
+        if self.held_exit.is_some() {
+            return;
+        }
+        if let Some(path) = self.app.begin_direct_file_read() {
             self.supervisor
                 .read_direct_file(path, self.refresh_options.show_last);
         } else if let Some(known) = self.app.begin_requested_refresh() {
@@ -507,8 +623,10 @@ pub fn run_with_loader(
     app.set_list_window(refresh_options.time);
     let mut runtime = Runtime::listing(app, environment, load_meter, refresh_options);
     let exit = run_until_exit(&mut runtime, &mut guard);
-    // Restore the terminal before the runtime waits for its free-space checks.
+    // Restore the terminal before the exit report and before the runtime
+    // waits for its free-space checks.
     drop(guard);
+    let _ = runtime.write_exit_report(&mut io::stderr());
     runtime.finish(exit)
 }
 
@@ -537,8 +655,10 @@ pub fn run_single_file(
     let app = App::new_single_file(file, tool_display, show_thinking, keys, environment.clone());
     let mut runtime = Runtime::single_file(app, environment);
     let exit = run_until_exit(&mut runtime, &mut guard);
-    // Restore the terminal before the runtime waits for its free-space checks.
+    // Restore the terminal before the exit report and before the runtime
+    // waits for its free-space checks.
     drop(guard);
+    let _ = runtime.write_exit_report(&mut io::stderr());
     drop(runtime);
     exit.map(|_| ())
 }

@@ -350,6 +350,7 @@ fn rename_in_rearview(app: &mut App, name: &str) {
     app.selected = Some(0);
     app.start_rename();
     app.dialog_mode = DialogMode::Rename {
+        session: app.conversations[0].path.clone(),
         input: name.to_owned(),
         cursor: name.chars().count(),
     };

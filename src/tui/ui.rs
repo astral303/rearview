@@ -24,6 +24,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Get the current theme
@@ -147,7 +148,7 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         render_search_bar(frame, app, chunks[0]);
         render_list(frame, app, chunks[1]);
         if app.is_opening() {
-            dim_list(frame, chunks[1]);
+            dim_area(frame, chunks[1]);
         }
         return;
     }
@@ -165,20 +166,25 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
     render_search_bar(frame, app, chunks[0]);
     render_list(frame, app, chunks[1]);
     if app.is_opening() {
-        dim_list(frame, chunks[1]);
+        dim_area(frame, chunks[1]);
     }
 
-    // Render bottom bar: opening label > confirm dialog > status message > hotkeys
+    // Render bottom bar: opening label > confirm dialog > held exit > status
+    // message > another rearview's work > deletes in progress > hotkeys
     if app.is_opening() {
         render_list_status_bar(frame, app, chunks[2]);
-    } else if *app.dialog_mode() == DialogMode::ConfirmDelete {
-        render_confirm_dialog(frame, chunks[2]);
+    } else if let DialogMode::ConfirmDelete { session } = app.dialog_mode() {
+        render_confirm_dialog(frame, app, session, chunks[2]);
+    } else if let Some(status) = app.held_exit_status_text() {
+        render_activity_status(frame, &status, chunks[2]);
     } else if let Some((msg, shown)) = app.status_message()
         && app.clock().elapsed_since(*shown) < STATUS_TTL
     {
         render_status_message(frame, msg, chunks[2]);
     } else if let Some(activity) = app.another_rearview_activity() {
         render_activity_status(frame, another_rearview_label(activity), chunks[2]);
+    } else if let Some(status) = app.deleting_status_text() {
+        render_activity_status(frame, &status, chunks[2]);
     } else {
         render_list_status_bar(frame, app, chunks[2]);
     }
@@ -195,14 +201,16 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         ),
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
         DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
-        DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
+        DialogMode::Rename { input, cursor, .. } => render_rename_dialog(frame, input, *cursor),
         DialogMode::ActionsMenu { selected, .. } => render_actions_menu(frame, app, *selected),
         _ => {}
     }
 }
 
-/// Backgrounds stay, so the selected row still shows which session is opening.
-fn dim_list(frame: &mut Frame, area: Rect) {
+/// Grey the text in `area`, the list while a session opens or a deleting
+/// row. Backgrounds stay, so the selected row still shows which session is
+/// opening.
+fn dim_area(frame: &mut Frame, area: Rect) {
     frame
         .buffer_mut()
         .set_style(area, Style::default().fg(rgb(th().dim_label)));
@@ -637,7 +645,9 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
 
     // Render dialog overlay if active
     match app.dialog_mode() {
-        DialogMode::ConfirmDelete => render_confirm_dialog(frame, layout.status),
+        DialogMode::ConfirmDelete { session } => {
+            render_confirm_dialog(frame, app, session, layout.status);
+        }
         DialogMode::ExportMenu { selected } => render_export_menu(frame, *selected, false),
         DialogMode::YankMenu { selected } => render_export_menu(frame, *selected, true),
         DialogMode::Help { scroll } => {
@@ -653,7 +663,7 @@ fn render_view_mode(frame: &mut Frame, app: &App, state: &ViewState) {
         }
         DialogMode::SemanticDebug => render_semantic_debug_popup(frame, app),
         DialogMode::ActiveFilters => render_active_filters_popup(frame, app),
-        DialogMode::Rename { input, cursor } => render_rename_dialog(frame, input, *cursor),
+        DialogMode::Rename { input, cursor, .. } => render_rename_dialog(frame, input, *cursor),
         DialogMode::ActionsMenu { selected, .. } => render_actions_menu(frame, app, *selected),
         DialogMode::None => {}
     }
@@ -1029,6 +1039,10 @@ fn top_row_day(state: &ViewState, today: NaiveDate, zone: Zone) -> Option<String
 }
 
 fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
+    if let Some(status) = app.held_exit_status_text() {
+        render_activity_status(frame, &status, area);
+        return;
+    }
     if let Some(label) = app.open_session_status().and_then(open_session_label) {
         render_activity_status(frame, label, area);
         return;
@@ -1467,14 +1481,23 @@ fn centered_modal_area(area: Rect, preferred_width: u16, preferred_height: u16) 
     }
 }
 
-fn render_confirm_dialog(frame: &mut Frame, area: Rect) {
+/// `Delete "<title>"? (y/n)` for the session at `session`, its title
+/// truncated to fit `area`.
+fn render_confirm_dialog(frame: &mut Frame, app: &App, session: &Path, area: Rect) {
+    const QUESTION_START: &str = "Delete \"";
+    const QUESTION_END: &str = "\"? ";
+    const ANSWERS: &str = "(y/n)";
+    let title = app.listed_title(session);
+    let title_width = usize::from(area.width)
+        .saturating_sub(1 + QUESTION_START.width() + QUESTION_END.width() + ANSWERS.width());
+    let question = format!(
+        "{QUESTION_START}{}{QUESTION_END}",
+        simple_truncate(&title, title_width)
+    );
     let prompt = Line::from(vec![
         Span::raw(" "),
-        Span::styled(
-            "Delete this conversation? ",
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::styled("(y/n)", Style::default().fg(rgb(th().text_secondary))),
+        Span::styled(question, Style::default().fg(Color::Yellow)),
+        Span::styled(ANSWERS, Style::default().fg(rgb(th().text_secondary))),
     ]);
     let paragraph = Paragraph::new(prompt);
     frame.render_widget(paragraph, area);
@@ -1926,11 +1949,14 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     let visible_count = items_per_page.max(1);
     let separator = "─".repeat(width);
 
-    let visible_items: Vec<ListItem> = app
-        .filtered()
-        .iter()
-        .skip(offset)
-        .take(visible_count)
+    let visible_rows = app.filtered().iter().skip(offset).take(visible_count);
+    let deleting_rows: Vec<usize> = visible_rows
+        .clone()
+        .enumerate()
+        .filter(|&(_, &conv_idx)| app.is_deleting(&app.conversations()[conv_idx].path))
+        .map(|(relative_idx, _)| relative_idx)
+        .collect();
+    let visible_items: Vec<ListItem> = visible_rows
         .enumerate()
         .map(|(relative_idx, &conv_idx)| {
             let conv = &app.conversations()[conv_idx];
@@ -1953,6 +1979,12 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
 
     let list = List::new(visible_items);
     frame.render_widget(list, area);
+    let lines_above_separator = lines_per_item as u16 - 1;
+    for relative_idx in deleting_rows {
+        let top = area.y + (relative_idx * lines_per_item) as u16;
+        let row = Rect::new(area.x, top, area.width, lines_above_separator).intersection(area);
+        dim_area(frame, row);
+    }
 }
 
 /// Opens every line of a row. One string, so the width it is budgeted and
@@ -3066,6 +3098,7 @@ mod tests {
     fn actions_menu_marks_each_key_letter_and_selected_row() {
         let mut app = semantic_searching_app("query", SemanticProgress::Complete);
         app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
+            session: None,
             selected: Some(SessionAction::Delete),
             availability: MenuAvailability::read(|_| ActionAvailability::Available),
         });
@@ -3107,6 +3140,7 @@ mod tests {
     fn actions_menu_shows_loading_fork_in_grey_in_place_of_fork() {
         let mut app = semantic_searching_app("query", SemanticProgress::Complete);
         app.set_dialog_mode_for_test(DialogMode::ActionsMenu {
+            session: None,
             selected: Some(SessionAction::Resume),
             availability: MenuAvailability::read(|action| match action {
                 SessionAction::Fork => ActionAvailability::Loading,

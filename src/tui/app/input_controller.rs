@@ -130,7 +130,7 @@ impl App {
     ) -> Option<Action> {
         self.clear_selection_anchor_on_loaded_list();
         match self.dialog_mode {
-            DialogMode::ConfirmDelete => return self.handle_confirm_key(code),
+            DialogMode::ConfirmDelete { .. } => return self.handle_confirm_key(code),
             DialogMode::ActionsMenu { .. } => {
                 return self.handle_actions_menu_key(code, modifiers);
             }
@@ -172,6 +172,22 @@ impl App {
         }
     }
 
+    /// True for a key that quits rearview from the screen on show once the
+    /// screen doesn't take it first: `Esc` and `Ctrl+C` in the list, `Ctrl+C`
+    /// in the viewer, and `Esc`, `q` and `Ctrl+C` in the viewer of a file
+    /// opened directly. A query in the list takes `Esc` first, as message
+    /// navigation and a search in the viewer do.
+    pub(crate) fn is_quit_key(&self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        let is_ctrl_c = code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL);
+        is_ctrl_c
+            || match self.app_mode {
+                AppMode::List => code == KeyCode::Esc,
+                AppMode::View(_) => {
+                    self.single_file_mode && matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+                }
+            }
+    }
+
     fn handle_view_key(
         &mut self,
         code: KeyCode,
@@ -193,6 +209,7 @@ impl App {
             return None;
         }
 
+        let quits = self.is_quit_key(code, modifiers);
         let state = match &mut self.app_mode {
             AppMode::View(s) => s,
             _ => return None,
@@ -217,14 +234,14 @@ impl App {
                     self.clear_view_search();
                     return None;
                 }
-                if self.single_file_mode {
+                if quits {
                     return Some(Action::Quit);
                 }
                 self.exit_view_mode();
                 None
             }
             KeyCode::Char('q') => {
-                if self.single_file_mode {
+                if quits {
                     return Some(Action::Quit);
                 }
                 self.exit_view_mode();
@@ -376,7 +393,7 @@ impl App {
                 self.sync_focus_after_scroll(viewport_height);
                 None
             }
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
+            _ if quits => Some(Action::Quit),
             _ => None,
         }
     }
@@ -440,17 +457,13 @@ impl App {
             KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.request_select()
             }
-            KeyCode::Esc => {
-                if self.query.is_empty() {
-                    Some(Action::Quit)
-                } else {
-                    self.query.clear();
-                    self.cursor_pos = 0;
-                    self.dispatch_search();
-                    None
-                }
+            KeyCode::Esc if !self.query.is_empty() => {
+                self.query.clear();
+                self.cursor_pos = 0;
+                self.dispatch_search();
+                None
             }
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
+            _ if self.is_quit_key(code, modifiers) => Some(Action::Quit),
             KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.semantic_toggle_available() {
                     self.toggle_list_search_mode();
