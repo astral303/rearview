@@ -188,6 +188,14 @@ pub(crate) fn is_busy_error(error: &AppError) -> bool {
     matches!(error, AppError::SessionCache(error) if is_busy(error))
 }
 
+/// True for SQLite's `SQLITE_BUSY_RECOVERY`: another connection rebuilds the
+/// write-ahead log's index, as the first connection to open after the
+/// cache's last connection closed does.
+fn is_recovery_error(error: &AppError) -> bool {
+    matches!(error, AppError::SessionCache(rusqlite::Error::SqliteFailure(error, _))
+        if error.extended_code == rusqlite::ffi::SQLITE_BUSY_RECOVERY)
+}
+
 /// A reader connection to a cache base's database. It never creates,
 /// rebuilds or invalidates a cache; [`CacheWriter`] holds every write.
 pub(crate) struct SqliteCache {
