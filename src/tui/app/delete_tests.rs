@@ -10,6 +10,10 @@ use super::*;
 use crate::history::{RefreshOutcome, SessionChanges, UpdatedSession};
 use crate::tui::list_change::{ListChange, ListChangeOutcome};
 
+/// The frame line of the list's first row: inside the border, below the
+/// search bar.
+const FIRST_ROW_LINE: u16 = 3;
+
 /// An app listing sessions `c`, `b` and `a`, newest first.
 fn three_sessions() -> App {
     app_listing(vec![
@@ -36,8 +40,8 @@ fn path_of(app: &App, name: &str) -> PathBuf {
         .clone()
 }
 
-/// Search results for every row arrive while a dialog is open; with no
-/// selection anchor, they select the first row.
+/// Search results for every row arrive; without a selection anchor, they
+/// select the first row.
 fn move_selection_to_first_row_by_search_results(app: &mut App) {
     let results = take_over_search_results(app);
     let every_row = (0..app.conversations().len()).collect();
@@ -61,34 +65,35 @@ fn y_deletes_session_prompt_was_opened_for_after_selection_moved() {
     );
 }
 
+/// The action `key` runs in the list's actions menu opened on `b`, after
+/// search results moved the selection to `c`, and `b`'s path.
+fn menu_key_after_selection_moved(key: char) -> (Option<Action>, PathBuf) {
+    let mut app = three_sessions();
+    press(&mut app, KeyCode::Down);
+    press_ctrl(&mut app, KeyCode::Char('x'));
+    move_selection_to_first_row_by_search_results(&mut app);
+    let action = press(&mut app, KeyCode::Char(key));
+    (action, path_of(&app, "b"))
+}
+
 #[test]
-fn menus_resume_and_fork_act_on_session_menu_was_opened_for_after_selection_moved() {
-    for (key, is_expected) in [
-        (
-            'r',
-            (|action| matches!(action, Action::Resume(_))) as fn(&Action) -> bool,
-        ),
-        ('f', |action| matches!(action, Action::ForkResume(_))),
-    ] {
-        let mut app = three_sessions();
-        press(&mut app, KeyCode::Down);
-        press_ctrl(&mut app, KeyCode::Char('x'));
-        move_selection_to_first_row_by_search_results(&mut app);
+fn menus_resume_acts_on_session_menu_was_opened_for_after_selection_moved() {
+    let (action, b) = menu_key_after_selection_moved('r');
 
-        let action =
-            press(&mut app, KeyCode::Char(key)).unwrap_or_else(|| panic!("{key} runs its action"));
+    assert!(
+        matches!(action, Some(Action::Resume(ref path)) if *path == b),
+        "r resumes the session the menu was opened for"
+    );
+}
 
-        let acted_on = match &action {
-            Action::Resume(path) | Action::ForkResume(path) => path.clone(),
-            _ => PathBuf::new(),
-        };
-        assert!(is_expected(&action), "{key} runs its own action");
-        assert_eq!(
-            acted_on,
-            path_of(&app, "b"),
-            "{key} acts on the session the menu was opened for"
-        );
-    }
+#[test]
+fn menus_fork_acts_on_session_menu_was_opened_for_after_selection_moved() {
+    let (action, b) = menu_key_after_selection_moved('f');
+
+    assert!(
+        matches!(action, Some(Action::ForkResume(ref path)) if *path == b),
+        "f forks the session the menu was opened for"
+    );
 }
 
 #[test]
@@ -113,19 +118,69 @@ fn menus_rename_renames_session_menu_was_opened_for_after_selection_moved() {
     );
 }
 
-#[test]
-fn viewers_menu_acts_on_open_session_after_selection_moved() {
+/// An app viewing `b`, after search results moved the list's selection to
+/// `c`, and `b`'s path.
+fn viewing_b_with_selection_moved() -> (App, PathBuf) {
     let mut app = three_sessions();
     press(&mut app, KeyCode::Down);
     app.enter_view_mode(80);
     move_selection_to_first_row_by_search_results(&mut app);
+    let b = path_of(&app, "b");
+    (app, b)
+}
+
+#[test]
+fn viewers_menu_acts_on_open_session_after_selection_moved() {
+    let (mut app, b) = viewing_b_with_selection_moved();
 
     press_ctrl(&mut app, KeyCode::Char('x'));
     let action = press(&mut app, KeyCode::Char('r'));
 
     assert!(
-        matches!(action, Some(Action::Resume(ref path)) if *path == path_of(&app, "b")),
+        matches!(action, Some(Action::Resume(ref path)) if *path == b),
         "the viewer's menu resumes the open session"
+    );
+}
+
+#[test]
+fn viewers_fork_acts_on_open_session_after_selection_moved() {
+    let (mut app, b) = viewing_b_with_selection_moved();
+
+    press_ctrl(&mut app, KeyCode::Char('x'));
+    let action = press(&mut app, KeyCode::Char('f'));
+
+    assert!(
+        matches!(action, Some(Action::ForkResume(ref path)) if *path == b),
+        "the viewer's menu forks the open session"
+    );
+}
+
+#[test]
+fn viewers_rename_renames_open_session_after_selection_moved() {
+    let (mut app, b) = viewing_b_with_selection_moved();
+
+    press_ctrl(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('m'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        matches!(app.begin_list_change(), Some(ListChange::Rename { ref path, .. }) if *path == b),
+        "the viewer's name box renames the open session"
+    );
+}
+
+#[test]
+fn viewers_y_deletes_open_session_after_selection_moved() {
+    let (mut app, b) = viewing_b_with_selection_moved();
+
+    press_ctrl(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('d'));
+    let action = press(&mut app, KeyCode::Char('y'));
+
+    assert!(
+        matches!(action, Some(Action::Delete(ref path)) if *path == b),
+        "y in the viewer deletes the open session"
     );
 }
 
@@ -267,7 +322,7 @@ fn select_with_keys(app: &mut App, path: &std::path::Path) {
 }
 
 /// Confirm the delete of the session at `path` through the actions menu,
-/// and hand it on as the runtime hands a confirmed delete to the worker.
+/// and queue it as the runtime does.
 fn confirm_delete_of(app: &mut App, path: &std::path::Path) {
     select_with_keys(app, path);
     press_ctrl(app, KeyCode::Char('x'));
@@ -306,15 +361,14 @@ fn make_as_worker(app: &App, change: ListChange) -> ListChangeOutcome {
     .unwrap()
 }
 
-/// The Codex thread ID numbered `number`, which the rollout's file name
-/// carries.
+/// Codex thread ID `number`. A rollout's file name ends with its thread ID.
 fn codex_thread(number: usize) -> String {
     format!("019f0000-0000-7000-8000-0000000000{number:02}")
 }
 
 /// An app listing Codex sessions `0` to `5` written under `home`, loaded
-/// through the test's own session cache. Codex deletes the sessions under
-/// the tree holding the transcript, so a delete stays inside `home`.
+/// through the test's own session cache. A delete removes files only inside
+/// `home`, the tree that holds the transcripts.
 fn app_listing_six_codex_sessions(home: &std::path::Path) -> (App, Vec<PathBuf>) {
     use crate::history::provider::contract_tests::{kept_storage_under, registered_fixtures};
     let fixture = registered_fixtures()
@@ -393,8 +447,8 @@ fn menu_stays_open_when_another_session_leaves_list() {
     );
 }
 
-/// Confirm the delete of session `name` through the actions menu, and hand
-/// it on as the runtime does; the worker doesn't take it.
+/// Confirm the delete of session `name` through the actions menu, and queue
+/// it as the runtime does; the worker doesn't take it.
 fn confirm_delete_of_named(app: &mut App, name: &str) {
     let path = path_of(app, name);
     confirm_delete_of(app, &path);
@@ -437,12 +491,15 @@ fn keys_and_click_pass_over_deleting_row() {
         (KeyCode::End, "a"),
     ] {
         press(&mut app, key);
-        assert_eq!(selected_name(&app), Some(expected), "{key:?}");
+        assert_eq!(
+            selected_name(&app),
+            Some(expected),
+            "{key:?} passes over the deleting row"
+        );
     }
 
     let frame = ratatui::layout::Rect::new(0, 0, 100, 30);
-    let list_top = 3;
-    let b_row = list_top + LIST_LINES_PER_ITEM as u16;
+    let b_row = FIRST_ROW_LINE + LIST_LINES_PER_ITEM as u16;
     assert!(
         !app.handle_list_click(b_row, frame),
         "a click on the deleting row doesn't land"
@@ -721,44 +778,64 @@ fn prompt_names_session_by_its_title_truncated_to_fit() {
     assert!(
         wide.iter()
             .any(|row| row.contains(" Delete \"Plan the release of the migration tool\"? (y/n)")),
-        "{wide:#?}"
+        "the prompt names the session by its whole title: {wide:#?}"
     );
     assert!(
         narrow
             .iter()
             .any(|row| row.contains(" Delete \"Plan the release of …\"? (y/n)")),
-        "{narrow:#?}"
+        "the prompt truncates the title to fit: {narrow:#?}"
     );
+}
+
+/// For each shown row of the list `app` draws, true when every character of
+/// its header line and preview line is in the disabled grey.
+fn grey_rows(app: &App) -> Vec<bool> {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::ui::render(frame, app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let disabled = crate::tui::theme::detect_theme().dim_label;
+    let disabled = ratatui::style::Color::Rgb(disabled.0, disabled.1, disabled.2);
+    let header_and_preview_lines = 2;
+    (0..app.filtered().len() as u16)
+        .map(|row| {
+            let top = FIRST_ROW_LINE + row * LIST_LINES_PER_ITEM as u16;
+            (top..top + header_and_preview_lines).all(|y| {
+                (1..buffer.area.width - 1)
+                    .map(|x| &buffer[(x, y)])
+                    .filter(|cell| !cell.symbol().trim().is_empty())
+                    .all(|cell| cell.fg == disabled)
+            })
+        })
+        .collect()
 }
 
 #[test]
 fn deleting_row_is_drawn_in_disabled_grey() {
     let mut app = three_sessions();
+
     confirm_delete_of_named(&mut app, "b");
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
 
-    terminal
-        .draw(|frame| crate::tui::ui::render(frame, &app))
-        .unwrap();
+    assert_eq!(
+        grey_rows(&app),
+        [false, true, false],
+        "b's row, deleting, is grey; the others keep their colours"
+    );
+}
 
-    let buffer = terminal.backend().buffer();
-    let disabled = crate::tui::theme::detect_theme().dim_label;
-    let disabled = ratatui::style::Color::Rgb(disabled.0, disabled.1, disabled.2);
-    // Inside the border, below the search bar, each row's header line and
-    // preview line.
-    let first_row_line = 3;
-    let lines_of = |row: u16| {
-        let top = first_row_line + row * LIST_LINES_PER_ITEM as u16;
-        top..top + 2
-    };
-    let is_grey = |row: u16| {
-        lines_of(row).all(|y| {
-            (1..buffer.area.width - 1)
-                .map(|x| &buffer[(x, y)])
-                .filter(|cell| !cell.symbol().trim().is_empty())
-                .all(|cell| cell.fg == disabled)
-        })
-    };
-    assert!(is_grey(1), "b's row, deleting, is grey");
-    assert!(!is_grey(2), "a's row keeps its colours");
+#[test]
+fn failed_delete_draws_row_in_its_colours_again() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "b");
+    let b = path_of(&app, "b");
+
+    fail_deleting(&mut app, &b);
+
+    assert_eq!(
+        grey_rows(&app),
+        [false, false, false],
+        "b's row keeps its colours once its delete failed"
+    );
 }
