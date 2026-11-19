@@ -1,6 +1,17 @@
-//! Durations as tool headers print them.
+//! Durations: the time between two timestamps, and the text tool headers
+//! and the `Answer` row print for one.
 
 use std::time::Duration;
+
+use chrono::DateTime;
+
+/// The time from `start` to `end`; `None` when either is missing or not an
+/// RFC 3339 timestamp, or when `end` precedes `start`.
+pub(crate) fn elapsed(start: Option<&str>, end: Option<&str>) -> Option<Duration> {
+    let start = DateTime::parse_from_rfc3339(start?).ok()?;
+    let end = DateTime::parse_from_rfc3339(end?).ok()?;
+    end.signed_duration_since(start).to_std().ok()
+}
 
 /// `49s`, `1m`, `1m 30s`, `1h 4m`: hours and minutes from an hour on,
 /// minutes and seconds below it, and a unit of zero left out. Below one

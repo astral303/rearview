@@ -151,7 +151,9 @@ fn move_call_down(call: &mut CallRange, rows: usize) {
 /// - a call answered at or after the start, in either copy: its lane, its
 ///   connector and its result, and a tool run's late results;
 /// - a sub-agent label new in the changed links, or a task path whose
-///   sub-agent differs in it.
+///   sub-agent differs in it;
+/// - a question call whose answers differ in the changed links: the
+///   `Answer` row under its result.
 ///
 /// A copy with the shown copy's entries, with `first_changed` its entry
 /// count, renders the last shown message again.

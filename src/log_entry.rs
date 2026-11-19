@@ -342,7 +342,7 @@ pub struct QuotedAnswer<'a> {
 /// The most bytes of a question's title Codex quotes in an answer.
 const QUOTED_QUESTION_BYTE_LIMIT: usize = 512;
 
-impl QuotedAnswer<'_> {
+impl<'a> QuotedAnswer<'a> {
     pub fn text(&self) -> String {
         format!(
             "> {}\n\n{}",
@@ -356,6 +356,16 @@ impl QuotedAnswer<'_> {
     pub fn quoted_question(title: &str) -> String {
         let end = title.floor_char_boundary(QUOTED_QUESTION_BYTE_LIMIT);
         title[..end].replace(['\n', '\r'], " ")
+    }
+
+    /// The question and the answer of a text of the shape [`Self::text`]
+    /// writes: a `> ` line, a blank line, then the answer. `None` for text of
+    /// another shape. A message the user typed can have this shape too:
+    /// read it as an answer only on a message whose `source_tool_use_id`
+    /// names a question call.
+    pub fn parse(text: &'a str) -> Option<Self> {
+        let (question, answer) = text.strip_prefix("> ")?.split_once("\n\n")?;
+        (!question.contains('\n')).then_some(Self { question, answer })
     }
 }
 
@@ -749,6 +759,40 @@ mod tests {
         };
         assert_eq!(metadata.timestamp(), Some("2024-03-01T00:06:00.000Z"));
         assert_eq!(metadata.activity_timestamp(), None);
+    }
+
+    #[test]
+    fn quoted_answer_reads_back_as_its_question_and_answer() {
+        let written = QuotedAnswer {
+            question: "Which profile\nfor the cool start?",
+            answer: "warm idle\n\nthen cold",
+        }
+        .text();
+
+        let read = QuotedAnswer::parse(&written).expect("the text a quoted answer wrote");
+        assert_eq!(
+            (read.question, read.answer),
+            (
+                "Which profile for the cool start?",
+                "warm idle\n\nthen cold"
+            )
+        );
+        assert!(QuotedAnswer::parse("a typed reply\n\nwithout a quote").is_none());
+    }
+
+    #[test]
+    fn answer_starting_with_quote_reads_back_whole() {
+        let written = QuotedAnswer {
+            question: "Which profile?",
+            answer: "> warm idle\n\n> cold start",
+        }
+        .text();
+
+        let read = QuotedAnswer::parse(&written).expect("the text a quoted answer wrote");
+        assert_eq!(
+            (read.question, read.answer),
+            ("Which profile?", "> warm idle\n\n> cold start")
+        );
     }
 
     #[test]

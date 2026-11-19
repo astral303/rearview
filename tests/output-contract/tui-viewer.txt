@@ -585,6 +585,9 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ 2. Keep recording once warm?
    ↓
    Result ┐ shown to the user
+   Answer │ 1. PICKED_OPTION_SENTINEL: warm idle · 2s later
+          │ 2. Yes, until I stop it.
+          │    TYPED_ANSWER_SENTINEL: then save the log. · 3s later
 
       You │ > QUESTION_TITLE_SENTINEL: which profile?
           │

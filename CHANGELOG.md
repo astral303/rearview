@@ -218,6 +218,8 @@
   (`request_user_input_async`) missing from the viewer, exports, `agent read`
   and search. It now shows as the user's message, the question quoted above
   the answer.
+  - The viewer also shows the answer under the question, with the delay:
+    `Answer │ warm idle · 49s later`.
   - In a session with answers, later `agent read` message numbers rise by
     one per answer message.
 - Fix a question to the user, a message from another agent and `sleep`

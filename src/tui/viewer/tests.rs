@@ -1083,6 +1083,171 @@ fn call_whose_result_is_hidden_doesnt_take_a_lane() {
     }
 }
 
+/// A Codex question call at `seconds` asking `questions`, and its result.
+fn codex_question_call(seconds: u32, questions: serde_json::Value) -> String {
+    codex_function_call(
+        seconds,
+        "call_question",
+        "request_user_input_async",
+        &serde_json::json!({ "questions": questions }).to_string(),
+        r#"{"accepted":true}"#,
+    )
+}
+
+/// The user's message at `seconds` answering question `index` of the
+/// question call, quoting `question`.
+fn codex_answer(seconds: u32, index: usize, question: &str, answer: &str) -> String {
+    let item_id = serde_json::json!(["request_user_input_async", "call_question", index]);
+    let replies = serde_json::json!([
+        {"answer": answer, "question": question, "questionItemId": item_id.to_string()}
+    ]);
+    codex_record(
+        seconds,
+        "response_item",
+        &serde_json::json!({"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": format!(
+                "<send_user_message_question_reply>\n{replies}\n</send_user_message_question_reply>"
+            )},
+        ]})
+        .to_string(),
+    )
+}
+
+/// The rows from the question call's `Answer` row to the end of its block,
+/// in a detail mode and in an expanded run.
+fn answer_rows(conversation: &ParsedConversation) -> [Vec<String>; 2] {
+    let mut expanded_run = test_render_options(ToolDisplayMode::Hidden);
+    expanded_run
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+    [test_render_options(ToolDisplayMode::Full), expanded_run].map(|options| {
+        rendered_text(&render_parsed_conversation(conversation, &options))
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("Answer"))
+            .take_while(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+#[test]
+fn answer_to_question_shows_under_its_result_with_its_delay() {
+    let conversation = codex_session_of(&[
+        codex_question_call(
+            1,
+            serde_json::json!([{"title": "Is it still running?", "options": ["Yes", "No"]}]),
+        ),
+        codex_answer(50, 0, "Is it still running?", "Yes"),
+    ]);
+
+    for rows in answer_rows(&conversation) {
+        assert_eq!(rows, ["   Answer │ Yes · 49s later"]);
+    }
+}
+
+#[test]
+fn answers_to_two_questions_arriving_apart_show_numbered_by_their_title() {
+    let conversation = codex_session_of(&[
+        codex_question_call(
+            1,
+            serde_json::json!([
+                {"title": "Which profile?", "options": ["warm idle", "cold start"]},
+                {"title": "Keep recording\nonce warm?"},
+            ]),
+        ),
+        codex_answer(
+            40,
+            1,
+            "Keep recording once warm?",
+            "Yes, until I stop it.\nThen save the log.",
+        ),
+        codex_answer(36, 0, "Which profile?", "warm idle"),
+        codex_answer(59, 2, "Something else?", "no title matches"),
+    ]);
+
+    for rows in answer_rows(&conversation) {
+        assert_eq!(
+            rows,
+            [
+                "   Answer │ 1. warm idle · 35s later",
+                "          │ 2. Yes, until I stop it.",
+                "          │    Then save the log. · 39s later",
+                "          │ no title matches · 58s later",
+            ]
+        );
+    }
+}
+
+#[test]
+fn wrapped_rows_of_numbered_answer_hang_under_its_text() {
+    let conversation = codex_session_of(&[
+        codex_question_call(
+            1,
+            serde_json::json!([{"title": "Which profile?"}, {"title": "Keep recording?"}]),
+        ),
+        codex_answer(10, 0, "Which profile?", &"idle ".repeat(40)),
+    ]);
+
+    for rows in answer_rows(&conversation) {
+        assert!(rows[0].starts_with("   Answer │ 1. idle"), "{rows:?}");
+        assert!(rows.len() > 1, "the answer wraps: {rows:?}");
+        assert!(
+            rows[1..].iter().all(|row| {
+                let text = row.strip_prefix("          │    ").unwrap_or_default();
+                !text.is_empty() && !text.starts_with(' ')
+            }),
+            "each wrapped row starts under the text: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn answer_is_numbered_by_title_equal_to_its_quote() {
+    let conversation = codex_session_of(&[
+        codex_question_call(
+            1,
+            serde_json::json!([
+                {"title": "Ship it? Even with the failing test?"},
+                {"title": "Ship it?"},
+            ]),
+        ),
+        codex_answer(10, 1, "Ship it?", "No"),
+    ]);
+
+    for rows in answer_rows(&conversation) {
+        assert_eq!(rows, ["   Answer │ 2. No · 9s later"]);
+    }
+}
+
+#[test]
+fn answer_to_title_over_512_bytes_is_numbered_by_its_truncated_quote() {
+    let long_title = format!("Keep recording\nonce warm? {}", "x".repeat(600));
+    let codex_quote = format!("Keep recording once warm? {}", "x".repeat(486));
+    let conversation = codex_session_of(&[
+        codex_question_call(
+            1,
+            serde_json::json!([{"title": "Ship it?"}, {"title": long_title}]),
+        ),
+        codex_answer(10, 1, &codex_quote, "Yes"),
+    ]);
+
+    for rows in answer_rows(&conversation) {
+        assert_eq!(rows, ["   Answer │ 2. Yes · 9s later"]);
+    }
+}
+
+#[test]
+fn unanswered_question_doesnt_show_an_answer_row() {
+    let conversation = codex_session_of(&[codex_question_call(
+        1,
+        serde_json::json!([{"title": "Ship it?"}]),
+    )]);
+
+    for rows in answer_rows(&conversation) {
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+}
+
 fn sub_agent_named(nickname: &'static str, lines: Vec<String>) -> NamedSubAgent {
     NamedSubAgent {
         thread: SUB_AGENT_THREAD,
@@ -1209,11 +1374,12 @@ fn agent_call_answered_by(
     ]
 }
 
-/// Links holding the agent calls of `entries` and no sub-agent identity.
+/// Links holding the calls and answers of `entries` and no sub-agent
+/// identity.
 fn links_of(entries: &[RenderableEntry]) -> ConversationLinks {
     let mut links = ConversationLinks::default();
     for parsed in entries {
-        links.record_agent_calls(&parsed.entry);
+        links.record_entry(&parsed.entry);
     }
     links
 }

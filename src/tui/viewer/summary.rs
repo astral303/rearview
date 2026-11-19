@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use crate::duration::elapsed;
 use crate::log_entry::{ContentBlock, LogEntry, Tool, ToolSummaryPhrase, UserContent};
 use crate::tui::theme::Rgb;
 
@@ -476,11 +477,13 @@ fn render_summary_group_details(
                     Some(tool_use_id),
                 );
                 let expanded = options.expanded_tool_outputs.contains(&output_id);
+                let answers = links.shown_answers(tool_use_id);
                 render_tool_result(
                     lines,
                     &ToolResultRenderSpec {
                         text: &content_str,
                         standalone_tool_name,
+                        answers: answers.as_deref(),
                         dimmed: false,
                         content_width: options.content_width,
                         timing: pad_timing,
@@ -553,12 +556,7 @@ fn run_tool_blocks<'a>(
 /// entry that carried a timestamp. `None` when either end is missing or is
 /// not an RFC 3339 timestamp, or when the end precedes the start.
 fn format_run_duration(started_at: Option<&str>, ended_at: Option<&str>) -> Option<String> {
-    use chrono::DateTime;
-
-    let started = DateTime::parse_from_rfc3339(started_at?).ok()?;
-    let ended = DateTime::parse_from_rfc3339(ended_at?).ok()?;
-    let seconds = ended.signed_duration_since(started).num_seconds();
-    (seconds >= 0).then(|| format_coarse_duration(seconds as u64))
+    elapsed(started_at, ended_at).map(|duration| format_coarse_duration(duration.as_secs()))
 }
 
 /// Whole units, truncated: `1h 5m` from an hour, `2m` from a minute, `40s`

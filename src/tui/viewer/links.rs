@@ -1,16 +1,19 @@
 //! The values a row reads from other entries of the conversation: each
-//! sub-agent's label, the sub-agent each `spawn_agent` call started, and
-//! the calls that message an agent, collected as the viewer loads a
-//! conversation.
+//! sub-agent's label, the sub-agent each `spawn_agent` call started, the
+//! calls that message an agent, and the answers to each question call,
+//! collected as the viewer loads a conversation.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthStr;
 
+use crate::duration::elapsed;
 use crate::history::RecordedIdentity;
-use crate::log_entry::{ContentBlock, LogEntry, SubagentIdentity, Tool};
+use crate::log_entry::{ContentBlock, LogEntry, QuotedAnswer, SubagentIdentity, Tool, UserContent};
+use crate::tool_format::asked_questions;
 
 use super::NAME_WIDTH;
 use super::ledger::fitted_name;
@@ -29,6 +32,7 @@ pub(crate) struct ConversationLinks {
     agent_calls: HashMap<String, Option<String>>,
     /// The ids of the calls that message an agent.
     message_calls: HashSet<String>,
+    question_answers: QuestionAnswers,
 }
 
 impl ConversationLinks {
@@ -66,9 +70,11 @@ impl ConversationLinks {
         }
     }
 
-    /// Record the agent calls `entry` makes, each with the agent type its
-    /// launch settings name, and the calls that message an agent.
-    pub(super) fn record_agent_calls(&mut self, entry: &LogEntry) {
+    /// Record the calls `entry` makes that a later row reads: each agent call
+    /// with the agent type its launch settings name, each call that messages
+    /// an agent, and each question call; and the answers `entry` gives.
+    pub(super) fn record_entry(&mut self, entry: &LogEntry) {
+        self.question_answers.record_answers(entry);
         for block in entry.content_blocks() {
             let ContentBlock::ToolUse {
                 id, tool, input, ..
@@ -87,6 +93,10 @@ impl ConversationLinks {
                 }
                 Tool::AgentMessage => {
                     self.message_calls.insert(id.clone());
+                }
+                Tool::UserQuestion => {
+                    self.question_answers
+                        .record_call(id, input, entry.timestamp());
                 }
                 _ => {}
             }
@@ -127,6 +137,13 @@ impl ConversationLinks {
             && tool_result_display_text(content).trim().is_empty()
     }
 
+    /// The answers to the question call `tool_use_id`, as its result's
+    /// `Answer` row shows them; `None` for any other call, and for a
+    /// question the user didn't answer.
+    pub(super) fn shown_answers(&self, tool_use_id: &str) -> Option<Vec<ShownAnswer>> {
+        self.question_answers.shown_answers(tool_use_id)
+    }
+
     fn started_subagent(&self, tool_use_id: &str, content: Option<&Value>) -> Option<String> {
         let call_agent_type = self.agent_calls.get(tool_use_id)?;
         let content = content?;
@@ -151,8 +168,9 @@ impl ConversationLinks {
 }
 
 /// The values of a [`ConversationLinks`] that differ in newer links of the
-/// conversation. It leaves out agent calls: a kept result's agent type
-/// changes only when a later call reuses its call id.
+/// conversation. It leaves out agent calls, message calls and question
+/// calls: what a kept result reads from its call changes only when a later
+/// call reuses the call's id.
 pub(super) struct LinkChanges {
     /// True when a sub-agent the shown links label has another label, or
     /// none, in the newer links.
@@ -160,6 +178,8 @@ pub(super) struct LinkChanges {
     /// The sub-agent keys only the newer links label.
     new_labels: HashSet<String>,
     agent_paths: HashSet<String>,
+    /// The question calls whose answers differ.
+    answered_calls: HashSet<String>,
 }
 
 impl LinkChanges {
@@ -176,6 +196,10 @@ impl LinkChanges {
                 .cloned()
                 .collect(),
             agent_paths: Self::changed_keys(&shown.by_agent_path, &newer.by_agent_path),
+            answered_calls: Self::changed_keys(
+                &shown.question_answers.answers,
+                &newer.question_answers.answers,
+            ),
         }
     }
 
@@ -196,9 +220,9 @@ impl LinkChanges {
         self.relabelled
     }
 
-    /// True when `entry`'s rows read a new label or a changed task path: the
-    /// label of the sub-agent the entry belongs to, or the task path a
-    /// result carries.
+    /// True when `entry`'s rows read a new label, a changed task path or
+    /// changed answers: the label of the sub-agent the entry belongs to, the
+    /// task path a result carries, or the answers under a question's result.
     pub(super) fn reaches(&self, entry: &LogEntry) -> bool {
         let parent = match entry {
             LogEntry::Assistant {
@@ -213,16 +237,139 @@ impl LinkChanges {
             .as_deref()
             .is_some_and(|key| self.new_labels.contains(key))
             || entry.content_blocks().iter().any(|block| match block {
-                ContentBlock::ToolResult { content, .. } => content
-                    .as_ref()
-                    .and_then(lone_task_name)
-                    .is_some_and(|path| self.agent_paths.contains(&path)),
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    self.answered_calls.contains(tool_use_id)
+                        || content
+                            .as_ref()
+                            .and_then(lone_task_name)
+                            .is_some_and(|path| self.agent_paths.contains(&path))
+                }
                 _ => false,
             })
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.new_labels.is_empty() && self.agent_paths.is_empty()
+        self.new_labels.is_empty() && self.agent_paths.is_empty() && self.answered_calls.is_empty()
+    }
+}
+
+/// The questions each question call asked, and the answers the user's
+/// messages gave, by the call's id.
+#[derive(Debug, Default, PartialEq)]
+struct QuestionAnswers {
+    calls: HashMap<String, AskedCall>,
+    answers: HashMap<String, Vec<GivenAnswer>>,
+}
+
+#[derive(Debug, PartialEq)]
+struct AskedCall {
+    /// Each title as an answer quotes it.
+    quoted_titles: Vec<String>,
+    asked_at: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+struct GivenAnswer {
+    question: String,
+    answer: String,
+    answered_at: Option<String>,
+}
+
+impl QuestionAnswers {
+    fn record_call(&mut self, id: &str, input: &Value, asked_at: Option<&str>) {
+        let quoted_titles = asked_questions(input)
+            .unwrap_or_default()
+            .iter()
+            .map(|question| QuotedAnswer::quoted_question(question.title))
+            .collect();
+        self.calls.insert(
+            id.to_owned(),
+            AskedCall {
+                quoted_titles,
+                asked_at: asked_at.map(str::to_owned),
+            },
+        );
+    }
+
+    /// Record the answers of a user message that names the call it answers
+    /// and holds nothing but quoted answers.
+    fn record_answers(&mut self, entry: &LogEntry) {
+        let LogEntry::User {
+            message,
+            source_tool_use_id: Some(call_id),
+            timestamp,
+            ..
+        } = entry
+        else {
+            return;
+        };
+        let UserContent::Blocks(blocks) = &message.content else {
+            return;
+        };
+        let Some(answers) = blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => QuotedAnswer::parse(text),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        self.answers
+            .entry(call_id.clone())
+            .or_default()
+            .extend(answers.into_iter().map(|answer| GivenAnswer {
+                question: answer.question.to_owned(),
+                answer: answer.answer.trim_end().to_owned(),
+                answered_at: timestamp.clone(),
+            }));
+    }
+
+    /// Each answer with its delay. A call that asked several questions
+    /// numbers each answer by the title it quotes, and lists an answer
+    /// matching none after the numbered ones.
+    fn shown_answers(&self, call_id: &str) -> Option<Vec<ShownAnswer>> {
+        let call = self.calls.get(call_id)?;
+        let given_answers = self.answers.get(call_id)?;
+        let mut shown: Vec<ShownAnswer> = given_answers
+            .iter()
+            .map(|given| ShownAnswer {
+                number: (call.quoted_titles.len() > 1)
+                    .then(|| call.number_of(&given.question))
+                    .flatten(),
+                text: given.answer.clone(),
+                delay: elapsed(call.asked_at.as_deref(), given.answered_at.as_deref()),
+            })
+            .collect();
+        shown.sort_by_key(|answer| answer.number.unwrap_or(usize::MAX));
+        Some(shown)
+    }
+}
+
+/// One answer as a question's `Answer` row shows it.
+#[derive(Debug, PartialEq)]
+pub(super) struct ShownAnswer {
+    /// The number of the question it answers, for a call of several
+    /// questions.
+    pub(super) number: Option<usize>,
+    pub(super) text: String,
+    /// The delay: the time from the question to the answer. `None` when
+    /// either time is missing.
+    pub(super) delay: Option<Duration>,
+}
+
+impl AskedCall {
+    /// The number of the first title whose quote is `question`.
+    fn number_of(&self, question: &str) -> Option<usize> {
+        self.quoted_titles
+            .iter()
+            .position(|title| title == question)
+            .map(|index| index + 1)
     }
 }
 

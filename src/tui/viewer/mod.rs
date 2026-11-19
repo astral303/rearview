@@ -647,14 +647,14 @@ fn renderable_entries(entries: Vec<LogEntry>, first_index: usize) -> Vec<Rendera
 }
 
 /// The links of a conversation: `identities` in record order, then the
-/// agent calls of `entries`.
+/// calls and answers of `entries`.
 fn links_of_conversation(
     identities: &[RecordedIdentity],
     entries: &[RenderableEntry],
 ) -> ConversationLinks {
     let mut links = ConversationLinks::from_recorded(identities);
     for parsed in entries {
-        links.record_agent_calls(&parsed.entry);
+        links.record_entry(&parsed.entry);
     }
     links
 }

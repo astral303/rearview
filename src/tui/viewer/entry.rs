@@ -11,7 +11,7 @@ use super::calls::{CallRanges, RenderedToolBlock};
 use super::commands::user_text;
 use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
-use super::links::ConversationLinks;
+use super::links::{ConversationLinks, ShownAnswer};
 use super::markdown::{apply_thinking_style, render_markdown_to_lines};
 use super::style::USER_LABEL;
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
@@ -614,6 +614,7 @@ struct ToolResultRenderRow<'a> {
     output_id: ToolOutputId,
     expanded: bool,
     content: String,
+    answers: Option<Vec<ShownAnswer>>,
 }
 
 fn collect_tool_result_rows<'a>(
@@ -647,6 +648,7 @@ fn collect_tool_result_rows<'a>(
             expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
             output_id,
             content,
+            answers: ctx.links.shown_answers(tool_use_id),
         });
     }
     rows
@@ -663,6 +665,7 @@ fn render_tool_result_row(
         &ToolResultRenderSpec {
             text: &row.content,
             standalone_tool_name: row.standalone_tool_name,
+            answers: row.answers.as_deref(),
             dimmed: ctx.style.is_subagent,
             content_width: ctx.options.content_width,
             timing,

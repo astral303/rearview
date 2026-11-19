@@ -610,6 +610,37 @@ fn spawn_result_shown_before_sub_agents_identity_renders_as_whole_render() {
     );
 }
 
+/// An answer arriving in the tail, after a reply below the question's
+/// result: the tail starts at the question call, whose result gains the
+/// `Answer` row.
+#[test]
+fn answer_in_tail_renders_its_questions_result_again() {
+    let conversation = codex_session_of(&[
+        codex_record(
+            0,
+            "response_item",
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"Ship the notes."}]}"#,
+        ),
+        codex_question_call(1, serde_json::json!([{"title": "Ship it now?"}])),
+        codex_reply(2, "I'll wait for your answer."),
+        codex_answer(30, 0, "Ship it now?", "Yes"),
+    ]);
+    let entries = numbered_entries(&conversation);
+    let first_changed = entries.len() - 1;
+    let shown = conversation_of_first(&entries, first_changed);
+    let call = 1;
+
+    let starts = assert_change_renders_as_whole_render(
+        "answer in tail",
+        &shown,
+        &WholeRenders::of(&conversation),
+        first_changed,
+    );
+
+    assert!(starts.tails > 0, "a tail renders the answer: {starts:?}");
+    assert_truncated_mode_tail_starts_at(&shown, &conversation, first_changed, call);
+}
+
 /// A Codex session whose result received without a call shows before any
 /// reply names the agent: once a reply does, summary mode renders whole.
 #[test]
