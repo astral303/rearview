@@ -330,6 +330,50 @@ fn panicking_read_replies_with_every_copy_of_its_batch_failed() {
     }
 }
 
+#[test]
+fn global_pool_job_runs_while_text_reader_holds_every_thread_of_its_pool() {
+    use super::search_worker::{TextsToRead, spawn_text_reader};
+    use std::sync::{Condvar, Mutex};
+    static READ_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+    static READ_RELEASED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+    fn set(flag: &(Mutex<bool>, Condvar)) {
+        *flag.0.lock().unwrap() = true;
+        flag.1.notify_all();
+    }
+    fn wait_for(flag: &(Mutex<bool>, Condvar)) -> bool {
+        let guard = flag.0.lock().unwrap();
+        *flag
+            .1
+            .wait_timeout_while(guard, TEXTS_READ_LIMIT, |is_set| !*is_set)
+            .unwrap()
+            .0
+    }
+    let reader = spawn_text_reader(|_| {
+        rayon::broadcast(|_| {
+            set(&READ_STARTED);
+            wait_for(&READ_RELEASED);
+        });
+        Vec::new()
+    });
+    let (reply, replies) = std::sync::mpsc::channel();
+    let copies = SearchTextsInMemory::default().keep_copies_of::<Conversation>(&[]);
+    reader.send(TextsToRead::new(copies, reply)).unwrap();
+    assert!(wait_for(&READ_STARTED), "the read starts");
+
+    let (job_ran, job_done) = std::sync::mpsc::channel();
+    rayon::spawn(move || job_ran.send(()).unwrap());
+    let job = job_done.recv_timeout(TEXTS_READ_LIMIT);
+    set(&READ_RELEASED);
+
+    assert!(
+        job.is_ok(),
+        "a job queued on the global pool runs while the read holds its pool's threads"
+    );
+    replies
+        .recv_timeout(TEXTS_READ_LIMIT)
+        .expect("the reader replies once released");
+}
+
 /// The rows of a frame 100 columns wide and `height` rows high, as the TUI
 /// draws it.
 fn frame_rows(app: &super::App, height: u16) -> Vec<String> {
@@ -651,7 +695,9 @@ impl ListWithTextReadsHeld {
         let rows = cached_rows(home, &environment);
         let gate =
             super::test_waits::ConnectionGate::closed(environment.cache_base().path(), |thread| {
-                thread.name() == Some("text-reader")
+                thread
+                    .name()
+                    .is_some_and(|name| name.starts_with("text-read"))
             });
         let mut app = super::App::new_loading_with_options(
             super::ToolDisplayMode::Hidden,
