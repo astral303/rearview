@@ -263,6 +263,48 @@ fn rows_whose_text_reader_is_gone_count_as_unreadable_not_loading() {
 }
 
 #[test]
+fn sessions_loading_count_down_with_each_batch_the_reader_replies() {
+    use super::search_worker::{PendingWork, SearchCommand, SearchWorkerState, WorkerInput};
+    let home = ClaudeHome::new();
+    for (minute, name) in [(5, "a"), (10, "b"), (15, "c")] {
+        home.write(name, minute, &["needle"]);
+    }
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    let one_at_a_time = crate::search::CopiesToRead {
+        copies: SearchTextsInMemory::default().keep_copies_of(&rows).copies,
+        are_every_row: false,
+    };
+    let batches = std::sync::Mutex::new(Vec::new());
+    one_at_a_time.read_in_batches(&|batch| batches.lock().unwrap().push(batch));
+    let (copies_to_read, _reader) = std::sync::mpsc::channel();
+    let (_generation, awaited) = super::request_generation::RequestGeneration::start();
+    let (texts_reply, _) = std::sync::mpsc::channel();
+    let mut worker = SearchWorkerState::new(copies_to_read, texts_reply, awaited);
+    worker.apply(
+        SearchCommand::UpdateData {
+            searchable: Arc::new(crate::search::precompute_search_text(&rows)),
+            conversations: Arc::new(rows.into_iter().map(Arc::new).collect()),
+        }
+        .into(),
+        &mut PendingWork::default(),
+    );
+
+    let mut loading = vec![worker.texts.sessions_without_texts().loading];
+    for batch in batches.into_inner().unwrap() {
+        worker.apply(WorkerInput::texts_read(batch), &mut PendingWork::default());
+        loading.push(worker.texts.sessions_without_texts().loading);
+    }
+
+    assert_eq!(
+        loading,
+        [3, 2, 1, 0],
+        "the read of one session at a time replies with each session as its read ends, and \
+         each reply lowers the count of sessions loading"
+    );
+}
+
+#[test]
 fn search_worker_stops_once_app_drops_its_commands_while_a_read_runs() {
     use super::search_worker::{SearchCommand, spawn_search_worker};
     let home = ClaudeHome::new();
@@ -299,28 +341,45 @@ fn search_worker_stops_once_app_drops_its_commands_while_a_read_runs() {
     );
 }
 
-#[test]
-fn panicking_read_replies_with_every_copy_of_its_batch_failed() {
-    use super::search_worker::{TextsToRead, spawn_text_reader};
+/// The failure of each read in the reply of `reader` to a batch of two
+/// sessions' copies; `None` for a read that returned texts.
+fn failures_replied(
+    reader: &std::sync::mpsc::Sender<super::search_worker::TextsToRead>,
+) -> Vec<Option<String>> {
     let home = ClaudeHome::new();
     home.write("a", 5, &["needle"]);
     home.write("b", 10, &["other"]);
     let (_cache, environment) = caching_environment(&home);
     let rows = cached_rows(&home, &environment);
     let copies = SearchTextsInMemory::default().keep_copies_of(&rows);
-    let reader = spawn_text_reader(|_| panic!("the read broke"));
     let (reply, replies) = std::sync::mpsc::channel();
 
-    reader.send(TextsToRead::new(copies, reply)).unwrap();
-    let reads = replies
+    reader
+        .send(super::search_worker::TextsToRead::new(copies, reply))
+        .unwrap();
+    replies
         .recv_timeout(TEXTS_READ_LIMIT)
         .expect("the reader replies")
         .into_texts_read()
-        .expect("the reply holds the batch's reads");
+        .expect("the reply contains the batch's reads")
+        .into_iter()
+        .map(|(_, read)| read.err().map(|failure| failure.to_string()))
+        .collect()
+}
 
-    assert_eq!(reads.len(), 2, "the reply holds every copy of the batch");
-    for (_, read) in reads {
-        let failure = read.err().map(|failure| failure.to_string());
+#[test]
+fn panicking_read_replies_with_every_copy_of_its_batch_failed() {
+    use super::search_worker::{spawn_text_reader, text_reader_pool};
+    let reader = spawn_text_reader(|_, _| panic!("the read broke"), text_reader_pool);
+
+    let failures = failures_replied(&reader);
+
+    assert_eq!(
+        failures.len(),
+        2,
+        "the reply contains every copy of the batch"
+    );
+    for failure in failures {
         assert!(
             failure
                 .as_deref()
@@ -331,8 +390,34 @@ fn panicking_read_replies_with_every_copy_of_its_batch_failed() {
 }
 
 #[test]
+fn failed_start_of_readers_threads_replies_with_every_copy_of_its_batch_failed() {
+    use super::search_worker::spawn_text_reader;
+    let reader = spawn_text_reader(crate::search::CopiesToRead::read_in_batches, || {
+        rayon::ThreadPoolBuilder::new()
+            .spawn_handler(|_| Err(std::io::Error::other("no thread left")))
+            .build()
+    });
+
+    let failures = failures_replied(&reader);
+
+    assert_eq!(
+        failures.len(),
+        2,
+        "the reply contains every copy of the batch"
+    );
+    for failure in failures {
+        assert!(
+            failure.as_deref().is_some_and(|failure| {
+                failure.contains("threads didn't start") && failure.contains("no thread left")
+            }),
+            "each copy failed with the build's error: {failure:?}"
+        );
+    }
+}
+
+#[test]
 fn global_pool_job_runs_while_text_reader_holds_every_thread_of_its_pool() {
-    use super::search_worker::{TextsToRead, spawn_text_reader};
+    use super::search_worker::{TextsToRead, spawn_text_reader, text_reader_pool};
     use std::sync::{Condvar, Mutex};
     static READ_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
     static READ_RELEASED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
@@ -348,13 +433,16 @@ fn global_pool_job_runs_while_text_reader_holds_every_thread_of_its_pool() {
             .unwrap()
             .0
     }
-    let reader = spawn_text_reader(|_| {
-        rayon::broadcast(|_| {
-            set(&READ_STARTED);
-            wait_for(&READ_RELEASED);
-        });
-        Vec::new()
-    });
+    let reader = spawn_text_reader(
+        |_, reply| {
+            rayon::broadcast(|_| {
+                set(&READ_STARTED);
+                wait_for(&READ_RELEASED);
+            });
+            reply(Vec::new());
+        },
+        text_reader_pool,
+    );
     let (reply, replies) = std::sync::mpsc::channel();
     let copies = SearchTextsInMemory::default().keep_copies_of::<Conversation>(&[]);
     reader.send(TextsToRead::new(copies, reply)).unwrap();

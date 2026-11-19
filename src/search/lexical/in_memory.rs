@@ -6,8 +6,8 @@ use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
-    CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScanScope, ScannedCopy,
-    ScannedRow, SearchField, SessionKey, TextVisitor, scan_search_texts,
+    CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScannedCopy, ScannedRow,
+    SearchField, SessionKey, TextVisitor, scan_search_texts_in_waves,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -233,13 +233,13 @@ fn joined_once(texts: &[&str], ranges: &[Range<usize>]) -> Arc<str> {
     unsafe { Arc::from_raw(Arc::into_raw(joined) as *const str) }
 }
 
-/// The texts of each of `copies` as the cache holds it, by its key. Each
-/// session is read on its own, through the cache's indexes on the session.
-fn read_copies(copies: &[CachedSession]) -> Vec<TextsRead> {
+/// The texts of each of `copies` as the cache holds it, by its key, each
+/// handed to `reply` as its read ends. Each session is read on its own,
+/// through the cache's indexes on the session.
+fn read_copies(copies: &[CachedSession], reply: BatchReply<'_>) {
     copies
         .par_iter()
-        .map(|cached| (cached.copy_key(), read_texts(cached)))
-        .collect()
+        .for_each(|cached| reply(vec![(cached.copy_key(), read_texts(cached))]));
 }
 
 /// [`SessionSearchTexts::read`] of `cached`, or the cause of its miss.
@@ -249,49 +249,82 @@ fn read_texts(cached: &CachedSession) -> TextsReadResult {
         .map_err(ReadFailure::of_miss)
 }
 
+/// The most waves the first read of every row's texts is scanned in. The
+/// search bar's count of sessions loading decreases as each wave ends.
+const FIRST_READ_WAVES: usize = 16;
+
 /// [`read_copies`] for the copies of every row of the list, in one scan of
-/// each table holding search text. A scan reads the whole cache whatever the
-/// copies, and reading every row one session at a time takes longer.
-fn read_every_row_copy(copies: &[CachedSession]) -> Vec<TextsRead> {
+/// each table holding search text, in waves of row ranges. `reply` receives
+/// each copy after the wave that reads its last row, laid out while the next
+/// wave scans. A scan reads the whole cache whatever the copies, and reading
+/// every row one session at a time takes longer.
+fn read_every_row_copy(copies: &[CachedSession], reply: BatchReply<'_>) {
     let references = copies.iter().collect::<Vec<_>>();
-    let scanned = scan_search_texts(
-        &references,
-        &TimeFilter::default(),
-        ScanScope::AllWorkspaces,
-        TextCollector::default,
-        |_, held| texts_in_read_order(held),
-    );
-    let scanned = match scanned {
-        Ok(scanned) => scanned,
-        Err(error) => {
-            let failure = ReadFailure::of(&error);
-            return copies
-                .iter()
-                .map(|cached| (cached.copy_key(), Err(failure.clone())))
-                .collect();
-        }
-    };
     let mut pieces = copies.iter().map(|_| Vec::new()).collect::<Vec<_>>();
-    for collector in scanned.reads {
-        for (copy, texts) in collector.by_copy {
-            pieces[copy].push(texts);
-        }
+    let mut is_replied = vec![false; copies.len()];
+    let scanned = rayon::scope(|layouts| {
+        scan_search_texts_in_waves(
+            &references,
+            FIRST_READ_WAVES,
+            TextCollector::default,
+            |_, held| texts_in_read_order(held),
+            |wave| {
+                for collector in wave.reads {
+                    for (copy, texts) in collector.by_copy {
+                        pieces[copy].push(texts);
+                    }
+                }
+                let done = wave
+                    .copies
+                    .into_iter()
+                    .map(|(copy, scanned)| {
+                        is_replied[copy] = true;
+                        (copy, scanned, std::mem::take(&mut pieces[copy]))
+                    })
+                    .collect::<Vec<_>>();
+                if !done.is_empty() {
+                    layouts.spawn(move |_| reply(laid_out_copies(copies, done)));
+                }
+            },
+        )
+    });
+    if let Err(error) = scanned {
+        let failure = ReadFailure::of(&error);
+        reply(
+            copies
+                .iter()
+                .zip(is_replied)
+                .filter(|(_, is_replied)| !is_replied)
+                .map(|(cached, _)| (cached.copy_key(), Err(failure.clone())))
+                .collect(),
+        );
     }
-    pieces
-        .into_par_iter()
-        .zip(scanned.copies)
-        .enumerate()
-        .map(|(copy, (pieces, scanned))| {
-            let cached = &copies[copy];
+}
+
+/// The texts of each of `done`, copies of `copies` by position, laid out
+/// from what the scan found of it.
+fn laid_out_copies(
+    copies: &[CachedSession],
+    done: Vec<(usize, ScannedCopyTexts, Vec<TextsInReadOrder>)>,
+) -> Vec<TextsRead> {
+    done.into_par_iter()
+        .map(|(copy, scanned, pieces)| {
             let texts = match scanned {
                 Ok(ScannedCopy::Scanned(())) => Ok(Arc::new(laid_out(pieces))),
                 Ok(ScannedCopy::ReadAlone(read)) => Ok(Arc::new(laid_out(vec![read]))),
                 Err(miss) => Err(ReadFailure::of_miss(miss)),
             };
-            (cached.copy_key(), texts)
+            (copies[copy].copy_key(), texts)
         })
         .collect()
 }
+
+/// A scan's result for one copy: its texts in the scan's pieces, its texts
+/// read alone, or the cause of its miss.
+type ScannedCopyTexts = CopyRead<ScannedCopy<(), TextsInReadOrder>>;
+
+/// Receives the reads of each batch of copies as the batch's read ends.
+pub(crate) type BatchReply<'a> = &'a (dyn Fn(Vec<TextsRead>) + Sync);
 
 /// A read of a copy's search texts.
 pub(crate) type TextsRead = (CopyKey, TextsReadResult);
@@ -350,14 +383,40 @@ pub(crate) struct CopiesToRead {
 }
 
 impl CopiesToRead {
-    /// The texts of each copy: in one scan when the copies are every row's,
-    /// else one session at a time.
-    pub(crate) fn read(&self) -> Vec<TextsRead> {
+    /// The texts of each copy, handed to `reply` a batch at a time as each
+    /// batch's read ends: in one scan, in waves, when the copies are every
+    /// row's, else one session at a time.
+    pub(crate) fn read_in_batches(&self, reply: BatchReply<'_>) {
         if self.are_every_row {
-            read_every_row_copy(&self.copies)
+            read_every_row_copy(&self.copies, reply);
         } else {
-            read_copies(&self.copies)
+            read_copies(&self.copies, reply);
         }
+    }
+
+    /// The texts of each copy, in the copies' order, once every batch's read
+    /// ends.
+    pub(crate) fn read(&self) -> Vec<TextsRead> {
+        let reads = std::sync::Mutex::new(HashMap::with_capacity(self.copies.len()));
+        self.read_in_batches(&|batch| {
+            reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(batch);
+        });
+        let mut reads = reads
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.copies
+            .iter()
+            .map(|cached| {
+                let key = cached.copy_key();
+                let read = reads
+                    .remove(&key)
+                    .expect("the read of every copy replies with the copy");
+                (key, read)
+            })
+            .collect()
     }
 
     /// A read of each copy that failed with `failure`.
@@ -458,7 +517,11 @@ impl SearchTextsInMemory {
             .filter_map(|conversation| conversation.borrow().cached_session.clone())
             .collect::<Vec<_>>();
         let mut in_memory = Self::default();
-        for (copy, read) in read_every_row_copy(&copies) {
+        let every_row = CopiesToRead {
+            copies,
+            are_every_row: true,
+        };
+        for (copy, read) in every_row.read() {
             let (read, texts) = match read {
                 Ok(texts) => (
                     CopyReadState::Held,

@@ -12,11 +12,12 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
+use std::sync::{Mutex, PoisonError};
 
 /// Row ranges per thread that a scan of each large table is split into.
 /// Many small ranges keep every thread busy until the scan ends, as rows
 /// differ in size by orders of magnitude.
-const RANGES_PER_THREAD: i64 = 16;
+pub(super) const RANGES_PER_THREAD: i64 = 16;
 /// The fewest rows a range holds, so a small table is one range.
 const MIN_ROWS_PER_RANGE: i64 = 4096;
 
@@ -86,6 +87,17 @@ pub(super) trait CopiesScan: Sync {
     /// finds the database gone, before the scan ends: an implementation
     /// holding reads of the copy can drop them here.
     fn copy_failed(&self, _copy: usize) {}
+    /// Maps each scanned session's row id to the position in `tasks` of its
+    /// last task, read on `connection` in the snapshot that planned `tasks`.
+    /// [`scan_copies_in_waves`] delivers a session missing from the map with
+    /// the last wave.
+    fn last_tasks(
+        &self,
+        _connection: &Connection,
+        _tasks: &[Self::Task],
+    ) -> Result<HashMap<i64, usize>> {
+        Ok(HashMap::new())
+    }
 }
 
 /// A task's outcome.
@@ -127,19 +139,114 @@ pub(super) fn scan_copies<S: CopiesScan, A>(
     plan: impl Fn(&Connection, SessionsById) -> Result<S>,
     read_alone: impl Fn(usize, &HeldCopy<'_>) -> Result<A>,
 ) -> Result<ScannedCopies<S::Read, A>> {
+    let mut reads = Vec::new();
+    let mut scanned = copies.iter().map(|_| None).collect::<Vec<_>>();
+    scan_copies_in_waves(copies, Waves::ONE, plan, read_alone, |wave| {
+        reads.extend(wave.reads);
+        for (position, found) in wave.copies {
+            scanned[position] = Some(found);
+        }
+    })?;
+    Ok(ScannedCopies {
+        reads,
+        copies: unless_every_read_failed(
+            scanned
+                .into_iter()
+                .map(|copy| copy.expect("every copy's cache base is scanned"))
+                .collect(),
+        )?,
+    })
+}
+
+/// Looks the copy at `position` up again in `connection`'s snapshot once its
+/// tasks ended, and returns the scan's result for it. Reads the copy alone
+/// through `read_alone` when another write replaced it or it is not ready.
+fn recheck<A>(
+    connection: &Connection,
+    copies: &[&CachedSession],
+    position: usize,
+    lookups: &mut [Option<Lookup>],
+    read_alone: &impl Fn(usize, &HeldCopy<'_>) -> Result<A>,
+) -> CopyRead<ScannedCopy<(), A>> {
+    let copy = copies[position];
+    let lookup = match lookups[position].take() {
+        Some(Lookup::Scanned(_)) => Lookup::of(connection, copy),
+        lookup => lookup.expect("every copy of the base is looked up"),
+    };
+    match lookup {
+        Lookup::Scanned(_) => Ok(ScannedCopy::Scanned(())),
+        Lookup::Replaced | Lookup::Missed(CopyMiss::NotReady) => {
+            read_copy_in(connection, &copy.address, |held| read_alone(position, held))
+                .map(ScannedCopy::ReadAlone)
+        }
+        Lookup::Missed(miss) => Err(miss),
+    }
+}
+
+/// One wave of [`scan_copies_in_waves`]: its tasks' kept reads, and the
+/// scan's result for each copy due in the wave, by the copy's position. A
+/// copy is due in the wave that runs its last task.
+pub(crate) struct ScannedWave<R, A> {
+    pub(crate) reads: Vec<R>,
+    pub(crate) copies: Vec<(usize, CopyRead<ScannedCopy<(), A>>)>,
+}
+
+/// The waves a scan reads its tasks in.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Waves {
+    pub(super) most: usize,
+    /// The fewest tasks of every wave but the last: a wave of fewer tasks
+    /// than threads leaves threads idle.
+    pub(super) least_tasks: usize,
+}
+
+impl Waves {
+    /// Every task in one wave.
+    pub(super) const ONE: Self = Self {
+        most: 1,
+        least_tasks: 1,
+    };
+
+    /// The tasks of every wave but the last, for a scan of `tasks` tasks.
+    fn tasks_per_wave(self, tasks: usize) -> usize {
+        tasks
+            .div_ceil(self.most.max(1))
+            .max(self.least_tasks)
+            .max(1)
+    }
+}
+
+/// [`scan_copies`] in `waves` of the tasks `plan` makes, in their order,
+/// each wave's tasks across threads. `deliver` receives each wave as it
+/// ends: its reads, and the copies whose last task
+/// ([`CopiesScan::last_tasks`]) it ran, each rechecked as [`scan_copies`]
+/// rechecks every copy. A copy the plan didn't find is delivered with the
+/// first wave.
+///
+/// Fails as [`scan_copies`] does, once the waves before the failure are
+/// delivered; a failure of every copy is delivered copy by copy.
+pub(super) fn scan_copies_in_waves<S: CopiesScan, A>(
+    copies: &[&CachedSession],
+    waves: Waves,
+    plan: impl Fn(&Connection, SessionsById) -> Result<S>,
+    read_alone: impl Fn(usize, &HeldCopy<'_>) -> Result<A>,
+    mut deliver: impl FnMut(ScannedWave<S::Read, A>),
+) -> Result<()> {
     let mut by_base: HashMap<&std::path::Path, Vec<usize>> = HashMap::new();
     for (position, copy) in copies.iter().enumerate() {
         by_base.entry(copy.base.path()).or_default().push(position);
     }
     let mut lookups = copies.iter().map(|_| None).collect::<Vec<_>>();
-    let mut scanned = copies.iter().map(|_| None).collect::<Vec<_>>();
-    let mut reads = Vec::new();
     for positions in by_base.into_values() {
         let base = &copies[positions[0]].base;
         let Some(cache) = SqliteCache::open_waiting(base)? else {
-            for position in positions {
-                scanned[position] = Some(Err(CopyMiss::NotThere));
-            }
+            deliver(ScannedWave {
+                reads: Vec::new(),
+                copies: positions
+                    .iter()
+                    .map(|&position| (position, Err(CopyMiss::NotThere)))
+                    .collect(),
+            });
             continue;
         };
         let planned = cache.with_read_snapshot(|connection| {
@@ -158,39 +265,65 @@ pub(super) fn scan_copies<S: CopiesScan, A>(
             }
             let scan = plan(connection, sessions)?;
             let tasks = scan.tasks(connection)?;
-            Ok(Some((scan, tasks)))
+            let tasks_per_wave = waves.tasks_per_wave(tasks.len());
+            let last_tasks = if tasks_per_wave < tasks.len() {
+                scan.last_tasks(connection, &tasks)?
+            } else {
+                HashMap::new()
+            };
+            Ok(Some((scan, tasks, tasks_per_wave, last_tasks)))
         })?;
-        if let Some((scan, tasks)) = planned {
-            reads.extend(read_tasks(&scan, tasks, base, &positions, &mut lookups)?);
+        let Some((scan, tasks, tasks_per_wave, last_tasks)) = planned else {
+            let rechecked = cache.with_read_snapshot(|connection| {
+                Ok(positions
+                    .iter()
+                    .map(|&position| {
+                        let found =
+                            recheck(connection, copies, position, &mut lookups, &read_alone);
+                        (position, found)
+                    })
+                    .collect())
+            })?;
+            deliver(ScannedWave {
+                reads: Vec::new(),
+                copies: rechecked,
+            });
+            continue;
+        };
+        let last_wave = tasks.len().saturating_sub(1) / tasks_per_wave;
+        let wave_of = |position: usize, lookups: &[Option<Lookup>]| match &lookups[position] {
+            Some(Lookup::Scanned(session)) => last_tasks
+                .get(session)
+                .map_or(last_wave, |task| task / tasks_per_wave),
+            _ => 0,
+        };
+        let due_waves = positions
+            .iter()
+            .map(|&position| (position, wave_of(position, &lookups)))
+            .collect::<Vec<_>>();
+        let mut remaining = tasks.into_iter();
+        let readers = OpenReaders::default();
+        for wave in 0..=last_wave {
+            let wave_tasks = remaining.by_ref().take(tasks_per_wave).collect();
+            let reads = read_tasks(&scan, wave_tasks, base, &readers, &positions, &mut lookups)?;
+            let rechecked = cache.with_read_snapshot(|connection| {
+                Ok(due_waves
+                    .iter()
+                    .filter(|(_, due)| *due == wave)
+                    .map(|&(position, _)| {
+                        let found =
+                            recheck(connection, copies, position, &mut lookups, &read_alone);
+                        (position, found)
+                    })
+                    .collect())
+            })?;
+            deliver(ScannedWave {
+                reads,
+                copies: rechecked,
+            });
         }
-        cache.with_read_snapshot(|connection| {
-            for &position in &positions {
-                let copy = copies[position];
-                let lookup = match lookups[position].take() {
-                    Some(Lookup::Scanned(_)) => Lookup::of(connection, copy),
-                    lookup => lookup.expect("every copy of the base is looked up"),
-                };
-                scanned[position] = Some(match lookup {
-                    Lookup::Scanned(_) => Ok(ScannedCopy::Scanned(())),
-                    Lookup::Replaced | Lookup::Missed(CopyMiss::NotReady) => {
-                        read_copy_in(connection, &copy.address, |held| read_alone(position, held))
-                            .map(ScannedCopy::ReadAlone)
-                    }
-                    Lookup::Missed(miss) => Err(miss),
-                });
-            }
-            Ok(())
-        })?;
     }
-    Ok(ScannedCopies {
-        reads,
-        copies: unless_every_read_failed(
-            scanned
-                .into_iter()
-                .map(|copy| copy.expect("every copy's cache base is scanned"))
-                .collect(),
-        )?,
-    })
+    Ok(())
 }
 
 /// The reads of `scan`'s `tasks` of the copies at `positions`, on the rayon
@@ -201,16 +334,17 @@ fn read_tasks<S: CopiesScan>(
     scan: &S,
     tasks: Vec<S::Task>,
     base: &CacheBase,
+    readers: &OpenReaders,
     positions: &[usize],
     lookups: &mut [Option<Lookup>],
 ) -> Result<Vec<S::Read>> {
     let task_ends = tasks
         .into_par_iter()
         .map_init(
-            || None,
-            |reader: &mut Option<SqliteCache>, task| {
+            || readers.lend(),
+            |reader: &mut LentReader<'_>, task| {
                 let copy = scan.copy_of(&task);
-                let end = match open_once(reader, base) {
+                let end = match open_once(&mut reader.reader, base) {
                     Ok(Some(cache)) => {
                         match cache.with_read_snapshot(|connection| scan.read(connection, task)) {
                             Ok(read) => TaskEnd::Succeeded(scan.task_ended(read)),
@@ -248,8 +382,44 @@ fn read_tasks<S: CopiesScan>(
     Ok(reads)
 }
 
-/// The read connection of this rayon work split, opened on its first task;
-/// `None` when `base`'s database is gone.
+/// Read connections a scan's work splits hand back as they end, for the
+/// splits of its later waves: a wave doesn't open a connection per split.
+#[derive(Default)]
+struct OpenReaders(Mutex<Vec<SqliteCache>>);
+
+impl OpenReaders {
+    /// A connection a split ended with, or none yet.
+    fn lend(&self) -> LentReader<'_> {
+        let reader = self.0.lock().unwrap_or_else(PoisonError::into_inner).pop();
+        LentReader {
+            readers: self,
+            reader,
+        }
+    }
+}
+
+/// A work split's read connection, handed back to its [`OpenReaders`] as the
+/// split ends.
+struct LentReader<'r> {
+    readers: &'r OpenReaders,
+    reader: Option<SqliteCache>,
+}
+
+impl Drop for LentReader<'_> {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            self.readers
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(reader);
+        }
+    }
+}
+
+/// The read connection of this rayon work split: the one [`OpenReaders`]
+/// lent it, or else one opened here on its first task; `None` when `base`'s
+/// database is gone.
 fn open_once<'r>(
     reader: &'r mut Option<SqliteCache>,
     base: &CacheBase,
@@ -269,24 +439,30 @@ pub(super) struct KeySplit {
 }
 
 impl KeySplit {
-    /// The split of `table`'s `key`, the first column of an index. The split
-    /// of an empty table is empty.
-    pub(super) fn of(connection: &Connection, table: &str, key: &str) -> Result<Self> {
+    /// The split of `table`'s `key`, the first column of an index, into at
+    /// most `ranges_per_thread` ranges per thread. The split of an empty
+    /// table is empty.
+    pub(super) fn of(
+        connection: &Connection,
+        table: &str,
+        key: &str,
+        ranges_per_thread: i64,
+    ) -> Result<Self> {
         let bounds = connection.query_row(&Self::bounds_query(table, key), [], |row| {
             Ok(row.get::<_, Option<i64>>(0)?.zip(row.get(1)?))
         })?;
-        Ok(Self::spanning(bounds))
+        Ok(Self::spanning(bounds, ranges_per_thread))
     }
 
-    /// The split of the keys from the least to the greatest of `bounds`;
-    /// empty without bounds.
-    pub(super) fn spanning(bounds: Option<(i64, i64)>) -> Self {
+    /// The split of the keys from the least to the greatest of `bounds` into
+    /// at most `ranges_per_thread` ranges per thread; empty without bounds.
+    pub(super) fn spanning(bounds: Option<(i64, i64)>, ranges_per_thread: i64) -> Self {
         let span = bounds.map_or(0, |(least, greatest)| {
             (greatest - least).saturating_add(1).max(0)
         });
         let threads = i64::try_from(rayon::current_num_threads()).unwrap_or(1);
         let count = (span / MIN_ROWS_PER_RANGE)
-            .clamp(1, threads * RANGES_PER_THREAD)
+            .clamp(1, threads * ranges_per_thread)
             .min(span.max(1));
         Self::of_width(bounds, (span + count - 1) / count)
     }
@@ -502,6 +678,122 @@ mod tests {
         );
     }
 
+    /// A scan of one task per scanned copy, in copy order; each task reads
+    /// its copy's position and is its copy's last task.
+    struct TaskPerCopyScan {
+        sessions: SessionsById,
+    }
+
+    impl CopiesScan for TaskPerCopyScan {
+        type Task = usize;
+        type Read = usize;
+
+        fn tasks(&self, _: &Connection) -> Result<Vec<usize>> {
+            let mut copies = self
+                .sessions
+                .values()
+                .map(|&(copy, _)| copy)
+                .collect::<Vec<_>>();
+            copies.sort_unstable();
+            Ok(copies)
+        }
+
+        fn copy_of(&self, task: &usize) -> Option<usize> {
+            Some(*task)
+        }
+
+        fn read(&self, _: &Connection, task: usize) -> Result<usize> {
+            Ok(task)
+        }
+
+        fn last_tasks(&self, _: &Connection, tasks: &[usize]) -> Result<HashMap<i64, usize>> {
+            Ok(self
+                .sessions
+                .iter()
+                .map(|(&session, &(copy, _))| {
+                    let task = tasks.iter().position(|task| *task == copy).unwrap();
+                    (session, task)
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn scan_in_waves_delivers_each_copy_once_with_the_wave_of_its_last_task() {
+        let base = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(base.path());
+        let references = copies.iter().collect::<Vec<_>>();
+        let replaced = copies.len() - 1;
+        super::super::tests::replace_copy(&copies[replaced]);
+        let scanned = copies.len() - 1;
+        let mut waves = Vec::new();
+
+        scan_copies_in_waves(
+            &references,
+            Waves {
+                most: scanned,
+                least_tasks: 1,
+            },
+            |_, sessions| Ok(TaskPerCopyScan { sessions }),
+            |position, _| Ok(position),
+            |wave| {
+                let delivered = wave
+                    .copies
+                    .iter()
+                    .map(|(copy, found)| (*copy, matches!(found, Ok(ScannedCopy::Scanned(())))))
+                    .collect::<Vec<_>>();
+                waves.push((wave.reads, delivered));
+            },
+        )
+        .unwrap();
+
+        let mut expected = (0..scanned)
+            .map(|copy| (vec![copy], vec![(copy, true)]))
+            .collect::<Vec<_>>();
+        expected[0].1.push((replaced, false));
+        for (_, delivered) in &mut waves {
+            delivered.sort_unstable();
+        }
+        assert_eq!(
+            waves, expected,
+            "each wave runs one task and delivers the copy that task ends; the copy replaced \
+             before the plan is delivered, read alone, with the first wave"
+        );
+    }
+
+    #[test]
+    fn scan_in_waves_runs_at_least_least_tasks_in_each_wave_but_last() {
+        let base = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(base.path());
+        let references = copies.iter().collect::<Vec<_>>();
+        for least_tasks in [2, copies.len()] {
+            let mut wave_tasks = Vec::new();
+
+            scan_copies_in_waves(
+                &references,
+                Waves {
+                    most: copies.len(),
+                    least_tasks,
+                },
+                |_, sessions| Ok(TaskPerCopyScan { sessions }),
+                |position, _| Ok(position),
+                |wave| wave_tasks.push(wave.reads.len()),
+            )
+            .unwrap();
+
+            let mut expected = vec![least_tasks; copies.len() / least_tasks];
+            if !copies.len().is_multiple_of(least_tasks) {
+                expected.push(copies.len() % least_tasks);
+            }
+            assert_eq!(
+                wave_tasks,
+                expected,
+                "{} tasks in waves of at least {least_tasks}",
+                copies.len()
+            );
+        }
+    }
+
     /// The split of a table holding rows of `ids`.
     fn split_of_rows(ids: &[i64]) -> KeySplit {
         let connection = Connection::open_in_memory().unwrap();
@@ -514,7 +806,7 @@ mod tests {
         for id in ids {
             insert.execute([id]).unwrap();
         }
-        KeySplit::of(&connection, "texts", "id").unwrap()
+        KeySplit::of(&connection, "texts", "id", RANGES_PER_THREAD).unwrap()
     }
 
     #[test]

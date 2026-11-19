@@ -19,6 +19,8 @@ pub use lexical::{
     searchable_conversation, session_id_for_lookup, session_id_matches, try_agent_search,
     try_debug_search,
 };
-pub(crate) use lexical::{CopiesToRead, ReadFailure, ScanScope, SessionsWithoutTexts, TextsRead};
+pub(crate) use lexical::{
+    BatchReply, CopiesToRead, ReadFailure, ScanScope, SessionsWithoutTexts, TextsRead,
+};
 #[cfg(test)]
 pub use lexical::{agent_search, search};

@@ -23,7 +23,8 @@
 - Speed up the session list's search about 6–18x per keystroke (on one example
   corpus). It searches texts read into memory in the background after launch.
   - Until a session's texts are read, it matches on its title, summary and
-    project name, and the search bar shows ` · N sessions loading`.
+    project name, and the search bar shows ` · N sessions loading`. The count
+    decreases as texts are read.
     ` · N sessions unreadable` counts sessions whose texts could not be read.
   - Reading those texts takes about 5–6x as long as before. The list loads
     faster, and becomes searchable about 1.2x sooner after launch.

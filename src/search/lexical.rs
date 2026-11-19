@@ -23,7 +23,9 @@ mod streamed;
 pub(crate) use streamed::hit_messages_of_texts;
 
 pub use hit_messages::{HitMessages, RetrievalTerms, SessionHitMessages};
-pub(crate) use in_memory::{CopiesToRead, ReadFailure, SessionsWithoutTexts, TextsRead};
+pub(crate) use in_memory::{
+    BatchReply, CopiesToRead, ReadFailure, SessionsWithoutTexts, TextsRead,
+};
 pub use in_memory::{SearchTextsInMemory, SessionSearchTexts};
 use raw::RawQuery;
 
