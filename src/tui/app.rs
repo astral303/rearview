@@ -950,17 +950,17 @@ impl App {
 
     /// The search bar's text after the result count while the list's search
     /// reads some sessions without their texts
-    /// ([`describe_sessions_without_texts`]). Semantic results on screen
+    /// ([`describe_search_reads`]). Semantic results on screen
     /// count the sessions their search read without semantic turns, in place
     /// of the list's counts.
-    pub fn sessions_without_texts_text(&self) -> String {
+    pub fn search_reads_label(&self) -> String {
         let mut counts = self.texts_held.sessions_without_texts;
         if let Some(semantic) = self.semantic_search.without_turns
             && self.list_search_mode == ListSearchMode::Semantic
         {
             counts = semantic;
         }
-        describe_sessions_without_texts(counts)
+        describe_search_reads(counts)
     }
 
     #[cfg(test)]
@@ -1320,7 +1320,7 @@ impl App {
 /// ` · 37 sessions loading` while their first read runs, then
 /// ` · 1 session unreadable` while a read has failed; empty when neither
 /// count is above zero.
-fn describe_sessions_without_texts(counts: SessionsWithoutTexts) -> String {
+fn describe_search_reads(counts: SessionsWithoutTexts) -> String {
     [
         (counts.loading, "loading"),
         (counts.unreadable, "unreadable"),

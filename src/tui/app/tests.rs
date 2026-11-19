@@ -2397,9 +2397,9 @@ fn single_file_mode_has_no_project_exclusions() {
 }
 
 #[test]
-fn sessions_without_texts_text_counts_loading_then_unreadable() {
+fn search_reads_label_counts_loading_then_unreadable() {
     let shown = |loading, unreadable| {
-        describe_sessions_without_texts(SessionsWithoutTexts {
+        describe_search_reads(SessionsWithoutTexts {
             loading,
             unreadable,
         })
@@ -2433,7 +2433,7 @@ fn semantic_results_count_sessions_their_search_could_not_read() {
     };
     app.query = "needle".to_string();
     app.dispatch_search();
-    let before_results = app.sessions_without_texts_text();
+    let before_results = app.search_reads_label();
     response_tx
         .send(SemanticSearchMessage::Complete(
             crate::tui::semantic_worker::SemanticSearchResponse {
@@ -2457,7 +2457,7 @@ fn semantic_results_count_sessions_their_search_could_not_read() {
         "before the semantic results, the list's search counts its own"
     );
     assert_eq!(
-        app.sessions_without_texts_text(),
+        app.search_reads_label(),
         " · 2 sessions unreadable",
         "the semantic results show their own counts in place of the list's"
     );
