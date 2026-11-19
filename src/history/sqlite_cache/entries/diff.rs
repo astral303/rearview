@@ -45,12 +45,13 @@ pub(in super::super) fn update_tail(
 /// Makes `rows`, the rows of the session's leading entries, the stored
 /// rows at sequence 0 on: an unchanged row is kept, a changed one updated
 /// in place. The session stores an entry at each of `rows`' sequences.
+/// Returns true when a row changed.
 pub(in super::super) fn replace_leading(
     connection: &Connection,
     session: i64,
     places: &WrittenPlaces,
     rows: &SessionRows,
-) -> Result<()> {
+) -> Result<bool> {
     let stored: Vec<(i64, i64)> = connection
         .prepare_cached(
             "SELECT id, digest FROM entries WHERE session = ?1 AND sequence < ?2 ORDER BY sequence",
@@ -66,6 +67,7 @@ pub(in super::super) fn replace_leading(
     );
     let mut writer = RowWriter::new(connection, session, places)?;
     let ids = RowIds::new(rows);
+    let mut changed = false;
     for (index, (row, &(id, digest))) in rows.entries.iter().zip(&stored).enumerate() {
         if digest == row.digest() {
             continue;
@@ -74,22 +76,24 @@ pub(in super::super) fn replace_leading(
         let search = SearchPlace::of(rows, index);
         writer.update_content(row, id, search)?;
         writer.place_entry(row, &place, search, id)?;
+        changed = true;
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Rewrites stored entries in place: each of `rows`' entries over the
 /// stored entry `stored` gives at its index, its id, its message and its
 /// digest. Each row keeps its place, and its message its thread and its
-/// ordinal.
+/// ordinal. Returns true when a row changed.
 pub(in super::super) fn rewrite_in_place(
     connection: &Connection,
     session: i64,
     places: &WrittenPlaces,
     rows: &SessionRows,
     stored: &[(i64, Option<i64>, i64)],
-) -> Result<()> {
+) -> Result<bool> {
     let mut writer = RowWriter::new(connection, session, places)?;
+    let mut changed = false;
     for (index, (row, &(id, message, digest))) in rows.entries.iter().zip(stored).enumerate() {
         if row.digest() == digest {
             continue;
@@ -100,8 +104,9 @@ pub(in super::super) fn rewrite_in_place(
         {
             writer.rewrite_message(rows, new, message)?;
         }
+        changed = true;
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// The stored rows a write compares with its rows.

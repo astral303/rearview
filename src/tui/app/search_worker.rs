@@ -205,7 +205,7 @@ impl SearchWorkerState {
                 searchable,
             }) => {
                 let copies = self.texts.keep_copies_of(&conversations);
-                if !copies.copies.is_empty() {
+                if !copies.copies().is_empty() {
                     self.send_to_reader(TextsToRead {
                         copies,
                         reply: self.texts_reply.clone(),

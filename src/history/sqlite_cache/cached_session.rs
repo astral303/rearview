@@ -5,6 +5,7 @@
 use super::copy_state::{CopyMiss, CopyRead, RowState};
 use super::files::{self, FileKey, RootKey};
 use super::roots::{Places, SessionRoots, StoredPath};
+use super::session_appends::StoredAppend;
 use super::{CacheBase, ReaderWait, SqliteCache, StoredEntries, entries};
 use crate::error::{AppError, Result};
 use crate::history::TranscriptEntries;
@@ -248,6 +249,22 @@ impl HeldCopy<'_> {
         visit: impl FnMut(super::search_texts::SearchText<'_>) -> std::ops::ControlFlow<()>,
     ) -> Result<()> {
         super::search_texts::visit_texts_within(self.connection, self.session, window, visit)
+    }
+
+    /// The append that wrote this copy over the copy of `generation`; `None`
+    /// when another write wrote it.
+    pub(crate) fn append_on(&self, generation: i64) -> Result<Option<StoredAppend>> {
+        super::session_appends::read(self.connection, self.session, generation)
+    }
+
+    /// Calls `visit` with each of `append`'s search texts, as
+    /// [`super::search_texts::visit_appended_texts`] does.
+    pub(crate) fn visit_appended_search_texts(
+        &self,
+        append: &StoredAppend,
+        visit: impl FnMut(super::search_texts::SearchText<'_>) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
+        super::search_texts::visit_appended_texts(self.connection, self.session, append, visit)
     }
 
     /// Calls `visit` with each search text and semantic turn the copy

@@ -39,6 +39,13 @@ pub(crate) struct ReadOrder {
     pub(super) position: i64,
 }
 
+impl ReadOrder {
+    /// The sequence of the text's entry; 0 for a part outside every entry.
+    pub(crate) fn entry_sequence(self) -> i64 {
+        self.sequence
+    }
+}
+
 /// The caller's side of a scan, one per task.
 pub(crate) trait TextVisitor: Send {
     /// True when the scan is to look up `text`'s row and keep it.
@@ -969,6 +976,22 @@ mod tests {
         }
     }
 
+    /// `copies` to read in one scan of every row, or one session at a time
+    /// without texts held.
+    fn copies_to_read(
+        copies: &[CachedSession],
+        are_every_row: bool,
+    ) -> crate::search::CopiesToRead {
+        if are_every_row {
+            crate::search::CopiesToRead::EveryRow(copies.to_vec())
+        } else {
+            crate::search::CopiesToRead::EachSession {
+                copies: copies.to_vec(),
+                held: HashMap::new(),
+            }
+        }
+    }
+
     #[test]
     fn launch_read_and_read_per_copy_hold_texts_of_session_replaced_since_its_row() {
         let base = tempfile::tempdir().unwrap();
@@ -982,11 +1005,7 @@ mod tests {
         let expected = alone(&copies[1]);
         super::super::tests::replace_copy(&copies[1]);
         for (are_every_row, read) in [(true, "the launch read"), (false, "a read per copy")] {
-            let texts = crate::search::CopiesToRead {
-                copies: copies.clone(),
-                are_every_row,
-            }
-            .read();
+            let texts = copies_to_read(&copies, are_every_row).read();
             assert!(
                 texts.iter().all(|(_, texts)| texts.is_ok()),
                 "{read}: every row holds texts"
@@ -1038,13 +1057,7 @@ mod tests {
     fn every_row_read_in_one_scan_is_laid_out_as_each_session_read_alone_for_every_provider() {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies_with_texts_outside_messages(base.path());
-        let read = |are_every_row| {
-            crate::search::CopiesToRead {
-                copies: copies.clone(),
-                are_every_row,
-            }
-            .read()
-        };
+        let read = |are_every_row| copies_to_read(&copies, are_every_row).read();
         let (in_one_scan, alone) = (read(true), read(false));
         assert_eq!(in_one_scan.len(), alone.len());
         for ((key, scanned), (alone_key, alone)) in in_one_scan.into_iter().zip(alone) {
@@ -1085,11 +1098,8 @@ mod tests {
     /// in reply order.
     fn first_read_batches(copies: &[CachedSession]) -> Vec<Vec<crate::search::TextsRead>> {
         let batches = std::sync::Mutex::new(Vec::new());
-        crate::search::CopiesToRead {
-            copies: copies.to_vec(),
-            are_every_row: true,
-        }
-        .read_in_batches(&|batch| batches.lock().unwrap().push(batch));
+        crate::search::CopiesToRead::EveryRow(copies.to_vec())
+            .read_in_batches(&|batch| batches.lock().unwrap().push(batch));
         batches.into_inner().unwrap()
     }
 

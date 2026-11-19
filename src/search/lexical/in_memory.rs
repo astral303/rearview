@@ -7,7 +7,7 @@ use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
 use crate::history::sqlite_cache::{
     CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScannedCopy, ScannedRow,
-    SearchField, SessionKey, TextVisitor, scan_search_texts_in_waves,
+    SearchField, SessionKey, StoredAppend, TextVisitor, scan_search_texts_in_waves,
 };
 use crate::time_filter::TimeFilter;
 use rayon::prelude::*;
@@ -28,6 +28,13 @@ pub struct SessionSearchTexts {
     texts: Box<[Range<usize>]>,
     /// The length of the dialogue at the start of `joined`.
     dialogue_len: usize,
+    /// The generation of the copy the texts were read from.
+    copy_generation: i64,
+    /// Each text's placement in its field group, by its position in `texts`.
+    placements: Box<[Placement]>,
+    /// The position in `texts` after the last text of each of
+    /// [`LAID_OUT_GROUPS`].
+    group_ends: [usize; LAID_OUT_GROUPS.len()],
 }
 
 impl SessionSearchTexts {
@@ -37,8 +44,111 @@ impl SessionSearchTexts {
     /// rows next change and name that copy.
     pub(crate) fn read(cached: &CachedSession) -> CopyRead<Self> {
         let copy = cached.clone().waiting();
-        let read = copy.read_copy(texts_in_read_order)?;
-        Ok(laid_out(vec![read]))
+        let (generation, read) = copy.read_copy(generation_and_texts)?;
+        Ok(laid_out(generation, vec![read]))
+    }
+
+    /// [`Self::read`] of `cached`, given `held`, the texts of an earlier
+    /// read. Returns `held` when the cache holds its copy. When an append
+    /// wrote the cached copy over that copy, reads the append's texts and
+    /// merges them into `held`; otherwise reads the copy whole.
+    pub(crate) fn read_after(cached: &CachedSession, held: &Arc<Self>) -> CopyRead<Arc<Self>> {
+        let copy = cached.clone().waiting();
+        let read = copy.read_copy(|copy| {
+            let generation = copy.generation();
+            if generation == held.copy_generation {
+                return Ok(CopyTexts::Held);
+            }
+            Ok(match copy.append_on(held.copy_generation)? {
+                Some(append) => CopyTexts::Appended {
+                    generation,
+                    append,
+                    texts: appended_texts(copy, &append)?,
+                },
+                None => CopyTexts::Whole {
+                    generation,
+                    texts: texts_in_read_order(copy)?,
+                },
+            })
+        })?;
+        Ok(match read {
+            CopyTexts::Held => Arc::clone(held),
+            CopyTexts::Appended {
+                generation,
+                append,
+                texts,
+            } => Arc::new(held.with_append(generation, &append, texts)),
+            CopyTexts::Whole { generation, texts } => Arc::new(laid_out(generation, vec![texts])),
+        })
+    }
+
+    /// Merges `added` into these texts: `append` wrote `added` in the copy
+    /// `generation` and kept the rest. Each field group lays out the kept
+    /// texts outside every message, the added ones, the kept texts of
+    /// messages, then the added ones. Every write rewrites the sub-agent
+    /// metadata: `added` alone contains it.
+    fn with_append(&self, generation: i64, append: &StoredAppend, added: TextsInReadOrder) -> Self {
+        let mut added_in_order = added
+            .texts
+            .iter()
+            .map(|(key, range)| (*key, &added.text[range.clone()]))
+            .collect::<Vec<_>>();
+        added_in_order.sort_by_key(|(key, _)| *key);
+        let mut added_in_order = added_in_order.into_iter().peekable();
+        let mut texts = Vec::with_capacity(self.texts.len() + added.texts.len());
+        let mut group_ends = [0; LAID_OUT_GROUPS.len()];
+        let mut group_start = 0;
+        for (index, group) in LAID_OUT_GROUPS.into_iter().enumerate() {
+            let held = group_start..self.group_ends[index];
+            group_start = held.end;
+            let mut added_to_group = Vec::new();
+            while let Some(((_, placement, _), text)) =
+                added_in_order.next_if(|((added, ..), _)| *added == group)
+            {
+                added_to_group.push((text, placement));
+            }
+            let added_outside =
+                added_to_group.partition_point(|(_, placement)| placement.is_outside_messages());
+            let held_outside = held.start
+                + self.placements[held.clone()]
+                    .partition_point(|placement| placement.is_outside_messages());
+            let kept = |positions: Range<usize>| {
+                positions
+                    .filter(|&position| self.placements[position].is_kept_by(group, append))
+                    .map(|position| {
+                        (
+                            &self.joined[self.texts[position].clone()],
+                            self.placements[position],
+                        )
+                    })
+            };
+            texts.extend(kept(held.start..held_outside));
+            texts.extend(added_to_group.drain(..added_outside));
+            texts.extend(kept(held_outside..held.end));
+            texts.extend(added_to_group);
+            group_ends[index] = texts.len();
+        }
+        Self::of_texts(generation, &texts, group_ends)
+    }
+
+    /// `texts`, in their layout order, each with its placement: the texts of
+    /// the copy `generation`, the last text of each of [`LAID_OUT_GROUPS`]
+    /// before its `group_ends`.
+    fn of_texts(
+        generation: i64,
+        texts: &[(&str, Placement)],
+        group_ends: [usize; LAID_OUT_GROUPS.len()],
+    ) -> Self {
+        let (texts, placements): (Vec<&str>, Vec<Placement>) = texts.iter().copied().unzip();
+        let (joined, ranges) = joined(&texts);
+        Self {
+            joined,
+            dialogue_len: ranges[..group_ends[0]].last().map_or(0, |range| range.end),
+            texts: ranges,
+            copy_generation: generation,
+            placements: placements.into_boxed_slice(),
+            group_ends,
+        }
     }
 
     /// The texts at `positions` in layout order.
@@ -80,6 +190,14 @@ enum FieldGroup {
     SemanticTurns,
 }
 
+/// The field groups of search texts, in layout order.
+const LAID_OUT_GROUPS: [FieldGroup; 4] = [
+    FieldGroup::Dialogue,
+    FieldGroup::SubagentText,
+    FieldGroup::SubagentMetadata,
+    FieldGroup::ThinkingAndToolCalls,
+];
+
 impl FieldGroup {
     fn of(field: SearchField) -> Self {
         match field {
@@ -92,19 +210,40 @@ impl FieldGroup {
     }
 }
 
-/// A text's place among its field group's texts: the text outside every
-/// message, then each message's texts.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// A text's place among its field group's texts: the texts outside every
+/// message by their entry's sequence, then each message's texts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Placement {
-    OutsideMessages,
+    OutsideMessages { entry: i64 },
     Message(usize),
 }
 
 impl Placement {
-    fn of(ordinal: Option<usize>) -> Self {
+    fn of(ordinal: Option<usize>, order: ReadOrder) -> Self {
         match ordinal {
-            None => Self::OutsideMessages,
+            None => Self::OutsideMessages {
+                entry: order.entry_sequence(),
+            },
             Some(ordinal) => Self::Message(ordinal),
+        }
+    }
+
+    fn is_outside_messages(self) -> bool {
+        matches!(self, Self::OutsideMessages { .. })
+    }
+
+    /// True when `append` kept the text of `group` at this placement. Every
+    /// write rewrites the sub-agent metadata.
+    fn is_kept_by(self, group: FieldGroup, append: &StoredAppend) -> bool {
+        if group == FieldGroup::SubagentMetadata {
+            return false;
+        }
+        match (self, append.first_message) {
+            (Self::OutsideMessages { entry }, _) => entry < append.first_entry,
+            (Self::Message(_), None) => true,
+            (Self::Message(ordinal), Some(first)) => {
+                i64::try_from(ordinal).is_ok_and(|ordinal| ordinal < first)
+            }
         }
     }
 }
@@ -116,13 +255,47 @@ type LayoutKey = (FieldGroup, Placement, ReadOrder);
 /// The layout key of a text of `field` in the message `ordinal`, at `order`
 /// in its session.
 fn layout_key(field: SearchField, ordinal: Option<usize>, order: ReadOrder) -> LayoutKey {
-    (FieldGroup::of(field), Placement::of(ordinal), order)
+    (FieldGroup::of(field), Placement::of(ordinal, order), order)
+}
+
+/// A copy's texts as a read after an earlier read finds them.
+enum CopyTexts {
+    /// The held texts are the copy's.
+    Held,
+    /// An append wrote the copy of `generation` over the held texts' copy;
+    /// `texts` are the append's.
+    Appended {
+        generation: i64,
+        append: StoredAppend,
+        texts: TextsInReadOrder,
+    },
+    /// Every text of the copy of `generation`.
+    Whole {
+        generation: i64,
+        texts: TextsInReadOrder,
+    },
 }
 
 /// The search texts of `held`, in the order its read returns them.
 fn texts_in_read_order(held: &HeldCopy<'_>) -> Result<TextsInReadOrder> {
     let mut read = TextsInReadOrder::default();
     held.visit_search_texts(&TimeFilter::default(), |text| {
+        read.push(layout_key(text.field, text.ordinal, text.order), text.text);
+        ControlFlow::Continue(())
+    })?;
+    Ok(read)
+}
+
+/// [`texts_in_read_order`], with the generation of `held`'s copy.
+fn generation_and_texts(held: &HeldCopy<'_>) -> Result<(i64, TextsInReadOrder)> {
+    Ok((held.generation(), texts_in_read_order(held)?))
+}
+
+/// Reads `append`'s search texts in `held`'s copy, in the order its read
+/// returns them.
+fn appended_texts(held: &HeldCopy<'_>, append: &StoredAppend) -> Result<TextsInReadOrder> {
+    let mut read = TextsInReadOrder::default();
+    held.visit_appended_search_texts(append, |text| {
         read.push(layout_key(text.field, text.ordinal, text.order), text.text);
         ControlFlow::Continue(())
     })?;
@@ -145,9 +318,10 @@ impl TextsInReadOrder {
     }
 }
 
-/// The texts of `pieces`, all of one session, in layout order. Texts of
-/// equal keys keep their order in `pieces`. Sorts and copies across threads.
-fn laid_out(pieces: Vec<TextsInReadOrder>) -> SessionSearchTexts {
+/// The texts of `pieces`, all of one session's copy of `generation`, in
+/// layout order. Texts of equal keys keep their order in `pieces`. Sorts and
+/// copies across threads.
+fn laid_out(generation: i64, pieces: Vec<TextsInReadOrder>) -> SessionSearchTexts {
     let mut ordered = pieces
         .iter()
         .flat_map(|piece| {
@@ -158,14 +332,18 @@ fn laid_out(pieces: Vec<TextsInReadOrder>) -> SessionSearchTexts {
         })
         .collect::<Vec<_>>();
     ordered.par_sort_by_key(|(key, _)| *key);
-    let dialogue_texts = ordered.partition_point(|((group, ..), _)| *group == FieldGroup::Dialogue);
-    let texts_in_order = ordered.iter().map(|(_, text)| *text).collect::<Vec<_>>();
-    joined(&texts_in_order, dialogue_texts)
+    let group_ends = LAID_OUT_GROUPS
+        .map(|group| ordered.partition_point(|((text_group, ..), _)| *text_group <= group));
+    let texts = ordered
+        .iter()
+        .map(|((_, placement, _), text)| (*text, *placement))
+        .collect::<Vec<_>>();
+    SessionSearchTexts::of_texts(generation, &texts, group_ends)
 }
 
 /// `texts`, in their order, each after a separator once the joined text
-/// holds a byte. The first `dialogue_texts` of them are the dialogue.
-fn joined(texts: &[&str], dialogue_texts: usize) -> SessionSearchTexts {
+/// contains a byte, and each text's range in the joined text.
+fn joined(texts: &[&str]) -> (Arc<str>, Box<[Range<usize>]>) {
     let mut end = 0;
     let ranges = texts
         .iter()
@@ -179,11 +357,7 @@ fn joined(texts: &[&str], dialogue_texts: usize) -> SessionSearchTexts {
             start..end
         })
         .collect::<Box<[_]>>();
-    SessionSearchTexts {
-        joined: joined_once(texts, &ranges),
-        dialogue_len: ranges[..dialogue_texts].last().map_or(0, |range| range.end),
-        texts: ranges,
-    }
+    (joined_once(texts, &ranges), ranges)
 }
 
 /// Bytes of texts a thread copies at once.
@@ -233,20 +407,31 @@ fn joined_once(texts: &[&str], ranges: &[Range<usize>]) -> Arc<str> {
     unsafe { Arc::from_raw(Arc::into_raw(joined) as *const str) }
 }
 
-/// The texts of each of `copies` as the cache holds it, by its key, each
-/// handed to `reply` as its read ends. Each session is read on its own,
-/// through the cache's indexes on the session.
-fn read_copies(copies: &[CachedSession], reply: BatchReply<'_>) {
-    copies
-        .par_iter()
-        .for_each(|cached| reply(vec![(cached.copy_key(), read_texts(cached))]));
+/// Reads the texts of each of `copies` as the cache holds it, and hands them
+/// to `reply` with the copy's key as its read ends. Reads each session on
+/// its own, through the cache's indexes on the session. With texts in
+/// `held`, reads only an append's texts on them.
+fn read_copies(
+    copies: &[CachedSession],
+    held: &HashMap<SessionKey, Arc<SessionSearchTexts>>,
+    reply: BatchReply<'_>,
+) {
+    copies.par_iter().for_each(|cached| {
+        let key = cached.copy_key();
+        let read = read_texts(cached, held.get(&key.session));
+        reply(vec![(key, read)]);
+    });
 }
 
-/// [`SessionSearchTexts::read`] of `cached`, or the cause of its miss.
-fn read_texts(cached: &CachedSession) -> TextsReadResult {
-    SessionSearchTexts::read(cached)
-        .map(Arc::new)
-        .map_err(ReadFailure::of_miss)
+/// [`SessionSearchTexts::read`] of `cached`, or
+/// [`SessionSearchTexts::read_after`] the texts `held`, or the cause of its
+/// miss.
+fn read_texts(cached: &CachedSession, held: Option<&Arc<SessionSearchTexts>>) -> TextsReadResult {
+    let read = match held {
+        Some(held) => SessionSearchTexts::read_after(cached, held),
+        None => SessionSearchTexts::read(cached).map(Arc::new),
+    };
+    read.map_err(ReadFailure::of_miss)
 }
 
 /// The most waves the first read of every row's texts is scanned in. The
@@ -267,7 +452,7 @@ fn read_every_row_copy(copies: &[CachedSession], reply: BatchReply<'_>) {
             &references,
             FIRST_READ_WAVES,
             TextCollector::default,
-            |_, held| texts_in_read_order(held),
+            |_, held| generation_and_texts(held),
             |wave| {
                 for collector in wave.reads {
                     for (copy, texts) in collector.by_copy {
@@ -309,19 +494,22 @@ fn laid_out_copies(
 ) -> Vec<TextsRead> {
     done.into_par_iter()
         .map(|(copy, scanned, pieces)| {
+            let cached = &copies[copy];
             let texts = match scanned {
-                Ok(ScannedCopy::Scanned(())) => Ok(Arc::new(laid_out(pieces))),
-                Ok(ScannedCopy::ReadAlone(read)) => Ok(Arc::new(laid_out(vec![read]))),
+                Ok(ScannedCopy::Scanned(())) => Ok(Arc::new(laid_out(cached.generation(), pieces))),
+                Ok(ScannedCopy::ReadAlone((generation, read))) => {
+                    Ok(Arc::new(laid_out(generation, vec![read])))
+                }
                 Err(miss) => Err(ReadFailure::of_miss(miss)),
             };
-            (copies[copy].copy_key(), texts)
+            (cached.copy_key(), texts)
         })
         .collect()
 }
 
 /// A scan's result for one copy: its texts in the scan's pieces, its texts
-/// read alone, or the cause of its miss.
-type ScannedCopyTexts = CopyRead<ScannedCopy<(), TextsInReadOrder>>;
+/// read alone with their copy's generation, or the cause of its miss.
+type ScannedCopyTexts = CopyRead<ScannedCopy<(), (i64, TextsInReadOrder)>>;
 
 /// Receives the reads of each batch of copies as the batch's read ends.
 pub(crate) type BatchReply<'a> = &'a (dyn Fn(Vec<TextsRead>) + Sync);
@@ -374,30 +562,40 @@ impl std::fmt::Display for ReadFailure {
     }
 }
 
-/// The copies of the list's rows whose texts are to be read.
-pub(crate) struct CopiesToRead {
-    pub(crate) copies: Vec<CachedSession>,
-    /// True when no row's texts were held or being read: at launch, or once
-    /// every row's copy changed.
-    pub(crate) are_every_row: bool,
+/// The copies of the list's rows whose texts are to be read, and how.
+pub(crate) enum CopiesToRead {
+    /// Every row's copy, none with held texts an appended reread starts
+    /// from: at launch. One scan of the cache reads them, in waves.
+    EveryRow(Vec<CachedSession>),
+    /// The changed rows' copies, each session read on its own.
+    EachSession {
+        copies: Vec<CachedSession>,
+        /// The texts of earlier copies of the sessions, by session: an
+        /// appended reread merges an append's texts into them.
+        held: HashMap<SessionKey, Arc<SessionSearchTexts>>,
+    },
 }
 
 impl CopiesToRead {
+    pub(crate) fn copies(&self) -> &[CachedSession] {
+        match self {
+            Self::EveryRow(copies) | Self::EachSession { copies, .. } => copies,
+        }
+    }
+
     /// The texts of each copy, handed to `reply` a batch at a time as each
-    /// batch's read ends: in one scan, in waves, when the copies are every
-    /// row's, else one session at a time.
+    /// batch's read ends.
     pub(crate) fn read_in_batches(&self, reply: BatchReply<'_>) {
-        if self.are_every_row {
-            read_every_row_copy(&self.copies, reply);
-        } else {
-            read_copies(&self.copies, reply);
+        match self {
+            Self::EveryRow(copies) => read_every_row_copy(copies, reply),
+            Self::EachSession { copies, held } => read_copies(copies, held, reply),
         }
     }
 
     /// The texts of each copy, in the copies' order, once every batch's read
     /// ends.
     pub(crate) fn read(&self) -> Vec<TextsRead> {
-        let reads = std::sync::Mutex::new(HashMap::with_capacity(self.copies.len()));
+        let reads = std::sync::Mutex::new(HashMap::with_capacity(self.copies().len()));
         self.read_in_batches(&|batch| {
             reads
                 .lock()
@@ -407,7 +605,7 @@ impl CopiesToRead {
         let mut reads = reads
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.copies
+        self.copies()
             .iter()
             .map(|cached| {
                 let key = cached.copy_key();
@@ -421,7 +619,7 @@ impl CopiesToRead {
 
     /// A read of each copy that failed with `failure`.
     pub(crate) fn failed(&self, failure: &ReadFailure) -> Vec<TextsRead> {
-        self.copies
+        self.copies()
             .iter()
             .map(|cached| (cached.copy_key(), Err(failure.clone())))
             .collect()
@@ -468,8 +666,9 @@ struct HeldSession {
 
 /// The texts read for one copy of a session.
 struct HeldTexts {
-    /// The generation of the copy the texts were read for.
-    generation: i64,
+    /// The generation of the copy the read was asked for. The texts can be
+    /// of a later copy ([`SessionSearchTexts::copy_generation`]).
+    requested_generation: i64,
     texts: Arc<SessionSearchTexts>,
 }
 
@@ -517,16 +716,12 @@ impl SearchTextsInMemory {
             .filter_map(|conversation| conversation.borrow().cached_session.clone())
             .collect::<Vec<_>>();
         let mut in_memory = Self::default();
-        let every_row = CopiesToRead {
-            copies,
-            are_every_row: true,
-        };
-        for (copy, read) in every_row.read() {
+        for (copy, read) in CopiesToRead::EveryRow(copies).read() {
             let (read, texts) = match read {
                 Ok(texts) => (
                     CopyReadState::Held,
                     Some(HeldTexts {
-                        generation: copy.generation,
+                        requested_generation: copy.generation,
                         texts,
                     }),
                 ),
@@ -591,13 +786,14 @@ impl SearchTextsInMemory {
     /// Keeps the texts of the sessions `conversations` list and drops the
     /// rest. Returns the copies whose texts are neither held nor being read,
     /// now marked as being read: copies new to their rows, and copies whose
-    /// read missed.
+    /// read missed; with the texts held of their sessions.
     pub(crate) fn keep_copies_of<C: Borrow<Conversation>>(
         &mut self,
         conversations: &[C],
     ) -> CopiesToRead {
         let mut kept = HashMap::with_capacity(conversations.len());
         let mut copies = Vec::new();
+        let mut held_texts = HashMap::new();
         for conversation in conversations {
             let Some(cached) = &conversation.borrow().cached_session else {
                 continue;
@@ -615,20 +811,28 @@ impl SearchTextsInMemory {
                 }
                 held => {
                     copies.push(cached.clone());
+                    let texts = held.and_then(|held| held.texts);
+                    if let Some(texts) = &texts {
+                        held_texts.insert(session.clone(), Arc::clone(&texts.texts));
+                    }
                     HeldSession {
                         generation,
                         read: CopyReadState::Reading,
-                        texts: held.and_then(|held| held.texts),
+                        texts,
                     }
                 }
             };
             kept.insert(session, held);
         }
-        let are_every_row = copies.len() == kept.len();
+        let are_every_row = copies.len() == kept.len() && held_texts.is_empty();
         self.by_session = kept;
-        CopiesToRead {
-            copies,
-            are_every_row,
+        if are_every_row {
+            CopiesToRead::EveryRow(copies)
+        } else {
+            CopiesToRead::EachSession {
+                copies,
+                held: held_texts,
+            }
         }
     }
 
@@ -649,12 +853,12 @@ impl SearchTextsInMemory {
                 if held
                     .texts
                     .as_ref()
-                    .is_some_and(|held| held.generation > copy.generation)
+                    .is_some_and(|held| held.requested_generation > copy.generation)
                 {
                     return;
                 }
                 held.texts = Some(HeldTexts {
-                    generation: copy.generation,
+                    requested_generation: copy.generation,
                     texts,
                 });
                 if is_row_copy {
@@ -684,6 +888,19 @@ mod tests {
         joined
     }
 
+    /// `texts`, the first `dialogue_texts` of them the dialogue, the rest
+    /// sub-agents' text, each its own message's.
+    fn session_of(texts: &[&str], dialogue_texts: usize) -> SessionSearchTexts {
+        let placed = texts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, text)| (*text, Placement::Message(ordinal)))
+            .collect::<Vec<_>>();
+        let mut group_ends = [texts.len(); LAID_OUT_GROUPS.len()];
+        group_ends[0] = dialogue_texts;
+        SessionSearchTexts::of_texts(1, &placed, group_ends)
+    }
+
     #[test]
     fn joined_texts_equal_texts_pushed_one_by_one_across_copy_tasks() {
         let long = "é".repeat(BYTES_PER_COPY_TASK / 3);
@@ -702,7 +919,7 @@ mod tests {
             ],
             vec![longer.as_str(), longer.as_str()],
         ] {
-            let joined = joined(&texts, texts.len());
+            let joined = session_of(&texts, texts.len());
             assert_eq!(
                 &*joined.joined,
                 pushed_one_by_one(&texts),
@@ -722,7 +939,7 @@ mod tests {
         let texts = ["asked", "", "answered", "tool call", "thinking"];
         for dialogue_texts in 0..=texts.len() {
             assert_eq!(
-                joined(&texts, dialogue_texts).dialogue(),
+                session_of(&texts, dialogue_texts).dialogue(),
                 pushed_one_by_one(&texts[..dialogue_texts]),
                 "the dialogue is the first {dialogue_texts} texts, joined"
             );

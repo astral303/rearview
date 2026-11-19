@@ -34,6 +34,7 @@ mod scope;
 mod search_parts;
 mod search_texts;
 mod semantic_scan;
+mod session_appends;
 mod text_scan;
 mod window;
 mod write_error;
@@ -73,6 +74,7 @@ pub use scope::{Cancellation, OperationScope, Patience, StaleCause};
 pub(crate) use scope::{LiveOwner, OperationAccess, read_copy_when_unlocked, read_when_unlocked};
 pub(crate) use search_parts::{SearchField, SearchPart, SemanticTurns};
 pub(crate) use semantic_scan::{ScannedTurns, scan_semantic_turns};
+pub(crate) use session_appends::StoredAppend;
 pub(crate) use text_scan::{
     ReadOrder, ScanScope, ScannedRow, TextVisitor, scan_search_texts, scan_search_texts_in_waves,
 };
@@ -808,6 +810,12 @@ impl CacheWriter {
                 return Err(AppError::SessionCacheSuperseded(update.session));
             }
             let session = update.session;
+            let append = session_appends::AppendRecord::begin(
+                batch,
+                session,
+                update.generation,
+                update.checkpoint.sequence as i64,
+            )?;
             let generation =
                 write_catalogue_rows(batch, session, record, keys, record.catalogue.message_count)?;
             for (path, launch_call) in &update.launch_calls {
@@ -820,10 +828,14 @@ impl CacheWriter {
                     )?
                     .execute(params![session, place.root, place.path, launch_call])?;
             }
-            entries::replace_leading(batch, session, places, &leading)?;
+            let leading_changed = entries::replace_leading(batch, session, places, &leading)?;
             entries::update_tail(batch, session, places, &tail)?;
-            entries::rewrite_in_place(batch, session, places, &in_place, &stored_in_place)?;
+            let in_place_changed =
+                entries::rewrite_in_place(batch, session, places, &in_place, &stored_in_place)?;
             write_malformed_lines(batch, session, entries)?;
+            if !leading_changed && !in_place_changed {
+                append.record(batch, tail.least_ordinal())?;
+            }
             Ok(generation)
         })
     }
@@ -1108,8 +1120,9 @@ fn write_transcript_reads(
 
 /// Updates the stored session row `session` to `record`'s, with
 /// `message_count`, and writes its files, their reads, its checkpoint, its
-/// parse errors and its sub-agent metadata parts. Returns the generation it
-/// gave the row.
+/// parse errors and its sub-agent metadata parts. Removes the record of the
+/// row's last write as an append: a resumed write records its own after.
+/// Returns the generation it gave the row.
 fn write_catalogue_rows(
     connection: &Connection,
     session: i64,
@@ -1118,6 +1131,7 @@ fn write_catalogue_rows(
     message_count: Option<i64>,
 ) -> Result<i64> {
     let row = &record.catalogue;
+    session_appends::clear(connection, session)?;
     let generation = next_generation(connection)?;
     let values = row.values(row.status.as_str(), message_count, None, generation);
     let mut statement = connection.prepare_cached(&catalogue::update_sql())?;

@@ -186,6 +186,14 @@ impl<'a> SessionRows<'a> {
         self.first_sequence + index
     }
 
+    /// The least ordinal among the rows' messages.
+    pub(in super::super) fn least_ordinal(&self) -> Option<i64> {
+        self.messages
+            .iter()
+            .filter_map(|message| message.ordinal)
+            .min()
+    }
+
     /// The number of messages that take a printed number.
     pub(in super::super) fn message_count(&self) -> i64 {
         self.messages
