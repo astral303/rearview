@@ -173,6 +173,9 @@ pub struct App {
     list_changes: std::collections::VecDeque<super::list_change::ListChange>,
     /// The sessions whose confirmed delete is queued or running
     deleting: list_state::DeletingSessions,
+    /// When the user chose to leave while confirmed renames or deletes had
+    /// yet to run; the bar then shows that leaving waits for them
+    exit_held_since: Option<Moment>,
     /// The load filters that narrowed this list, named for the user: the
     /// ones it launched with, then the terms the last load or refresh
     /// reported
@@ -286,8 +289,10 @@ const SPINNER_FRAME: Duration = Duration::from_millis(80);
 const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// In the list's bottom bar while a session opens.
 const OPENING_LABEL: &str = "Opening…";
-/// In the list's bottom bar while one session's delete is queued or runs.
-const DELETING_LABEL: &str = "Deleting…";
+/// In the bottom bar while leaving waits for renames alone.
+const RENAMING_ACTIVITY: &str = "Renaming";
+/// After the bottom bar's activity while leaving waits for it.
+const LEAVE_NOW_HINT: &str = "Esc leaves now";
 /// Beside the spinner while a search runs.
 const SEARCHING_LABEL: &str = "searching";
 /// In the viewer's mode cell while the rows shown are rendered again.
@@ -304,6 +309,15 @@ const REFRESHING_LABEL: &str = "refreshing";
 /// on, the whole seconds it has run (`⠋ searching 1s`).
 fn spinner_status(label: &str, elapsed: Duration) -> Option<String> {
     spinner_status_counting(label, elapsed, elapsed)
+}
+
+/// The bottom bar's activity while `count` sessions are being deleted:
+/// `Deleting` for one, `Deleting 3 sessions` for several.
+fn deleting_activity(count: usize) -> String {
+    match count {
+        1 => "Deleting".to_owned(),
+        count => format!("Deleting {count} sessions"),
+    }
 }
 
 /// [`spinner_status`] for work running for `elapsed`, showing the whole
@@ -396,6 +410,7 @@ impl App {
             deferred_copy: None,
             list_changes: std::collections::VecDeque::new(),
             deleting: list_state::DeletingSessions::default(),
+            exit_held_since: None,
             active_filters: Vec::new(),
             launch_filter_count: 0,
             missing_earlier_turns,
@@ -1087,11 +1102,24 @@ impl App {
     /// delete was last confirmed with none in progress. `None` while none is.
     pub fn deleting_status_text(&self) -> Option<String> {
         let (count, since) = self.deleting.in_progress()?;
-        let label = match count {
-            1 => DELETING_LABEL.to_owned(),
-            count => format!("Deleting {count} sessions…"),
-        };
+        let label = format!("{}…", deleting_activity(count));
         Some(spinner_status(&label, self.clock().elapsed_since(since)).unwrap_or(label))
+    }
+
+    /// The bottom bar while leaving waits for confirmed changes:
+    /// `Deleting 3 sessions before leaving… · Esc leaves now`, with the
+    /// count, spinner and seconds of [`Self::deleting_status_text`], then
+    /// `Renaming before leaving…` once only renames are left, its seconds
+    /// counted from the user's quit. `None` until an exit is held.
+    pub fn held_exit_status_text(&self) -> Option<String> {
+        let held_since = self.exit_held_since?;
+        let (activity, since) = match self.deleting.in_progress() {
+            Some((count, since)) => (deleting_activity(count), since),
+            None => (RENAMING_ACTIVITY.to_owned(), held_since),
+        };
+        let label = format!("{activity} before leaving…");
+        let status = spinner_status(&label, self.clock().elapsed_since(since)).unwrap_or(label);
+        Some(format!("{status} · {LEAVE_NOW_HINT}"))
     }
 
     /// Take the pending open one step, waiting up to `wait` for its read or
@@ -1351,4 +1379,4 @@ mod viewer_tail_tests;
 mod shown_name_tests;
 
 #[cfg(test)]
-mod delete_tests;
+pub(crate) mod delete_tests;

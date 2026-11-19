@@ -3,7 +3,7 @@
 //! come back to the runtime through the supervisor.
 
 use super::app::RefreshFailure;
-use super::list_change::{ListChange, ListChangeOutcome};
+use super::list_change::{ChangeKind, ListChange, ListChangeOutcome};
 use crate::error::{AppError, Result};
 use crate::history::load_meter::LoadMeter;
 use crate::history::provider::{DirectFileRead, open_direct_file};
@@ -210,6 +210,12 @@ impl TaskSupervisor {
         };
         self.refresh = None;
         Some(outcome)
+    }
+
+    /// The kind of the rename or delete the worker runs; `None` while it
+    /// doesn't run one.
+    pub(crate) fn running_change(&self) -> Option<ChangeKind> {
+        self.change.as_ref().map(|(_, stopped)| stopped.kind())
     }
 
     /// The running rename or delete's outcome once it has one: a job that

@@ -4,7 +4,7 @@ use super::{Action, App, AppMode, DialogMode};
 use crate::error::Result;
 use crate::history::DisplayEntries;
 use crate::history::provider::{RenamedTitle, TitleAndSummary};
-use crate::tui::list_change::ListChange;
+use crate::tui::list_change::{ListChange, rename_failure};
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::path::{Path, PathBuf};
 
@@ -250,7 +250,7 @@ impl App {
                     self.show_renamed_session(idx, title, &renamed);
                 }
             }
-            Err(e) => self.set_status(format!("Failed to rename: {}", e)),
+            Err(error) => self.set_status(rename_failure(&error)),
         }
     }
 

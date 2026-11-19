@@ -1,9 +1,10 @@
-use super::{App, AppMode, DialogMode};
+use super::{Action, App, AppMode, DialogMode};
 use crate::clock::Moment;
 use crate::error::AppError;
 use crate::history::provider::Deleted;
 use crate::history::{Conversation, ExcludedProjects, Workspace};
-use crate::tui::list_change::{DeleteStages, ListChange, ListChangeOutcome};
+use crate::search::preview::sanitize_preview;
+use crate::tui::list_change::{ChangeKind, DeleteStages, ListChange, ListChangeOutcome};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,6 +13,10 @@ const LIST_PAGE_ROWS: isize = 10;
 
 /// A delete at least this long records its stages in the debug log.
 const SLOW_DELETE_THRESHOLD: Duration = Duration::from_secs(1);
+
+/// The status when the user resumes, forks or selects a session being
+/// deleted: the TUI stays.
+const SESSION_BEING_DELETED: &str = "Session is being deleted";
 
 /// The session the list's selection stays on while the rows change.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,6 +291,20 @@ impl App {
         self.conversations.iter().find(|row| row.path == path)
     }
 
+    /// The listed session's custom title, else its summary, else its
+    /// preview; empty when the session at `path` is not listed.
+    pub fn listed_title(&self, path: &Path) -> String {
+        let Some(row) = self.listed_row(path) else {
+            return String::new();
+        };
+        [&row.custom_title, &row.summary]
+            .into_iter()
+            .flatten()
+            .find(|title| !title.is_empty())
+            .cloned()
+            .unwrap_or_else(|| sanitize_preview(&row.preview))
+    }
+
     pub(crate) fn has_multiple_sources(&self) -> bool {
         let sources = self
             .conversations
@@ -311,6 +330,7 @@ impl App {
         self.list_changes.push_back(ListChange::Delete {
             source,
             path: path.to_path_buf(),
+            title: self.listed_title(path),
             confirmed_at: now,
         });
         self.deleting.add(path.to_path_buf(), now);
@@ -336,6 +356,39 @@ impl App {
         self.list_changes.pop_front()
     }
 
+    /// The kind of each confirmed rename or delete the worker has yet to
+    /// receive, oldest first.
+    pub(crate) fn queued_list_changes(&self) -> impl Iterator<Item = ChangeKind> + '_ {
+        self.list_changes.iter().map(ListChange::kind)
+    }
+
+    /// True when `action` resumes, forks or selects a session being deleted.
+    pub(crate) fn acts_on_session_being_deleted(&self, action: &Action) -> bool {
+        match action {
+            Action::Select(session) | Action::Resume(session) | Action::ForkResume(session) => {
+                self.is_deleting(session)
+            }
+            Action::Delete(_) | Action::Refresh | Action::Quit => false,
+        }
+    }
+
+    /// Report in the bar that the TUI stays: the session to leave with is
+    /// being deleted.
+    pub(crate) fn report_session_being_deleted(&mut self) {
+        self.set_status(SESSION_BEING_DELETED.to_owned());
+    }
+
+    /// Show that leaving waits for the confirmed renames and deletes (see
+    /// [`Self::held_exit_status_text`]). Outside single-file mode the list
+    /// replaces a viewer, so the list's bar and the greyed rows show.
+    pub(crate) fn hold_exit(&mut self) {
+        let now = self.clock().now();
+        self.exit_held_since.get_or_insert(now);
+        if !self.single_file_mode && matches!(self.app_mode, AppMode::View(_)) {
+            self.exit_view_mode();
+        }
+    }
+
     /// Show the result of a rename or delete.
     pub(crate) fn finish_list_change(&mut self, outcome: ListChangeOutcome) {
         match outcome {
@@ -348,6 +401,7 @@ impl App {
                 path,
                 result,
                 stages,
+                ..
             } => {
                 let update_started_at = self.clock().now();
                 self.finish_delete(&path, result);

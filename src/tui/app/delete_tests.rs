@@ -366,26 +366,33 @@ fn codex_thread(number: usize) -> String {
     format!("019f0000-0000-7000-8000-0000000000{number:02}")
 }
 
-/// An app listing Codex sessions `0` to `5` written under `home`, loaded
-/// through the test's own session cache. A delete removes files only inside
-/// `home`, the tree that holds the transcripts.
-fn app_listing_six_codex_sessions(home: &std::path::Path) -> (App, Vec<PathBuf>) {
+/// Codex sessions `0` to `count - 1` written under `home`: Codex's storage
+/// pinned to `home`, and each session's transcript.
+pub(crate) fn codex_sessions_under(
+    home: &std::path::Path,
+    count: usize,
+) -> (
+    &'static dyn crate::history::provider::SessionStorage,
+    Vec<PathBuf>,
+) {
     use crate::history::provider::contract_tests::{kept_storage_under, registered_fixtures};
     let fixture = registered_fixtures()
         .into_iter()
         .find(|fixture| fixture.storage().source() == crate::history::Source::Codex)
         .expect("Codex has a fixture");
-    let transcripts = (0..6)
+    let transcripts = (0..count)
         .map(|number| fixture.write_session(home, &codex_thread(number)))
         .collect();
-    let environment = crate::history::environment::test_support::test_environment(
-        vec![kept_storage_under(fixture, home)],
-        None,
-    );
-    let rows = crate::history::environment::test_support::load_rows_in(
-        &environment,
-        kept_storage_under(fixture, home),
-    );
+    (kept_storage_under(fixture, home), transcripts)
+}
+
+/// An app listing six Codex sessions written under `home` (see
+/// [`codex_sessions_under`]), loaded through the test's own session cache.
+fn app_listing_six_codex_sessions(home: &std::path::Path) -> (App, Vec<PathBuf>) {
+    let (storage, transcripts) = codex_sessions_under(home, 6);
+    let environment =
+        crate::history::environment::test_support::test_environment(vec![storage], None);
+    let rows = crate::history::environment::test_support::load_rows_in(&environment, storage);
     (
         super::claude_home::app_reading(rows, environment),
         transcripts,
@@ -458,6 +465,7 @@ fn confirm_delete_of_named(app: &mut App, name: &str) {
 fn fail_deleting(app: &mut App, path: &std::path::Path) {
     app.finish_list_change(crate::tui::list_change::ListChangeOutcome::Deleted {
         path: path.to_path_buf(),
+        title: app.listed_title(path),
         result: Err(crate::error::AppError::DeleteRefused("refused".to_owned())),
         stages: crate::tui::list_change::DeleteStages::default(),
     });
@@ -641,6 +649,61 @@ fn bar_shows_deleting_for_single_session_and_count_for_multiple() {
         finish_deleting(&mut app, &path);
     }
     assert_eq!(app.deleting_status_text(), None);
+}
+
+#[test]
+fn bar_shows_leaving_waits_for_deletes_then_for_rename() {
+    let clock = Arc::new(crate::clock::TestClock::default());
+    let mut app = three_sessions_on(&clock);
+    rename_and_close_name_box(&mut app, "a");
+    confirm_delete_of_named(&mut app, "b");
+    confirm_delete_of_named(&mut app, "c");
+
+    app.hold_exit();
+    assert_eq!(
+        app.held_exit_status_text().as_deref(),
+        Some("Deleting 2 sessions before leaving… · Esc leaves now")
+    );
+    clock.advance(std::time::Duration::from_millis(1200));
+    assert_eq!(
+        app.held_exit_status_text().as_deref(),
+        Some("⠴ Deleting 2 sessions before leaving… 1s · Esc leaves now"),
+        "the spinner and seconds count from the first delete"
+    );
+
+    for name in ["b", "c"] {
+        let path = path_of(&app, name);
+        finish_deleting(&mut app, &path);
+    }
+    assert_eq!(
+        app.held_exit_status_text().as_deref(),
+        Some("⠴ Renaming before leaving… 1s · Esc leaves now"),
+        "a rename alone is left; its seconds count from the quit"
+    );
+}
+
+#[test]
+fn failed_delete_reports_title_prompt_showed_after_refresh_removed_its_row() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "b");
+    let b = path_of(&app, "b");
+    let title = app.listed_title(&b);
+    let change = app.begin_list_change().expect("the delete is queued");
+    refresh_finding(
+        &mut app,
+        SessionChanges {
+            removed: vec![b],
+            ..Default::default()
+        },
+    );
+
+    let outcome = make_as_worker(&app, change);
+
+    let report = outcome.failure_report().unwrap_or_default();
+    assert!(
+        !title.is_empty() && report.starts_with(&format!("Failed to delete \"{title}\": ")),
+        "the report names the session by the prompt's title: {report:?}"
+    );
 }
 
 /// Rename session `name` through the actions menu, then close the name box

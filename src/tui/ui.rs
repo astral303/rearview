@@ -169,12 +169,14 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         dim_area(frame, chunks[1]);
     }
 
-    // Render bottom bar: opening label > confirm dialog > status message >
-    // another rearview's work > deletes in progress > hotkeys
+    // Render bottom bar: opening label > confirm dialog > held exit > status
+    // message > another rearview's work > deletes in progress > hotkeys
     if app.is_opening() {
         render_list_status_bar(frame, app, chunks[2]);
     } else if let DialogMode::ConfirmDelete { session } = app.dialog_mode() {
         render_confirm_dialog(frame, app, session, chunks[2]);
+    } else if let Some(status) = app.held_exit_status_text() {
+        render_activity_status(frame, &status, chunks[2]);
     } else if let Some((msg, shown)) = app.status_message()
         && app.clock().elapsed_since(*shown) < STATUS_TTL
     {
@@ -1037,6 +1039,10 @@ fn top_row_day(state: &ViewState, today: NaiveDate, zone: Zone) -> Option<String
 }
 
 fn render_view_status_bar(frame: &mut Frame, app: &App, state: &ViewState, area: Rect) {
+    if let Some(status) = app.held_exit_status_text() {
+        render_activity_status(frame, &status, area);
+        return;
+    }
     if let Some(label) = app.open_session_status().and_then(open_session_label) {
         render_activity_status(frame, label, area);
         return;
@@ -1481,7 +1487,7 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, session: &Path, area: Rec
     const QUESTION_START: &str = "Delete \"";
     const QUESTION_END: &str = "\"? ";
     const ANSWERS: &str = "(y/n)";
-    let title = app.listed_row(session).map(row_title).unwrap_or_default();
+    let title = app.listed_title(session);
     let title_width = usize::from(area.width)
         .saturating_sub(1 + QUESTION_START.width() + QUESTION_END.width() + ANSWERS.width());
     let question = format!(
@@ -1495,17 +1501,6 @@ fn render_confirm_dialog(frame: &mut Frame, app: &App, session: &Path, area: Rec
     ]);
     let paragraph = Paragraph::new(prompt);
     frame.render_widget(paragraph, area);
-}
-
-/// The title the delete prompt names `row`'s session by: its custom title,
-/// else its summary, else its preview.
-fn row_title(row: &Conversation) -> String {
-    [&row.custom_title, &row.summary]
-        .into_iter()
-        .flatten()
-        .find(|title| !title.is_empty())
-        .cloned()
-        .unwrap_or_else(|| sanitize_preview(&row.preview))
 }
 
 /// The `Ctrl+X` menu in the export menu's frame. Each action's key letter is

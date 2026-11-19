@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Result of running the TUI
+#[derive(Clone)]
 pub enum Action {
     Select(PathBuf),
     Delete(PathBuf),

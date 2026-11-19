@@ -343,6 +343,7 @@ fn known_sessions_are_listed_rows_and_skipped_sessions() {
 pub(super) fn finish_deleting(app: &mut App, path: &Path) {
     app.finish_list_change(crate::tui::list_change::ListChangeOutcome::Deleted {
         path: path.to_path_buf(),
+        title: app.listed_title(path),
         result: Ok(crate::history::provider::Deleted::just_the_session()),
         stages: crate::tui::list_change::DeleteStages::default(),
     });

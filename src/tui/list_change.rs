@@ -21,6 +21,8 @@ pub(crate) enum ListChange {
     Delete {
         source: Source,
         path: PathBuf,
+        /// The title the delete prompt showed.
+        title: String,
         /// When the user confirmed the delete with `y`.
         confirmed_at: Moment,
     },
@@ -35,9 +37,55 @@ pub(crate) enum ListChangeOutcome {
     },
     Deleted {
         path: PathBuf,
+        /// The title the delete prompt showed.
+        title: String,
         result: Result<Deleted>,
         stages: DeleteStages,
     },
+}
+
+/// The report of a rename that failed with `error`, in the bar and on stderr.
+pub(crate) fn rename_failure(error: &AppError) -> String {
+    format!("Failed to rename: {error}")
+}
+
+/// A rename or a delete, without its session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChangeKind {
+    Rename,
+    Delete,
+}
+
+impl ListChangeOutcome {
+    pub(crate) fn kind(&self) -> ChangeKind {
+        match self {
+            Self::Renamed { .. } => ChangeKind::Rename,
+            Self::Deleted { .. } => ChangeKind::Delete,
+        }
+    }
+
+    pub(crate) fn succeeded(&self) -> bool {
+        match self {
+            Self::Renamed { result, .. } => result.is_ok(),
+            Self::Deleted { result, .. } => result.is_ok(),
+        }
+    }
+
+    /// The line rearview prints on stderr after leaving the TUI for a rename
+    /// or delete that failed; `None` when it succeeded.
+    pub(crate) fn failure_report(&self) -> Option<String> {
+        match self {
+            Self::Deleted {
+                title,
+                result: Err(error),
+                ..
+            } => Some(format!("Failed to delete \"{title}\": {error}")),
+            Self::Renamed {
+                result: Err(error), ..
+            } => Some(rename_failure(error)),
+            Self::Deleted { result: Ok(_), .. } | Self::Renamed { result: Ok(_), .. } => None,
+        }
+    }
 }
 
 /// The time a delete spent in the queue, then in each stage on the
@@ -58,6 +106,13 @@ pub(crate) struct DeleteStages {
 }
 
 impl ListChange {
+    pub(crate) fn kind(&self) -> ChangeKind {
+        match self {
+            Self::Rename { .. } => ChangeKind::Rename,
+            Self::Delete { .. } => ChangeKind::Delete,
+        }
+    }
+
     /// Make the change as `operation`'s refresh owner. Fails when acquiring
     /// the ownership fails. A delete times its stages on `clock`.
     pub(crate) fn make(self, operation: &OperationScope, clock: &dyn Clock) -> ListChangeOutcome {
@@ -86,12 +141,14 @@ impl ListChange {
             Self::Delete {
                 source,
                 path,
+                title,
                 confirmed_at,
             } => {
                 let (result, stages) =
                     delete_with_stages(operation, clock, source, &path, confirmed_at);
                 ListChangeOutcome::Deleted {
                     path,
+                    title,
                     result,
                     stages,
                 }
@@ -107,8 +164,9 @@ impl ListChange {
                 title: title.clone(),
                 result: Err(AppError::RefreshStopped),
             },
-            Self::Delete { path, .. } => ListChangeOutcome::Deleted {
+            Self::Delete { path, title, .. } => ListChangeOutcome::Deleted {
                 path: path.clone(),
+                title: title.clone(),
                 result: Err(AppError::RefreshStopped),
                 stages: DeleteStages::default(),
             },

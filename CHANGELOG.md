@@ -126,8 +126,12 @@
   `Deleting N sessions…`. Confirming a delete in the viewer now returns to the
   list at once.
 - Fix a confirmed delete or rename not being carried out when another was
-  confirmed while a delete or a refresh ran. Each now runs, in the order
-  confirmed.
+  confirmed while a delete or a refresh ran, or when the user left `rearview`
+  before it started. Each now runs, in the order confirmed.
+  - Leaving `rearview` now waits for them, and the bottom bar shows
+    `Deleting N sessions before leaving… · Esc leaves now`.
+  - `Esc` or `Ctrl+C` during that wait leaves at once and reports on stderr
+    the changes not carried out, such as `Not deleted: 2 sessions`.
 - Fix search missing text the viewer shows in tool calls, thinking and
   sub-agent transcripts. The session list missed all three, and the list and
   `agent search` both missed a tool call's body, such as an edit's diff, a
