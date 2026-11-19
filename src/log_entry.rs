@@ -245,6 +245,9 @@ pub enum Tool {
     /// A sub-agent handing its report back to the agent that launched it.
     AgentReport,
     Wait,
+    /// Questions the agent put to the user. Its canonical input is
+    /// `questions`, a list of `{title, options}`, each option a string.
+    UserQuestion,
     TaskList,
     WebFetch,
     WebSearch,
@@ -310,6 +313,7 @@ impl Tool {
             Tool::ReceivedMessage => (82, "received", "message", "messages"),
             Tool::AgentReport => (85, "handed back", "report", "reports"),
             Tool::Wait => (90, "waited", "time", "times"),
+            Tool::UserQuestion => (95, "asked the user", "time", "times"),
             Tool::TaskList => (100, "updated the task list", "time", "times"),
             Tool::WebFetch => (110, "fetched", "URL", "URLs"),
             Tool::WebSearch => (120, "searched the web", "time", "times"),

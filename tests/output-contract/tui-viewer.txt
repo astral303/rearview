@@ -115,7 +115,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
       You │ Add the release notes
 
-    Codex │ Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, updated the task list 1 time
+    Codex │ Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time
 
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
@@ -562,6 +562,16 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ↓
    Result ┐ Wall time: 12.1 seconds
           │ Sleep interrupted by new input.
+
+    Codex │ request_user_input_async: 2 questions
+          │
+          │ 1. QUESTION_TITLE_SENTINEL: which profile?
+          │   • warm idle
+          │   • QUESTION_OPTION_SENTINEL
+          │
+   ┌──────┘ 2. Keep recording once warm?
+   ↓
+   Result ┐ shown to the user
 
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question

@@ -1180,9 +1180,19 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "function_call_output", "id": "fco_sleep", "call_id": "call_sleep", "output": "Wall time: 12.1 seconds\nSleep interrupted by new input."}),
                     ),
+                    line(
+                        24,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_question", "name": "request_user_input_async", "arguments": "{\"questions\":[{\"title\":\"QUESTION_TITLE_SENTINEL: which profile?\",\"options\":[\"warm idle\",\"QUESTION_OPTION_SENTINEL\"]},{\"title\":\"Keep recording once warm?\"}]}", "call_id": "call_question"}),
+                    ),
+                    line(
+                        25,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_question", "call_id": "call_question", "output": "{\"accepted\":true}"}),
+                    ),
                 ],
             );
-            const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, updated the task list 1 time";
+            const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time";
             const LAUNCH_RUN: &str = "Started 2 agents";
             AgentSession::new(
                 Source::Codex,
@@ -1236,6 +1246,16 @@ pub(super) mod tests {
                     .in_summary_row(PATCH_RUN),
                     Marker::in_call_or_subagent("sleep's duration", "sleep: 45s")
                         .in_summary_row(PATCH_RUN),
+                    Marker::in_call_or_subagent(
+                        "question count",
+                        "request_user_input_async: 2 questions",
+                    )
+                    .in_summary_row(PATCH_RUN),
+                    Marker::shown("question's title", "QUESTION_TITLE_SENTINEL")
+                        .in_summary_row(PATCH_RUN),
+                    Marker::shown("question's option", "QUESTION_OPTION_SENTINEL")
+                        .in_summary_row(PATCH_RUN),
+                    Marker::shown("question shown to the user", "shown to the user"),
                     Marker::shown("message to an agent", "SEND_MESSAGE_SENTINEL")
                         .in_summary_row(PATCH_RUN),
                 ],

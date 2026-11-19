@@ -214,9 +214,12 @@
 
 #### Codex
 
-- Fix a message from another agent and `sleep` showing as the call's name
-  over raw JSON in the viewer and exports, and as
+- Fix a question to the user, a message from another agent and `sleep`
+  showing as the call's name over raw JSON in the viewer and exports, and as
   `tool <name> input_keys=…` in `agent read` and search:
+  - A question now shows `request_user_input_async: 2 questions`, then each
+    question and its options. Its result now shows `shown to the user`, not
+    `{"accepted":true}`.
   - A message from another agent now shows
     `inter_agent_message: new task from /root · text encrypted by Codex`.
     The suffix shows when Codex stored the text encrypted; a readable text

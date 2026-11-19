@@ -189,6 +189,10 @@ pub fn tool_call_header(name: &str, tool: Tool, input: &Value) -> ToolCallHeader
             Some(duration) => ToolCallHeader::named(name_prefix(name), format_duration(duration)),
             None => ToolCallHeader::raw_input(name),
         },
+        Tool::UserQuestion => ToolCallHeader::named(
+            name_prefix(name),
+            question_count(asked_questions(input).map_or(0, |questions| questions.len())),
+        ),
         // `ResultReceipt` reaches no header; the raw input keeps the match
         // exhaustive.
         Tool::TaskList | Tool::ResultReceipt | Tool::Other => ToolCallHeader::raw_input(name),
@@ -243,6 +247,9 @@ pub fn tool_call_body(tool: Tool, input: &Value) -> Option<ToolCallBody<'_>> {
         Tool::AgentReport => plain_field("message"),
         Tool::WebFetch => plain_field("prompt"),
         Tool::Wait if wait_duration(input).is_some() => None,
+        Tool::UserQuestion => {
+            asked_questions(input).map(|questions| ToolBody::plain(questions_text(&questions)))
+        }
         Tool::Wait | Tool::TaskList | Tool::ResultReceipt | Tool::Other => {
             return Some(ToolCallBody::RawInput(input));
         }
@@ -269,7 +276,10 @@ fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
 /// under `input` instead of `file_path`); the name plus the input then shows
 /// more than an empty header.
 fn lacks_header_field(tool: Tool, input: &Value) -> bool {
-    header_field(tool, input).is_some_and(|key| string_field(input, key).is_none())
+    match tool {
+        Tool::UserQuestion => asked_questions(input).is_none(),
+        _ => header_field(tool, input).is_some_and(|key| string_field(input, key).is_none()),
+    }
 }
 
 fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
@@ -287,12 +297,84 @@ fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
         Tool::AgentReport => Some("message"),
         Tool::WebFetch => Some("url"),
         Tool::WebSearch => Some("query"),
+        // Its header reads a list of questions, which `lacks_header_field`
+        // checks.
+        Tool::UserQuestion => None,
         Tool::DirectoryListing
         | Tool::Wait
         | Tool::TaskList
         | Tool::ResultReceipt
         | Tool::Other => None,
     }
+}
+
+/// One question of a [`Tool::UserQuestion`] call: its title and the answers
+/// it offers, if any.
+pub(crate) struct AskedQuestion<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) options: Vec<&'a str>,
+}
+
+/// The questions of a [`Tool::UserQuestion`] call; `None` unless `questions`
+/// is a non-empty list of objects, each with a string `title`.
+pub(crate) fn asked_questions(input: &Value) -> Option<Vec<AskedQuestion<'_>>> {
+    let questions = input.get("questions")?.as_array()?;
+    if questions.is_empty() {
+        return None;
+    }
+    questions
+        .iter()
+        .map(|question| {
+            Some(AskedQuestion {
+                title: string_field(question, "title")?,
+                options: question
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn question_count(count: usize) -> String {
+    match count {
+        1 => "1 question".to_owned(),
+        count => format!("{count} questions"),
+    }
+}
+
+/// Each title, numbered when there are several, then its options as bullets;
+/// a blank line between questions. A numbered title's later lines hang
+/// under its text, not under its number.
+fn questions_text(questions: &[AskedQuestion<'_>]) -> String {
+    let numbered = questions.len() > 1;
+    questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let number = if numbered {
+                format!("{}. ", index + 1)
+            } else {
+                String::new()
+            };
+            let hanging_indent = " ".repeat(number.len());
+            let mut title_lines = question.title.lines();
+            let first_line = title_lines.next().unwrap_or_default();
+            let mut lines = vec![format!("{number}{first_line}")];
+            lines.extend(title_lines.map(|line| format!("{hanging_indent}{line}")));
+            lines.extend(
+                question
+                    .options
+                    .iter()
+                    .map(|option| format!("  • {option}")),
+            );
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn name_prefix(name: &str) -> String {
@@ -834,6 +916,53 @@ mod tests {
             body_text(&result),
             Some(serde_json::to_string_pretty(&input).unwrap().as_str())
         );
+    }
+
+    #[test]
+    fn question_call_counts_its_questions_and_lists_each_title_and_option() {
+        let input = json!({"questions": [
+            {"title": "Is the firmware session still running?", "options": ["Yes", "No"]},
+        ]});
+        let result = format_tool_call("request_user_input_async", Tool::UserQuestion, &input, 80);
+        assert_eq!(result.header(), "request_user_input_async: 1 question");
+        assert_eq!(
+            body_text(&result),
+            Some("Is the firmware session still running?\n  • Yes\n  • No")
+        );
+    }
+
+    #[test]
+    fn several_questions_are_numbered_and_one_without_options_shows_its_title_alone() {
+        let input = json!({"questions": [
+            {"title": "Which profile?", "options": ["warm idle", "cold start"]},
+            {"title": "Keep recording\nonce warm?"},
+        ]});
+        let result = format_tool_call("request_user_input_async", Tool::UserQuestion, &input, 80);
+        assert_eq!(result.header(), "request_user_input_async: 2 questions");
+        assert_eq!(
+            body_text(&result),
+            Some(
+                "1. Which profile?\n  • warm idle\n  • cold start\n\n2. Keep recording\n   once warm?"
+            )
+        );
+    }
+
+    #[test]
+    fn question_call_without_titled_questions_shows_its_name_and_input() {
+        for input in [
+            json!({"questions": []}),
+            json!({"questions": [{"options": ["Yes"]}]}),
+            json!({"arguments": "not json"}),
+        ] {
+            let result =
+                format_tool_call("request_user_input_async", Tool::UserQuestion, &input, 80);
+            assert_eq!(result.header(), "request_user_input_async:", "{input}");
+            assert_eq!(
+                body_text(&result),
+                Some(serde_json::to_string_pretty(&input).unwrap().as_str()),
+                "{input}"
+            );
+        }
     }
 
     #[test]

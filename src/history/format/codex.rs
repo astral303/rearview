@@ -948,18 +948,26 @@ fn parse_thread(
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RecordState {
     last_shown: LastShown,
+    /// The ids of the question calls whose result is still to come.
+    question_calls: BTreeSet<String>,
     own_history: OwnHistory,
 }
 
 impl RecordState {
     /// The state before the first record of the rollout `header` opens.
     fn at_start(header: &RolloutHeader) -> Self {
+        Self::before_records(match header.own_history_start {
+            Some(boundary) => OwnHistory::Pending { boundary },
+            None => OwnHistory::Started,
+        })
+    }
+
+    /// The state before any record is read.
+    fn before_records(own_history: OwnHistory) -> Self {
         Self {
             last_shown: LastShown::default(),
-            own_history: match header.own_history_start {
-                Some(boundary) => OwnHistory::Pending { boundary },
-                None => OwnHistory::Started,
-            },
+            question_calls: BTreeSet::new(),
+            own_history,
         }
     }
 }
@@ -1056,7 +1064,7 @@ impl ThreadProjection {
             let read = self.read_earlier(admitted.admit_linked(&rollout.path), &rollout, parallel);
             if let Err(unread) = read {
                 self.entries.clear();
-                self.state.last_shown = LastShown::default();
+                self.state = RecordState::before_records(self.state.own_history);
                 self.started = None;
                 self.earlier_turns = unread;
                 continue;
@@ -1180,12 +1188,9 @@ impl ThreadProjection {
             // The first own record: what was read so far is the parent's
             // history, its last model and goal included.
             self.entries.clear();
-            self.state = RecordState {
-                last_shown: LastShown::default(),
-                own_history: OwnHistory::Started,
-            };
+            self.state = RecordState::before_records(OwnHistory::Started);
         }
-        if let Some(entry) = normalize_line(object, &mut self.state.last_shown, &mut self.dropped) {
+        if let Some(entry) = normalize_line(object, &mut self.state, &mut self.dropped) {
             let record = RecordLine {
                 transcript: transcript.clone(),
                 line,
@@ -1747,7 +1752,7 @@ fn parse_record(line: &str) -> Option<Value> {
 
 fn normalize_line(
     object: &Map<String, Value>,
-    last_shown: &mut LastShown,
+    state: &mut RecordState,
     dropped: &mut DroppedRecords,
 ) -> Option<LogEntry> {
     let timestamp = object
@@ -1756,8 +1761,11 @@ fn normalize_line(
         .map(str::to_owned);
     let payload = object.get("payload")?.as_object()?;
     let kind = object.get("type").and_then(Value::as_str);
+    let last_shown = &mut state.last_shown;
     match kind {
-        Some("response_item") => normalize_response_item(payload, timestamp, dropped),
+        Some("response_item") => {
+            normalize_response_item(payload, timestamp, &mut state.question_calls, dropped)
+        }
         Some("compacted") => compaction_summary(payload, timestamp),
         Some("turn_context") => model_change(payload, timestamp, &mut last_shown.model),
         Some("event_msg") => event_message(payload, timestamp, &mut last_shown.goal, dropped),
@@ -1782,28 +1790,38 @@ fn normalize_line(
 fn normalize_response_item(
     payload: &Map<String, Value>,
     timestamp: Option<String>,
+    question_calls: &mut BTreeSet<String>,
     dropped: &mut DroppedRecords,
 ) -> Option<LogEntry> {
     let kind = payload.get("type").and_then(Value::as_str);
-    match kind {
+    let entry = match kind {
         Some("message") => normalize_message(payload, timestamp, dropped),
         Some("reasoning") => reasoning_summary(payload, timestamp),
-        Some("custom_tool_call") => tool_call(payload, payload.get("input").cloned(), timestamp),
+        Some("custom_tool_call") => {
+            Some(tool_call(payload, payload.get("input").cloned(), timestamp))
+        }
         Some("function_call") => {
             let arguments = payload.get("arguments").and_then(Value::as_str);
             let input = arguments.map(|raw| {
                 serde_json::from_str(raw).unwrap_or_else(|_| json!({ "arguments": raw }))
             });
-            tool_call(payload, input, timestamp)
+            Some(tool_call(payload, input, timestamp))
         }
-        Some("custom_tool_call_output" | "function_call_output") => tool_result(payload, timestamp),
+        Some("custom_tool_call_output" | "function_call_output") => {
+            Some(tool_result(payload, timestamp, question_calls))
+        }
         Some("agent_message") => inter_agent_message(payload, timestamp),
         Some("web_search_call") => web_search_call(payload, timestamp),
         _ => {
             dropped.unrecognised("response_item.type", kind);
             None
         }
+    };
+    if let Some(entry) = &entry {
+        record_question_calls(entry, question_calls);
+        remove_answered_question_calls(entry, question_calls);
     }
+    entry
 }
 
 fn normalize_message(
@@ -1985,11 +2003,49 @@ fn tool_call(
     payload: &Map<String, Value>,
     input: Option<Value>,
     timestamp: Option<String>,
-) -> Option<LogEntry> {
+) -> LogEntry {
     let call_id = string_field(payload, "call_id").unwrap_or_else(|| "unknown".to_owned());
     let name = string_field(payload, "name").unwrap_or_else(|| "unknown".to_owned());
     let blocks = tools::tool_use_blocks(&call_id, &name, &input.unwrap_or_else(|| json!({})));
-    Some(assistant_entry(payload, blocks, timestamp))
+    assistant_entry(payload, blocks, timestamp)
+}
+
+/// Add the id of each question call `entry` makes to `question_calls`, for
+/// its result to find.
+fn record_question_calls(entry: &LogEntry, question_calls: &mut BTreeSet<String>) {
+    for block in entry.content_blocks() {
+        if let ContentBlock::ToolUse {
+            id,
+            tool: Tool::UserQuestion,
+            ..
+        } = block
+        {
+            question_calls.insert(id.clone());
+        }
+    }
+}
+
+/// Remove from `question_calls` each call a result in `entry` answers.
+fn remove_answered_question_calls(entry: &LogEntry, question_calls: &mut BTreeSet<String>) {
+    for block in entry.content_blocks() {
+        if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+            question_calls.remove(tool_use_id);
+        }
+    }
+}
+
+/// The result Codex returns once it shows the user a question.
+const QUESTION_SHOWN_RESULT: &str = r#"{"accepted":true}"#;
+
+/// `shown to the user` for the result Codex returns once it shows the user a
+/// question; any other result as Codex wrote it. The user answers in a later
+/// message.
+fn question_result_text(text: String) -> String {
+    if text.trim() == QUESTION_SHOWN_RESULT {
+        "shown to the user".to_owned()
+    } else {
+        text
+    }
 }
 
 /// The model's web search through Codex's built-in tool. The call has no
@@ -2003,9 +2059,15 @@ fn web_search_call(payload: &Map<String, Value>, timestamp: Option<String>) -> O
 
 /// Reads a tool-result payload into a user entry. With no `call_id` the result
 /// answers no call: it takes the item's own `id`, or `"unknown"` when the
-/// payload carries neither, and keeps the tool name the payload gives.
-fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
-    let text = tool_result_text(&Value::String(output_text(payload))).unwrap_or_default();
+/// payload carries neither, and keeps the tool name the payload gives. The
+/// result of a call in `question_calls` reads as [`question_result_text`]
+/// writes it.
+fn tool_result(
+    payload: &Map<String, Value>,
+    timestamp: Option<String>,
+    question_calls: &BTreeSet<String>,
+) -> LogEntry {
+    let mut text = tool_result_text(&Value::String(output_text(payload))).unwrap_or_default();
     // The id and the name are decided together: with no `call_id` the result
     // answers no call, so it takes the item's own id and the tool it names.
     let (tool_use_id, standalone_tool_name) = match string_field(payload, "call_id") {
@@ -2015,7 +2077,10 @@ fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Optio
             string_field(payload, "name"),
         ),
     };
-    Some(LogEntry::User {
+    if question_calls.contains(&tool_use_id) {
+        text = question_result_text(text);
+    }
+    LogEntry::User {
         message: UserMessage {
             role: "user".to_owned(),
             content: UserContent::Blocks(vec![ContentBlock::ToolResult {
@@ -2030,7 +2095,7 @@ fn tool_result(payload: &Map<String, Value>, timestamp: Option<String>) -> Optio
         parent_tool_use_id: None,
         source_tool_use_id: None,
         usage: None,
-    })
+    }
 }
 
 /// A tool result's output: one string, or the text of content blocks typed
@@ -3207,7 +3272,7 @@ mod tests {
         let record: Value = serde_json::from_str(line).unwrap();
         normalize_line(
             record.as_object().unwrap(),
-            &mut LastShown::default(),
+            &mut RecordState::before_records(OwnHistory::Started),
             &mut DroppedRecords::default(),
         )
     }
@@ -3573,6 +3638,67 @@ mod tests {
 
         assert_eq!(finer_precision, [true, false]);
         assert_eq!(other_offset, [false, true]);
+    }
+
+    /// The text of the result of the call `name` makes with `arguments`,
+    /// when Codex returns `output`, as the two records read in order.
+    fn result_of(name: &str, arguments: &str, output: &str) -> String {
+        let mut state = RecordState::before_records(OwnHistory::Started);
+        let mut read = |payload: Value| {
+            let record = json!({"timestamp": "2026-08-01T02:01:16Z", "type": "response_item", "payload": payload});
+            normalize_line(
+                record.as_object().unwrap(),
+                &mut state,
+                &mut DroppedRecords::default(),
+            )
+        };
+        read(
+            json!({"type": "function_call", "call_id": "call_1", "name": name, "arguments": arguments}),
+        );
+        let result =
+            read(json!({"type": "function_call_output", "call_id": "call_1", "output": output}));
+        match result.as_ref().map(LogEntry::content_blocks) {
+            Some(
+                [
+                    ContentBlock::ToolResult {
+                        content: Some(Value::String(text)),
+                        ..
+                    },
+                ],
+            ) => text.clone(),
+            other => panic!("one result, got {other:?}"),
+        }
+    }
+
+    const QUESTION_ARGUMENTS: &str =
+        r#"{"questions":[{"title":"Ship it?","options":["Yes","No"]}]}"#;
+
+    #[test]
+    fn accepted_question_reads_as_shown_to_the_user() {
+        assert_eq!(
+            result_of(
+                "request_user_input_async",
+                QUESTION_ARGUMENTS,
+                r#"{"accepted":true}"#
+            ),
+            "shown to the user"
+        );
+    }
+
+    #[test]
+    fn question_calls_error_and_other_calls_acceptance_keep_their_text() {
+        assert_eq!(
+            result_of(
+                "request_user_input_async",
+                r#"{"questions":[]}"#,
+                "questions must not be empty"
+            ),
+            "questions must not be empty"
+        );
+        assert_eq!(
+            result_of("list_agents", "{}", r#"{"accepted":true}"#),
+            r#"{"accepted":true}"#
+        );
     }
 
     /// The tool and input of the one call `line` reads as.

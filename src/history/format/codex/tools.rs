@@ -28,6 +28,9 @@ pub(super) fn tool_use_blocks(call_id: &str, name: &str, input: &Value) -> Vec<C
         .collect()
 }
 
+/// The call that puts questions to the user and returns before they answer.
+const QUESTION_CALL: &str = "request_user_input_async";
+
 struct CanonicalCall {
     tool: Tool,
     input: Value,
@@ -40,6 +43,12 @@ fn canonical_calls(name: &str, input: &Value) -> Vec<CanonicalCall> {
         "apply_patch" => patch_text(input).map(patch_edits),
         "run" | "web__run" => Some(web_calls(input)),
         "sleep" => sleep_call(input).map(|call| vec![call]),
+        // Codex's arguments are the canonical input; a call they don't fit
+        // shows its name and input.
+        QUESTION_CALL => Some(vec![CanonicalCall {
+            tool: Tool::UserQuestion,
+            input: input.clone(),
+        }]),
         _ => function_call(name, input).map(|call| vec![call]),
     };
     calls.filter(|calls| !calls.is_empty()).unwrap_or_else(|| {
@@ -503,6 +512,11 @@ mod tests {
             ("interrupt_agent", json!({"target": "scout"}), Tool::Other),
             ("request_user_input", json!({"questions": []}), Tool::Other),
             ("sleep", json!({"duration_ms": 60000}), Tool::Wait),
+            (
+                "request_user_input_async",
+                json!({"questions": [{"title": "Ship it?", "options": ["Yes", "No"]}]}),
+                Tool::UserQuestion,
+            ),
             ("sleep", json!({"duration_ms": "1m"}), Tool::Other),
             ("sleep", json!({"duration_ms": 1.5}), Tool::Other),
             ("sleep", json!({"duration_ms": -1}), Tool::Other),

@@ -666,7 +666,7 @@ fn every_agents_outputs_render_in_place_as_in_whole_render() {
     // mode.
     let expected = [
         ("Claude", 56),
-        ("Codex", 84),
+        ("Codex", 92),
         ("OpenCode", 44),
         ("Kimi", 56),
         ("Grok", 32),

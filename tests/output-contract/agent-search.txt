@@ -356,7 +356,7 @@ protocol agent-search mode=lexical cut=none chars=6000 policy=per-hit groups=2 h
 query text=question hits=4
 sessions matched=2 offset=0 searched=2 failed=0
 groups count=2
-conversation rank=1 project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 score=4.055556 hits=2 total=3 : active codex question ... codex answer searchable ... follow-up question
+conversation rank=1 project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 score=4.055556 hits=2 total=4 : active codex question ... codex answer searchable ... follow-up question
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4b123428b81950de source=lexical score=4.055556 focus=m13..m13 at=2026-08-01T06:02:00 | follow-up question
 read ref=ch_74aec3f6df49:m12..m14 focus=m13..m13 tools=false tool-results=false thinking=false subagents=false
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_b381c31a261bdba3 source=lexical score=4.052632 focus=m2..m2 at=2026-08-01T06:00:03 | child task question
