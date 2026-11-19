@@ -132,9 +132,12 @@ impl ReaderWait {
         }
     }
 
+    /// A reader that doesn't wait for a rebuild still waits up to
+    /// [`observer::REBUILD_LOCK_THRESHOLD`] for a lock: another connection's
+    /// checkpoint on close, or its recovery of the write-ahead log.
     fn busy_timeout(self) -> Duration {
         match self {
-            Self::Waiting(timeout) => timeout,
+            Self::Waiting(timeout) => timeout.max(observer::REBUILD_LOCK_THRESHOLD),
             Self::Interactive => INTERACTIVE_BUSY_TIMEOUT,
         }
     }
@@ -236,7 +239,8 @@ impl SqliteCache {
         Self::open_waiting_at_most(base, WAITING_BUSY_TIMEOUT)
     }
 
-    /// [`Self::open_waiting`], each statement waiting at most `timeout`.
+    /// [`Self::open_waiting`], each statement waiting for a lock up to the
+    /// longer of `timeout` and [`observer::REBUILD_LOCK_THRESHOLD`].
     pub(crate) fn open_waiting_at_most(
         base: &CacheBase,
         timeout: Duration,

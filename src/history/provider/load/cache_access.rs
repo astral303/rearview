@@ -55,9 +55,10 @@ pub(super) fn publishing(owner: Option<&RefreshToken>) -> Option<&RefreshToken> 
 /// The reader a read opens the database with when it does not write it.
 #[derive(Clone, Copy)]
 pub(super) enum DatabaseReader {
-    /// Its statements fail at once while another connection holds an
-    /// exclusive lock, as a rebuild does. Probes use it, and so does a read
-    /// of the cache as it is; that read waits through
+    /// Its statements wait up to the session cache's
+    /// `REBUILD_LOCK_THRESHOLD` for another connection's exclusive lock, as
+    /// a rebuild holds it, then fail. Probes use it, and so does a read of
+    /// the cache as it is; that read waits through
     /// [`OperationScope::read_when_unlocked`].
     WithoutWaiting,
     /// [`InteractiveCache::open`]: the TUI's drawing thread.

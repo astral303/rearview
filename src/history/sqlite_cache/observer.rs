@@ -12,8 +12,11 @@ use rusqlite::OptionalExtension;
 use std::time::Duration;
 
 /// The longest a waiter's or an observation's connection waits for the
-/// database's exclusive lock, as a connection closing last holds it through
-/// its checkpoint. A lock held longer is reported as another rearview's
+/// database's exclusive lock, and the least a reader's statement waits for a
+/// lock. A connection closing last holds the exclusive lock through its
+/// checkpoint; the first connection to open after the cache's last
+/// connection closed locks the write-ahead log while it rebuilds the log's
+/// index. An exclusive lock held longer is reported as another rearview's
 /// rebuild.
 pub(super) const REBUILD_LOCK_THRESHOLD: Duration = Duration::from_millis(100);
 

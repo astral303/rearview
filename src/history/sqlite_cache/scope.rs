@@ -398,7 +398,11 @@ mod tests {
     use crate::history::sqlite_cache::refresh::tests::{
         exclusive_lock, rearview, rearview_on, record_of, record_with_reason, replace_owner,
     };
-    use crate::history::sqlite_cache::{CacheWrite, DriveRunningOut, SqliteCache, apply_writes};
+    use crate::history::sqlite_cache::tests::every_record_copies;
+    use crate::history::sqlite_cache::{
+        CacheWrite, CachedSession, DriveRunningOut, SqliteCache, apply_writes,
+        read_copy_without_waiting,
+    };
 
     fn operation(base: &CacheBase) -> OperationScope {
         OperationScope::new(base, Patience::UntilAcquired, Arc::default())
@@ -696,5 +700,113 @@ mod tests {
             operation.finish().lost_write_permission,
             "a full disk revokes the owner's write permission"
         );
+    }
+
+    /// `copy` read through [`read_copy_when_unlocked`] on `clock`, as an
+    /// agent command reads a copy, its wait published on `status`.
+    fn read_copy_waiting_out_locks(
+        copy: &CachedSession,
+        clock: &TestClock,
+        status: &WaitStatus,
+    ) -> CopyRead<()> {
+        read_copy_when_unlocked(clock, status, &Cancellation::default(), || {
+            read_copy_without_waiting(&copy.base, &copy.address, |_| Ok(()))
+        })
+    }
+
+    /// Copies read on many threads at once after the cache's last connection
+    /// closed, as an agent search reads its hits: the first reader rebuilds
+    /// the write-ahead log's index while the others open. Only a poll moves
+    /// the test clock.
+    #[test]
+    fn parallel_copy_reads_after_last_connection_closed_dont_poll() {
+        const READERS: usize = 16;
+        const ROUNDS: usize = 10;
+        let directory = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(directory.path());
+        let clock = TestClock::default();
+        let status = WaitStatus::default();
+        let started = clock.now();
+
+        for _ in 0..ROUNDS {
+            let together = std::sync::Barrier::new(READERS);
+            std::thread::scope(|scope| {
+                for _ in 0..READERS {
+                    scope.spawn(|| {
+                        together.wait();
+                        for copy in &copies {
+                            let read = read_copy_waiting_out_locks(copy, &clock, &status);
+                            assert!(read.is_ok(), "each copy is read: {read:?}");
+                        }
+                    });
+                }
+            });
+        }
+
+        assert_eq!(
+            clock.elapsed_since(started),
+            Duration::ZERO,
+            "no read polls for a rebuild"
+        );
+    }
+
+    /// When a copy read's first read meets SQLite's exclusive lock held
+    /// briefly, as by a connection closing last through its checkpoint, the
+    /// read waits it out in SQLite's busy handler.
+    #[test]
+    fn copy_read_waits_out_lock_released_during_its_first_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(directory.path());
+        let lock = exclusive_lock(directory.path());
+        test_hooks::at_the_first_busy_wait(move || drop(lock));
+        let clock = TestClock::default();
+        let started = clock.now();
+
+        let read = read_copy_waiting_out_locks(&copies[0], &clock, &WaitStatus::default());
+
+        assert!(read.is_ok(), "the copy is read: {read:?}");
+        assert_eq!(
+            clock.elapsed_since(started),
+            Duration::ZERO,
+            "the read doesn't poll for a rebuild"
+        );
+    }
+
+    /// The rebuild's lock is released after the read polled twice, each poll
+    /// after the read's busy timeout ran out in SQLite's busy handler.
+    #[test]
+    fn copy_read_behind_rebuild_waits_and_reports_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let copies = every_record_copies(directory.path());
+        let rebuild = exclusive_lock(directory.path());
+        let clock = TestClock::default();
+        let status = WaitStatus::default();
+        let started = clock.now();
+
+        let (read, reported) = std::thread::scope(|scope| {
+            let releasing = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while clock.elapsed_since(started) < 2 * UNLOCK_POLL {
+                    assert!(std::time::Instant::now() < deadline, "the read polls");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let reported = status.current();
+                drop(rebuild);
+                reported
+            });
+            let read = read_copy_waiting_out_locks(&copies[0], &clock, &status);
+            (read, releasing.join().unwrap())
+        });
+
+        assert!(
+            read.is_ok(),
+            "the copy is read once the rebuild ends: {read:?}"
+        );
+        assert_eq!(
+            reported,
+            Some(OtherRearview::Rebuilding),
+            "the read reports the rebuild while it waits"
+        );
+        assert_eq!(status.current(), None, "the read's wait ends with it");
     }
 }
