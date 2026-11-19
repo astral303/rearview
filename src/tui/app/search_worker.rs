@@ -155,12 +155,13 @@ impl TextsToRead {
     }
 }
 
-/// The sessions without texts held, as the worker counts them once it has
-/// applied `updates_applied` `UpdateData` commands.
+/// The worker's counts of sessions without texts and of sessions being read
+/// again, after it applied `updates_applied` `UpdateData` commands.
 #[derive(Clone, Copy)]
 pub(super) struct TextsHeld {
     pub(super) updates_applied: u64,
     pub(super) sessions_without_texts: SessionsWithoutTexts,
+    pub(super) sessions_updating: usize,
 }
 
 /// The work the inputs waiting ask the worker for.
@@ -322,6 +323,7 @@ pub(super) fn spawn_search_worker(clock: Arc<dyn Clock>) -> SearchWorker {
                 let held = TextsHeld {
                     updates_applied: state.updates_applied,
                     sessions_without_texts: state.texts.sessions_without_texts(),
+                    sessions_updating: state.texts.sessions_updating(),
                 };
                 if pending.texts_changed && texts_held_tx.send(held).is_err() {
                     return;

@@ -393,6 +393,7 @@ impl App {
             texts_held: TextsHeld {
                 updates_applied: 0,
                 sessions_without_texts: SessionsWithoutTexts::default(),
+                sessions_updating: 0,
             },
             search_data_sent: 0,
             search_generation: parts.search_worker.generation,
@@ -948,19 +949,21 @@ impl App {
         }
     }
 
-    /// The search bar's text after the result count while the list's search
-    /// reads some sessions without their texts
-    /// ([`describe_search_reads`]). Semantic results on screen
-    /// count the sessions their search read without semantic turns, in place
-    /// of the list's counts.
+    /// The search bar's label after the result count: the counts of
+    /// sessions searched without their texts or in texts being read again
+    /// ([`describe_search_reads`]). With semantic results on screen, the
+    /// semantic search's counts of sessions without semantic turns replace
+    /// the list's.
     pub fn search_reads_label(&self) -> String {
-        let mut counts = self.texts_held.sessions_without_texts;
         if let Some(semantic) = self.semantic_search.without_turns
             && self.list_search_mode == ListSearchMode::Semantic
         {
-            counts = semantic;
+            return describe_search_reads(semantic, 0);
         }
-        describe_search_reads(counts)
+        describe_search_reads(
+            self.texts_held.sessions_without_texts,
+            self.texts_held.sessions_updating,
+        )
     }
 
     #[cfg(test)]
@@ -1317,21 +1320,24 @@ impl App {
     }
 }
 
-/// ` · 37 sessions loading` while their first read runs, then
-/// ` · 1 session unreadable` while a read has failed; empty when neither
-/// count is above zero.
-fn describe_search_reads(counts: SessionsWithoutTexts) -> String {
-    [
-        (counts.loading, "loading"),
-        (counts.unreadable, "unreadable"),
-    ]
-    .into_iter()
-    .filter(|&(count, _)| count > 0)
-    .map(|(count, state)| match count {
-        1 => format!(" · 1 session {state}"),
-        count => format!(" · {count} sessions {state}"),
-    })
-    .collect()
+/// ` · 37 sessions loading` while their first read runs, or else
+/// ` · 2 sessions updating` while `updating` sessions are read again, then
+/// ` · 1 session unreadable` while a read has failed; empty when no count is
+/// above zero.
+fn describe_search_reads(counts: SessionsWithoutTexts, updating: usize) -> String {
+    let (reading, state) = if counts.loading > 0 {
+        (counts.loading, "loading")
+    } else {
+        (updating, "updating")
+    };
+    [(reading, state), (counts.unreadable, "unreadable")]
+        .into_iter()
+        .filter(|&(count, _)| count > 0)
+        .map(|(count, state)| match count {
+            1 => format!(" · 1 session {state}"),
+            count => format!(" · {count} sessions {state}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]

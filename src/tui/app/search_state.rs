@@ -141,11 +141,12 @@ impl App {
     }
 
     /// True until the search worker has counted the sessions of the rows
-    /// last sent, and while some of those sessions' first read runs: the
-    /// list's search results can still change without a keystroke.
+    /// last sent, and while some of those sessions are read: the list's
+    /// search results can still change without a keystroke.
     pub fn is_reading_search_texts(&self) -> bool {
         self.texts_held.updates_applied < self.search_data_sent
             || self.texts_held.sessions_without_texts.loading > 0
+            || self.texts_held.sessions_updating > 0
     }
 
     pub(super) fn semantic_scope_indices(&self) -> Arc<Vec<usize>> {
@@ -369,7 +370,8 @@ impl App {
     pub fn receive_search_results(&mut self) -> bool {
         let mut applied = false;
         while let Ok(held) = self.texts_held_rx.try_recv() {
-            applied |= self.texts_held.sessions_without_texts != held.sessions_without_texts;
+            applied |= self.texts_held.sessions_without_texts != held.sessions_without_texts
+                || self.texts_held.sessions_updating != held.sessions_updating;
             self.texts_held = held;
         }
         while let Ok(response) = self.search_rx.try_recv() {

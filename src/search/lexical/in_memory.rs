@@ -579,6 +579,15 @@ impl SearchTextsInMemory {
         without
     }
 
+    /// The count of sessions being read again; search uses their held texts
+    /// until each read ends.
+    pub fn sessions_updating(&self) -> usize {
+        self.by_session
+            .values()
+            .filter(|held| held.texts.is_some() && held.read == CopyReadState::Reading)
+            .count()
+    }
+
     /// Keeps the texts of the sessions `conversations` list and drops the
     /// rest. Returns the copies whose texts are neither held nor being read,
     /// now marked as being read: copies new to their rows, and copies whose

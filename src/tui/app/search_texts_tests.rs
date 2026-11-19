@@ -608,6 +608,95 @@ fn search_bar_shows_sessions_loading_until_their_reads_land_then_sessions_unread
 }
 
 #[test]
+fn session_read_again_counts_as_updating_until_its_read_ends() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["original wording"]);
+    home.write("b", 10, &["unrelated"]);
+    let (_cache, environment) = caching_environment(&home);
+    let mut texts = SearchTextsInMemory::default();
+    read_missing(&mut texts, &cached_rows(&home, &environment));
+    home.append(&a, 6, "revised wording");
+
+    let reading = texts
+        .keep_copies_of(&cached_rows(&home, &environment))
+        .copies;
+    let while_reading = (texts.sessions_updating(), texts.sessions_without_texts());
+    finish_reads(&mut texts, &reading);
+
+    assert_eq!(
+        while_reading,
+        (1, SessionsWithoutTexts::default()),
+        "the session read again counts as updating, not loading"
+    );
+    assert_eq!(
+        texts.sessions_updating(),
+        0,
+        "the session stops updating once its read ends"
+    );
+}
+
+#[test]
+fn search_bar_shows_session_the_worker_reads_again_until_its_read_ends() {
+    let home = ClaudeHome::new();
+    let a = home.write("a", 5, &["needle"]);
+    home.write("b", 10, &["other"]);
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    let mut app = super::claude_home::app_reading(rows, environment);
+    receive_until(&mut app, |app| !app.is_reading_search_texts());
+    home.append(&a, 6, "revised wording");
+
+    let gate =
+        super::test_waits::ConnectionGate::closed(app.environment.cache_base().path(), |thread| {
+            thread
+                .name()
+                .is_some_and(|name| name.starts_with("text-read"))
+        });
+    super::claude_home::serve_list_refresh(&mut app, crate::time_filter::TimeFilter::default());
+    receive_until(&mut app, |app| app.texts_held.sessions_updating > 0);
+    let while_reading = search_bar_text(&app);
+    gate.open();
+    receive_until(&mut app, |app| !app.is_reading_search_texts());
+
+    assert!(
+        while_reading.contains("1/2 · 1 session updating"),
+        "the search bar shows the worker's count of the session read again: {while_reading:?}"
+    );
+    let after_read = search_bar_text(&app);
+    assert!(
+        !after_read.contains("updating"),
+        "the count ends with the read: {after_read:?}"
+    );
+}
+
+#[test]
+fn search_bar_shows_sessions_updating_and_hides_them_behind_refreshing() {
+    let home = ClaudeHome::new();
+    home.write("a", 5, &["needle"]);
+    home.write("b", 10, &["other"]);
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    let mut app = super::claude_home::app_reading(rows, environment);
+    receive_until(&mut app, |app| !app.is_reading_search_texts());
+    // The counts are this test's, not the worker's.
+    app.texts_held_rx = std::sync::mpsc::channel().1;
+    app.texts_held.sessions_updating = 2;
+
+    let updating = search_bar_text(&app);
+    app.begin_refresh().expect("a refresh begins");
+    let refreshing = frame_rows(&app, 10).join("\n");
+
+    assert!(
+        updating.contains("1/2 · 2 sessions updating"),
+        "the search bar counts the sessions read again: {updating:?}"
+    );
+    assert!(
+        refreshing.contains("refreshing…") && !refreshing.contains("updating"),
+        "a refresh's label hides the count: {refreshing}"
+    );
+}
+
+#[test]
 fn texts_read_run_last_search_again_only_while_the_app_awaits_it() {
     use super::ListSearchMode;
     use super::search_worker::{PendingWork, SearchCommand, SearchWorkerState, WorkerInput};

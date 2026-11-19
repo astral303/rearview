@@ -26,6 +26,9 @@
     project name, and the search bar shows ` · N sessions loading`. The count
     decreases as texts are read.
     ` · N sessions unreadable` counts sessions whose texts could not be read.
+  - While sessions' texts are read again after a refresh, the search bar
+    shows ` · N sessions updating`. Until a session's read ends, the search
+    matches its earlier texts.
   - Reading those texts takes about 5–6x as long as before. The list loads
     faster, and becomes searchable about 1.2x sooner after launch.
 - Speed up the session list's search for lowercase quoted text containing `k`
