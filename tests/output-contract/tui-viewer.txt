@@ -117,6 +117,19 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time
 
+      You │ > QUESTION_TITLE_SENTINEL: which profile?
+          │
+          │ PICKED_OPTION_SENTINEL: warm idle
+
+      You │ > Keep recording once warm?
+          │
+          │ Yes, until I stop it.
+          │ TYPED_ANSWER_SENTINEL: then save the log.
+
+      You │ user: <send_user_message_question_reply>
+          │ [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
+          │ </send_user_message_question_reply>
+
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
 
@@ -572,6 +585,19 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ 2. Keep recording once warm?
    ↓
    Result ┐ shown to the user
+
+      You │ > QUESTION_TITLE_SENTINEL: which profile?
+          │
+          │ PICKED_OPTION_SENTINEL: warm idle
+
+      You │ > Keep recording once warm?
+          │
+          │ Yes, until I stop it.
+          │ TYPED_ANSWER_SENTINEL: then save the log.
+
+      You │ user: <send_user_message_question_reply>
+          │ [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
+          │ </send_user_message_question_reply>
 
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question

@@ -34,8 +34,8 @@ use crate::history::provider::{
 use crate::history::task_notification::ReportSender;
 use crate::history::{Admitted, ParsePermit, Source, TaskReport, TranscriptEntries};
 use crate::log_entry::{
-    AssistantMessage, ContentBlock, DELIVERED_REPORT_KEY, LogEntry, NOTICE_LABEL, SubagentIdentity,
-    TokenUsage, Tool, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, DELIVERED_REPORT_KEY, LogEntry, NOTICE_LABEL, QuotedAnswer,
+    SubagentIdentity, TokenUsage, Tool, UserContent, UserMessage,
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, FixedOffset};
@@ -1841,6 +1841,16 @@ fn normalize_message(
             {
                 return Some(user_shell_command_entry(payload, &command, timestamp));
             }
+            // An answer to a question is one complete XML element too.
+            if let [text] = texts.as_slice()
+                && let Some(json) = question_reply_envelope(text)
+            {
+                let Some(replies) = question_replies(json) else {
+                    dropped.failed("send_user_message_question_reply");
+                    return None;
+                };
+                return Some(question_answer_entry(&replies, timestamp));
+            }
             let typed_by_the_user = texts
                 .into_iter()
                 .filter(|text| !is_injected_context(text))
@@ -1890,6 +1900,93 @@ fn normalize_message(
             dropped.unrecognised("message.role", role);
             None
         }
+    }
+}
+
+/// The user's answer to one question of a question call, as Codex's reply
+/// envelope records it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionReply {
+    /// `["request_user_input_async","<call id>",<question index>]` as a JSON
+    /// string, or the call id alone in an older reply.
+    question_item_id: String,
+    /// The question's title, truncated to 512 bytes, its line breaks as
+    /// spaces.
+    question: String,
+    answer: String,
+}
+
+impl QuestionReply {
+    fn call_id(&self) -> String {
+        match serde_json::from_str::<Value>(&self.question_item_id) {
+            Ok(Value::Array(parts)) if parts.len() == 3 => parts[1]
+                .as_str()
+                .unwrap_or(&self.question_item_id)
+                .to_owned(),
+            _ => self.question_item_id.clone(),
+        }
+    }
+}
+
+const QUESTION_REPLY_OPEN: &str = "<send_user_message_question_reply>";
+const QUESTION_REPLY_CLOSE: &str = "</send_user_message_question_reply>";
+
+/// The JSON inside Codex's reply envelope, when a message's text is nothing
+/// but the envelope. Text before the envelope, as when an agent quotes one,
+/// keeps the message as text.
+fn question_reply_envelope(text: &str) -> Option<&str> {
+    text.trim()
+        .strip_prefix(QUESTION_REPLY_OPEN)?
+        .strip_suffix(QUESTION_REPLY_CLOSE)
+}
+
+/// The replies an envelope's JSON holds, one reply or a list; `None` for
+/// JSON of another shape and for an empty list.
+fn question_replies(json: &str) -> Option<Vec<QuestionReply>> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Replies {
+        Several(Vec<QuestionReply>),
+        One(QuestionReply),
+    }
+    let replies = match serde_json::from_str::<Replies>(json).ok()? {
+        Replies::Several(replies) => replies,
+        Replies::One(reply) => vec![reply],
+    };
+    (!replies.is_empty()).then_some(replies)
+}
+
+/// The user's message answering a question call: each reply as a quote of
+/// its question and the answer. The message names the call when every reply
+/// names the same one.
+fn question_answer_entry(replies: &[QuestionReply], timestamp: Option<String>) -> LogEntry {
+    let call_ids: BTreeSet<String> = replies.iter().map(QuestionReply::call_id).collect();
+    let source_tool_use_id = match call_ids.len() {
+        1 => call_ids.into_iter().next(),
+        _ => None,
+    };
+    let blocks = replies
+        .iter()
+        .map(|reply| ContentBlock::Text {
+            text: QuotedAnswer {
+                question: &reply.question,
+                answer: &reply.answer,
+            }
+            .text(),
+        })
+        .collect();
+    LogEntry::User {
+        message: UserMessage {
+            role: "user".to_owned(),
+            content: UserContent::Blocks(blocks),
+        },
+        timestamp,
+        uuid: None,
+        cwd: None,
+        parent_tool_use_id: None,
+        source_tool_use_id,
+        usage: None,
     }
 }
 
@@ -2459,8 +2556,10 @@ fn string_field(payload: &Map<String, Value>, name: &str) -> Option<String> {
 /// `<tag>…</tag>` wrapper, a bare placeholder tag, or the AGENTS.md pair — so
 /// the test is structural rather than a list of tag names that would go stale.
 /// The known cost: a prompt that is one complete XML element and nothing else
-/// is misread as context, as is a `<user_shell_command>` record of a command
-/// the user ran through the agent.
+/// is misread as context. `normalize_message` reads two such elements before
+/// this test: a `<user_shell_command>` record of a command the user ran
+/// through the agent, and a `<send_user_message_question_reply>` envelope of
+/// the user's answers.
 fn is_injected_context(text: &str) -> bool {
     let text = text.trim();
     if text.starts_with("# AGENTS.md instructions") && text.ends_with("</INSTRUCTIONS>") {
@@ -3668,6 +3767,153 @@ mod tests {
             ) => text.clone(),
             other => panic!("one result, got {other:?}"),
         }
+    }
+
+    /// A user message of `text`.
+    fn user_message(text: &str) -> String {
+        json!({
+            "timestamp": "2026-08-01T02:02:05Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+        })
+        .to_string()
+    }
+
+    /// The texts and the call the user message `text` reads as names.
+    fn read_user_message(text: &str) -> Option<(Vec<String>, Option<String>)> {
+        let LogEntry::User {
+            message,
+            source_tool_use_id,
+            ..
+        } = normalized(&user_message(text))?
+        else {
+            panic!("a user message reads as a user entry");
+        };
+        let texts = match message.content {
+            UserContent::Blocks(blocks) => blocks
+                .into_iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => text,
+                    other => panic!("text blocks alone, got {other:?}"),
+                })
+                .collect(),
+            UserContent::String(text) => vec![text],
+        };
+        Some((texts, source_tool_use_id))
+    }
+
+    fn reply(call_id: &str, index: usize, question: &str, answer: &str) -> Value {
+        json!({
+            "answer": answer,
+            "question": question,
+            "questionItemId": json!(["request_user_input_async", call_id, index]).to_string(),
+        })
+    }
+
+    fn envelope(replies: Value) -> String {
+        format!(
+            "<send_user_message_question_reply>\n{replies}\n</send_user_message_question_reply>"
+        )
+    }
+
+    #[test]
+    fn answer_to_question_reads_as_quote_and_answer_naming_its_call() {
+        let text = envelope(json!([reply(
+            "call_q",
+            0,
+            "Is it running?",
+            "Yes\nsince noon"
+        )]));
+
+        assert_eq!(
+            read_user_message(&text),
+            Some((
+                vec!["> Is it running?\n\nYes\nsince noon".to_owned()],
+                Some("call_q".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn answers_to_several_questions_read_as_one_block_each() {
+        let one_call = envelope(json!([
+            reply("call_q", 0, "Which profile?", "warm idle"),
+            reply("call_q", 1, "Keep recording?", "Yes"),
+        ]));
+
+        let expected_texts = vec![
+            "> Which profile?\n\nwarm idle".to_owned(),
+            "> Keep recording?\n\nYes".to_owned(),
+        ];
+        assert_eq!(
+            read_user_message(&one_call),
+            Some((expected_texts, Some("call_q".to_owned())))
+        );
+    }
+
+    #[test]
+    fn answers_to_two_calls_dont_name_either() {
+        let two_calls = envelope(json!([
+            reply("call_q", 0, "Which profile?", "warm idle"),
+            reply("call_r", 0, "Ship it?", "No"),
+        ]));
+
+        assert_eq!(
+            read_user_message(&two_calls).map(|(_, call)| call),
+            Some(None),
+            "answers to two calls name neither"
+        );
+    }
+
+    #[test]
+    fn answer_as_one_reply_with_plain_id_names_that_id() {
+        let text =
+            envelope(json!({"answer": "Yes", "question": "Ship it?", "questionItemId": "call_q"}));
+
+        assert_eq!(
+            read_user_message(&text),
+            Some((
+                vec!["> Ship it?\n\nYes".to_owned()],
+                Some("call_q".to_owned())
+            ))
+        );
+    }
+
+    #[test]
+    fn quoted_envelope_stays_text_and_malformed_one_is_dropped() {
+        let quoted = format!(
+            "user: {}",
+            envelope(json!([reply("call_q", 0, "Ship it?", "Yes")]))
+        );
+        assert_eq!(
+            read_user_message(&quoted),
+            Some((vec![quoted.clone()], None))
+        );
+        assert_eq!(read_user_message(&envelope(json!({"answer": "Yes"}))), None);
+    }
+
+    #[test]
+    fn malformed_reply_envelope_counts_as_failed_record() {
+        let record: Value =
+            serde_json::from_str(&user_message(&envelope(json!({"answer": "Yes"})))).unwrap();
+        let mut dropped = DroppedRecords::counting();
+
+        let entry = normalize_line(
+            record.as_object().unwrap(),
+            &mut RecordState::before_records(OwnHistory::Started),
+            &mut dropped,
+        );
+
+        assert!(entry.is_none(), "the malformed envelope is dropped");
+        assert_eq!(
+            dropped.counts().collect::<Vec<_>>(),
+            [(
+                None,
+                "send_user_message_question_reply",
+                DropOutcome::Failed,
+                1
+            )]
+        );
     }
 
     const QUESTION_ARGUMENTS: &str =

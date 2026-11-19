@@ -23,7 +23,8 @@ pub enum LogEntry {
         #[serde(default, rename = "parent_tool_use_id")]
         parent_tool_use_id: Option<String>,
         /// The call this message answers. Claude Code sets it to the `Skill`
-        /// call on the skill text it records after loading a skill.
+        /// call on the skill text it records after loading a skill; the
+        /// Codex reader, to the question call a user's answer names.
         #[serde(
             default,
             rename = "sourceToolUseID",
@@ -326,6 +327,35 @@ impl Tool {
             noun,
             plural_noun,
         }
+    }
+}
+
+/// The user's answer to a question an agent asked, as a text block of the
+/// user's message holds it: the question as a one-line quote, a blank line,
+/// then the answer. Codex writes this form itself when the question's id is
+/// over 512 bytes.
+pub struct QuotedAnswer<'a> {
+    pub question: &'a str,
+    pub answer: &'a str,
+}
+
+/// The most bytes of a question's title Codex quotes in an answer.
+const QUOTED_QUESTION_BYTE_LIMIT: usize = 512;
+
+impl QuotedAnswer<'_> {
+    pub fn text(&self) -> String {
+        format!(
+            "> {}\n\n{}",
+            Self::quoted_question(self.question),
+            self.answer
+        )
+    }
+
+    /// `title` as Codex quotes it in an answer: truncated to 512 bytes at a
+    /// character boundary, its line breaks as spaces.
+    pub fn quoted_question(title: &str) -> String {
+        let end = title.floor_char_boundary(QUOTED_QUESTION_BYTE_LIMIT);
+        title[..end].replace(['\n', '\r'], " ")
     }
 }
 
@@ -885,5 +915,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn quoted_question_is_truncated_at_character_boundary_with_line_breaks_as_spaces() {
+        let title = format!("{}é\nrest", "x".repeat(511));
+
+        assert_eq!(
+            QuotedAnswer::quoted_question(&title),
+            "x".repeat(511),
+            "the two-byte `é` would end past byte 512"
+        );
+        assert_eq!(
+            QuotedAnswer::quoted_question("Keep recording\r\nonce warm?"),
+            "Keep recording  once warm?"
+        );
     }
 }

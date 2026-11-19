@@ -214,6 +214,12 @@
 
 #### Codex
 
+- Fix the user's answer to a question Codex asked while it kept working
+  (`request_user_input_async`) missing from the viewer, exports, `agent read`
+  and search. It now shows as the user's message, the question quoted above
+  the answer.
+  - In a session with answers, later `agent read` message numbers rise by
+    one per answer message.
 - Fix a question to the user, a message from another agent and `sleep`
   showing as the call's name over raw JSON in the viewer and exports, and as
   `tool <name> input_keys=…` in `agent read` and search:

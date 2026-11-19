@@ -1190,6 +1190,24 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "function_call_output", "id": "fco_question", "call_id": "call_question", "output": "{\"accepted\":true}"}),
                     ),
+                    // The two questions answered in separate messages.
+                    line(
+                        26,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_answer_1", "role": "user", "content": [{"type": "input_text", "text": "<send_user_message_question_reply>\n[{\"answer\":\"PICKED_OPTION_SENTINEL: warm idle\",\"question\":\"QUESTION_TITLE_SENTINEL: which profile?\",\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"call_question\\\",0]\"}]\n</send_user_message_question_reply>"}]}),
+                    ),
+                    line(
+                        27,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_answer_2", "role": "user", "content": [{"type": "input_text", "text": "<send_user_message_question_reply>\n[{\"answer\":\"Yes, until I stop it.\\nTYPED_ANSWER_SENTINEL: then save the log.\",\"question\":\"Keep recording once warm?\",\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"call_question\\\",1]\"}]\n</send_user_message_question_reply>"}]}),
+                    ),
+                    // An envelope quoted after other text, as a parent passes
+                    // one on to a sub-agent.
+                    line(
+                        28,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_quoted_answer", "role": "user", "content": [{"type": "input_text", "text": "user: <send_user_message_question_reply>\n[{\"answer\":\"QUOTED_ENVELOPE_SENTINEL\",\"question\":\"Ship it?\",\"questionItemId\":\"call_other\"}]\n</send_user_message_question_reply>"}]}),
+                    ),
                 ],
             );
             const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time";
@@ -1256,6 +1274,9 @@ pub(super) mod tests {
                     Marker::shown("question's option", "QUESTION_OPTION_SENTINEL")
                         .in_summary_row(PATCH_RUN),
                     Marker::shown("question shown to the user", "shown to the user"),
+                    Marker::shown("answer to a question", "PICKED_OPTION_SENTINEL"),
+                    Marker::shown("typed answer to a question", "TYPED_ANSWER_SENTINEL"),
+                    Marker::shown("quoted reply envelope", "QUOTED_ENVELOPE_SENTINEL"),
                     Marker::shown("message to an agent", "SEND_MESSAGE_SENTINEL")
                         .in_summary_row(PATCH_RUN),
                 ],
