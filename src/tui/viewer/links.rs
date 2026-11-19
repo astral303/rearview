@@ -1,5 +1,7 @@
-//! Each sub-agent's label, and the sub-agent each `spawn_agent` call started,
-//! collected as the viewer loads a conversation.
+//! The values a row reads from other entries of the conversation: each
+//! sub-agent's label, the sub-agent each `spawn_agent` call started, and
+//! the calls that message an agent, collected as the viewer loads a
+//! conversation.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -16,7 +18,7 @@ use super::style::subagent_label;
 use super::tools::tool_result_display_text;
 
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct SubagentRoster {
+pub(crate) struct ConversationLinks {
     /// The label of each sub-agent whose provider recorded a nickname, by the
     /// sub-agent's key (its `parent_tool_use_id`).
     labels: HashMap<String, String>,
@@ -29,20 +31,20 @@ pub(crate) struct SubagentRoster {
     message_calls: HashSet<String>,
 }
 
-impl SubagentRoster {
-    /// A roster with a label for each sub-agent in `identities`, by its key.
+impl ConversationLinks {
+    /// Links with a label for each sub-agent in `identities`, by its key.
     /// The first identity recorded for a key or a task path stays.
     pub(crate) fn from_identities<'a>(
         identities: impl IntoIterator<Item = (&'a str, &'a SubagentIdentity)>,
     ) -> Self {
-        let mut roster = Self::default();
+        let mut links = Self::default();
         for (key, identity) in identities {
-            roster.record_identity(key, identity);
+            links.record_identity(key, identity);
         }
-        roster
+        links
     }
 
-    /// A roster with each of `recorded`, in record order.
+    /// Links with each of `recorded`, in record order.
     pub(crate) fn from_recorded(recorded: &[RecordedIdentity]) -> Self {
         Self::from_identities(
             recorded
@@ -148,20 +150,20 @@ impl SubagentRoster {
     }
 }
 
-/// The values of a [`SubagentRoster`] that differ in a newer roster of the
+/// The values of a [`ConversationLinks`] that differ in newer links of the
 /// conversation. It leaves out agent calls: a kept result's agent type
 /// changes only when a later call reuses its call id.
-pub(super) struct RosterChanges {
-    /// True when a sub-agent the shown roster labels has another label, or
-    /// none, in the newer roster.
+pub(super) struct LinkChanges {
+    /// True when a sub-agent the shown links label has another label, or
+    /// none, in the newer links.
     relabelled: bool,
-    /// The sub-agent keys only the newer roster labels.
+    /// The sub-agent keys only the newer links label.
     new_labels: HashSet<String>,
     agent_paths: HashSet<String>,
 }
 
-impl RosterChanges {
-    pub(super) fn between(shown: &SubagentRoster, newer: &SubagentRoster) -> Self {
+impl LinkChanges {
+    pub(super) fn between(shown: &ConversationLinks, newer: &ConversationLinks) -> Self {
         Self {
             relabelled: shown
                 .labels

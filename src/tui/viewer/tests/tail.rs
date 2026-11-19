@@ -33,7 +33,7 @@ impl<'a> ShownCopy<'a> {
         let kept = entries.partition_point(|parsed| parsed.entry_index < first_changed);
         ShownRender {
             replaced: &entries[kept..],
-            roster: &self.conversation.roster,
+            links: &self.conversation.links,
             messages: self.messages,
             options: self.options,
         }
@@ -661,8 +661,8 @@ fn session_agent_named_in_tail_renders_summary_mode_whole() {
 }
 
 /// The first `count` entries of a sub-agent's turn, keyed `toolu_parent`,
-/// between two exchanges, with `roster`.
-fn sub_agent_turn_between_exchanges(count: usize, roster: SubagentRoster) -> ParsedConversation {
+/// between two exchanges, with `links`.
+fn sub_agent_turn_between_exchanges(count: usize, links: ConversationLinks) -> ParsedConversation {
     let mut entries = vec![
         stamped_message(0, "user", &day_one(), "first question"),
         stamped_message(1, "assistant", &day_one_later(), "first answer"),
@@ -672,14 +672,14 @@ fn sub_agent_turn_between_exchanges(count: usize, roster: SubagentRoster) -> Par
     ];
     entries.truncate(count);
     ParsedConversation {
-        roster,
+        links,
         ..conversation_of(entries)
     }
 }
 
-/// A roster labelling the sub-agent `toolu_parent` with `nickname`.
-fn roster_naming(nickname: &str) -> SubagentRoster {
-    SubagentRoster::from_identities([(
+/// Links labelling the sub-agent `toolu_parent` with `nickname`.
+fn links_naming(nickname: &str) -> ConversationLinks {
+    ConversationLinks::from_identities([(
         "toolu_parent",
         &SubagentIdentity {
             nickname: Some(nickname.to_owned()),
@@ -688,13 +688,13 @@ fn roster_naming(nickname: &str) -> SubagentRoster {
     )])
 }
 
-/// A label for a shown sub-agent, new in the changed roster: the tail starts
+/// A label for a shown sub-agent, new in the changed links: the tail starts
 /// at the sub-agent's turn while it shows, and at the message before it
 /// while thinking is hidden.
 #[test]
 fn new_label_of_shown_sub_agent_renders_from_its_turn_as_whole_render() {
-    let shown = sub_agent_turn_between_exchanges(4, SubagentRoster::default());
-    let changed = sub_agent_turn_between_exchanges(5, roster_naming("Lorentz"));
+    let shown = sub_agent_turn_between_exchanges(4, ConversationLinks::default());
+    let changed = sub_agent_turn_between_exchanges(5, links_naming("Lorentz"));
 
     let starts =
         assert_change_renders_as_whole_render("new label", &shown, &WholeRenders::of(&changed), 4);
@@ -710,12 +710,12 @@ fn new_label_of_shown_sub_agent_renders_from_its_turn_as_whole_render() {
     );
 }
 
-/// The shown roster's sub-agent with another label in the changed roster:
+/// The sub-agent the shown links label, with another label in the changed links:
 /// the whole conversation renders again.
 #[test]
 fn relabelled_sub_agent_renders_whole() {
-    let shown = sub_agent_turn_between_exchanges(4, roster_naming("Lorentz"));
-    let changed = sub_agent_turn_between_exchanges(5, roster_naming("Hubble"));
+    let shown = sub_agent_turn_between_exchanges(4, links_naming("Lorentz"));
+    let changed = sub_agent_turn_between_exchanges(5, links_naming("Hubble"));
 
     let starts =
         assert_change_renders_as_whole_render("relabelled", &shown, &WholeRenders::of(&changed), 4);

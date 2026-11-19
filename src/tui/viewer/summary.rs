@@ -10,7 +10,7 @@ use super::calls::{
 };
 use super::connectors::lane_color;
 use super::ledger::{LedgerRow, NameCol, RowContent, push_row, wrap_row};
-use super::roster::SubagentRoster;
+use super::links::ConversationLinks;
 use super::style::{USER_LABEL, assistant_label};
 use super::timing::TimingSlot;
 use super::tools::{
@@ -73,9 +73,9 @@ impl PendingToolSummary {
 
     /// The label the run collapses under, and the colour it prints in: the
     /// user's own, or the agent's for the entries the run holds.
-    pub(super) fn label(&self, roster: &SubagentRoster) -> Cow<'_, str> {
+    pub(super) fn label(&self, links: &ConversationLinks) -> Cow<'_, str> {
         match (&self.author, self.parent_id.as_deref()) {
-            (_, Some(parent)) => Cow::Owned(roster.label(parent)),
+            (_, Some(parent)) => Cow::Owned(links.label(parent)),
             (RunAuthor::User, None) => Cow::Borrowed(USER_LABEL),
             (RunAuthor::Agent(agent), None) => assistant_label(None, agent.as_deref()),
         }
@@ -391,19 +391,19 @@ fn render_summary_group_details(
     lines: &mut Vec<RenderedLine>,
     calls: &mut Vec<CallRange>,
     entries: &[RenderableEntry],
-    roster: &SubagentRoster,
+    links: &ConversationLinks,
     pending: &PendingToolSummary,
     options: &RenderOptions,
 ) {
     let mut rendered_any = false;
     let lanes = Lanes::of(
         run_tool_blocks(entries, pending).map(|entry_block| entry_block.block),
-        roster,
+        links,
     );
     let mut call_ranges = CallRanges::new(&lanes);
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
     let parent_id = pending.parent_id.as_deref();
-    let label = pending.label(roster);
+    let label = pending.label(links);
     let label_color = pending.label_color();
     for EntryToolBlock {
         parsed,
@@ -464,7 +464,7 @@ fn render_summary_group_details(
                 content,
                 standalone_tool_name,
             } => {
-                let Some(content_str) = roster.result_text(tool_use_id, content) else {
+                let Some(content_str) = links.result_text(tool_use_id, content) else {
                     continue;
                 };
                 let start_line = start_block(lines, &mut rendered_any);
@@ -595,7 +595,7 @@ pub(super) fn flush_tool_summary(
     rendered: &mut RenderedConversation,
     pending: &mut Option<PendingToolSummary>,
     entries: &[RenderableEntry],
-    roster: &SubagentRoster,
+    links: &ConversationLinks,
     options: &RenderOptions,
 ) {
     let Some(pending) = pending.take() else {
@@ -603,7 +603,7 @@ pub(super) fn flush_tool_summary(
     };
 
     let start_line = rendered.lines.len();
-    let label = pending.label(roster);
+    let label = pending.label(links);
     let ts = if options.show_timing {
         pending
             .started_at
@@ -638,7 +638,7 @@ pub(super) fn flush_tool_summary(
             &mut rendered.lines,
             &mut rendered.calls,
             entries,
-            roster,
+            links,
             &pending,
             options,
         );

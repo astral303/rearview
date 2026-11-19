@@ -15,7 +15,7 @@ use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, RECAP_LABEL, Tool, UserContent, UserMessage,
 };
 use crate::tool_format;
-use crate::tui::viewer::{BlockLocation, SubagentRoster, user_text};
+use crate::tui::viewer::{BlockLocation, ConversationLinks, user_text};
 use chrono::DateTime;
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;
@@ -484,14 +484,14 @@ pub(crate) fn export_content(
 /// for each sub-agent's rows.
 struct ExportedConversation {
     entries: Vec<LogEntry>,
-    roster: SubagentRoster,
+    links: ConversationLinks,
 }
 
 impl ExportedConversation {
     /// `[↳label] ` before a sub-agent's row; empty for the session's own.
     fn subagent_prefix(&self, parent_tool_use_id: &Option<String>) -> String {
         match parent_tool_use_id {
-            Some(id) => format!("[{}] ", self.roster.label(id)),
+            Some(id) => format!("[{}] ", self.links.label(id)),
             None => String::new(),
         }
     }
@@ -500,7 +500,7 @@ impl ExportedConversation {
 impl From<DisplayEntries> for ExportedConversation {
     fn from(displayed: DisplayEntries) -> Self {
         Self {
-            roster: SubagentRoster::from_recorded(&displayed.subagent_identities),
+            links: ConversationLinks::from_recorded(&displayed.subagent_identities),
             entries: displayed.entries,
         }
     }
@@ -674,7 +674,7 @@ fn ledger_text(conversation: &ExportedConversation, options: ExportOptions) -> S
                 }
                 let (user_speaker, text) = user_speaker_and_text(message);
                 let speaker = match parent_tool_use_id {
-                    Some(id) => conversation.roster.label(id),
+                    Some(id) => conversation.links.label(id),
                     None => user_speaker.to_string(),
                 };
                 if let Some(text) = text {
@@ -713,7 +713,7 @@ fn ledger_text(conversation: &ExportedConversation, options: ExportOptions) -> S
                     continue;
                 }
                 let speaker = match parent_tool_use_id {
-                    Some(id) => conversation.roster.label(id),
+                    Some(id) => conversation.links.label(id),
                     None => agent.as_deref().unwrap_or("Claude").to_owned(),
                 };
                 for block in &message.content {

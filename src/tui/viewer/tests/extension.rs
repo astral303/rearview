@@ -9,7 +9,7 @@ use super::*;
 /// `changed`, a newer copy's entries, from the entry numbered
 /// `first_changed` on: it equals the conversation of `changed` in every
 /// field, and the extension returns the shown copy's replaced entries,
-/// their origins and its roster.
+/// their origins and its links.
 fn assert_extension_equals_whole_read<E: Clone>(
     case: &str,
     shown: &[E],
@@ -41,16 +41,16 @@ fn assert_extension_equals_whole_read<E: Clone>(
     );
     assert!(
         replaced.origins == shown_copy.origins[first_changed..]
-            && replaced.roster_before(&conversation) == &shown_copy.roster,
+            && replaced.links_before(&conversation) == &shown_copy.links,
         "{case}, changed from entry {first_changed}: the extension returns the replaced \
-         origins and the roster before it"
+         origins and the links before it"
     );
 }
 
-/// The extension returns the roster it replaced, and doesn't return the
-/// lanes or the activity span: the test reads the roster alone.
+/// The extension returns the links it replaced, and doesn't return the
+/// lanes or the activity span: the test reads the links alone.
 #[test]
-fn extension_without_changed_entries_doesnt_replace_roster() {
+fn extension_without_changed_entries_doesnt_replace_links() {
     for (name, entries) in every_agents_stored_entries() {
         let mut conversation = parsed_conversation(entries.clone().into());
         let tail = ConversationTail::of(entries.len(), entries[entries.len()..].to_vec().into());
@@ -58,8 +58,8 @@ fn extension_without_changed_entries_doesnt_replace_roster() {
         let replaced = conversation.extend_with(tail);
 
         assert!(
-            replaced.roster.is_none(),
-            "{name}: an extension without changed entries keeps the conversation's roster"
+            replaced.links.is_none(),
+            "{name}: an extension without changed entries keeps the conversation's links"
         );
     }
 }

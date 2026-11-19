@@ -24,7 +24,7 @@ pub(crate) fn fields_differing(
         entries,
         origins,
         subagent_identities,
-        roster,
+        links,
         lanes,
         activity_span,
     } = conversation;
@@ -38,7 +38,7 @@ pub(crate) fn fields_differing(
             "sub-agent identities",
             subagent_identities == &whole.subagent_identities,
         ),
-        ("roster", roster == &whole.roster),
+        ("links", links == &whole.links),
         ("lanes", lanes == &whole.lanes),
         (
             "activity span",
@@ -105,22 +105,22 @@ fn read_bare_file(file_path: &Path) -> ParsedConversation {
     .unwrap()
 }
 
-/// Entries rendered with an empty roster keep their ID labels.
+/// Entries rendered with empty links keep their ID labels.
 fn render_parsed_entries(
     entries: &[RenderableEntry],
     options: &RenderOptions,
 ) -> RenderedConversation {
-    render_to_end(entries, &SubagentRoster::default(), options)
+    render_to_end(entries, &ConversationLinks::default(), options)
 }
 
-/// `entries` rendered with `roster` and `options`, without a stop.
+/// `entries` rendered with `links` and `options`, without a stop.
 fn render_to_end(
     entries: &[RenderableEntry],
-    roster: &SubagentRoster,
+    links: &ConversationLinks,
     options: &RenderOptions,
 ) -> RenderedConversation {
-    let lanes = Lanes::of(top_level_tool_blocks(entries), roster);
-    render_entries(entries, roster, &lanes, options, &|| true)
+    let lanes = Lanes::of(top_level_tool_blocks(entries), links);
+    render_entries(entries, links, &lanes, options, &|| true)
         .expect("a render that keeps going finishes")
 }
 
@@ -139,7 +139,7 @@ fn render_stop_checks(entries: usize, answers: &[bool]) -> (usize, bool) {
     let calls = std::cell::Cell::new(0);
     let finished = render_entries(
         &entries,
-        &SubagentRoster::default(),
+        &ConversationLinks::default(),
         &Lanes::default(),
         &test_render_options(ToolDisplayMode::Full),
         &|| {
@@ -1209,19 +1209,19 @@ fn agent_call_answered_by(
     ]
 }
 
-/// A roster holding the agent calls of `entries` and no sub-agent identity.
-fn roster_of(entries: &[RenderableEntry]) -> SubagentRoster {
-    let mut roster = SubagentRoster::default();
+/// Links holding the agent calls of `entries` and no sub-agent identity.
+fn links_of(entries: &[RenderableEntry]) -> ConversationLinks {
+    let mut links = ConversationLinks::default();
     for parsed in entries {
-        roster.record_agent_calls(&parsed.entry);
+        links.record_agent_calls(&parsed.entry);
     }
-    roster
+    links
 }
 
-fn render_with_roster(entries: &[RenderableEntry], roster: &SubagentRoster) -> String {
+fn render_with_links(entries: &[RenderableEntry], links: &ConversationLinks) -> String {
     rendered_text(&render_to_end(
         entries,
-        roster,
+        links,
         &test_render_options(ToolDisplayMode::Full),
     ))
 }
@@ -1242,8 +1242,8 @@ fn spawn_agent_result_shows_its_path_alone_without_nicknamed_matching_sub_agent(
         r#"{"task_name":"/root/unnamed"}"#,
     ))
     .collect();
-    let mut roster = roster_of(&entries);
-    roster.record_identity(
+    let mut links = links_of(&entries);
+    links.record_identity(
         SUB_AGENT_THREAD,
         &crate::log_entry::SubagentIdentity {
             nickname: None,
@@ -1253,7 +1253,7 @@ fn spawn_agent_result_shows_its_path_alone_without_nicknamed_matching_sub_agent(
         },
     );
 
-    let text = render_with_roster(&entries, &roster);
+    let text = render_with_links(&entries, &links);
 
     assert!(text.contains("/root/ghost"), "{text}");
     assert!(text.contains("/root/unnamed"), "{text}");
@@ -1270,7 +1270,7 @@ fn spawn_agent_result_with_other_output_shows_whole() {
         r#"{"task_name":"/root/extra","note":"queued"}"#,
     );
 
-    let text = render_with_roster(&entries, &roster_of(&entries));
+    let text = render_with_links(&entries, &links_of(&entries));
 
     assert!(text.contains(r#""note":"queued""#), "{text}");
 }
@@ -1283,8 +1283,8 @@ fn spawn_agent_result_takes_calls_agent_type_when_sub_agent_records_no_role() {
         serde_json::json!({"agent_type": "grunt"}),
         r#"{"task_name":"/root/scout"}"#,
     );
-    let mut roster = roster_of(&entries);
-    roster.record_identity(
+    let mut links = links_of(&entries);
+    links.record_identity(
         SUB_AGENT_THREAD,
         &crate::log_entry::SubagentIdentity {
             nickname: Some("Lorentz".to_owned()),
@@ -1294,7 +1294,7 @@ fn spawn_agent_result_takes_calls_agent_type_when_sub_agent_records_no_role() {
         },
     );
 
-    let text = render_with_roster(&entries, &roster);
+    let text = render_with_links(&entries, &links);
 
     assert!(text.contains("Lorentz (grunt) · /root/scout"), "{text}");
 }

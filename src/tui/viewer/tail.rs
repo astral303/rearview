@@ -8,8 +8,8 @@ use std::collections::HashSet;
 use crate::log_entry::{ContentBlock, LogEntry};
 
 use super::days::DayLabels;
+use super::links::{ConversationLinks, LinkChanges};
 use super::rerender::{ReplacedRows, SPARE_ROWS_AFTER_GROWTH, ShownRows};
-use super::roster::{RosterChanges, SubagentRoster};
 use super::{
     CallRange, MessageRange, ParsedConversation, RenderOptions, RenderableEntry,
     RenderedConversation, RenderedLine, ReplacedEntries, session_agent,
@@ -17,11 +17,11 @@ use super::{
 
 /// The rows the viewer shows of an earlier copy of a conversation, and the
 /// values of that copy the newer copy doesn't have: its entries from the
-/// first changed entry on, and its roster. The entries before the first
+/// first changed entry on, and its links. The entries before the first
 /// changed entry are the newer copy's.
 pub(crate) struct ShownRender<'a> {
     pub(super) replaced: &'a [RenderableEntry],
-    pub(super) roster: &'a SubagentRoster,
+    pub(super) links: &'a ConversationLinks,
     /// The message ranges of the shown rows.
     pub(super) messages: &'a [MessageRange],
     /// The options the shown rows were rendered with.
@@ -40,7 +40,7 @@ impl<'a> ShownRender<'a> {
     ) -> Self {
         Self {
             replaced: &replaced.entries,
-            roster: replaced.roster_before(conversation),
+            links: replaced.links_before(conversation),
             messages,
             options,
         }
@@ -150,7 +150,7 @@ fn move_call_down(call: &mut CallRange, rows: usize) {
 /// value the change alters:
 /// - a call answered at or after the start, in either copy: its lane, its
 ///   connector and its result, and a tool run's late results;
-/// - a sub-agent label new in the changed roster, or a task path whose
+/// - a sub-agent label new in the changed links, or a task path whose
 ///   sub-agent differs in it.
 ///
 /// A copy with the shown copy's entries, with `first_changed` its entry
@@ -158,7 +158,7 @@ fn move_call_down(call: &mut CallRange, rows: usize) {
 ///
 /// The whole conversation renders again when the options differ from the
 /// shown render's, when summary mode's runs of received results would show
-/// another session agent, when a sub-agent the shown roster labels gets
+/// another session agent, when a sub-agent the shown links label gets
 /// another label, and when the start is the first entry. The session agent
 /// the shown rows borrowed is the first that the entries before the first
 /// changed entry name, or else the first of the replaced entries.
@@ -168,7 +168,7 @@ pub(crate) fn tail_render_start(
     first_changed: usize,
     options: &RenderOptions,
 ) -> RowsToRender {
-    let roster_changes = RosterChanges::between(shown.roster, &conversation.roster);
+    let link_changes = LinkChanges::between(shown.links, &conversation.links);
     let entries = &conversation.entries;
     let kept = entries.partition_point(|parsed| parsed.entry_index < first_changed);
     let shows_another_session_agent = || {
@@ -178,11 +178,11 @@ pub(crate) fn tail_render_start(
     };
     if shown.options != options
         || (options.tool_display.is_summary() && shows_another_session_agent())
-        || roster_changes.relabels_shown_sub_agent()
+        || link_changes.relabels_shown_sub_agent()
     {
         return RowsToRender::Whole;
     }
-    let start_before = first_roster_reader(&roster_changes, &entries[..kept])
+    let start_before = first_link_reader(&link_changes, &entries[..kept])
         .map_or(first_changed, |reader| reader.entry_index + 1);
     let Some((message, first)) =
         start_answering_every_call(&shown, conversation, first_changed, start_before)
@@ -195,9 +195,9 @@ pub(crate) fn tail_render_start(
     })
 }
 
-/// The first of `kept` whose rows read a roster value in `changes`.
-fn first_roster_reader<'a>(
-    changes: &RosterChanges,
+/// The first of `kept` whose rows read a linked value in `changes`.
+fn first_link_reader<'a>(
+    changes: &LinkChanges,
     kept: &'a [RenderableEntry],
 ) -> Option<&'a RenderableEntry> {
     if changes.is_empty() {
