@@ -120,7 +120,8 @@
     to its message.
   - A message that is one paragraph, one heading or one table doesn't have
     blocks to focus: copying the block would copy the message.
-- Add a light background to the rows the `▌` marks in message navigation.
+- Add a background highlight to the currently selected rows (`▌` marks) in
+  message navigation.
 
 ### Fixes
 
