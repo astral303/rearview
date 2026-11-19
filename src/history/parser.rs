@@ -1955,13 +1955,92 @@ pub(crate) fn is_clear_only_conversation(user_messages: &[String]) -> bool {
 
 pub(crate) fn normalize_whitespace(s: &str) -> String {
     let mut normalized = String::with_capacity(s.len());
-    for word in s.split_whitespace() {
-        if !normalized.is_empty() {
-            normalized.push(' ');
-        }
-        normalized.push_str(word);
-    }
+    push_whitespace_normalized(&mut normalized, s);
     normalized
+}
+
+/// Appends `text` to `normalized` with each run of whitespace one space and
+/// without whitespace at either end. Finds whitespace byte by byte, without
+/// decoding each character, and copies the text between two changed runs at
+/// once: the list's first read normalises every text the cache stores, and
+/// most runs are one space already.
+pub(crate) fn push_whitespace_normalized(normalized: &mut String, text: &str) {
+    let bytes = text.as_bytes();
+    let mut unchanged_from = whitespace_run_end(bytes, 0);
+    let mut searched_from = unchanged_from;
+    while let Some(run_start) = next_whitespace(bytes, searched_from) {
+        let run_end = whitespace_run_end(bytes, run_start);
+        if run_end == bytes.len() {
+            normalized.push_str(&text[unchanged_from..run_start]);
+            return;
+        }
+        if run_end - run_start > 1 || bytes[run_start] != b' ' {
+            normalized.push_str(&text[unchanged_from..run_start]);
+            normalized.push(' ');
+            unchanged_from = run_end;
+        }
+        searched_from = run_end;
+    }
+    normalized.push_str(&text[unchanged_from..]);
+}
+
+/// True for each byte a whitespace character's UTF-8 encoding starts with
+/// (see [`whitespace_len`]).
+const STARTS_WHITESPACE: [bool; 256] = {
+    let mut starts = [false; 256];
+    let first_bytes = [
+        b'\t', b'\n', 0x0B, 0x0C, b'\r', b' ', 0xC2, 0xE1, 0xE2, 0xE3,
+    ];
+    let mut index = 0;
+    while index < first_bytes.len() {
+        starts[first_bytes[index] as usize] = true;
+        index += 1;
+    }
+    starts
+};
+
+/// The position of the first whitespace character in `bytes` at or after
+/// `from`.
+fn next_whitespace(bytes: &[u8], mut from: usize) -> Option<usize> {
+    loop {
+        let candidate = from
+            + bytes[from..]
+                .iter()
+                .position(|&byte| STARTS_WHITESPACE[usize::from(byte)])?;
+        if whitespace_len(&bytes[candidate..]) > 0 {
+            return Some(candidate);
+        }
+        from = candidate + 1;
+    }
+}
+
+/// The position after the run of whitespace in `bytes` at `from`; `from`
+/// when a run doesn't start there.
+fn whitespace_run_end(bytes: &[u8], mut from: usize) -> usize {
+    loop {
+        let length = whitespace_len(&bytes[from..]);
+        if length == 0 {
+            return from;
+        }
+        from += length;
+    }
+}
+
+/// The byte length of the whitespace character `bytes` start with; 0 when
+/// they start with another character or are empty. Matches the UTF-8
+/// encoding of each character [`char::is_whitespace`] accepts: U+0009 to
+/// U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000 to U+200A, U+2028,
+/// U+2029, U+202F, U+205F and U+3000.
+fn whitespace_len(bytes: &[u8]) -> usize {
+    match bytes {
+        [b'\t'..=b'\r' | b' ', ..] => 1,
+        [0xC2, 0x85 | 0xA0, ..] => 2,
+        [0xE1, 0x9A, 0x80, ..]
+        | [0xE2, 0x80, 0x80..=0x8A | 0xA8 | 0xA9 | 0xAF, ..]
+        | [0xE2, 0x81, 0x9F, ..]
+        | [0xE3, 0x80, 0x80, ..] => 3,
+        _ => 0,
+    }
 }
 
 /// `text` as `full_text` keeps it: terminal codes and control characters
@@ -2536,6 +2615,58 @@ mod tests {
             "hello world"
         );
         assert_eq!(normalize_whitespace(""), "");
+    }
+
+    #[test]
+    fn whitespace_len_matches_each_character_char_is_whitespace_accepts() {
+        let mut encoded = [0; 4];
+        for character in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let bytes = character.encode_utf8(&mut encoded).as_bytes();
+            let expected = if character.is_whitespace() {
+                bytes.len()
+            } else {
+                0
+            };
+            assert_eq!(
+                whitespace_len(bytes),
+                expected,
+                "{character:?} matches as `char::is_whitespace` accepts it"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_normalised_text_equals_its_words_joined_by_one_space() {
+        let whitespace = (0..=u32::from(char::MAX))
+            .filter_map(char::from_u32)
+            .filter(|character| character.is_whitespace())
+            .collect::<String>();
+        let mut texts = vec![
+            String::new(),
+            whitespace.clone(),
+            format!("{whitespace}word{whitespace}"),
+            "two  words\n\n\tand\u{3000}\u{3000}more \u{a0}".to_owned(),
+        ];
+        // Each text contains runs of one whitespace character beside
+        // U+00A2, U+1681, U+2010 and U+3001, whose first bytes match a
+        // whitespace character's, and beside `é` and `本`.
+        for space in whitespace.chars() {
+            texts.push(format!(
+                "{space}{space}\u{a2}{space}\u{1681}{space}{space}\u{2010}é{space}\u{3001}日本{space}"
+            ));
+        }
+        for text in texts {
+            let mut normalized = "kept".to_owned();
+            push_whitespace_normalized(&mut normalized, &text);
+            assert_eq!(
+                normalized,
+                format!(
+                    "kept{}",
+                    text.split_whitespace().collect::<Vec<_>>().join(" ")
+                ),
+                "{text:?} follows the kept text as its words joined by one space"
+            );
+        }
     }
 
     #[test]

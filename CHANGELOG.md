@@ -29,8 +29,8 @@
   - While sessions' texts are read again after a refresh, the search bar
     shows ` · N sessions updating`. Until a session's read ends, the search
     matches its earlier texts.
-  - Reading those texts takes about 5–6x as long as before. The list loads
-    faster, and becomes searchable about 1.2x sooner after launch.
+  - Reading those texts takes about 6–7x as long as before. The list loads
+    faster, and becomes searchable about 1.1x sooner after launch.
 - Speed up the session list's search for lowercase quoted text containing `k`
   or `i` about 2–3x per keystroke when a result contains a Kelvin sign
   (U+212A) or a dotted capital I (`İ`) (on one example corpus). Sessions

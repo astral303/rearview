@@ -1,7 +1,8 @@
-//! Query words counted in a stored text as they occur in the text after
+//! Query words counted in a search text as they occur in the text after
 //! normalisation: each run of whitespace one space, lowercased, and each word
-//! separator a space. The stored text, which the session cache stores without
-//! terminal codes, is never normalised.
+//! separator a space. The count reads the text without normalising it:
+//! `agent search` passes the text as the session cache stores it, without
+//! terminal codes, and the session list passes it with whitespace normalised.
 //!
 //! An ASCII word is found by a byte search that ignores ASCII case. Text
 //! holding a character lowercasing to ASCII follows the exact path, one

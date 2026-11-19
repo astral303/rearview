@@ -1,10 +1,12 @@
 //! Each listed session's search texts, read from the session cache into
 //! memory, so a search of the list scans memory instead of reading the
-//! cache. The texts stay as the cache stores them.
+//! cache. The read normalises each text's whitespace as the parse does: a
+//! row read from the cache then shows the context line a parsed row shows.
 
 use crate::error::Result;
 use crate::history::Conversation;
 use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
+use crate::history::parser::push_whitespace_normalized;
 use crate::history::sqlite_cache::{
     CachedSession, CopyKey, CopyMiss, CopyRead, HeldCopy, ReadOrder, ScannedCopy, ScannedRow,
     SearchField, SessionKey, StoredAppend, TextVisitor, is_one_numbering,
@@ -17,12 +19,12 @@ use std::collections::HashMap;
 use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 
-/// One session's search texts, as the session cache stores them: the
-/// dialogue, then sub-agents' text, the sub-agent metadata, and thinking and
-/// tool calls. Each field holds the text outside every message, then each
-/// message's texts in message order, each after a separator as `full_text`
-/// lays out its parts. The title and the summary are the row's (see
-/// [`Conversation::title_and_summary_texts`]).
+/// One session's search texts, read from the session cache with whitespace
+/// normalised: the dialogue, then sub-agents' text, the sub-agent metadata,
+/// and thinking and tool calls. Each field contains the text outside every
+/// message, then each message's texts in message order, each after a
+/// separator as `full_text` lays out its parts. The title and the summary
+/// are the row's (see [`Conversation::title_and_summary_texts`]).
 pub struct SessionSearchTexts {
     joined: Arc<str>,
     /// Each text's byte range in `joined`.
@@ -319,10 +321,14 @@ struct TextsInReadOrder {
 }
 
 impl TextsInReadOrder {
+    /// Adds `text` with its whitespace normalised, as the parse lays out a
+    /// row's texts. Drops a text of whitespace alone, as the parse does.
     fn push(&mut self, key: LayoutKey, text: &str) {
         let start = self.text.len();
-        self.text.push_str(text);
-        self.texts.push((key, start..self.text.len()));
+        push_whitespace_normalized(&mut self.text, text);
+        if self.text.len() > start {
+            self.texts.push((key, start..self.text.len()));
+        }
     }
 }
 

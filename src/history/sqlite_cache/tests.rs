@@ -315,13 +315,23 @@ pub(crate) fn parsed_record(
 /// `session`'s row as the catalogue lists it after its parse is written to
 /// the cache in `base`: a row reading its copy.
 pub(crate) fn cached_row(base: &Path, session: &AgentSession) -> Conversation {
+    parsed_and_cached_row(base, session).1
+}
+
+/// `session`'s row as its parse lists it, and as the catalogue lists it
+/// after the parse is written to the cache in `base`.
+pub(crate) fn parsed_and_cached_row(
+    base: &Path,
+    session: &AgentSession,
+) -> (Conversation, Conversation) {
     let cache = admitted_cache(base);
     let source = session.row.source;
     let storage = storage_of(source);
     cache.admit_storage(storage).unwrap();
     let root = root_of(session);
     let stub = stub_of(session, 1);
-    cache.write(&parsed_record(source, &root, &stub)).unwrap();
+    let (record, parsed) = parsed_record_and_row(source, &root, &stub);
+    cache.write(&record).unwrap();
     let CatalogueSession::Listed(listed) = cache
         .catalogue_session(storage, source, &root, &stub.cache_key, false)
         .unwrap()
@@ -329,7 +339,7 @@ pub(crate) fn cached_row(base: &Path, session: &AgentSession) -> Conversation {
     else {
         panic!("the fixture session is listed")
     };
-    *listed
+    (parsed, *listed)
 }
 
 /// Each agent's every-record session cached in one database in `base`, as
