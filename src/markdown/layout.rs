@@ -3,6 +3,8 @@
 //! Produces a backend-neutral LayoutDoc that can be rendered to TUI spans
 //! or ANSI strings via thin sinks.
 
+use std::ops::Range;
+
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -70,6 +72,150 @@ pub struct LineWrap {
 #[derive(Clone, Debug)]
 pub struct LayoutDoc {
     pub lines: Vec<Line>,
+    /// The top-level blocks, in order; empty unless the render recorded
+    /// them ([`LayoutEngine::render_with_blocks`]).
+    pub blocks: Vec<LayoutBlock>,
+}
+
+/// A top-level block of the input: what it is, where its source is, and
+/// the lines it laid out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutBlock {
+    pub kind: BlockKind,
+    /// Bytes of the input.
+    pub source: Range<usize>,
+    /// Indices into [`LayoutDoc::lines`], without the blank line that
+    /// separates the block from the one above.
+    pub lines: Range<usize>,
+    /// The items of a list, in order; empty for any other block. Each item
+    /// holds its nested content.
+    pub items: Vec<LayoutItem>,
+}
+
+/// One item of a top-level list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutItem {
+    /// Bytes of the input, from its bullet or number.
+    pub source: Range<usize>,
+    /// Indices into [`LayoutDoc::lines`].
+    pub lines: Range<usize>,
+}
+
+/// The kinds of top-level block a render records. A thematic break and an
+/// HTML block are not recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    Paragraph,
+    Heading,
+    /// A fenced or indented code block; `code` is its text as the parser
+    /// read it, without the fences or the indent.
+    CodeBlock {
+        code: String,
+    },
+    Quote,
+    List,
+    Table,
+}
+
+impl BlockKind {
+    /// The kind a top-level block opened by `tag` records; `None` for a
+    /// block that isn't recorded.
+    fn opened_by(tag: &Tag) -> Option<Self> {
+        match tag {
+            Tag::Paragraph => Some(Self::Paragraph),
+            Tag::Heading { .. } => Some(Self::Heading),
+            Tag::CodeBlock(_) => Some(Self::CodeBlock {
+                code: String::new(),
+            }),
+            Tag::BlockQuote(_) => Some(Self::Quote),
+            Tag::List(_) => Some(Self::List),
+            Tag::Table(_) => Some(Self::Table),
+            _ => None,
+        }
+    }
+}
+
+/// The top-level blocks of a render, recorded as the parser's events open
+/// and close them.
+#[derive(Default)]
+struct BlockRecorder {
+    /// The tags open around the current event.
+    depth: usize,
+    /// The top-level block the current event is inside.
+    open: Option<LayoutBlock>,
+    blocks: Vec<LayoutBlock>,
+}
+
+impl BlockRecorder {
+    /// Record `event`, whose source is `source`, before the engine lays it
+    /// out. `first_line` is the index of the first line it can lay out,
+    /// after any line still pending, such as an HTML block's, because a
+    /// recorded block or item flushes that line as it starts.
+    fn record_event(&mut self, event: &Event, source: Range<usize>, first_line: usize) {
+        match event {
+            Event::Start(tag) => {
+                let first_lines = first_line..first_line;
+                match self.depth {
+                    0 => {
+                        self.open = BlockKind::opened_by(tag).map(|kind| LayoutBlock {
+                            kind,
+                            source,
+                            lines: first_lines,
+                            items: Vec::new(),
+                        });
+                    }
+                    1 if matches!(tag, Tag::Item) => {
+                        if let Some(list) = &mut self.open {
+                            list.items.push(LayoutItem {
+                                source,
+                                lines: first_lines,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                self.depth += 1;
+            }
+            Event::Text(text) if self.depth == 1 => {
+                if let Some(LayoutBlock {
+                    kind: BlockKind::CodeBlock { code },
+                    ..
+                }) = &mut self.open
+                {
+                    code.push_str(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Record the end of `tag` once the engine laid it out into `lines`.
+    fn record_end(&mut self, tag: TagEnd, lines: &[Line]) {
+        self.depth -= 1;
+        match self.depth {
+            0 => {
+                if let Some(mut block) = self.open.take() {
+                    block.lines = laid_out_since(block.lines.start, lines);
+                    self.blocks.push(block);
+                }
+            }
+            1 if matches!(tag, TagEnd::Item) => {
+                if let Some(item) = self.open.as_mut().and_then(|list| list.items.last_mut()) {
+                    item.lines = laid_out_since(item.lines.start, lines);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The lines from `first` to the end of `lines`, without the blank lines
+/// that open them.
+fn laid_out_since(first: usize, lines: &[Line]) -> Range<usize> {
+    let start = (first..lines.len())
+        .find(|&index| !lines[index].runs.is_empty())
+        .unwrap_or(lines.len());
+    start..lines.len()
 }
 
 /// Tracks list state and computes precise continuation prefixes.
@@ -123,6 +269,8 @@ pub struct LayoutEngine {
     heading_level: Option<u8>,
     link_url: Option<String>,
     table_state: Option<TableState>,
+    /// `None` unless the render records the top-level blocks.
+    block_recorder: Option<BlockRecorder>,
 }
 
 impl LayoutEngine {
@@ -144,22 +292,57 @@ impl LayoutEngine {
             heading_level: None,
             link_url: None,
             table_state: None,
+            block_recorder: None,
         }
     }
 
     pub fn render(input: &str, max_width: usize) -> LayoutDoc {
+        let mut engine = Self::new(max_width);
+        for event in Parser::new_ext(input, Self::parser_options()) {
+            engine.handle_event(event);
+        }
+        engine.finish()
+    }
+
+    /// [`Self::render`], with [`LayoutDoc::blocks`] recorded. The lines are
+    /// the same.
+    pub fn render_with_blocks(input: &str, max_width: usize) -> LayoutDoc {
+        let mut engine = Self::new(max_width);
+        engine.block_recorder = Some(BlockRecorder::default());
+        for (event, source) in Parser::new_ext(input, Self::parser_options()).into_offset_iter() {
+            engine.record_event(&event, source);
+            let end = match &event {
+                Event::End(tag) => Some(*tag),
+                _ => None,
+            };
+            engine.handle_event(event);
+            if let Some(tag) = end {
+                engine.record_end(tag);
+            }
+        }
+        engine.finish()
+    }
+
+    fn parser_options() -> Options {
         let mut options = Options::empty();
         options.insert(Options::ENABLE_STRIKETHROUGH);
         options.insert(Options::ENABLE_TABLES);
+        options
+    }
 
-        let parser = Parser::new_ext(input, options);
-        let mut engine = Self::new(max_width);
-
-        for event in parser {
-            engine.handle_event(event);
+    /// Record `event` before it is laid out.
+    fn record_event(&mut self, event: &Event, source: Range<usize>) {
+        let first_line = self.lines.len() + usize::from(!self.current_line.is_empty());
+        if let Some(recorder) = &mut self.block_recorder {
+            recorder.record_event(event, source, first_line);
         }
+    }
 
-        engine.finish()
+    /// Record the end of `tag` once it is laid out.
+    fn record_end(&mut self, tag: TagEnd) {
+        if let Some(recorder) = &mut self.block_recorder {
+            recorder.record_end(tag, &self.lines);
+        }
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -658,7 +841,13 @@ impl LayoutEngine {
         while self.lines.last().is_some_and(|l| l.runs.is_empty()) {
             self.lines.pop();
         }
-        LayoutDoc { lines: self.lines }
+        LayoutDoc {
+            lines: self.lines,
+            blocks: self
+                .block_recorder
+                .map(|recorder| recorder.blocks)
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -887,6 +1076,154 @@ mod tests {
     fn line_break_in_source_doesnt_continue_line_above() {
         let lines = line_wraps("first line\nsecond line", 80);
         assert_eq!(lines[1], ("second line".to_string(), LineWrap::default()));
+    }
+
+    const EVERY_BLOCK: &str = "# Title\n\nFirst line\nsecond line.\n\n```rust\nlet x = 1;\n```\n\n> quoted\n> more\n\n- a\n- b\n  - nested\n\n---\n\n| h | i |\n|---|---|\n| 1 | 2 |\n";
+
+    fn texts_of(doc: &LayoutDoc, lines: &Range<usize>) -> Vec<String> {
+        doc.lines[lines.clone()]
+            .iter()
+            .map(|line| line.runs.iter().map(|run| run.text.as_str()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn recorded_block_holds_its_source_and_its_lines() {
+        let doc = LayoutEngine::render_with_blocks(EVERY_BLOCK, 80);
+        let blocks: Vec<(BlockKind, &str, Vec<String>)> = doc
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.kind.clone(),
+                    EVERY_BLOCK[block.source.clone()].trim_end(),
+                    texts_of(&doc, &block.lines),
+                )
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            [
+                (BlockKind::Heading, "# Title", vec!["# Title".to_owned()]),
+                (
+                    BlockKind::Paragraph,
+                    "First line\nsecond line.",
+                    vec!["First line".to_owned(), "second line.".to_owned()]
+                ),
+                (
+                    BlockKind::CodeBlock {
+                        code: "let x = 1;\n".to_owned()
+                    },
+                    "```rust\nlet x = 1;\n```",
+                    vec![
+                        "```rust".to_owned(),
+                        "let x = 1;".to_owned(),
+                        "```".to_owned()
+                    ]
+                ),
+                (
+                    BlockKind::Quote,
+                    "> quoted\n> more",
+                    vec!["> quoted".to_owned(), "> more".to_owned()]
+                ),
+                (
+                    BlockKind::List,
+                    "- a\n- b\n  - nested",
+                    vec!["- a".to_owned(), "- b".to_owned(), "  - nested".to_owned()]
+                ),
+                (
+                    BlockKind::Table,
+                    "| h | i |\n|---|---|\n| 1 | 2 |",
+                    texts_of(&doc, &(doc.lines.len() - 5..doc.lines.len()))
+                ),
+            ],
+            "every block but the thematic break is recorded, without the blank line above it"
+        );
+    }
+
+    #[test]
+    fn list_item_holds_its_nested_list() {
+        let doc = LayoutEngine::render_with_blocks(EVERY_BLOCK, 80);
+        let list = doc
+            .blocks
+            .iter()
+            .find(|block| block.kind == BlockKind::List)
+            .unwrap();
+        let items: Vec<(&str, Vec<String>)> = list
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    EVERY_BLOCK[item.source.clone()].trim_end(),
+                    texts_of(&doc, &item.lines),
+                )
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("- a", vec!["- a".to_owned()]),
+                (
+                    "- b\n  - nested",
+                    vec!["- b".to_owned(), "  - nested".to_owned()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn indented_code_block_records_code_without_indent() {
+        let doc = LayoutEngine::render_with_blocks("Code:\n\n    first\n    second\n", 80);
+        assert_eq!(
+            doc.blocks[1].kind,
+            BlockKind::CodeBlock {
+                code: "first\nsecond\n".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn recording_blocks_doesnt_change_lines() {
+        let html_between = "<div>\nboxed\n</div>\n\nAfter the box.\n\n<br>\n\n- item";
+        let html_in_a_row = "<div>one</div>\n\n<div>two</div>\n";
+        let html_before_and_after =
+            "# Title\n\n<div>one</div>\n\n<div>two</div>\n\n```\ncode\n```\n\n<p>end</p>\n";
+        for input in [
+            EVERY_BLOCK,
+            html_between,
+            html_in_a_row,
+            html_before_and_after,
+        ] {
+            let plain = LayoutEngine::render(input, 12);
+            let recorded = LayoutEngine::render_with_blocks(input, 12);
+            assert_eq!(
+                texts_of(&recorded, &(0..recorded.lines.len())),
+                texts_of(&plain, &(0..plain.lines.len())),
+                "{input:?} lays out the same lines"
+            );
+            assert!(plain.blocks.is_empty(), "a plain render records no block");
+        }
+        let block_texts = |input: &str| {
+            let recorded = LayoutEngine::render_with_blocks(input, 80);
+            recorded
+                .blocks
+                .iter()
+                .map(|block| texts_of(&recorded, &block.lines))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            block_texts(html_between),
+            [vec!["After the box.".to_owned()], vec!["- item".to_owned()]],
+            "an HTML block's line stays out of the next block"
+        );
+        assert_eq!(
+            block_texts(html_before_and_after),
+            [
+                vec!["# Title".to_owned()],
+                vec!["```".to_owned(), "code".to_owned(), "```".to_owned()]
+            ],
+            "HTML blocks' line stays out of the blocks around it"
+        );
     }
 
     #[test]
