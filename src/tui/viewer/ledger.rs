@@ -4,6 +4,7 @@ use textwrap::{Options, WordSeparator, WordSplitter, WrapAlgorithm};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::output::{RowContinuation, RowWrap};
+use super::text_blocks::TextBlockRow;
 use super::{LineStyle, NAME_WIDTH, RenderedLine, TIMESTAMP_WIDTH, ToolOutputId, th};
 use crate::tui::theme::Theme;
 
@@ -158,15 +159,29 @@ pub(super) fn time_span(time: &str, theme: &Theme) -> (String, LineStyle) {
     (format!(" {time} "), timing_text_style(theme))
 }
 
-/// A row's content spans, and its place in its line when the line wrapped.
+/// A row's content spans, its place in its line when the line wrapped, and
+/// the block of a message's text it shows.
 pub(super) struct RowContent {
     spans: Vec<(String, LineStyle)>,
     wrap: RowWrap,
+    text_block_row: Option<TextBlockRow>,
 }
 
 impl RowContent {
     pub(super) fn wrapped(spans: Vec<(String, LineStyle)>, wrap: RowWrap) -> Self {
-        Self { spans, wrap }
+        Self {
+            spans,
+            wrap,
+            text_block_row: None,
+        }
+    }
+
+    /// `styled_line`'s content with its spans in place of its own.
+    fn of_styled_line(styled_line: &StyledLine, spans: Vec<(String, LineStyle)>) -> Self {
+        Self {
+            text_block_row: styled_line.text_block_row.clone(),
+            ..Self::wrapped(spans, styled_line.wrap)
+        }
     }
 }
 
@@ -184,6 +199,7 @@ pub(super) fn push_row(
     let RowContent {
         spans: content,
         wrap,
+        text_block_row,
     } = content.into();
     let content_len: usize = content.iter().map(|(text, _)| text.len()).sum();
     let mut spans = Vec::with_capacity(3 + content.len());
@@ -245,6 +261,7 @@ pub(super) fn push_row(
     };
     line.continuation = wrap.continuation;
     line.continued_text_len = content_len.saturating_sub(wrap.indent_len);
+    line.text_block_row = text_block_row;
     lines.push(line);
 }
 
@@ -304,7 +321,7 @@ pub(super) fn render_ledger_block_styled(
                 tool_output_id: None,
                 clickable: false,
             },
-            RowContent::wrapped(styled_line.spans.clone(), styled_line.wrap),
+            RowContent::of_styled_line(styled_line, styled_line.spans.clone()),
         );
     }
 }
@@ -398,7 +415,7 @@ pub(super) fn render_ledger_block_styled_dimmed(
                 tool_output_id,
                 clickable: tool_output_id.is_some(),
             },
-            RowContent::wrapped(content, styled_line.wrap),
+            RowContent::of_styled_line(styled_line, content),
         );
     }
 }

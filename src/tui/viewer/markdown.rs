@@ -1,21 +1,44 @@
 use super::output::{RowContinuation, RowWrap};
+use super::text_blocks::{TextBlockRow, text_block_rows};
 use super::{LineStyle, th};
+use crate::markdown::layout::{LayoutDoc, LayoutEngine};
 
 /// A line with styled spans from markdown rendering
 pub(super) struct StyledLine {
     pub(super) spans: Vec<(String, LineStyle)>,
     pub(super) wrap: RowWrap,
+    /// The block of a message's text the line shows.
+    pub(super) text_block_row: Option<TextBlockRow>,
 }
 
 /// Render markdown text to styled lines for TUI display
 pub(super) fn render_markdown_to_lines(input: &str, max_width: usize) -> Vec<StyledLine> {
-    let doc = crate::markdown::layout::LayoutEngine::render(input, max_width);
+    styled_lines(
+        LayoutEngine::render(input, max_width),
+        std::iter::repeat(None),
+    )
+}
+
+/// [`render_markdown_to_lines`] for a message's text: each line carries the
+/// top-level block it shows, which message navigation steps through.
+pub(super) fn render_message_text_to_lines(input: &str, max_width: usize) -> Vec<StyledLine> {
+    let doc = LayoutEngine::render_with_blocks(input, max_width);
+    let text_block_rows = text_block_rows(input, &doc);
+    styled_lines(doc, text_block_rows)
+}
+
+/// `doc`'s lines with `text_block_rows`, one per line, as styled lines.
+fn styled_lines(
+    doc: LayoutDoc,
+    text_block_rows: impl IntoIterator<Item = Option<TextBlockRow>>,
+) -> Vec<StyledLine> {
     doc.lines
         .into_iter()
+        .zip(text_block_rows)
         // Drop fence-only lines — TUI signals code blocks via color instead.
         // Empty lines are kept (they're blank spacers, not fences).
-        .filter(|line| line.runs.is_empty() || line.runs.iter().any(|r| !r.attrs.code_fence))
-        .map(|line| StyledLine {
+        .filter(|(line, _)| line.runs.is_empty() || line.runs.iter().any(|r| !r.attrs.code_fence))
+        .map(|(line, text_block_row)| StyledLine {
             spans: line
                 .runs
                 .into_iter()
@@ -32,6 +55,7 @@ pub(super) fn render_markdown_to_lines(input: &str, max_width: usize) -> Vec<Sty
                 },
                 indent_len: line.wrap.prefix_len,
             },
+            text_block_row,
         })
         .collect()
 }
@@ -73,6 +97,7 @@ pub(super) fn apply_thinking_style(styled_lines: Vec<StyledLine>) -> Vec<StyledL
                 })
                 .collect(),
             wrap: line.wrap,
+            text_block_row: line.text_block_row,
         })
         .collect()
 }

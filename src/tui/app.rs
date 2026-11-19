@@ -37,6 +37,7 @@ mod request_generation;
 mod search_state;
 mod search_worker;
 mod session_store;
+mod text_block_focus;
 mod types;
 mod view_state;
 mod viewer_render;
@@ -53,7 +54,7 @@ pub use types::{
     Action, AppMode, CopyIdentity, CountHighlight, DialogMode, DirectFile, Focus, HeaderRow,
     LIST_LINES_PER_ITEM, ListScope, ListSearchMode, LoadingState, MatchesArrival,
     OpenSessionStatus, PendingRender, PendingViewSearch, RowsRead, SemanticProgress,
-    SemanticResultMetadata, TuiSearchOptions, ViewSearchMode, ViewSpot, ViewState,
+    SemanticResultMetadata, TextBlockFocus, TuiSearchOptions, ViewSearchMode, ViewSpot, ViewState,
     list_lines_per_item,
 };
 
@@ -1377,6 +1378,9 @@ mod viewer_tail_tests;
 
 #[cfg(test)]
 mod shown_name_tests;
+
+#[cfg(test)]
+mod text_block_tests;
 
 #[cfg(test)]
 pub(crate) mod delete_tests;

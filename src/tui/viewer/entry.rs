@@ -12,7 +12,9 @@ use super::commands::user_text;
 use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
 use super::links::{ConversationLinks, ShownAnswer};
-use super::markdown::{apply_thinking_style, render_markdown_to_lines};
+use super::markdown::{
+    apply_thinking_style, render_markdown_to_lines, render_message_text_to_lines,
+};
 use super::style::USER_LABEL;
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
@@ -368,7 +370,7 @@ fn step_user_text(
         (None, content) => user_text(content),
     };
     let Some(text) = text else { return false };
-    let md_lines = render_markdown_to_lines(&text, ctx.options.content_width);
+    let md_lines = render_message_text_to_lines(&text, ctx.options.content_width);
     if ctx.style.dimmed {
         render_ledger_block_styled_dimmed(
             lines,
@@ -430,7 +432,7 @@ fn step_assistant_text(
                 &ctx.style.label,
                 ctx.style.label_color,
                 ctx.style.bold,
-                render_markdown_to_lines(text, ctx.options.content_width),
+                render_message_text_to_lines(text, ctx.options.content_width),
                 timing.take_once(),
             );
         }

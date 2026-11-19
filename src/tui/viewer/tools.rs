@@ -11,7 +11,7 @@ use super::ledger::{
     render_truncation_indicator, wrap_row, wrap_row_indented,
 };
 use super::links::ShownAnswer;
-use super::markdown::render_markdown_to_lines;
+use super::markdown::{render_markdown_to_lines, render_message_text_to_lines};
 use super::timing::TimingSlot;
 use super::*;
 
@@ -796,7 +796,7 @@ pub(super) fn render_subagent_reply(
         expanded,
         can_expand,
     } = *spec;
-    let mut body = render_markdown_to_lines(text, content_width);
+    let mut body = render_message_text_to_lines(text, content_width);
     let truncation = Truncation::of_report(
         body.len(),
         TRUNCATED_RESULT_LINES,

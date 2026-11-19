@@ -109,6 +109,18 @@
   message to another agent. `--match` now finds text in the body.
   - A read of several messages and `agent outline` count the body's lines on
     the call's line: `Edit: src/lib.rs (+2 lines)`.
+- Copy one block of a message in the viewer. In message navigation, focus a
+  message's blocks (`→`), step between them (`J`/`K`) and copy the focused
+  paragraph, heading, code block, quote, list or table (`y`).
+  - A code block is copied without its fences and a quote without its outer
+    `>` marks; any other block is copied as Markdown.
+  - Focus a list's items (`→` on the list); an item is copied without its
+    bullet or number.
+  - Return the focus one level (`←`): from an item to its list, from a block
+    to its message.
+  - A message that is one paragraph, one heading or one table doesn't have
+    blocks to focus: copying the block would copy the message.
+- Add a light background to the rows the `▌` marks in message navigation.
 
 ### Fixes
 

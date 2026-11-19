@@ -1254,14 +1254,7 @@ fn opened_sessions_first_frame_shows_its_rows_from_top_for_every_agent() {
         );
         assert_eq!(
             (state.scroll_offset, state.focus, state.message_nav_active),
-            (
-                0,
-                Some(Focus {
-                    message_index: 0,
-                    call_index: None
-                }),
-                false
-            ),
+            (0, Some(Focus::message(0)), false),
             "{agent:?}: the viewer shows the top, the first message focused, navigation off"
         );
         assert!(

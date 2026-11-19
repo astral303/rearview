@@ -318,7 +318,7 @@ thread_local! {
     static COPIED_TEXT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-fn record_copied_text(text: &str) -> Result<ClipboardDestination, String> {
+pub(super) fn record_copied_text(text: &str) -> Result<ClipboardDestination, String> {
     COPIED_TEXT.with(|copied| copied.borrow_mut().push(text.to_owned()));
     Ok(ClipboardDestination::System)
 }
@@ -331,7 +331,7 @@ fn copied_during(app: &mut App, action: impl FnOnce(&mut App)) -> Vec<String> {
     COPIED_TEXT.with(|copied| std::mem::take(&mut *copied.borrow_mut()))
 }
 
-fn copied_by(app: &mut App, code: KeyCode) -> Vec<String> {
+pub(super) fn copied_by(app: &mut App, code: KeyCode) -> Vec<String> {
     copied_during(app, |app| press(app, code))
 }
 
@@ -2671,7 +2671,15 @@ fn write_subagent_reply_conversation(path: &std::path::Path) {
     let checks: Vec<String> = (1..=40)
         .map(|check| format!("check-{check}:PASS"))
         .collect();
-    let reply = format!("{} {SUBAGENT_REPLY_LAST_WORD}", checks.join(" "));
+    write_subagent_reply(
+        path,
+        &format!("{} {SUBAGENT_REPLY_LAST_WORD}", checks.join(" ")),
+    );
+}
+
+/// A user message, then the sub-agent's reply `reply`, as Claude Code
+/// records a sub-agent turn.
+pub(super) fn write_subagent_reply(path: &std::path::Path, reply: &str) {
     let lines = [
         r#"{"type":"user","timestamp":"2024-01-01T00:00:00Z","message":{"role":"user","content":"intro"}}"#.to_string(),
         serde_json::json!({
@@ -2691,11 +2699,9 @@ fn write_subagent_reply_conversation(path: &std::path::Path) {
     std::fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
-#[test]
-fn right_arrow_expands_focused_subagent_reply_and_left_arrow_collapses_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("reply.jsonl");
-    write_subagent_reply_conversation(&path);
+/// The viewer on the session at `path`, its outputs truncated and its
+/// sub-agents' turns shown.
+pub(super) fn viewer_showing_subagent_turns(path: PathBuf) -> App {
     let mut rows = vec![test_conversation(path, None)];
     cache_rows(&mut rows);
     let show_thinking = true;
@@ -2710,6 +2716,15 @@ fn right_arrow_expands_focused_subagent_reply_and_left_arrow_collapses_it() {
     );
     app.selected = Some(0);
     app.enter_view_mode(80);
+    app
+}
+
+#[test]
+fn right_arrow_expands_focused_subagent_reply_and_left_arrow_collapses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reply.jsonl");
+    write_subagent_reply_conversation(&path);
+    let mut app = viewer_showing_subagent_turns(path);
     press(&mut app, KeyCode::Char('J'));
     assert_eq!(focused_message(&app), Some(1));
     assert!(!view_text(&app).contains(SUBAGENT_REPLY_LAST_WORD));

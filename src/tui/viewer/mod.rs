@@ -30,6 +30,7 @@ mod search_rows;
 mod style;
 mod summary;
 mod tail;
+mod text_blocks;
 mod timing;
 mod tools;
 
@@ -48,6 +49,7 @@ pub(crate) use summary::format_coarse_duration;
 pub(crate) use tail::{RowsToRender, ShownRender, splice_tail, tail_render_start};
 #[cfg(test)]
 pub(crate) use tests::fields_differing;
+pub use text_blocks::{BlockRows, TextBlock, text_blocks_in};
 
 use calls::{CallRanges, Lanes, top_level_tool_blocks};
 use days::DayLabels;
@@ -71,8 +73,18 @@ const SEPARATOR_WIDTH: usize = 3;
 /// the timestamp column while timing is shown, the name and the separator —
 /// are taken from `frame_width`. Every wrap in the viewer uses this width.
 pub fn content_width(frame_width: usize, show_timing: bool) -> usize {
+    frame_width.saturating_sub(ledger_width(show_timing))
+}
+
+/// The column a row's content area starts at, counted with the gutter: the
+/// space that ends the separator, then the text.
+pub fn content_area_column(show_timing: bool) -> usize {
+    ledger_width(show_timing) - 1
+}
+
+fn ledger_width(show_timing: bool) -> usize {
     let timestamp = if show_timing { TIMESTAMP_WIDTH } else { 0 };
-    frame_width.saturating_sub(GUTTER_WIDTH + timestamp + NAME_WIDTH + SEPARATOR_WIDTH)
+    GUTTER_WIDTH + timestamp + NAME_WIDTH + SEPARATOR_WIDTH
 }
 
 /// Get the current theme (cached after first detection)

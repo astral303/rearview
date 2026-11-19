@@ -4747,6 +4747,30 @@ fn assistant_with_reordered_blocks_entry() -> RenderableEntry {
     }
 }
 
+/// Message navigation steps through the blocks of a message's text alone:
+/// a tool call and thinking aren't the message's text.
+#[test]
+fn only_rows_of_message_text_carry_text_block() {
+    let entries = vec![assistant_with_reordered_blocks_entry()];
+    let mut options = test_render_options(ToolDisplayMode::Full);
+    options.show_thinking = true;
+
+    let rendered = render_parsed_entries(&entries, &options);
+
+    let in_text_block: Vec<String> = rendered
+        .lines
+        .iter()
+        .filter(|line| line.text_block_row.is_some())
+        .map(RenderedLine::text)
+        .collect();
+    assert_eq!(
+        in_text_block.len(),
+        1,
+        "one row carries a text block: {in_text_block:?}"
+    );
+    assert!(in_text_block[0].contains("TEXT_BLOCK"), "{in_text_block:?}");
+}
+
 #[test]
 fn assistant_block_order_hidden_mode_text_then_summary_then_thinking() {
     let entries = vec![assistant_with_reordered_blocks_entry()];

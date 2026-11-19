@@ -16,7 +16,8 @@ use crate::tui::app::{
 };
 use crate::tui::theme::{self, Theme};
 use crate::tui::viewer::{
-    LineStyle, RenderedLine, day_at_line, format_coarse_duration, session_dates, short_date,
+    self, CallRange, LineStyle, RenderedLine, day_at_line, format_coarse_duration, session_dates,
+    short_date,
 };
 use chrono::{DateTime, Local, NaiveDate};
 use ratatui::layout::Position;
@@ -864,28 +865,73 @@ enum GutterMark {
     Focused,
     /// A row between the focused call's input and its result.
     FocusedGap,
-    InsideRun,
+    /// A row of the focused message outside its focused call or block.
+    RestOfMessage,
 }
 
-fn gutter_mark(state: &ViewState, line_idx: usize) -> GutterMark {
-    if !state.message_nav_active {
-        return GutterMark::Hidden;
+/// The rows message navigation marks, found once per frame.
+enum GutterMarks<'a> {
+    Hidden,
+    Clear,
+    Focus {
+        message: std::ops::Range<usize>,
+        inside: FocusInsideMessage<'a>,
+    },
+}
+
+/// The rows the `▌` marks inside the focused message.
+enum FocusInsideMessage<'a> {
+    WholeMessage,
+    Call(&'a CallRange),
+    /// The rows of a block of the message's text, or of a list's item.
+    TextRows(std::ops::Range<usize>),
+}
+
+impl<'a> GutterMarks<'a> {
+    fn of(state: &'a ViewState) -> Self {
+        if !state.message_nav_active {
+            return Self::Hidden;
+        }
+        let Some(message) = state
+            .focus
+            .and_then(|focus| state.message_ranges.get(focus.message_index))
+        else {
+            return Self::Clear;
+        };
+        let call = state
+            .focused_call()
+            .and_then(|call| state.call_ranges.get(call));
+        let inside = match (call, state.focused_text()) {
+            (Some(call), _) => FocusInsideMessage::Call(call),
+            (None, Some(text)) => FocusInsideMessage::TextRows(text.rows),
+            (None, None) => FocusInsideMessage::WholeMessage,
+        };
+        Self::Focus {
+            message: message.rows(),
+            inside,
+        }
     }
-    let Some(focus) = state.focus else {
-        return GutterMark::Clear;
-    };
-    let in_focused_message = state
-        .message_ranges
-        .get(focus.message_index)
-        .is_some_and(|message| (message.start_line..message.end_line).contains(&line_idx));
-    if !in_focused_message {
-        return GutterMark::Clear;
-    }
-    match focus.call_index.and_then(|idx| state.call_ranges.get(idx)) {
-        None => GutterMark::Focused,
-        Some(call) if call.contains_line(line_idx) => GutterMark::Focused,
-        Some(call) if call.input_to_result_gap().contains(&line_idx) => GutterMark::FocusedGap,
-        Some(_) => GutterMark::InsideRun,
+
+    fn mark(&self, line_idx: usize) -> GutterMark {
+        let inside = match self {
+            Self::Hidden => return GutterMark::Hidden,
+            Self::Clear => return GutterMark::Clear,
+            Self::Focus { message, .. } if !message.contains(&line_idx) => {
+                return GutterMark::Clear;
+            }
+            Self::Focus { inside, .. } => inside,
+        };
+        match inside {
+            FocusInsideMessage::WholeMessage => GutterMark::Focused,
+            FocusInsideMessage::Call(call) if call.contains_line(line_idx) => GutterMark::Focused,
+            FocusInsideMessage::Call(call) if call.input_to_result_gap().contains(&line_idx) => {
+                GutterMark::FocusedGap
+            }
+            FocusInsideMessage::TextRows(rows) if rows.contains(&line_idx) => GutterMark::Focused,
+            FocusInsideMessage::Call(_) | FocusInsideMessage::TextRows(_) => {
+                GutterMark::RestOfMessage
+            }
+        }
     }
 }
 
@@ -895,9 +941,61 @@ fn gutter_span(mark: GutterMark) -> Span<'static> {
         GutterMark::Clear => return Span::raw("  "),
         GutterMark::Focused => ("▌ ", th().accent),
         GutterMark::FocusedGap => ("▏ ", th().accent),
-        GutterMark::InsideRun => ("▏ ", th().text_muted),
+        GutterMark::RestOfMessage => ("▏ ", th().text_muted),
     };
     Span::styled(glyph, Style::default().fg(rgb(color)))
+}
+
+/// `spans`, a row the `▌` marks, with `background` under every cell from
+/// `column` on that has no background of its own, padded with it to `width`
+/// columns.
+fn with_background_from(
+    spans: Vec<Span<'static>>,
+    column: usize,
+    width: usize,
+    background: Color,
+) -> Vec<Span<'static>> {
+    let under = |style: Style| match style.bg {
+        Some(_) => style,
+        None => style.bg(background),
+    };
+    let mut tinted = Vec::with_capacity(spans.len() + 2);
+    let mut used = 0;
+    for span in spans {
+        let span_width = span.width();
+        if used >= column {
+            let style = under(span.style);
+            tinted.push(span.style(style));
+        } else if used + span_width <= column {
+            tinted.push(span);
+        } else {
+            let (before, after) = split_at_column(&span.content, column - used);
+            tinted.push(Span::styled(before, span.style));
+            tinted.push(Span::styled(after, under(span.style)));
+        }
+        used += span_width;
+    }
+    if used < width {
+        tinted.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(background),
+        ));
+    }
+    tinted
+}
+
+/// `text` split where its first `columns` columns end. A wide character
+/// truncated by that column starts the second part.
+fn split_at_column(text: &str, columns: usize) -> (String, String) {
+    let mut used = 0;
+    let cut = text
+        .char_indices()
+        .find(|&(_, character)| {
+            used += UnicodeWidthChar::width(character).unwrap_or(0);
+            used > columns
+        })
+        .map_or(text.len(), |(index, _)| index);
+    (text[..cut].to_owned(), text[cut..].to_owned())
 }
 
 /// The open session's rows, drawn at `now` on the list's clock.
@@ -905,6 +1003,8 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect, now: Mo
     let visible_height = area.height as usize;
     let visible_rows = state.scroll_offset..state.scroll_offset + visible_height;
     let highlights = match_highlights(state, visible_rows);
+    let gutter_marks = GutterMarks::of(state);
+    let content_column = viewer::content_area_column(state.show_timing);
 
     let visible_lines: Vec<Line> = state
         .rendered_lines
@@ -913,7 +1013,8 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect, now: Mo
         .skip(state.scroll_offset)
         .take(visible_height)
         .map(|(line_idx, rendered)| {
-            let mut spans: Vec<Span> = vec![gutter_span(gutter_mark(state, line_idx))];
+            let mark = gutter_marks.mark(line_idx);
+            let mut spans: Vec<Span> = vec![gutter_span(mark)];
 
             if let Some(row_highlights) = highlights.get(&line_idx) {
                 spans.extend(highlight_line_matches(rendered, row_highlights));
@@ -942,6 +1043,13 @@ fn render_view_content(frame: &mut Frame, state: &ViewState, area: Rect, now: Mo
                         Style::default().bg(rgb(th().selection_bg)),
                     ));
                 }
+            } else if mark == GutterMark::Focused {
+                spans = with_background_from(
+                    spans,
+                    content_column,
+                    area.width as usize,
+                    rgb(th().focus_bg),
+                );
             }
 
             let mut line = Line::from(spans);
@@ -1736,11 +1844,11 @@ fn render_help_overlay(
             ("k / ↑".into(), "Scroll up"),
             ("Wheel".into(), "Scroll"),
             ("Click".into(), "Expand / collapse tool row"),
-            ("J / ]".into(), "Next message / call"),
-            ("K / [".into(), "Previous message / call"),
+            ("J / ]".into(), "Next message / call / block"),
+            ("K / [".into(), "Previous message / call / block"),
             ("Enter".into(), "Expand / collapse run or call"),
-            ("→".into(), "Expand run or call"),
-            ("←".into(), "Collapse / leave call or run"),
+            ("→".into(), "Expand run or call; enter blocks"),
+            ("←".into(), "Collapse / leave call, run or block"),
             ("d / Ctrl+D".into(), "Half page down"),
             ("u / Ctrl+U".into(), "Half page up"),
             ("g / Home".into(), "Jump to top"),
@@ -1751,7 +1859,7 @@ fn render_help_overlay(
             ("T".into(), "Toggle thinking"),
             ("i".into(), "Toggle timing"),
             ("e".into(), "Export to file"),
-            ("y".into(), "Copy message / call, or menu"),
+            ("y".into(), "Copy message / call / block, or menu"),
             ("p".into(), "Show file path"),
             ("Y".into(), "Copy path"),
             ("I".into(), "Copy session ID"),
@@ -2599,7 +2707,154 @@ mod tests {
                 cell_fg(&terminal, 0, line as u16),
             );
             assert_eq!(mark, expected, "line {line}: {row:?}");
+            assert_eq!(
+                content_background(&terminal, line as u16),
+                background_of_mark(mark.0),
+                "line {line}: the rows `▌` marks have the focus background"
+            );
         }
+    }
+
+    /// The background of row `y`'s content area, its first and last cells
+    /// alike, and of no cell before it.
+    fn content_background(terminal: &Terminal<TestBackend>, y: u16) -> Color {
+        let buffer = terminal.backend().buffer();
+        let column = viewer::content_area_column(false) as u16;
+        let last = buffer.area.width - 1;
+        assert_eq!(
+            buffer[(column, y)].bg,
+            buffer[(last, y)].bg,
+            "row {y}: one background across the content area"
+        );
+        assert!(
+            (0..column).all(|x| buffer[(x, y)].bg == Color::Reset),
+            "row {y}: the gutter and ledger columns keep the pane's background"
+        );
+        buffer[(column, y)].bg
+    }
+
+    fn background_of_mark(mark: char) -> Color {
+        if mark == '▌' {
+            rgb(th().focus_bg)
+        } else {
+            Color::Reset
+        }
+    }
+
+    #[test]
+    fn gutter_and_background_mark_focused_block_and_item() {
+        use crate::tui::app::{Focus, TextBlockFocus};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocks.jsonl");
+        let reply = "First paragraph.\n\n- one\n- two\n\nLast paragraph.";
+        let lines = [
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "intro"}}),
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}}),
+        ];
+        std::fs::write(&path, lines.map(|line| line.to_string() + "\n").concat()).unwrap();
+        let mut app = viewer_on_cached_session(&path, 80);
+        for code in [KeyCode::Char('J'), KeyCode::Right, KeyCode::Char('J')] {
+            app.handle_key(code, KeyModifiers::empty(), 17);
+        }
+        let draw = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 17)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_view_content(frame, view_state(app), frame.area(), app.clock().now())
+                })
+                .unwrap();
+            terminal
+        };
+        let marks_of = |terminal: &Terminal<TestBackend>, app: &App| {
+            let message = view_state(app).message_ranges[1].rows();
+            message
+                .map(|line| {
+                    let mark = row_text(terminal, line as u16).chars().next().unwrap();
+                    assert_eq!(
+                        content_background(terminal, line as u16),
+                        background_of_mark(mark),
+                        "line {line}: the rows `▌` marks have the focus background"
+                    );
+                    mark
+                })
+                .collect::<String>()
+        };
+
+        assert_eq!(
+            view_state(&app).focus,
+            Some(Focus {
+                text_block: Some(TextBlockFocus {
+                    block: 1,
+                    item: None
+                }),
+                ..Focus::message(1)
+            })
+        );
+        assert_eq!(
+            marks_of(&draw(&app), &app),
+            "▏▏▌▌▏▏",
+            "the list's rows are marked, the paragraphs and blank rows dimly"
+        );
+
+        app.handle_key(KeyCode::Right, KeyModifiers::empty(), 17);
+        assert_eq!(
+            marks_of(&draw(&app), &app),
+            "▏▏▌▏▏▏",
+            "the first item is marked"
+        );
+        app.handle_key(KeyCode::Char('J'), KeyModifiers::empty(), 17);
+        assert_eq!(
+            marks_of(&draw(&app), &app),
+            "▏▏▏▌▏▏",
+            "the second item is marked"
+        );
+
+        app.handle_key(KeyCode::Left, KeyModifiers::empty(), 17);
+        assert_eq!(
+            marks_of(&draw(&app), &app),
+            "▏▏▌▌▏▏",
+            "the list is marked again"
+        );
+        app.handle_key(KeyCode::Left, KeyModifiers::empty(), 17);
+        assert_eq!(
+            marks_of(&draw(&app), &app),
+            "▌▌▌▌▌▌",
+            "the whole message, its blank rows included, is marked"
+        );
+    }
+
+    #[test]
+    fn focus_background_leaves_ledger_and_cells_with_background_of_their_own() {
+        let focus = Color::Rgb(1, 2, 3);
+        let found = Style::default().bg(Color::Yellow);
+        let spans = vec![
+            Span::raw("▌ "),
+            Span::raw("   Claude"),
+            Span::raw(" │ "),
+            Span::styled("match", found),
+            Span::raw(" after"),
+        ];
+
+        let tinted = with_background_from(spans, 13, 30, focus);
+
+        let cells: Vec<(String, Option<Color>)> = tinted
+            .iter()
+            .map(|span| (span.content.to_string(), span.style.bg))
+            .collect();
+        assert_eq!(
+            cells,
+            [
+                ("▌ ".to_owned(), None),
+                ("   Claude".to_owned(), None),
+                (" │".to_owned(), None),
+                (" ".to_owned(), Some(focus)),
+                ("match".to_owned(), Some(Color::Yellow)),
+                (" after".to_owned(), Some(focus)),
+                (" ".repeat(5), Some(focus)),
+            ]
+        );
     }
 
     /// A timestamp in the test clock's year, so its date doesn't show a year.

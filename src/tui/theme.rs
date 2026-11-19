@@ -26,6 +26,11 @@ pub struct Theme {
     pub status_bar_bg: Rgb,
     pub overlay_bg: Rgb,
     pub selection_bg: Rgb,
+    /// Under the content of the rows the viewer's focus marks: the accent
+    /// at [`FOCUS_ACCENT_SHARE`] over the terminal's background when it
+    /// reports an RGB colour, otherwise over the background the theme is
+    /// made for.
+    pub focus_bg: Rgb,
 
     // Semantic colors
     pub diff_add: Rgb,
@@ -92,6 +97,7 @@ impl Theme {
             status_bar_bg: (30, 30, 35),
             overlay_bg: (25, 25, 30),
             selection_bg: (45, 45, 55),
+            focus_bg: (15, 25, 23),
 
             diff_add: (120, 200, 120),
             diff_remove: (220, 120, 120),
@@ -157,6 +163,7 @@ impl Theme {
             status_bar_bg: (238, 241, 244), // Very light cool gray
             overlay_bg: (246, 248, 249),    // Near-white for modals
             selection_bg: (221, 235, 232),  // Pale teal wash for selection
+            focus_bg: (238, 246, 245),      // Paler teal wash for the focus
 
             diff_add: (40, 120, 60),        // Dark green for additions
             diff_remove: (180, 50, 50),     // Dark red for removals
@@ -205,12 +212,49 @@ impl Theme {
     }
 }
 
+/// The accent's share of [`Theme::focus_bg`].
+const FOCUS_ACCENT_SHARE: f32 = 0.07;
+
+/// `accent` at [`FOCUS_ACCENT_SHARE`] over `background`, each channel
+/// rounded.
+fn focus_bg_over(background: Rgb, accent: Rgb) -> Rgb {
+    let blend = |background: u8, accent: u8| {
+        (FOCUS_ACCENT_SHARE * f32::from(accent)
+            + (1.0 - FOCUS_ACCENT_SHARE) * f32::from(background))
+        .round() as u8
+    };
+    (
+        blend(background.0, accent.0),
+        blend(background.1, accent.1),
+        blend(background.2, accent.2),
+    )
+}
+
+impl Theme {
+    /// The theme for a terminal that reported `background`: light over a
+    /// light one, dark otherwise. An RGB answer also sets `focus_bg` over
+    /// it. An ANSI answer (`$COLORFGBG`) keeps the fixed `focus_bg`: the
+    /// terminal's palette decides that colour's RGB.
+    fn for_terminal_background(background: terminal_light::Color) -> Self {
+        let mut theme = if background.luma() > 0.6 {
+            Theme::light()
+        } else {
+            Theme::dark()
+        };
+        if let terminal_light::Color::Rgb(rgb) = background {
+            theme.focus_bg = focus_bg_over((rgb.r, rgb.g, rgb.b), theme.accent);
+        }
+        theme
+    }
+}
+
 fn stdout_is_terminal() -> bool {
     use std::io::IsTerminal;
     std::io::stdout().is_terminal()
 }
 
-/// Detect terminal background luminance and return appropriate theme
+/// The theme for the terminal's background colour, read once; the dark
+/// theme when the terminal doesn't report one.
 pub fn detect_theme() -> &'static Theme {
     THEME.get_or_init(|| {
         // terminal-light writes its query to stdout, so a probe while stdout
@@ -224,9 +268,58 @@ pub fn detect_theme() -> &'static Theme {
         if cfg!(test) || !stdout_is_terminal() {
             return Theme::dark();
         }
-        match terminal_light::luma() {
-            Ok(luma) if luma > 0.6 => Theme::light(),
-            _ => Theme::dark(), // Default to dark on detection failure
+        match terminal_light::background_color() {
+            Ok(background) => Theme::for_terminal_background(background),
+            Err(_) => Theme::dark(), // Default to dark on detection failure
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pane the dark theme's fixed `focus_bg` was chosen over.
+    const DARK_PANE: Rgb = (10, 12, 12);
+    const WHITE: Rgb = (255, 255, 255);
+
+    fn reported(rgb: Rgb) -> terminal_light::Color {
+        terminal_light::Color::Rgb(terminal_light::Rgb::new(rgb.0, rgb.1, rgb.2))
+    }
+
+    #[test]
+    fn focus_bg_over_theme_background_is_fixed_focus_bg() {
+        assert_eq!(
+            focus_bg_over(DARK_PANE, Theme::dark().accent),
+            Theme::dark().focus_bg
+        );
+        assert_eq!(
+            focus_bg_over(WHITE, Theme::light().accent),
+            Theme::light().focus_bg
+        );
+    }
+
+    #[test]
+    fn focus_bg_blends_accent_over_reported_background() {
+        let dark = Theme::for_terminal_background(reported((30, 30, 30)));
+        assert_eq!(
+            (dark.accent, dark.focus_bg),
+            (Theme::dark().accent, (33, 42, 40)),
+            "a dark grey terminal gets the dark theme, its band lighter than the grey"
+        );
+        let off_white = Theme::for_terminal_background(reported((253, 246, 227)));
+        assert_eq!(
+            (off_white.accent, off_white.focus_bg),
+            (Theme::light().accent, (236, 238, 219)),
+            "an off-white terminal gets the light theme, its band over the off-white"
+        );
+    }
+
+    #[test]
+    fn ansi_background_keeps_fixed_focus_bg() {
+        let theme = Theme::for_terminal_background(terminal_light::Color::Ansi(
+            terminal_light::AnsiColor::new(0),
+        ));
+        assert_eq!(theme.focus_bg, Theme::dark().focus_bg);
+    }
 }

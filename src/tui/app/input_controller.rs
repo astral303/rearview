@@ -1,4 +1,4 @@
-use super::{Action, App, AppMode, DialogMode, ListSearchMode, ViewSearchMode, ViewState};
+use super::{Action, App, AppMode, DialogMode, Focus, ListSearchMode, ViewSearchMode, ViewState};
 use crate::search;
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -224,7 +224,7 @@ impl App {
                 {
                     state.message_nav_active = false;
                     if let Some(focus) = &mut state.focus {
-                        focus.call_index = None;
+                        *focus = Focus::message(focus.message_index);
                     }
                     return None;
                 }

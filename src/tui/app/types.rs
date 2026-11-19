@@ -97,8 +97,8 @@ pub enum OpenSessionStatus {
     AnotherRearview(OtherRearview),
 }
 
-/// Where message navigation points. The call lives inside the message, so
-/// replacing the message drops the call with it.
+/// The stop message navigation points at. Replacing the message drops the
+/// focused call or text block, because both are inside the message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Focus {
     /// Index into `ViewState::message_ranges`.
@@ -107,6 +107,31 @@ pub struct Focus {
     /// the message's own calls. `None` while the message itself is focused,
     /// which is always so outside an expanded tool run.
     pub call_index: Option<usize>,
+    /// The block of the message's text, `None` while the message or a call
+    /// is focused. Set alone, without a call, because a tool run has calls
+    /// and no text.
+    pub text_block: Option<TextBlockFocus>,
+}
+
+impl Focus {
+    /// The whole message at `message_index`.
+    pub fn message(message_index: usize) -> Self {
+        Self {
+            message_index,
+            call_index: None,
+            text_block: None,
+        }
+    }
+}
+
+/// A focused block of a message's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextBlockFocus {
+    /// The block's position among the message's text blocks, in row order.
+    pub block: usize,
+    /// The focused item of a list block, by its index among the list's
+    /// items; `None` while the whole block is focused.
+    pub item: Option<usize>,
 }
 
 /// State for the conversation viewer
@@ -533,6 +558,10 @@ impl ViewState {
 
     pub fn focused_call(&self) -> Option<usize> {
         self.focus.and_then(|focus| focus.call_index)
+    }
+
+    pub fn focused_text_block(&self) -> Option<TextBlockFocus> {
+        self.focus.and_then(|focus| focus.text_block)
     }
 
     /// True from the arrival of a reload's read, the first read of a file
