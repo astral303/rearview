@@ -1,9 +1,11 @@
 //! A session's stored search texts as lexical search reads them: each text
 //! without terminal codes, with its message number and place in the
 //! session, borrowed from SQLite. Each statement reads through an index on
-//! the session, without joins.
+//! the session. The read of an append's texts outside every message joins
+//! its entries to their parts; every other statement reads `parts` alone.
 
 use super::SearchField;
+use super::session_appends::StoredAppend;
 use super::text_scan::{
     LayoutGroup, MessagesInWindow, ReadOrder, StoredPlace, StoredWindow, text_at,
 };
@@ -88,6 +90,22 @@ pub(super) fn visit_texts_within(
     Ok(())
 }
 
+/// Calls `visit` with each of `append`'s search texts in the session row
+/// `session`, until `visit` breaks: the texts of its messages, those outside
+/// every message of its entries, and the sub-agent metadata. Each statement
+/// reads through an index: the messages' parts through `parts_by_message`,
+/// the entries through their sequence, then each entry's parts.
+pub(super) fn visit_appended_texts(
+    connection: &Connection,
+    session: i64,
+    append: &StoredAppend,
+    mut visit: impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+) -> Result<()> {
+    let read = SessionRead::new(connection, session, None)?;
+    let _ = read.visit_appended(append, &mut visit)?;
+    Ok(())
+}
+
 /// The session `?1`'s sub-agent metadata parts, outside every entry.
 /// `ORDER BY part` makes SQLite read them through `parts_outside_entries`,
 /// the index of those parts alone, not through the index of every part of
@@ -113,6 +131,18 @@ fn parts_of_messages_query() -> String {
     format!(
         "SELECT {READ_PART_COLUMNS} FROM parts WHERE session = ?1 \
          AND message_ordinal BETWEEN ?2 AND ?3 AND search_field IN ({})",
+        searched_part_field_codes()
+    )
+}
+
+/// The searched parts outside every message of the session `?1`'s entries
+/// at sequence `?2` on.
+fn parts_outside_messages_from_entry_query() -> String {
+    format!(
+        "SELECT parts.entry_sequence, parts.message_ordinal, parts.search_position, \
+         parts.search_field, parts.text FROM entries JOIN parts ON parts.entry = entries.id \
+         WHERE entries.session = ?1 AND entries.sequence >= ?2 \
+         AND parts.message_ordinal IS NULL AND parts.search_field IN ({})",
         searched_part_field_codes()
     )
 }
@@ -146,6 +176,29 @@ impl<'c> SessionRead<'c> {
         }
         if self.window.is_some() {
             return Ok(ControlFlow::Continue(()));
+        }
+        self.visit_subagent_metadata(visit)
+    }
+
+    /// Visits the texts `append` changed, until `visit` breaks.
+    fn visit_appended(
+        &self,
+        append: &StoredAppend,
+        visit: &mut impl FnMut(SearchText<'_>) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>> {
+        if let Some(first_message) = append.first_message {
+            let mut statement = self.connection.prepare_cached(&parts_of_messages_query())?;
+            let rows = statement.query([self.session, first_message, i64::MAX])?;
+            if Self::visit_rows(rows, visit)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        let mut statement = self
+            .connection
+            .prepare_cached(&parts_outside_messages_from_entry_query())?;
+        let rows = statement.query([self.session, append.first_entry])?;
+        if Self::visit_rows(rows, visit)?.is_break() {
+            return Ok(ControlFlow::Break(()));
         }
         self.visit_subagent_metadata(visit)
     }
@@ -224,7 +277,9 @@ mod tests {
     /// holds, only while each statement reads through an index, without
     /// sorting: the read through `parts_by_session`. The sub-agent metadata
     /// read uses the index of those parts alone; a windowed read or scan
-    /// reads a run of messages' parts through `parts_by_message`.
+    /// reads a run of messages' parts through `parts_by_message`. The read of
+    /// an append's texts outside every message reads its entries through
+    /// their sequence, then each entry's parts.
     #[test]
     fn each_statement_on_one_sessions_parts_reads_through_an_index_without_sorting() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
@@ -236,6 +291,10 @@ mod tests {
             (parts_of_messages_query(), "parts_by_message"),
             (SUBAGENT_METADATA_READ.to_owned(), "parts_outside_entries"),
             (parts_of_messages(), "parts_by_message"),
+            (
+                parts_outside_messages_from_entry_query(),
+                "sqlite_autoindex_parts_1",
+            ),
         ] {
             let mut statement = connection
                 .prepare(&format!("EXPLAIN QUERY PLAN {query}"))

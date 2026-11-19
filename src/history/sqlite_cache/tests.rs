@@ -42,6 +42,67 @@ pub(crate) fn mark_writing(copy: &super::CachedSession) {
         .unwrap();
 }
 
+/// Replaces `from` with `to` in the stored part texts of `copy`'s session and
+/// keeps its generation, which no write does. A read shows `to` only when it
+/// reads the altered rows.
+pub(crate) fn alter_stored_texts(copy: &super::CachedSession, from: &str, to: &str) {
+    SqliteCache::open(&copy.base)
+        .unwrap()
+        .connection
+        .execute(
+            "UPDATE parts SET text = replace(text, ?2, ?3) \
+             WHERE session = (SELECT id FROM sessions WHERE generation = ?1)",
+            rusqlite::params![copy.generation, from, to],
+        )
+        .unwrap();
+}
+
+/// Adds `text` as a dialogue text to each stored entry outside every message
+/// of `copy`'s session, as no write does: `ClaudeHome`'s sessions don't
+/// contain any search text outside messages.
+pub(crate) fn add_texts_outside_messages(copy: &super::CachedSession, text: &str) {
+    let added = SqliteCache::open(&copy.base)
+        .unwrap()
+        .connection
+        .execute(
+            "INSERT INTO parts (session, entry, part, kind, search_field, entry_sequence, \
+             search_position, text) SELECT session, id, 1000, 'text', 0, sequence, 1000, ?2 \
+             FROM entries WHERE message IS NULL \
+             AND session = (SELECT id FROM sessions WHERE generation = ?1)",
+            rusqlite::params![copy.generation, text],
+        )
+        .unwrap();
+    assert!(
+        added > 0,
+        "the session stores an entry outside every message"
+    );
+}
+
+/// A start of the cache's generation counter again, with the sessions kept.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GenerationsRestart {
+    /// The counter set back to 0: the next writes number below every stored
+    /// generation.
+    SetBack,
+    /// The counter dropped, as a rebuild or a low-space deletion drops
+    /// `meta`: the next write starts a numbering of its own.
+    Dropped,
+}
+
+/// Restarts the generation counter of `copy`'s cache as `restart` names.
+pub(crate) fn restart_generations(copy: &super::CachedSession, restart: GenerationsRestart) {
+    let statement = match restart {
+        GenerationsRestart::SetBack => "UPDATE meta SET value = '0' WHERE key = 'last_generation'",
+        GenerationsRestart::Dropped => "DELETE FROM meta WHERE key = 'last_generation'",
+    };
+    let changed = SqliteCache::open(&copy.base)
+        .unwrap()
+        .connection
+        .execute(statement, [])
+        .unwrap();
+    assert_eq!(changed, 1, "the cache stores its generation counter");
+}
+
 /// Gives the session `copy` reads a new generation, as a write of another
 /// copy of it does, and returns that generation.
 pub(crate) fn replace_copy(copy: &super::CachedSession) -> i64 {

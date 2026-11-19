@@ -6,7 +6,10 @@
 //! session, its place and its message number. [`scan_copies`] runs the
 //! tasks and rechecks the sessions read.
 
-use super::copies_scan::{CopiesScan, KeySplit, ScannedCopies, SessionsById, scan_copies};
+use super::copies_scan::{
+    CopiesScan, KeySplit, RANGES_PER_THREAD, ScannedCopies, ScannedWave, SessionsById, Waves,
+    scan_copies, scan_copies_in_waves,
+};
 use super::search_texts::searched_part_field_codes;
 use super::{CachedSession, HeldCopy, SearchField};
 use crate::error::Result;
@@ -34,6 +37,13 @@ pub(crate) struct ReadOrder {
     pub(super) group: LayoutGroup,
     pub(super) sequence: i64,
     pub(super) position: i64,
+}
+
+impl ReadOrder {
+    /// The sequence of the text's entry; 0 for a part outside every entry.
+    pub(crate) fn entry_sequence(self) -> i64 {
+        self.sequence
+    }
 }
 
 /// The caller's side of a scan, one per task.
@@ -90,6 +100,8 @@ const SUBAGENT_METADATA_SCAN: &str = "SELECT session, part, text FROM parts WHER
 /// subquery, as [`KeySplit::bounds_query`] reads a table's.
 const SESSION_PART_BOUNDS: &str = "SELECT (SELECT MIN(id) FROM parts WHERE session = ?1), \
      (SELECT MAX(id) FROM parts WHERE session = ?1)";
+/// The greatest part id of the session `?1`.
+const SESSION_GREATEST_PART: &str = "SELECT MAX(id) FROM parts WHERE session = ?1";
 
 /// The sessions a scan reads, as the command selected them; the selection
 /// decides how a windowed scan finds the messages inside its window.
@@ -125,11 +137,54 @@ pub(crate) fn scan_search_texts<V: TextVisitor, A>(
                     only: SessionFilter::of(connection, &sessions)?,
                     sessions,
                     window,
+                    ranges_per_thread: RANGES_PER_THREAD,
                 },
                 visitor: &visitor,
             })
         },
         read_alone,
+    )
+}
+
+/// Row ranges per thread in each wave of [`scan_search_texts_in_waves`]. A
+/// wave ends with its slowest range; the other ranges keep every thread
+/// reading until then.
+const RANGES_PER_THREAD_PER_WAVE: usize = 4;
+
+/// [`scan_search_texts`] of every search text of `copies`, without a
+/// window, in up to `waves` waves of row ranges in id order: `deliver`
+/// receives each wave's reads and the copies due in it
+/// ([`scan_copies_in_waves`]). Every wave but the last reads at least
+/// [`RANGES_PER_THREAD_PER_WAVE`] ranges per thread: a small cache is one
+/// wave. The sub-agent metadata is read in the first wave.
+pub(crate) fn scan_search_texts_in_waves<V: TextVisitor, A>(
+    copies: &[&CachedSession],
+    waves: usize,
+    visitor: impl Fn() -> V + Sync,
+    read_alone: impl Fn(usize, &HeldCopy<'_>) -> Result<A>,
+    deliver: impl FnMut(ScannedWave<V, A>),
+) -> Result<()> {
+    let ranges_per_thread = RANGES_PER_THREAD
+        .max(i64::try_from(RANGES_PER_THREAD_PER_WAVE.saturating_mul(waves)).unwrap_or(i64::MAX));
+    scan_copies_in_waves(
+        copies,
+        Waves {
+            most: waves,
+            least_tasks: rayon::current_num_threads().saturating_mul(RANGES_PER_THREAD_PER_WAVE),
+        },
+        |connection, sessions| {
+            Ok(TextScan {
+                scan: Scan {
+                    only: SessionFilter::of(connection, &sessions)?,
+                    sessions,
+                    window: None,
+                    ranges_per_thread,
+                },
+                visitor: &visitor,
+            })
+        },
+        read_alone,
+        deliver,
     )
 }
 
@@ -169,6 +224,30 @@ impl<V: TextVisitor, F: Fn() -> V + Sync> CopiesScan for TextScan<'_, F> {
         .scan(task, &mut visitor)?;
         Ok(visitor)
     }
+
+    /// A session's last task contains its greatest part id, or names the
+    /// session; a session without parts is done once the sub-agent metadata
+    /// is read.
+    fn last_tasks(
+        &self,
+        connection: &Connection,
+        tasks: &[ScanTask],
+    ) -> Result<HashMap<i64, usize>> {
+        let mut greatest_part = connection.prepare_cached(SESSION_GREATEST_PART)?;
+        let mut last_tasks = HashMap::new();
+        for &session in self.scan.sessions.keys() {
+            let greatest: Option<i64> = greatest_part.query_row([session], |row| row.get(0))?;
+            let last = tasks.iter().rposition(|task| match task {
+                ScanTask::Parts(rows) => greatest.is_some_and(|id| rows.contains(&id)),
+                ScanTask::Messages { session: read, .. } => *read == session,
+                ScanTask::SubagentMetadata => greatest.is_none(),
+            });
+            if let Some(last) = last {
+                last_tasks.insert(session, last);
+            }
+        }
+        Ok(last_tasks)
+    }
 }
 
 /// One cache base's part of a scan.
@@ -176,6 +255,8 @@ struct Scan {
     sessions: SessionsById,
     only: SessionFilter,
     window: Option<MessagesInWindow>,
+    /// The most row ranges per thread the scan's parts are split into.
+    ranges_per_thread: i64,
 }
 
 /// The scan's condition on a text's session: none when the scan reads every
@@ -379,30 +460,36 @@ enum ScanTask {
 
 impl Scan {
     /// The scan's tasks, read on `connection`. With a window, the parts of
-    /// each run of messages inside it. Without one, the parts in row ranges
-    /// from the scanned sessions' least to their greatest part id, then the
-    /// sub-agent metadata.
+    /// each run of messages inside it. Without one, the sub-agent metadata,
+    /// then the parts in row ranges from the scanned sessions' least to
+    /// their greatest part id, in id order.
     fn tasks(&self, connection: &Connection) -> Result<Vec<ScanTask>> {
         if let Some(window) = &self.window {
             return Ok(window.runs().collect());
         }
         let split = if self.only.reads_every_listed_session() {
-            KeySplit::of(connection, "parts", "id")?
+            KeySplit::of(connection, "parts", "id", self.ranges_per_thread)?
         } else {
-            KeySplit::of_sessions_parts(connection, self.sessions.keys().copied())?
+            KeySplit::of_sessions_parts(
+                connection,
+                self.sessions.keys().copied(),
+                self.ranges_per_thread,
+            )?
         };
-        let mut tasks = split.ranges().map(ScanTask::Parts).collect::<Vec<_>>();
-        tasks.push(ScanTask::SubagentMetadata);
-        Ok(tasks)
+        Ok(std::iter::once(ScanTask::SubagentMetadata)
+            .chain(split.ranges().map(ScanTask::Parts))
+            .collect())
     }
 }
 
 impl KeySplit {
     /// The split of the part ids of `sessions`, from the least to the
-    /// greatest, each end read from `parts_by_session` per session.
+    /// greatest, each end read from `parts_by_session` per session, into at
+    /// most `ranges_per_thread` ranges per thread.
     fn of_sessions_parts(
         connection: &Connection,
         sessions: impl Iterator<Item = i64>,
+        ranges_per_thread: i64,
     ) -> Result<Self> {
         let mut statement = connection.prepare_cached(SESSION_PART_BOUNDS)?;
         let mut bounds: Option<(i64, i64)> = None;
@@ -418,7 +505,7 @@ impl KeySplit {
                 );
             }
         }
-        Ok(Self::spanning(bounds))
+        Ok(Self::spanning(bounds, ranges_per_thread))
     }
 }
 
@@ -889,6 +976,22 @@ mod tests {
         }
     }
 
+    /// `copies` to read in one scan of every row, or one session at a time
+    /// without texts held.
+    fn copies_to_read(
+        copies: &[CachedSession],
+        are_every_row: bool,
+    ) -> crate::search::CopiesToRead {
+        if are_every_row {
+            crate::search::CopiesToRead::EveryRow(copies.to_vec())
+        } else {
+            crate::search::CopiesToRead::EachSession {
+                copies: copies.to_vec(),
+                held: HashMap::new(),
+            }
+        }
+    }
+
     #[test]
     fn launch_read_and_read_per_copy_hold_texts_of_session_replaced_since_its_row() {
         let base = tempfile::tempdir().unwrap();
@@ -902,11 +1005,7 @@ mod tests {
         let expected = alone(&copies[1]);
         super::super::tests::replace_copy(&copies[1]);
         for (are_every_row, read) in [(true, "the launch read"), (false, "a read per copy")] {
-            let texts = crate::search::CopiesToRead {
-                copies: copies.clone(),
-                are_every_row,
-            }
-            .read();
+            let texts = copies_to_read(&copies, are_every_row).read();
             assert!(
                 texts.iter().all(|(_, texts)| texts.is_ok()),
                 "{read}: every row holds texts"
@@ -958,13 +1057,7 @@ mod tests {
     fn every_row_read_in_one_scan_is_laid_out_as_each_session_read_alone_for_every_provider() {
         let base = tempfile::tempdir().unwrap();
         let copies = every_record_copies_with_texts_outside_messages(base.path());
-        let read = |are_every_row| {
-            crate::search::CopiesToRead {
-                copies: copies.clone(),
-                are_every_row,
-            }
-            .read()
-        };
+        let read = |are_every_row| copies_to_read(&copies, are_every_row).read();
         let (in_one_scan, alone) = (read(true), read(false));
         assert_eq!(in_one_scan.len(), alone.len());
         for ((key, scanned), (alone_key, alone)) in in_one_scan.into_iter().zip(alone) {
@@ -975,6 +1068,112 @@ mod tests {
                 "{key:?}: the scan lays out the session's texts as its own read does"
             );
         }
+    }
+
+    /// Adds to the last of `copies` an entry's part of `search_field` and
+    /// `text` at a part id past every thread's share of the first read's
+    /// ranges: the read's ranges span that id, and that copy's last task is
+    /// the last.
+    fn add_part_past_every_range(
+        base: &std::path::Path,
+        copies: &[CachedSession],
+        search_field: Option<i64>,
+        text: rusqlite::types::Value,
+    ) {
+        let last = copies.last().unwrap();
+        admitted_cache(base)
+            .connection
+            .execute(
+                "INSERT INTO parts (id, session, entry, part, kind, search_field, entry_sequence, \
+                 search_position, text) \
+                 SELECT 1 << 40, session, entry, 1 << 20, 'text', ?1, 0, 0, ?2 FROM parts \
+                 WHERE session = (SELECT id FROM sessions WHERE generation = ?3) \
+                 AND entry IS NOT NULL LIMIT 1",
+                rusqlite::params![search_field, text, last.generation],
+            )
+            .unwrap();
+    }
+
+    /// The batches `read_in_batches` replies with for every row of `copies`,
+    /// in reply order.
+    fn first_read_batches(copies: &[CachedSession]) -> Vec<Vec<crate::search::TextsRead>> {
+        let batches = std::sync::Mutex::new(Vec::new());
+        crate::search::CopiesToRead::EveryRow(copies.to_vec())
+            .read_in_batches(&|batch| batches.lock().unwrap().push(batch));
+        batches.into_inner().unwrap()
+    }
+
+    #[test]
+    fn first_read_in_several_waves_replies_more_than_once_with_each_copy_once() {
+        let base = tempfile::tempdir().unwrap();
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
+        add_part_past_every_range(
+            base.path(),
+            &copies,
+            None,
+            rusqlite::types::Value::Text("not searched".to_owned()),
+        );
+
+        let batches = first_read_batches(&copies);
+
+        let mut replied = batches.iter().flatten().collect::<Vec<_>>();
+        assert!(
+            batches.len() > 1,
+            "the read replies after each wave that ends a copy's rows: {} replies",
+            batches.len()
+        );
+        assert!(
+            replied.iter().all(|(_, read)| read.is_ok()),
+            "every copy's read returns its texts"
+        );
+        replied.sort_by_key(|(key, _)| copies.iter().position(|copy| copy.copy_key() == *key));
+        assert_eq!(
+            replied
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            copies
+                .iter()
+                .map(CachedSession::copy_key)
+                .collect::<Vec<_>>(),
+            "the replies hold each copy once"
+        );
+    }
+
+    #[test]
+    fn first_read_failing_in_a_later_wave_replies_failure_for_copies_not_yet_replied() {
+        let base = tempfile::tempdir().unwrap();
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
+        add_part_past_every_range(
+            base.path(),
+            &copies,
+            Some(SearchField::Full.code()),
+            rusqlite::types::Value::Blob(vec![0xFF]),
+        );
+
+        let batches = first_read_batches(&copies);
+
+        let (failed, read): (Vec<_>, Vec<_>) = batches
+            .iter()
+            .flatten()
+            .partition(|(_, read)| read.is_err());
+        let last_copy = copies.last().unwrap().copy_key();
+        assert!(
+            batches
+                .last()
+                .is_some_and(|batch| batch.iter().all(|(_, read)| read.is_err())),
+            "the failure is the last reply"
+        );
+        assert_eq!(
+            failed.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            [&last_copy],
+            "the copy due in the failed wave replies a failure"
+        );
+        assert_eq!(
+            read.len(),
+            copies.len() - 1,
+            "every other copy replied its texts once, before the failure"
+        );
     }
 
     /// The query plan of `query`, each parameter bound to 1.
@@ -1034,6 +1233,10 @@ mod tests {
             ),
             (
                 SESSION_PART_BOUNDS.to_owned(),
+                "SEARCH parts USING COVERING INDEX parts_by_session (session=?)",
+            ),
+            (
+                SESSION_GREATEST_PART.to_owned(),
                 "SEARCH parts USING COVERING INDEX parts_by_session (session=?)",
             ),
             (
@@ -1162,6 +1365,7 @@ mod tests {
                     only: SessionFilter::of(connection, &sessions)?,
                     sessions,
                     window: None,
+                    ranges_per_thread: RANGES_PER_THREAD,
                 }
                 .tasks(connection)?;
                 Ok((tasks, bounds))
@@ -1183,6 +1387,83 @@ mod tests {
         assert!(
             tasks.contains(&ScanTask::SubagentMetadata),
             "the scan reads the sub-agent metadata: {tasks:?}"
+        );
+    }
+
+    #[test]
+    fn sessions_last_task_contains_its_greatest_part_or_reads_metadata_without_parts() {
+        let base = tempfile::tempdir().unwrap();
+        let copies = every_record_copies_with_texts_outside_messages(base.path());
+        admitted_cache(base.path())
+            .connection
+            .execute(
+                "DELETE FROM parts WHERE session = (SELECT MIN(id) FROM sessions)",
+                [],
+            )
+            .unwrap();
+        let cache = SqliteCache::open_waiting(&copies[0].base).unwrap().unwrap();
+        let last_tasks = cache
+            .with_read_snapshot(|connection| {
+                let sessions = copies
+                    .iter()
+                    .enumerate()
+                    .map(|(position, copy)| {
+                        let Lookup::Scanned(session) = Lookup::of(connection, copy) else {
+                            panic!("the cache holds the copy");
+                        };
+                        (session, (position, copy.generation))
+                    })
+                    .collect::<SessionsById>();
+                let greatest = sessions
+                    .keys()
+                    .map(|&session| {
+                        let greatest: Option<i64> =
+                            connection
+                                .query_row(SESSION_GREATEST_PART, [session], |row| row.get(0))?;
+                        Ok((session, greatest))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                let mut ids = greatest.values().flatten().copied().collect::<Vec<_>>();
+                ids.sort_unstable();
+                let middle = ids[ids.len() / 2];
+                let tasks = [
+                    ScanTask::SubagentMetadata,
+                    ScanTask::Parts(ids[0]..=middle),
+                    ScanTask::Parts(middle + 1..=ids[ids.len() - 1]),
+                ];
+                let expected = greatest
+                    .iter()
+                    .map(|(&session, greatest)| {
+                        let task = match greatest {
+                            None => 0,
+                            Some(id) if *id <= middle => 1,
+                            Some(_) => 2,
+                        };
+                        (session, task)
+                    })
+                    .collect::<HashMap<_, _>>();
+                let scan = TextScan {
+                    scan: Scan {
+                        only: SessionFilter::of(connection, &sessions)?,
+                        sessions,
+                        window: None,
+                        ranges_per_thread: RANGES_PER_THREAD,
+                    },
+                    visitor: &KeepEvery::default,
+                };
+                Ok((scan.last_tasks(connection, &tasks)?, expected))
+            })
+            .unwrap();
+        let (found, expected) = last_tasks;
+        assert!(
+            (0..=2).all(|task| expected.values().any(|expected| *expected == task)),
+            "a session is without parts, and the others' greatest parts fall in both ranges: \
+             {expected:?}"
+        );
+        assert_eq!(
+            found, expected,
+            "each session's last task is the range containing its greatest part, or the sub-agent \
+             metadata read for a session without parts"
         );
     }
 }

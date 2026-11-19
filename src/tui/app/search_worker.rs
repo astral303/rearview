@@ -9,13 +9,13 @@ use crate::clock::Clock;
 use crate::history::Conversation;
 use crate::search::query::ParsedQuery;
 use crate::search::{
-    self, CopiesToRead, ReadFailure, SearchTextsInMemory, SearchableConversation,
+    self, BatchReply, CopiesToRead, ReadFailure, SearchTextsInMemory, SearchableConversation,
     SessionsWithoutTexts, TextsRead,
 };
 use chrono::{DateTime, Local};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub(super) enum SearchCommand {
     UpdateData {
@@ -155,12 +155,13 @@ impl TextsToRead {
     }
 }
 
-/// The sessions without texts held, as the worker counts them once it has
-/// applied `updates_applied` `UpdateData` commands.
+/// The worker's counts of sessions without texts and of sessions being read
+/// again, after it applied `updates_applied` `UpdateData` commands.
 #[derive(Clone, Copy)]
 pub(super) struct TextsHeld {
     pub(super) updates_applied: u64,
     pub(super) sessions_without_texts: SessionsWithoutTexts,
+    pub(super) sessions_updating: usize,
 }
 
 /// The work the inputs waiting ask the worker for.
@@ -204,7 +205,7 @@ impl SearchWorkerState {
                 searchable,
             }) => {
                 let copies = self.texts.keep_copies_of(&conversations);
-                if !copies.copies.is_empty() {
+                if !copies.copies().is_empty() {
                     self.send_to_reader(TextsToRead {
                         copies,
                         reply: self.texts_reply.clone(),
@@ -297,7 +298,7 @@ pub(super) fn spawn_search_worker(clock: Arc<dyn Clock>) -> SearchWorker {
         .name("search-worker".into())
         .spawn(move || {
             let mut state = SearchWorkerState::new(
-                spawn_text_reader(CopiesToRead::read),
+                spawn_text_reader(CopiesToRead::read_in_batches, text_reader_pool),
                 texts_reply,
                 awaited_search,
             );
@@ -322,6 +323,7 @@ pub(super) fn spawn_search_worker(clock: Arc<dyn Clock>) -> SearchWorker {
                 let held = TextsHeld {
                     updates_applied: state.updates_applied,
                     sessions_without_texts: state.texts.sessions_without_texts(),
+                    sessions_updating: state.texts.sessions_updating(),
                 };
                 if pending.texts_changed && texts_held_tx.send(held).is_err() {
                     return;
@@ -349,31 +351,77 @@ pub(super) struct SearchWorker {
 }
 
 /// Start the thread reading the search texts of each batch of copies sent
-/// to it with `read`, in parallel, and replying with each batch's reads
-/// together. A batch whose read panics replies with every copy failed. The
-/// thread stops once the search worker is gone.
+/// to it with `read`, in parallel on the thread pool `build_pool` builds for
+/// the first batch. `read` hands its reads to the reply a few copies at a
+/// time, and each reply reaches the worker as it is made. When the pool's
+/// build fails or the read panics, the reader replies a failure for each
+/// copy not yet replied; a failed build is tried again with the next batch.
+/// The thread stops once the search worker is gone.
+///
+/// The read runs on its own pool, not rayon's global one: a job another
+/// thread queues on the global pool, such as the drawing thread's
+/// `precompute_search_text` after a delete, would otherwise wait until the
+/// whole read ends.
 pub(super) fn spawn_text_reader(
-    read: fn(&CopiesToRead) -> Vec<TextsRead>,
+    read: fn(&CopiesToRead, BatchReply<'_>),
+    build_pool: fn() -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
 ) -> mpsc::Sender<TextsToRead> {
     let (batches_tx, batches_rx) = mpsc::channel::<TextsToRead>();
     std::thread::Builder::new()
         .name("text-reader".into())
         .spawn(move || {
+            let mut pool = None;
             while let Ok(TextsToRead { copies, reply }) = batches_rx.recv() {
-                let reads =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&copies)))
-                        .unwrap_or_else(|panic| {
-                            let message = panic
-                                .downcast_ref::<String>()
-                                .map(String::as_str)
-                                .or_else(|| panic.downcast_ref::<&str>().copied())
-                                .unwrap_or("a panic without a message");
-                            let cause = format!("the search text reader panicked: {message}");
-                            copies.failed(&ReadFailure::Error(cause.into()))
-                        });
-                let _ = reply.send(WorkerInput(Input::TextsRead(reads)));
+                let replied = Mutex::new(HashSet::new());
+                let reply_with = |reads: Vec<TextsRead>| {
+                    replied
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend(reads.iter().map(|(copy, _)| copy.clone()));
+                    let _ = reply.send(WorkerInput(Input::TextsRead(reads)));
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> Result<(), rayon::ThreadPoolBuildError> {
+                        let pool = match &mut pool {
+                            Some(pool) => pool,
+                            unbuilt => unbuilt.insert(build_pool()?),
+                        };
+                        pool.install(|| read(&copies, &reply_with));
+                        Ok(())
+                    },
+                ));
+                let cause = match outcome {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => {
+                        format!("the search text reader's threads didn't start: {error}")
+                    }
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("a panic without a message");
+                        format!("the search text reader panicked: {message}")
+                    }
+                };
+                let replied = replied.into_inner().unwrap_or_else(PoisonError::into_inner);
+                let unreplied = copies
+                    .failed(&ReadFailure::Error(cause.into()))
+                    .into_iter()
+                    .filter(|(copy, _)| !replied.contains(copy))
+                    .collect();
+                let _ = reply.send(WorkerInput(Input::TextsRead(unreplied)));
             }
         })
         .expect("failed to spawn search text reader thread");
     batches_tx
+}
+
+/// The text reader's thread pool, as many threads as rayon's global pool:
+/// the first read of a cache in the file cache keeps every thread busy, and
+/// fewer threads would slow it. The threads sleep between reads.
+pub(super) fn text_reader_pool() -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
+    rayon::ThreadPoolBuilder::new()
+        .thread_name(|index| format!("text-read-{index}"))
+        .build()
 }

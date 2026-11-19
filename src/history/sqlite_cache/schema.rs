@@ -5,7 +5,7 @@ use crate::semantic::filter::SEMANTIC_TURN_VERSION;
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 41;
+pub(super) const SCHEMA_VERSION: u32 = 42;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The `meta` key holding the [`SEMANTIC_TURN_VERSION`] of the stored
 /// `semantic_turns`. A database holding another is emptied and rebuilt, as
@@ -41,6 +41,7 @@ pub(super) const TABLES: &[&str] = &[
     "threads",
     "transcripts",
     "parse_errors",
+    "session_appends",
     "session_checkpoints",
     "transcript_reads",
     "session_files",
@@ -119,8 +120,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- then missing.
     entries_error TEXT,
     -- A number no earlier write of any session in this database carried,
-    -- from the `last_generation` meta counter. Every write gives the row a
-    -- new one, so a reader holding the old number sees the copy change.
+    -- from the `last_generation` meta counter, also across a rebuild (see
+    -- `numbering_start`). Every write gives the row a new one, so a reader
+    -- holding the old number sees the copy change.
     generation INTEGER NOT NULL,
     UNIQUE (storage, root, cache_key)
 );
@@ -187,6 +189,20 @@ CREATE TABLE IF NOT EXISTS session_checkpoints (
     sequence INTEGER NOT NULL,
     checkpoint BLOB NOT NULL,
     ledger BLOB NOT NULL
+);
+
+-- The session's last write, when it was a resumed write that changed only
+-- the search texts of messages numbered `first_message` on, those outside
+-- every message of entries at `first_entry` on, and the sub-agent metadata.
+-- A reader holding the texts of the copy `previous_generation`, the copy the
+-- write resumed, reads only those. Any other write of the session removes
+-- the row.
+CREATE TABLE IF NOT EXISTS session_appends (
+    session INTEGER PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
+    previous_generation INTEGER NOT NULL,
+    -- Null when the write didn't change any message's texts.
+    first_message INTEGER,
+    first_entry INTEGER NOT NULL
 );
 
 -- The session row's parse errors.
@@ -468,8 +484,8 @@ mod tests {
     /// with. A change to either fails `schema_text_matches_its_version`
     /// until both are set again.
     const PINNED_SCHEMA: (u32, &str) = (
-        41,
-        "d4cb26e632a6673f369a63dedf831c520c59e9e644c16f86e8918e32a05b6af8",
+        42,
+        "19f02bdafd8b6658def4d75587a4e6c65e271fec4963513c887ab4db5b0edced",
     );
 
     /// [`CREATE`] without its `--` comments and with its whitespace

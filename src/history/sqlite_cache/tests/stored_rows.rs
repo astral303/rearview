@@ -54,6 +54,13 @@ const SHARED_TABLES: &[(&str, &str)] = &[
     ("roots", "every session under a root shares its row"),
 ];
 
+/// The tables that record how the last write wrote a session, not what the
+/// session contains, each with the reason. [`stored_rows`] doesn't read them.
+const WRITE_RECORD_TABLES: &[(&str, &str)] = &[(
+    "session_appends",
+    "a resumed write records its append; a write of the whole session doesn't",
+)];
+
 /// The columns two writes of one session store differently, each with the
 /// reason.
 const NOT_COMPARED: &[(&str, &str, &str)] = &[(
@@ -93,7 +100,7 @@ impl StoredTable {
 }
 
 /// The rows of the session row `session` in each table but
-/// [`SHARED_TABLES`]. Panics when one of the rows
+/// [`SHARED_TABLES`] and [`WRITE_RECORD_TABLES`]. Panics when one of the rows
 /// references a row of another session.
 pub(super) fn stored_rows(connection: &Connection, session: i64) -> Vec<StoredTable> {
     session_tables()
@@ -101,7 +108,7 @@ pub(super) fn stored_rows(connection: &Connection, session: i64) -> Vec<StoredTa
         .collect()
 }
 
-/// Each table but [`SHARED_TABLES`], with the columns of
+/// Each table but [`SHARED_TABLES`] and [`WRITE_RECORD_TABLES`], with the columns of
 /// it [`stored_rows`] compares, read from the schema `connection` holds.
 pub(super) fn compared_columns(connection: &Connection) -> Vec<(&'static str, Vec<String>)> {
     session_tables()
@@ -142,10 +149,12 @@ pub(super) fn assert_same_lines(actual: &[String], expected: &[String], claim: &
 }
 
 fn session_tables() -> impl Iterator<Item = &'static str> {
-    schema::TABLES
-        .iter()
-        .copied()
-        .filter(|table| !SHARED_TABLES.iter().any(|(name, _)| name == table))
+    schema::TABLES.iter().copied().filter(|table| {
+        !SHARED_TABLES
+            .iter()
+            .chain(WRITE_RECORD_TABLES)
+            .any(|(name, _)| name == table)
+    })
 }
 
 /// A column of a table, as `pragma_table_info` reports it.

@@ -1458,13 +1458,9 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
                 "{}/{}{}",
                 selected + 1,
                 app.filtered().len(),
-                app.sessions_without_texts_text()
+                app.search_reads_label()
             ),
-            (None, None) => format!(
-                "0/{}{}",
-                app.filtered().len(),
-                app.sessions_without_texts_text()
-            ),
+            (None, None) => format!("0/{}{}", app.filtered().len(), app.search_reads_label()),
         },
     };
     let status_text = if app.list_search_mode() == ListSearchMode::Semantic {

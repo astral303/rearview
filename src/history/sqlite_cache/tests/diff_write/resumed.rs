@@ -14,7 +14,10 @@ use super::*;
 use crate::clock::TestClock;
 use crate::history::provider::walk::test_support::{link_directory, unlink_directory};
 use crate::history::resumed::{ResumeContext, WholeRead, read_resumed};
+use crate::history::sqlite_cache::CachedSession;
+use crate::search::lexical::SessionSearchTexts;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const OWN_THREAD: &str = "019f0000-0000-7000-8000-00000000000a";
@@ -149,14 +152,37 @@ impl CodexSession {
 
 /// Reads `fixture`'s session on from its copy in `cache` and writes the read
 /// to `cache`, or writes its parse when it is read whole, as a load does.
-/// Asserts that the updated row and entries match a fresh parse and write.
+/// Asserts that the updated row and entries match a fresh parse and write,
+/// and that the search texts read again after the copy's texts equal a
+/// whole read of the new copy.
 pub(in crate::history::sqlite_cache::tests) fn update_stored(
     cache: &mut TemporaryCache,
     fixture: &Fixture,
 ) -> Update {
+    let held = SessionSearchTexts::read(&cached_copy(cache, fixture))
+        .map(Arc::new)
+        .expect("the cache holds the session's copy");
     let (update, record) = update_stored_changing_files(cache, fixture, &|| {});
     assert_matches_fresh_write(cache, fixture, &record);
+    let updated = cached_copy(cache, fixture);
+    let reread =
+        SessionSearchTexts::read_after(&updated, &held).expect("the cache holds the updated copy");
+    let whole = SessionSearchTexts::read(&updated).expect("the cache holds the updated copy");
+    assert_eq!(
+        (reread.joined(), reread.dialogue()),
+        (whole.joined(), whole.dialogue()),
+        "{}: the search texts read again after the stored copy's equal a whole read",
+        fixture.label()
+    );
     update
+}
+
+/// The copy of `fixture`'s session the catalogue of `cache` lists.
+fn cached_copy(cache: &TemporaryCache, fixture: &Fixture) -> CachedSession {
+    fixture
+        .listed(cache)
+        .cached_session
+        .expect("a listed session has a cached copy")
 }
 
 /// [`update_stored`], with `change` run as the read opens each transcript,
