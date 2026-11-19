@@ -540,9 +540,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ send_message: /root/scout
           │
-   ┌──────┘ SEND_MESSAGE_SENTINEL: add the dates
-   ↓
-   Result ┐
+          │ SEND_MESSAGE_SENTINEL: add the dates
 
     Codex │ update_plan:
           │

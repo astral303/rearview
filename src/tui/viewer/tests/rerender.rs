@@ -287,12 +287,13 @@ fn message_toggling(
 
 /// `entries` with their lanes and an empty roster.
 pub(super) fn conversation_of(entries: Vec<RenderableEntry>) -> ParsedConversation {
-    let lanes = Lanes::of(top_level_tool_blocks(&entries));
+    let roster = SubagentRoster::default();
+    let lanes = Lanes::of(top_level_tool_blocks(&entries), &roster);
     ParsedConversation {
         entries,
         origins: Vec::new(),
         subagent_identities: Vec::new(),
-        roster: SubagentRoster::default(),
+        roster,
         lanes,
         activity_span: None,
     }
@@ -621,7 +622,7 @@ fn sub_agents_reply_and_output_render_in_place_as_in_whole_render() {
         ],
     );
     let roster = roster_of(&entries);
-    let lanes = Lanes::of(top_level_tool_blocks(&entries));
+    let lanes = Lanes::of(top_level_tool_blocks(&entries), &roster);
     let conversation = ParsedConversation {
         entries,
         origins: Vec::new(),

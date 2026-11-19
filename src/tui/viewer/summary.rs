@@ -396,7 +396,10 @@ fn render_summary_group_details(
     options: &RenderOptions,
 ) {
     let mut rendered_any = false;
-    let lanes = Lanes::of(run_tool_blocks(entries, pending).map(|entry_block| entry_block.block));
+    let lanes = Lanes::of(
+        run_tool_blocks(entries, pending).map(|entry_block| entry_block.block),
+        roster,
+    );
     let mut call_ranges = CallRanges::new(&lanes);
     let pad_timing = TimingSlot::from_show_timing(options.show_timing);
     let parent_id = pending.parent_id.as_deref();
@@ -408,15 +411,10 @@ fn render_summary_group_details(
         block,
     } in run_tool_blocks(entries, pending)
     {
-        if rendered_any {
-            push_separator(lines);
-        }
-        rendered_any = true;
         let location = BlockLocation {
             entry_index: parsed.entry_index,
             block_index,
         };
-        let start_line = lines.len();
         match block {
             ToolBlock::Call {
                 id,
@@ -424,6 +422,7 @@ fn render_summary_group_details(
                 tool,
                 input,
             } => {
+                let start_line = start_block(lines, &mut rendered_any);
                 let output_id = make_tool_output_id(
                     parsed.entry_index,
                     parent_id,
@@ -465,6 +464,10 @@ fn render_summary_group_details(
                 content,
                 standalone_tool_name,
             } => {
+                let Some(content_str) = roster.result_text(tool_use_id, content) else {
+                    continue;
+                };
+                let start_line = start_block(lines, &mut rendered_any);
                 let output_id = make_tool_output_id(
                     parsed.entry_index,
                     parent_id,
@@ -473,7 +476,6 @@ fn render_summary_group_details(
                     Some(tool_use_id),
                 );
                 let expanded = options.expanded_tool_outputs.contains(&output_id);
-                let content_str = roster.result_text(tool_use_id, content);
                 render_tool_result(
                     lines,
                     &ToolResultRenderSpec {
@@ -501,6 +503,16 @@ fn render_summary_group_details(
         }
     }
     calls.extend(call_ranges.into_calls());
+}
+
+/// Separate the next block of an expanded run from the block rendered before
+/// it, and return the block's first row.
+fn start_block(lines: &mut Vec<RenderedLine>, rendered_any: &mut bool) -> usize {
+    if *rendered_any {
+        push_separator(lines);
+    }
+    *rendered_any = true;
+    lines.len()
 }
 
 /// The tool calls and results of the run in file order: the blocks of every

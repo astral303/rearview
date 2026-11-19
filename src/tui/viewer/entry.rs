@@ -630,6 +630,9 @@ fn collect_tool_result_rows<'a>(
         else {
             continue;
         };
+        let Some(content) = ctx.roster.result_text(tool_use_id, content.as_ref()) else {
+            continue;
+        };
         let output_id = make_tool_output_id(
             ctx.entry_index,
             ctx.parent_id,
@@ -643,7 +646,7 @@ fn collect_tool_result_rows<'a>(
             block_index,
             expanded: ctx.options.expanded_tool_outputs.contains(&output_id),
             output_id,
-            content: ctx.roster.result_text(tool_use_id, content.as_ref()),
+            content,
         });
     }
     rows

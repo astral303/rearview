@@ -418,7 +418,7 @@ impl ParsedConversation {
         self.entries.extend(entries);
 
         let roster = roster_of_conversation(&self.subagent_identities, &self.entries);
-        self.lanes = Lanes::of(top_level_tool_blocks(&self.entries));
+        self.lanes = Lanes::of(top_level_tool_blocks(&self.entries), &roster);
         ReplacedEntries {
             first_changed,
             entries: replaced_entries,
@@ -619,7 +619,7 @@ pub(crate) fn parsed_conversation(displayed: DisplayEntries) -> ParsedConversati
     let origins = displayed.origins;
     let entries = renderable_entries(displayed.entries, 0);
     let roster = roster_of_conversation(&subagent_identities, &entries);
-    let lanes = Lanes::of(top_level_tool_blocks(&entries));
+    let lanes = Lanes::of(top_level_tool_blocks(&entries), &roster);
     let activity_span = extended_activity_span(None, &entries);
     ParsedConversation {
         entries,

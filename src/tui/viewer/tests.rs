@@ -119,7 +119,7 @@ fn render_to_end(
     roster: &SubagentRoster,
     options: &RenderOptions,
 ) -> RenderedConversation {
-    let lanes = Lanes::of(top_level_tool_blocks(entries));
+    let lanes = Lanes::of(top_level_tool_blocks(entries), roster);
     render_entries(entries, roster, &lanes, options, &|| true)
         .expect("a render that keeps going finishes")
 }
@@ -924,6 +924,163 @@ fn codex_goal_and_interrupted_turn_show_as_labelled_rows() {
 
     assert!(text.contains("Goal │ Ship the parser"), "{text}");
     assert!(text.contains("Notice │ Conversation interrupted"), "{text}");
+}
+
+/// A Codex function call at `seconds` and its output.
+fn codex_function_call(
+    seconds: u32,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    output: &str,
+) -> String {
+    let call = codex_record(
+        seconds,
+        "response_item",
+        &serde_json::json!({"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments})
+            .to_string(),
+    );
+    let output = codex_record(
+        seconds,
+        "response_item",
+        &serde_json::json!({"type": "function_call_output", "call_id": call_id, "output": output})
+            .to_string(),
+    );
+    format!("{call}\n{output}")
+}
+
+#[test]
+fn empty_result_of_message_to_agent_doesnt_show_a_row_and_other_results_keep_theirs() {
+    let conversation = codex_session_of(&[
+        codex_function_call(
+            1,
+            "call_send",
+            "send_message",
+            r#"{"target":"/root/scout","message":"Add the dates."}"#,
+            "",
+        ),
+        codex_function_call(
+            2,
+            "call_followup",
+            "followup_task",
+            r#"{"target":"/root/scout","message":"One more."}"#,
+            "collab tool failed: agent thread limit reached",
+        ),
+        codex_function_call(
+            3,
+            "call_shell",
+            "shell_command",
+            r#"{"command":"cat notes.txt"}"#,
+            "",
+        ),
+    ]);
+    let mut expanded_run = test_render_options(ToolDisplayMode::Hidden);
+    expanded_run
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+
+    for options in [test_render_options(ToolDisplayMode::Full), expanded_run] {
+        let rendered = render_parsed_conversation(&conversation, &options);
+        let text = rendered_text(&rendered);
+
+        let result_rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("Result"))
+            .collect();
+
+        assert!(text.contains("send_message: /root/scout"), "{text}");
+        assert!(
+            result_rows
+                .iter()
+                .any(|row| row.ends_with("collab tool failed: agent thread limit reached")),
+            "an error result keeps its row: {text}"
+        );
+        assert_eq!(
+            result_rows.len(),
+            2,
+            "the shell command's empty result keeps its row, the message's doesn't show one: {text}"
+        );
+        assert!(
+            rendered
+                .calls
+                .iter()
+                .all(|call| call.result.is_some() || call.input.id.0.ends_with("id:call_send")),
+            "only the message's call is without a result block: {:?}",
+            rendered.calls
+        );
+    }
+}
+
+/// A message to an agent and a shell command open at once, the shell
+/// command opened first when `shell_first`: their calls, then the message's
+/// empty result and the shell command's output.
+fn message_and_shell_command_open_together(shell_first: bool) -> ParsedConversation {
+    let call = |call_id: &str, name: &str, arguments: &str| {
+        codex_record(
+            1,
+            "response_item",
+            &serde_json::json!({"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments})
+                .to_string(),
+        )
+    };
+    let output = |call_id: &str, output: &str| {
+        codex_record(
+            2,
+            "response_item",
+            &serde_json::json!({"type": "function_call_output", "call_id": call_id, "output": output})
+                .to_string(),
+        )
+    };
+    let send = call(
+        "call_send",
+        "send_message",
+        r#"{"target":"/root/scout","message":"Add the dates."}"#,
+    );
+    let shell = call(
+        "call_shell",
+        "shell_command",
+        r#"{"command":"cat notes.txt"}"#,
+    );
+    let calls = if shell_first {
+        [shell, send]
+    } else {
+        [send, shell]
+    };
+    let mut lines = Vec::from(calls);
+    lines.extend([output("call_send", ""), output("call_shell", "notes")]);
+    codex_session_of(&lines)
+}
+
+#[test]
+fn call_whose_result_is_hidden_doesnt_take_a_lane() {
+    let mut expanded_run = test_render_options(ToolDisplayMode::Hidden);
+    expanded_run
+        .expanded_tool_outputs
+        .insert(make_tool_summary_output_id(0, None));
+
+    for shell_first in [false, true] {
+        let conversation = message_and_shell_command_open_together(shell_first);
+
+        let detail =
+            render_parsed_conversation(&conversation, &test_render_options(ToolDisplayMode::Full));
+        let detail_lanes: Vec<_> = detail
+            .detail_calls
+            .iter()
+            .map(|call| call.rows.lane)
+            .collect();
+        assert_eq!(
+            detail_lanes,
+            [None, None],
+            "neither call opens beside another in a detail mode, shell first: {shell_first}"
+        );
+
+        let run = render_parsed_conversation(&conversation, &expanded_run);
+        assert_eq!(
+            lanes_of(&run),
+            [None, None],
+            "neither call opens beside another in an expanded run, shell first: {shell_first}"
+        );
+    }
 }
 
 fn sub_agent_named(nickname: &'static str, lines: Vec<String>) -> NamedSubAgent {

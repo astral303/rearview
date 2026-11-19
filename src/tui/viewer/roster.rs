@@ -25,6 +25,8 @@ pub(crate) struct SubagentRoster {
     /// The agent type each agent call asked for, by call id; `None` for a
     /// call that names none.
     agent_calls: HashMap<String, Option<String>>,
+    /// The ids of the calls that message an agent.
+    message_calls: HashSet<String>,
 }
 
 impl SubagentRoster {
@@ -63,22 +65,28 @@ impl SubagentRoster {
     }
 
     /// Record the agent calls `entry` makes, each with the agent type its
-    /// launch settings name.
+    /// launch settings name, and the calls that message an agent.
     pub(super) fn record_agent_calls(&mut self, entry: &LogEntry) {
         for block in entry.content_blocks() {
-            if let ContentBlock::ToolUse {
-                id,
-                tool: Tool::Agent,
-                input,
-                ..
+            let ContentBlock::ToolUse {
+                id, tool, input, ..
             } = block
-            {
-                let agent_type = input
-                    .get("launch")
-                    .and_then(|launch| launch.get("agent_type"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                self.agent_calls.insert(id.clone(), agent_type);
+            else {
+                continue;
+            };
+            match tool {
+                Tool::Agent => {
+                    let agent_type = input
+                        .get("launch")
+                        .and_then(|launch| launch.get("agent_type"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    self.agent_calls.insert(id.clone(), agent_type);
+                }
+                Tool::AgentMessage => {
+                    self.message_calls.insert(id.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -97,9 +105,24 @@ impl SubagentRoster {
     /// `Lorentz² (suite_runner) · /root/scout`. A result answering a launch
     /// without a task name reads as the nickname it carries, or the agent
     /// id when the nickname is missing.
-    pub(super) fn result_text(&self, tool_use_id: &str, content: Option<&Value>) -> String {
-        self.started_subagent(tool_use_id, content)
-            .unwrap_or_else(|| tool_result_display_text(content))
+    ///
+    /// `None` for a result [`Self::hides_result`] hides.
+    pub(super) fn result_text(&self, tool_use_id: &str, content: Option<&Value>) -> Option<String> {
+        if self.hides_result(tool_use_id, content) {
+            return None;
+        }
+        Some(
+            self.started_subagent(tool_use_id, content)
+                .unwrap_or_else(|| tool_result_display_text(content)),
+        )
+    }
+
+    /// True for the empty result of a call that messages an agent: Codex
+    /// returns one for every delivered message. The result doesn't show a
+    /// row, and its call doesn't take a lane.
+    pub(super) fn hides_result(&self, tool_use_id: &str, content: Option<&Value>) -> bool {
+        self.message_calls.contains(tool_use_id)
+            && tool_result_display_text(content).trim().is_empty()
     }
 
     fn started_subagent(&self, tool_use_id: &str, content: Option<&Value>) -> Option<String> {

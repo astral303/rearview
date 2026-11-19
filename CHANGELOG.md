@@ -222,6 +222,8 @@
     The suffix shows when Codex stored the text encrypted; a readable text
     shows under the header.
   - A `sleep` call now shows its duration: `sleep: 1m`.
+- Fix `send_message` and `followup_task` showing an empty `Result` row in the
+  viewer.
 - Fix a sub-agent launch without a task name showing as `spawn_agent` over
   raw JSON. It now shows a header, such as
   `spawn_agent (explorer) · gpt-5.6-sol (high) · fork`, and the prompt, in the
