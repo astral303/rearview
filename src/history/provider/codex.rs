@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 27,
+            schema_version: 28,
         }
     }
 
@@ -1101,6 +1101,18 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "function_call_output", "id": "fco_spawn", "call_id": "call_spawn", "output": "{\"task_name\":\"/root/scout\"}"}),
                     ),
+                    // A launch without a task name; its result names a
+                    // sub-agent without a transcript.
+                    line(
+                        10,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_spawn_v1", "name": "spawn_agent", "namespace": "multi_agent_v1", "arguments": "{\"message\":\"PROMPT_WITHOUT_TASK_NAME_SENTINEL: find the stale-copy check.\",\"agent_type\":\"LAUNCH_TYPE_SENTINEL\",\"fork_context\":true}", "call_id": "call_spawn_v1"}),
+                    ),
+                    line(
+                        10,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_spawn_v1", "call_id": "call_spawn_v1", "output": "{\"agent_id\":\"019f0000-0000-7000-8000-0000000000e1\",\"nickname\":\"Hubble\"}"}),
+                    ),
                     line(
                         11,
                         "response_item",
@@ -1157,6 +1169,7 @@ pub(super) mod tests {
             );
             const PATCH_RUN: &str =
                 "Edited 2 files, messaged 1 agent, updated the task list 1 time";
+            const LAUNCH_RUN: &str = "Started 2 agents";
             AgentSession::new(
                 Source::Codex,
                 session,
@@ -1180,9 +1193,19 @@ pub(super) mod tests {
                     Marker::in_call_or_subagent("web search", "WEB_SEARCH_SENTINEL")
                         .in_summary_row("Fetched 1 URL, searched the web 2 times"),
                     Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
-                        .in_summary_row("Started 1 agent"),
+                        .in_summary_row(LAUNCH_RUN),
                     Marker::shown("launch setting", "service_tier: flex")
-                        .in_summary_row("Started 1 agent"),
+                        .in_summary_row(LAUNCH_RUN),
+                    Marker::in_call_or_subagent(
+                        "agent type of a launch without a task name",
+                        "LAUNCH_TYPE_SENTINEL",
+                    )
+                    .in_summary_row(LAUNCH_RUN),
+                    Marker::in_call_or_subagent(
+                        "prompt of a launch without a task name",
+                        "PROMPT_WITHOUT_TASK_NAME_SENTINEL",
+                    )
+                    .in_summary_row(LAUNCH_RUN),
                     Marker::in_call_or_subagent(
                         "exec script's shell command",
                         "EXEC_COMMAND_SENTINEL",

@@ -8436,8 +8436,9 @@ mod tests {
     }
 
     /// m1 makes an edit, runs a skill with arguments, updates a plan the
-    /// viewer shows as JSON, and launches a sub-agent with a setting its
-    /// header doesn't show; m2 thanks.
+    /// viewer shows as JSON, and launches two sub-agents: one with a task
+    /// name and a setting its header doesn't show, one without a task name;
+    /// m2 thanks.
     fn calls_with_bodies() -> AgentTranscript {
         use AgentMessageRole::{Assistant, User};
         let made = || source(Assistant);
@@ -8466,6 +8467,15 @@ mod tests {
                             "description": "scout",
                             "prompt": "List the modules.",
                             "launch": {"fork_turns": "none", "service_tier": "flex"}
+                        }),
+                        made(),
+                    ),
+                    call(
+                        "spawn_agent",
+                        Tool::Agent,
+                        json!({
+                            "prompt": "Map the cache.",
+                            "launch": {"agent_type": "explorer", "fork_turns": "all"}
                         }),
                         made(),
                     ),
@@ -8514,6 +8524,7 @@ mod tests {
                 "m1.2\n| Skill: review\n| --strict\n",
                 "m1.3\n| tool update_plan input_keys=plan\n| {\n| \"plan\": [\n| {\n| \"step\": \"Ship\"\n| }\n| ]\n| }\n",
                 "m1.4\n| spawn_agent: scout\n| service_tier: flex\n| List the modules.\n",
+                "m1.5\n| spawn_agent (explorer) · fork\n| Map the cache.\n",
             ),
             "{one_message}"
         );
@@ -8523,6 +8534,7 @@ mod tests {
                 "m1.2\n| Skill: review (+1 line)\n",
                 "m1.3\n| tool update_plan input_keys=plan (+7 lines)\n",
                 "m1.4\n| spawn_agent: scout (+1 line)\n| List the modules.\n",
+                "m1.5\n| spawn_agent (explorer) · fork\n| Map the cache.\n",
             )),
             "{several}"
         );

@@ -107,7 +107,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ NUMBERED_REPLY_SENTINEL: the command printed nothing.
 
-    Codex │ Started 1 agent
+    Codex │ Started 2 agents
 
       You │ Show the last commit
 
@@ -522,6 +522,12 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ LAUNCH_PROMPT_SENTINEL: list the release steps.
    ↓
    Result ┐ /root/scout
+
+    Codex │ spawn_agent (LAUNCH_TYPE_SENTINEL) · fork
+          │
+   ┌──────┘ PROMPT_WITHOUT_TASK_NAME_SENTINEL: find the stale-copy check.
+   ↓
+   Result ┐ Hubble
 
       You │ Show the last commit
 
