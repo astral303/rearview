@@ -389,6 +389,72 @@ fn focused_call_of_expanded_run_in_tail_stays_focused_as_after_whole_render() {
     );
 }
 
+const BLOCKS_REPLY: &str = "First paragraph.\n\nSecond paragraph.\n\n- one\n- two";
+
+/// `intro`, `reply`, then `texts`, as the user's messages. The unchanged
+/// first message lets a refresh that changes the reply read a tail.
+fn write_blocks_then(path: &Path, reply: &str, texts: &[String]) {
+    let mut lines = vec![user_line("intro"), user_line(reply)];
+    lines.extend(texts.iter().map(|text| user_line(text)));
+    write_lines(path, lines);
+}
+
+/// Focus the second item of [`BLOCKS_REPLY`]'s list.
+fn focus_second_item(app: &mut App) {
+    focus_message(app, "First paragraph.");
+    for code in [
+        KeyCode::Right,
+        KeyCode::Char('J'),
+        KeyCode::Char('J'),
+        KeyCode::Right,
+        KeyCode::Char('J'),
+    ] {
+        press(app, code);
+    }
+    assert_eq!(view(app).focused_text_block(), Some(SECOND_ITEM));
+}
+
+const SECOND_ITEM: TextBlockFocus = TextBlockFocus {
+    block: 2,
+    item: Some(1),
+};
+
+#[test]
+fn focused_item_stays_focused_after_refresh_as_after_whole_render() {
+    let mut twins = Twins::open(
+        |path| write_blocks_then(path, BLOCKS_REPLY, &numbered(0..20)),
+        focus_second_item,
+    );
+
+    twins.refresh_after(|path| write_blocks_then(path, BLOCKS_REPLY, &numbered(0..22)));
+
+    twins.assert_alike("an item focused above the new messages");
+    assert_eq!(
+        view(twins.tail_viewer()).focused_text_block(),
+        Some(SECOND_ITEM),
+        "the item stays focused"
+    );
+}
+
+#[test]
+fn message_whose_text_changed_is_focused_whole_after_refresh_as_after_whole_render() {
+    let mut twins = Twins::open(
+        |path| write_blocks_then(path, BLOCKS_REPLY, &numbered(0..2)),
+        focus_second_item,
+    );
+
+    let edited = BLOCKS_REPLY.replace("Second paragraph.", "Second paragraph, edited.");
+    twins.refresh_after(|path| write_blocks_then(path, &edited, &numbered(0..2)));
+
+    twins.assert_alike("an item focused in a message whose text changed");
+    let state = view(twins.tail_viewer());
+    assert_eq!(
+        (state.focused_message(), state.focused_text_block()),
+        (Some(1), None),
+        "the whole message is focused"
+    );
+}
+
 #[test]
 fn output_expanded_in_tail_stays_expanded_as_after_whole_render() {
     let write = |path: &Path, texts: &[String]| {

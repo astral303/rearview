@@ -331,27 +331,43 @@ summary mode.
 
 ### Navigate and copy messages
 
-You can navigate by focusing on one message or tool call at a time. A teal `▌`
-marks the focused item. Inside an expanded tool run, the focused call carries
-the `▌` marker, and the rest of the run carries a dim `▏`.
+You can navigate by focusing on one message, one tool call or one block of a
+message's text at a time. A teal `▌` marks the rows in focus, and they get a
+light background. Inside an expanded tool run, the focused call carries the `▌`
+marker, and the rest of the run carries a dim `▏`. Inside a message, the
+focused block carries the `▌`, and the rest of the message the `▏`.
 
 - `J`/`K` or `]`/`[` enter message navigation and step between messages. In an
   expanded run, they step directly between a message and the nearest call; they
   do not stop on the whole run. Entering from above selects the first call, and
   entering from below selects the last. One `K` reverses one `J` at every step.
+  Once `→` has focused a block, they step between the message's blocks, and
+  inside a list between its items; past the first or last block they step to
+  the neighbouring message.
 - `Enter` expands or collapses the focused message's run.
 - `→` expands a focused message's run or a focused call's output within the run.
+  On a message with nothing left to expand, it focuses the message's first
+  block: a paragraph, heading, code block, quote, list or table. On a list, it
+  focuses the first item; on a message that is one list, it focuses the first
+  item at once. A message that is one paragraph, one heading or one table
+  ignores `→`: copying that block would copy the message.
 - `←` reverses one level: it trims full call output, moves focus from a trimmed
-  call to the whole run, or collapses the focused run to one row.
+  call to the whole run, or collapses the focused run to one row. It moves focus
+  from a list item to its list, and from a block to its message. In a message
+  that is one list, it moves focus from an item to the message.
 - `y` copies the focused message as raw Markdown. On a call, it copies the
   header, full input, and full result. When the whole run is focused, it copies
-  every call in that run. Outside message navigation, it opens a conversation
-  copy menu with ledger, plain, Markdown, and JSONL formats.
+  every call in that run. On a block, it copies the block: a code block without
+  its fences, a quote without its outer `>` marks, a list item without its
+  bullet or number, and any other block as Markdown. Outside message
+  navigation, it opens a conversation copy menu with ledger, plain, Markdown,
+  and JSONL formats.
 - `/` searches the conversation and focuses the message containing each match.
   `n` and `N` move between matches; the status bar shows the current match and
   total.
 - Scrolling moves focus to the content on screen, one call at a time through an
-  expanded run. A collapsed run has no calls to focus.
+  expanded run. When a focused block scrolls off screen, focus moves to the
+  nearest block on screen. A collapsed run has no calls to focus.
 - `Esc` leaves message navigation.
 
 ### Show thinking and subagents

@@ -4,17 +4,19 @@
 use super::*;
 use crate::tui::viewer::output::RowContinuation;
 use crate::tui::viewer::rerender::ReplacedRows;
+use crate::tui::viewer::text_blocks::TextBlockRow;
 use std::ops::Range;
 
 /// The fields a test compares of one row: its spans with their styles, its
-/// output id, whether a click toggles it, and how it continues the row
-/// above.
+/// output id, whether a click toggles it, how it continues the row above,
+/// and the text block it shows.
 type RowFields = (
     Vec<(String, LineStyle)>,
     Option<ToolOutputId>,
     bool,
     RowContinuation,
     usize,
+    Option<TextBlockRow>,
 );
 
 /// The fields a test compares of one call of an expanded run: its input's
@@ -77,6 +79,7 @@ impl Shown {
                         line.clickable,
                         line.continuation,
                         line.continued_text_len,
+                        line.text_block_row.clone(),
                     )
                 })
                 .collect(),

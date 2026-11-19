@@ -1,9 +1,10 @@
 use super::session_store::{FinishedRefresh, ReadCause, SessionCopy};
+use super::text_block_focus::list_of_item;
 use super::viewer_render::Rendered;
 use super::{
     App, AppMode, CopyIdentity, CountHighlight, DialogMode, Focus, HeaderRow, MatchesArrival,
-    OpenSessionStatus, PendingRender, PendingViewSearch, RowsRead, ViewSearchMode, ViewSpot,
-    ViewState,
+    OpenSessionStatus, PendingRender, PendingViewSearch, RowsRead, TextBlockFocus, ViewSearchMode,
+    ViewSpot, ViewState,
 };
 use crate::history::provider::{RenamedTitle, SessionRead, SessionTitle, TitleAndSummary};
 use crate::history::sqlite_cache::{AdoptedCopy, EntryHashes, Publication, SessionAddress};
@@ -731,6 +732,9 @@ impl OpenSessionRead {
 
 /// The status of a refresh that could not read the open session.
 pub(super) const SESSION_READ_FAILED: &str = "Refresh failed: the session could not be read";
+
+/// The status of a copy of a message, block or item without text.
+pub(super) const NO_TEXT_TO_COPY: &str = "No text content in this message";
 
 impl App {
     /// Open the selected session at once, reading and rendering it on this
@@ -1999,6 +2003,9 @@ impl App {
     ///
     /// The run as a whole is not a stop. `←` focuses it, and `]` from there
     /// leaves the run rather than stepping back into its calls.
+    ///
+    /// Inside a message whose blocks `→` focused, the blocks and a focused
+    /// list's items are stops too, until the focus leaves the message.
     fn step_focus(&mut self, viewport_height: usize, step: fn(&ViewState, Focus) -> Option<Focus>) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
@@ -2018,6 +2025,15 @@ impl App {
     }
 
     fn next_stop(state: &ViewState, focus: Focus) -> Option<Focus> {
+        if let Some(text_block) = focus.text_block {
+            if let Some(next) = state.text_stop_after(focus.message_index, text_block) {
+                return Some(Focus {
+                    text_block: Some(next),
+                    ..focus
+                });
+            }
+            return Self::next_stop(state, Focus::message(focus.message_index));
+        }
         if let Some(call) = focus.call_index {
             let calls = Self::message_calls(state, focus.message_index);
             if calls.contains(&(call + 1)) {
@@ -2033,6 +2049,15 @@ impl App {
     }
 
     fn prev_stop(state: &ViewState, focus: Focus) -> Option<Focus> {
+        if let Some(text_block) = focus.text_block {
+            if let Some(previous) = state.text_stop_before(focus.message_index, text_block) {
+                return Some(Focus {
+                    text_block: Some(previous),
+                    ..focus
+                });
+            }
+            return Self::prev_stop(state, Focus::message(focus.message_index));
+        }
         if let Some(call) = focus.call_index {
             let calls = Self::message_calls(state, focus.message_index);
             if let Some(prev) = call.checked_sub(1).filter(|prev| calls.contains(prev)) {
@@ -2050,16 +2075,16 @@ impl App {
     /// expanded run, or the message itself when it has no calls.
     fn first_stop_in(state: &ViewState, message_index: usize) -> Focus {
         Focus {
-            message_index,
             call_index: Self::message_calls(state, message_index).next(),
+            ..Focus::message(message_index)
         }
     }
 
     /// The same from below, so one `[` undoes the `]` that left the run.
     fn last_stop_in(state: &ViewState, message_index: usize) -> Focus {
         Focus {
-            message_index,
             call_index: Self::message_calls(state, message_index).last(),
+            ..Focus::message(message_index)
         }
     }
 
@@ -2067,9 +2092,12 @@ impl App {
         let Some(focus) = state.focus else {
             return;
         };
-        let row = match focus.call_index {
-            Some(call) => state.call_ranges.get(call).map(|c| c.input.start_line),
-            None => Self::focused_message_range(state).map(|(_, message)| message.start_line),
+        let row = match (focus.call_index, state.focused_text()) {
+            (Some(call), _) => state.call_ranges.get(call).map(|c| c.input.start_line),
+            (None, Some(text)) => Some(text.rows.start),
+            (None, None) => {
+                Self::focused_message_range(state).map(|(_, message)| message.start_line)
+            }
         };
         if let Some(row) = row {
             Self::ensure_line_visible(state, row, viewport_height);
@@ -2078,10 +2106,19 @@ impl App {
 
     fn set_focused_message(state: &mut ViewState, message_index: usize) {
         if state.focused_message() != Some(message_index) {
-            state.focus = Some(Focus {
-                message_index,
-                call_index: None,
-            });
+            state.focus = Some(Focus::message(message_index));
+        }
+    }
+
+    /// Focus `text_block` of the focused message and scroll its first row
+    /// into view, as [`Self::focus_call`] does a call's.
+    fn focus_text_block(state: &mut ViewState, text_block: TextBlockFocus, viewport_height: usize) {
+        let Some(focus) = &mut state.focus else {
+            return;
+        };
+        focus.text_block = Some(text_block);
+        if let Some(text) = state.focused_text() {
+            Self::ensure_line_visible(state, text.rows.start, viewport_height);
         }
     }
 
@@ -2157,13 +2194,26 @@ impl App {
             .and_then(|call| state.call_ranges.get(call))
     }
 
+    /// At a message stop, `→` first expands what it expands today: a tool
+    /// run, a truncated task report, reply or tool output. Once nothing is
+    /// left to expand and no call to focus, it focuses the message's first
+    /// block ([`ViewState::first_text_stop`]). On a list it focuses the
+    /// first item.
     pub(super) fn expand_focused(&mut self, viewport_height: usize) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
+        if let Some(focus) = state.focus
+            && let Some(text_block) = focus.text_block
+        {
+            if let Some(item) = state.first_item_stop(focus.message_index, text_block) {
+                Self::focus_text_block(state, item, viewport_height);
+            }
+            return;
+        }
         let ids = Self::focused_tool_output_ids(state);
         if ids.is_empty() {
-            return;
+            return Self::focus_first_text_block(state, viewport_height);
         }
         let message_stop_entry = match state.focused_call() {
             Some(_) => None,
@@ -2172,6 +2222,9 @@ impl App {
         if !Self::expand_all(state, ids.clone()) {
             if message_stop_entry.is_some() {
                 self.focus_first_call(viewport_height);
+                if let AppMode::View(state) = &mut self.app_mode {
+                    Self::focus_first_text_block(state, viewport_height);
+                }
             }
             return;
         }
@@ -2189,10 +2242,36 @@ impl App {
         }
     }
 
+    /// Focus the first block of the focused message, at its message stop in
+    /// message navigation, as [`ViewState::first_text_stop`] finds it.
+    fn focus_first_text_block(state: &mut ViewState, viewport_height: usize) {
+        let Some(focus) = state.focus else {
+            return;
+        };
+        if !state.message_nav_active || focus.call_index.is_some() {
+            return;
+        }
+        if let Some(first) = state.first_text_stop(focus.message_index) {
+            Self::focus_text_block(state, first, viewport_height);
+        }
+    }
+
+    /// `←` moves the focus from an item to its list, or to its message when
+    /// the list is the message's only block, and from a block to its
+    /// message; elsewhere it collapses as it does today.
     pub(super) fn collapse_focused(&mut self) {
         let AppMode::View(state) = &mut self.app_mode else {
             return;
         };
+        if let Some(focus) = state.focus
+            && let Some(text_block) = focus.text_block
+        {
+            state.focus = Some(Focus {
+                text_block: state.text_stop_outward(focus.message_index, text_block),
+                ..focus
+            });
+            return;
+        }
         let ids = Self::focused_tool_output_ids(state);
         if Self::collapse_all(state, ids.clone()) {
             self.schedule_toggled_outputs_render(&ids);
@@ -2243,15 +2322,21 @@ impl App {
     }
 
     /// The ids the focused stop toggles: a focused call's expandable areas,
-    /// otherwise the focused message's own rows, in `parsed_conversation`.
+    /// a focused block's clickable rows (a truncated reply's), otherwise the
+    /// focused message's own rows, in `parsed_conversation`.
     fn focused_tool_output_ids(state: &ViewState) -> BTreeSet<ToolOutputId> {
-        let shown_ids = match Self::focused_call_range(state) {
-            Some(call) => call
+        let shown_ids = match (Self::focused_call_range(state), state.focused_text()) {
+            (Some(call), _) => call
                 .areas()
                 .filter(|area| Self::is_expandable(state, area))
                 .map(|area| area.id.clone())
                 .collect(),
-            None => Self::focused_message_tool_output_ids(state),
+            (None, Some(text)) => state.rendered_lines[text.rows]
+                .iter()
+                .filter(|line| line.clickable)
+                .filter_map(|line| line.tool_output_id.clone())
+                .collect(),
+            (None, None) => Self::focused_message_tool_output_ids(state),
         };
         shown_ids
             .into_iter()
@@ -2376,19 +2461,16 @@ impl App {
         };
         let mut changed = false;
         if let Some(focus) = &mut state.focus
-            && focus.call_index.is_some()
+            && (focus.call_index.is_some() || focus.text_block.is_some())
         {
-            focus.call_index = None;
+            *focus = Focus::message(focus.message_index);
             changed = true;
         }
         if let Some(message_index) = message_idx
             && (!state.message_nav_active || state.focused_message() != Some(message_index))
         {
             state.message_nav_active = true;
-            state.focus = Some(Focus {
-                message_index,
-                call_index: None,
-            });
+            state.focus = Some(Focus::message(message_index));
             changed = true;
         }
         let mut toggled_output = None;
@@ -2455,10 +2537,62 @@ impl App {
             return;
         };
         let call_index = Self::clamped_call(state, &viewport, message_index, drift);
+        let text_block = Self::clamped_text_block(state, &viewport, message_index);
         state.focus = Some(Focus {
             message_index,
             call_index,
+            text_block,
         });
+    }
+
+    /// The block or item inside `message_index` the focus lands on: the
+    /// focused one while it is on screen. A focused item or block that
+    /// drifted off an edge moves to the on-screen item of its list nearest
+    /// that edge, otherwise to the nearest on-screen block. `None` when the
+    /// focus moved to another message, or when no block of the message is on
+    /// screen.
+    fn clamped_text_block(
+        state: &ViewState,
+        viewport: &std::ops::Range<usize>,
+        message_index: usize,
+    ) -> Option<TextBlockFocus> {
+        let mut focused = state
+            .focus
+            .filter(|focus| focus.message_index == message_index)?
+            .text_block?;
+        let blocks = state.text_blocks_of(message_index);
+        let block = blocks.get(focused.block)?;
+        let is_on_screen =
+            |rows: &std::ops::Range<usize>| FocusDrift::of(rows.clone(), viewport).is_on_screen();
+        if let Some(item) = focused.item {
+            let items = block.items(&state.rendered_lines);
+            let landed = items
+                .iter()
+                .find(|shown| shown.item == item)
+                .map(|shown| FocusDrift::of(shown.rows.clone(), viewport))
+                .and_then(|drift| {
+                    let on_screen = items
+                        .iter()
+                        .filter(|shown| is_on_screen(&shown.rows))
+                        .map(|shown| shown.item);
+                    drift.clamp(Some(item), on_screen)
+                });
+            if landed.is_some() {
+                return Some(TextBlockFocus {
+                    item: landed,
+                    ..focused
+                });
+            }
+            focused = list_of_item(&blocks, focused)?;
+        }
+        let on_screen = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, shown)| is_on_screen(&shown.rows))
+            .map(|(index, _)| index);
+        FocusDrift::of(block.rows.clone(), viewport)
+            .clamp(Some(focused.block), on_screen)
+            .map(|block| TextBlockFocus { block, item: None })
     }
 
     /// A view with no message focused yet reads as drifted off the top, so the
@@ -2561,15 +2695,16 @@ impl App {
 
         match text {
             Some(text) if text.is_empty() => {
-                self.set_status("No text content in this message".to_owned());
+                self.set_status(NO_TEXT_TO_COPY.to_owned());
             }
             Some(text) => self.copy_to_clipboard("Message", &text),
             None => self.set_status("Message not found".to_owned()),
         }
     }
 
-    /// Copy the focused call or message; while the open session's refresh is
-    /// pending, once it finishes, so the copy holds the newest messages.
+    /// Copy the focused call, block or message; while the open session's
+    /// refresh is pending, once it finishes, so the copy holds the newest
+    /// messages.
     pub(super) fn copy_focused(&mut self, viewport_height: usize) {
         if self.defers_copy() {
             self.deferred_copy = Some(DeferredCopy::Focused { viewport_height });
@@ -2581,7 +2716,7 @@ impl App {
     fn copy_focused_now(&mut self, viewport_height: usize) {
         if self.focused_call_is_active() {
             self.copy_focused_call();
-        } else {
+        } else if !self.copy_focused_text() {
             self.copy_focused_message(viewport_height);
         }
     }
@@ -2717,11 +2852,19 @@ struct ScrollAnchor {
 }
 
 /// The reader's place in the shown rows: the anchor message and its row on
-/// screen, and the focused call, to find again in new rows.
+/// screen, and the focused call or block, to find again in new rows.
 struct ViewPlace {
     anchor: Option<ScrollAnchor>,
     focused_call_id: Option<ToolOutputId>,
+    focused_text: Option<PlacedTextBlock>,
     scroll_offset: usize,
+}
+
+/// A focused block, and the texts of its message. The block stays focused
+/// in the new rows when the message shows these texts unchanged there.
+struct PlacedTextBlock {
+    text_block: TextBlockFocus,
+    message_texts: Vec<Arc<str>>,
 }
 
 impl ViewPlace {
@@ -2747,15 +2890,24 @@ impl ViewPlace {
                 Some(relocation) => relocation.tool_output_id(&id),
                 None => Some(id),
             });
+        let focused_text = state.focus.and_then(|focus| {
+            Some(PlacedTextBlock {
+                text_block: focus.text_block?,
+                message_texts: state.message_texts(focus.message_index),
+            })
+        });
         Self {
             anchor,
             focused_call_id,
+            focused_text,
             scroll_offset: state.scroll_offset,
         }
     }
 
     /// Focus the anchor message and the focused call in `state`'s new rows,
-    /// and scroll the anchor message back to its row on screen.
+    /// and scroll the anchor message back to its row on screen. The focused
+    /// block stays focused, as far as the new rows show it, when the
+    /// focused message's text is unchanged; otherwise the message is.
     fn restore(self, state: &mut ViewState, viewport_height: usize) {
         let max_scroll = state.total_lines.saturating_sub(viewport_height);
 
@@ -2771,10 +2923,18 @@ impl ViewPlace {
                 .iter()
                 .position(|call| call.input.id == id)
         });
-        state.focus = resolved_idx.map(|message_index| Focus {
+        let resolved_text = |message_index: usize| {
+            let placed = self.focused_text.as_ref()?;
+            (state.message_texts(message_index) == placed.message_texts)
+                .then(|| state.shown_text_block(message_index, placed.text_block))
+                .flatten()
+        };
+        let focus = resolved_idx.map(|message_index| Focus {
             message_index,
             call_index: resolved_call,
+            text_block: resolved_text(message_index),
         });
+        state.focus = focus;
 
         state.scroll_offset = match (self.anchor, resolved_idx) {
             (Some(a), Some(idx)) => {

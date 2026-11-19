@@ -3,6 +3,7 @@
 //! Lays out markdown text with line wrapping. The Ledger export prints it as
 //! plain text; the viewer styles the same layout (`tui::viewer::markdown`).
 
+pub mod block_content;
 pub mod layout;
 
 use unicode_width::UnicodeWidthStr;

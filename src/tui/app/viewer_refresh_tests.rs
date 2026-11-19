@@ -457,10 +457,7 @@ fn message_copy_asked_for_during_unchanged_refresh_runs_once_it_finishes() {
     let message_index = scroll_to_message(&mut app, "message 10");
     if let AppMode::View(state) = &mut app.app_mode {
         state.message_nav_active = true;
-        state.focus = Some(Focus {
-            message_index,
-            call_index: None,
-        });
+        state.focus = Some(Focus::message(message_index));
     }
     COPIED.with(|copied| copied.borrow_mut().clear());
 
@@ -737,10 +734,7 @@ fn message_copy_copies_message_on_screen_after_file_grew() {
     let message_index = scroll_to_message(&mut app, "message 10");
     if let AppMode::View(state) = &mut app.app_mode {
         state.message_nav_active = true;
-        state.focus = Some(Focus {
-            message_index,
-            call_index: None,
-        });
+        state.focus = Some(Focus::message(message_index));
     }
 
     // Not read again: the copy must not copy whatever now sits at its place.
@@ -794,10 +788,7 @@ fn message_copy_during_read_waits_for_it_though_newer_refresh_fails() {
     let message_index = scroll_to_message(&mut app, "message 1");
     if let AppMode::View(state) = &mut app.app_mode {
         state.message_nav_active = true;
-        state.focus = Some(Focus {
-            message_index,
-            call_index: None,
-        });
+        state.focus = Some(Focus::message(message_index));
     }
     COPIED.with(|copied| copied.borrow_mut().clear());
     let gate = ConnectionGate::closed(app.environment.cache_base().path(), |thread| {
@@ -2028,10 +2019,7 @@ pub(super) fn focus_message(app: &mut App, text: &str) {
     let message_index = scroll_to_message(app, text);
     if let AppMode::View(state) = &mut app.app_mode {
         state.message_nav_active = true;
-        state.focus = Some(Focus {
-            message_index,
-            call_index: None,
-        });
+        state.focus = Some(Focus::message(message_index));
     }
 }
 

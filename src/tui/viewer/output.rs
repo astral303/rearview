@@ -1,4 +1,5 @@
 use super::ToolOutputId;
+use super::text_blocks::TextBlockRow;
 use crate::tui::theme::Rgb;
 
 /// A single rendered line with its spans
@@ -14,6 +15,8 @@ pub struct RenderedLine {
     /// its content after the ledger columns and any indent it repeats.
     /// Counted from the end, because connector lanes repaint the columns.
     pub continued_text_len: usize,
+    /// The block of a message's text the row shows; `None` outside one.
+    pub text_block_row: Option<TextBlockRow>,
 }
 
 impl RenderedLine {
@@ -24,6 +27,7 @@ impl RenderedLine {
             clickable: false,
             continuation: RowContinuation::None,
             continued_text_len: 0,
+            text_block_row: None,
         }
     }
 
