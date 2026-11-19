@@ -149,7 +149,7 @@ impl App {
     /// `row` when it is selectable, else the next selectable row after it,
     /// else the nearest one before it; `None` when no shown row is
     /// selectable.
-    fn selectable_row_near(&self, row: usize) -> Option<usize> {
+    pub(super) fn selectable_row_near(&self, row: usize) -> Option<usize> {
         (row..self.filtered.len())
             .find(|&row| self.is_selectable(row))
             .or_else(|| {

@@ -119,7 +119,8 @@
   session they were opened for, and close when it is removed from the list.
   - The prompt now names the session: `Delete "<title>"? (y/n)`.
 - Fix the list's selection moving to another session when a delete or a
-  refresh removed or added rows above it. It now stays on its session.
+  refresh removed or added rows above it, or when a rename finished. It now
+  stays on its session.
 - Fix a delete showing nothing while it ran. Its row is now greyed and can't
   be selected until the delete ends, and the bottom bar shows `Deleting…` or
   `Deleting N sessions…`. Confirming a delete in the viewer now returns to the

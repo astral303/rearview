@@ -6,6 +6,10 @@ use ratatui::layout::Rect;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
+/// The reason the actions menu shows beside every action on a session being
+/// deleted, short enough to fit beside `Resume` in the menu's width.
+const BEING_DELETED_REASON: &str = "being deleted";
+
 /// This rearview's work on the list that rename and delete wait for.
 #[derive(Clone, Copy)]
 enum ListWork {
@@ -65,16 +69,19 @@ impl App {
     }
 
     /// The availability of `action` on `session`, without waiting for a
-    /// `fork` declaration that has yet to be read. A file opened directly
-    /// offers Rename alone, and only when its agent stores it: renaming
-    /// writes to the file, and a copy elsewhere must stay unchanged. Rename
-    /// and delete wait for this rearview's work on the list (see
-    /// [`Self::rename_and_delete_wait`]).
+    /// `fork` declaration that has yet to be read. No action is available on
+    /// a session being deleted. A file opened directly offers Rename alone,
+    /// and only when its agent stores it: renaming writes to the file, and a
+    /// copy elsewhere must stay unchanged. Rename and delete wait for this
+    /// rearview's work on the list (see [`Self::rename_and_delete_wait`]).
     fn read_availability(
         &self,
         session: Option<&Path>,
         action: SessionAction,
     ) -> ActionAvailability {
+        if session.is_some_and(|session| self.is_deleting(session)) {
+            return ActionAvailability::Waiting(BEING_DELETED_REASON);
+        }
         if matches!(action, SessionAction::Delete | SessionAction::Rename)
             && let Some(work) = self.rename_and_delete_wait(session)
         {

@@ -1,4 +1,3 @@
-use super::list_state::SelectionAnchor;
 use super::session_store::{ReadCause, SessionCopy};
 use super::view_state::DeferredCopy;
 use super::{Action, App, AppMode, DialogMode};
@@ -255,10 +254,11 @@ impl App {
         }
     }
 
-    /// Show row `idx` renamed to `title`, keeping it selected. `renamed` is
-    /// the place the rename put the title. The row and the open viewer's
-    /// header show the agent's new name at once, and a session refresh reads
-    /// the session again.
+    /// Show row `idx` renamed to `title`; the selection stays on its session.
+    /// `renamed` is the place the rename put the title. The row and the open
+    /// viewer's header show the agent's new name at once, and a session
+    /// refresh reads the session again. The name box closes when it is open
+    /// on this session.
     pub(super) fn show_renamed_session(&mut self, idx: usize, title: &str, renamed: &RenamedTitle) {
         let row = &mut self.conversations[idx];
         let path = row.path.clone();
@@ -278,19 +278,13 @@ impl App {
             state.show_renamed(title, renamed);
         }
         self.store.request_session_refresh(&path);
-        self.dialog_mode = DialogMode::None;
+        if matches!(&self.dialog_mode, DialogMode::Rename { session, .. } if *session == path) {
+            self.dialog_mode = DialogMode::None;
+        }
         self.set_status("Session renamed".to_string());
         self.refresh_search_data();
-        // The search results arrive later; they keep the renamed row selected.
-        self.selection_anchor = Some(SelectionAnchor::Kept(path.clone()));
+        self.anchor_selection_to_its_session();
         self.update_filter();
-        if let Some(new_selected) = self
-            .filtered
-            .iter()
-            .position(|&i| self.conversations[i].path == path)
-        {
-            self.selected = Some(new_selected);
-        }
     }
 
     /// Export the open session as the export menu's `option`. JSONL copies

@@ -586,6 +586,89 @@ fn bar_shows_deleting_for_single_session_and_count_for_multiple() {
     assert_eq!(app.deleting_status_text(), None);
 }
 
+/// Rename session `name` through the actions menu, then close the name box
+/// with `Esc` while the rename waits in the queue.
+fn rename_and_close_name_box(app: &mut App, name: &str) {
+    let path = path_of(app, name);
+    select_with_keys(app, &path);
+    press_ctrl(app, KeyCode::Char('x'));
+    press(app, KeyCode::Char('m'));
+    press(app, KeyCode::Char('n'));
+    press(app, KeyCode::Enter);
+    press(app, KeyCode::Esc);
+}
+
+/// Hand `app` the successful outcome of the rename at the front of its
+/// queue, as the worker hands it back.
+fn finish_queued_rename(app: &mut App) {
+    let Some(ListChange::Rename { path, title, .. }) = app.begin_list_change() else {
+        panic!("a rename is at the front of the queue");
+    };
+    app.finish_list_change(ListChangeOutcome::Renamed {
+        path,
+        title,
+        result: Ok(crate::history::provider::RenamedTitle::InTranscript),
+    });
+}
+
+#[test]
+fn rename_finishing_after_its_session_was_confirmed_for_delete_doesnt_select_it() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "a");
+    let _running = app.begin_list_change();
+    rename_and_close_name_box(&mut app, "b");
+    confirm_delete_of_named(&mut app, "b");
+
+    finish_queued_rename(&mut app);
+
+    assert_eq!(
+        selected_name(&app),
+        Some("c"),
+        "the selection stays off the rows being deleted"
+    );
+    assert_eq!(app.dialog_mode, DialogMode::None, "no dialog opens");
+}
+
+#[test]
+fn every_action_on_session_being_deleted_is_unavailable_with_its_reason() {
+    let mut app = three_sessions();
+    confirm_delete_of_named(&mut app, "b");
+    // The keys pass over b's row; only a direct write puts the selection
+    // on it, to read the availability the menu would show there.
+    app.selected = Some(1);
+
+    for action in crate::tui::actions_menu::SessionAction::ALL {
+        assert_eq!(
+            app.action_availability(action),
+            crate::tui::actions_menu::ActionAvailability::Waiting("being deleted"),
+            "{action:?} is unavailable on a session being deleted, with the reason"
+        );
+    }
+}
+
+#[test]
+fn rename_finishing_keeps_selection_and_menu_on_another_session() {
+    let mut app = three_sessions();
+    rename_and_close_name_box(&mut app, "b");
+    let c = path_of(&app, "c");
+    select_with_keys(&mut app, &c);
+    press_ctrl(&mut app, KeyCode::Char('x'));
+
+    finish_queued_rename(&mut app);
+
+    assert_eq!(
+        selected_name(&app),
+        Some("c"),
+        "the selection stays on its session"
+    );
+    assert!(
+        matches!(&app.dialog_mode, DialogMode::ActionsMenu { session: Some(session), .. }
+            if *session == c),
+        "the menu stays open on its own session: {:?}",
+        app.dialog_mode
+    );
+}
+
 #[test]
 fn delete_records_its_wait_in_the_queue_from_y() {
     let clock = Arc::new(crate::clock::TestClock::default());
