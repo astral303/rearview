@@ -11,7 +11,8 @@ use serde_json::Value;
 /// Formatted tool call representation
 pub struct FormattedToolCall {
     /// The header up to its value: `Read: `, `Task (Explore): `, or the bare
-    /// `name:` of a call formatted from its raw input.
+    /// `name:` of a call formatted from its raw input. Empty when the value
+    /// is the whole header, as for a Codex launch without a task name.
     pub prefix: String,
     /// The rest of the header: a path, a pattern, a command's first line.
     pub value: String,
@@ -269,6 +270,8 @@ fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
         Tool::Read | Tool::Edit | Tool::Write | Tool::FileReference => Some("file_path"),
         Tool::Grep | Tool::Glob => Some("pattern"),
         Tool::Skill => Some("skill"),
+        // A launch without a task name opens its header with the tool's name.
+        Tool::Agent if launch_settings(input).is_some() => None,
         Tool::Agent => Some("description"),
         Tool::AgentMessage => Some("recipient"),
         Tool::AgentReport if is_delivered_report(input) => None,
@@ -297,15 +300,20 @@ pub(crate) fn launch_prompt(tool: Tool, input: &Value) -> Option<&str> {
 }
 
 fn agent_header(name: &str, input: &Value) -> ToolCallHeader {
-    let description = string_field(input, "description").unwrap_or("");
+    let description = string_field(input, "description");
     if let Some(launch) = launch_settings(input) {
-        return ToolCallHeader::named(name_prefix(name), launch_header(description, launch));
+        return match description {
+            Some(task) => ToolCallHeader::named(name_prefix(name), launch_header(task, launch)),
+            // The whole header is the value: `agent read` and search replace
+            // an empty value with the call's input keys.
+            None => ToolCallHeader::named(String::new(), launch_header(name, launch)),
+        };
     }
     let prefix = match string_field(input, "subagent_type") {
         Some(subagent_type) => format!("{name} ({subagent_type}): "),
         None => name_prefix(name),
     };
-    ToolCallHeader::named(prefix, description.to_owned())
+    ToolCallHeader::named(prefix, description.unwrap_or("").to_owned())
 }
 
 fn agent_body(input: &Value) -> Option<ToolBody> {
@@ -324,11 +332,12 @@ fn launch_settings(input: &Value) -> Option<&serde_json::Map<String, Value>> {
 /// The launch settings a `spawn_agent` header carries; the body lists the rest.
 const LAUNCH_HEADER_KEYS: [&str; 4] = ["agent_type", "model", "reasoning_effort", "fork_turns"];
 
-/// `task (agent_type) · model (effort) · fork last 3 turns`, unlabelled:
-/// model names and efforts read as themselves.
-fn launch_header(description: &str, launch: &serde_json::Map<String, Value>) -> String {
+/// `lead (agent_type) · model (effort) · fork last 3 turns`, unlabelled:
+/// model names and efforts read as themselves. `lead` is the task name, or
+/// the tool's name for a launch without a task name.
+fn launch_header(lead: &str, launch: &serde_json::Map<String, Value>) -> String {
     let setting = |key: &str| launch.get(key).and_then(Value::as_str);
-    let mut header = description.to_owned();
+    let mut header = lead.to_owned();
     if let Some(agent_type) = setting("agent_type") {
         header.push_str(&format!(" ({agent_type})"));
     }
@@ -338,7 +347,7 @@ fn launch_header(description: &str, launch: &serde_json::Map<String, Value>) -> 
         (None, Some(effort)) => header.push_str(&format!(" · {effort}")),
         (None, None) => {}
     }
-    if let Some(fork) = fork_section(setting("fork_turns")) {
+    if let Some(fork) = fork_part(setting("fork_turns")) {
         header.push_str(&format!(" · {fork}"));
     }
     header
@@ -346,7 +355,7 @@ fn launch_header(description: &str, launch: &serde_json::Map<String, Value>) -> 
 
 /// Codex's `fork_turns`: `none`, `all` (also when missing or empty), or a
 /// count of the most recent turns.
-fn fork_section(fork_turns: Option<&str>) -> Option<String> {
+fn fork_part(fork_turns: Option<&str>) -> Option<String> {
     match fork_turns.map(str::trim).unwrap_or_default() {
         "none" => None,
         "" | "all" => Some("fork".to_owned()),
@@ -656,6 +665,78 @@ mod tests {
         let result = format_tool_call("spawn_agent", Tool::Agent, &input, 80);
         assert_eq!(result.header(), "spawn_agent: scout");
         assert_eq!(body_text(&result), Some("depth: 2\nservice_tier: flex"));
+    }
+
+    const LAUNCH_PROMPT: &str = "Find where the session cache decides a copy is stale.";
+
+    /// `launch` carries a `fork_turns`, as the Codex reader writes for every
+    /// launch without a task name.
+    fn launch_without_task_name(launch: Value) -> FormattedToolCall {
+        let input = json!({"prompt": LAUNCH_PROMPT, "launch": launch});
+        format_tool_call("spawn_agent", Tool::Agent, &input, 80)
+    }
+
+    #[test]
+    fn spawn_agent_header_without_task_name_carries_its_type_model_effort_and_fork() {
+        let headers = [
+            (
+                json!({
+                    "agent_type": "explorer",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "fork_turns": "all",
+                }),
+                "spawn_agent (explorer) · gpt-5.6-sol (high) · fork",
+            ),
+            (
+                json!({"agent_type": "explorer", "fork_turns": "none"}),
+                "spawn_agent (explorer)",
+            ),
+            (
+                json!({"model": "gpt-5.6-sol", "fork_turns": "none"}),
+                "spawn_agent · gpt-5.6-sol",
+            ),
+            (
+                json!({"reasoning_effort": "high", "fork_turns": "none"}),
+                "spawn_agent · high",
+            ),
+            (json!({"fork_turns": "all"}), "spawn_agent · fork"),
+            (json!({"fork_turns": "none"}), "spawn_agent"),
+        ];
+        for (launch, header) in headers {
+            let call = launch_without_task_name(launch.clone());
+            assert_eq!(call.header(), header, "{launch} reads as `{header}`");
+            assert_eq!(
+                body_text(&call),
+                Some(LAUNCH_PROMPT),
+                "the body of {launch} is its prompt alone"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_agent_without_task_name_shows_its_items_in_place_of_a_prompt() {
+        let input = json!({"launch": {
+            "agent_type": "explorer",
+            "fork_turns": "all",
+            "items": [{"type": "text", "text": "Read the cache."}],
+        }});
+        let call = format_tool_call("spawn_agent", Tool::Agent, &input, 80);
+        assert_eq!(call.header(), "spawn_agent (explorer) · fork");
+        assert_eq!(
+            body_text(&call),
+            Some(r#"items: [{"text":"Read the cache.","type":"text"}]"#)
+        );
+    }
+
+    #[test]
+    fn spawn_agent_with_fork_context_not_boolean_shows_it_in_body() {
+        let call = launch_without_task_name(json!({"fork_context": "yes", "fork_turns": "none"}));
+        assert_eq!(call.header(), "spawn_agent");
+        assert_eq!(
+            body_text(&call),
+            Some(format!("fork_context: yes\n{LAUNCH_PROMPT}").as_str())
+        );
     }
 
     #[test]

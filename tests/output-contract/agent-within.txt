@@ -85,8 +85,8 @@ conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-0000000000
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_74aec3f6df49 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=10 tz=-04:00 warnings=1 warning-records=1 omitted-lines=22
-query text=the hits=10
+protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=11 tz=-04:00 warnings=1 warning-records=1 omitted-lines=24
+query text=the hits=11
 continue within ref=ch_74aec3f6df49 action=narrow-query-or-increase-budget
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_974c3840e189 answer

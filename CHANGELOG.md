@@ -212,6 +212,14 @@
   rejecting a malformed ref, a flag the ref does not allow or `--after` later
   than `--before`. They now fail at once.
 
+#### Codex
+
+- Fix a sub-agent launch without a task name showing as `spawn_agent` over
+  raw JSON. It now shows a header, such as
+  `spawn_agent (explorer) · gpt-5.6-sol (high) · fork`, and the prompt, in the
+  viewer, exports, `agent read` and search. In the viewer its result now
+  shows the sub-agent's nickname.
+
 ### Changes
 
 - A semantic `agent within` of a session without a copy in the session

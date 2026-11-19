@@ -86,36 +86,60 @@ fn function_call(name: &str, input: &Value) -> Option<CanonicalCall> {
         return None;
     }
     let mut input = input.clone();
+    // Every `spawn_agent` call is an agent launch, including a launch without
+    // a task name whose prompt is `items` and not `message`.
+    let is_launch = name == "spawn_agent" && input.is_object();
     if let Some(object) = input.as_object_mut() {
         for (codex_key, canonical_key) in mapping.header_keys {
             if let Some(value) = object.remove(*codex_key) {
                 object.insert((*canonical_key).to_owned(), value);
             }
         }
-        if name == "spawn_agent" {
+        if is_launch {
             gather_launch_settings(object);
         }
     }
-    has_header_string(mapping.header_keys, &input).then_some(CanonicalCall {
+    (is_launch || has_header_string(mapping.header_keys, &input)).then_some(CanonicalCall {
         tool: mapping.tool,
         input,
     })
 }
 
 /// Move every `spawn_agent` argument but the task name and the message under
-/// `launch`, where the agent header reads the type, model, effort and forked
-/// turns.
+/// `launch`, where the agent header reads the type, model, effort and
+/// `fork_turns`.
 fn gather_launch_settings(object: &mut Map<String, Value>) {
+    let has_task_name = object.contains_key("description");
     let settings: Vec<String> = object
         .keys()
         .filter(|key| !matches!(key.as_str(), "description" | "prompt"))
         .cloned()
         .collect();
-    let launch: Map<String, Value> = settings
+    let mut launch: Map<String, Value> = settings
         .iter()
         .filter_map(|key| object.remove_entry(key))
         .collect();
+    if !has_task_name {
+        write_fork_context_as_fork_turns(&mut launch);
+    }
     object.insert("launch".to_owned(), Value::Object(launch));
+}
+
+/// Replace the boolean `fork_context` of a launch without a task name with
+/// the `fork_turns` of a launch with a task name: `true` forks every turn,
+/// `false` or missing none. Keep a `fork_context` that is not a boolean for
+/// the body to show: Codex rejects that call, and the value shows why.
+fn write_fork_context_as_fork_turns(launch: &mut Map<String, Value>) {
+    let fork_context = launch.get("fork_context").and_then(Value::as_bool);
+    if fork_context.is_some() {
+        launch.remove("fork_context");
+    }
+    let fork_turns = if fork_context == Some(true) {
+        "all"
+    } else {
+        "none"
+    };
+    launch.insert("fork_turns".to_owned(), Value::from(fork_turns));
 }
 
 /// The arguments without their encrypted values. Codex encrypts the message
@@ -544,6 +568,64 @@ mod tests {
                     "service_tier": "flex",
                 },
             })
+        );
+    }
+
+    #[test]
+    fn spawn_agent_call_without_task_name_or_message_is_agent_launch() {
+        let items = json!([{"type": "text", "text": "Map the cache."}]);
+        let (tool, input) = single(
+            "spawn_agent",
+            json!({"items": items, "agent_type": "explorer", "fork_context": true}),
+        );
+        assert_eq!(tool, Tool::Agent);
+        assert_eq!(
+            input,
+            json!({"launch": {"items": items, "agent_type": "explorer", "fork_turns": "all"}})
+        );
+    }
+
+    fn launch_settings_of(arguments: Value) -> Value {
+        let (_, input) = single("spawn_agent", arguments);
+        input["launch"].clone()
+    }
+
+    #[test]
+    fn spawn_agent_without_task_name_and_with_fork_context_true_forks_every_turn() {
+        assert_eq!(
+            launch_settings_of(json!({"message": "Map the cache.", "fork_context": true})),
+            json!({"fork_turns": "all"})
+        );
+    }
+
+    #[test]
+    fn spawn_agent_with_fork_context_false_or_missing_doesnt_fork() {
+        for arguments in [
+            json!({"message": "Map the cache.", "fork_context": false}),
+            json!({"message": "Map the cache."}),
+        ] {
+            assert_eq!(
+                launch_settings_of(arguments.clone()),
+                json!({"fork_turns": "none"}),
+                "{arguments} forks none of the turns"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_agent_with_fork_context_not_boolean_keeps_it_and_doesnt_fork() {
+        assert_eq!(
+            launch_settings_of(json!({"message": "Map the cache.", "fork_context": "yes"})),
+            json!({"fork_context": "yes", "fork_turns": "none"})
+        );
+    }
+
+    #[test]
+    fn spawn_agent_with_task_name_and_without_fork_turns_doesnt_gain_one() {
+        assert_eq!(
+            launch_settings_of(json!({"task_name": "scout", "message": "Map the cache."})),
+            json!({}),
+            "the launch keeps Codex's default of forking every turn"
         );
     }
 

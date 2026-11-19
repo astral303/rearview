@@ -2116,43 +2116,57 @@ mod tests {
         }
     }
 
-    /// Codex's default `spawn_agent`, without `task_name`: the viewer shows
-    /// its input as JSON.
     #[test]
-    fn launch_with_input_shown_as_json_shows_its_prompt_in_collapsed_read_and_counts_the_rest() {
+    fn launch_without_task_name_reads_as_its_header_then_its_prompt() {
         let input = serde_json::json!({
-            "launch": {"agent_type": "explorer", "fork_context": true},
+            "launch": {"agent_type": "explorer", "fork_turns": "all"},
             "prompt": "two\nlines",
         });
 
-        let whole = tool_call_read_text("spawn_agent", Tool::Agent, &input, CallLines::Whole);
-        let collapsed =
-            tool_call_read_text("spawn_agent", Tool::Agent, &input, CallLines::Collapsed);
+        assert_eq!(
+            tool_call_text("spawn_agent", Tool::Agent, &input),
+            "spawn_agent (explorer) · fork\ntwo\nlines",
+            "search reads the agent type and the prompt"
+        );
+        for lines in [CallLines::Collapsed, CallLines::Whole] {
+            assert_eq!(
+                read_text("spawn_agent", Tool::Agent, &input, lines),
+                tool_call_text("spawn_agent", Tool::Agent, &input)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_without_task_name_and_with_items_counts_them_in_collapsed_read() {
+        let input = serde_json::json!({"launch": {
+            "agent_type": "explorer",
+            "fork_turns": "all",
+            "items": [{"type": "text", "text": "Map the cache."}],
+        }});
+        let read = |lines| read_text("spawn_agent", Tool::Agent, &input, lines);
 
         assert_eq!(
-            whole.text,
-            [
-                "tool spawn_agent input_keys=launch,prompt",
-                "{",
-                "\"launch\": {",
-                "\"agent_type\": \"explorer\",",
-                "\"fork_context\": true",
-                "},",
-                "\"prompt\": \"two",
-                "lines\"",
-                "}",
-            ]
-            .join("\n")
+            read(CallLines::Whole),
+            r#"spawn_agent (explorer) · fork
+items: [{"text":"Map the cache.","type":"text"}]"#
         );
         assert_eq!(
-            collapsed.text,
-            "tool spawn_agent input_keys=launch,prompt (+6 lines)\ntwo\nlines"
+            read(CallLines::Collapsed),
+            "spawn_agent (explorer) · fork (+1 line)"
         );
-        assert_eq!(
-            whole.whole_lines - line_count(&collapsed.text),
-            6,
-            "the count is the lines the collapsed read leaves out"
-        );
+    }
+
+    #[test]
+    fn launch_without_task_name_or_settings_reads_as_tool_name_and_prompt() {
+        let input =
+            serde_json::json!({"launch": {"fork_turns": "none"}, "prompt": "Map the cache."});
+
+        for lines in [CallLines::Collapsed, CallLines::Whole] {
+            assert_eq!(
+                read_text("spawn_agent", Tool::Agent, &input, lines),
+                "spawn_agent\nMap the cache."
+            );
+        }
     }
 
     #[test]

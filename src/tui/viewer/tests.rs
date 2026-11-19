@@ -1142,6 +1142,79 @@ fn spawn_agent_result_takes_calls_agent_type_when_sub_agent_records_no_role() {
     assert!(text.contains("Lorentz (grunt) · /root/scout"), "{text}");
 }
 
+/// The rows of a Codex session whose launches without a task name are each
+/// answered by one of `outputs`, as `ToolDisplayMode::Full` shows them.
+fn launches_without_task_name_answered_by(outputs: &[serde_json::Value]) -> String {
+    let lines: Vec<String> = outputs
+        .iter()
+        .enumerate()
+        .flat_map(|(index, output)| {
+            let call = serde_json::json!({
+                "type": "function_call",
+                "call_id": format!("call_{index}"),
+                "name": "spawn_agent",
+                "arguments": r#"{"message":"Map the cache."}"#,
+            });
+            let result = serde_json::json!({
+                "type": "function_call_output",
+                "call_id": format!("call_{index}"),
+                "output": output.to_string(),
+            });
+            [
+                codex_record(1, "response_item", &call.to_string()),
+                codex_record(1, "response_item", &result.to_string()),
+            ]
+        })
+        .collect();
+    rendered_text(&render_parsed_conversation(
+        &codex_session_of(&lines),
+        &test_render_options(ToolDisplayMode::Full),
+    ))
+}
+
+#[test]
+fn spawn_agent_result_without_task_name_shows_its_nickname() {
+    let text = launches_without_task_name_answered_by(&[
+        serde_json::json!({"agent_id": "019f0000-0000-7000-8000-0000000000e1", "nickname": "Hubble"}),
+        serde_json::json!({"agent_id": "019f0000-0000-7000-8000-0000000000e2", "nickname": "Hubble the 2nd"}),
+    ]);
+
+    assert!(text.contains("Result ┐ Hubble\n"), "{text}");
+    assert!(text.contains("Result ┐ Hubble²\n"), "{text}");
+    assert!(!text.contains("agent_id"), "{text}");
+}
+
+#[test]
+fn spawn_agent_result_without_nickname_shows_its_agent_id() {
+    let text = launches_without_task_name_answered_by(&[
+        serde_json::json!({"agent_id": "019f0000-0000-7000-8000-0000000000e1", "nickname": null}),
+        serde_json::json!({"agent_id": "019f0000-0000-7000-8000-0000000000e2"}),
+    ]);
+
+    assert!(
+        text.contains("Result ┐ 019f0000-0000-7000-8000-0000000000e1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Result ┐ 019f0000-0000-7000-8000-0000000000e2\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn spawn_agent_result_with_agent_id_and_other_output_shows_whole() {
+    let text = launches_without_task_name_answered_by(&[serde_json::json!({
+        "agent_id": "019f0000-0000-7000-8000-0000000000e1",
+        "nickname": "Hubble",
+        "note": "queued",
+    })]);
+
+    assert!(
+        text.contains(r#"Result ┐ {"agent_id":"019f0000-0000-7000-8000-0000000000e1""#),
+        "{text}"
+    );
+}
+
 #[test]
 fn sub_agents_consecutive_calls_collapse_into_one_expandable_run_row() {
     let entries = sub_agent_run_of_two_commands();

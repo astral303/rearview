@@ -1,9 +1,10 @@
 //! Each sub-agent's label, and the sub-agent each `spawn_agent` call started,
 //! collected as the viewer loads a conversation.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthStr;
 
 use crate::history::RecordedIdentity;
@@ -93,7 +94,9 @@ impl SubagentRoster {
 
     /// The text a tool result shows. A result answering an agent call with
     /// nothing but the task path it started reads as the sub-agent it names:
-    /// `Lorentz² (suite_runner) · /root/scout`.
+    /// `Lorentz² (suite_runner) · /root/scout`. A result answering a launch
+    /// without a task name reads as the nickname it carries, or the agent
+    /// id when the nickname is missing.
     pub(super) fn result_text(&self, tool_use_id: &str, content: Option<&Value>) -> String {
         self.started_subagent(tool_use_id, content)
             .unwrap_or_else(|| tool_result_display_text(content))
@@ -101,7 +104,11 @@ impl SubagentRoster {
 
     fn started_subagent(&self, tool_use_id: &str, content: Option<&Value>) -> Option<String> {
         let call_agent_type = self.agent_calls.get(tool_use_id)?;
-        let agent_path = lone_task_name(content?)?;
+        let content = content?;
+        if let Some(nickname_or_id) = started_agent_nickname_or_id(content) {
+            return Some(nickname_or_id);
+        }
+        let agent_path = lone_task_name(content)?;
         let Some((identity, nickname)) = self
             .by_agent_path
             .get(&agent_path)
@@ -197,17 +204,38 @@ impl RosterChanges {
 /// The task path of a `spawn_agent` result that carries nothing else:
 /// `{"task_name": "/root/scout"}`, as a JSON string or an object.
 fn lone_task_name(content: &Value) -> Option<String> {
-    let parsed;
-    let object = match content {
-        Value::String(text) => {
-            parsed = serde_json::from_str::<Value>(text).ok()?;
-            parsed.as_object()?
-        }
-        Value::Object(object) => object,
-        _ => return None,
-    };
+    let object = result_object(content)?;
     match object.iter().collect::<Vec<_>>().as_slice() {
         [(key, Value::String(path))] if key.as_str() == "task_name" => Some(path.clone()),
+        _ => None,
+    }
+}
+
+/// The nickname of the result of a launch without a task name,
+/// `{"agent_id": "019f…", "nickname": "Hubble"}`, as a JSON string or an
+/// object; its agent id when the nickname is missing or null. `None` for a
+/// result that carries anything else.
+fn started_agent_nickname_or_id(content: &Value) -> Option<String> {
+    let object = result_object(content)?;
+    let agent_id = object.get("agent_id")?.as_str()?;
+    let nickname = match object.get("nickname") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(nickname)) => Some(nickname.as_str()),
+        Some(_) => return None,
+    };
+    let keys = 1 + usize::from(object.contains_key("nickname"));
+    (object.len() == keys).then(|| nickname.map_or_else(|| agent_id.to_owned(), compact_ordinal))
+}
+
+/// A tool result's JSON object: the content itself, or the object a string
+/// content contains.
+fn result_object(content: &Value) -> Option<Cow<'_, Map<String, Value>>> {
+    match content {
+        Value::String(text) => match serde_json::from_str::<Value>(text).ok()? {
+            Value::Object(object) => Some(Cow::Owned(object)),
+            _ => None,
+        },
+        Value::Object(object) => Some(Cow::Borrowed(object)),
         _ => None,
     }
 }

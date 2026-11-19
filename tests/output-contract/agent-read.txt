@@ -653,7 +653,7 @@ $ rearview agent read ch_0b26e45343df:s99
 protocol agent-error kind=not-found ref=ch_0b26e45343df detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_74aec3f6df49
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=16 hidden-tool-results=10 hidden-thinking=1 hidden-subagents=4 warnings=1 warning-records=1
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=17 hidden-tool-results=11 hidden-thinking=1 hidden-subagents=4 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 subagent s2 type=grunt span=m11..m12 : child
@@ -681,13 +681,13 @@ m24 user 06:03:05
 m25..m26 hidden 06:03:06..06:03:07 tools=1
 m27 06:03:08
 | NUMBERED_REPLY_SENTINEL: the command printed nothing.
-m28..m29 hidden 06:03:09..06:03:10 tools=1 tool-results=1
-m30 user 06:03:11
+m28..m31 hidden 06:03:09..06:03:10 tools=2 tool-results=2
+m32 user 06:03:11
 | Show the last commit
-m31..m32 hidden 06:03:12..06:03:13 tools=1 tool-results=1
-m33 user 06:03:14
+m33..m34 hidden 06:03:12..06:03:13 tools=1 tool-results=1
+m35 user 06:03:14
 | Add the release notes
-m34..m39 hidden 06:03:15..06:03:20 tools=4 tool-results=2
+m36..m41 hidden 06:03:15..06:03:20 tools=4 tool-results=2
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
@@ -764,25 +764,30 @@ m28.1 06:03:09 result=m29
 | LAUNCH_PROMPT_SENTINEL: list the release steps.
 m29 06:03:10 call=m28.1
 | {"task_name":"/root/scout"}
-m30 user 06:03:11
+m30.1 06:03:10 result=m31
+| spawn_agent (LAUNCH_TYPE_SENTINEL) · fork
+| PROMPT_WITHOUT_TASK_NAME_SENTINEL: find the stale-copy check.
+m31 06:03:10 call=m30.1
+| {"agent_id":"019f0000-0000-7000-8000-0000000000e1","nickname":"Hubble"}
+m32 user 06:03:11
 | Show the last commit
-m31.1 06:03:12 result=m32
+m33.1 06:03:12 result=m34
 | exec: git log -1 EXEC_COMMAND_SENTINEL
-m32 06:03:13 call=m31.1
+m34 06:03:13 call=m33.1
 | commit a1b2c3d
-m33 user 06:03:14
+m35 user 06:03:14
 | Add the release notes
-m34.1 06:03:15 result=m35
+m36.1 06:03:15 result=m37
 | apply_patch: NOTES.md (+2 lines)
-m34.2 06:03:15 result=m35
+m36.2 06:03:15 result=m37
 | apply_patch: RELEASE.md (+1 line)
-m35 06:03:16 call=m34.1..2
+m37 06:03:16 call=m36.1..2
 | Done: 2 files added
-m36.1 06:03:17 result=m37
+m38.1 06:03:17 result=m39
 | send_message: /root/scout (+1 line)
-m38.1 06:03:19 result=m39
+m40.1 06:03:19 result=m41
 | tool update_plan input_keys=explanation,plan (+9 lines)
-m39 06:03:20 call=m38.1
+m41 06:03:20 call=m40.1
 | Plan updated
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m2..m4
@@ -808,29 +813,29 @@ m3 s1 06:00:03 slice=match=the context=3 hits=0 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tail 3
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=6 hidden-tool-results=4 warnings=1 warning-records=1
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=7 hidden-tool-results=5 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m27 06:03:08
 | NUMBERED_REPLY_SENTINEL: the command printed nothing.
-m28..m29 hidden 06:03:09..06:03:10 tools=1 tool-results=1
-m30 user 06:03:11
+m28..m31 hidden 06:03:09..06:03:10 tools=2 tool-results=2
+m32 user 06:03:11
 | Show the last commit
-m31..m32 hidden 06:03:12..06:03:13 tools=1 tool-results=1
-m33 user 06:03:14
+m33..m34 hidden 06:03:12..06:03:13 tools=1 tool-results=1
+m35 user 06:03:14
 | Add the release notes
-m34..m39 hidden 06:03:15..06:03:20 tools=4 tool-results=2
+m36..m41 hidden 06:03:15..06:03:20 tools=4 tool-results=2
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --subagents --tail 2
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=1 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
-m36.1 06:03:17 result=m37
+m38.1 06:03:17 result=m39
 | send_message: /root/scout (+1 line)
-m38.1 06:03:19 result=m39
+m40.1 06:03:19 result=m41
 | tool update_plan input_keys=explanation,plan (+9 lines)
-m39 hidden 06:03:20 tool-results=1
+m41 hidden 06:03:20 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m6.1
 --- stdout
@@ -878,7 +883,7 @@ continue read refs=ch_74aec3f6df49:m1..m3 tools=false tool-results=false thinkin
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 policy=text omit=m11..m39 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
+protocol agent-read cut=tail chars=900 policy=text omit=m11..m41 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -889,9 +894,9 @@ m4 hidden 06:00:04 thinking=1
 m5 06:00:05
 | codex answer searchable
 m6..m10 hidden 06:00:07..06:00:11 tools=3 tool-results=2
-continue read refs=ch_74aec3f6df49:m11..m39 tools=true tool-results=true thinking=false subagents=true
+continue read refs=ch_74aec3f6df49:m11..m41 tools=true tool-results=true thinking=false subagents=true
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
-$ rearview agent read ch_74aec3f6df49:m11..m39 --tools --tool-results --subagents
+$ rearview agent read ch_74aec3f6df49:m11..m41 --tools --tool-results --subagents
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+tool-results+subagents omit=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
@@ -945,30 +950,35 @@ m28.1 06:03:09 result=m29
 | LAUNCH_PROMPT_SENTINEL: list the release steps.
 m29 06:03:10 call=m28.1
 | {"task_name":"/root/scout"}
-m30 user 06:03:11
+m30.1 06:03:10 result=m31
+| spawn_agent (LAUNCH_TYPE_SENTINEL) · fork
+| PROMPT_WITHOUT_TASK_NAME_SENTINEL: find the stale-copy check.
+m31 06:03:10 call=m30.1
+| {"agent_id":"019f0000-0000-7000-8000-0000000000e1","nickname":"Hubble"}
+m32 user 06:03:11
 | Show the last commit
-m31.1 06:03:12 result=m32
+m33.1 06:03:12 result=m34
 | exec: git log -1 EXEC_COMMAND_SENTINEL
-m32 06:03:13 call=m31.1
+m34 06:03:13 call=m33.1
 | commit a1b2c3d
-m33 user 06:03:14
+m35 user 06:03:14
 | Add the release notes
-m34.1 06:03:15 result=m35
+m36.1 06:03:15 result=m37
 | apply_patch: NOTES.md (+2 lines)
-m34.2 06:03:15 result=m35
+m36.2 06:03:15 result=m37
 | apply_patch: RELEASE.md (+1 line)
-m35 06:03:16 call=m34.1..2
+m37 06:03:16 call=m36.1..2
 | Done: 2 files added
-m36.1 06:03:17 result=m37
+m38.1 06:03:17 result=m39
 | send_message: /root/scout (+1 line)
-m38.1 06:03:19 result=m39
+m40.1 06:03:19 result=m41
 | tool update_plan input_keys=explanation,plan (+9 lines)
-m39 06:03:20 call=m38.1
+m41 06:03:20 call=m40.1
 | Plan updated
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m39
+protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m41
 $ rearview agent read ch_74aec3f6df49:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
