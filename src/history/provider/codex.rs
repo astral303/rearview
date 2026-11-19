@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 30,
+            schema_version: 31,
         }
     }
 
@@ -1282,12 +1282,32 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "custom_tool_call_output", "id": "ctco_patch_variable", "call_id": "call_patch_variable", "output": [{"type": "input_text", "text": "Done: 1 file updated"}]}),
                     ),
+                    // A shell command and a patch in `String.raw` templates.
+                    line(
+                        41,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_raw_command", "status": "completed", "call_id": "call_raw_command", "name": "exec", "input": "const r = await tools.exec_command({cmd:String.raw`rg -n \"RAW_COMMAND_SENTINEL\\s+\\d\" docs`,workdir:\"/repo\"});\ntext(r.output);"}),
+                    ),
+                    line(
+                        42,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_raw_command", "call_id": "call_raw_command", "output": [{"type": "input_text", "text": "docs/notes.md:3"}]}),
+                    ),
+                    line(
+                        43,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_raw_patch", "status": "completed", "call_id": "call_raw_patch", "name": "exec", "input": "const patch = String.raw`*** Begin Patch\n*** Add File: PATHS.md\n+RAW_PATCH_SENTINEL: C:\\Users\n*** End Patch`;\ntext(await tools.apply_patch(patch));"}),
+                    ),
+                    line(
+                        44,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_raw_patch", "call_id": "call_raw_patch", "output": [{"type": "input_text", "text": "Done: 1 file added"}]}),
+                    ),
                 ],
             );
             const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time";
             const LAUNCH_RUN: &str = "Started 2 agents";
-            const SCRIPT_RUN: &str =
-                "Ran 2 scripts, edited 1 file, waited 3 times, updated the task list 1 time";
+            const SCRIPT_RUN: &str = "Ran 1 shell command, ran 2 scripts, edited 2 files, waited 3 times, updated the task list 1 time";
             AgentSession::new(
                 Source::Codex,
                 session,
@@ -1376,6 +1396,16 @@ pub(super) mod tests {
                         .in_summary_row(SCRIPT_RUN),
                     Marker::shown("patch in a script's variable", "PATCH_VARIABLE_SENTINEL")
                         .in_summary_row(SCRIPT_RUN),
+                    Marker::in_call_or_subagent(
+                        "script's shell command in a `String.raw` template",
+                        "RAW_COMMAND_SENTINEL",
+                    )
+                    .in_summary_row(SCRIPT_RUN),
+                    Marker::shown(
+                        "patch in a script's variable containing a `String.raw` template",
+                        "RAW_PATCH_SENTINEL",
+                    )
+                    .in_summary_row(SCRIPT_RUN),
                 ],
             )
             .with_hidden(&[

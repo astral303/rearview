@@ -5,7 +5,8 @@
 //! source is not parsed further. A layout reads literal values out of a
 //! call's argument text by key, whether the argument is JSON
 //! (`{"command":"…"}`) or a bare object literal (`{ cmd: "…" }`), and reads
-//! a literal only when it is the property's whole value.
+//! a literal, a `String.raw` template included, only when it is the
+//! property's whole value.
 //! - The first call names the layout of a shell command, an edit, a web
 //!   search or fetch, an agent launch or message, or an image read.
 //! - A poll, typed input, a plan update and a patch in a variable need the
@@ -491,8 +492,10 @@ fn script_patch(rest_of_script: &str) -> Option<String> {
 static VARIABLE_ARGUMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(\w+)\s*\)").unwrap());
 
-static INITIALISER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"(?s)^\s*=\s*({STRING_LITERAL})")).unwrap());
+static INITIALISER: LazyLock<Regex> = LazyLock::new(|| {
+    let string_literal = string_literal_pattern();
+    Regex::new(&format!(r"(?s)^\s*=\s*({string_literal})")).unwrap()
+});
 
 /// The patch of `apply_patch(patch)`, from `const`, `let` or `var patch =`
 /// and a string literal before the call. `None` unless the script declares
@@ -683,17 +686,29 @@ fn script_web_call(rest_of_script: &str) -> Option<CanonicalCall> {
     None
 }
 
-const STRING_LITERAL: &str = r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`"#;
+/// JavaScript keeps the text of a template with this tag as written,
+/// backslashes included.
+const RAW_TAG: &str = "String.raw";
+
+/// The pattern of a quoted string, or of a template literal with or without
+/// [`RAW_TAG`].
+fn string_literal_pattern() -> String {
+    let raw_tag = regex::escape(RAW_TAG);
+    format!(r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?:{raw_tag}\s*)?`(?:[^`\\]|\\.)*`"#)
+}
 
 static PROPERTY: LazyLock<Regex> = LazyLock::new(|| {
+    let string_literal = string_literal_pattern();
     Regex::new(&format!(
-        r#"(?s)(?:^|[^\w"'`])["']?(\w+)["']?\s*:\s*(?:({STRING_LITERAL})|(\d+)\b)?"#
+        r#"(?s)(?:^|[^\w"'`])["']?(\w+)["']?\s*:\s*(?:({string_literal})|(\d+)\b)?"#
     ))
     .unwrap()
 });
 
-static LEADING_STRING_LITERAL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"(?s)^\s*({STRING_LITERAL})")).unwrap());
+static LEADING_STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    let string_literal = string_literal_pattern();
+    Regex::new(&format!(r"(?s)^\s*({string_literal})")).unwrap()
+});
 
 struct Property<'a> {
     key: &'a str,
@@ -804,8 +819,9 @@ fn number_argument(object_text: &str, key: &str) -> Argument<u64> {
 /// The text of a string literal; `None` for a template literal with a
 /// substitution, whose text is known only when the script runs.
 fn static_text(literal: &str) -> Option<String> {
-    let has_substitution = literal.starts_with('`') && literal.contains("${");
-    (!has_substitution).then(|| unescape_literal(literal))
+    let is_template = literal.ends_with('`');
+    let has_substitution = is_template && literal.contains("${");
+    (!has_substitution).then(|| literal_text(literal))
 }
 
 /// The object literal `text` opens with, braces included; `None` when `text`
@@ -856,7 +872,7 @@ fn has_property(object_text: &str, key: &str) -> bool {
 /// its substitutions.
 fn property_string(object_text: &str, key: &str) -> Option<String> {
     match property(object_text, key)?.literal? {
-        Literal::String(literal) => Some(unescape_literal(literal)),
+        Literal::String(literal) => Some(literal_text(literal)),
         Literal::Number(_) => None,
     }
 }
@@ -867,7 +883,18 @@ fn leading_string_literal(text: &str) -> Option<String> {
     let literal = LEADING_STRING_LITERAL.captures(text)?.get(1)?;
     after_whitespace_and_comments(&text[literal.end()..])
         .starts_with([')', ','])
-        .then(|| unescape_literal(literal.as_str()))
+        .then(|| literal_text(literal.as_str()))
+}
+
+/// The text of a string literal: a [`RAW_TAG`] template's text as written,
+/// any other literal unescaped. A template literal keeps its substitutions
+/// as written.
+fn literal_text(literal: &str) -> String {
+    let Some(raw_template) = literal.strip_prefix(RAW_TAG) else {
+        return unescape_literal(literal);
+    };
+    let template = raw_template.trim_start();
+    template[1..template.len() - 1].to_owned()
 }
 
 fn unescape_literal(literal: &str) -> String {
@@ -1731,12 +1758,8 @@ mod tests {
     fn exec_patch_not_literal_or_beside_other_calls_is_its_tools_and_source() {
         for (source, calls) in [
             (
-                "const patch = String.raw`*** Begin Patch\n*** Add File: c.md\n+c\n*** End Patch`;\nawait tools.apply_patch(patch);",
-                &["apply_patch"][..],
-            ),
-            (
                 "const patch = `*** Begin Patch\n*** Add File: ${name}\n+c\n*** End Patch`;\nawait tools.apply_patch(patch);",
-                &["apply_patch"],
+                &["apply_patch"][..],
             ),
             ("await tools.apply_patch(patch);", &["apply_patch"]),
             (
@@ -1753,6 +1776,194 @@ mod tests {
             ),
         ] {
             assert_eq!(single("exec", json!(source)), script(source, calls));
+        }
+    }
+
+    fn rows(source: &str) -> Vec<(Tool, Value)> {
+        calls("exec", json!(source))
+            .into_iter()
+            .map(|(tool, input, _)| (tool, input))
+            .collect()
+    }
+
+    #[test]
+    fn exec_shell_command_in_string_raw_shows_as_its_plain_literal_twin() {
+        for (raw, plain, command) in [
+            (
+                "const r = await tools.exec_command({cmd:String.raw`git log -1 --format=%s`,workdir:\"/repo\",yield_time_ms:10000}); text(r.output);",
+                "const r = await tools.exec_command({cmd:`git log -1 --format=%s`,workdir:\"/repo\",yield_time_ms:10000}); text(r.output);",
+                "git log -1 --format=%s",
+            ),
+            (
+                "await tools.shell_command({ command: String.raw`\n$ErrorActionPreference = 'Stop'\nGet-ChildItem`, workdir: \"/repo\" });",
+                "await tools.shell_command({ command: \"\\n$ErrorActionPreference = 'Stop'\\nGet-ChildItem\", workdir: \"/repo\" });",
+                "\n$ErrorActionPreference = 'Stop'\nGet-ChildItem",
+            ),
+            (
+                "await tools.exec_command({ cmd: String.raw `git status` });",
+                "await tools.exec_command({ cmd: `git status` });",
+                "git status",
+            ),
+            (
+                "await tools.exec_command({ cmd: String.raw\n  `git status` });",
+                "await tools.exec_command({ cmd:\n  `git status` });",
+                "git status",
+            ),
+        ] {
+            let row = (Tool::Shell, json!({ "command": command }));
+            assert_eq!(
+                single("exec", json!(raw)),
+                row,
+                "the `String.raw` script shows its command as written"
+            );
+            assert_eq!(
+                single("exec", json!(plain)),
+                row,
+                "the plain-literal twin shows the same command"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_patch_in_string_raw_variable_splits_into_edits_like_its_plain_literal_twin() {
+        let expected = vec![
+            (
+                Tool::Edit,
+                json!({"file_path": "a.md", "patch": "@@\n-x\n+y"}),
+            ),
+            (Tool::Edit, json!({"file_path": "b.md", "patch": "+b"})),
+        ];
+        let raw = "const patch = String.raw`*** Begin Patch\n*** Update File: a.md\n@@\n-x\n+y\n*** Add File: b.md\n+b\n*** End Patch`;\ntext(await tools.apply_patch(patch));";
+        let plain = "const patch = \"*** Begin Patch\\n*** Update File: a.md\\n@@\\n-x\\n+y\\n*** Add File: b.md\\n+b\\n*** End Patch\";\ntext(await tools.apply_patch(patch));";
+        assert_eq!(
+            rows(raw),
+            expected,
+            "the `String.raw` script shows one edit per file"
+        );
+        assert_eq!(
+            rows(plain),
+            expected,
+            "the plain-literal twin shows the same edits"
+        );
+    }
+
+    #[test]
+    fn string_raw_template_keeps_backslashes_as_written() {
+        let raw = r#"await tools.exec_command({ cmd: String.raw`rg "\bfoo\s+bar"` });"#;
+        assert_eq!(
+            single("exec", json!(raw)),
+            (Tool::Shell, json!({"command": r#"rg "\bfoo\s+bar""#}))
+        );
+        let plain = r#"await tools.exec_command({ cmd: `rg "\bfoo\s+bar"` });"#;
+        assert_eq!(
+            single("exec", json!(plain)),
+            (Tool::Shell, json!({"command": "rg \"\u{8}foo\\s+bar\""})),
+            "the plain template unescapes `\\b` and keeps `\\s`"
+        );
+        let escaped_backtick = r"await tools.exec_command({ cmd: String.raw`echo \`date\`` });";
+        assert_eq!(
+            single("exec", json!(escaped_backtick)),
+            (Tool::Shell, json!({"command": r"echo \`date\`"})),
+            "an escaped backtick keeps its backslash"
+        );
+    }
+
+    #[test]
+    fn string_raw_template_with_substitution_shows_its_text_where_plain_template_does() {
+        for (plain, raw, expected) in [
+            (
+                "await tools.exec_command({ cmd: `rg ${pattern} docs` });",
+                "await tools.exec_command({ cmd: String.raw`rg ${pattern} docs` });",
+                (Tool::Shell, json!({"command": "rg ${pattern} docs"})),
+            ),
+            (
+                "await tools.apply_patch(`*** Begin Patch\n*** Add File: ${name}\n+c\n*** End Patch`);",
+                "await tools.apply_patch(String.raw`*** Begin Patch\n*** Add File: ${name}\n+c\n*** End Patch`);",
+                (Tool::Edit, json!({"file_path": "${name}", "patch": "+c"})),
+            ),
+        ] {
+            assert_eq!(
+                rows(plain),
+                std::slice::from_ref(&expected),
+                "the plain template shows its text, the substitution as written"
+            );
+            assert_eq!(
+                rows(raw),
+                [expected],
+                "the `String.raw` twin shows the same text"
+            );
+        }
+    }
+
+    #[test]
+    fn string_raw_template_with_substitution_is_tools_and_source_where_plain_template_is() {
+        for (plain, raw, calls) in [
+            (
+                "const patch = `*** Begin Patch\n*** Add File: ${name}\n+c\n*** End Patch`;\nawait tools.apply_patch(patch);",
+                "const patch = String.raw`*** Begin Patch\n*** Add File: ${name}\n+c\n*** End Patch`;\nawait tools.apply_patch(patch);",
+                &["apply_patch"][..],
+            ),
+            (
+                "await tools.write_stdin({ session_id: 7, chars: `${keys}` });",
+                "await tools.write_stdin({ session_id: 7, chars: String.raw`${keys}` });",
+                &["write_stdin"],
+            ),
+            (
+                "await tools.update_plan({ plan: [{ step: `Run ${n}`, status: \"pending\" }] });",
+                "await tools.update_plan({ plan: [{ step: String.raw`Run ${n}`, status: \"pending\" }] });",
+                &["update_plan"],
+            ),
+        ] {
+            assert_eq!(
+                single("exec", json!(plain)),
+                script(plain, calls),
+                "the plain template's script shows its tools and source"
+            );
+            assert_eq!(
+                single("exec", json!(raw)),
+                script(raw, calls),
+                "the `String.raw` twin's script shows its tools and source"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_string_raw_inside_expression_or_other_tag_is_its_tools_and_source() {
+        for (source, calls) in [
+            (
+                "await tools.exec_command({ cmd: String.raw`rg -n ` + pattern });",
+                &["exec_command"][..],
+            ),
+            (
+                "await tools.exec_command({ cmd: String.raw` git status `.trim() });",
+                &["exec_command"],
+            ),
+            (
+                "await tools.exec_command({ cmd: dedent`git status` });",
+                &["exec_command"],
+            ),
+            (
+                "const raw = String.raw;\nawait tools.exec_command({ cmd: raw`git status` });",
+                &["exec_command"],
+            ),
+            (
+                "const patch = String.raw`*** Begin Patch\n*** Add File: c.md\n+c\n*** End Patch` + extra;\nawait tools.apply_patch(patch);",
+                &["apply_patch"],
+            ),
+            (
+                "const patch = String.raw`*** Begin Patch\n*** Add File: c.md\n+c\n*** End Patch`.trim();\nawait tools.apply_patch(patch);",
+                &["apply_patch"],
+            ),
+            (
+                "const patch = dedent`*** Begin Patch\n*** Add File: c.md\n+c\n*** End Patch`;\nawait tools.apply_patch(patch);",
+                &["apply_patch"],
+            ),
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                script(source, calls),
+                "the script shows its source, not a value it may not use"
+            );
         }
     }
 
