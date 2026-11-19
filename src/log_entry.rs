@@ -220,6 +220,12 @@ pub struct TokenUsage {
 #[serde(rename_all = "snake_case")]
 pub enum Tool {
     Shell,
+    /// A script, shown as the tools it calls in its header and its source in
+    /// its body. Its canonical input is the `source`, the tools it `calls`
+    /// in order of first use, empty when it doesn't call a tool, and the
+    /// settings it ran under: `yield_after_ms`, after which the call returns
+    /// while the script runs on, and `max_output_tokens`.
+    Script,
     /// A shell command the user ran themselves through the agent, which the
     /// model did not call. Its header reads `ran {command}`, with no tool name
     /// to print.
@@ -249,6 +255,11 @@ pub enum Tool {
     /// Questions the agent put to the user. Its canonical input is
     /// `questions`, a list of `{title, options}`, each option a string.
     UserQuestion,
+    /// An update to the agent's task list. A reader that lays it out writes
+    /// `steps`, a list of `{text, status}` with the status `pending`,
+    /// `in_progress` or `completed`, and may add an `explanation` and the
+    /// `calls` of the script that made the update; any other input shows as
+    /// it is.
     TaskList,
     WebFetch,
     WebSearch,
@@ -306,6 +317,7 @@ impl Tool {
             Tool::Read => (30, "read", "file", "files"),
             Tool::FileReference => (35, "referenced", "file", "files"),
             Tool::Shell | Tool::UserShell => (40, "ran", "shell command", "shell commands"),
+            Tool::Script => (45, "ran", "script", "scripts"),
             Tool::Edit => (50, "edited", "file", "files"),
             Tool::Write => (60, "wrote", "file", "files"),
             Tool::Skill => (65, "loaded", "skill", "skills"),

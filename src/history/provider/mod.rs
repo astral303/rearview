@@ -780,7 +780,7 @@ mod tests {
             (Source::Claude, "claude", 20),
             (Source::Pi, "pi", 18),
             (Source::Omp, "omp", 20),
-            (Source::Codex, "codex", 29),
+            (Source::Codex, "codex", 30),
             (Source::Kimi, "kimi", 19),
             (Source::Grok, "grok", 11),
             (Source::OpenCode, "opencode", 17),

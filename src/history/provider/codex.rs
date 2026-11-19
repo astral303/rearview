@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 29,
+            schema_version: 30,
         }
     }
 
@@ -1208,10 +1208,86 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "message", "id": "msg_quoted_answer", "role": "user", "content": [{"type": "input_text", "text": "user: <send_user_message_question_reply>\n[{\"answer\":\"QUOTED_ENVELOPE_SENTINEL\",\"question\":\"Ship it?\",\"questionItemId\":\"call_other\"}]\n</send_user_message_question_reply>"}]}),
                     ),
+                    // A script with a control comment that calls two tools,
+                    // then one without a control comment.
+                    line(
+                        29,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_script", "status": "completed", "call_id": "call_script", "name": "exec", "input": "// @exec: {\"yield_time_ms\":60000,\"max_output_tokens\":14000}\nconst r = await Promise.allSettled([tools.update_plan({plan:[{step:\"SCRIPT_SOURCE_SENTINEL: date the notes\",status:\"in_progress\"}]}), tools.exec_command({cmd:\"git status\"})]);\ntext(JSON.stringify(r));"}),
+                    ),
+                    line(
+                        30,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_script", "call_id": "call_script", "output": [{"type": "input_text", "text": "Script completed"}]}),
+                    ),
+                    line(
+                        31,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_mcp_script", "status": "completed", "call_id": "call_mcp_script", "name": "exec", "input": "const r = await tools.mcp__ide__find_definition({symbol: \"MCP_SCRIPT_SENTINEL\"});\ntext(r.content[0].text);"}),
+                    ),
+                    line(
+                        32,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_mcp_script", "call_id": "call_mcp_script", "output": [{"type": "input_text", "text": "src/lib.rs:12"}]}),
+                    ),
+                    // Scripts that poll a process, and type into one.
+                    line(
+                        33,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_poll", "status": "completed", "call_id": "call_poll", "name": "exec", "input": "// @exec: {\"yield_time_ms\":60000,\"max_output_tokens\":480}\ntext(await tools.write_stdin({session_id:24279,chars:\"\",yield_time_ms:50000,max_output_tokens:330}))"}),
+                    ),
+                    line(
+                        34,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_poll", "call_id": "call_poll", "output": [{"type": "input_text", "text": "Process running with session ID 24279"}]}),
+                    ),
+                    line(
+                        35,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_typed", "status": "completed", "call_id": "call_typed", "name": "exec", "input": "text(await tools.write_stdin({session_id:72867,chars:\"TYPED_INPUT_SENTINEL\\n\",yield_time_ms:10000}))"}),
+                    ),
+                    line(
+                        36,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_typed", "call_id": "call_typed", "output": [{"type": "input_text", "text": "Process exited with code 0"}]}),
+                    ),
+                    // A direct call that types several lines.
+                    line(
+                        36,
+                        "response_item",
+                        json!({"type": "function_call", "id": "fc_typed_lines", "name": "write_stdin", "arguments": "{\"session_id\":72868,\"chars\":\"import json\\nprint(TYPED_LINES_SENTINEL)\\n\",\"yield_time_ms\":5000}", "call_id": "call_typed_lines"}),
+                    ),
+                    line(
+                        36,
+                        "response_item",
+                        json!({"type": "function_call_output", "id": "fco_typed_lines", "call_id": "call_typed_lines", "output": ">>> >>> "}),
+                    ),
+                    line(
+                        37,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_script_plan", "status": "completed", "call_id": "call_script_plan", "name": "exec", "input": "// @exec: {\"max_output_tokens\":3600}\ntext(await tools.update_plan({explanation:\"PLAN_EXPLANATION_SENTINEL: one step left\",plan:[{step:\"Read the notes\",status:\"completed\"},{step:\"SCRIPT_PLAN_STEP_SENTINEL: date them\",status:\"in_progress\"},{step:\"Ship\",status:\"pending\"}]}))"}),
+                    ),
+                    line(
+                        38,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_script_plan", "call_id": "call_script_plan", "output": [{"type": "input_text", "text": "Plan updated"}]}),
+                    ),
+                    line(
+                        39,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_patch_variable", "status": "completed", "call_id": "call_patch_variable", "name": "exec", "input": "const patch = \"*** Begin Patch\\n*** Update File: NOTES.md\\n@@\\n-# Notes\\n+# Notes, PATCH_VARIABLE_SENTINEL\\n*** End Patch\";\ntext(await tools.apply_patch(patch));"}),
+                    ),
+                    line(
+                        40,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_patch_variable", "call_id": "call_patch_variable", "output": [{"type": "input_text", "text": "Done: 1 file updated"}]}),
+                    ),
                 ],
             );
             const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time";
             const LAUNCH_RUN: &str = "Started 2 agents";
+            const SCRIPT_RUN: &str =
+                "Ran 2 scripts, edited 1 file, waited 3 times, updated the task list 1 time";
             AgentSession::new(
                 Source::Codex,
                 session,
@@ -1254,9 +1330,9 @@ pub(super) mod tests {
                     )
                     .in_summary_row("Ran 1 shell command"),
                     Marker::shown("patch", "PATCH_SENTINEL").in_summary_row(PATCH_RUN),
-                    Marker::shown("plan update", "PLAN_STEP_SENTINEL"),
+                    Marker::shown("plan update", "PLAN_STEP_SENTINEL").in_summary_row(PATCH_RUN),
                     Marker::shown("readable message from an agent", "INTER_AGENT_TASK_TEXT")
-                        .in_summary_row("Received 1 message, waited 1 time, called 1 tool"),
+                        .in_summary_row("Ran 1 script, received 1 message, waited 1 time"),
                     Marker::in_call_or_subagent(
                         "encrypted message from an agent",
                         "RECEIVED_FROM_SENTINEL",
@@ -1279,6 +1355,27 @@ pub(super) mod tests {
                     Marker::shown("quoted reply envelope", "QUOTED_ENVELOPE_SENTINEL"),
                     Marker::shown("message to an agent", "SEND_MESSAGE_SENTINEL")
                         .in_summary_row(PATCH_RUN),
+                    Marker::in_call_or_subagent(
+                        "script's tools and settings",
+                        "exec: update_plan, exec_command · yields after 1m · output ≤ 14,000 tokens",
+                    )
+                    .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("script's source", "SCRIPT_SOURCE_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("source of a script without settings", "MCP_SCRIPT_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
+                    Marker::in_call_or_subagent("poll of a process", "poll session 24279")
+                        .in_summary_row(SCRIPT_RUN),
+                    Marker::in_call_or_subagent("input typed into a process", "TYPED_INPUT_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("lines typed into a process", "TYPED_LINES_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("plan update's explanation", "PLAN_EXPLANATION_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("plan update's step from a script", "SCRIPT_PLAN_STEP_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("patch in a script's variable", "PATCH_VARIABLE_SENTINEL")
+                        .in_summary_row(SCRIPT_RUN),
                 ],
             )
             .with_hidden(&[

@@ -1,13 +1,24 @@
 //! Codex's tool calls mapped onto the canonical [`Tool`] set.
 //!
 //! `exec` runs a JavaScript script in which tool calls read `tools.<name>(…)`.
-//! The script is not parsed: its first such call names the tool, and the
-//! strings the header needs are read out of the argument text by key, whether
-//! the argument is JSON (`{"command":"…"}`) or a bare object literal
-//! (`{ cmd: "…" }`).
+//! [`script_scan`] finds those calls outside comments and literals; the
+//! source is not parsed further. A layout reads literal values out of a
+//! call's argument text by key, whether the argument is JSON
+//! (`{"command":"…"}`) or a bare object literal (`{ cmd: "…" }`), and reads
+//! a literal only when it is the property's whole value.
+//! - The first call names the layout of a shell command, an edit, a web
+//!   search or fetch, an agent launch or message, or an image read.
+//! - A poll, typed input, a plan update and a patch in a variable need the
+//!   script's one call, at depth 0, and arguments known before it runs.
+//!
+//! Any other script is a [`Tool::Script`]: its source and the tools it
+//! calls.
+
+mod script_scan;
 
 use crate::log_entry::{ContentBlock, Tool};
 use regex::Regex;
+use script_scan::{ScriptCall, ScriptScan};
 use serde_json::{Map, Value, json};
 use std::sync::LazyLock;
 
@@ -39,10 +50,16 @@ struct CanonicalCall {
 fn canonical_calls(name: &str, input: &Value) -> Vec<CanonicalCall> {
     let input = &without_encrypted_payloads(input);
     let calls = match name {
-        "exec" => input.as_str().and_then(script_calls),
+        "exec" => input.as_str().map(script_calls),
         "apply_patch" => patch_text(input).map(patch_edits),
         "run" | "web__run" => Some(web_calls(input)),
         "sleep" => sleep_call(input).map(|call| vec![call]),
+        "write_stdin" => stdin_call(input)
+            .or_else(|| function_call(name, input))
+            .map(|call| vec![call]),
+        "update_plan" => plan_update(input)
+            .or_else(|| function_call(name, input))
+            .map(|call| vec![call]),
         // Codex's arguments are the canonical input; a call they don't fit
         // shows its name and input.
         QUESTION_CALL => Some(vec![CanonicalCall {
@@ -68,8 +85,6 @@ fn tool_mapping(name: &str) -> ToolMapping {
     let (tool, header_keys): (Tool, &'static [(&'static str, &'static str)]) = match name {
         "shell_command" => (Tool::Shell, &[("command", "command")]),
         "exec_command" => (Tool::Shell, &[("cmd", "command")]),
-        // `write_stdin` also feeds `chars` to the process's stdin when it is
-        // non-empty; counted as a wait, that text is not shown.
         "write_stdin" | "wait" | "wait_agent" => (Tool::Wait, &[]),
         "spawn_agent" => (
             Tool::Agent,
@@ -113,6 +128,81 @@ fn function_call(name: &str, input: &Value) -> Option<CanonicalCall> {
         tool: mapping.tool,
         input,
     })
+}
+
+/// A `write_stdin` call as a wait on the process its `session_id` names,
+/// after typing its `chars`, for up to its `yield_time_ms`. `None` unless
+/// the process's `session_id` is a number or text, `chars` is text, and
+/// `yield_time_ms` a whole number; null or missing `chars` and
+/// `yield_time_ms` are left out.
+fn stdin_call(arguments: &Value) -> Option<CanonicalCall> {
+    let session_id = match arguments.get("session_id")? {
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        _ => return None,
+    };
+    let chars = match arguments.get("chars") {
+        None | Some(Value::Null) => "",
+        Some(chars) => chars.as_str()?,
+    };
+    let wait_ms = match arguments.get("yield_time_ms") {
+        None | Some(Value::Null) => None,
+        Some(wait_ms) => Some(wait_ms.as_u64()?),
+    };
+    Some(process_wait(session_id, chars, wait_ms))
+}
+
+/// A wait on the process `session_id` names, for up to `wait_ms`, after
+/// typing `chars`. Without `chars`, the wait polls the process for output.
+fn process_wait(session_id: String, chars: &str, wait_ms: Option<u64>) -> CanonicalCall {
+    let mut input = json!({ "session_id": session_id });
+    if !chars.is_empty() {
+        input["input"] = Value::from(chars);
+    }
+    if let Some(wait_ms) = wait_ms {
+        input["wait_ms"] = Value::from(wait_ms);
+    }
+    CanonicalCall {
+        tool: Tool::Wait,
+        input,
+    }
+}
+
+/// The statuses Codex accepts for a plan's step.
+const PLAN_STATUSES: [&str; 3] = ["pending", "in_progress", "completed"];
+
+/// An `update_plan` call as its explanation and steps. `None` unless `plan`
+/// is a list, each step has a text `step` and one of [`PLAN_STATUSES`], and
+/// `explanation` is text, null or missing.
+fn plan_update(arguments: &Value) -> Option<CanonicalCall> {
+    let steps = arguments
+        .get("plan")?
+        .as_array()?
+        .iter()
+        .map(|step| plan_step(step.get("step")?.as_str()?, step.get("status")?.as_str()?))
+        .collect::<Option<Vec<_>>>()?;
+    let explanation = match arguments.get("explanation") {
+        None | Some(Value::Null) => None,
+        Some(explanation) => Some(explanation.as_str()?),
+    };
+    Some(task_list(steps, explanation))
+}
+
+fn plan_step(text: &str, status: &str) -> Option<Value> {
+    PLAN_STATUSES
+        .contains(&status)
+        .then(|| json!({ "text": text, "status": status }))
+}
+
+fn task_list(steps: Vec<Value>, explanation: Option<&str>) -> CanonicalCall {
+    let mut input = json!({ "steps": steps });
+    if let Some(explanation) = explanation {
+        input["explanation"] = Value::from(explanation);
+    }
+    CanonicalCall {
+        tool: Tool::TaskList,
+        input,
+    }
 }
 
 /// A `sleep` call as a wait for its `duration_ms`; `None` unless that is a
@@ -188,25 +278,191 @@ fn has_header_string(header_keys: &[(&str, &str)], input: &Value) -> bool {
             .any(|(_, canonical_key)| input.get(canonical_key).is_some_and(Value::is_string))
 }
 
-fn script_calls(script: &str) -> Option<Vec<CanonicalCall>> {
-    let call = first_script_call(script)?;
+fn script_calls(input: &str) -> Vec<CanonicalCall> {
+    let script = ExecScript::parse(input);
+    let scan = script_scan::scan(script.source);
+    layout(&scan)
+        .filter(|layout| !layout.is_empty())
+        .unwrap_or_else(|| vec![script.into_call(&scan.calls)])
+}
+
+/// The calls a script's layout shows; `None` for a script without one. The
+/// first call names the layout. A wait on a process, a plan update and a
+/// patch in a variable get their layouts only as the script's one call, at
+/// depth 0, in a script that doesn't name `tools` anywhere else.
+fn layout(scan: &ScriptScan<'_>) -> Option<Vec<CanonicalCall>> {
+    let call = scan.calls.first()?;
+    let is_only_call = scan.calls.len() == 1 && call.depth == 0 && !scan.names_tools_otherwise;
     match call.name {
-        "apply_patch" => script_patch(call.rest_of_script).map(|patch| patch_edits(&patch)),
+        "apply_patch" => script_patch(call.rest_of_script)
+            .or_else(|| {
+                if is_only_call {
+                    patch_in_variable(scan, call)
+                } else {
+                    None
+                }
+            })
+            .map(|patch| patch_edits(&patch)),
         "run" | "web__run" => script_web_call(call.rest_of_script).map(|call| vec![call]),
-        name => script_function_call(name, call.rest_of_script, script).map(|call| vec![call]),
+        "write_stdin" if is_only_call => {
+            script_stdin_call(call.rest_of_script).map(|call| vec![call])
+        }
+        "update_plan" if is_only_call => {
+            script_plan_update(call.rest_of_script).map(|call| vec![call])
+        }
+        name => script_function_call(name, call.rest_of_script).map(|call| vec![call]),
     }
 }
 
-fn script_function_call(name: &str, rest_of_script: &str, script: &str) -> Option<CanonicalCall> {
-    let mapping = tool_mapping(name);
-    if mapping.tool == Tool::Other {
+static PLAN_ARRAY_START: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:^|[^\w"'`])["']?plan["']?\s*:\s*\["#).unwrap());
+
+/// The plan update a script's `update_plan` call makes, read from its object
+/// literal as [`plan_update`] reads a direct call's arguments; its input
+/// names `update_plan` as the tool the script called. `None` unless `plan`
+/// is an array literal of object literals, each with `step` and `status`
+/// string literals, and `explanation` is a string literal or missing.
+fn script_plan_update(rest_of_script: &str) -> Option<CanonicalCall> {
+    let arguments = leading_object(rest_of_script)?;
+    let array_start = PLAN_ARRAY_START.find(arguments)?.end() - 1;
+    let array = bracketed(&arguments[array_start..], '[', ']')?;
+    if !ends_value(&arguments[array_start + array.len()..]) {
         return None;
     }
-    if mapping.header_keys.is_empty() {
-        return Some(CanonicalCall {
-            tool: mapping.tool,
-            input: Value::String(script.to_owned()),
-        });
+    let known_text = |object: &str, key: &str| match string_argument(object, key) {
+        Argument::Known(text) => Some(text),
+        Argument::Missing | Argument::Unknown => None,
+    };
+    let steps = object_literals(array)?
+        .into_iter()
+        .map(|step| plan_step(&known_text(step, "step")?, &known_text(step, "status")?))
+        .collect::<Option<Vec<_>>>()?;
+    let explanation = string_argument(arguments, "explanation")
+        .map(Some)
+        .or_missing(|| None)?;
+    let mut plan_update = task_list(steps, explanation.as_deref());
+    plan_update.input["calls"] = json!(["update_plan"]);
+    Some(plan_update)
+}
+
+/// The object literals `array`, an array literal, lists in order; `None`
+/// when it lists anything else.
+fn object_literals(array: &str) -> Option<Vec<&str>> {
+    let mut rest = &array[1..array.len() - 1];
+    let mut objects = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Some(objects);
+        }
+        let object = bracketed(rest, '{', '}')?;
+        objects.push(object);
+        rest = rest[object.len()..].trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest);
+    }
+}
+
+/// The wait a script's `write_stdin` call makes, read from its object
+/// literal as [`stdin_call`] reads a direct call's arguments. `None` unless
+/// `session_id` is a number literal, and `chars` and `yield_time_ms` are
+/// literals or missing.
+fn script_stdin_call(rest_of_script: &str) -> Option<CanonicalCall> {
+    let arguments = leading_object(rest_of_script)?;
+    let Argument::Known(session_id) = number_argument(arguments, "session_id") else {
+        return None;
+    };
+    let chars = string_argument(arguments, "chars").or_missing(String::new)?;
+    let wait_ms = number_argument(arguments, "yield_time_ms")
+        .map(Some)
+        .or_missing(|| None)?;
+    Some(process_wait(session_id.to_string(), &chars, wait_ms))
+}
+
+/// Codex's `exec` input split as Codex splits it: an optional control
+/// comment on the first line, `// @exec:` then a JSON object of settings,
+/// and the source after it.
+struct ExecScript<'a> {
+    source: &'a str,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<u64>,
+}
+
+const CONTROL_COMMENT_PREFIX: &str = "// @exec:";
+/// The largest integer JavaScript holds exactly. Codex rejects a setting
+/// above it.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+impl<'a> ExecScript<'a> {
+    /// A control comment Codex rejects stays in the source: Codex refused
+    /// that script, and its result shows why.
+    fn parse(input: &'a str) -> Self {
+        Self::with_control_comment(input).unwrap_or(Self {
+            source: input,
+            yield_time_ms: None,
+            max_output_tokens: None,
+        })
+    }
+
+    /// `None` unless the first line is a control comment Codex accepts: a
+    /// JSON object of `yield_time_ms` and `max_output_tokens`, each a safe
+    /// integer or null, followed by source.
+    fn with_control_comment(input: &'a str) -> Option<Self> {
+        let (first_line, source) = input.split_once('\n')?;
+        let settings = first_line
+            .trim_start()
+            .strip_prefix(CONTROL_COMMENT_PREFIX)?;
+        if source.trim().is_empty() {
+            return None;
+        }
+        let settings: Map<String, Value> = serde_json::from_str(settings.trim()).ok()?;
+        let mut script = Self {
+            source,
+            yield_time_ms: None,
+            max_output_tokens: None,
+        };
+        for (key, value) in settings {
+            let value = match value {
+                Value::Null => None,
+                number => Some(number.as_u64().filter(|value| *value <= MAX_SAFE_INTEGER)?),
+            };
+            match key.as_str() {
+                "yield_time_ms" => script.yield_time_ms = value,
+                "max_output_tokens" => script.max_output_tokens = value,
+                _ => return None,
+            }
+        }
+        Some(script)
+    }
+
+    /// The script as its source, the tools `calls` name in order of first
+    /// use, and the control comment's settings.
+    fn into_call(self, calls: &[ScriptCall<'_>]) -> CanonicalCall {
+        let mut called: Vec<&str> = Vec::new();
+        for call in calls {
+            if !called.contains(&call.name) {
+                called.push(call.name);
+            }
+        }
+        let mut input = json!({ "source": self.source, "calls": called });
+        if let Some(yield_time_ms) = self.yield_time_ms {
+            input["yield_after_ms"] = Value::from(yield_time_ms);
+        }
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            input["max_output_tokens"] = Value::from(max_output_tokens);
+        }
+        CanonicalCall {
+            tool: Tool::Script,
+            input,
+        }
+    }
+}
+
+/// A call whose header reads strings out of its argument; `None` for a tool
+/// without such a header, such as a wait.
+fn script_function_call(name: &str, rest_of_script: &str) -> Option<CanonicalCall> {
+    let mapping = tool_mapping(name);
+    if mapping.tool == Tool::Other || mapping.header_keys.is_empty() {
+        return None;
     }
     let input: Map<String, Value> = mapping
         .header_keys
@@ -230,6 +486,53 @@ fn patch_text(input: &Value) -> Option<&str> {
 
 fn script_patch(rest_of_script: &str) -> Option<String> {
     leading_string_literal(rest_of_script).or_else(|| property_string(rest_of_script, "input"))
+}
+
+static VARIABLE_ARGUMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\w+)\s*\)").unwrap());
+
+static INITIALISER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"(?s)^\s*=\s*({STRING_LITERAL})")).unwrap());
+
+/// The patch of `apply_patch(patch)`, from `const`, `let` or `var patch =`
+/// and a string literal before the call. `None` unless the script declares
+/// the name once, at depth 0, and doesn't assign it again, and the literal
+/// is the whole initialiser, its text known before the script runs.
+fn patch_in_variable(scan: &ScriptScan<'_>, call: &ScriptCall<'_>) -> Option<String> {
+    let variable = VARIABLE_ARGUMENT
+        .captures(call.rest_of_script)?
+        .get(1)?
+        .as_str();
+    let mut declarations = scan
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == variable);
+    let declaration = declarations.next()?;
+    if declarations.next().is_some()
+        || declaration.depth != 0
+        || declaration.offset > call.offset
+        || scan.assigned.contains(&variable)
+    {
+        return None;
+    }
+    let literal = INITIALISER.captures(declaration.rest_of_script)?.get(1)?;
+    if !ends_initialiser(&declaration.rest_of_script[literal.end()..]) {
+        return None;
+    }
+    static_text(literal.as_str())
+}
+
+/// True when the text after a declaration's literal ends its initialiser:
+/// after whitespace and comments, the script ends, `;` or `,` follows, or a
+/// line break and then a name, which starts the next statement.
+fn ends_initialiser(after_literal: &str) -> bool {
+    let rest = after_whitespace_and_comments(after_literal);
+    let crosses_line = after_literal[..after_literal.len() - rest.len()].contains('\n');
+    rest.is_empty()
+        || rest.starts_with([';', ','])
+        || (crosses_line
+            && rest
+                .starts_with(|first: char| first.is_alphabetic() || first == '_' || first == '$'))
 }
 
 const FILE_SECTION_MARKERS: [&str; 3] =
@@ -380,26 +683,11 @@ fn script_web_call(rest_of_script: &str) -> Option<CanonicalCall> {
     None
 }
 
-struct ScriptCall<'a> {
-    name: &'a str,
-    rest_of_script: &'a str,
-}
-
-static FIRST_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"tools\.(\w+)\s*\(").unwrap());
-
-fn first_script_call(script: &str) -> Option<ScriptCall<'_>> {
-    let call = FIRST_CALL.captures(script)?;
-    Some(ScriptCall {
-        name: call.get(1)?.as_str(),
-        rest_of_script: &script[call.get(0)?.end()..],
-    })
-}
-
 const STRING_LITERAL: &str = r#""(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`"#;
 
 static PROPERTY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?s)(?:^|[^\w"'`])["']?(\w+)["']?\s*:\s*({STRING_LITERAL})?"#
+        r#"(?s)(?:^|[^\w"'`])["']?(\w+)["']?\s*:\s*(?:({STRING_LITERAL})|(\d+)\b)?"#
     ))
     .unwrap()
 });
@@ -409,32 +697,177 @@ static LEADING_STRING_LITERAL: LazyLock<Regex> =
 
 struct Property<'a> {
     key: &'a str,
-    string_literal: Option<&'a str>,
+    /// The value when one literal is the whole of it: `"y"`, not
+    /// `"y" + "\n"`.
+    literal: Option<Literal<'a>>,
+}
+
+enum Literal<'a> {
+    String(&'a str),
+    /// A whole number written in decimal digits.
+    Number(&'a str),
 }
 
 fn properties(object_text: &str) -> impl Iterator<Item = Property<'_>> {
-    PROPERTY
-        .captures_iter(object_text)
-        .map(|captures| Property {
+    PROPERTY.captures_iter(object_text).map(|captures| {
+        let literal = captures
+            .get(2)
+            .map(|literal| Literal::String(literal.as_str()))
+            .or_else(|| {
+                captures
+                    .get(3)
+                    .map(|literal| Literal::Number(literal.as_str()))
+            })
+            .filter(|_| ends_value(&object_text[captures.get_match().end()..]));
+        Property {
             key: captures.get(1).map_or("", |key| key.as_str()),
-            string_literal: captures.get(2).map(|literal| literal.as_str()),
-        })
+            literal,
+        }
+    })
+}
+
+/// True when the text after a value's literal ends the value: `,`, `}` or
+/// `]` follows, after any whitespace and comments.
+fn ends_value(after_literal: &str) -> bool {
+    after_whitespace_and_comments(after_literal).starts_with([',', '}', ']'])
+}
+
+fn after_whitespace_and_comments(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        if let Some(comment) = rest.strip_prefix("//") {
+            rest = comment.find('\n').map_or("", |end| &comment[end..]);
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            rest = comment.find("*/").map_or("", |end| &comment[end + 2..]);
+        } else {
+            return rest;
+        }
+        rest = rest.trim_start();
+    }
+}
+
+/// The first property `key` names in `object_text`.
+fn property<'a>(object_text: &'a str, key: &str) -> Option<Property<'a>> {
+    properties(object_text).find(|property| property.key == key)
+}
+
+/// A layout's argument: missing, a literal with its value known before the
+/// script runs, or anything else.
+enum Argument<T> {
+    Missing,
+    Known(T),
+    Unknown,
+}
+
+impl<T> Argument<T> {
+    fn map<U>(self, change: impl FnOnce(T) -> U) -> Argument<U> {
+        match self {
+            Self::Missing => Argument::Missing,
+            Self::Known(value) => Argument::Known(change(value)),
+            Self::Unknown => Argument::Unknown,
+        }
+    }
+
+    /// The known value, or `missing` for a missing argument; `None` for an
+    /// unknown one, which the layout doesn't show.
+    fn or_missing(self, missing: impl FnOnce() -> T) -> Option<T> {
+        match self {
+            Self::Missing => Some(missing()),
+            Self::Known(value) => Some(value),
+            Self::Unknown => None,
+        }
+    }
+}
+
+fn string_argument(object_text: &str, key: &str) -> Argument<String> {
+    match property(object_text, key) {
+        None => Argument::Missing,
+        Some(Property {
+            literal: Some(Literal::String(literal)),
+            ..
+        }) => static_text(literal).map_or(Argument::Unknown, Argument::Known),
+        Some(_) => Argument::Unknown,
+    }
+}
+
+fn number_argument(object_text: &str, key: &str) -> Argument<u64> {
+    match property(object_text, key) {
+        None => Argument::Missing,
+        Some(Property {
+            literal: Some(Literal::Number(digits)),
+            ..
+        }) => digits.parse().map_or(Argument::Unknown, Argument::Known),
+        Some(_) => Argument::Unknown,
+    }
+}
+
+/// The text of a string literal; `None` for a template literal with a
+/// substitution, whose text is known only when the script runs.
+fn static_text(literal: &str) -> Option<String> {
+    let has_substitution = literal.starts_with('`') && literal.contains("${");
+    (!has_substitution).then(|| unescape_literal(literal))
+}
+
+/// The object literal `text` opens with, braces included; `None` when `text`
+/// opens with anything else, or the object doesn't close.
+fn leading_object(text: &str) -> Option<&str> {
+    bracketed(text.trim_start(), '{', '}')
+}
+
+/// `text` from its first character, `open`, to the `close` that balances
+/// it. Brackets inside string literals don't count.
+fn bracketed(text: &str, open: char, close: char) -> Option<&str> {
+    if !text.starts_with(open) {
+        return None;
+    }
+    let mut depth = 0_usize;
+    let mut open_quote: Option<char> = None;
+    let mut is_escaped = false;
+    for (index, character) in text.char_indices() {
+        if let Some(quote) = open_quote {
+            if is_escaped {
+                is_escaped = false;
+            } else if character == '\\' {
+                is_escaped = true;
+            } else if character == quote {
+                open_quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '"' | '\'' | '`') {
+            open_quote = Some(character);
+        } else if character == open {
+            depth += 1;
+        } else if character == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&text[..index + close.len_utf8()]);
+            }
+        }
+    }
+    None
 }
 
 fn has_property(object_text: &str, key: &str) -> bool {
-    properties(object_text).any(|property| property.key == key)
+    property(object_text, key).is_some()
 }
 
+/// The first `key`'s string literal, as written: a template literal keeps
+/// its substitutions.
 fn property_string(object_text: &str, key: &str) -> Option<String> {
-    properties(object_text)
-        .filter(|property| property.key == key)
-        .find_map(|property| property.string_literal)
-        .map(unescape_literal)
+    match property(object_text, key)?.literal? {
+        Literal::String(literal) => Some(unescape_literal(literal)),
+        Literal::Number(_) => None,
+    }
 }
 
+/// The string literal a call's argument list, `text`, opens with, when it is
+/// the whole first argument.
 fn leading_string_literal(text: &str) -> Option<String> {
     let literal = LEADING_STRING_LITERAL.captures(text)?.get(1)?;
-    Some(unescape_literal(literal.as_str()))
+    after_whitespace_and_comments(&text[literal.end()..])
+        .starts_with([')', ','])
+        .then(|| unescape_literal(literal.as_str()))
 }
 
 fn unescape_literal(literal: &str) -> String {
@@ -565,10 +998,44 @@ mod tests {
             single("view_image", json!({"path": "shot.png", "detail": "high"})).1,
             json!({"file_path": "shot.png", "detail": "high"})
         );
+    }
+
+    #[test]
+    fn write_stdin_waits_on_the_process_its_session_id_names_after_typing_its_chars() {
         assert_eq!(
-            single("write_stdin", json!({"session_id": 1, "chars": "y\n"})).1,
-            json!({"session_id": 1, "chars": "y\n"})
+            single(
+                "write_stdin",
+                json!({"session_id": 24279, "chars": "", "yield_time_ms": 50000, "max_output_tokens": 330})
+            ),
+            (Tool::Wait, json!({"session_id": "24279", "wait_ms": 50000}))
         );
+        assert_eq!(
+            single(
+                "write_stdin",
+                json!({"session_id": "72867", "chars": "\u{3}"})
+            ),
+            (Tool::Wait, json!({"session_id": "72867", "input": "\u{3}"}))
+        );
+        assert_eq!(
+            single("write_stdin", json!({"session_id": 1})),
+            (Tool::Wait, json!({"session_id": "1"}))
+        );
+    }
+
+    #[test]
+    fn write_stdin_without_session_id_or_with_chars_not_text_or_wait_not_whole_number_keeps_its_arguments()
+     {
+        for arguments in [
+            json!({"chars": "y\n"}),
+            json!({"session_id": 1, "chars": ["y"]}),
+            json!({"session_id": 1, "yield_time_ms": "1s"}),
+            json!({"session_id": 1, "yield_time_ms": 1.5}),
+        ] {
+            assert_eq!(
+                single("write_stdin", arguments.clone()),
+                (Tool::Wait, arguments)
+            );
+        }
     }
 
     #[test]
@@ -793,26 +1260,353 @@ mod tests {
         );
     }
 
+    /// A script shown as its tools and source, without control comment
+    /// settings.
+    fn script(source: &str, calls: &[&str]) -> (Tool, Value) {
+        (Tool::Script, json!({"source": source, "calls": calls}))
+    }
+
     #[test]
-    fn exec_script_with_no_recognizable_call_stays_other() {
-        for script in [
-            "echo TOOL_INPUT_VISIBLE",
-            "const now = await tools.clock__curr_time({});",
-            "await tools.exec_command({ cmd: command })",
-            "await tools.exec_command(",
+    fn exec_script_without_header_from_its_first_call_is_its_tools_and_source() {
+        for (source, calls) in [
+            ("echo TOOL_INPUT_VISIBLE", &[][..]),
+            (
+                "const now = await tools.clock__curr_time({});",
+                &["clock__curr_time"],
+            ),
+            (
+                "await tools.exec_command({ cmd: command })",
+                &["exec_command"],
+            ),
+            ("await tools.exec_command(", &["exec_command"]),
+            (
+                "await tools.wait_agent({ agent_ids: [\"scout\"] })",
+                &["wait_agent"],
+            ),
         ] {
-            let (tool, input) = single("exec", json!(script));
-            assert_eq!(tool, Tool::Other, "{script}");
-            assert_eq!(input, json!(script));
+            assert_eq!(single("exec", json!(source)), script(source, calls));
         }
     }
 
     #[test]
-    fn exec_waits_and_plan_updates_keep_script_as_input() {
-        let plan = "await tools.update_plan({ plan: [{ step: \"a\", status: \"in_progress\" }] });";
-        assert_eq!(single("exec", json!(plan)), (Tool::TaskList, json!(plan)));
-        let stdin = "await tools.write_stdin({ session_id: shell.session_id, chars: \"\" });";
-        assert_eq!(single("exec", json!(stdin)), (Tool::Wait, json!(stdin)));
+    fn exec_script_names_its_tools_once_each_in_order_of_first_use() {
+        let source = "const r = await Promise.allSettled([tools.update_plan({ plan: [] }), tools.exec_command({ cmd }), tools.update_plan({ plan: [] })]);\nawait tools.mcp__ide__find({ symbol: \"a\" });";
+        assert_eq!(
+            single("exec", json!(source)),
+            script(source, &["update_plan", "exec_command", "mcp__ide__find"])
+        );
+    }
+
+    #[test]
+    fn exec_script_names_its_calls_outside_comments_and_literals() {
+        for (source, calls) in [
+            (
+                "// await tools.exec_command({ cmd: \"git push\" })\ntext(\"not yet\");",
+                &[][..],
+            ),
+            (
+                "/* tools.update_plan({ plan: [] }) */ text('tools.exec_command({ cmd: \"ls\" })');",
+                &[],
+            ),
+            (
+                "text(`${await tools.mcp__ide__find({ symbol: \"a\" })} and tools.exec_command(`);",
+                &["mcp__ide__find"],
+            ),
+            (
+                "const r = await tools[\"mcp__ide__find\"]({ symbol: \"a\" });",
+                &["mcp__ide__find"],
+            ),
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                script(source, calls),
+                "the header names {calls:?} alone"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_name_inside_another_word_isnt_a_call() {
+        let source = "const py = \"for a, b in itertools.zip_longest(x, y): pass\";\nawait tools.exec_command({ cmd: py });";
+        assert_eq!(
+            single("exec", json!(source)),
+            script(source, &["exec_command"])
+        );
+    }
+
+    #[test]
+    fn control_comment_leaves_source_and_its_settings_are_read() {
+        let source = "text(load(\"skill\").length);";
+        let with_comment = format!(
+            "  // @exec: {{\"yield_time_ms\": 60000, \"max_output_tokens\": 14000}}\n{source}"
+        );
+        assert_eq!(
+            single("exec", json!(with_comment)),
+            (
+                Tool::Script,
+                json!({"source": source, "calls": [], "yield_after_ms": 60000, "max_output_tokens": 14000})
+            )
+        );
+        let null_setting = format!("// @exec: {{\"max_output_tokens\": null}}\n{source}");
+        assert_eq!(single("exec", json!(null_setting)), script(source, &[]));
+        let largest_safe_integer =
+            format!("// @exec: {{\"max_output_tokens\": 9007199254740991}}\n{source}");
+        assert_eq!(
+            single("exec", json!(largest_safe_integer)),
+            (
+                Tool::Script,
+                json!({"source": source, "calls": [], "max_output_tokens": 9_007_199_254_740_991_u64})
+            )
+        );
+    }
+
+    #[test]
+    fn control_comment_codex_rejects_stays_in_source() {
+        for input in [
+            "// @exec: {\"timeout_ms\": 1000}\ntext(1);",
+            "// @exec: {\"yield_time_ms\": \"1s\"}\ntext(1);",
+            "// @exec: {\"yield_time_ms\": -1}\ntext(1);",
+            "// @exec: {\"max_output_tokens\": 9007199254740992}\ntext(1);",
+            "// @exec: [1000]\ntext(1);",
+            "// @exec: {yield_time_ms: 1000}\ntext(1);",
+            "// @exec: {\"yield_time_ms\": 1000}\n  \n",
+            "// @exec: {\"yield_time_ms\": 1000}",
+        ] {
+            assert_eq!(
+                single("exec", json!(input)),
+                script(input, &[]),
+                "the control comment Codex rejects stays in the source"
+            );
+        }
+    }
+
+    #[test]
+    fn update_plan_reads_its_explanation_and_each_steps_text_and_status() {
+        assert_eq!(
+            single(
+                "update_plan",
+                json!({"explanation": "Ship it", "plan": [
+                    {"step": "Read", "status": "completed"},
+                    {"step": "Write", "status": "in_progress"},
+                    {"step": "Ship", "status": "pending"},
+                ]})
+            ),
+            (
+                Tool::TaskList,
+                json!({"explanation": "Ship it", "steps": [
+                    {"text": "Read", "status": "completed"},
+                    {"text": "Write", "status": "in_progress"},
+                    {"text": "Ship", "status": "pending"},
+                ]})
+            )
+        );
+    }
+
+    #[test]
+    fn update_plan_with_step_codex_rejects_keeps_its_arguments() {
+        for arguments in [
+            json!({"plan": [{"step": "Read", "status": "done"}]}),
+            json!({"plan": [{"status": "pending"}]}),
+        ] {
+            assert_eq!(
+                single("update_plan", arguments.clone()),
+                (Tool::TaskList, arguments)
+            );
+        }
+    }
+
+    #[test]
+    fn update_plan_with_plan_not_list_or_explanation_not_text_keeps_its_arguments() {
+        for arguments in [
+            json!({"plan": "Read, then ship"}),
+            json!({"explanation": 3, "plan": []}),
+        ] {
+            assert_eq!(
+                single("update_plan", arguments.clone()),
+                (Tool::TaskList, arguments)
+            );
+        }
+    }
+
+    #[test]
+    fn exec_update_plan_as_its_one_call_is_plan_update_naming_its_tool() {
+        let plan = "// @exec: {\"max_output_tokens\": 3600}\ntext(await tools.update_plan({ explanation: \"Ship it\", plan: [{ step: \"Read, then [write]\", status: \"completed\" }, {status:'pending', step:'Ship'},] }));";
+        assert_eq!(
+            single("exec", json!(plan)),
+            (
+                Tool::TaskList,
+                json!({
+                    "explanation": "Ship it",
+                    "steps": [
+                        {"text": "Read, then [write]", "status": "completed"},
+                        {"text": "Ship", "status": "pending"},
+                    ],
+                    "calls": ["update_plan"],
+                })
+            )
+        );
+        let json_quoted =
+            r#"await tools.update_plan({"plan":[{"step":"Read","status":"in_progress"}]})"#;
+        assert_eq!(
+            single("exec", json!(json_quoted)),
+            (
+                Tool::TaskList,
+                json!({"steps": [{"text": "Read", "status": "in_progress"}], "calls": ["update_plan"]})
+            )
+        );
+    }
+
+    #[test]
+    fn exec_update_plan_with_step_not_literal_or_beside_other_calls_is_its_tools_and_source() {
+        for (source, calls) in [
+            (
+                "const plan = [{ step: \"a\", status: \"pending\" }];\nawait tools.update_plan({ plan });",
+                &["update_plan"][..],
+            ),
+            (
+                "await tools.update_plan({ plan: steps.map(step => ({ step, status: \"pending\" })) });",
+                &["update_plan"],
+            ),
+            (
+                "await tools.update_plan({ plan: [{ step: name, status: \"pending\" }] });",
+                &["update_plan"],
+            ),
+            (
+                "await tools.update_plan({ plan: [{ step: \"a\", status: \"done\" }] });",
+                &["update_plan"],
+            ),
+            (
+                "await tools.update_plan({ explanation: why, plan: [{ step: \"a\", status: \"pending\" }] });",
+                &["update_plan"],
+            ),
+            (
+                "await Promise.all([tools.update_plan({ plan: [{ step: \"a\", status: \"pending\" }] }), tools.exec_command({ cmd: \"ls\" })]);",
+                &["update_plan", "exec_command"],
+            ),
+        ] {
+            assert_eq!(single("exec", json!(source)), script(source, calls));
+        }
+    }
+
+    #[test]
+    fn exec_update_plan_with_text_known_only_at_run_time_is_its_tools_and_source() {
+        for source in [
+            "await tools.update_plan({ plan: [{ step: \"Run \" + n, status: \"pending\" }] });",
+            "await tools.update_plan({ plan: [{ step: `Run ${n}`, status: \"pending\" }] });",
+            "await tools.update_plan({ explanation: `${done} done`, plan: [] });",
+            "await tools.update_plan({ plan: [{ step: \"a\", status: \"pending\" }].concat(rest) });",
+            "for (const n of runs) await tools.update_plan({ plan: [{ step: \"a\", status: \"pending\" }] });",
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                script(source, &["update_plan"]),
+                "the script shows its source, not a plan read from part of it"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_update_plan_only_in_comment_or_string_is_script_without_tools() {
+        for source in [
+            "// await tools.update_plan({ plan: [{ step: \"a\", status: \"pending\" }] })\ntext(\"not yet\");",
+            "text(\"await tools.update_plan({ plan: [] })\");",
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                script(source, &[]),
+                "the script doesn't call a tool"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_write_stdin_as_its_one_call_is_wait_on_its_process() {
+        let poll = "// @exec: {\"yield_time_ms\":60000,\"max_output_tokens\":480}\ntext(await tools.write_stdin({session_id:24279,chars:\"\",yield_time_ms:50000,max_output_tokens:330}))";
+        assert_eq!(
+            single("exec", json!(poll)),
+            (Tool::Wait, json!({"session_id": "24279", "wait_ms": 50000}))
+        );
+        let typed = "await tools.write_stdin({ session_id: 8852, chars: \"/exit\\n\" });";
+        assert_eq!(
+            single("exec", json!(typed)),
+            (
+                Tool::Wait,
+                json!({"session_id": "8852", "input": "/exit\n"})
+            )
+        );
+        let json_quoted = r#"await tools.write_stdin({"session_id":3,"yield_time_ms":1000})"#;
+        assert_eq!(
+            single("exec", json!(json_quoted)),
+            (Tool::Wait, json!({"session_id": "3", "wait_ms": 1000}))
+        );
+    }
+
+    #[test]
+    fn exec_write_stdin_with_argument_not_literal_or_beside_other_calls_is_its_tools_and_source() {
+        for (source, calls) in [
+            (
+                "await tools.write_stdin({ session_id: shell.session_id, chars: \"\" });",
+                &["write_stdin"][..],
+            ),
+            (
+                "await tools.write_stdin({ session_id: 7, chars: keys });",
+                &["write_stdin"],
+            ),
+            (
+                "await tools.write_stdin({ session_id: 7, yield_time_ms: wait });",
+                &["write_stdin"],
+            ),
+            ("await tools.write_stdin(arguments);", &["write_stdin"]),
+            (
+                "await Promise.all(ids.map(id => tools.write_stdin({ session_id: 7 })).concat([tools.write_stdin({ session_id: 8 })]));",
+                &["write_stdin"],
+            ),
+            (
+                "const s = await tools.exec_command({ cmd: server });\nawait tools.write_stdin({ session_id: 7 });",
+                &["exec_command", "write_stdin"],
+            ),
+        ] {
+            assert_eq!(single("exec", json!(source)), script(source, calls));
+        }
+    }
+
+    #[test]
+    fn exec_write_stdin_with_literal_inside_expression_is_its_tools_and_source() {
+        for source in [
+            "await tools.write_stdin({ session_id: 7, yield_time_ms: 30 * 1000 });",
+            "await tools.write_stdin({ session_id: 7, chars: \"y\" + \"\\n\" });",
+            "await tools.write_stdin({ session_id: 7.5 });",
+            "await tools.write_stdin({ session_id: 7, chars: `${cmd}\\n` });",
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                script(source, &["write_stdin"]),
+                "the script shows its source, not a wait on the literal alone"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_write_stdin_in_loop_branch_or_beside_other_use_of_tools_is_its_tools_and_source() {
+        for source in [
+            "for (const key of keys) { await tools.write_stdin({ session_id: 7, chars: \"y\" }); }",
+            "for (let i = 0; i < 3; i++) await tools.write_stdin({ session_id: 7 });",
+            "if (stuck)\n  await tools.write_stdin({ session_id: 7, chars: \"\\u0003\" });",
+            "stuck && await tools.write_stdin({ session_id: 7 });",
+            "[1, 2].forEach(async () => { await tools.write_stdin({ session_id: 7 }); });",
+            "await tools.write_stdin({ session_id: 7 });\nawait tools[name]({});",
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                script(source, &["write_stdin"]),
+                "a script that may call `write_stdin` other than once shows its source"
+            );
+        }
+        let after_braceless_branch = "if (!ready) text(\"waiting\")\nawait tools.write_stdin({ session_id: 7, yield_time_ms: 1000 });";
+        assert_eq!(
+            single("exec", json!(after_braceless_branch)),
+            (Tool::Wait, json!({"session_id": "7", "wait_ms": 1000}))
+        );
     }
 
     #[test]
@@ -873,6 +1667,96 @@ mod tests {
     }
 
     #[test]
+    fn exec_patch_in_variable_splits_into_edits_like_a_literal_one() {
+        let source = "// @exec: {\"max_output_tokens\": 600}\nconst patch = \"*** Begin Patch\\n*** Update File: a.md\\n@@\\n-x\\n+y\\n*** Delete File: b.md\\n*** End Patch\";\ntext(await tools.apply_patch(patch));";
+        assert_eq!(
+            calls("exec", json!(source))
+                .into_iter()
+                .map(|(tool, input, _)| (tool, input))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Tool::Edit,
+                    json!({"file_path": "a.md", "patch": "@@\n-x\n+y"})
+                ),
+                (
+                    Tool::Edit,
+                    json!({"file_path": "b.md", "patch": "*** Delete File: b.md"})
+                ),
+            ]
+        );
+        for source in [
+            "let p = `*** Begin Patch\n*** Add File: c.md\n+c\n*** End Patch`;\nawait tools.apply_patch( p );",
+            "var p = '*** Begin Patch\\n*** Add File: c.md\\n+c\\n*** End Patch' // the patch\ntext(await tools.apply_patch(p));",
+            "const p = \"*** Begin Patch\\n*** Add File: c.md\\n+c\\n*** End Patch\", q = 1;\nawait tools.apply_patch(p);",
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                (Tool::Edit, json!({"file_path": "c.md", "patch": "+c"})),
+                "the literal is the whole initialiser of the patch"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_patch_in_variable_changed_or_declared_twice_is_its_tools_and_source() {
+        for source in [
+            "let patch = \"*** Begin Patch\\n*** Add File: a.md\\n+a\\n*** End Patch\";\npatch = patch.replace(\"a.md\", \"b.md\");\nawait tools.apply_patch(patch);",
+            "let patch = \"*** Begin Patch\\n*** Add File: a.md\\n+a\\n*** End Patch\";\npatch += \"\\n\";\nawait tools.apply_patch(patch);",
+            "var p = 'old';\nvar p = '*** Begin Patch\\n*** Add File: c.md\\n+c\\n*** End Patch';\nawait tools.apply_patch(p);",
+            "const patch = \"*** Begin Patch\\n*** Add File: a.md\\n+a\\n*** End Patch\";\nfunction other() { const patch = \"*** Begin Patch\\n*** Add File: b.md\\n+b\\n*** End Patch\"; }\nawait tools.apply_patch(patch);",
+            "if (ready) { const patch = \"*** Begin Patch\\n*** Add File: a.md\\n+a\\n*** End Patch\"; }\nawait tools.apply_patch(patch);",
+            "const patch = \"*** Begin Patch\\n*** Add File: a.md\\n+a\\n*** End Patch\" + \"*** Begin Patch\\n*** Add File: b.md\\n+b\\n*** End Patch\";\nawait tools.apply_patch(patch);",
+            "const patch = \"*** Begin Patch\\n*** Add File: a.md\\n+a\\n*** End Patch\"\n  + extra;\nawait tools.apply_patch(patch);",
+            "await tools.apply_patch(patch);\nvar patch = \"*** Begin Patch\\n*** Add File: a.md\\n+a\\n*** End Patch\";",
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                script(source, &["apply_patch"]),
+                "the script shows its source, not a patch it may not apply"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_patch_literal_inside_expression_is_its_tools_and_source() {
+        let source = "await tools.apply_patch(\"*** Begin Patch\\n*** Add File: a.md\\n+a\\n*** End Patch\" + rest);";
+        assert_eq!(
+            single("exec", json!(source)),
+            script(source, &["apply_patch"])
+        );
+    }
+
+    #[test]
+    fn exec_patch_not_literal_or_beside_other_calls_is_its_tools_and_source() {
+        for (source, calls) in [
+            (
+                "const patch = String.raw`*** Begin Patch\n*** Add File: c.md\n+c\n*** End Patch`;\nawait tools.apply_patch(patch);",
+                &["apply_patch"][..],
+            ),
+            (
+                "const patch = `*** Begin Patch\n*** Add File: ${name}\n+c\n*** End Patch`;\nawait tools.apply_patch(patch);",
+                &["apply_patch"],
+            ),
+            ("await tools.apply_patch(patch);", &["apply_patch"]),
+            (
+                "const patches = [\"*** Begin Patch\\n*** Add File: c.md\\n+c\\n*** End Patch\"];\nawait tools.apply_patch(patches[0]);",
+                &["apply_patch"],
+            ),
+            (
+                "const patch = \"no file section\";\nawait tools.apply_patch(patch);",
+                &["apply_patch"],
+            ),
+            (
+                "const patch = \"*** Begin Patch\\n*** Add File: c.md\\n+c\\n*** End Patch\";\nawait tools.apply_patch(patch);\nawait tools.exec_command({ cmd: \"git diff\" });",
+                &["apply_patch", "exec_command"],
+            ),
+        ] {
+            assert_eq!(single("exec", json!(source)), script(source, calls));
+        }
+    }
+
+    #[test]
     fn exec_web_runs_read_their_first_query_or_reference() {
         let search = json!(
             "const result = await tools.web__run({\n  search_query: [{ q: \"standalone web search\" }],\n});"
@@ -888,6 +1772,6 @@ mod tests {
             (Tool::WebFetch, json!({"url": "https://example.com/docs"}))
         );
         let find = "await tools.web__run({ find: [{ ref_id: \"turn0search0\", pattern: \"x\" }] })";
-        assert_eq!(single("exec", json!(find)), (Tool::Other, json!(find)));
+        assert_eq!(single("exec", json!(find)), script(find, &["web__run"]));
     }
 }
