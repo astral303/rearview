@@ -85,7 +85,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ codex answer searchable
 
-    Codex │ Waited 1 time, called 2 tools
+    Codex │ Received 1 message, waited 1 time, called 1 tool
 
       You │ follow-up question
 
@@ -115,7 +115,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
       You │ Add the release notes
 
-    Codex │ Edited 2 files, messaged 1 agent, updated the task list 1 time
+    Codex │ Edited 2 files, messaged 1 agent, received 1 message, updated the task list 1 time
 
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
@@ -452,21 +452,11 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ↓
    Result ┐ function output searchable
 
-    Codex │ inter_agent_message:
+    Codex │ inter_agent_message: new task from /root
           │
-          │ {
-          │   "author": "/root",
-          │   "message": "INTER_AGENT_TASK_TEXT",
-          │   "recipient": "/root/child"
-          │ }
+          │ INTER_AGENT_TASK_TEXT
 
-↳Fixture³ │ inter_agent_message:
-          │
-          │ {
-          │   "author": "/root",
-          │   "message": "Message Type: NEW_TASK\nTask name: /root/child\nSender: /root\nPayload:\n",
-          │   "recipient": "/root/child"
-          │ }
+↳Fixture³ │ inter_agent_message: new task from /root · text encrypted by Codex
 
 ↳Fixture³ │ TASKED_SUBAGENT_SENTINEL: the notes file lists the release steps.
 
@@ -567,6 +557,8 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ }
    ↓
    Result ┐ Plan updated
+
+    Codex │ inter_agent_message: message from /root/RECEIVED_FROM_SENTINEL · text encrypted by Codex
 
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question

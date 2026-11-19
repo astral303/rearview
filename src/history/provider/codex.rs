@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 28,
+            schema_version: 29,
         }
     }
 
@@ -1165,10 +1165,14 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "function_call_output", "id": "fco_plan", "call_id": "call_plan", "output": "Plan updated"}),
                     ),
+                    line(
+                        21,
+                        "response_item",
+                        json!({"type": "agent_message", "id": "amsg_from_sender", "author": "/root/RECEIVED_FROM_SENTINEL", "recipient": "/root", "content": [{"type": "input_text", "text": "Message Type: MESSAGE\nTask name: /root\nSender: /root/RECEIVED_FROM_SENTINEL\nPayload:\n"}, {"type": "encrypted_content", "encrypted_content": "ENCRYPTED_SENTINEL_4"}]}),
+                    ),
                 ],
             );
-            const PATCH_RUN: &str =
-                "Edited 2 files, messaged 1 agent, updated the task list 1 time";
+            const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, updated the task list 1 time";
             const LAUNCH_RUN: &str = "Started 2 agents";
             AgentSession::new(
                 Source::Codex,
@@ -1213,7 +1217,13 @@ pub(super) mod tests {
                     .in_summary_row("Ran 1 shell command"),
                     Marker::shown("patch", "PATCH_SENTINEL").in_summary_row(PATCH_RUN),
                     Marker::shown("plan update", "PLAN_STEP_SENTINEL"),
-                    Marker::shown("inter-agent message", "INTER_AGENT_TASK_TEXT"),
+                    Marker::shown("readable message from an agent", "INTER_AGENT_TASK_TEXT")
+                        .in_summary_row("Received 1 message, waited 1 time, called 1 tool"),
+                    Marker::in_call_or_subagent(
+                        "encrypted message from an agent",
+                        "RECEIVED_FROM_SENTINEL",
+                    )
+                    .in_summary_row(PATCH_RUN),
                     Marker::shown("message to an agent", "SEND_MESSAGE_SENTINEL")
                         .in_summary_row(PATCH_RUN),
                 ],

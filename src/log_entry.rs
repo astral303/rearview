@@ -237,6 +237,11 @@ pub enum Tool {
     Skill,
     Agent,
     AgentMessage,
+    /// A message another agent sent this one. Its canonical input names the
+    /// sender as `sender`, and may carry the message's `kind`, its readable
+    /// `message`, and `encrypted_by`, the agent that stored the text
+    /// encrypted.
+    ReceivedMessage,
     /// A sub-agent handing its report back to the agent that launched it.
     AgentReport,
     Wait,
@@ -302,6 +307,7 @@ impl Tool {
             Tool::Skill => (65, "loaded", "skill", "skills"),
             Tool::Agent => (70, "started", "agent", "agents"),
             Tool::AgentMessage => (80, "messaged", "agent", "agents"),
+            Tool::ReceivedMessage => (82, "received", "message", "messages"),
             Tool::AgentReport => (85, "handed back", "report", "reports"),
             Tool::Wait => (90, "waited", "time", "times"),
             Tool::TaskList => (100, "updated the task list", "time", "times"),

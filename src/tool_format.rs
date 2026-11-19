@@ -174,6 +174,9 @@ pub fn tool_call_header(name: &str, tool: Tool, input: &Value) -> ToolCallHeader
         Tool::Skill => ToolCallHeader::named(name_prefix(name), field("skill")),
         Tool::Agent => agent_header(name, input),
         Tool::AgentMessage => ToolCallHeader::named(name_prefix(name), field("recipient")),
+        Tool::ReceivedMessage => {
+            ToolCallHeader::named(name_prefix(name), received_message_header(input))
+        }
         Tool::AgentReport if is_delivered_report(input) => {
             ToolCallHeader::named(name_prefix(name), "report delivered".to_owned())
         }
@@ -231,7 +234,7 @@ pub fn tool_call_body(tool: Tool, input: &Value) -> Option<ToolCallBody<'_>> {
         Tool::Edit => edit_body(input),
         Tool::Skill => plain_field("args"),
         Tool::Agent => agent_body(input),
-        Tool::AgentMessage => plain_field("message"),
+        Tool::AgentMessage | Tool::ReceivedMessage => plain_field("message"),
         Tool::AgentReport if is_delivered_report(input) => None,
         Tool::AgentReport => plain_field("message"),
         Tool::WebFetch => plain_field("prompt"),
@@ -274,6 +277,7 @@ fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
         Tool::Agent if launch_settings(input).is_some() => None,
         Tool::Agent => Some("description"),
         Tool::AgentMessage => Some("recipient"),
+        Tool::ReceivedMessage => Some("sender"),
         Tool::AgentReport if is_delivered_report(input) => None,
         Tool::AgentReport => Some("message"),
         Tool::WebFetch => Some("url"),
@@ -384,6 +388,20 @@ fn launch_body(launch: &serde_json::Map<String, Value>, prompt: Option<&str>) ->
 
 fn is_delivered_report(input: &Value) -> bool {
     input.get(DELIVERED_REPORT_KEY).and_then(Value::as_bool) == Some(true)
+}
+
+/// `new task from /root`, or `from /root` without a kind, then
+/// ` · text encrypted by Codex` when the text is unreadable.
+fn received_message_header(input: &Value) -> String {
+    let sender = string_field(input, "sender").unwrap_or("");
+    let mut header = match string_field(input, "kind") {
+        Some(kind) => format!("{kind} from {sender}"),
+        None => format!("from {sender}"),
+    };
+    if let Some(agent) = string_field(input, "encrypted_by") {
+        header.push_str(&format!(" · text encrypted by {agent}"));
+    }
+    header
 }
 
 /// The command's first line is the header's value and its later lines the
@@ -567,6 +585,7 @@ mod tests {
             Tool::Skill,
             Tool::Agent,
             Tool::AgentMessage,
+            Tool::ReceivedMessage,
             Tool::AgentReport,
             Tool::WebFetch,
             Tool::WebSearch,
@@ -757,6 +776,32 @@ mod tests {
         let result = format_tool_call("SendMessage", Tool::AgentMessage, &input, 80);
         assert_eq!(result.header(), "SendMessage: worker-1");
         assert_eq!(body_text(&result), Some("How far along are you?"));
+    }
+
+    #[test]
+    fn received_message_names_its_kind_and_sender_and_carries_readable_text() {
+        let input = json!({"kind": "new task", "sender": "/root", "message": "Map the callers."});
+        let result = format_tool_call("inter_agent_message", Tool::ReceivedMessage, &input, 80);
+        assert_eq!(result.header(), "inter_agent_message: new task from /root");
+        assert_eq!(body_text(&result), Some("Map the callers."));
+    }
+
+    #[test]
+    fn encrypted_received_message_is_one_header_line() {
+        let input = json!({"kind": "message", "sender": "/root/scout", "encrypted_by": "Codex"});
+        let result = format_tool_call("inter_agent_message", Tool::ReceivedMessage, &input, 80);
+        assert_eq!(
+            result.header(),
+            "inter_agent_message: message from /root/scout · text encrypted by Codex"
+        );
+        assert_eq!(body_text(&result), None);
+    }
+
+    #[test]
+    fn received_message_without_kind_names_its_sender_alone() {
+        let input = json!({"sender": "/root", "message": "Map the callers."});
+        let result = format_tool_call("inter_agent_message", Tool::ReceivedMessage, &input, 80);
+        assert_eq!(result.header(), "inter_agent_message: from /root");
     }
 
     #[test]

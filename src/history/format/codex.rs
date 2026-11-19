@@ -2044,13 +2044,15 @@ fn output_text(payload: &Map<String, Value>) -> String {
 
 /// A message between agents of a multi-agent run. A sub-agent's final answer
 /// reads as a task report: the report the sub-agent hands back. Any other
-/// message is a tool call whose input the viewer shows as JSON.
+/// message reads as a message the recipient received.
 fn inter_agent_message(
     payload: &Map<String, Value>,
     timestamp: Option<String>,
 ) -> Option<LogEntry> {
     let text = block_texts(payload.get("content")).join("\n");
-    if let Some(report) = final_answer_report(&text, string_field(payload, "author").as_deref()) {
+    let parsed = InterAgentText::parse(&text);
+    let author = string_field(payload, "author");
+    if let Some(report) = final_answer_report(&parsed, author.as_deref()) {
         return Some(LogEntry::User {
             message: UserMessage {
                 role: "user".to_owned(),
@@ -2064,39 +2066,92 @@ fn inter_agent_message(
             usage: None,
         });
     }
+    let mut input = Map::new();
+    if let Some(message_type) = parsed.message_type {
+        input.insert("kind".to_owned(), json!(message_kind(message_type)));
+    }
+    if let Some(author) = author {
+        input.insert("sender".to_owned(), json!(author));
+    }
+    let message = trim_blank_lines(parsed.payload);
+    if !message.is_empty() {
+        input.insert("message".to_owned(), json!(message));
+    }
+    if has_encrypted_block(payload.get("content")) {
+        input.insert("encrypted_by".to_owned(), json!("Codex"));
+    }
     let block = ContentBlock::ToolUse {
         id: string_field(payload, "id").unwrap_or_else(|| "inter_agent".to_owned()),
         name: "inter_agent_message".to_owned(),
-        tool: Tool::Other,
-        input: json!({
-            "author": string_field(payload, "author"),
-            "recipient": string_field(payload, "recipient"),
-            "message": text,
-        }),
+        tool: Tool::ReceivedMessage,
+        input: Value::Object(input),
     };
     Some(assistant_entry(payload, vec![block], timestamp))
 }
 
-/// The first line of a sub-agent's final answer; header lines follow, then
-/// `Payload:` on a line of its own and the report.
-const FINAL_ANSWER_TYPE: &str = "Message Type: FINAL_ANSWER";
-const FINAL_ANSWER_PAYLOAD: &str = "Payload:";
+/// The text of a message between agents. Codex writes a `Message Type:` line,
+/// more header lines, `Payload:` on a line of its own, then the payload.
+/// Text without that header is all payload.
+struct InterAgentText<'a> {
+    /// The type as Codex writes it: `NEW_TASK`, `MESSAGE`, `FINAL_ANSWER`.
+    message_type: Option<&'a str>,
+    payload: &'a str,
+}
+
+const MESSAGE_TYPE_LABEL: &str = "Message Type: ";
+const PAYLOAD_LINE: &str = "Payload:";
+
+impl<'a> InterAgentText<'a> {
+    fn parse(text: &'a str) -> Self {
+        Self::with_header(text).unwrap_or(Self {
+            message_type: None,
+            payload: text,
+        })
+    }
+
+    fn with_header(text: &'a str) -> Option<Self> {
+        let mut lines = text.split_inclusive('\n');
+        let first_line = lines.next()?;
+        let message_type = first_line.trim_end().strip_prefix(MESSAGE_TYPE_LABEL)?;
+        let mut payload_start = first_line.len();
+        for line in lines {
+            payload_start += line.len();
+            if line.trim_end() == PAYLOAD_LINE {
+                return Some(Self {
+                    message_type: Some(message_type),
+                    payload: &text[payload_start..],
+                });
+            }
+        }
+        None
+    }
+}
+
+/// A message type as the row reads it: `NEW_TASK` as `new task`.
+fn message_kind(message_type: &str) -> String {
+    message_type.to_lowercase().replace('_', " ")
+}
+
+/// True when `content` holds an `encrypted_content` block: Codex stored the
+/// message's text encrypted.
+fn has_encrypted_block(content: Option<&Value>) -> bool {
+    content.and_then(Value::as_array).is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("encrypted_content"))
+    })
+}
 
 /// The report a final answer carries, named by the task of the sub-agent that
 /// wrote it: the last segment of its agent path (`/root/scout` is `scout`),
 /// the name its `spawn_agent` row shows. The agent path is its sender.
-fn final_answer_report(text: &str, author: Option<&str>) -> Option<TaskReport> {
-    let mut lines = text.split_inclusive('\n');
-    if lines.next()?.trim_end() != FINAL_ANSWER_TYPE {
+fn final_answer_report(text: &InterAgentText<'_>, author: Option<&str>) -> Option<TaskReport> {
+    if text.message_type != Some("FINAL_ANSWER") {
         return None;
     }
-    lines
-        .by_ref()
-        .find(|line| line.trim_end() == FINAL_ANSWER_PAYLOAD)?;
-    let report: String = lines.collect();
     let task = author.and_then(task_name);
     Some(
-        TaskReport::handed_back(task, &report).sent_by(ReportSender {
+        TaskReport::handed_back(task, text.payload).sent_by(ReportSender {
             task_id: author.map(str::to_owned),
             launch_call: None,
         }),
@@ -3520,17 +3575,73 @@ mod tests {
         assert_eq!(other_offset, [false, true]);
     }
 
-    #[test]
-    fn message_between_agents_that_is_not_final_answer_stays_call() {
-        let message = FINAL_ANSWER.replace("Message Type: FINAL_ANSWER", "Message Type: MESSAGE");
-
-        let Some(LogEntry::Assistant { message, .. }) = normalized(&message) else {
-            panic!("any other message reads as an assistant call");
+    /// The tool and input of the one call `line` reads as.
+    fn received_message(line: &str) -> (Tool, Value) {
+        let Some(LogEntry::Assistant { message, .. }) = normalized(line) else {
+            panic!("a message that is not a final answer reads as an assistant call");
         };
-        assert!(
-            matches!(&message.content[..], [ContentBlock::ToolUse { name, .. }] if name == "inter_agent_message"),
-            "{:?}",
-            message.content
+        match &message.content[..] {
+            [ContentBlock::ToolUse { tool, input, .. }] => (*tool, input.clone()),
+            other => panic!("one call, got {other:?}"),
+        }
+    }
+
+    /// An `agent_message` record from `author` holding `content`.
+    fn agent_message_record(author: &str, content: Value) -> String {
+        json!({
+            "timestamp": "2026-08-01T02:01:16.169Z",
+            "type": "response_item",
+            "payload": {"type": "agent_message", "id": "amsg_1", "author": author,
+                        "recipient": "/root/scout", "content": content},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn encrypted_message_between_agents_reads_as_its_kind_and_sender() {
+        for (message_type, kind) in [("NEW_TASK", "new task"), ("MESSAGE", "message")] {
+            let record = agent_message_record(
+                "/root",
+                json!([
+                    {"type": "input_text", "text": format!("Message Type: {message_type}\nTask name: /root/scout\nSender: /root\nPayload:\n")},
+                    {"type": "encrypted_content", "encrypted_content": "gAAAAABqyYK5mgJha4X0Hf"},
+                ]),
+            );
+
+            assert_eq!(
+                received_message(&record),
+                (
+                    Tool::ReceivedMessage,
+                    json!({"kind": kind, "sender": "/root", "encrypted_by": "Codex"})
+                ),
+                "{message_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn readable_message_between_agents_carries_its_payload() {
+        let record = agent_message_record(
+            "/root",
+            json!([{"type": "input_text", "text": "Message Type: NEW_TASK\nTask name: /root/scout\nSender: /root\nPayload:\nMap every caller.\nReport the slow ones."}]),
+        );
+
+        assert_eq!(
+            received_message(&record).1,
+            json!({"kind": "new task", "sender": "/root", "message": "Map every caller.\nReport the slow ones."})
+        );
+    }
+
+    #[test]
+    fn message_between_agents_without_header_is_all_payload() {
+        let record = agent_message_record(
+            "/root",
+            json!([{"type": "input_text", "text": "Map every caller."}]),
+        );
+
+        assert_eq!(
+            received_message(&record).1,
+            json!({"sender": "/root", "message": "Map every caller."})
         );
     }
 
