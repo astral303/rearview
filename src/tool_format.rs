@@ -24,12 +24,38 @@ pub struct FormattedToolCall {
     pub value_is_first_line: bool,
     /// Optional continuation lines (e.g., prompt text, diff lines)
     pub body: Option<ToolBody>,
+    /// A shell call's commands after the first, each after `prefix`; `value`
+    /// and `body` show the first. Empty for any other call.
+    pub later_commands: Vec<FormattedCommand>,
+}
+
+/// A shell command's first row and its later rows, as
+/// [`FormattedToolCall::value`] and [`FormattedToolCall::body`] show the
+/// first command.
+pub struct FormattedCommand {
+    pub value: String,
+    pub body: Option<ToolBody>,
 }
 
 impl FormattedToolCall {
     /// The header as one line: `prefix` then `value`.
     pub fn header(&self) -> String {
         format!("{}{}", self.prefix, self.value)
+    }
+
+    /// The call as exports write it: the header, its body on the lines
+    /// after it, then each later command after `prefix`, followed by its
+    /// body.
+    pub fn text(&self) -> String {
+        let mut text = self.header();
+        push_body_lines(&mut text, self.body.as_ref());
+        for command in &self.later_commands {
+            text.push('\n');
+            text.push_str(&self.prefix);
+            text.push_str(&command.value);
+            push_body_lines(&mut text, command.body.as_ref());
+        }
+        text
     }
 
     /// A header whose `value` names the call.
@@ -39,7 +65,15 @@ impl FormattedToolCall {
             value,
             value_is_first_line: false,
             body,
+            later_commands: Vec::new(),
         }
+    }
+}
+
+fn push_body_lines(text: &mut String, body: Option<&ToolBody>) {
+    if let Some(body) = body {
+        text.push('\n');
+        text.push_str(&body.text);
     }
 }
 
@@ -102,11 +136,14 @@ pub struct ToolCallHeader {
     /// As [`FormattedToolCall::prefix`].
     pub prefix: String,
     /// The rest of the header, such as a path or a pattern, or a shell call's
-    /// whole command.
+    /// first command, whole.
     pub value: String,
     /// True when `value` is a shell command. [`format_tool_call`] shows its
     /// first line in the header and its later lines as the body.
     pub value_is_command: bool,
+    /// A shell call's commands after `value`, each whole; empty for any
+    /// other call.
+    pub later_commands: Vec<String>,
 }
 
 impl ToolCallHeader {
@@ -115,15 +152,27 @@ impl ToolCallHeader {
             prefix,
             value,
             value_is_command: false,
+            later_commands: Vec::new(),
         }
     }
 
     fn command(prefix: String, input: &Value) -> Self {
+        let mut commands = shell_commands(input).unwrap_or_default().into_iter();
         Self {
             prefix,
-            value: string_field(input, "command").unwrap_or("").to_owned(),
+            value: commands.next().unwrap_or_default().to_owned(),
             value_is_command: true,
+            later_commands: commands.map(str::to_owned).collect(),
         }
+    }
+
+    /// A shell call's commands in order, `value` first; empty for any other
+    /// call.
+    pub fn commands(&self) -> impl Iterator<Item = &str> {
+        self.value_is_command
+            .then_some(self.value.as_str())
+            .into_iter()
+            .chain(self.later_commands.iter().map(String::as_str))
     }
 
     /// The bare `name:` of a call shown as its raw input.
@@ -143,7 +192,7 @@ pub fn format_tool_call(
 ) -> FormattedToolCall {
     let header = tool_call_header(name, tool, input);
     if header.value_is_command {
-        return format_shell(header.prefix, &header.value, max_width);
+        return format_shell(header, max_width);
     }
     FormattedToolCall::named(
         header.prefix,
@@ -277,6 +326,31 @@ fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
     input.get(key).and_then(Value::as_str)
 }
 
+/// The commands a shell call runs, in order: its `commands`, a list of
+/// strings, when the provider's reader wrote several, or else its
+/// `command`. `None` without either, or when `commands` is empty or lists
+/// anything but strings.
+fn shell_commands(input: &Value) -> Option<Vec<&str>> {
+    let Some(commands) = input.get("commands") else {
+        return string_field(input, "command").map(|command| vec![command]);
+    };
+    commands
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .filter(|commands| !commands.is_empty())
+}
+
+/// The calls `input` counts as in a run's summary row: one per command of a
+/// shell call, one for any other call.
+pub(crate) fn counted_calls(tool: Tool, input: &Value) -> usize {
+    match tool {
+        Tool::Shell | Tool::UserShell => shell_commands(input).map_or(1, |commands| commands.len()),
+        _ => 1,
+    }
+}
+
 /// Whether `input` lacks the key the layout for `tool` builds its header
 /// from. A provider's mapping can leave a canonical call without it (an
 /// OpenCode injected read whose narration did not parse carries the narration
@@ -284,6 +358,7 @@ fn string_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
 /// more than an empty header.
 fn lacks_header_field(tool: Tool, input: &Value) -> bool {
     match tool {
+        Tool::Shell | Tool::UserShell => shell_commands(input).is_none(),
         Tool::UserQuestion => asked_questions(input).is_none(),
         _ => header_field(tool, input).is_some_and(|key| string_field(input, key).is_none()),
     }
@@ -291,7 +366,6 @@ fn lacks_header_field(tool: Tool, input: &Value) -> bool {
 
 fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
     match tool {
-        Tool::Shell | Tool::UserShell => Some("command"),
         Tool::Script => Some("source"),
         Tool::Read | Tool::Edit | Tool::Write | Tool::FileReference => Some("file_path"),
         Tool::Grep | Tool::Glob => Some("pattern"),
@@ -305,9 +379,9 @@ fn header_field(tool: Tool, input: &Value) -> Option<&'static str> {
         Tool::AgentReport => Some("message"),
         Tool::WebFetch => Some("url"),
         Tool::WebSearch => Some("query"),
-        // Its header reads a list of questions, which `lacks_header_field`
-        // checks.
-        Tool::UserQuestion => None,
+        // `lacks_header_field` checks a shell call's commands and a list of
+        // questions.
+        Tool::Shell | Tool::UserShell | Tool::UserQuestion => None,
         Tool::DirectoryListing
         | Tool::Wait
         | Tool::TaskList
@@ -667,21 +741,33 @@ fn with_thousands_separators(count: u64) -> String {
     grouped
 }
 
-/// The command's first line is the header's value and its later lines the
-/// body. With a width, every line wraps at the width less the prefix.
-fn format_shell(prefix: String, command: &str, max_width: usize) -> FormattedToolCall {
-    let available_width = max_width.saturating_sub(prefix.chars().count());
+/// The first command's first line is the header's value and its later lines
+/// the body; each later command follows in the same form. With a width,
+/// every line wraps at the width less the prefix.
+fn format_shell(header: ToolCallHeader, max_width: usize) -> FormattedToolCall {
+    let available_width = max_width.saturating_sub(header.prefix.chars().count());
+    let first = format_command(&header.value, available_width);
+    FormattedToolCall {
+        prefix: header.prefix,
+        value: first.value,
+        value_is_first_line: true,
+        body: first.body,
+        later_commands: header
+            .later_commands
+            .iter()
+            .map(|command| format_command(command, available_width))
+            .collect(),
+    }
+}
 
+fn format_command(command: &str, available_width: usize) -> FormattedCommand {
     let mut rows = command
         .lines()
         .flat_map(|line| wrap_shell_line(line, available_width));
     let value = rows.next().unwrap_or_default();
     let later_rows: Vec<String> = rows.collect();
-
-    FormattedToolCall {
-        prefix,
+    FormattedCommand {
         value,
-        value_is_first_line: true,
         body: (!later_rows.is_empty()).then(|| ToolBody::plain(later_rows.join("\n"))),
     }
 }
@@ -1512,6 +1598,74 @@ mod tests {
         assert_eq!(header.prefix, "Bash: ");
         assert_eq!(header.value, "cd src\ncargo test");
         assert!(header.value_is_command);
+    }
+
+    fn several_commands() -> Value {
+        json!({"commands": ["git status --short", "cd src\ncargo test", "rg -n TODO src"]})
+    }
+
+    #[test]
+    fn shell_call_of_several_commands_header_contains_each_whole_in_order() {
+        let header = tool_call_header("exec", Tool::Shell, &several_commands());
+
+        assert_eq!(header.prefix, "exec: ");
+        assert_eq!(
+            header.commands().collect::<Vec<_>>(),
+            ["git status --short", "cd src\ncargo test", "rg -n TODO src"]
+        );
+    }
+
+    #[test]
+    fn shell_call_of_several_commands_formats_each_after_prefix_with_its_own_later_rows() {
+        let result = format_tool_call("exec", Tool::Shell, &several_commands(), 20);
+
+        assert_eq!(result.header(), "exec: git status");
+        assert_eq!(body_text(&result), Some("--short"));
+        let later: Vec<_> = result
+            .later_commands
+            .iter()
+            .map(|command| {
+                (
+                    command.value.as_str(),
+                    command.body.as_ref().map(|body| body.text.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            later,
+            [("cd src", Some("cargo test")), ("rg -n TODO src", None)]
+        );
+        assert_eq!(
+            result.text(),
+            "exec: git status\n--short\nexec: cd src\ncargo test\nexec: rg -n TODO src",
+            "the export text shows each command after the prefix, its later rows under it"
+        );
+    }
+
+    #[test]
+    fn shell_call_with_commands_not_a_list_of_strings_shows_its_name_and_input() {
+        for input in [
+            json!({"commands": []}),
+            json!({"commands": ["ls", 1]}),
+            json!({"commands": "ls", "command": "ls"}),
+        ] {
+            let result = format_tool_call("exec", Tool::Shell, &input, NO_WRAP);
+            assert_eq!(result.header(), "exec:", "{input} shows as its input");
+            assert!(result.later_commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn summary_counts_shell_call_once_per_command_and_other_calls_once() {
+        assert_eq!(counted_calls(Tool::Shell, &several_commands()), 3);
+        assert_eq!(counted_calls(Tool::Shell, &json!({"command": "ls"})), 1);
+        assert_eq!(
+            counted_calls(
+                Tool::Read,
+                &json!({"file_path": "a.rs", "commands": ["a", "b"]})
+            ),
+            1
+        );
     }
 
     #[test]

@@ -653,7 +653,7 @@ $ rearview agent read ch_0b26e45343df:s99
 protocol agent-error kind=not-found ref=ch_0b26e45343df detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_74aec3f6df49
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=29 hidden-tool-results=22 hidden-thinking=1 hidden-subagents=4 warnings=1 warning-records=1
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=30 hidden-tool-results=23 hidden-thinking=1 hidden-subagents=4 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 subagent s2 type=grunt span=m11..m12 : child
@@ -701,7 +701,7 @@ m49 user 06:03:28
 | user: <send_user_message_question_reply>
 | [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
 | </send_user_message_question_reply>
-m50..m67 hidden 06:03:29..06:03:44 tools=9 tool-results=9
+m50..m69 hidden 06:03:29..06:03:46 tools=10 tool-results=10
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
@@ -862,6 +862,12 @@ m66.1 06:03:43 result=m67
 | exec: PATHS.md (+1 line)
 m67 06:03:44 call=m66.1
 | Done: 1 file added
+m68.1 06:03:45 result=m69
+| exec: git status --short
+| exec: git log -5 --oneline
+| exec: rg -n SEVERAL_COMMANDS_SENTINEL src
+m69 06:03:46 call=m68.1
+| src/lib.rs:7
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m2..m4
 --- stdout
@@ -886,7 +892,7 @@ m3 s1 06:00:03 slice=match=the context=3 hits=0 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tail 3
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=9 hidden-tool-results=9 warnings=1 warning-records=1
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=10 hidden-tool-results=10 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m47 user 06:03:26
@@ -902,19 +908,21 @@ m49 user 06:03:28
 | user: <send_user_message_question_reply>
 | [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
 | </send_user_message_question_reply>
-m50..m67 hidden 06:03:29..06:03:44 tools=9 tool-results=9
+m50..m69 hidden 06:03:29..06:03:46 tools=10 tool-results=10
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --subagents --tail 2
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
-m64.1 06:03:41 result=m65
-| exec: rg -n "RAW_COMMAND_SENTINEL\s+\d" docs
-m65 hidden 06:03:42 tool-results=1
 m66.1 06:03:43 result=m67
 | exec: PATHS.md (+1 line)
 m67 hidden 06:03:44 tool-results=1
+m68.1 06:03:45 result=m69
+| exec: git status --short
+| exec: git log -5 --oneline
+| exec: rg -n SEVERAL_COMMANDS_SENTINEL src
+m69 hidden 06:03:46 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m6.1
 --- stdout
@@ -962,7 +970,7 @@ continue read refs=ch_74aec3f6df49:m1..m3 tools=false tool-results=false thinkin
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 policy=text omit=m11..m67 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
+protocol agent-read cut=tail chars=900 policy=text omit=m11..m69 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -973,9 +981,9 @@ m4 hidden 06:00:04 thinking=1
 m5 06:00:05
 | codex answer searchable
 m6..m10 hidden 06:00:07..06:00:11 tools=3 tool-results=2
-continue read refs=ch_74aec3f6df49:m11..m67 tools=true tool-results=true thinking=false subagents=true
+continue read refs=ch_74aec3f6df49:m11..m69 tools=true tool-results=true thinking=false subagents=true
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
-$ rearview agent read ch_74aec3f6df49:m11..m67 --tools --tool-results --subagents
+$ rearview agent read ch_74aec3f6df49:m11..m69 --tools --tool-results --subagents
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+tool-results+subagents omit=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
@@ -1113,10 +1121,16 @@ m66.1 06:03:43 result=m67
 | exec: PATHS.md (+1 line)
 m67 06:03:44 call=m66.1
 | Done: 1 file added
+m68.1 06:03:45 result=m69
+| exec: git status --short
+| exec: git log -5 --oneline
+| exec: rg -n SEVERAL_COMMANDS_SENTINEL src
+m69 06:03:46 call=m68.1
+| src/lib.rs:7
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m67
+protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m69
 $ rearview agent read ch_74aec3f6df49:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
