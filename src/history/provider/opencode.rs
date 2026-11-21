@@ -1150,6 +1150,18 @@ pub(super) mod tests {
             );
             fixture::insert_part(
                 &connection,
+                "prt_ses_subagent_reasoning",
+                "msg_ses_subagent",
+                "ses_subagent",
+                1755000200500i64,
+                &json!({
+                    "type": "reasoning",
+                    "text": "SUBAGENT_THINKING_SENTINEL: read the notes first",
+                    "time": { "start": 1755000200500i64, "end": 1755000200900i64 },
+                }),
+            );
+            fixture::insert_part(
+                &connection,
                 "prt_ses_subagent_step_finish",
                 "msg_ses_subagent",
                 "ses_subagent",
@@ -1177,6 +1189,7 @@ pub(super) mod tests {
                     Marker::in_call_or_subagent("directory listing", "OPENCODE_LIST_SENTINEL")
                         .in_summary_row("Listed 1 directory, ran 1 shell command"),
                     Marker::in_call_or_subagent("sub-agent message", "sub-agent answer"),
+                    Marker::in_subagent_thinking("SUBAGENT_THINKING_SENTINEL"),
                     Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
                         .in_summary_row("Started 1 agent"),
                     Marker::shown("edit diff", "EDIT_DIFF_SENTINEL").in_summary_row(
@@ -1186,7 +1199,7 @@ pub(super) mod tests {
                     Marker::shown("MCP call", "MCP_INPUT_SENTINEL"),
                 ],
             )
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 14)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 15)
             // The sub-agent's step: 30 input, 6 output, 2 reasoning and 4 cache
             // reads.
             .with_subagent_tokens(42)

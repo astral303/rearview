@@ -463,6 +463,7 @@ pub(super) mod tests {
                         "sub-agent message",
                         "OMP sub-agent answer searchable",
                     ),
+                    Marker::in_subagent_thinking("SUBAGENT_THINKING_SENTINEL"),
                     Marker::shown("/clear boundary", "Context cleared"),
                     Marker::in_call_or_subagent("tool call", "OMP_COMMAND_SENTINEL")
                         .in_summary_row("Ran 1 shell command"),

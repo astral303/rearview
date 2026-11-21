@@ -159,6 +159,9 @@ pub(crate) struct Marker {
     /// True for a marker in a call's header, a launch prompt or a sub-agent's
     /// message: `agent read --tools --subagents` shows it.
     pub(crate) is_in_call_or_subagent: bool,
+    /// True for a marker in a sub-agent's thinking: `agent read --subagents
+    /// --thinking` shows it, and `agent read --subagents` does not.
+    pub(crate) is_in_subagent_thinking: bool,
     /// The summary-mode row of the run containing the marker's call. The
     /// tests check that row, and that the outputs don't show the marker
     /// beside a JSON key. `None` skips both checks, as for a marker outside a
@@ -174,6 +177,7 @@ impl Marker {
             record,
             text,
             is_in_call_or_subagent: false,
+            is_in_subagent_thinking: false,
             summary_row: None,
         }
     }
@@ -183,6 +187,14 @@ impl Marker {
         Self {
             is_in_call_or_subagent: true,
             ..Self::shown(record, text)
+        }
+    }
+
+    /// A marker in a sub-agent's thinking.
+    pub(crate) fn in_subagent_thinking(text: &'static str) -> Self {
+        Self {
+            is_in_subagent_thinking: true,
+            ..Self::shown("sub-agent's thinking", text)
         }
     }
 

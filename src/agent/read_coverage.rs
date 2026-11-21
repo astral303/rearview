@@ -2,6 +2,8 @@
 //! - With `--tools --subagents`, each marker in a call's header, a launch
 //!   prompt or a sub-agent's message shows. Tool results stay hidden, so a
 //!   marker in a call's header cannot show through the call's result.
+//! - With `--subagents --thinking`, each marker in a sub-agent's thinking
+//!   shows; with `--subagents` alone, none does.
 //! - With default flags, the header counts the hidden tool calls, and the
 //!   read covers each message a read with every flag covers: a message, call
 //!   or hidden record holds it. A read with every flag does not report a
@@ -81,6 +83,16 @@ const EVERY_FLAG: ProtocolOptions = ProtocolOptions {
         after: None,
         before: None,
     },
+};
+
+const WITH_SUBAGENTS: ProtocolOptions = ProtocolOptions {
+    subagents: true,
+    ..DEFAULT_FLAGS
+};
+
+const WITH_SUBAGENTS_AND_THINKING: ProtocolOptions = ProtocolOptions {
+    thinking: true,
+    ..WITH_SUBAGENTS
 };
 
 const TOOL_RESULTS_ALONE: ProtocolOptions = ProtocolOptions {
@@ -441,6 +453,53 @@ fn every_agents_read_with_tools_and_subagents_shows_each_call_and_subagent_marke
         .collect();
 
     assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+}
+
+/// Each marker of `session` in a sub-agent's thinking that `agent read
+/// --subagents --thinking` doesn't show or `agent read --subagents` shows;
+/// and how many such markers `session` has.
+fn misread_subagent_thinking_markers(session: &AgentSession) -> (Vec<String>, usize) {
+    let with_thinking = read(session, WITH_SUBAGENTS_AND_THINKING);
+    let without_thinking = read(session, WITH_SUBAGENTS);
+    let markers: Vec<_> = session
+        .markers
+        .iter()
+        .filter(|marker| marker.is_in_subagent_thinking)
+        .collect();
+    let mut gaps = Vec::new();
+    for marker in &markers {
+        let source = session.row.source;
+        if !with_thinking.contains(marker.text) {
+            gaps.push(format!(
+                "{source:?}: `--thinking` doesn't show {}",
+                marker.text
+            ));
+        }
+        if without_thinking.contains(marker.text) {
+            gaps.push(format!(
+                "{source:?}: a read without `--thinking` shows {}",
+                marker.text
+            ));
+        }
+    }
+    (gaps, markers.len())
+}
+
+#[test]
+fn every_agents_read_with_subagents_shows_subagents_thinking_only_with_thinking() {
+    let mut gaps = Vec::new();
+    let mut markers = 0;
+    for session in every_record_sessions() {
+        let (session_gaps, session_markers) = misread_subagent_thinking_markers(&session);
+        gaps.extend(session_gaps);
+        markers += session_markers;
+    }
+
+    assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+    assert!(
+        markers > 0,
+        "some agent's fixture contains a sub-agent's thinking"
+    );
 }
 
 /// Each message `agent search` finds a marker of `session` in, with the

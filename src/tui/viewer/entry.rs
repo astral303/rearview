@@ -15,7 +15,7 @@ use super::links::{ConversationLinks, ShownAnswer};
 use super::markdown::{
     apply_thinking_style, render_markdown_to_lines, render_message_text_to_lines,
 };
-use super::style::USER_LABEL;
+use super::style::{SUBAGENT_THINKING_LABEL, THINKING_LABEL, USER_LABEL};
 use super::summary::{SummaryRowSpec, render_tool_activity_summary, summarize_tool_activity};
 use super::timing::{RowTiming, TimingSlot};
 use super::tools::{
@@ -175,8 +175,8 @@ struct MessageStyle<'a> {
     /// Whether the first text-block label is bold.
     bold: bool,
     /// True when the message renders as a sub-agent's: it dims its tool
-    /// results, skips thinking blocks, truncates its replies, and keeps its
-    /// tool blocks out of the connectors. Distinct from `dimmed` because
+    /// results and thinking, truncates its replies, and keeps its tool blocks
+    /// out of the connectors. Distinct from `dimmed` because
     /// skill-mode user messages are dimmed but not nested.
     is_subagent: bool,
     /// The background task's report the user message holds, parsed once
@@ -546,7 +546,7 @@ fn step_thinking(
     timing: &mut RowTiming<'_>,
     blocks: &[ContentBlock],
 ) -> bool {
-    if !ctx.options.show_thinking || ctx.style.is_subagent {
+    if !ctx.options.show_thinking {
         return false;
     }
     let mut printed = false;
@@ -559,14 +559,25 @@ fn step_thinking(
         }
         let md_lines = render_markdown_to_lines(thinking, ctx.options.content_width);
         let styled_lines = apply_thinking_style(md_lines);
-        render_ledger_block_styled(
-            lines,
-            "Thinking",
-            th().accent_dim,
-            false,
-            styled_lines,
-            timing.consume(),
-        );
+        if ctx.style.is_subagent {
+            render_ledger_block_styled_dimmed(
+                lines,
+                SUBAGENT_THINKING_LABEL,
+                th().accent_dim,
+                styled_lines,
+                timing.pad(),
+                None,
+            );
+        } else {
+            render_ledger_block_styled(
+                lines,
+                THINKING_LABEL,
+                th().accent_dim,
+                false,
+                styled_lines,
+                timing.consume(),
+            );
+        }
         printed = true;
     }
     printed

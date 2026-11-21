@@ -960,6 +960,7 @@ pub(crate) mod tests {
                         "sub-agent transcript message",
                         "SPLICED_SUBAGENT_SENTINEL",
                     ),
+                    Marker::in_subagent_thinking("SUBAGENT_THINKING_SENTINEL"),
                     Marker::in_call_or_subagent(
                         "message of a sub-agent without user text",
                         "FORKED_SUBAGENT_SENTINEL",

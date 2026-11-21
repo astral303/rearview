@@ -8,6 +8,12 @@ use crate::log_entry;
 /// commands they ran through the agent.
 pub(super) const USER_LABEL: &str = "You";
 
+/// The label on the main agent's thinking.
+pub(super) const THINKING_LABEL: &str = "Thinking";
+
+/// The label on a sub-agent's thinking.
+pub(super) const SUBAGENT_THINKING_LABEL: &str = "↳Thinking";
+
 /// Create a label for subagent entries from a parent_tool_use_id.
 pub(super) fn subagent_label(parent_tool_use_id: &str) -> String {
     format!("↳{}", log_entry::short_parent_id(parent_tool_use_id))

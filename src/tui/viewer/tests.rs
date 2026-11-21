@@ -801,8 +801,19 @@ fn codex_session_with_sub_agent(
     read_as_viewer(crate::history::Source::Codex, &parent, &[sub_agent]).entries
 }
 
-/// Two shell commands with the sub-agent's reasoning between them.
+/// A sub-agent's two shell commands, one after the other.
 fn sub_agent_run_of_two_commands() -> Vec<RenderableEntry> {
+    codex_session_with_sub_agent(
+        &[],
+        &[
+            codex_shell_command(3, "call_1", "cargo test"),
+            codex_shell_command(5, "call_2", "cargo build"),
+        ],
+    )
+}
+
+/// A sub-agent's two shell commands with its thinking between them.
+fn subagent_commands_around_thinking() -> Vec<RenderableEntry> {
     codex_session_with_sub_agent(
         &[],
         &[
@@ -1551,6 +1562,27 @@ fn sub_agents_consecutive_calls_collapse_into_one_expandable_run_row() {
     );
     let line = &rendered.lines[row];
     assert!(line.tool_output_id.is_some() && line.clickable, "{text}");
+}
+
+#[test]
+fn subagents_thinking_between_calls_shows_between_two_run_rows() {
+    let entries = subagent_commands_around_thinking();
+    let rendered = render_parsed_entries(&entries, &sub_agent_summary_options());
+
+    let text = rendered_text(&rendered);
+    let run_row = format!("{SUB_AGENT_LABEL} │ Ran 1 shell command");
+    assert_eq!(text.matches(&run_row).count(), 2, "{text}");
+    let thinking = row_containing(&rendered, "↳Thinking │ Checking the build");
+    let first_run = row_containing(&rendered, &run_row);
+    let second_run = rendered
+        .lines
+        .iter()
+        .rposition(|line| line_text(line).contains(&run_row))
+        .unwrap();
+    assert!(
+        first_run < thinking && thinking < second_run,
+        "the thinking shows between the runs of the calls before and after it:\n{text}"
+    );
 }
 
 #[test]
@@ -4285,6 +4317,241 @@ fn show_thinking_controls_subagent_entries() {
     let text = rendered_text(&shown);
     assert!(text.contains("subagent text"));
     assert!(text.contains("agent progress text"));
+}
+
+/// An assistant entry containing a call, a text block and a thinking block
+/// `THINK_BLOCK`: a sub-agent's when `parent` names the call that launched it.
+fn reply_with_call_and_thinking(parent: Option<&str>) -> Vec<RenderableEntry> {
+    let mut entry = serde_json::json!({
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "THINK_BLOCK", "signature": "sig"},
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "echo hi"}},
+            {"type": "text", "text": "TEXT_BLOCK"}
+        ]}
+    });
+    if let Some(parent) = parent {
+        entry["parent_tool_use_id"] = serde_json::json!(parent);
+    }
+    vec![RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(&entry.to_string()),
+    }]
+}
+
+/// The rows showing `THINK_BLOCK`, each as its spans.
+fn thinking_rows(rendered: &RenderedConversation) -> Vec<Vec<(String, LineStyle)>> {
+    rendered
+        .lines
+        .iter()
+        .filter(|line| line_text(line).contains("THINK_BLOCK"))
+        .map(|line| line.spans.clone())
+        .collect()
+}
+
+/// `spans`, each dimmed.
+fn dimmed_spans(spans: &[(String, LineStyle)]) -> Vec<(String, LineStyle)> {
+    spans
+        .iter()
+        .map(|(text, style)| {
+            (
+                text.clone(),
+                LineStyle {
+                    dimmed: true,
+                    ..style.clone()
+                },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn subagents_thinking_row_is_labelled_and_dimmed_with_main_agents_text_style() {
+    for tool_display in [
+        ToolDisplayMode::Hidden,
+        ToolDisplayMode::Truncated,
+        ToolDisplayMode::Full,
+    ] {
+        let mut options = test_render_options(tool_display);
+        options.show_thinking = true;
+        let main = render_parsed_entries(&reply_with_call_and_thinking(None), &options);
+        let sub_agent = render_parsed_entries(
+            &reply_with_call_and_thinking(Some("toolu_parent_abc")),
+            &options,
+        );
+
+        let (main_rows, sub_agent_rows) = (thinking_rows(&main), thinking_rows(&sub_agent));
+        let ([main_row], [sub_agent_row]) = (main_rows.as_slice(), sub_agent_rows.as_slice())
+        else {
+            panic!("{tool_display:?}: each agent's thinking shows in one row");
+        };
+        assert_eq!(
+            sub_agent_row[0],
+            (
+                "↳Thinking".to_owned(),
+                LineStyle {
+                    fg: Some(th().accent_dim),
+                    dimmed: true,
+                    ..LineStyle::default()
+                }
+            ),
+            "{tool_display:?}: a sub-agent's thinking row fills the label column with a \
+             dimmed `↳Thinking`"
+        );
+        assert!(
+            sub_agent_row[1].1.dimmed,
+            "{tool_display:?}: the row's separator is dimmed"
+        );
+        assert_eq!(
+            sub_agent_row[2..],
+            dimmed_spans(&main_row[2..]),
+            "{tool_display:?}: the text has the main agent's thinking style, dimmed"
+        );
+        let text = rendered_text(&sub_agent);
+        let text_position = text.find("TEXT_BLOCK").expect("the sub-agent's text shows");
+        let thinking_position = text
+            .find("THINK_BLOCK")
+            .expect("the sub-agent's thinking shows");
+        assert!(
+            text_position < thinking_position,
+            "{tool_display:?}: the thinking row follows the sub-agent's text, as the main \
+             agent's does:\n{text}"
+        );
+        assert_timing_column_unchanged_by_subagents_thinking(tool_display);
+    }
+}
+
+/// A sub-agent's assistant entry containing a call and a thinking block
+/// `thinking`, sent at second 1.
+fn subagent_call_and_thinking(thinking: &str) -> Vec<RenderableEntry> {
+    let entry = serde_json::json!({
+        "type": "assistant",
+        "timestamp": "2026-08-01T10:00:01.000Z",
+        "parent_tool_use_id": "toolu_parent_abc",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "echo hi"}},
+            {"type": "thinking", "thinking": thinking, "signature": "sig"}
+        ]}
+    });
+    vec![RenderableEntry {
+        entry_index: 0,
+        entry: claude_entry(&entry.to_string()),
+    }]
+}
+
+/// With the time column shown, the `↳Thinking` row's time column is blank,
+/// and the message's other rows are those it shows when its thinking is
+/// empty, its time included.
+fn assert_timing_column_unchanged_by_subagents_thinking(tool_display: ToolDisplayMode) {
+    let mut options = test_render_options(tool_display);
+    options.show_thinking = true;
+    options.show_timing = true;
+    let with_thinking = render_parsed_entries(&subagent_call_and_thinking("THINK_BLOCK"), &options);
+    let empty_thinking = render_parsed_entries(&subagent_call_and_thinking(""), &options);
+
+    let thinking_row = row_containing(&with_thinking, "THINK_BLOCK");
+    let text = rendered_text(&with_thinking);
+    assert!(
+        with_thinking.lines[thinking_row].spans[0]
+            .0
+            .trim()
+            .is_empty(),
+        "{tool_display:?}: the `↳Thinking` row's time column is blank:\n{text}"
+    );
+    let other_rows: Vec<String> = with_thinking
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| *row != thinking_row)
+        .map(|(_, line)| line_text(line))
+        .collect();
+    let rows_without_thinking: Vec<String> = empty_thinking.lines.iter().map(line_text).collect();
+    assert_eq!(
+        other_rows, rows_without_thinking,
+        "{tool_display:?}: the message's other rows, their times included, don't change"
+    );
+    if tool_display.is_summary() {
+        let stamp = format_timestamp("2026-08-01T10:00:01.000Z", Zone::System).unwrap();
+        assert!(
+            rows_without_thinking
+                .iter()
+                .any(|row| row.trim_start().starts_with(&stamp)),
+            "the summary row shows the message's time:\n{text}"
+        );
+    }
+}
+
+/// A thinking-only assistant entry at `entry_index`, sent at `second`: a
+/// sub-agent's when `parent` names the call that launched it.
+fn thinking_entry(
+    entry_index: usize,
+    second: u32,
+    parent: Option<&str>,
+    thinking: &str,
+) -> RenderableEntry {
+    let mut entry = serde_json::json!({
+        "type": "assistant",
+        "timestamp": format!("2026-08-01T10:00:{second:02}.000Z"),
+        "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": thinking, "signature": "sig"}
+        ]}
+    });
+    if let Some(parent) = parent {
+        entry["parent_tool_use_id"] = serde_json::json!(parent);
+    }
+    RenderableEntry {
+        entry_index,
+        entry: claude_entry(&entry.to_string()),
+    }
+}
+
+#[test]
+fn subagents_thinking_above_main_agents_differs_from_it_in_label_and_dimming() {
+    let entries = vec![
+        thinking_entry(0, 1, Some("toolu_parent_abc"), "SUB_AGENT_THINKING"),
+        thinking_entry(1, 2, None, "MAIN_AGENT_THINKING"),
+    ];
+    let mut options = test_render_options(ToolDisplayMode::Hidden);
+    options.show_thinking = true;
+    let rendered = render_parsed_entries(&entries, &options);
+
+    let row_of = |thinking: &str| &rendered.lines[row_containing(&rendered, thinking)].spans;
+    let (sub_agent, main) = (row_of("SUB_AGENT_THINKING"), row_of("MAIN_AGENT_THINKING"));
+    let text = rendered_text(&rendered);
+    assert_eq!(
+        (sub_agent[0].0.as_str(), sub_agent[0].1.dimmed),
+        ("↳Thinking", true),
+        "{text}"
+    );
+    assert_eq!(
+        (main[0].0.as_str(), main[0].1.dimmed),
+        (" Thinking", false),
+        "{text}"
+    );
+    assert!(
+        sub_agent[2].1.dimmed && !main[2].1.dimmed,
+        "the sub-agent's text is dimmed and the main agent's isn't: {text}"
+    );
+}
+
+#[test]
+fn subagents_thinking_doesnt_show_with_thinking_hidden_in_any_tools_mode() {
+    for tool_display in [
+        ToolDisplayMode::Hidden,
+        ToolDisplayMode::Truncated,
+        ToolDisplayMode::Full,
+    ] {
+        let rendered = render_parsed_entries(
+            &reply_with_call_and_thinking(Some("toolu_parent_abc")),
+            &test_render_options(tool_display),
+        );
+
+        assert!(
+            thinking_rows(&rendered).is_empty(),
+            "{tool_display:?}: thinking hidden doesn't show the sub-agent's thinking:\n{}",
+            rendered_text(&rendered)
+        );
+    }
 }
 
 #[test]
