@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::history::user_text::parse_command_name;
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
-use crate::tui::parse_command_name;
 
 const SKILL_TEXT_PREFIX: &str = "Base directory for this skill:";
 

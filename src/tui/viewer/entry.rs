@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::history::skill_text::skill_text_directory;
+use crate::history::user_text::user_text;
 use crate::history::{TaskReport, user_task_report};
 use crate::log_entry::{ContentBlock, LogEntry, RECAP_LABEL, UserContent};
 use crate::tui::theme::Rgb;
@@ -8,7 +9,6 @@ use crate::tui::theme::Rgb;
 use super::RenderedLine;
 
 use super::calls::{CallRanges, RenderedToolBlock};
-use super::commands::user_text;
 use super::connectors::lane_color;
 use super::ledger::{render_ledger_block_styled, render_ledger_block_styled_dimmed};
 use super::links::{ConversationLinks, ShownAnswer};

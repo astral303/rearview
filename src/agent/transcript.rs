@@ -8,6 +8,7 @@ use crate::history::format::RecordLine;
 use crate::history::parser::UnlistedReason;
 use crate::history::provider::{SessionTitle, TitleAndSummary};
 use crate::history::task_notification::{ReportKind, ReportSender};
+use crate::history::user_text::local_command_output;
 use crate::history::{
     TaskReport, blocks_task_report, extract_skill_preview, parse_task_report, user_task_report,
 };
@@ -20,7 +21,6 @@ use crate::log_entry::{
 use crate::tool_format::{
     ToolCallBody, ToolCallHeader, launch_prompt, tool_call_body, tool_call_header,
 };
-use crate::tui::viewer::local_command_output;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;

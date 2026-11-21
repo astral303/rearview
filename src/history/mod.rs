@@ -33,6 +33,7 @@ pub(crate) mod sqlite_cache;
 pub mod task_notification;
 #[cfg(test)]
 mod token_count_coverage;
+pub(crate) mod user_text;
 pub(crate) mod workspace;
 
 use crate::error::{AppError, Result};
