@@ -385,6 +385,52 @@ fn reread_after_append_without_message_texts_holds_whole_reads_texts() {
 }
 
 #[test]
+fn reread_after_append_holds_whole_reads_texts_with_whitespace_normalised() {
+    use crate::history::message_texts::PADDED_MESSAGE_SEPARATOR;
+    use crate::history::sqlite_cache::tests::alter_stored_texts;
+    let home = ClaudeHome::new();
+    let a = home.write(
+        "a",
+        5,
+        &["first   question\n\n", "\t second\u{a0} question"],
+    );
+    let (_cache, environment) = caching_environment(&home);
+    let first = cached_rows(&home, &environment);
+    let mut texts = SearchTextsInMemory::default();
+    read_missing(&mut texts, &first);
+    let previous = copy_of(&first, "a").generation();
+
+    home.append(&a, 6, "third\u{3000}\u{3000}question\n");
+    home.append(&a, 7, "becomes whitespace");
+    let appended = cached_rows(&home, &environment);
+    alter_stored_texts(
+        copy_of(&appended, "a"),
+        "becomes whitespace",
+        " \n\t\u{2028} ",
+    );
+    let append = copy_of(&appended, "a")
+        .clone()
+        .waiting()
+        .read_copy(|copy| copy.append_on(previous))
+        .unwrap();
+    let held = reread(&mut texts, &appended, "a");
+
+    assert!(
+        append.is_some(),
+        "the reread reads the append's texts alone"
+    );
+    assert_eq!(
+        &**held.joined(),
+        ["first question", "second question", "third question"]
+            .join(PADDED_MESSAGE_SEPARATOR)
+            .as_str(),
+        "the reread normalises whitespace in the kept and the appended texts and drops a text of whitespace alone"
+    );
+    assert_eq!(held.joined(), whole_read(&appended, "a").joined());
+    assert_eq!(held.dialogue(), whole_read(&appended, "a").dialogue());
+}
+
+#[test]
 fn reread_holds_whole_reads_texts_after_each_change_of_the_session() {
     let home = ClaudeHome::new();
     let parent = home.write("a", 5, &["delegate the survey", "check the quarry"]);

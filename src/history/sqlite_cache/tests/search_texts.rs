@@ -63,10 +63,10 @@ fn after_title_and_summary<'a>(
     text
 }
 
-/// The parse and the cache lay out a row's texts in block order, the
-/// dialogue first, then the other fields; the parse collapses whitespace,
-/// the cache keeps each text as written. A context line's snippets read
-/// this layout.
+/// The parse and the read of a cached copy into memory lay out a row's
+/// texts in block order, the dialogue first, then the other fields, with
+/// whitespace normalised. The cache stores each text as written. A context
+/// line's snippets read this layout.
 #[test]
 fn parse_and_cache_lay_out_texts_in_block_order() {
     let laid_out = [
@@ -152,8 +152,9 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
     }
     for (read, text) in reads {
         assert_eq!(
-            text, laid_out,
-            "{read} lays out the texts in block order, as written"
+            text,
+            normalize_whitespace(&laid_out),
+            "{read} lays out the texts in block order, whitespace normalised"
         );
     }
 }

@@ -480,72 +480,18 @@ fn field_score(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::provider::contract_tests::every_record_sessions;
-    use crate::history::provider::{Fingerprint, SessionRoot, SessionStub};
-    use crate::history::sqlite_cache::tests::parsed_record_and_row;
-    use crate::history::sqlite_cache::{CatalogueSession, SqliteCache};
+    use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
+    use crate::history::sqlite_cache::tests::parsed_and_cached_row;
     use crate::search::evidence::{LexicalEvidence, build_lexical_evidence};
 
     #[test]
     fn cache_and_memory_preserve_scores_evidence_literals_and_windows_for_every_provider() {
-        let base = tempfile::tempdir().unwrap();
-        let cache = SqliteCache::open(&crate::history::sqlite_cache::tests::rearview_at(
-            base.path(),
-        ))
-        .unwrap();
-        cache.mark_admitted().unwrap();
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T16:00:00Z")
             .unwrap()
             .with_timezone(&Local);
         for session in every_record_sessions() {
-            let storage = session.row.source.provider().storage().cache();
-            cache.admit_storage(storage).unwrap();
-            let root = SessionRoot::new(
-                crate::history::environment::test_support::directory_holding_files(
-                    &session.row.path,
-                    &session.row.subagents,
-                ),
-            );
-            let stub = SessionStub {
-                locator: session.row.path.clone(),
-                subagents: session.row.subagents.clone(),
-                cache_key: "session".to_owned(),
-                fingerprint: Fingerprint {
-                    size: 1000,
-                    modified: Some(std::time::UNIX_EPOCH),
-                },
-            };
-            let stub = if session.row.source == crate::history::Source::OpenCode {
-                let stamp = session
-                    .row
-                    .source
-                    .provider()
-                    .storage()
-                    .current_fingerprint(&root, &session.row.path)
-                    .unwrap()
-                    .unwrap();
-                SessionStub {
-                    fingerprint: Fingerprint {
-                        size: stamp.file_size,
-                        modified: Some(
-                            std::time::UNIX_EPOCH
-                                + std::time::Duration::new(stamp.mtime_secs, stamp.mtime_nsecs),
-                        ),
-                    },
-                    ..stub
-                }
-            } else {
-                stub
-            };
-            let (record, row) = parsed_record_and_row(session.row.source, &root, &stub);
-            cache.write(&record).unwrap();
-            let CatalogueSession::Listed(cached) = cache
-                .catalogue_session(storage, session.row.source, &root, &stub.cache_key, false)
-                .unwrap()
-                .unwrap()
-            else {
-                panic!("listed fixture")
-            };
+            let base = tempfile::tempdir().unwrap();
+            let (row, cached) = parsed_and_cached_row(base.path(), &session);
             let mut original = row;
             original.project_name.clone_from(&cached.project_name);
             let first_second = original
@@ -569,7 +515,7 @@ mod tests {
                 },
             ];
             let original = [original];
-            let cached = [*cached];
+            let cached = [cached];
             let in_memory = SearchTextsInMemory::read(&cached);
             let held = in_memory
                 .get(&cached[0])
@@ -619,32 +565,9 @@ mod tests {
                             |_| true,
                         )
                         .unwrap();
-                        let signature = |results: Vec<(usize, ScoreDebug)>| {
-                            results
-                                .into_iter()
-                                .map(|(index, score)| {
-                                    (
-                                        index,
-                                        score.total.to_bits(),
-                                        score
-                                            .fields
-                                            .into_iter()
-                                            .map(|field| {
-                                                (
-                                                    field.name,
-                                                    field.tf_score.to_bits(),
-                                                    field.adjacency_score.to_bits(),
-                                                    field.word_details,
-                                                )
-                                            })
-                                            .collect::<Vec<_>>(),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        };
                         assert_eq!(
-                            signature(actual.results),
-                            signature(expected.results),
+                            scores_and_word_counts(actual.results),
+                            scores_and_word_counts(expected.results),
                             "{} {query:?}, window {window:?}",
                             session.row.source.label()
                         );
@@ -657,10 +580,11 @@ mod tests {
                 let read_from_memory = build_lexical_evidence(&cached[0], Some(held), &parsed);
                 queries_with_evidence += usize::from(read_from_memory.is_some());
                 assert_eq!(
-                    context_line(&cached[0], read_from_memory),
+                    context_line(&cached[0], read_from_memory, 80),
                     context_line(
                         &original[0],
-                        build_lexical_evidence(&original[0], None, &parsed)
+                        build_lexical_evidence(&original[0], None, &parsed),
+                        80
                     ),
                     "{} {query:?}: the context line is the parsed session's",
                     session.row.source.label()
@@ -677,6 +601,30 @@ mod tests {
     /// A result's index and total score, and each of its fields' name, term
     /// score and adjacency score.
     type ResultScores = (usize, u64, Vec<(&'static str, u64, u64)>);
+
+    /// [`ResultScores`], with each field's per-word counts and scores.
+    type ResultScoresAndWordCounts = (
+        usize,
+        u64,
+        Vec<(&'static str, u64, u64, Vec<(String, usize, f64)>)>,
+    );
+
+    fn scores_and_word_counts(results: Vec<(usize, ScoreDebug)>) -> Vec<ResultScoresAndWordCounts> {
+        results
+            .into_iter()
+            .map(|(index, score)| {
+                let fields = score.fields.into_iter().map(|field| {
+                    (
+                        field.name,
+                        field.tf_score.to_bits(),
+                        field.adjacency_score.to_bits(),
+                        field.word_details,
+                    )
+                });
+                (index, score.total.to_bits(), fields.collect())
+            })
+            .collect()
+    }
 
     fn scores(results: Vec<(usize, ScoreDebug)>) -> Vec<ResultScores> {
         results
@@ -983,6 +931,183 @@ mod tests {
         );
     }
 
+    /// A Claude session containing runs of whitespace: paragraphs apart by
+    /// blank lines, a line wrapped onto an indented line, a code block with
+    /// indented and blank lines, and an edit whose diff contains indented
+    /// lines. Its first messages, the row's preview, don't contain any of
+    /// them.
+    fn whitespace_runs_records() -> Vec<serde_json::Value> {
+        use crate::search::test_fixtures::{claude_user_record, october};
+        let paragraphs = "The retry loop now waits before each attempt.\n\n\n\nEach wait doubles the backoff\n        until the\t\tlimit.";
+        let reply = "Here is the patch for the lexer:\n\n```rust\nfn parse(input: &str) {\n        let tokens = lex(input)\n                .filter(|token| !token.is_blank());\n\n\n        for token in tokens {\n                emit(token);\n        }\n}\n```\n\nThe filter drops blank tokens before emit sees them.";
+        vec![
+            claude_user_record("start the review", october(10, 8)),
+            claude_user_record("check the build first", october(10, 9)),
+            claude_user_record("then read the patch", october(10, 9)),
+            serde_json::json!({"type": "assistant", "timestamp": october(10, 9).to_rfc3339(),
+                "message": {"id": "paragraphs", "role": "assistant", "content": [
+                    {"type": "text", "text": paragraphs}]}}),
+            claude_user_record("review the lexer change", october(10, 10)),
+            serde_json::json!({"type": "assistant", "timestamp": october(10, 11).to_rfc3339(),
+            "message": {"id": "reply", "role": "assistant", "content": [
+                {"type": "text", "text": reply},
+                {"type": "tool_use", "id": "edit", "name": "Edit", "input": {
+                    "file_path": "src/lexer.rs",
+                    "old_string": "    let tokens = lex(input);\n\n    for token in tokens {",
+                    "new_string": "    let tokens = lex(input)\n        .filter(|token| !token.is_blank());\n\n    for token in tokens {"
+                }}]}}),
+            serde_json::json!({"type": "user", "timestamp": october(10, 12).to_rfc3339(),
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "edit",
+                     "content": "The file src/lexer.rs has been updated."}]}}),
+            claude_user_record("thanks, that reads well", october(10, 13)),
+            claude_user_record("commit it", october(10, 14)),
+            claude_user_record("and open the pull request", october(10, 15)),
+        ]
+    }
+
+    /// Writes `records` as a Claude transcript in a new directory, parses
+    /// it, writes its record to a new session cache, and returns the parsed
+    /// row, the row the cache lists, and both directories.
+    fn parsed_and_cached_rows(
+        records: &[serde_json::Value],
+    ) -> (Conversation, Conversation, [tempfile::TempDir; 2]) {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("session.jsonl");
+        let lines = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, lines).unwrap();
+        let session =
+            AgentSession::new(crate::history::Source::Claude, path, Vec::new(), Vec::new());
+        let base = tempfile::tempdir().unwrap();
+        let (parsed, cached) = parsed_and_cached_row(base.path(), &session);
+        (parsed, cached, [home, base])
+    }
+
+    /// A cached row shows the parsed row's context line when the session's
+    /// texts contain runs of whitespace. A row with a failed cache write
+    /// keeps its parse's texts; a row read from the cache reads its copy's.
+    /// The context line's window counts each character of a run kept as the
+    /// cache stores it, and the run's bytes keep two hits from joining one
+    /// snippet.
+    #[test]
+    fn cached_row_shows_parsed_rows_context_line_for_runs_of_whitespace() {
+        let (parsed, cached, _directories) = parsed_and_cached_rows(&whitespace_runs_records());
+        let cached = [cached];
+        let in_memory = SearchTextsInMemory::read(&cached);
+        let held = in_memory
+            .get(&cached[0])
+            .expect("the texts are read into memory");
+        let mut differing = Vec::new();
+        for query in [
+            "attempt doubles",
+            "tokens emit",
+            "emit",
+            "filter",
+            "for token",
+            "parse input",
+            "\"is_blank\"",
+            "\"lex(input) .filter\"",
+        ] {
+            let parsed_query = ParsedQuery::parse(query);
+            for width in [40, 80, 120] {
+                let line = |row: &Conversation, texts| {
+                    context_line(
+                        row,
+                        build_lexical_evidence(row, texts, &parsed_query),
+                        width,
+                    )
+                };
+                let from_cache = line(&cached[0], Some(held));
+                assert!(
+                    from_cache.is_some(),
+                    "{query:?} at {width} columns: the cached copy shows a context line"
+                );
+                let from_parse = line(&parsed, None);
+                if from_parse != from_cache {
+                    differing.push(format!(
+                        "{query:?} at {width} columns:\n  parsed: {from_parse:?}\n  cached: \
+                         {from_cache:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            differing.is_empty(),
+            "the cached row shows the parsed row's context line:\n{}",
+            differing.join("\n")
+        );
+    }
+
+    /// A row parsed in this process and its cached copy give each query the
+    /// same score, and each field the same counts of words and adjacent
+    /// pairs, when runs of whitespace separate the words: on the
+    /// session list's texts in memory and on `agent search`'s texts in the
+    /// cache. The order of results follows the scores.
+    #[test]
+    fn parsed_row_and_its_cached_copy_score_runs_of_whitespace_alike() {
+        let (mut parsed, cached, _directories) = parsed_and_cached_rows(&whitespace_runs_records());
+        parsed.project_name.clone_from(&cached.project_name);
+        let parsed = [parsed];
+        let cached = [cached];
+        let in_memory = SearchTextsInMemory::read(&cached);
+        let without_texts = SearchTextsInMemory::default();
+        let window = TimeFilter::default();
+        let now = crate::search::test_fixtures::october(20, 12);
+        let ranked = |rows: &[Conversation], query: &str, surface| {
+            let searchable = precompute_search_text(rows);
+            let searched =
+                debug_search_with_surface(rows, &searchable, query, now, surface, |_| true);
+            scores_and_word_counts(searched.unwrap().results)
+        };
+        let mut pairs_scored = 0;
+        for query in [
+            "backoff until",
+            "the limit",
+            "\"backoff until\"",
+            "attempt each",
+            "tokens emit",
+            "token tokens",
+            "filter token",
+            "\"lex(input) .filter\"",
+        ] {
+            let from_parse = ranked(&parsed, query, SearchSurface::List(&without_texts));
+            assert!(!from_parse.is_empty(), "{query:?} finds the parsed row");
+            pairs_scored += usize::from(from_parse.iter().any(|(_, _, fields)| {
+                fields.iter().any(|(name, _, adjacency, _)| {
+                    *name == "body" && f64::from_bits(*adjacency) > 0.0
+                })
+            }));
+            for (surface, name) in [
+                (
+                    SearchSurface::List(&in_memory),
+                    "the session list's texts in memory",
+                ),
+                (
+                    SearchSurface::Agent {
+                        window: &window,
+                        retrieval: &RetrievalTerms::WordsAndLiterals,
+                        scope: ScanScope::AllWorkspaces,
+                    },
+                    "`agent search`'s texts in the cache",
+                ),
+            ] {
+                assert_eq!(
+                    ranked(&cached, query, surface),
+                    from_parse,
+                    "{query:?}: {name} score the cached copy as the parse scores its row"
+                );
+            }
+        }
+        assert!(
+            pairs_scored > 1,
+            "some queries score adjacent words across a run of whitespace"
+        );
+    }
+
     const QUERIES: [&str; 13] = [
         "t",
         "e",
@@ -999,16 +1124,17 @@ mod tests {
         "unknown_needle",
     ];
 
-    /// The context line a row 80 columns wide shows for `evidence`.
+    /// The context line a row `width` columns wide shows for `evidence`.
     fn context_line(
         conversation: &Conversation,
         evidence: Option<LexicalEvidence>,
+        width: usize,
     ) -> Option<String> {
         let evidence = evidence?;
         crate::search::preview::build_context_segments_from_ranges(
             &evidence.texts(conversation),
             &evidence.context_ranges,
-            80,
+            width,
         )
     }
 }
