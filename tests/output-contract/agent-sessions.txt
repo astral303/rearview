@@ -42,13 +42,13 @@ continue sessions offset=6 action=rerun-with-offset
 protocol agent-warning kind=malformed-transcript count=2
 $ rearview agent sessions --budget 500
 --- stdout
-protocol agent-sessions cut=tail chars=500 tz=-04:00 warnings=2 warning-records=1
+protocol agent-sessions cut=tail chars=500 full=1615 tz=-04:00 warnings=2 warning-records=1
 sessions matched=7 offset=0 listed=0
 continue sessions offset=0 action=rerun-with-offset
 protocol agent-warning kind=malformed-transcript count=2
 $ rearview agent sessions --budget 1200
 --- stdout
-protocol agent-sessions cut=tail chars=1200 tz=-04:00 warnings=2 warning-records=1
+protocol agent-sessions cut=tail chars=1200 full=1615 tz=-04:00 warnings=2 warning-records=1
 sessions matched=7 offset=0 listed=4
 session project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc agent=claude messages=48 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 : USER_TEXT_SENTINEL: check the plugin's files and how it starts ... ASSISTANT_TEXT_SENTINEL: listing the files first. ...
 session project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df agent=kimi messages=27 at=2026-08-06T06:00:01 to=2026-08-06T06:03:21 : kimi title

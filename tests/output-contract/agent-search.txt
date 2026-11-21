@@ -159,7 +159,7 @@ read ref=ch_f04d3718e406:m3..m5 focus=m4..m4 tools=true tool-results=true thinki
 protocol agent-warning kind=malformed-transcript count=2
 $ rearview agent search searchable --budget 700
 --- stdout
-protocol agent-search mode=lexical cut=tail chars=700 policy=per-hit groups=5 hits=9 tz=-04:00 warnings=2 warning-records=1 omitted-lines=22
+protocol agent-search mode=lexical cut=tail chars=700 full=4086 policy=per-hit groups=5 hits=9 tz=-04:00 warnings=2 warning-records=1 omitted-lines=22
 query text=searchable hits=9
 sessions matched=5 offset=0 searched=5 failed=0
 groups count=5
@@ -261,7 +261,7 @@ read ref=ch_982349c13ee4:m4..m6 focus=m5..m5 tools=false tool-results=false thin
 protocol agent-warning kind=malformed-transcript count=2
 $ rearview agent search --mode exact sentinel
 --- stdout
-protocol agent-search mode=exact cut=tail chars=6000 policy=per-hit groups=7 hits=14 tz=-04:00 warnings=2 warning-records=1 omitted-lines=4
+protocol agent-search mode=exact cut=tail chars=6000 full=6545 policy=per-hit groups=7 hits=14 tz=-04:00 warnings=2 warning-records=1 omitted-lines=4
 query text=sentinel hits=14
 sessions matched=7 offset=0 searched=7 failed=0
 groups count=7

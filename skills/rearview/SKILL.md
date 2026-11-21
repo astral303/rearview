@@ -76,13 +76,15 @@ conversations. `--flat` ranks message hits across conversations. Use
 only when duplicate suppression hides relevant evidence.
 
 Compact records are the only output. A header's `protocol agent-…` names the
-record grammar. Header `chars=` values are hard Unicode-character limits;
-`cut=` and omission fields describe truncation. After search or within
-truncation, narrow the query or scope, or increase `--budget`. A
-`continue read refs=` record names the omitted refs, `;` between them, and
-the flags that show them. A `continue search offset=N mode=M` or
-`continue sessions offset=N` record means more sessions match; rerun with
-`--offset N` (and `--mode M`) for more. Do not invent opaque pagination state.
+record grammar. Header `chars=` values are hard Unicode-character limits:
+20000 by default for `read` and `outline`, 6000 for other commands. A header
+with `cut=` other than `none` prints `full=N`: rerun with `--budget N` for
+everything, or narrow the query, scope or range when N is large. Output runs
+about 2–3 characters per token. A `continue read refs=` record names the
+omitted refs, `;` between them, and the flags that show them. A
+`continue search offset=N mode=M` or `continue sessions offset=N` record
+means more sessions match; rerun with `--offset N` (and `--mode M`) for more.
+Do not invent opaque pagination state.
 
 Read and outline records:
 

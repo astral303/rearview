@@ -35,6 +35,7 @@ pub(crate) struct ResolvedFocus {
 }
 
 const DEFAULT_OUTPUT_CHARS: usize = 6000;
+const DEFAULT_READ_OUTPUT_CHARS: usize = 20_000;
 const DEFAULT_SEARCH_TOP: usize = 10;
 const DEFAULT_WITHIN_TOP: usize = 20;
 const DEFAULT_SESSIONS_LIMIT: usize = 20;
@@ -78,12 +79,15 @@ fn apply_configured_render_policy(
     }
 }
 
+/// `cli_budget`, else `configured`, else `default`; `None` with
+/// `--no-budget`.
 fn configured_budget(
+    default: usize,
     no_budget: bool,
     cli_budget: Option<usize>,
     configured: Option<usize>,
 ) -> Option<usize> {
-    (!no_budget).then(|| configured_usize(cli_budget, DEFAULT_OUTPUT_CHARS, configured))
+    (!no_budget).then(|| configured_usize(cli_budget, default, configured))
 }
 
 fn configured_embedding_budget(config: &SemanticConfig) -> EmbeddingBudget {
@@ -1615,7 +1619,12 @@ impl AgentService {
             ),
             retrieval_hits_per_conversation: None,
             all_hits: args.all_hits,
-            budget: configured_budget(args.no_budget, args.budget, agent_config.output_chars),
+            budget: configured_budget(
+                DEFAULT_OUTPUT_CHARS,
+                args.no_budget,
+                args.budget,
+                agent_config.output_chars,
+            ),
             session_offset: args.offset,
             window: time,
         };
@@ -1839,7 +1848,12 @@ impl AgentService {
                 self.with_stale_cache_record(std::mem::take(&mut selection.warnings), &listing);
             let records = agent::sessions::format_sessions_with_warnings(
                 &listing,
-                configured_budget(args.no_budget, args.budget, agent_config.output_chars),
+                configured_budget(
+                    DEFAULT_OUTPUT_CHARS,
+                    args.no_budget,
+                    args.budget,
+                    agent_config.output_chars,
+                ),
                 &warnings,
                 self.clock().local_wall(),
             );
@@ -1883,7 +1897,12 @@ impl AgentService {
             cli_mode: args.mode_override(),
             config_mode,
             tui_semantic_search: None,
-            budget: configured_budget(args.no_budget, args.budget, agent_config.output_chars),
+            budget: configured_budget(
+                DEFAULT_OUTPUT_CHARS,
+                args.no_budget,
+                args.budget,
+                agent_config.output_chars,
+            ),
             window,
         };
         let mode = agent::search::effective_agent_mode(
@@ -4073,7 +4092,12 @@ fn agent_protocol_options(
     clock: &dyn Clock,
 ) -> Result<agent::protocol::ProtocolOptions> {
     Ok(agent::protocol::ProtocolOptions {
-        budget: configured_budget(output.no_budget, output.budget, config.output_chars),
+        budget: configured_budget(
+            DEFAULT_READ_OUTPUT_CHARS,
+            output.no_budget,
+            output.budget,
+            config.output_chars,
+        ),
         tools: configured_visibility(output.tools, config.tools),
         tool_results: configured_visibility(output.tool_results, config.tool_results),
         thinking: configured_visibility(output.thinking, config.thinking),
@@ -9870,9 +9894,13 @@ mode = "hybrid"
     fn explicit_agent_values_override_agent_defaults() {
         assert_eq!(configured_usize(Some(7), 10, Some(12)), 7);
         assert_eq!(configured_usize(None, 10, Some(12)), 12);
-        assert_eq!(configured_budget(false, Some(6000), Some(9000)), Some(6000));
-        assert_eq!(configured_budget(false, None, Some(9000)), Some(9000));
-        assert_eq!(configured_budget(true, Some(6000), Some(9000)), None);
+        assert_eq!(
+            configured_budget(5000, false, Some(6000), Some(9000)),
+            Some(6000)
+        );
+        assert_eq!(configured_budget(5000, false, None, Some(9000)), Some(9000));
+        assert_eq!(configured_budget(5000, false, None, None), Some(5000));
+        assert_eq!(configured_budget(5000, true, Some(6000), Some(9000)), None);
     }
 
     /// A Claude Code transcript named `name`, last written at the UTC time

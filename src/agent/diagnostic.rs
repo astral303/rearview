@@ -302,11 +302,15 @@ pub fn warning_atoms(warning_count: usize, warning_records: &[String]) -> String
 /// The part of `budget` an output's other records share: warning records
 /// print whole, whatever the budget.
 pub fn budget_beside_warnings(budget: Option<usize>, warning_records: &[String]) -> Option<usize> {
-    let warning_chars = warning_records
+    budget.map(|budget| budget.saturating_sub(warning_chars(warning_records)))
+}
+
+/// The characters of `warning_records`.
+pub fn warning_chars(warning_records: &[String]) -> usize {
+    warning_records
         .iter()
         .map(|record| record.chars().count())
-        .sum();
-    budget.map(|budget| budget.saturating_sub(warning_chars))
+        .sum()
 }
 
 /// The records of `warnings`, by kind, and how many warnings they report.

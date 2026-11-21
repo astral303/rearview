@@ -15,7 +15,7 @@ query text=Sentinel hits=0
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 $ rearview agent within ch_581699c40efc the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=20 tz=-04:00 omitted-lines=41
+protocol agent-within mode=lexical cut=tail chars=400 full=7773 policy=per-hit hits=20 tz=-04:00 omitted-lines=41
 query text=the hits=20
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 continue within ref=ch_581699c40efc action=narrow-query-or-increase-budget
@@ -49,7 +49,7 @@ conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-00
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent within ch_0b26e45343df the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=8 tz=-04:00 warnings=1 warning-records=1 omitted-lines=18
+protocol agent-within mode=lexical cut=tail chars=400 full=3453 policy=per-hit hits=8 tz=-04:00 warnings=1 warning-records=1 omitted-lines=18
 query text=the hits=8
 continue within ref=ch_0b26e45343df action=narrow-query-or-increase-budget
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
@@ -89,7 +89,7 @@ conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-0000000000
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_74aec3f6df49 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=15 tz=-04:00 warnings=1 warning-records=1 omitted-lines=32
+protocol agent-within mode=lexical cut=tail chars=400 full=6123 policy=per-hit hits=15 tz=-04:00 warnings=1 warning-records=1 omitted-lines=32
 query text=the hits=15
 continue within ref=ch_74aec3f6df49 action=narrow-query-or-increase-budget
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
@@ -120,7 +120,7 @@ query text=Sentinel hits=0
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 $ rearview agent within ch_974c3840e189 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=8 tz=-05:00 omitted-lines=17
+protocol agent-within mode=lexical cut=tail chars=400 full=3004 policy=per-hit hits=8 tz=-05:00 omitted-lines=17
 query text=the hits=8
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 continue within ref=ch_974c3840e189 action=narrow-query-or-increase-budget
@@ -144,7 +144,7 @@ query text=Sentinel hits=0
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 $ rearview agent within ch_efbbec792ccc the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=9 tz=-04:00 omitted-lines=19
+protocol agent-within mode=lexical cut=tail chars=400 full=3420 policy=per-hit hits=9 tz=-04:00 omitted-lines=19
 query text=the hits=9
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 continue within ref=ch_efbbec792ccc action=narrow-query-or-increase-budget
@@ -173,7 +173,7 @@ query text=Sentinel hits=0
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 $ rearview agent within ch_f04d3718e406 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=6 tz=-05:00 omitted-lines=13
+protocol agent-within mode=lexical cut=tail chars=400 full=2383 policy=per-hit hits=6 tz=-05:00 omitted-lines=13
 query text=the hits=6
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 continue within ref=ch_f04d3718e406 action=narrow-query-or-increase-budget
@@ -204,7 +204,7 @@ query text=Sentinel hits=0
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 $ rearview agent within ch_982349c13ee4 the --budget 400
 --- stdout
-protocol agent-within mode=lexical cut=tail chars=400 policy=per-hit hits=6 tz=-05:00 omitted-lines=13
+protocol agent-within mode=lexical cut=tail chars=400 full=2561 policy=per-hit hits=6 tz=-05:00 omitted-lines=13
 query text=the hits=6
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 continue within ref=ch_982349c13ee4 action=narrow-query-or-increase-budget

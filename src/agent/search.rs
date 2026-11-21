@@ -1,10 +1,11 @@
 use crate::agent::diagnostic::{
-    AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms,
+    AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms, warning_chars,
 };
 use crate::agent::ordered_scan::{ScanStep, scan_in_order};
 use crate::agent::perf::{SearchReads, time_retrieval};
 use crate::agent::protocol::{
-    budget_atom, cut_short, flags_showing, protocol_snippet, title_for_conversation,
+    budget_atom, cut_short, decimal_digits, flags_showing, full_atom, protocol_snippet,
+    smallest_budget_fitting, title_for_conversation,
 };
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
@@ -384,28 +385,26 @@ pub fn format_agent_output_with_warnings(
     let warning_suffix = warning_atoms(warning_count, &warning_records);
     let offset = output_offset(hits.iter().find_map(|hit| hit.times), written_at);
     let tz = tz_atom(offset);
-    let mut rendered = if output.protocol == AgentProtocolKind::Search && !output.flat {
-        format!(
-            "protocol {protocol} mode={} cut=none chars={} policy=per-hit groups={} hits={}{tz}{}\n",
-            mode_atom(output.mode),
-            budget_atom(output.budget),
-            output.groups.len(),
-            hits.len(),
-            warning_suffix
-        )
+    let grouped = output.protocol == AgentProtocolKind::Search && !output.flat;
+    let groups = if grouped {
+        format!(" groups={}", output.groups.len())
     } else {
+        String::new()
+    };
+    let hit_count = hits.len();
+    let header = |cut: &str, full: Option<usize>| {
         format!(
-            "protocol {protocol} mode={} cut=none chars={} policy=per-hit hits={}{tz}{}\n",
+            "protocol {protocol} mode={} cut={cut} chars={}{} policy=per-hit{groups} hits={hit_count}{tz}{warning_suffix}",
             mode_atom(output.mode),
             budget_atom(output.budget),
-            hits.len(),
-            warning_suffix
+            full_atom(cut, full),
         )
     };
+    let mut rendered = header("none", None) + "\n";
     rendered.push_str(&format!(
         "query text={} hits={}\n",
         crate::agent::protocol::escape_atom(&output.query),
-        hits.len()
+        hit_count
     ));
     if let Some(target) = &output.target {
         rendered.push_str(&format!(
@@ -418,7 +417,7 @@ pub fn format_agent_output_with_warnings(
     if let Some(coverage) = output.coverage {
         push_coverage_lines(&mut rendered, coverage, output.mode);
     }
-    if output.protocol == AgentProtocolKind::Search && !output.flat {
+    if grouped {
         rendered.push_str(&format!("groups count={}\n", output.groups.len()));
         for (index, group) in output.groups.iter().enumerate() {
             rendered.push_str(&format!(
@@ -437,7 +436,7 @@ pub fn format_agent_output_with_warnings(
                 push_hit_lines(&mut rendered, hit, offset, zone);
             }
         }
-        return bound_agent_output(output, rendered, &warning_records, output.budget);
+        return bound_agent_output(output, rendered, header, &warning_records);
     }
 
     let mut titled_sessions = std::collections::HashSet::new();
@@ -453,28 +452,39 @@ pub fn format_agent_output_with_warnings(
         }
         push_hit_lines(&mut rendered, hit, offset, zone);
     }
-    bound_agent_output(output, rendered, &warning_records, output.budget)
+    bound_agent_output(output, rendered, header, &warning_records)
 }
 
 /// `rendered`, then `warning_records`, whole. When the budget left beside
 /// them cannot hold every record of `rendered`, its last records are
-/// omitted, the header counts their lines and a `continue` record names the
-/// remedy.
+/// omitted, the header `header` writes for a `cut=` and a `full=` counts
+/// their lines and names the budget printing every record, and a `continue`
+/// record names the remedy.
 fn bound_agent_output(
     output: &AgentSearchOutput,
     rendered: String,
+    header: impl Fn(&str, Option<usize>) -> String,
     warning_records: &[String],
-    budget: Option<usize>,
 ) -> String {
     let with_warnings = |records: String| records + &warning_records.concat();
-    let Some(budget) = budget_beside_warnings(budget, warning_records) else {
+    let (Some(header_budget), Some(budget)) = (
+        output.budget,
+        budget_beside_warnings(output.budget, warning_records),
+    ) else {
         return with_warnings(rendered);
     };
-    if rendered.chars().count() <= budget {
+    let rendered_chars = rendered.chars().count();
+    if rendered_chars <= budget {
         return with_warnings(rendered);
     }
 
+    let full = smallest_budget_fitting(
+        rendered_chars - decimal_digits(header_budget) + warning_chars(warning_records),
+    );
     let lines = rendered.lines().collect::<Vec<_>>();
+    let truncated_header = |omitted_lines: usize| {
+        header("tail", Some(full)) + &format!(" omitted-lines={omitted_lines}\n")
+    };
     let mut records = Vec::new();
     let mut index = 1;
     while index < lines.len() {
@@ -501,9 +511,7 @@ fn bound_agent_output(
                 .map(|record| record.lines().count())
                 .sum::<usize>(),
         );
-        let header =
-            lines[0].replace("cut=none", "cut=tail") + &format!(" omitted-lines={omitted}\n");
-        let candidate = header + &records.concat() + &recovery;
+        let candidate = truncated_header(omitted) + &records.concat() + &recovery;
         if candidate.chars().count() <= budget {
             return with_warnings(candidate);
         }
@@ -515,9 +523,7 @@ fn bound_agent_output(
             records.pop();
         }
     }
-    let header = lines[0].replace("cut=none", "cut=tail")
-        + &format!(" omitted-lines={}\n", lines.len().saturating_sub(1));
-    let candidate = header + &recovery;
+    let candidate = truncated_header(lines.len().saturating_sub(1)) + &recovery;
     if candidate.chars().count() <= budget {
         with_warnings(candidate)
     } else {
@@ -1618,8 +1624,8 @@ mod tests {
     use super::*;
     use crate::agent::refs::AgentConversationKey;
     use crate::agent::test_support::{
-        assert_each_budget_cuts_short_or_ends_with_warnings, text_message, text_message_at,
-        warnings_of_two_kinds, written_at,
+        assert_each_budget_cuts_short_or_ends_with_warnings, cuts_checking_full, text_message,
+        text_message_at, warnings_of_two_kinds, written_at,
     };
     use crate::agent::transcript::{AgentMessage, AgentMessageRole, AgentTranscript};
     use crate::semantic::rank::PreparedChunk;
@@ -1628,6 +1634,7 @@ mod tests {
         SemanticRationaleKind,
     };
     use chrono::Local;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -2925,10 +2932,10 @@ mod tests {
 
         assert!(rendered.chars().count() <= 500);
         assert!(
-            rendered.starts_with(
-                "protocol agent-within mode=lexical cut=tail chars=500 policy=per-hit"
-            )
+            rendered.starts_with("protocol agent-within mode=lexical cut=tail chars=500 full="),
+            "{rendered}"
         );
+        assert!(rendered.contains(" policy=per-hit "), "{rendered}");
         assert!(rendered.contains("omitted-lines="));
         assert_eq!(
             rendered
@@ -3096,6 +3103,66 @@ mod tests {
         assert_each_budget_cuts_short_or_ends_with_warnings(roomy, &warnings, |budget| {
             format_agent_output_with_warnings(&output(Some(budget)), &warnings, written_at())
         });
+    }
+
+    #[test]
+    fn truncated_search_and_within_name_budget_printing_every_hit() {
+        let hits = (1..=6)
+            .map(|ordinal| {
+                lexical_dialogue_hit(
+                    &format!("ch_{ordinal}"),
+                    "title",
+                    10.0 - ordinal as f64,
+                    &format!("hit {ordinal} {}", "x".repeat(100)),
+                    MessageRange::single(ordinal),
+                    MessageRange::single(ordinal),
+                )
+            })
+            .collect::<Vec<_>>();
+        let groups = hits
+            .chunks(2)
+            .map(|group_hits| AgentConversationGroup {
+                conversation_ref: group_hits[0].conversation_ref.clone(),
+                project_id: "pr_test".to_string(),
+                conversation_uuid: "uuid".to_string(),
+                session: "session.jsonl".to_string(),
+                title: "title".to_string(),
+                score: group_hits[0].score,
+                total_hits: group_hits.len(),
+                hits: group_hits.to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let warnings = warnings_of_two_kinds();
+        let mut cuts = BTreeSet::new();
+        for (protocol, flat, warnings) in [
+            (AgentProtocolKind::Search, true, &warnings[..]),
+            (AgentProtocolKind::Search, false, &warnings[..]),
+            (AgentProtocolKind::Within, true, &[][..]),
+        ] {
+            let output_at = |budget| {
+                let output = AgentSearchOutput {
+                    protocol,
+                    target: None,
+                    query: "needle".to_string(),
+                    mode: SearchMode::Lexical,
+                    hits: if flat { hits.clone() } else { vec![] },
+                    groups: if flat { vec![] } else { groups.clone() },
+                    flat,
+                    budget,
+                    coverage: None,
+                };
+                format_agent_output_with_warnings(&output, warnings, written_at())
+            };
+            let budgets =
+                |unbudgeted: usize| (300..unbudgeted).step_by(37).chain([unbudgeted + 10]);
+            cuts.extend(cuts_checking_full(budgets, output_at));
+        }
+
+        assert_eq!(
+            cuts,
+            BTreeSet::from(["none".to_owned(), "tail".to_owned()]),
+            "each cut= a search prints"
+        );
     }
 
     #[test]

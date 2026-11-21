@@ -10,6 +10,7 @@ use crate::clock::{TestClock, Zone};
 use crate::history::{Conversation, Source};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Asserts that `row` counts `count` messages, as `transcript` numbers them,
@@ -156,6 +157,56 @@ pub fn assert_each_budget_cuts_short_or_ends_with_warnings(
         output_at(roomy).ends_with('\n'),
         "the output is complete at {roomy}"
     );
+}
+
+/// The `cut=` values of the outputs `output_at` prints at the budgets
+/// `budgets` returns for the unbudgeted output's length, leaving out outputs
+/// cut short. Asserts of each output that a header with `cut=` other than
+/// `none` prints `full=N`, that the output at budget N is the unbudgeted
+/// output with `chars=N` and the output at N - 1 is not, and that a header
+/// with `cut=none` doesn't print `full=`.
+#[track_caller]
+pub fn cuts_checking_full<Budgets: IntoIterator<Item = usize>>(
+    budgets: impl FnOnce(usize) -> Budgets,
+    output_at: impl Fn(Option<usize>) -> String,
+) -> BTreeSet<String> {
+    let unbudgeted = output_at(None);
+    let everything_at =
+        |budget: usize| unbudgeted.replacen(" chars=none", &format!(" chars={budget}"), 1);
+    let mut cuts = BTreeSet::new();
+    for budget in budgets(unbudgeted.chars().count()) {
+        let output = output_at(Some(budget));
+        if !output.ends_with('\n') {
+            continue;
+        }
+        let header = output.lines().next().unwrap_or_default();
+        let cut = atom(header, "cut").expect("a header with cut=").to_owned();
+        let full = atom(header, "full");
+        if cut == "none" {
+            assert_eq!(
+                full, None,
+                "a header with cut=none doesn't print full=: {output}"
+            );
+        } else {
+            let full = full
+                .unwrap_or_else(|| panic!("a header with cut={cut} prints full=: {output}"))
+                .parse::<usize>()
+                .expect("full= is a number");
+            assert_eq!(
+                output_at(Some(full)),
+                everything_at(full),
+                "budget {full}, the full= of budget {budget}, prints everything: {output}"
+            );
+            assert_ne!(
+                output_at(Some(full - 1)),
+                everything_at(full - 1),
+                "budget {}, below the full= of budget {budget}, doesn't print everything: {output}",
+                full - 1
+            );
+        }
+        cuts.insert(cut);
+    }
+    cuts
 }
 
 /// `timestamp` as `agent` output prints it in full: in local time, to the
@@ -325,6 +376,7 @@ const fn optional(name: &'static str, values: ValueCheck) -> OrderedAtom {
 const READ_HEADER: &[OrderedAtom] = &[
     required("cut", is_read_cut),
     required("chars", is_count_or_none),
+    optional("full", is_digits),
     required("policy", is_policy),
     required("omit", is_omitted_runs),
     required("tz", is_offset),
@@ -340,6 +392,7 @@ const READ_HEADER: &[OrderedAtom] = &[
 const OUTLINE_HEADER: &[OrderedAtom] = &[
     required("cut", is_outline_cut),
     required("chars", is_count_or_none),
+    optional("full", is_digits),
     required("policy", is_policy),
     required("messages", is_digits),
     optional("at", is_full_time),
