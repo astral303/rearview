@@ -1,6 +1,6 @@
 $ rearview agent outline ch_581699c40efc
 --- stdout
-protocol agent-outline cut=none chars=6000 policy=text messages=46 at=2026-09-01T06:00:00 to=2026-09-01T06:33:10 tz=-04:00
+protocol agent-outline cut=none chars=6000 policy=text messages=48 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m1 user 06:00:00 chars=62 | USER_TEXT_SENTINEL: check the plugin's files and how it starts
@@ -18,9 +18,11 @@ m31 user 06:30:00 chars=59 | [Recap] RECAP_SENTINEL: fix the parser, then run th
 m32 user 06:31:00 chars=74 | [Notice] NOTICE_SENTINEL: safeguards flagged this message; switched model.
 m35 06:32:02 chars=70 | NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 m36 user 06:33:00 chars=37 | Fix the tokenizer, then plan the rest
+m47 user 06:34:00 chars=59 | is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
+m48 user 06:34:01 chars=22 | *Skill: release-notes*
 $ rearview agent outline ch_581699c40efc --tools --tool-results --thinking --subagents --no-budget
 --- stdout
-protocol agent-outline cut=none chars=none policy=text+tools+tool-results+thinking+subagents messages=46 at=2026-09-01T06:00:00 to=2026-09-01T06:33:10 tz=-04:00
+protocol agent-outline cut=none chars=none policy=text+tools+tool-results+thinking+subagents messages=48 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=m5 report=m6 : Read the README
 subagent s2 type=Explore launch=m7 span=m8..m10 report=m11 : Check how the plugin starts
@@ -29,17 +31,17 @@ seg m1..m10 s1,s2 chars=733 at=2026-09-01T06:00:00 to=2026-09-01T06:00:16 | USER
 seg m11..m20 s3 chars=512 at=2026-09-01T06:00:20 to=2026-09-01T06:02:03 | The plugin starts from plugin.json. / Read: src/main.rs fn main() { ATTACHED_FILE_SENTINEL(); }
 seg m21..m30 chars=570 at=2026-09-01T06:02:03 to=2026-09-01T06:02:10 | Reference: src/REFERENCE_SENTINEL.rs / Found 1 new diagnostic issue in 1 file src/main.rs: [Line 3:5] DIAGNOSTICS_SENTI
 seg m31..m41 chars=549 at=2026-09-01T06:30:00 to=2026-09-01T06:33:05 | [Recap] RECAP_SENTINEL: fix the parser, then run the tests. / WebFetch: https://example.com/grammar (+1 line)
-seg m42..m46 chars=165 at=2026-09-01T06:33:06 to=2026-09-01T06:33:10 | The grammar has three token kinds. / User has approved your plan.
+seg m42..m48 chars=246 at=2026-09-01T06:33:06 to=2026-09-01T06:34:01 | The grammar has three token kinds. / *Skill: release-notes*
 $ rearview agent outline ch_581699c40efc --budget 500
 --- stdout
-protocol agent-outline cut=tail chars=500 policy=text messages=46 at=2026-09-01T06:00:00 to=2026-09-01T06:33:10 tz=-04:00 omitted-records=14 warnings=0 warning-records=0
+protocol agent-outline cut=tail chars=500 policy=text messages=48 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 tz=-04:00 omitted-records=16 warnings=0 warning-records=0
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m1 user 06:00:00 chars=62 | USER_TEXT_SENTINEL: check the plugin's files and how it starts
-continue read refs=ch_581699c40efc:m2..m36 tools=false tool-results=false thinking=false subagents=false
+continue read refs=ch_581699c40efc:m2..m48 tools=false tool-results=false thinking=false subagents=false
 $ rearview agent outline ch_581699c40efc:m2..m5
 --- stdout
-protocol agent-outline cut=none chars=6000 policy=text messages=46 at=2026-09-01T06:00:00 to=2026-09-01T06:33:10 tz=-04:00
+protocol agent-outline cut=none chars=6000 policy=text messages=48 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m2 06:00:02 chars=49 | ASSISTANT_TEXT_SENTINEL: listing the files first.
@@ -294,7 +296,7 @@ day 1969-12-31
 m5 19:00:01 chars=22 | grok answer searchable
 $ rearview agent outline ch_581699c40efc --after 2026-09-01T06:00:30 --before 2026-09-01T06:05
 --- stdout
-protocol agent-outline cut=none chars=6000 policy=text messages=46 at=2026-09-01T06:00:00 to=2026-09-01T06:33:10 tz=-04:00 messages-in-window=19
+protocol agent-outline cut=none chars=6000 policy=text messages=48 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 tz=-04:00 messages-in-window=19
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m13 report 06:01:00 chars=85 | Agent "Background check" finished TASK_REPORT_SENTINEL: the background check pas

@@ -13,6 +13,8 @@ mod semantic_worker;
 mod supervisor;
 pub mod theme;
 mod ui;
+#[cfg(test)]
+mod user_text_coverage;
 pub mod viewer;
 
 #[cfg(test)]

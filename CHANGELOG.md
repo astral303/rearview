@@ -247,6 +247,23 @@
   rejecting a malformed ref, a flag the ref does not allow or `--after` later
   than `--before`. They now fail at once.
 
+#### Claude Code
+
+- Fix the list's search matching the caveat before a slash command, `/clear`,
+  the tag names around a slash command's output, and skill text (a skill's
+  file, recorded as a user message when the skill loads). The viewer doesn't
+  show any of them. Search now reads a user message as the viewer shows it.
+  - `agent search` no longer chooses a session for such a match and then
+    doesn't find a hit in it.
+  - A search for the line the viewer shows for skill text, such as
+    `Skill: officecli`, now finds it.
+- Fix `agent read` leaving out skill text, and a prompt that quotes a caveat,
+  output or `/clear` tag. It now prints each as the viewer shows it, and later
+  messages in that session are numbered higher.
+- Fix the viewer and exports showing a prompt that quotes a slash command's
+  tags after other words as that command alone. The prompt now shows as
+  written.
+
 #### Codex
 
 - Fix an `exec` script showing as one escaped JSON string in the viewer and

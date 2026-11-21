@@ -4,7 +4,6 @@
 //! for the matched message.
 
 use crate::agent::transcript::{AgentMessageRole, agent_user_text};
-use crate::history::is_clear_metadata_message;
 use crate::log_entry::{AssistantMessage, ContentBlock, LogEntry, UserContent};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -211,12 +210,8 @@ impl MessageNumbering {
             UserContent::String(_) => first_text.is_some(),
             UserContent::Blocks(blocks) => has_visible_block(AgentMessageRole::User, blocks),
         };
-        if !has_visible_part {
-            return None;
-        }
-        if let Some(text) = first_text.as_deref()
-            && (is_clear_metadata_message(text)
-                || (!self.has_user_message && text.trim() == "Warmup"))
+        if !has_visible_part
+            || (!self.has_user_message && first_text.is_some_and(|text| text.trim() == "Warmup"))
         {
             return None;
         }
@@ -295,7 +290,7 @@ pub(crate) fn visible_text(role: AgentMessageRole, text: String) -> Option<Strin
 /// [`visible_text`] borrowed from `text` when nothing converts it.
 fn shown_text(role: AgentMessageRole, text: &str) -> Option<Cow<'_, str>> {
     let shown = match role {
-        AgentMessageRole::User => agent_user_text(text),
+        AgentMessageRole::User => agent_user_text(text)?,
         AgentMessageRole::Assistant => Cow::Borrowed(text),
     };
     (!shown.trim().is_empty()).then_some(shown)
@@ -577,6 +572,32 @@ mod tests {
         assert_eq!(
             message_texts(&records)[1..3],
             [["Compacted"], ["Error during compaction: connection lost."]]
+        );
+    }
+
+    #[test]
+    fn user_text_is_message_when_viewer_shows_it() {
+        const QUOTED_TAG: &str = "is <local-command-caveat> written before every command?";
+        let records = [
+            prompt(),
+            user(json!(
+                "<local-command-caveat>Caveat: run locally.</local-command-caveat>"
+            )),
+            user(json!("<command-name>/clear</command-name>")),
+            user(json!("<local-command-stdout></local-command-stdout>")),
+            user(json!([{"type": "text",
+                "text": "Base directory for this skill: /skills/officecli\n\n# Office CLI"}])),
+            user(json!(QUOTED_TAG)),
+            user(json!(
+                "<command-message>init</command-message>\n<command-name>init</command-name>"
+            )),
+            reply(),
+        ];
+
+        assert_numbered_alike(&records, 5);
+        assert_eq!(
+            message_texts(&records)[1..4],
+            [["*Skill: officecli*"], [QUOTED_TAG], ["init"]]
         );
     }
 

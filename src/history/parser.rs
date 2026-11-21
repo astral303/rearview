@@ -10,6 +10,7 @@ use super::message_texts::{MessageTextBuilder, MessageTextStarts, push_separated
 use super::provider::{ReadError, SessionStub, TranscriptRead};
 use super::resumed::{SessionCheckpoint, ThreadFold, checkpoint_place, leading_digest, walk_steps};
 use super::row_fold::{FoldCheckpoint, FoldedRow, RowFold, Unlisted};
+use super::user_text::{SlashCommand, user_block_text};
 use super::{Conversation, ParseError, ParsePermit, Source, TranscriptEntries, parse_task_report};
 use crate::agent::message_numbering::{ThreadIdentity, has_visible_block};
 use crate::agent::refs::MessageRange;
@@ -24,12 +25,13 @@ use crate::error::{AppError, Result};
 use crate::log_entry::{
     AgentContent, ContentBlock, LogEntry, UserContent, extract_text_from_assistant,
     extract_text_from_blocks, extract_text_from_user, labeled_metadata_text, parse_agent_progress,
-    progress_timestamp, search_texts_of_blocks, search_texts_of_user,
+    progress_timestamp, search_texts_of_blocks,
 };
 use crate::search::normalize_for_search;
 use crate::semantic::filter::{SemanticTurnRole, filter_turn};
 use chrono::{DateTime, Local};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use std::path::{Path, PathBuf};
@@ -1256,7 +1258,8 @@ struct UserTurnText {
     /// The text [`semantic_turn`] embeds: a task report's summary and body,
     /// any other turn's own text.
     semantic_text: String,
-    /// A slash command as `agent read` shows it, `/name args`.
+    /// A slash command's list preview, `/name args`
+    /// ([`extract_skill_preview`]).
     skill_preview: Option<String>,
 }
 
@@ -1406,20 +1409,36 @@ fn shown_user_preview(preview: String, skill_preview: Option<String>) -> Option<
 
 /// A task report previews as its summary and is searched and embedded as its
 /// summary and body, never as the notification's machine state; any other
-/// message previews and embeds as its text and is searched with its tool
-/// results. A slash command is searched as `agent read` shows it, so a phrase
-/// spanning the name and its arguments matches in both.
+/// message previews and embeds as its text and is searched as each text block
+/// shows it ([`user_block_text`]), with its tool results.
 fn user_turn_text(content: &UserContent) -> UserTurnText {
-    user_turn_text_of(extract_text_from_user(content), || {
-        search_texts_of_user(content)
+    match content {
+        UserContent::String(text) => user_turn_text_of(text.clone(), || {
+            text_block_search_part(text).into_iter().collect()
+        }),
+        UserContent::Blocks(blocks) => user_blocks_text(blocks),
+    }
+}
+
+/// [`user_turn_text`] for `blocks`, a user record's or a sub-agent turn's.
+fn user_blocks_text(blocks: &[ContentBlock]) -> UserTurnText {
+    user_turn_text_of(extract_text_from_blocks(blocks), || {
+        blocks
+            .iter()
+            .flat_map(|block| match block {
+                ContentBlock::Text { text } => text_block_search_part(text).into_iter().collect(),
+                _ => search_texts_of_blocks(std::slice::from_ref(block)),
+            })
+            .collect()
     })
 }
 
-/// [`user_turn_text`] for a sub-agent turn's `blocks`.
-fn user_blocks_text(blocks: &[ContentBlock]) -> UserTurnText {
-    user_turn_text_of(extract_text_from_blocks(blocks), || {
-        search_texts_of_blocks(blocks)
-    })
+/// The search part of a user text block: the text it shows. `None` when it
+/// shows nothing or an empty text.
+fn text_block_search_part(text: &str) -> Option<String> {
+    user_block_text(text)
+        .filter(|shown| !shown.is_empty())
+        .map(Cow::into_owned)
 }
 
 /// [`user_turn_text`] for a turn whose text is `text`; `search_texts` gives
@@ -1434,9 +1453,7 @@ fn user_turn_text_of(text: String, search_texts: impl FnOnce() -> Vec<String>) -
     };
     let skill_preview = extract_skill_preview(&preview);
     UserTurnText {
-        search_parts: skill_preview
-            .clone()
-            .map_or(search_parts, |skill_preview| vec![skill_preview]),
+        search_parts,
         preview,
         semantic_text,
         skill_preview,
@@ -1887,7 +1904,7 @@ pub(crate) fn conversation_from_entries<'a>(
 
 /// Detects metadata emitted by the /clear command wrapper messages and
 /// other system-injected boilerplate that should not appear in previews.
-pub(crate) fn is_clear_metadata_message(message: &str) -> bool {
+fn is_clear_metadata_message(message: &str) -> bool {
     let trimmed = message.trim();
 
     trimmed.is_empty()
@@ -1903,47 +1920,12 @@ pub(crate) fn is_clear_metadata_message(message: &str) -> bool {
         || super::skill_text::skill_directory(trimmed).is_some()
 }
 
-/// Claude Code opens a slash command's text with one of these tags. A prompt
-/// that quotes a tag after other words is not a slash command.
-const COMMAND_TAG_OPENERS: [&str; 2] = ["<command-name>", "<command-message>"];
-
-/// Extract a clean preview from a skill invocation message (e.g. "/consult how to do X?").
-/// Returns None if the message is not a skill invocation or is a /clear command.
-pub(crate) fn extract_skill_preview(message: &str) -> Option<String> {
-    let trimmed = message.trim();
-    if !COMMAND_TAG_OPENERS
-        .iter()
-        .any(|opener| trimmed.starts_with(opener))
-    {
-        return None;
-    }
-
-    let start = trimmed.find("<command-name>")?;
-    let end = trimmed.find("</command-name>")?;
-    let content_start = start + "<command-name>".len();
-    if content_start >= end {
-        return None;
-    }
-
-    let command_name = &trimmed[content_start..end];
-    if !command_name.starts_with('/') || command_name == "/clear" {
-        return None;
-    }
-
-    // Extract command args if present
-    if let Some(args_start) = trimmed.find("<command-args>")
-        && let Some(args_end) = trimmed.find("</command-args>")
-    {
-        let args_content_start = args_start + "<command-args>".len();
-        if args_content_start < args_end {
-            let args = trimmed[args_content_start..args_end].trim();
-            if !args.is_empty() {
-                return Some(format!("{} {}", command_name, args));
-            }
-        }
-    }
-
-    Some(command_name.to_string())
+/// The list preview of a slash command, `/name args`. `None` for any other
+/// message, for `/clear`, and for a command whose name lacks its `/`.
+fn extract_skill_preview(message: &str) -> Option<String> {
+    SlashCommand::of(message)
+        .filter(|command| command.name.starts_with('/'))?
+        .shown_line()
 }
 
 /// True when `user_messages` hold only a `/clear` command's caveat, command

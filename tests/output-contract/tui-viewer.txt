@@ -43,6 +43,10 @@
 
    Claude │ Edited 1 file, loaded 1 skill, messaged 1 agent, fetched 1 URL, called 1 tool
 
+      You │ is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
+
+      You │ Skill: release-notes
+
 === viewer, tools summary, thinking hidden: kimi wire.jsonl
       You │ active kimi question
 
@@ -368,6 +372,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ }
    ↓
    Result ┐ User has approved your plan.
+
+      You │ is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
+
+      You │ Skill: release-notes
 
 === viewer, tools in full, thinking shown: kimi wire.jsonl
       You │ active kimi question
