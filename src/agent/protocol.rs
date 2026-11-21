@@ -1,7 +1,7 @@
 use crate::agent::call_links::{AnsweredCall, Call, CallAddress, CallLinks, numbered_calls};
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::agent::diagnostic::{
-    AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms,
+    AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms, warning_chars,
 };
 use crate::agent::hidden_parts::HiddenParts;
 use crate::agent::record_writer::{
@@ -1095,9 +1095,13 @@ impl<'a> HiddenRun<'a> {
 }
 
 /// The `agent read` header. `cut=`, `omit=`, `tz=` and the `hidden-` atoms
-/// depend on the entries the budget selects; the other atoms are fixed here.
+/// depend on the entries the budget selects, and `full=` is set once they
+/// are selected; the other atoms are fixed when the header is made.
 struct ReadHeader {
     budget: Option<usize>,
+    /// The budget printing every entry whole: `full=` on a header whose
+    /// `cut=` is not `none`.
+    full: Option<usize>,
     policy: String,
     /// ` messages-in-window=N`, or empty without a window.
     window: String,
@@ -1114,6 +1118,7 @@ impl ReadHeader {
     ) -> Self {
         Self {
             budget: options.budget,
+            full: None,
             policy: options.visibility().atom(),
             window: window_atom(options.window, messages_in_window),
             warnings: warning_atoms(warning_count, warning_records),
@@ -1122,9 +1127,10 @@ impl ReadHeader {
 
     fn line(&self, cut: &str, omit: &str, offset: FixedOffset, hidden_atoms: &str) -> String {
         format!(
-            "protocol agent-read cut={} chars={} policy={} omit={omit}{}{}{hidden_atoms}{}\n",
+            "protocol agent-read cut={} chars={}{} policy={} omit={omit}{}{}{hidden_atoms}{}\n",
             escape_atom(cut),
             budget_atom(self.budget),
+            full_atom(cut, self.full),
             self.policy,
             tz_atom(offset),
             self.window,
@@ -1133,7 +1139,7 @@ impl ReadHeader {
     }
 
     /// The fixed atoms: the header a budget estimate counts beyond `cut=`,
-    /// `chars=`, `omit=` and the `hidden-` atoms. Every offset is as long as
+    /// `chars=`, `full=`, `omit=` and the `hidden-` atoms. Every offset is as long as
     /// the offset of `written_at`.
     fn fixed_atoms(&self, written_at: DateTime<Zone>) -> String {
         format!(
@@ -1205,7 +1211,7 @@ pub fn format_read_with_warnings(
         entries.extend(request_entries);
     }
     let (warning_count, warning_records) = format_warning_records(warnings);
-    let header = ReadHeader::new(
+    let mut header = ReadHeader::new(
         header_options,
         messages_in_window,
         warning_count,
@@ -1222,10 +1228,17 @@ pub fn format_read_with_warnings(
 
     let budget = budget_beside_warnings(options.budget, &warning_records);
     let protected = focused_indices(&entries, focus.as_ref());
+    let header_atoms = header.fixed_atoms(written_at);
+    let fixed_parts = ReadFixedParts {
+        header_atoms: &header_atoms,
+        warning_chars: warning_chars(&warning_records),
+    };
     let BudgetSelection {
         mut selected,
         truncated,
-    } = kept_end.select(&entries, focus, budget, &header.fixed_atoms(written_at));
+        full,
+    } = kept_end.select(&entries, focus, budget, fixed_parts);
+    header.full = full;
     let spans = entries.iter().map(EntrySpan::of).collect::<Vec<_>>();
     let render = |entries: &[ReadEntry<'_>], selected: &[usize], cut: &str, size| {
         let mut writer = RecordWriter::new(size, zone);
@@ -1340,14 +1353,12 @@ pub fn format_outline_with_warnings(
         window_atom(options.window, messages_in_window)
     );
     let (warning_count, warning_records) = format_warning_records(warnings);
-    let header = format!(
-        "protocol agent-outline cut=none chars={} {header_fields}{}\n",
-        budget_atom(options.budget),
-        warning_atoms(warning_count, &warning_records)
-    );
+    let warning_suffix = warning_atoms(warning_count, &warning_records);
     let conversation = conversation_record(resolved);
-    let render = |records: &[OutlineRecord]| {
-        let mut output = format!("{header}{conversation}");
+    let render_with_chars = |chars: &str, records: &[OutlineRecord]| {
+        let mut output = format!(
+            "protocol agent-outline cut=none chars={chars} {header_fields}{warning_suffix}\n{conversation}"
+        );
         output.push_str(&messages.legend_records(records));
         output.push_str(&outline_records_text(records, offset));
         for record in &warning_records {
@@ -1355,6 +1366,8 @@ pub fn format_outline_with_warnings(
         }
         output
     };
+    let chars = budget_atom(options.budget);
+    let render = |records: &[OutlineRecord]| render_with_chars(&chars, records);
 
     let Some(budget) = options.budget else {
         return Ok(render(&messages.records(OUTLINE_MIN_SEGMENT_SIZE)));
@@ -1362,9 +1375,18 @@ pub fn format_outline_with_warnings(
     Ok(
         fitted_outline(&messages, budget, render).unwrap_or_else(|| {
             let coarsest = messages.records(messages.coarsest_segment_size());
+            let chars_beside_budget =
+                |records: &[OutlineRecord]| render_with_chars("", records).chars().count();
+            // `fitted_outline` tries the smallest segments only when the
+            // coarsest fit.
+            let full = smallest_budget_fitting(
+                chars_beside_budget(&messages.records(OUTLINE_MIN_SEGMENT_SIZE))
+                    .max(chars_beside_budget(&coarsest)),
+            );
             let header_fields = OutlineHeaderFields {
                 fields: &header_fields,
                 offset,
+                full,
             };
             truncated_outline(
                 &messages,
@@ -1377,11 +1399,14 @@ pub fn format_outline_with_warnings(
     )
 }
 
-/// The fixed atoms of an outline's header, and the offset its `tz=` names.
+/// The fixed atoms of an outline's header, the offset its `tz=` names, and
+/// its `full=`: the smallest budget printing the outline `--no-budget`
+/// prints.
 #[derive(Clone, Copy)]
 struct OutlineHeaderFields<'f> {
     fields: &'f str,
     offset: FixedOffset,
+    full: usize,
 }
 
 /// `records`, with the `day` record before each message record on another
@@ -1428,12 +1453,17 @@ fn truncated_outline(
 ) -> String {
     let (warning_count, warning_records) = warnings;
     let conversation = conversation_record(messages.resolved);
-    let header_fields = header.fields;
+    let OutlineHeaderFields {
+        fields: header_fields,
+        full,
+        ..
+    } = header;
     let warning_record_count = warning_records.len();
     let keeping = |keep: usize| {
         let omitted = records.len() - keep;
         let mut truncated = format!(
-            "protocol agent-outline cut=tail chars={budget} {header_fields} omitted-records={omitted} warnings={warning_count} warning-records={warning_record_count}\n"
+            "protocol agent-outline cut=tail chars={budget}{} {header_fields} omitted-records={omitted} warnings={warning_count} warning-records={warning_record_count}\n",
+            full_atom("tail", Some(full))
         );
         truncated.push_str(&conversation);
         truncated.push_str(&messages.legend_records(&records[..keep]));
@@ -2680,12 +2710,12 @@ impl KeptEnd {
         entries: &[ReadEntry<'_>],
         focus: Option<ProtocolFocus>,
         budget: Option<usize>,
-        header_atoms: &str,
+        fixed_parts: ReadFixedParts<'_>,
     ) -> BudgetSelection {
         match self {
-            Self::Start => select_for_budget(entries, focus, budget, header_atoms),
+            Self::Start => select_for_budget(entries, focus, budget, fixed_parts),
             Self::RequestEnds(order) => {
-                select_request_ends_for_budget(entries, order, budget, header_atoms)
+                select_request_ends_for_budget(entries, order, budget, fixed_parts)
             }
         }
     }
@@ -2752,15 +2782,28 @@ struct BudgetSelection {
     selected: Vec<usize>,
     /// The kept entries with a truncated body.
     truncated: BTreeSet<usize>,
+    /// [`CompactReadLayout::full`]; `None` without a budget.
+    full: Option<usize>,
 }
 
 impl BudgetSelection {
-    fn everything(entries: &[ReadEntry<'_>]) -> Self {
+    fn everything(entries: &[ReadEntry<'_>], full: Option<usize>) -> Self {
         Self {
             selected: (0..entries.len()).collect(),
             truncated: BTreeSet::new(),
+            full,
         }
     }
+}
+
+/// The parts of a read besides its entries and the header atoms that depend
+/// on them.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReadFixedParts<'h> {
+    /// [`ReadHeader::fixed_atoms`].
+    header_atoms: &'h str,
+    /// The characters of the warning records after the entries.
+    warning_chars: usize,
 }
 
 /// Each request's last entries that fit `budget`, taken in [`TailOrder`]. An
@@ -2772,15 +2815,14 @@ fn select_request_ends_for_budget(
     entries: &[ReadEntry<'_>],
     order: &TailOrder,
     budget: Option<usize>,
-    header_atoms: &str,
+    fixed_parts: ReadFixedParts<'_>,
 ) -> BudgetSelection {
     let Some(budget) = budget else {
-        return BudgetSelection::everything(entries);
+        return BudgetSelection::everything(entries, None);
     };
-    let layout = CompactReadLayout::new(entries, header_atoms);
-    let all = (0..entries.len()).collect::<BTreeSet<_>>();
-    if layout.rendered_chars(&all, &BTreeSet::new(), budget) <= budget {
-        return BudgetSelection::everything(entries);
+    let layout = CompactReadLayout::new(entries, fixed_parts);
+    if layout.fits_everything(budget) {
+        return BudgetSelection::everything(entries, Some(layout.full));
     }
     let mut selected = BTreeSet::new();
     let mut truncated = BTreeSet::new();
@@ -2813,6 +2855,7 @@ fn select_request_ends_for_budget(
     BudgetSelection {
         selected: selected.into_iter().collect(),
         truncated,
+        full: Some(layout.full),
     }
 }
 
@@ -2830,8 +2873,56 @@ struct EntrySize {
 }
 
 /// The length of every part of a read, to find the read of any selection of
-/// its entries without writing it.
+/// its entries without writing it, and the budget printing every entry.
 struct CompactReadLayout<'h, 'e> {
+    parts: ReadPartSizes<'h, 'e>,
+    /// The characters of the read of every entry whole, beside the digits
+    /// of its `chars=`.
+    everything_chars: usize,
+    /// The smallest budget that the read of every entry whole fits: `full=`
+    /// on the header of a read of any other selection.
+    full: usize,
+}
+
+impl<'h, 'e> CompactReadLayout<'h, 'e> {
+    fn new(entries: &[ReadEntry<'e>], fixed_parts: ReadFixedParts<'h>) -> Self {
+        let parts = ReadPartSizes::new(entries, fixed_parts.header_atoms);
+        let all = (0..entries.len()).collect::<BTreeSet<_>>();
+        let everything_chars = parts.chars_beside_budget(&all, &BTreeSet::new(), None);
+        Self {
+            parts,
+            everything_chars,
+            full: smallest_budget_fitting(everything_chars + fixed_parts.warning_chars),
+        }
+    }
+
+    /// True when the read of every entry whole fits `budget`.
+    fn fits_everything(&self, budget: usize) -> bool {
+        self.everything_chars + decimal_digits(budget) <= budget
+    }
+
+    fn can_truncate(&self, entry: usize) -> bool {
+        self.parts.truncated[entry].is_some()
+    }
+
+    /// The characters of the read of `selected`, those in `truncated` at
+    /// their floor, every record at full size.
+    fn rendered_chars(
+        &self,
+        selected: &BTreeSet<usize>,
+        truncated: &BTreeSet<usize>,
+        budget: usize,
+    ) -> usize {
+        self.parts
+            .chars_beside_budget(selected, truncated, Some(self.full))
+            + decimal_digits(budget)
+    }
+}
+
+/// The length of every part of a read: its entries' records, at full size
+/// and at their floor, and the records and header atoms that depend on
+/// them.
+struct ReadPartSizes<'h, 'e> {
     whole: Vec<EntrySize>,
     /// Each entry with its content truncated to its
     /// [`TRUNCATION_FLOOR_CHARS`]; `None` for a run of hidden messages, or
@@ -2849,7 +2940,7 @@ struct CompactReadLayout<'h, 'e> {
     header_atoms: &'h str,
 }
 
-impl<'h, 'e> CompactReadLayout<'h, 'e> {
+impl<'h, 'e> ReadPartSizes<'h, 'e> {
     fn new(entries: &[ReadEntry<'e>], header_atoms: &'h str) -> Self {
         let whole = entries
             .iter()
@@ -2894,10 +2985,6 @@ impl<'h, 'e> CompactReadLayout<'h, 'e> {
         }
     }
 
-    fn can_truncate(&self, entry: usize) -> bool {
-        self.truncated[entry].is_some()
-    }
-
     /// The entry at its floor when it is in `truncated` and has one, else
     /// whole.
     fn size(&self, entry: usize, truncated: &BTreeSet<usize>) -> EntrySize {
@@ -2909,12 +2996,13 @@ impl<'h, 'e> CompactReadLayout<'h, 'e> {
     }
 
     /// The characters of the read of `selected`, those in `truncated` at
-    /// their floor, every record at full size.
-    fn rendered_chars(
+    /// their floor, every record at full size, with `full=` on a header
+    /// whose `cut=` is not `none`, without the digits of `chars=`.
+    fn chars_beside_budget(
         &self,
         selected: &BTreeSet<usize>,
         truncated: &BTreeSet<usize>,
-        budget: usize,
+        full: Option<usize>,
     ) -> usize {
         let header_atoms = self.header_atoms;
         let cut = read_cut(
@@ -2928,7 +3016,8 @@ impl<'h, 'e> CompactReadLayout<'h, 'e> {
             hidden.add(&self.hidden[index]);
         }
         let mut chars = format!(
-            "protocol agent-read cut={cut} chars={budget} omit={omitted}{header_atoms}{}\n",
+            "protocol agent-read cut={cut} chars={} omit={omitted}{header_atoms}{}\n",
+            full_atom(&cut, full),
             hidden.total_atoms()
         )
         .chars()
@@ -3007,9 +3096,9 @@ fn select_for_budget(
     entries: &[ReadEntry<'_>],
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
-    header_atoms: &str,
+    fixed_parts: ReadFixedParts<'_>,
 ) -> BudgetSelection {
-    select_for_budget_with_work(entries, focus, budget, header_atoms).0
+    select_for_budget_with_work(entries, focus, budget, fixed_parts).0
 }
 
 /// The read's start, or its focus, then the entries next to it while they
@@ -3021,19 +3110,21 @@ fn select_for_budget_with_work(
     entries: &[ReadEntry<'_>],
     focus: Option<ProtocolFocus>,
     budget: Option<usize>,
-    header_atoms: &str,
+    fixed_parts: ReadFixedParts<'_>,
 ) -> (BudgetSelection, SelectionWork) {
     let work = SelectionWork {
         serialized_entries: entries.len(),
         candidate_checks: 0,
     };
     let Some(budget) = budget else {
-        return (BudgetSelection::everything(entries), work);
+        return (BudgetSelection::everything(entries, None), work);
     };
-    let layout = CompactReadLayout::new(entries, header_atoms);
-    let all = (0..entries.len()).collect::<BTreeSet<_>>();
-    if layout.rendered_chars(&all, &BTreeSet::new(), budget) <= budget {
-        return (BudgetSelection::everything(entries), work);
+    let layout = CompactReadLayout::new(entries, fixed_parts);
+    if layout.fits_everything(budget) {
+        return (
+            BudgetSelection::everything(entries, Some(layout.full)),
+            work,
+        );
     }
 
     let mut selected = focused_indices(entries, focus.as_ref());
@@ -3077,6 +3168,7 @@ fn select_for_budget_with_work(
         BudgetSelection {
             selected: growing.selected.into_iter().collect(),
             truncated: growing.truncated,
+            full: Some(layout.full),
         },
         growing.work,
     )
@@ -3126,6 +3218,29 @@ pub(crate) fn budget_atom(budget: Option<usize>) -> String {
     budget
         .map(|budget| budget.to_string())
         .unwrap_or_else(|| "none".to_string())
+}
+
+/// The smallest budget N that fits `chars` characters plus the digits
+/// `chars=N` prints.
+pub(crate) fn smallest_budget_fitting(chars: usize) -> usize {
+    let mut budget = chars;
+    while chars + decimal_digits(budget) > budget {
+        budget = chars + decimal_digits(budget);
+    }
+    budget
+}
+
+pub(crate) fn decimal_digits(number: usize) -> usize {
+    number.checked_ilog10().map_or(1, |log| log as usize + 1)
+}
+
+/// ` full=N`, the budget printing everything, on a header whose `cut=` is not
+/// `none`; empty when `cut=` is `none` or without a budget.
+pub(crate) fn full_atom(cut: &str, full: Option<usize>) -> String {
+    match full {
+        Some(full) if cut != "none" => format!(" full={full}"),
+        _ => String::new(),
+    }
 }
 
 fn tool_result_text(content: &Value) -> String {
@@ -3185,8 +3300,9 @@ mod tests {
     use super::*;
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{
-        assert_each_budget_cuts_short_or_ends_with_warnings, day_record, local_time, record_time,
-        source, text_message, text_message_at, warnings_of_two_kinds, written_at,
+        assert_each_budget_cuts_short_or_ends_with_warnings, cuts_checking_full, day_record,
+        local_time, record_time, source, text_message, text_message_at, warnings_of_two_kinds,
+        written_at,
     };
     use crate::agent::transcript::AgentPartSource;
     use crate::log_entry::Tool;
@@ -3262,11 +3378,12 @@ mod tests {
         budget: usize,
     ) -> Vec<usize> {
         let spans = messages.iter().map(EntrySpan::of).collect::<Vec<_>>();
-        let render_chars = |selected: &BTreeSet<usize>| {
+        let render_chars = |selected: &BTreeSet<usize>, full: Option<usize>| {
             let selected_list = selected.iter().copied().collect::<Vec<_>>();
+            let cut = read_cut(messages.len(), &selected_list, false);
             let header = format!(
-                "protocol agent-read cut={} chars={budget} omit={}\n",
-                read_cut(messages.len(), &selected_list, false),
+                "protocol agent-read cut={cut} chars={budget}{} omit={}\n",
+                full_atom(&cut, full),
                 omitted_message_ranges(&spans, selected)
             );
             let records = written(messages, &selected_list);
@@ -3274,9 +3391,14 @@ mod tests {
             header.chars().count() + records.chars().count() + continuation.chars().count()
         };
         let all = (0..messages.len()).collect::<BTreeSet<_>>();
-        if render_chars(&all) <= budget {
+        let everything_chars = render_chars(&all, None);
+        if everything_chars <= budget {
             return all.into_iter().collect();
         }
+        let full = Some(smallest_budget_fitting(
+            everything_chars - decimal_digits(budget),
+        ));
+        let render_chars = |selected: &BTreeSet<usize>| render_chars(selected, full);
         let mut selected = BTreeSet::new();
         if let Some(focus) = focus {
             for (index, entry) in messages.iter().enumerate() {
@@ -3346,8 +3468,12 @@ mod tests {
                 range: MessageRange::single(20),
             };
             let expected = legacy_select_for_budget(&messages, Some(focus.clone()), budget);
-            let (actual, work) =
-                select_for_budget_with_work(&messages, Some(focus), Some(budget), "");
+            let (actual, work) = select_for_budget_with_work(
+                &messages,
+                Some(focus),
+                Some(budget),
+                ReadFixedParts::default(),
+            );
 
             assert_eq!(
                 actual.selected, expected,
@@ -3379,7 +3505,12 @@ mod tests {
 
         for budget in (100..=2_000).step_by(29) {
             let expected = legacy_select_for_budget(&messages, None, budget);
-            let (actual, work) = select_for_budget_with_work(&messages, None, Some(budget), "");
+            let (actual, work) = select_for_budget_with_work(
+                &messages,
+                None,
+                Some(budget),
+                ReadFixedParts::default(),
+            );
 
             assert_eq!(
                 actual.selected, expected,
@@ -3422,13 +3553,26 @@ mod tests {
                 range: MessageRange::single(20),
             };
             let expected = legacy_select_for_budget(&messages, Some(focus.clone()), budget);
-            let (actual, _) = select_for_budget_with_work(&messages, Some(focus), Some(budget), "");
+            let (actual, _) = select_for_budget_with_work(
+                &messages,
+                Some(focus),
+                Some(budget),
+                ReadFixedParts::default(),
+            );
 
             assert_eq!(
                 actual.selected, expected,
                 "selection differs at budget {budget}"
             );
         }
+    }
+
+    /// ` full=N` of a truncated output whose unbudgeted output is
+    /// `unbudgeted`: its characters with the digits of N in place of
+    /// `chars=none`. `unbudgeted` doesn't print a `same=` record.
+    fn full_atom_printing(unbudgeted: &str) -> String {
+        let chars_beside_budget = unbudgeted.chars().count() - "none".len();
+        format!(" full={}", smallest_budget_fitting(chars_beside_budget))
     }
 
     /// ` tz=` of an output without times, on test time.
@@ -3712,28 +3856,33 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let transcript = transcript(vec![text_message(1, AgentMessageRole::User, &body)]);
-        let output = format_read(
-            &[ReadRequest {
-                resolved: &resolved,
-                transcript: &transcript,
-                range: Some(MessageRange::single(1)),
-                subagent: None,
-                call: None,
-            }],
-            None,
-            Some(&ReadSlice::Match {
-                query: "needle".to_string(),
-                context: 0,
-            }),
-            ProtocolOptions {
-                budget: Some(400),
-                ..options()
-            },
-        )
-        .unwrap();
+        let sliced = |budget| {
+            format_read(
+                &[ReadRequest {
+                    resolved: &resolved,
+                    transcript: &transcript,
+                    range: Some(MessageRange::single(1)),
+                    subagent: None,
+                    call: None,
+                }],
+                None,
+                Some(&ReadSlice::Match {
+                    query: "needle".to_string(),
+                    context: 0,
+                }),
+                ProtocolOptions {
+                    budget,
+                    ..options()
+                },
+            )
+            .unwrap()
+        };
+
+        let output = sliced(Some(400));
 
         assert!(output.starts_with(&format!(
-            "protocol agent-read cut=body chars=400 policy=text omit=none{}\n",
+            "protocol agent-read cut=body chars=400{} policy=text omit=none{}\n",
+            full_atom_printing(&sliced(None)),
             tz_now()
         )));
         assert!(output.contains("| >1: needle line 1"));
@@ -4400,14 +4549,18 @@ mod tests {
             message(4, User, vec![tool_result(Some(json!("ok")), source(User))]),
             text_message(5, Assistant, &"y".repeat(TRUNCATION_FLOOR_CHARS)),
         ]);
-        let unbudgeted = ProtocolOptions {
-            budget: None,
-            ..options()
-        };
+        let unbudgeted = read(
+            &transcript,
+            None,
+            ProtocolOptions {
+                budget: None,
+                ..options()
+            },
+        );
         let without_m5 = read(
             &transcript,
             None,
-            with_budget(read(&transcript, None, unbudgeted).chars().count() - 10),
+            with_budget(unbudgeted.chars().count() - 10),
         );
         assert!(without_m5.contains("\nm3..m4 hidden "), "{without_m5}");
         let budget = without_m5.chars().count() - 10;
@@ -4417,7 +4570,8 @@ mod tests {
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=tail chars={budget} policy=text omit=m3..m5{}\n",
+                "protocol agent-read cut=tail chars={budget}{} policy=text omit=m3..m5{}\n",
+                full_atom_printing(&unbudgeted),
                 tz_now()
             )),
             "{output}"
@@ -4571,6 +4725,14 @@ mod tests {
             text_message(5, User, "question three"),
         ]);
         let budget = 1_000;
+        let unbudgeted = read(
+            &transcript,
+            None,
+            ProtocolOptions {
+                budget: None,
+                ..options()
+            },
+        );
 
         let output = read(&transcript, None, with_budget(budget));
 
@@ -4578,7 +4740,8 @@ mod tests {
         assert!(output.chars().count() > budget - 40, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=body chars=1000 policy=text omit=none{}\n",
+                "protocol agent-read cut=body chars=1000{} policy=text omit=none{}\n",
+                full_atom_printing(&unbudgeted),
                 tz_now()
             )),
             "{output}"
@@ -4808,29 +4971,34 @@ mod tests {
             text_message(4, Assistant, &"long answer ".repeat(50)),
         ]);
 
-        let output = format_read(
-            &[ReadRequest {
-                resolved: &resolved("session.jsonl"),
-                transcript: &transcript,
-                range: None,
-                subagent: None,
-                call: None,
-            }],
-            Some(ProtocolFocus {
-                conversation_full_ref: None,
-                range: MessageRange::single(3),
-            }),
-            None,
-            ProtocolOptions {
-                budget: Some(400),
-                ..options()
-            },
-        )
-        .unwrap();
+        let read_focused = |budget| {
+            format_read(
+                &[ReadRequest {
+                    resolved: &resolved("session.jsonl"),
+                    transcript: &transcript,
+                    range: None,
+                    subagent: None,
+                    call: None,
+                }],
+                Some(ProtocolFocus {
+                    conversation_full_ref: None,
+                    range: MessageRange::single(3),
+                }),
+                None,
+                ProtocolOptions {
+                    budget,
+                    ..options()
+                },
+            )
+            .unwrap()
+        };
+
+        let output = read_focused(Some(400));
 
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=head+focus+tail chars=400 policy=text omit=m1,m4{} hidden-tools=1 hidden-tool-results=1\n",
+                "protocol agent-read cut=head+focus+tail chars=400{} policy=text omit=m1,m4{} hidden-tools=1 hidden-tool-results=1\n",
+                full_atom_printing(&read_focused(None)),
                 tz_now()
             )),
             "{output}"
@@ -5079,7 +5247,8 @@ mod tests {
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=head chars={budget} policy=text omit=m1..m3{}\n",
+                "protocol agent-read cut=head chars={budget}{} policy=text omit=m1..m3{}\n",
+                full_atom_printing(&unbudgeted),
                 tz_at("2026-10-14T15:44:00Z")
             )),
             "{output}"
@@ -5102,12 +5271,23 @@ mod tests {
             text_message(3, Assistant, &"test output line\n".repeat(200)),
         ]);
 
+        let unbudgeted = read_tail(
+            &transcript,
+            None,
+            3,
+            ProtocolOptions {
+                budget: None,
+                ..options()
+            },
+        );
+
         let output = read_tail(&transcript, None, 3, with_budget(1_000));
 
         assert!(output.chars().count() <= 1_000, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=body chars=1000 policy=text omit=none{}\n",
+                "protocol agent-read cut=body chars=1000{} policy=text omit=none{}\n",
+                full_atom_printing(&unbudgeted),
                 tz_now()
             )),
             "{output}"
@@ -5692,6 +5872,36 @@ mod tests {
         assert_each_budget_cuts_short_or_ends_with_warnings(roomy, &warnings, |budget| {
             outline_with_warnings(&resolved, &transcript, with_budget(budget), &warnings)
         });
+    }
+
+    /// 24 messages print in segments, 8 one record each.
+    #[test]
+    fn truncated_outline_names_budget_printing_unbudgeted_outline() {
+        let resolved = resolved("session.jsonl");
+        let warnings = warnings_of_two_kinds();
+        let mut cuts = BTreeSet::new();
+        for (transcript, warnings) in [
+            (long_session(24), &warnings[..]),
+            (long_session(24), &[][..]),
+            (long_session(8), &warnings[..]),
+        ] {
+            let outline_at = |budget| {
+                let options = ProtocolOptions {
+                    budget,
+                    ..options()
+                };
+                outline_with_warnings(&resolved, &transcript, options, warnings)
+            };
+            let budgets =
+                |unbudgeted: usize| (100..unbudgeted).step_by(19).chain([unbudgeted + 10]);
+            cuts.extend(cuts_checking_full(budgets, outline_at));
+        }
+
+        assert_eq!(
+            cuts,
+            BTreeSet::from(["none".to_owned(), "tail".to_owned()]),
+            "each cut= an outline prints"
+        );
     }
 
     #[test]
@@ -7559,7 +7769,7 @@ mod tests {
     /// Expanding m1 past midnight adds a `day` record before m2, back on the
     /// first date.
     fn reply_back_on_the_first_date() -> AgentTranscript {
-        calls_across_midnight(180, 2, CallHeaders::Varied, ReplyDate::FirstDay)
+        calls_across_midnight(180, 2, CallHeaders::Long, ReplyDate::FirstDay)
     }
 
     /// m1's floor holds records on both sides of midnight.
@@ -7569,7 +7779,7 @@ mod tests {
 
     /// m1's floor ends before midnight, beside m2 on the next day.
     fn floor_before_midnight() -> AgentTranscript {
-        calls_across_midnight(180, 2, CallHeaders::Varied, ReplyDate::NextDay)
+        calls_across_midnight(180, 2, CallHeaders::Long, ReplyDate::NextDay)
     }
 
     /// m1 holds a body of 198 characters, then one call: keeping 200
@@ -7596,6 +7806,133 @@ mod tests {
         }
     }
 
+    /// The `cut=` of each read `read_at` prints at `samples` budgets at
+    /// fixed steps from [`SMALLEST_SWEPT_BUDGET`], each read's `full=`
+    /// checked.
+    fn cuts_at_sampled_budgets(
+        samples: usize,
+        read_at: impl Fn(Option<usize>) -> String,
+    ) -> BTreeSet<String> {
+        let sampled_budgets = |unbudgeted_chars: usize| {
+            let step = unbudgeted_chars.saturating_sub(SMALLEST_SWEPT_BUDGET) / samples;
+            stepped_budgets(unbudgeted_chars, step.max(1))
+        };
+        cuts_checking_full(sampled_budgets, read_at)
+    }
+
+    /// An output one digit short of the next power of ten needs a budget
+    /// with one digit more.
+    #[test]
+    fn smallest_budget_fitting_counts_digits_of_budget_it_names() {
+        let cases = [
+            (0, 1),
+            (8, 9),
+            (9, 11),
+            (97, 99),
+            (98, 101),
+            (99, 102),
+            (996, 999),
+            (997, 1_001),
+            (999, 1_003),
+            (9_996, 10_001),
+        ];
+
+        for (chars, budget) in cases {
+            assert_eq!(
+                smallest_budget_fitting(chars),
+                budget,
+                "{chars} characters and the digits of `chars=` fit budget {budget} and no smaller one"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_read_names_budget_printing_every_entry() {
+        let [tools, tools_and_results] = call_flags();
+        let replies = timed_replies(12, 300);
+        let one_reply = timed_replies(1, 100);
+        let (session, other_session) = (resolved("session.jsonl"), resolved("other.jsonl"));
+        let request = |resolved, transcript, range| ReadRequest {
+            resolved,
+            transcript,
+            range,
+            subagent: None,
+            call: None,
+        };
+        let with = |options: ProtocolOptions, budget| ProtocolOptions { budget, ..options };
+        let mut cuts = BTreeSet::new();
+        for (transcript, options) in [
+            (reply_back_on_the_first_date(), tools),
+            (floor_across_midnight(), tools_and_results),
+            (replies.clone(), options()),
+        ] {
+            cuts.extend(cuts_at_sampled_budgets(12, |budget| {
+                read(&transcript, None, with(options, budget))
+            }));
+        }
+        cuts.extend(cuts_at_sampled_budgets(12, |budget| {
+            let focus = ProtocolFocus {
+                conversation_full_ref: None,
+                range: MessageRange::single(6),
+            };
+            let requests = [request(&session, &replies, None)];
+            format_read(&requests, Some(focus), None, with(options(), budget)).unwrap()
+        }));
+        cuts.extend(cuts_at_sampled_budgets(12, |budget| {
+            read_tail(&replies, None, 8, with(options(), budget))
+        }));
+        // A tail read keeps each request's end first; omitting the start of
+        // a later request leaves a gap after an earlier one.
+        let long_replies = timed_replies(3, 2_000);
+        for (earlier, later) in [
+            (&one_reply, &replies),
+            (&one_reply, &long_replies),
+            (&long_replies, &replies),
+        ] {
+            cuts.extend(cuts_at_sampled_budgets(24, |budget| {
+                let requests = [
+                    request(&other_session, earlier, None),
+                    request(&session, later, None),
+                ];
+                read_tails(&requests, 2, with(options(), budget))
+            }));
+        }
+        let long_reply = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            &"a line of test output\n".repeat(60),
+        )]);
+        cuts.extend(cuts_at_sampled_budgets(12, |budget| {
+            let slice = ReadSlice::Lines("1..40".parse().unwrap());
+            let requests = [request(
+                &session,
+                &long_reply,
+                Some(MessageRange::single(1)),
+            )];
+            format_read(&requests, None, Some(&slice), with(options(), budget)).unwrap()
+        }));
+
+        let every_cut = [
+            "none",
+            "tail",
+            "head",
+            "focus",
+            "head+focus",
+            "head+focus+tail",
+            "body",
+            "body+tail",
+            "body+head",
+            "body+focus",
+            "body+head+focus",
+            "body+head+focus+tail",
+        ];
+        assert_eq!(
+            cuts,
+            every_cut.map(str::to_owned).into(),
+            "each cut= a read prints"
+        );
+    }
+
     /// Checked where a truncation keeps more than its floor: shrinking it to
     /// its floor makes room for the message.
     #[test]
@@ -7603,6 +7940,10 @@ mod tests {
         let [tools, tools_and_results] = call_flags();
         for (transcript, options) in [
             (reply_back_on_the_first_date(), tools),
+            (
+                calls_across_midnight(180, 2, CallHeaders::Varied, ReplyDate::FirstDay),
+                tools,
+            ),
             // m1's floor ends on its first call header's first character.
             (
                 calls_across_midnight(198, 2, CallHeaders::Long, ReplyDate::NextDay),
@@ -7829,24 +8170,32 @@ mod tests {
             &reply_back_on_the_first_date(),
             None,
             ProtocolOptions {
-                budget: Some(643),
+                budget: Some(839),
                 tools: true,
                 ..options()
             },
         );
 
-        assert!(output.chars().count() <= 643, "{output}");
+        assert!(output.chars().count() <= 839, "{output}");
+        assert!(
+            output.contains(OMISSION_MARKER),
+            "m1 is truncated: {output}"
+        );
+        assert!(
+            output.contains("\nday 2026-10-15"),
+            "m1 is expanded past midnight: {output}"
+        );
         assert!(output.contains("| Done.\n"), "{output}");
     }
 
     #[test]
     fn floor_holding_records_on_both_sides_of_midnight_is_kept_beside_next_days_reply() {
-        assert_m1_keeps_its_floor_beside_m2(&floor_across_midnight(), 662);
+        assert_m1_keeps_its_floor_beside_m2(&floor_across_midnight(), 672);
     }
 
     #[test]
     fn floor_ending_before_midnight_is_kept_beside_next_days_reply() {
-        assert_m1_keeps_its_floor_beside_m2(&floor_before_midnight(), 627);
+        assert_m1_keeps_its_floor_beside_m2(&floor_before_midnight(), 636);
     }
 
     /// Asserts that `budget` is the smallest budget showing m2 in the read of

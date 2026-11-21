@@ -3,7 +3,8 @@
 
 use crate::agent::diagnostic::{AgentWarning, format_warning_records, warning_atoms};
 use crate::agent::protocol::{
-    budget_atom, cut_short, escape_atom, protocol_snippet, title_for_conversation,
+    budget_atom, cut_short, decimal_digits, escape_atom, full_atom, protocol_snippet,
+    smallest_budget_fitting, title_for_conversation,
 };
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::time_span::{output_offset, time_atoms, tz_atom};
@@ -107,7 +108,8 @@ pub fn format_sessions(listing: &SessionListing, budget: Option<usize>) -> Strin
 /// `budget` beside every warning record, a `continue sessions` record naming
 /// the offset of the next page, then the warning records, whole. Their times
 /// are in `written_at`'s zone, and `written_at` sets the `tz=` offset of a
-/// listing that does not show a time.
+/// listing that does not show a time. A header omitting a record names the
+/// budget printing every session.
 pub fn format_sessions_with_warnings(
     listing: &SessionListing,
     budget: Option<usize>,
@@ -128,15 +130,16 @@ pub fn format_sessions_with_warnings(
         .iter()
         .map(|session| session_record(session, &listing.window, offset, written_at.timezone()))
         .collect::<Vec<_>>();
-    let render = |listed: usize| {
+    let render = |listed: usize, full: Option<usize>| {
         let cut = if listed == records.len() {
             "none"
         } else {
             "tail"
         };
         let mut output = format!(
-            "protocol agent-sessions cut={cut} chars={}{}{warning_suffix}\n",
+            "protocol agent-sessions cut={cut} chars={}{}{}{warning_suffix}\n",
             budget_atom(budget),
+            full_atom(cut, full),
             tz_atom(offset)
         );
         output.push_str(&format!(
@@ -159,11 +162,16 @@ pub fn format_sessions_with_warnings(
     };
 
     let mut listed = records.len();
-    let mut output = render(listed);
-    if let Some(budget) = budget {
+    let mut output = render(listed, None);
+    if let Some(budget) = budget
+        && output.chars().count() > budget
+    {
+        let full = Some(smallest_budget_fitting(
+            output.chars().count() - decimal_digits(budget),
+        ));
         while output.chars().count() > budget && listed > 0 {
             listed -= 1;
-            output = render(listed);
+            output = render(listed, full);
         }
         if output.chars().count() > budget {
             return cut_short(&output, budget);
@@ -201,8 +209,8 @@ fn session_record(
 mod tests {
     use super::*;
     use crate::agent::test_support::{
-        assert_each_budget_cuts_short_or_ends_with_warnings, resolved_conversation,
-        warnings_of_two_kinds, written_at,
+        assert_each_budget_cuts_short_or_ends_with_warnings, cuts_checking_full,
+        resolved_conversation, warnings_of_two_kinds, written_at,
     };
     use crate::agent::time_span::TimeSpan;
     use crate::history::MessageTimes;
@@ -325,15 +333,22 @@ mod tests {
         }
     }
 
-    /// The smallest budget that holds a `cut=tail` header naming it and the
+    /// The smallest budget that fits a `cut=tail` header naming it, the
+    /// `full=` of the listing whose unbudgeted output is `unbudgeted` and the
     /// offset `tz`, then `body` characters.
-    fn budget_with_header(body: usize, tz: &str) -> usize {
+    fn budget_with_header(body: usize, unbudgeted: &str, tz: &str) -> usize {
         (body..)
             .find(|&budget| {
-                let header = format!("protocol agent-sessions cut=tail chars={budget}{tz}\n");
-                body + header.chars().count() <= budget
+                body + truncated_header(budget, unbudgeted, tz).chars().count() <= budget
             })
             .unwrap()
+    }
+
+    /// The `cut=tail` header at `budget` of the listing whose unbudgeted
+    /// output is `unbudgeted`, naming the offset `tz`.
+    fn truncated_header(budget: usize, unbudgeted: &str, tz: &str) -> String {
+        let full = smallest_budget_fitting(unbudgeted.chars().count() - "none".len());
+        format!("protocol agent-sessions cut=tail chars={budget} full={full}{tz}\n")
     }
 
     #[test]
@@ -436,15 +451,17 @@ mod tests {
             .sum::<usize>();
         let continue_record = "continue sessions offset=2 action=rerun-with-offset\n";
         let tz = tz_of(&listing);
-        let budget = budget_with_header(sessions_line_and_two_records + continue_record.len(), &tz);
+        let budget = budget_with_header(
+            sessions_line_and_two_records + continue_record.len(),
+            &unbudgeted,
+            &tz,
+        );
 
         let output = format_sessions(&listing, Some(budget));
 
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
-            output.starts_with(&format!(
-                "protocol agent-sessions cut=tail chars={budget}{tz}\n"
-            )),
+            output.starts_with(&truncated_header(budget, &unbudgeted, &tz)),
             "{output}"
         );
         assert!(output.contains("listed=2\n"), "{output}");
@@ -492,13 +509,35 @@ mod tests {
             &warning_record,
         ]
         .concat();
-        let budget = budget_with_header(body.chars().count(), &tz_of(&listing));
+        let budget = budget_with_header(body.chars().count(), &unbudgeted, &tz_of(&listing));
 
         let output = records_with_warnings(&listing, Some(budget), &warnings);
 
         assert!(output.chars().count() <= budget, "{output}");
         assert!(output.contains("listed=0\n"), "{output}");
         assert!(output.ends_with(&warning_record), "{output}");
+    }
+
+    /// A page of two sessions continues with the third; the whole listing
+    /// doesn't continue.
+    #[test]
+    fn truncated_listing_names_budget_printing_every_session_of_its_page() {
+        let sessions = sessions();
+        let warnings = warnings_of_two_kinds();
+        let mut cuts = std::collections::BTreeSet::new();
+        for (limit, warnings) in [(2, &warnings[..]), (10, &[][..])] {
+            let listing = listing(&sessions, &TimeFilter::default(), 0, limit);
+            let output_at = |budget| records_with_warnings(&listing, budget, warnings);
+            let budgets =
+                |unbudgeted: usize| (100..unbudgeted).step_by(11).chain([unbudgeted + 10]);
+            cuts.extend(cuts_checking_full(budgets, output_at));
+        }
+
+        assert_eq!(
+            cuts,
+            ["none", "tail"].map(str::to_owned).into(),
+            "each cut= a listing prints"
+        );
     }
 
     #[test]

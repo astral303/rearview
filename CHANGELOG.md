@@ -113,6 +113,11 @@
   message to another agent. `--match` now finds text in the body.
   - A read of several messages and `agent outline` count the body's lines on
     the call's line: `Edit: src/lib.rs (+2 lines)`.
+- Add `full=N` to the header of truncated agent output: the same command with
+  `--budget N` prints what `--no-budget` prints. A header with `cut=` other
+  than `none` prints it after `chars=`.
+- Raise the default budget of `agent read` and `agent outline` from 6,000 to
+  20,000 characters. `[agent].output_chars = 6000` sets the earlier default.
 - Copy one block of a message in the viewer. In message navigation, focus a
   message's blocks (`→`), step between them (`J`/`K`) and copy the focused
   paragraph, heading, code block, quote, list or table (`y`).

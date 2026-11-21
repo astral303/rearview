@@ -951,6 +951,75 @@ fn agent_sessions_follows_configured_output_budget() {
     assert_shows(&output, "continue sessions offset=");
 }
 
+#[test]
+fn each_agent_command_prints_its_default_configured_or_given_budget() {
+    let home = tempfile::tempdir().expect("home");
+    let claude_config = tempfile::tempdir().expect("claude config");
+    write_transcript(
+        &project(claude_config.path()).join(format!("{CLAUDE_MAIN_SESSION}.jsonl")),
+        "budget question",
+    );
+    let config_dir = home.path().join(".config/rearview");
+    std::fs::create_dir_all(&config_dir).expect("create config directory");
+    let header_chars = |config_toml: &str, args: &[&str]| {
+        std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config");
+        let output = stdout_of(
+            &rearview_in(claude_config.path())
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .args(args)
+                .output()
+                .expect("run rearview"),
+        );
+        let header = output.lines().next().unwrap_or_default().to_owned();
+        header
+            .split_whitespace()
+            .find_map(|atom| atom.strip_prefix("chars="))
+            .unwrap_or_else(|| panic!("a header with chars=: {output}"))
+            .to_owned()
+    };
+    let configured = "[agent]\noutput_chars = 9000\n";
+
+    for (command, default) in [
+        (vec!["agent", "read", CLAUDE_MAIN_SESSION], "20000"),
+        (vec!["agent", "outline", CLAUDE_MAIN_SESSION], "20000"),
+        (vec!["agent", "search", "--lexical", "budget"], "6000"),
+        (
+            vec![
+                "agent",
+                "within",
+                CLAUDE_MAIN_SESSION,
+                "budget",
+                "--lexical",
+            ],
+            "6000",
+        ),
+        (vec!["agent", "sessions"], "6000"),
+    ] {
+        let with_flag = |flag: &[&'static str]| [&command[..], flag].concat();
+        assert_eq!(
+            header_chars("", &command),
+            default,
+            "the command's default budget: {command:?}"
+        );
+        assert_eq!(
+            header_chars(configured, &command),
+            "9000",
+            "[agent].output_chars replaces the default: {command:?}"
+        );
+        assert_eq!(
+            header_chars(configured, &with_flag(&["--budget", "7000"])),
+            "7000",
+            "--budget replaces [agent].output_chars: {command:?}"
+        );
+        assert_eq!(
+            header_chars(configured, &with_flag(&["--no-budget"])),
+            "none",
+            "--no-budget prints without a budget: {command:?}"
+        );
+    }
+}
+
 /// Earlier releases matched the name of the folder holding a Claude Code
 /// session. That name is not a project name.
 #[test]
