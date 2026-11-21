@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::duration::elapsed;
 use crate::log_entry::{ContentBlock, LogEntry, Tool, ToolSummaryPhrase, UserContent};
+use crate::tool_format;
 use crate::tui::theme::Rgb;
 
 use super::calls::{
@@ -114,8 +115,8 @@ pub(super) struct ToolActivitySummary {
 }
 
 impl ToolActivitySummary {
-    fn add_call(&mut self, tool: Tool) {
-        *self.counts.entry(tool.summary_kind()).or_default() += 1;
+    fn add_calls(&mut self, tool: Tool, count: usize) {
+        *self.counts.entry(tool.summary_kind()).or_default() += count;
     }
 
     pub(super) fn count_of(&self, tool: Tool) -> usize {
@@ -233,18 +234,20 @@ pub(super) fn render_tool_activity_summary(
     }
 }
 
-/// The run-row activity in `blocks`: every call, plus every result carrying a
-/// tool name of its own. A result answering a call counts nothing — the call
-/// above it is already counted.
+/// The run-row activity in `blocks`: every call, a shell call once per
+/// command, plus every result carrying a tool name of its own. A result
+/// answering a call counts nothing — the call above it is already counted.
 pub(super) fn summarize_tool_activity(blocks: &[ContentBlock]) -> ToolActivitySummary {
     let mut summary = ToolActivitySummary::default();
     for block in blocks {
         match block {
-            ContentBlock::ToolUse { tool, .. } => summary.add_call(*tool),
+            ContentBlock::ToolUse { tool, input, .. } => {
+                summary.add_calls(*tool, tool_format::counted_calls(*tool, input));
+            }
             ContentBlock::ToolResult {
                 standalone_tool_name: Some(_),
                 ..
-            } => summary.add_call(Tool::ResultReceipt),
+            } => summary.add_calls(Tool::ResultReceipt, 1),
             _ => {}
         }
     }

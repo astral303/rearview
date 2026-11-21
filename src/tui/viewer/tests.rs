@@ -4413,6 +4413,219 @@ fn tool_call_metadata_tracks_truncated_and_expanded_state() {
     assert!(expanded.iter().any(|line| line_text(line).contains("five")));
 }
 
+const SEVERAL_COMMANDS_ID: &str = "call_several";
+
+/// The rows of a Codex `exec` call that runs `commands`.
+fn several_commands_rows(
+    commands: &[&str],
+    tool_display: ToolDisplayMode,
+    content_width: usize,
+    expanded: bool,
+) -> Vec<RenderedLine> {
+    let input = serde_json::json!({ "commands": commands });
+    let output_id = several_commands_output_id();
+    let mut lines = Vec::new();
+    render_tool_call(
+        &mut lines,
+        &ToolCallRenderSpec {
+            name: "exec",
+            tool: Tool::Shell,
+            input: &input,
+            label: "Codex",
+            label_color: th().accent_dim,
+            dimmed: false,
+            tool_word_color: None,
+            content_width,
+            timing: timing::TimingSlot::Disabled,
+            tool_display,
+            tool_output_id: &output_id,
+            expanded,
+        },
+    );
+    lines
+}
+
+fn several_commands_output_id() -> ToolOutputId {
+    make_tool_output_id(
+        0,
+        None,
+        0,
+        ToolOutputKind::ToolCall,
+        Some(SEVERAL_COMMANDS_ID),
+    )
+}
+
+fn texts(lines: &[RenderedLine]) -> Vec<String> {
+    lines.iter().map(line_text).collect()
+}
+
+#[test]
+fn shell_call_of_several_commands_shows_each_on_exec_row_under_one_label() {
+    let rows = several_commands_rows(
+        &[
+            "git status --short",
+            "cd src\ncargo test",
+            "rg -n TODO src --glob '*.rs' --glob '!target'",
+        ],
+        ToolDisplayMode::Full,
+        30,
+        false,
+    );
+
+    assert_eq!(
+        texts(&rows),
+        [
+            "    Codex │ exec: git status --short",
+            "          │ exec: cd src",
+            "          │       cargo test",
+            "          │ exec: rg -n TODO src --glob",
+            "          │       '*.rs' --glob '!target'",
+        ]
+    );
+}
+
+#[test]
+fn several_commands_truncate_each_long_command_alone_and_one_click_toggles_all() {
+    let long = "one\ntwo\nthree\nfour\nfive\nsix";
+    let commands = ["cd src\ncargo test", long, "git log -1"];
+
+    let truncated = several_commands_rows(&commands, ToolDisplayMode::Truncated, 80, false);
+
+    let text = texts(&truncated).join("\n");
+    assert!(
+        text.contains("exec: cd src"),
+        "the short command shows: {text}"
+    );
+    assert!(
+        text.contains("exec: one"),
+        "the long command's first row shows: {text}"
+    );
+    assert!(
+        text.contains("four"),
+        "the long command's third later row shows: {text}"
+    );
+    assert!(
+        !text.contains("five"),
+        "the long command shows 3 later rows: {text}"
+    );
+    assert!(
+        text.contains("exec: git log -1"),
+        "the command after the long one shows: {text}"
+    );
+    let indicator = truncated
+        .iter()
+        .position(|line| line_text(line).contains("(2 more lines...)"))
+        .unwrap_or_else(|| panic!("the long command shows its hidden rows' count: {text}"));
+    assert!(
+        line_text(&truncated[indicator + 1]).contains("exec: git log -1"),
+        "the count sits under the long command, before the next: {text}"
+    );
+    let id = several_commands_output_id();
+    let short_command_row = truncated
+        .iter()
+        .find(|line| line_text(line).ends_with("cargo test"))
+        .unwrap();
+    assert!(
+        short_command_row.clickable && short_command_row.tool_output_id.as_ref() == Some(&id),
+        "a click on a command shown whole also toggles the call: {text}"
+    );
+    assert!(
+        truncated
+            .iter()
+            .filter(|line| line.clickable)
+            .all(|line| line.tool_output_id.as_ref() == Some(&id)),
+        "every clickable row toggles the one call"
+    );
+
+    let expanded = several_commands_rows(&commands, ToolDisplayMode::Truncated, 80, true);
+
+    let text = texts(&expanded).join("\n");
+    assert!(
+        text.contains("six"),
+        "the expanded call shows the long command's last row: {text}"
+    );
+    assert!(
+        !text.contains("more lines"),
+        "the expanded call truncates no command: {text}"
+    );
+}
+
+#[test]
+fn several_commands_each_longer_than_limit_truncate_under_their_own_command() {
+    let commands = ["a1\na2\na3\na4\na5\na6", "b1\nb2\nb3\nb4\nb5\nb6\nb7"];
+
+    let rows = several_commands_rows(&commands, ToolDisplayMode::Truncated, 80, false);
+
+    assert_eq!(
+        texts(&rows),
+        [
+            "    Codex │ exec: a1",
+            "          │       a2",
+            "          │       a3",
+            "          │       a4",
+            "          │       (2 more lines...)",
+            "          │ exec: b1",
+            "          │       b2",
+            "          │       b3",
+            "          │       b4",
+            "          │       (3 more lines...)",
+        ]
+    );
+}
+
+#[test]
+fn command_one_row_over_limit_shows_whole_after_truncated_command() {
+    let commands = ["a1\na2\na3\na4\na5\na6", "b1\nb2\nb3\nb4\nb5"];
+
+    let rows = several_commands_rows(&commands, ToolDisplayMode::Truncated, 80, false);
+
+    assert_eq!(
+        texts(&rows),
+        [
+            "    Codex │ exec: a1",
+            "          │       a2",
+            "          │       a3",
+            "          │       a4",
+            "          │       (2 more lines...)",
+            "          │ exec: b1",
+            "          │       b2",
+            "          │       b3",
+            "          │       b4",
+            "          │       b5",
+        ]
+    );
+}
+
+#[test]
+fn summary_row_counts_each_command_of_shell_call_that_runs_several() {
+    let entries = vec![
+        RenderableEntry {
+            entry_index: 0,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","agent":"Codex","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"exec","tool":"shell","input":{"commands":["git status","git log -1","rg -n TODO src"]}}]}}"#,
+            )
+            .unwrap(),
+        },
+        tool_result_entry(1, "call_1"),
+        RenderableEntry {
+            entry_index: 2,
+            entry: serde_json::from_str(
+                r#"{"type":"assistant","agent":"Codex","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_2","name":"exec","tool":"shell","input":{"command":"cargo test"}}]}}"#,
+            )
+            .unwrap(),
+        },
+        tool_result_entry(3, "call_2"),
+    ];
+
+    let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Hidden));
+
+    let text = rendered_text(&rendered);
+    assert!(
+        text.contains("Ran 4 shell commands"),
+        "the three commands of one call and the single command count 4: {text}"
+    );
+}
+
 #[test]
 fn test_format_timestamp() {
     // UTC timestamp with Z suffix

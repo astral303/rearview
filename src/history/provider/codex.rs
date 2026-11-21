@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 31,
+            schema_version: 32,
         }
     }
 
@@ -1303,11 +1303,22 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "custom_tool_call_output", "id": "ctco_raw_patch", "call_id": "call_raw_patch", "output": [{"type": "input_text", "text": "Done: 1 file added"}]}),
                     ),
+                    // A script that runs three shell commands at once.
+                    line(
+                        45,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_several_commands", "status": "completed", "call_id": "call_several_commands", "name": "exec", "input": "const [status, log, todo] = await Promise.all([\n  tools.exec_command({cmd:\"git status --short\"}),\n  tools.exec_command({cmd:\"git log -5 --oneline\"}),\n  tools.exec_command({cmd:\"rg -n SEVERAL_COMMANDS_SENTINEL src\"}),\n]);\ntext([status, log, todo].map(r => r.output).join(\"\\n\"));"}),
+                    ),
+                    line(
+                        46,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_several_commands", "call_id": "call_several_commands", "output": [{"type": "input_text", "text": "src/lib.rs:7"}]}),
+                    ),
                 ],
             );
             const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time";
             const LAUNCH_RUN: &str = "Started 2 agents";
-            const SCRIPT_RUN: &str = "Ran 1 shell command, ran 2 scripts, edited 2 files, waited 3 times, updated the task list 1 time";
+            const SCRIPT_RUN: &str = "Ran 4 shell commands, ran 2 scripts, edited 2 files, waited 3 times, updated the task list 1 time";
             AgentSession::new(
                 Source::Codex,
                 session,
@@ -1404,6 +1415,11 @@ pub(super) mod tests {
                     Marker::shown(
                         "patch in a script's variable containing a `String.raw` template",
                         "RAW_PATCH_SENTINEL",
+                    )
+                    .in_summary_row(SCRIPT_RUN),
+                    Marker::in_call_or_subagent(
+                        "later shell command of a script that runs several",
+                        "SEVERAL_COMMANDS_SENTINEL",
                     )
                     .in_summary_row(SCRIPT_RUN),
                 ],

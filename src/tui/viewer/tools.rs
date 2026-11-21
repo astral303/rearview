@@ -177,48 +177,90 @@ pub(super) struct ToolResultRenderSpec<'a> {
     pub expanded: bool,
 }
 /// Render a formatted tool call: its header rows, then its body rows under
-/// the truncation rule.
+/// the truncation rule. A shell call that runs several commands shows each
+/// command's rows in turn, truncated alone, under the call's one label.
 pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRenderSpec<'_>) {
+    let formatted =
+        tool_format::format_tool_call(spec.name, spec.tool, spec.input, tool_format::NO_WRAP);
+    let sections: Vec<CallSection> = call_sections(&formatted, spec.content_width)
+        .map(|rows| {
+            let truncation = Truncation::of_tool_result(
+                rows.body.len(),
+                TRUNCATED_BODY_LINES,
+                spec.tool_display,
+                spec.expanded,
+            );
+            CallSection { rows, truncation }
+        })
+        .collect();
+    // A click on any command's body expands or truncates every command.
+    let clickable = sections.iter().any(|section| section.truncation.clickable);
+    for (index, section) in sections.into_iter().enumerate() {
+        let (timing, name) = if index == 0 {
+            (
+                spec.timing,
+                NameCol::Label {
+                    text: spec.label,
+                    color: spec.label_color,
+                    bold: false,
+                    dimmed: spec.dimmed,
+                },
+            )
+        } else {
+            (spec.timing.continuation(), NameCol::BlankPlain)
+        };
+        let first_row = LedgerRow {
+            timing,
+            name,
+            separator_dimmed: spec.dimmed,
+            tool_output_id: Some(spec.tool_output_id),
+            clickable: false,
+        };
+        render_call_section(lines, spec, first_row, section, clickable);
+    }
+}
+
+/// A section's rows and how many of its body rows show.
+struct CallSection {
+    rows: CallRows,
+    truncation: Truncation,
+}
+
+/// Render one section: its first row as `first_row` places it, its later
+/// header rows, then its body rows under its truncation. `clickable` makes
+/// the body rows toggle the whole call.
+fn render_call_section(
+    lines: &mut Vec<RenderedLine>,
+    spec: &ToolCallRenderSpec<'_>,
+    first_row: LedgerRow<'_>,
+    section: CallSection,
+    clickable: bool,
+) {
     let ToolCallRenderSpec {
         name,
-        tool,
-        input,
-        label,
-        label_color,
         dimmed,
         tool_word_color,
-        content_width,
         timing,
-        tool_display,
         tool_output_id,
-        expanded,
+        ..
     } = *spec;
-    let formatted = tool_format::format_tool_call(name, tool, input, tool_format::NO_WRAP);
-    let CallRows {
-        header,
-        blank_row_after_header,
-        indent,
-        body,
-    } = call_rows(&formatted, content_width);
-    let (first_row, later_header_rows) = header
+    let CallSection {
+        rows:
+            CallRows {
+                header,
+                blank_row_after_header,
+                indent,
+                body,
+            },
+        truncation,
+    } = section;
+    let (header_first_row, later_header_rows) = header
         .split_first()
         .expect("wrap_row_indented yields at least one row");
-
     push_row(
         lines,
-        LedgerRow {
-            timing,
-            name: NameCol::Label {
-                text: label,
-                color: label_color,
-                bold: false,
-                dimmed,
-            },
-            separator_dimmed: dimmed,
-            tool_output_id: Some(tool_output_id),
-            clickable: false,
-        },
-        header_spans(&first_row.text, name, tool_word_color, dimmed),
+        first_row,
+        header_spans(&header_first_row.text, name, tool_word_color, dimmed),
     );
 
     let continuation = timing.continuation();
@@ -240,9 +282,7 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
         );
     }
 
-    let truncation =
-        Truncation::of_tool_result(body.len(), TRUNCATED_BODY_LINES, tool_display, expanded);
-    let id = truncation.clickable.then_some(tool_output_id);
+    let id = clickable.then_some(tool_output_id);
     for (row, style) in body.into_iter().take(truncation.shown) {
         push_row(
             lines,
@@ -251,7 +291,7 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
                 name: NameCol::BlankPlain,
                 separator_dimmed: dimmed,
                 tool_output_id: id,
-                clickable: truncation.clickable,
+                clickable,
             },
             RowContent::wrapped(vec![(row.text, style)], row.wrap),
         );
@@ -268,6 +308,24 @@ pub(super) fn render_tool_call(lines: &mut Vec<RenderedLine>, spec: &ToolCallRen
     }
 }
 
+/// The rows of each section of a call that truncates on its own: the call,
+/// or each command of a shell call.
+fn call_sections<'a>(
+    formatted: &'a FormattedToolCall,
+    content_width: usize,
+) -> impl Iterator<Item = CallRows> + 'a {
+    std::iter::once(call_rows(formatted, content_width)).chain(formatted.later_commands.iter().map(
+        move |command| {
+            command_rows(
+                &formatted.prefix,
+                &command.value,
+                command.body.as_ref(),
+                content_width,
+            )
+        },
+    ))
+}
+
 /// The rows of one call at the content width, without the ledger columns.
 struct CallRows {
     /// The header's rows: the first opens with the prefix, the rest are
@@ -282,41 +340,58 @@ struct CallRows {
 }
 
 /// Wrap the call at `content_width`. The header's value wraps under its
-/// prefix. A shell command's rows after the first, its first line's wrapped
-/// rows included, are body rows under the value column with no blank row
-/// between, so a long command truncates as a long body does; another call's
-/// header shows whole and its body sits flush left after a blank row.
+/// prefix and shows whole; the body sits flush left after a blank row. A
+/// shell command's rows are [`command_rows`].
 fn call_rows(formatted: &FormattedToolCall, content_width: usize) -> CallRows {
-    let value_column = " ".repeat(formatted.prefix.width());
-    let mut header = wrap_row_indented(
-        &formatted.value,
-        content_width,
-        &formatted.prefix,
-        &value_column,
-    );
     if formatted.value_is_first_line {
-        let mut body: Vec<_> = header
-            .drain(1..)
-            .map(|row| (row, plain_body_style()))
-            .collect();
-        if let Some(later_lines) = &formatted.body {
-            body.extend(body_rows(later_lines, content_width, &value_column));
-        }
-        return CallRows {
-            header,
-            blank_row_after_header: false,
-            indent: value_column,
-            body,
-        };
+        return command_rows(
+            &formatted.prefix,
+            &formatted.value,
+            formatted.body.as_ref(),
+            content_width,
+        );
     }
+    let value_column = " ".repeat(formatted.prefix.width());
     CallRows {
-        header,
+        header: wrap_row_indented(
+            &formatted.value,
+            content_width,
+            &formatted.prefix,
+            &value_column,
+        ),
         blank_row_after_header: formatted.body.is_some(),
         indent: String::new(),
         body: formatted
             .body
             .as_ref()
             .map_or_else(Vec::new, |body| body_rows(body, content_width, "")),
+    }
+}
+
+/// A shell command's rows: its first row after `prefix`, then its later
+/// rows, its first line's wrapped rows included, as body rows under the
+/// value column with no blank row between, so a long command truncates as a
+/// long body does.
+fn command_rows(
+    prefix: &str,
+    first_line: &str,
+    later_lines: Option<&ToolBody>,
+    content_width: usize,
+) -> CallRows {
+    let value_column = " ".repeat(prefix.width());
+    let mut header = wrap_row_indented(first_line, content_width, prefix, &value_column);
+    let mut body: Vec<_> = header
+        .drain(1..)
+        .map(|row| (row, plain_body_style()))
+        .collect();
+    if let Some(later_lines) = later_lines {
+        body.extend(body_rows(later_lines, content_width, &value_column));
+    }
+    CallRows {
+        header,
+        blank_row_after_header: false,
+        indent: value_column,
+        body,
     }
 }
 

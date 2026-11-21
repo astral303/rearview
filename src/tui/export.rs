@@ -803,11 +803,7 @@ fn markdown_code_fence(content: &str) -> String {
 
 /// Format a tool call for export (non-ledger formats)
 fn format_tool_call_for_export(name: &str, tool: Tool, input: &serde_json::Value) -> String {
-    let formatted = tool_format::format_tool_call(name, tool, input, tool_format::NO_WRAP);
-    match &formatted.body {
-        Some(body) => format!("{}\n{}", formatted.header(), body.text),
-        None => formatted.header(),
-    }
+    tool_format::format_tool_call(name, tool, input, tool_format::NO_WRAP).text()
 }
 
 /// Format a tool call for ledger export with line wrapping
@@ -817,11 +813,7 @@ fn format_tool_call_for_ledger(
     input: &serde_json::Value,
     max_width: usize,
 ) -> String {
-    let formatted = tool_format::format_tool_call(name, tool, input, max_width);
-    let text = match &formatted.body {
-        Some(body) => format!("{}\n{}", formatted.header(), body.text),
-        None => formatted.header(),
-    };
+    let text = tool_format::format_tool_call(name, tool, input, max_width).text();
     // Wrap any remaining long lines
     wrap_plain_text(&text, max_width)
 }
@@ -1258,6 +1250,21 @@ mod tests {
 
         assert!(copied.contains(ASSISTANT_TOOL_CALL), "{copied}");
         assert!(copied.contains(THINKING_BLOCK), "{copied}");
+    }
+
+    #[test]
+    fn exports_show_each_of_several_shell_commands_after_its_prefix() {
+        let input = serde_json::json!({"commands": ["git status --short", "cd src\ncargo test", "rg -n TODO src"]});
+
+        assert_eq!(
+            format_tool_call_for_export("exec", Tool::Shell, &input),
+            "exec: git status --short\nexec: cd src\ncargo test\nexec: rg -n TODO src"
+        );
+        assert_eq!(
+            format_tool_call_for_ledger("exec", Tool::Shell, &input, 20),
+            "exec: git status\n--short\nexec: cd src\ncargo test\nexec: rg -n TODO src",
+            "the ledger export wraps each command at the width less the prefix"
+        );
     }
 
     /// The first entry of the Claude session at `path`, as exports read it.

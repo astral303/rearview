@@ -1087,14 +1087,20 @@ fn non_empty_text(text: &str) -> Option<String> {
 }
 
 /// A tool call as search reads it, terminal codes stripped: the header the
-/// viewer shows, with every line of a shell command, then the body as
-/// [`ToolCallBody::searched`] reads it. When the header's value is empty, as
-/// for input the viewer shows as JSON, the header is the call's name and
-/// input keys.
+/// viewer shows, with every line of each shell command after the prefix,
+/// then the body as [`ToolCallBody::searched`] reads it. When the header's
+/// value is empty, as for input the viewer shows as JSON, the header is the
+/// call's name and input keys.
 pub(crate) fn tool_call_text(name: &str, tool: Tool, input: &Value) -> String {
     let header = tool_call_header(name, tool, input);
     let header_text = if header.value.trim().is_empty() {
         name_and_input_keys(name, input, MAX_AGENT_SEGMENT_CHARS)
+    } else if header.value_is_command {
+        header
+            .commands()
+            .map(|command| format!("{}{command}", header.prefix))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         format!("{}{}", header.prefix, header.value)
     };
@@ -1159,14 +1165,12 @@ pub(crate) fn tool_call_read_text(
     lines: CallLines,
 ) -> CallReadText {
     let header = tool_call_header(name, tool, input);
+    if header.value_is_command && !header.value.trim().is_empty() {
+        return commands_read_text(&header, lines);
+    }
     let header_line = tool_call_line(&header, name, input);
-    let whole_header = if header.value_is_command && !header.value.trim().is_empty() {
-        sanitize_agent_text(&whole_command(&header))
-    } else {
-        within_segment(&header_line)
-    };
     let body = tool_call_body(tool, input).and_then(searched_body);
-    let whole = with_body(whole_header, body.as_deref());
+    let whole = with_body(within_segment(&header_line), body.as_deref());
     let whole_lines = line_count(&whole);
     match lines {
         CallLines::Whole => CallReadText {
@@ -1191,6 +1195,37 @@ pub(crate) fn tool_call_read_text(
     }
 }
 
+/// A shell call's commands in the form `lines` names: each command whole,
+/// or each on one line with `(+N lines)` counting that command's lines left
+/// out.
+fn commands_read_text(header: &ToolCallHeader, lines: CallLines) -> CallReadText {
+    let whole_commands: Vec<String> = header
+        .commands()
+        .map(|command| whole_command(&header.prefix, command))
+        .collect();
+    let whole = sanitize_agent_text(&whole_commands.join("\n"));
+    let text = match lines {
+        CallLines::Whole => whole.clone(),
+        CallLines::Collapsed => header
+            .commands()
+            .zip(&whole_commands)
+            .map(|(command, whole_command)| {
+                let left_out = line_count(&sanitize_agent_text(whole_command)) - 1;
+                within_segment(&with_line_count(
+                    command_line(&header.prefix, command),
+                    left_out,
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    CallReadText {
+        is_collapsed: text != whole,
+        whole_lines: line_count(&whole),
+        text,
+    }
+}
+
 /// The lines `--lines` counts in `text`.
 fn line_count(text: &str) -> usize {
     text.split('\n').count()
@@ -1211,11 +1246,11 @@ fn with_line_count(line: String, left_out: usize) -> String {
 
 const COMMAND_CONTINUATION_INDENT: &str = "  ";
 
-/// The header with every line of its command, each later line indented so the
+/// `prefix` then every line of `command`, each later line indented so the
 /// command's last line stands apart from the part after it.
-fn whole_command(header: &ToolCallHeader) -> String {
-    let mut lines = header.value.lines();
-    let mut text = format!("{}{}", header.prefix, lines.next().unwrap_or_default());
+fn whole_command(prefix: &str, command: &str) -> String {
+    let mut lines = command.lines();
+    let mut text = format!("{prefix}{}", lines.next().unwrap_or_default());
     for line in lines {
         text.push('\n');
         if !line.is_empty() {
@@ -1226,25 +1261,26 @@ fn whole_command(header: &ToolCallHeader) -> String {
     text
 }
 
-/// The call's header on one line. A shell command shows its first non-empty
-/// line.
+/// `prefix` then the first non-empty line of `command`.
+fn command_line(prefix: &str, command: &str) -> String {
+    let shown = command
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    format!("{prefix}{shown}")
+}
+
+/// The call's header on one line, for a call [`commands_read_text`] doesn't
+/// read.
 fn tool_call_line(header: &ToolCallHeader, name: &str, input: &Value) -> String {
     if header.value.trim().is_empty() {
         return name_and_input_keys(name, input, MAX_AGENT_SEGMENT_CHARS);
     }
-    if !header.value_is_command {
-        return format!(
-            "{}{}",
-            header.prefix,
-            header.value.lines().collect::<Vec<_>>().join(" ")
-        );
-    }
-    let shown = header
-        .value
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default();
-    format!("{}{shown}", header.prefix)
+    format!(
+        "{}{}",
+        header.prefix,
+        header.value.lines().collect::<Vec<_>>().join(" ")
+    )
 }
 
 /// `tool NAME input_keys=KEY,KEY`, within `max_chars`.
@@ -1976,6 +2012,75 @@ mod tests {
             tool_call_text("Bash", Tool::Shell, &shell_input("cd src\ncargo test")),
             "Bash: cd src\ncargo test"
         );
+    }
+
+    fn several_commands() -> Value {
+        serde_json::json!({"commands": ["git status --short", "cd src\ncargo test\ncargo clippy", "rg -n TODO src"]})
+    }
+
+    #[test]
+    fn search_reads_each_of_several_commands_after_its_prefix() {
+        assert_eq!(
+            tool_call_text("exec", Tool::Shell, &several_commands()),
+            "exec: git status --short\nexec: cd src\ncargo test\ncargo clippy\nexec: rg -n TODO src"
+        );
+    }
+
+    #[test]
+    fn read_of_several_messages_shows_each_command_on_one_line_counting_its_own_later_lines() {
+        let read = tool_call_read_text(
+            "exec",
+            Tool::Shell,
+            &several_commands(),
+            CallLines::Collapsed,
+        );
+
+        assert_eq!(
+            read.text,
+            "exec: git status --short\nexec: cd src (+2 lines)\nexec: rg -n TODO src"
+        );
+        assert!(read.is_collapsed);
+        assert_eq!(
+            read.whole_lines, 5,
+            "`--lines` numbers every line of every command"
+        );
+    }
+
+    #[test]
+    fn one_message_read_shows_each_of_several_commands_whole() {
+        assert_eq!(
+            read_text("exec", Tool::Shell, &several_commands(), CallLines::Whole),
+            "exec: git status --short\nexec: cd src\n  cargo test\n  cargo clippy\nexec: rg -n TODO src"
+        );
+    }
+
+    #[test]
+    fn read_of_several_messages_shows_several_one_line_commands_uncollapsed() {
+        let input = serde_json::json!({"commands": ["git status", "git log -1"]});
+
+        let read = tool_call_read_text("exec", Tool::Shell, &input, CallLines::Collapsed);
+
+        assert_eq!(read.text, "exec: git status\nexec: git log -1");
+        assert!(!read.is_collapsed);
+    }
+
+    #[test]
+    fn read_of_several_messages_truncates_each_command_longer_than_search_segment_alone() {
+        let long = "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2);
+        let input = serde_json::json!({"commands": ["git status", long, "git log -1"]});
+
+        let read = read_text("exec", Tool::Shell, &input, CallLines::Collapsed);
+        let lines: Vec<&str> = read.lines().collect();
+
+        assert_eq!(lines.len(), 3, "each command keeps its line: {read}");
+        assert_eq!(lines[0], "exec: git status");
+        assert_eq!(lines[1].chars().count(), MAX_AGENT_SEGMENT_CHARS);
+        assert!(
+            lines[1].starts_with("exec: xxx"),
+            "the long command's line opens with its prefix and command: {}",
+            &lines[1][..20]
+        );
+        assert_eq!(lines[2], "exec: git log -1");
     }
 
     fn message_ending_in_line_break() -> Value {

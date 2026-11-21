@@ -271,6 +271,12 @@
   names.
 - Fix an `exec` script whose command or path is built from several parts
   showing the first part as its header. It now shows its tools and source.
+- Fix an `exec` script that runs several shell commands showing the first
+  command alone (about 9% of the `exec` scripts shown by their first call, in
+  one example corpus). Each command now shows on its own `exec:` line in the
+  viewer, exports and `agent read`, above the script's one result, and search
+  finds every command. Summary mode now counts each command in
+  `Ran N shell commands`.
 - Fix the user's answer to a question Codex asked while it kept working
   (`request_user_input_async`) missing from the viewer, exports, `agent read`
   and search. It now shows as the user's message, the question quoted above

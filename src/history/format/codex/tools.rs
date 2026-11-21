@@ -7,6 +7,8 @@
 //! (`{"command":"…"}`) or a bare object literal (`{ cmd: "…" }`), and reads
 //! a literal, a `String.raw` template included, only when it is the
 //! property's whole value.
+//! - A script whose two or more calls are all shell commands shows as one
+//!   shell call of every command.
 //! - The first call names the layout of a shell command, an edit, a web
 //!   search or fetch, an agent launch or message, or an image read.
 //! - A poll, typed input, a plan update and a patch in a variable need the
@@ -287,11 +289,15 @@ fn script_calls(input: &str) -> Vec<CanonicalCall> {
         .unwrap_or_else(|| vec![script.into_call(&scan.calls)])
 }
 
-/// The calls a script's layout shows; `None` for a script without one. The
-/// first call names the layout. A wait on a process, a plan update and a
-/// patch in a variable get their layouts only as the script's one call, at
-/// depth 0, in a script that doesn't name `tools` anywhere else.
+/// The calls a script's layout shows; `None` for a script without one. A
+/// script of several shell commands shows them all; otherwise the first
+/// call names the layout. A wait on a process, a plan update and a patch in
+/// a variable get their layouts only as the script's one call, at depth 0,
+/// in a script that doesn't name `tools` anywhere else.
 fn layout(scan: &ScriptScan<'_>) -> Option<Vec<CanonicalCall>> {
+    if let Some(commands) = several_shell_commands(scan) {
+        return Some(vec![commands]);
+    }
     let call = scan.calls.first()?;
     let is_only_call = scan.calls.len() == 1 && call.depth == 0 && !scan.names_tools_otherwise;
     match call.name {
@@ -313,6 +319,43 @@ fn layout(scan: &ScriptScan<'_>) -> Option<Vec<CanonicalCall>> {
         }
         name => script_function_call(name, call.rest_of_script).map(|call| vec![call]),
     }
+}
+
+/// One shell call containing the command of each shell call in the source,
+/// in source order. `None` unless the script has two or more calls, each a
+/// shell command whose object literal argument sets the command to a
+/// literal that isn't blank, and doesn't name `tools` anywhere else.
+fn several_shell_commands(scan: &ScriptScan<'_>) -> Option<CanonicalCall> {
+    if scan.calls.len() < 2 || scan.names_tools_otherwise {
+        return None;
+    }
+    let commands = scan
+        .calls
+        .iter()
+        .map(|call| {
+            let arguments = leading_object(call.rest_of_script)?;
+            property_string(arguments, shell_command_key(call.name)?)
+                .filter(|command| !command.trim().is_empty())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(CanonicalCall {
+        tool: Tool::Shell,
+        input: json!({ "commands": commands }),
+    })
+}
+
+/// The key of the command a shell call's arguments name; `None` for a call
+/// that isn't a shell command.
+fn shell_command_key(name: &str) -> Option<&'static str> {
+    let mapping = tool_mapping(name);
+    if mapping.tool != Tool::Shell {
+        return None;
+    }
+    mapping
+        .header_keys
+        .iter()
+        .find(|(_, canonical_key)| *canonical_key == "command")
+        .map(|(codex_key, _)| *codex_key)
 }
 
 static PLAN_ARRAY_START: LazyLock<Regex> =
@@ -1277,13 +1320,60 @@ mod tests {
             single("exec", object_literal),
             (Tool::Shell, json!({"command": "printf 'a b'"}))
         );
+    }
 
-        let two_kinds = json!(
-            "await tools.exec_command({ cmd: \"first\" });\nawait tools.shell_command({ command: \"second\" });"
-        );
+    #[test]
+    fn exec_script_of_several_literal_shell_commands_is_one_call_of_every_command() {
+        for (source, commands) in [
+            (
+                "const [s, l] = await Promise.all([\n  tools.exec_command({ cmd: \"git status --short\" }),\n  tools.exec_command({ cmd: 'git log -5 --oneline' }),\n]);",
+                &["git status --short", "git log -5 --oneline"][..],
+            ),
+            (
+                "await tools.exec_command({ cmd: \"first\" });\nawait tools.shell_command({ command: \"second\" });\nawait tools.exec_command({\"cmd\":\"third\",\"workdir\":\"/repo\"});",
+                &["first", "second", "third"],
+            ),
+            (
+                "await Promise.allSettled([tools.exec_command({cmd:String.raw`rg -n \"\\bTODO\\b\" src`}), tools.exec_command({cmd:`cargo test\n--lib`})]);",
+                &[r#"rg -n "\bTODO\b" src"#, "cargo test\n--lib"],
+            ),
+            (
+                "for (const dir of dirs) { await tools.exec_command({ cmd: \"ls\" }); }\nawait tools.exec_command({ cmd: \"ls\" });",
+                &["ls", "ls"],
+            ),
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                (Tool::Shell, json!({ "commands": commands })),
+                "the script shows each command in source order"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_script_with_call_not_literal_shell_command_or_with_blank_command_is_named_by_its_first_call()
+     {
+        for source in [
+            "await tools.exec_command({ cmd: \"first\" });\nawait tools.exec_command({ cmd: later });",
+            "await tools.exec_command({ cmd: \"first\" });\nawait tools.exec_command({ cmd: `rg ${pattern}` + \" src\" });",
+            "await tools.exec_command({ cmd: \"first\" });\nawait tools.view_image({ path: \"shot.png\" });",
+            "await tools.exec_command({ cmd: \"first\" });\nawait tools.exec_command({ cmd: \"second\" });\nawait tools[name]({});",
+            "await tools.exec_command({ cmd: \"first\" });\nawait tools.exec_command(options);\nawait tools.exec_command({ cmd: \"third\" });",
+            "await tools.exec_command({ cmd: \"first\" });\nawait tools.exec_command({ cmd: \"\" });",
+            "await tools.exec_command({ cmd: \"first\" });\nawait tools.exec_command({ cmd: \" \\n \" });",
+        ] {
+            assert_eq!(
+                single("exec", json!(source)),
+                (Tool::Shell, json!({"command": "first"})),
+                "the script shows its first command alone"
+            );
+        }
+        let blank_first =
+            "await tools.exec_command({ cmd: \"\" });\nawait tools.exec_command({ cmd: \"ls\" });";
         assert_eq!(
-            single("exec", two_kinds),
-            (Tool::Shell, json!({"command": "first"}))
+            single("exec", json!(blank_first)),
+            (Tool::Shell, json!({"command": ""})),
+            "the script with a blank first command shows that command alone"
         );
     }
 
