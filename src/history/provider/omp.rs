@@ -448,6 +448,9 @@ pub(super) mod tests {
                     r#"{"type":"message","id":"task-a","parentId":"edit-t","timestamp":"2026-01-02T03:04:27.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_task","name":"task","arguments":{"agent":"explore","task":"TASK_PROMPT_SENTINEL: check the dates","solutionSpace":"the notes file","i":"check the dates"}}]}}"#,
                     r#"{"type":"message","id":"task-t","parentId":"task-a","timestamp":"2026-01-02T03:04:28.000Z","message":{"role":"toolResult","toolCallId":"call_task","toolName":"task","content":[{"type":"text","text":"The dates are right."}]}}"#,
                     r#"{"type":"message","id":"task-r","parentId":"task-t","timestamp":"2026-01-02T03:04:29.000Z","message":{"role":"assistant","content":[{"type":"text","text":"The release steps are dated."}]}}"#,
+                    r#"{"type":"message","id":"image-u","parentId":"task-r","timestamp":"2026-01-02T03:04:30.000Z","message":{"role":"user","content":[{"type":"text","text":"Show the window"}]}}"#,
+                    r#"{"type":"message","id":"image-a","parentId":"image-u","timestamp":"2026-01-02T03:04:31.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_image","name":"read","arguments":{"path":"window.png"}}]}}"#,
+                    r#"{"type":"message","id":"image-t","parentId":"image-a","timestamp":"2026-01-02T03:04:32.000Z","message":{"role":"toolResult","toolCallId":"call_image","toolName":"read","content":[{"type":"text","text":"IMAGE_RESULT_SENTINEL: the window"},{"type":"image","data":"OMP_IMAGE_DATA_SENTINEL","mimeType":"image/png"}]}}"#,
                 ]
                 .map(str::to_owned),
             );
@@ -470,9 +473,14 @@ pub(super) mod tests {
                     Marker::shown("edit diff", "EDIT_DIFF_SENTINEL")
                         .in_summary_row("Edited 1 file, called 1 tool"),
                     Marker::shown("sub-agent task's prompt", "TASK_PROMPT_SENTINEL"),
+                    Marker::shown("text beside an image in a result", "IMAGE_RESULT_SENTINEL"),
+                    Marker::shown("image in a result", "[Image: image/png]"),
                 ],
             )
-            .with_hidden(&[("abandoned branch's prompt", "OMP_ABANDONED_SENTINEL")])
+            .with_hidden(&[
+                ("abandoned branch's prompt", "OMP_ABANDONED_SENTINEL"),
+                ("image's data in a result", "OMP_IMAGE_DATA_SENTINEL"),
+            ])
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 13)
             // The sub-agent's reply: 7 input and 3 output.
             .with_subagent_tokens(10)

@@ -225,6 +225,11 @@
 - Fix `--generate-semantic-cache` reporting success when it could not store
   the embeddings it computed. It now fails and reports how many passages were
   not stored.
+- Fix an image missing from a tool result (Claude Code, Codex, Grok Build and
+  Kimi Code). It now shows as `[Image: image/png]`, and search finds that
+  line.
+  - A Claude Code result that was an image alone showed as JSON with the
+    image's data.
 
 #### `rearview agent` commands
 
@@ -271,6 +276,8 @@
 - Fix the viewer and exports showing a prompt that quotes a slash command's
   tags after other words as that command alone. The prompt now shows as
   written.
+- Fix a tool search's result showing as JSON. Each tool it found now shows as
+  `[Tool: Read]`, and search finds that line.
 
 #### Codex
 
@@ -328,6 +335,18 @@
   `spawn_agent (explorer) · gpt-5.6-sol (high) · fork`, and the prompt, in the
   viewer, exports, `agent read` and search. In the viewer its result now
   shows the sub-agent's nickname.
+
+#### Kimi Code
+
+- Fix a tool result of several parts showing empty. It now shows its text:
+  the text beside an image, and every part of a result made of several text
+  parts.
+
+#### OpenCode
+
+- Fix an image or PDF a tool read missing from the tool's result in an
+  OpenCode 2 session. It now shows as `[Attached image/png: shot.png]` under
+  the tool's text.
 
 ### Changes
 

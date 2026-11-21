@@ -24,7 +24,7 @@ use super::dropped::DroppedRecords;
 use super::lines::{self, LineCursor, visit_line_spans_from};
 use super::{
     EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection, at_own_lines,
-    rename_key, rfc3339_from_millis,
+    data_url_media_type, leading_media_type, non_empty_text_field, rename_key, rfc3339_from_millis,
 };
 use crate::agent::transcript::tool_result_text;
 use crate::error::Result;
@@ -34,6 +34,7 @@ use crate::history::provider::{
 use crate::history::{MalformedLine, ParsePermit, Source};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
+    image_placeholder,
 };
 use crate::parallel::ParallelThreshold;
 use serde::{Deserialize, Serialize};
@@ -716,16 +717,44 @@ fn canonicalize_input(tool: Tool, input: &mut Value) {
     rename_key(arguments, "path", "file_path");
 }
 
+/// The text a part of a tool's output shows: a text part's text, or an image
+/// part's [`image_placeholder`]. `None` for an empty text part and any other
+/// part, such as a video.
+fn output_part_text(part: &Value) -> Option<String> {
+    match part.get("type").and_then(Value::as_str)? {
+        "text" => non_empty_text_field(part).map(str::to_owned),
+        "image_url" => {
+            let url = part.pointer("/imageUrl/url").and_then(Value::as_str);
+            Some(image_placeholder(url.and_then(image_url_media_type)))
+        }
+        _ => None,
+    }
+}
+
+/// The media type an image part's URL names: a `data:` URL's, or that of a
+/// `blobref:image/png;<hash>` reference to an image Kimi stores in a separate
+/// blob file.
+fn image_url_media_type(url: &str) -> Option<&str> {
+    match url.strip_prefix("blobref:") {
+        Some(reference) => Some(leading_media_type(reference)),
+        None => data_url_media_type(url),
+    }
+}
+
 fn tool_result(event: &Map<String, Value>, timestamp: Option<String>) -> Option<LogEntry> {
     // The result is `{output, note}` — the note is runtime plumbing wrapped in
     // `<system>…</system>`, so only the output is kept.
     let text = match event.get("result") {
         Some(Value::String(text)) => text.clone(),
-        Some(value) => value
-            .get("output")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        Some(value) => match value.get("output") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(output_part_text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        },
         None => String::new(),
     };
     let text = tool_result_text(&Value::String(text)).unwrap_or_default();
@@ -854,6 +883,60 @@ mod tests {
     use super::*;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::parser::process_conversation_file;
+
+    /// The result content a `tool.result` event whose output is `parts`
+    /// reads as.
+    fn result_of_parts(parts: Value) -> Value {
+        let event = json!({"type": "tool.result", "toolCallId": "ReadMediaFile_1",
+            "result": {"output": parts}});
+        let entry = tool_result(event.as_object().unwrap(), None).unwrap();
+        match entry.content_blocks() {
+            [
+                ContentBlock::ToolResult {
+                    content: Some(content),
+                    ..
+                },
+            ] => content.clone(),
+            _ => panic!("a tool result entry: {entry:?}"),
+        }
+    }
+
+    #[test]
+    fn text_parts_of_tool_output_with_image_show() {
+        let content = result_of_parts(json!([
+            {"type": "text", "text": "<image path=\"shot.png\">"},
+            {"type": "image_url", "imageUrl": {"url": "blobref:image/png;8c14c704"}},
+            {"type": "text", "text": "</image>"},
+        ]));
+
+        assert_eq!(
+            content,
+            json!("<image path=\"shot.png\">\n[Image: image/png]\n</image>"),
+            "the text beside the image shows, in part order"
+        );
+    }
+
+    #[test]
+    fn empty_text_part_beside_image_doesnt_show_a_line() {
+        let content = result_of_parts(json!([
+            {"type": "text", "text": ""},
+            {"type": "image_url", "imageUrl": {"url": "blobref:image/png;8c14c704"}},
+        ]));
+
+        assert_eq!(content, json!("[Image: image/png]"));
+    }
+
+    #[test]
+    fn image_parts_show_media_type_their_url_states_and_video_shows_nothing() {
+        let content = result_of_parts(json!([
+            {"type": "image_url", "imageUrl": {"url": "data:image/jpeg;base64,AAAA"}},
+            {"type": "image_url", "imageUrl": {"url": "blobref:8c14c704"}},
+            {"type": "image_url", "imageUrl": {"url": "https://example.com/shot"}},
+            {"type": "video_url", "videoUrl": {"url": "blobref:video/mp4;ee368b31"}},
+        ]));
+
+        assert_eq!(content, json!("[Image: image/jpeg]\n[Image]\n[Image]"));
+    }
 
     #[test]
     fn counting_names_skipped_and_unrecognised_wire_and_loop_event_types() {

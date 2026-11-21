@@ -442,7 +442,7 @@ impl<'a> PartText<'a> {
                 digest.number(Some(2));
                 digest.number(Some(items.len() as i64));
                 for item in items {
-                    digest.text(tool_result_item_text(item));
+                    digest.text(tool_result_item_text(item).as_deref());
                 }
             }
         }
@@ -604,7 +604,7 @@ pub(super) fn searched_items_text(items: &[Value]) -> String {
     items
         .iter()
         .filter_map(tool_result_item_text)
-        .map(without_terminal_codes)
+        .map(|text| without_terminal_codes(&text).into_owned())
         .collect::<Vec<_>>()
         .join("\n")
 }

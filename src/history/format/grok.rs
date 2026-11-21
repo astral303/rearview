@@ -30,7 +30,7 @@ use crate::history::provider::{
 use crate::history::{MalformedLine, ParsePermit, Source};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, RECAP_LABEL, TokenUsage, Tool, UserContent,
-    UserMessage, replacement_diff,
+    UserMessage, image_placeholder, replacement_diff,
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -1203,8 +1203,10 @@ fn backend_search_text(output: &Map<String, Value>) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// The display `content`: its text parts, and an edit's diff parts as a
-/// replacement diff.
+/// The display `content`: its text parts, its image parts as their
+/// [`image_placeholder`], and an edit's diff parts as a replacement diff. An
+/// image read's result comes from here, because its `rawOutput` doesn't
+/// contain any text.
 fn content_text(update: &Map<String, Value>) -> Option<String> {
     let parts: Vec<String> = update
         .get("content")
@@ -1212,10 +1214,18 @@ fn content_text(update: &Map<String, Value>) -> Option<String> {
         .into_iter()
         .flatten()
         .filter_map(|part| match part.get("type").and_then(Value::as_str)? {
-            "content" => part
-                .pointer("/content/text")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            "content" => {
+                let content = part.get("content")?;
+                match content.get("type").and_then(Value::as_str) {
+                    Some("image") => Some(image_placeholder(
+                        content.get("mimeType").and_then(Value::as_str),
+                    )),
+                    _ => content
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                }
+            }
             "diff" => Some(replacement_diff(
                 part.get("oldText")
                     .and_then(Value::as_str)

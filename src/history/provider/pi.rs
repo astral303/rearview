@@ -359,6 +359,7 @@ pub(super) mod tests {
                         .in_summary_row(LISTING_RUN),
                     Marker::shown("edit diff", "EDIT_DIFF_SENTINEL")
                         .in_summary_row("Edited 1 file"),
+                    Marker::shown("image in a result", "[Image: image/jpeg]"),
                 ],
             )
             .with_hidden(&[

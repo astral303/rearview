@@ -439,6 +439,35 @@ pub enum ContentBlock {
     Other,
 }
 
+/// The text an image shows as, in a message or a tool result:
+/// `[Image: image/png]`, or `[Image]` when its record doesn't state a media
+/// type of the form `type/subtype`.
+pub fn image_placeholder(media_type: Option<&str>) -> String {
+    match media_type.filter(|media_type| is_media_type(media_type)) {
+        Some(media_type) => format!("[Image: {media_type}]"),
+        None => "[Image]".to_owned(),
+    }
+}
+
+/// True for `type/subtype`, each half made of ASCII letters, digits and
+/// `.`, `+` or `-`.
+fn is_media_type(text: &str) -> bool {
+    let is_name = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+    };
+    text.split_once('/')
+        .is_some_and(|(kind, subtype)| is_name(kind) && is_name(subtype))
+}
+
+/// The text a tool reference shows as in a tool result: `[Tool: Monitor]`.
+/// A tool search returns one for each tool it finds.
+pub fn tool_reference_placeholder(tool_name: &str) -> String {
+    format!("[Tool: {tool_name}]")
+}
+
 /// Extract only Text blocks (for previews and user-facing display)
 pub fn extract_text_from_blocks(blocks: &[ContentBlock]) -> String {
     blocks
@@ -847,18 +876,42 @@ mod tests {
     }
 
     #[test]
-    fn search_texts_ignore_non_text_blocks_in_array() {
+    fn image_placeholder_names_valid_media_type() {
+        assert_eq!(image_placeholder(Some("image/png")), "[Image: image/png]");
+        assert_eq!(
+            image_placeholder(Some("image/svg+xml")),
+            "[Image: image/svg+xml]"
+        );
+    }
+
+    #[test]
+    fn image_placeholder_doesnt_name_malformed_media_type() {
+        for media_type in [None, Some(""), Some("png"), Some("image/"), Some("/png")] {
+            assert_eq!(image_placeholder(media_type), "[Image]", "{media_type:?}");
+        }
+        for media_type in ["image/ png", "image/png\n[Tool: Read]", "image /png"] {
+            assert_eq!(
+                image_placeholder(Some(media_type)),
+                "[Image]",
+                "whitespace or a line break inside {media_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_texts_read_image_in_array_as_placeholder_without_its_data() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "id".into(),
             standalone_tool_name: None,
             content: Some(json!([
                 {"type": "text", "text": "visible"},
-                {"type": "image", "source": {"data": "base64..."}}
+                {"type": "image", "source": {"media_type": "image/png", "data": "base64..."}}
             ])),
         }];
-        let result = search_texts_of_blocks(&blocks).concat();
-        assert!(result.contains("visible"));
-        assert!(!result.contains("base64"));
+        assert_eq!(
+            search_texts_of_blocks(&blocks),
+            ["visible\n[Image: image/png]"]
+        );
     }
 
     #[test]

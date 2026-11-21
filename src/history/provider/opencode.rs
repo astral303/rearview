@@ -461,7 +461,7 @@ impl SessionStorage for OpenCodeStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "opencode",
-            schema_version: 18,
+            schema_version: 19,
         }
     }
 

@@ -426,16 +426,27 @@ fn attachment_lines(message: &Value) -> impl Iterator<Item = String> + '_ {
                         .flatten()
                 })
                 .unwrap_or(INLINE_ATTACHMENT);
-            Some(format!("[Attached {mime}: {name}]"))
+            Some(attachment_placeholder(mime, Some(name)))
         })
 }
 
 /// OpenCode 2's label for an attachment with neither a name nor a URI.
 const INLINE_ATTACHMENT: &str = "inline attachment";
 
-/// The text a finished call returned: its text content, or, for a failed
-/// call that returned none, its error message. A call still streaming or
-/// running has returned nothing.
+/// A file as OpenCode 2 names it when it summarises a session:
+/// `[Attached image/png: shot.png]`, or `[Attached image/png]` without a
+/// name. Its contents are not shown.
+fn attachment_placeholder(mime: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("[Attached {mime}: {name}]"),
+        None => format!("[Attached {mime}]"),
+    }
+}
+
+/// The text a finished call returned: its content one item per line, a text
+/// item's text or a file's [`attachment_placeholder`], or, for a failed call
+/// that returned none, its error message. A call still streaming or running
+/// has returned nothing.
 fn tool_output(item: &Value) -> Option<String> {
     let state = item.get("state")?;
     let text = state
@@ -444,8 +455,7 @@ fn tool_output(item: &Value) -> Option<String> {
         .map(|content| {
             content
                 .iter()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .filter_map(tool_content_text)
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -457,6 +467,17 @@ fn tool_output(item: &Value) -> Option<String> {
             .pointer("/error/message")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// The text a call's content `item` shows; `None` for an item of another
+/// type, or a file without a media type.
+fn tool_content_text(item: &Value) -> Option<String> {
+    let field = |key: &str| item.get(key).and_then(Value::as_str);
+    match field("type")? {
+        "text" => field("text").map(str::to_owned),
+        "file" => Some(attachment_placeholder(field("mime")?, field("name"))),
         _ => None,
     }
 }
@@ -787,6 +808,55 @@ mod tests {
                 "[Attached image/png: file:///tmp/screenshot.png]",
                 "[Attached application/octet-stream: inline attachment]",
             ]
+        );
+    }
+
+    /// OpenCode 2's `read` returns an image as a file item named by the path
+    /// it read, beside its text, its contents inline as a data URI. An MCP
+    /// tool's image is a file item without a name.
+    #[test]
+    fn opencode_2_tool_result_names_each_file_it_returned() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        let connection = fixture::create_opencode_2_database(&database);
+        fixture::insert_opencode_2_session_row(&connection, "ses_image", None);
+        fixture::insert_opencode_2_message(
+            &connection,
+            "ses_image",
+            0,
+            "assistant",
+            &json!({
+                "model": { "id": "model-a" },
+                "time": { "created": 1755000110000i64 },
+                "content": [{
+                    "type": "tool", "id": "call_image", "name": "read",
+                    "state": { "status": "completed", "input": { "path": "shot.png" }, "content": [
+                        { "type": "text", "text": "Image read successfully" },
+                        { "type": "file", "uri": "data:image/png;base64,iVBORw0KGgo=",
+                          "mime": "image/png", "name": "shot.png" },
+                        { "type": "file", "uri": "data:image/jpeg;base64,AAAA", "mime": "image/jpeg" },
+                    ] },
+                }],
+            }),
+        );
+        drop(connection);
+
+        let projection = opencode_2_projection(&database, "ses_image");
+        let results = projection
+            .entries
+            .iter()
+            .flat_map(|(_, entry)| entry.content_blocks().to_vec())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => content,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            results,
+            [json!(
+                "Image read successfully\n[Attached image/png: shot.png]\n[Attached image/jpeg]"
+            )]
         );
     }
 

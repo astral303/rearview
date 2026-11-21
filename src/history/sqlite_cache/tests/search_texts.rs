@@ -9,7 +9,8 @@ use crate::history::provider::contract_tests::registered_fixtures;
 
 /// The lines of a Claude session holding a text of each kind of layout:
 /// a title and a summary, a reply written as two records, a tool result's
-/// items ahead of a text block in its entry, each kind of user text the
+/// items ahead of a text block in its entry, a result with an image and a
+/// tool reference beside its text, each kind of user text the
 /// viewer hides or rewrites, and texts outside the dialogue: thinking, a
 /// tool call and a sub-agent's reply.
 fn every_layout_kind_lines() -> Vec<String> {
@@ -36,6 +37,13 @@ fn every_layout_kind_lines() -> Vec<String> {
                 {"type": "text", "text": "item two"},
             ]},
             {"type": "text", "text": "after the result"},
+        ])),
+        user(serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "shot", "content": [
+                {"type": "text", "text": "the window"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                {"type": "tool_reference", "tool_name": "Monitor"},
+            ]},
         ])),
         user(serde_json::json!(
             "<command-name>/model</command-name>\n<command-args>opus</command-args>"
@@ -95,6 +103,7 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
         "answer part two",
         "item one\nitem two",
         "after the result",
+        "the window\n[Image: image/png]\n[Tool: Monitor]",
         "/model opus",
         "command output",
         "init",

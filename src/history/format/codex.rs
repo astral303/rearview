@@ -19,7 +19,7 @@ use super::lines::{self, LineCursor, visit_lines_from, visit_parsed_lines};
 use super::splice::SubagentThread;
 use super::{
     EarlierTurns, RecordLine, SessionFormat, SessionHeader, SessionProjection, append_exit_code,
-    block_texts, trim_blank_lines,
+    block_texts, data_url_media_type, non_empty_text_field, trim_blank_lines,
 };
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::transcript::tool_result_text;
@@ -35,7 +35,7 @@ use crate::history::task_notification::ReportSender;
 use crate::history::{Admitted, ParsePermit, Source, TaskReport, TranscriptEntries};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, DELIVERED_REPORT_KEY, LogEntry, NOTICE_LABEL, QuotedAnswer,
-    SubagentIdentity, TokenUsage, Tool, UserContent, UserMessage,
+    SubagentIdentity, TokenUsage, Tool, UserContent, UserMessage, image_placeholder,
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, FixedOffset};
@@ -2195,13 +2195,33 @@ fn tool_result(
     }
 }
 
-/// A tool result's output: one string, or the text of content blocks typed
-/// `input_text`, which `tool_result_text` would skip.
+/// A tool result's output: one string, or its content items one per line,
+/// each `input_text` item's text and each `input_image` item's
+/// [`image_placeholder`]. `tool_result_text` would skip both.
 fn output_text(payload: &Map<String, Value>) -> String {
     match payload.get("output") {
         Some(Value::String(text)) => text.clone(),
-        output => block_texts(output).join("\n"),
+        output => output
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(output_item_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
+}
+
+/// The text `item` of a tool's output shows; `None` for an item without
+/// text, such as encrypted content.
+fn output_item_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) == Some("input_image") {
+        let media_type = item
+            .get("image_url")
+            .and_then(Value::as_str)
+            .and_then(data_url_media_type);
+        return Some(image_placeholder(media_type));
+    }
+    non_empty_text_field(item).map(str::to_owned)
 }
 
 /// A message between agents of a multi-agent run. A sub-agent's final answer
@@ -3077,6 +3097,21 @@ mod tests {
     use crate::history::format::at_own_lines;
     use crate::history::format::dropped::DropOutcome;
     use crate::history::parser::process_conversation_file;
+
+    #[test]
+    fn output_image_items_show_media_type_their_url_states() {
+        let payload = json!({"output": [
+            {"type": "input_text", "text": "Script completed"},
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=", "detail": "high"},
+            {"type": "input_image", "file_id": "file-abc"},
+            {"type": "encrypted_content", "encrypted_content": "ENCRYPTED"},
+        ]});
+
+        assert_eq!(
+            output_text(payload.as_object().unwrap()),
+            "Script completed\n[Image: image/png]\n[Image]"
+        );
+    }
 
     /// A rollout from `reader` alone, its lines past the header parsed on the
     /// rayon pool for a batch `parallel` admits. `None` when the first line is
