@@ -2,9 +2,9 @@
 //! sub-agent, numbered in launch order over the whole session so it stays the
 //! same in every read, and the facts its legend record states.
 
+use crate::agent::address::MessageAddresses;
 use crate::agent::call_links::{CallAddress, CallLinks, numbered_calls};
 use crate::agent::protocol::{escape_atom, protocol_snippet};
-use crate::agent::record_writer::ordinal_range;
 use crate::agent::transcript::{AgentMessage, AgentMessagePart, AgentTranscript, SubagentOrigin};
 use crate::log_entry::Tool;
 use serde_json::Value;
@@ -85,7 +85,13 @@ impl IndexedCall<'_> {
 }
 
 impl Subagents {
-    pub fn of(transcript: &AgentTranscript, links: &CallLinks<'_>) -> Self {
+    /// The sub-agents of `transcript`, their legend records naming messages
+    /// as `addresses` names them.
+    pub fn of(
+        transcript: &AgentTranscript,
+        links: &CallLinks<'_>,
+        addresses: &MessageAddresses,
+    ) -> Self {
         let threads = threads_of(&transcript.messages);
         if threads.is_empty() {
             return Self::default();
@@ -144,7 +150,7 @@ impl Subagents {
         subagents.link_targets(&transcript.messages, &threads, &starts, &handle_of_thread);
         for subagent in &mut subagents.list {
             subagent.reports.sort_unstable();
-            subagent.legend = Arc::from(subagent.legend_record());
+            subagent.legend = Arc::from(subagent.legend_record(addresses));
         }
         subagents
     }
@@ -291,21 +297,21 @@ impl Subagent {
     /// `subagent s326 type=suite_runner launch=m15397 span=m15399..m15435
     /// report=m15411,m15437 in=s12 : fuel_generation_focused`, each atom left
     /// out when the transcript does not record it.
-    fn legend_record(&self) -> String {
+    fn legend_record(&self, addresses: &MessageAddresses) -> String {
         let mut record = format!("subagent s{}", self.handle);
         if let Some(kind) = &self.kind {
             record.push_str(&format!(" type={}", escape_atom(kind)));
         }
         if let Some(launch) = self.launch {
-            record.push_str(&format!(" launch=m{}", launch.ordinal));
+            record.push_str(&format!(" launch={}", addresses.message(launch.ordinal)));
         }
         let (first, last) = (self.messages[0], self.messages[self.messages.len() - 1]);
-        record.push_str(&format!(" span={}", ordinal_range(first, last)));
+        record.push_str(&format!(" span={}", addresses.range(first, last)));
         if !self.reports.is_empty() {
             let reports = self
                 .reports
                 .iter()
-                .map(|ordinal| format!("m{ordinal}"))
+                .map(|&ordinal| addresses.message(ordinal))
                 .collect::<Vec<_>>();
             record.push_str(&format!(" report={}", reports.join(",")));
         }

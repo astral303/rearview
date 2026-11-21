@@ -5,25 +5,19 @@
 
 use crate::agent::transcript::{AgentMessage, AgentMessagePart, AgentTranscript, SubagentOrigin};
 use std::collections::HashMap;
-use std::fmt;
 use std::path::Path;
 
 /// The id readers give a call or a result recorded without an id. Link
 /// nothing by it: unrelated calls share it.
 const UNKNOWN_ID: &str = "unknown";
 
-/// A tool call's address: the `number`th call of message `mN`, counting every
-/// call of the message in order from 1.
+/// A tool call's place: the `number`th call of the message `ordinal` names,
+/// counting every call of the message in order from 1. Records print it
+/// through [`crate::agent::address::MessageAddresses::call`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CallAddress {
     pub ordinal: usize,
     pub number: usize,
-}
-
-impl fmt::Display for CallAddress {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "m{}.{}", self.ordinal, self.number)
-    }
 }
 
 /// A call that a result in another message answers: the addresses of the

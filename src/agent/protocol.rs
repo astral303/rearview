@@ -1,3 +1,4 @@
+use crate::agent::address::MessageAddresses;
 use crate::agent::call_links::{AnsweredCall, Call, CallAddress, CallLinks, numbered_calls};
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::agent::diagnostic::{
@@ -7,7 +8,7 @@ use crate::agent::hidden_parts::HiddenParts;
 use crate::agent::record_writer::{
     CallCopy, CallRecord, CallResultRecord, HiddenRecord, MessageRecord, MessageRuns,
     OmittedRecord, RecordSize, RecordWriter, continue_read_record, conversation_record,
-    handles_field, message_range_ref, message_record_start, ordinal_range, read_record,
+    handles_field, message_range_ref, message_record_start, read_record,
 };
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
@@ -180,9 +181,17 @@ pub enum ReadPriority {
     Tail(NonZeroUsize),
 }
 
+/// A conversation a read or an outline shows, with the addresses its records
+/// print for its messages.
+#[derive(Clone, Copy, Debug)]
+struct ReadConversation<'a> {
+    resolved: &'a ResolvedConversation,
+    addresses: &'a MessageAddresses,
+}
+
 #[derive(Clone, Debug)]
 struct RenderedMessage<'a> {
-    conversation: &'a ResolvedConversation,
+    conversation: ReadConversation<'a>,
     message: &'a AgentMessage,
     times: Option<TimeSpan>,
     content: MessageContent<'a>,
@@ -350,7 +359,7 @@ impl<'a> RenderedMessage<'a> {
             }
         }
         if let Some(omission) = truncation.and_then(|truncation| truncation.omission.as_ref()) {
-            let reference = self.conversation.reference.canonical();
+            let reference = self.conversation.resolved.reference.canonical();
             writer.write_omitted_records(&self.omitted_record(&reference, omission));
         }
     }
@@ -380,8 +389,11 @@ impl<'a> RenderedMessage<'a> {
     /// The characters of the message's records and content alone, the
     /// content truncated to `truncation`.
     fn measured_chars(&self, hidden: &HiddenParts<'_>, truncation: Option<&Truncation>) -> usize {
-        let mut writer =
-            RecordWriter::measuring(self.printed_record_times(truncation).next(), self.zone);
+        let mut writer = RecordWriter::measuring(
+            self.printed_record_times(truncation).next(),
+            self.conversation.addresses,
+            self.zone,
+        );
         self.write(hidden, truncation, &mut writer);
         writer.into_output().chars().count()
     }
@@ -879,7 +891,7 @@ enum ReadEntry<'a> {
 }
 
 impl<'a> ReadEntry<'a> {
-    fn conversation(&self) -> &'a ResolvedConversation {
+    fn conversation(&self) -> ReadConversation<'a> {
         match self {
             Self::Message { rendered, .. } => rendered.conversation,
             Self::Hidden(run) => run.conversation,
@@ -933,7 +945,8 @@ impl<'a> ReadEntry<'a> {
                 rendered.measured_chars(hidden, rendered.truncation.as_ref())
             }
             Self::Hidden(run) => {
-                let mut writer = RecordWriter::measuring(run.times, run.zone);
+                let mut writer =
+                    RecordWriter::measuring(run.times, run.conversation.addresses, run.zone);
                 run.write(&mut writer);
                 writer.into_output().chars().count()
             }
@@ -963,8 +976,8 @@ fn write_entries<'e>(
     selected: &[usize],
 ) {
     for run in selected.chunk_by(|&first, &next| {
-        entries[first].conversation().reference.canonical()
-            == entries[next].conversation().reference.canonical()
+        entries[first].conversation().resolved.reference.canonical()
+            == entries[next].conversation().resolved.reference.canonical()
     }) {
         let mut subagents = run
             .iter()
@@ -972,7 +985,8 @@ fn write_entries<'e>(
             .collect::<Vec<_>>();
         subagents.sort_by_key(|subagent| subagent.handle);
         subagents.dedup();
-        writer.enter_conversation(entries[run[0]].conversation(), &subagents);
+        let conversation = entries[run[0]].conversation();
+        writer.enter_conversation(conversation.resolved, conversation.addresses, &subagents);
         for &index in run {
             entries[index].write(writer);
         }
@@ -980,8 +994,8 @@ fn write_entries<'e>(
             .iter()
             .map(|&index| EntrySpan::of(&entries[index]))
             .collect::<Vec<_>>();
-        if let Some((reference, runs, flags)) = recipe_showing_hidden_entries(spans.iter()) {
-            writer.write_read_record(reference, &runs, flags);
+        if let Some(recipe) = recipe_showing_hidden_entries(spans.iter()) {
+            writer.write_read_record(recipe.reference, &recipe.runs, recipe.flags);
         }
     }
 }
@@ -990,7 +1004,7 @@ fn write_entries<'e>(
 /// not show text; at least one hides a part.
 #[derive(Clone, Debug)]
 struct HiddenRun<'a> {
-    conversation: &'a ResolvedConversation,
+    conversation: ReadConversation<'a>,
     first: usize,
     last: usize,
     hidden: HiddenParts<'a>,
@@ -1025,7 +1039,7 @@ struct HiddenMessage<'a> {
 
 impl<'a> HiddenRun<'a> {
     fn new(
-        conversation: &'a ResolvedConversation,
+        conversation: ReadConversation<'a>,
         visibility: ContentVisibility,
         zone: Zone,
         first: HiddenMessage<'a>,
@@ -1187,7 +1201,11 @@ pub fn format_read_with_warnings(
     let mut entries = Vec::new();
     let mut request_entry_counts = Vec::with_capacity(requests.len());
     let mut messages_in_window = 0;
-    for request in requests {
+    let indexes = requests
+        .iter()
+        .map(|request| TranscriptIndex::of(request.transcript))
+        .collect::<Vec<_>>();
+    for (request, index) in requests.iter().zip(&indexes) {
         let request_options = request.options(options);
         header_options = header_options.showing(request_options.visibility());
         let shape = ReadShape {
@@ -1197,16 +1215,15 @@ pub fn format_read_with_warnings(
             anchors: one_message && request.call.is_none(),
             zone,
         };
-        let index = TranscriptIndex::of(request.transcript);
-        let mut selected = requested_messages(request, &index)?;
+        let mut selected = requested_messages(request, index)?;
         messages_in_window += selected
             .iter()
             .filter(|message| is_in_window(message, options.window))
             .count();
         if let ReadPriority::Tail(count) = &priority {
-            selected = tail_messages(request, selected, &index.links, *count, &shape);
+            selected = tail_messages(request, selected, index, *count, &shape);
         }
-        let request_entries = read_entries(request, selected, &index, &shape)?;
+        let request_entries = read_entries(request, selected, index, &shape)?;
         request_entry_counts.push(request_entries.len());
         entries.extend(request_entries);
     }
@@ -1475,6 +1492,7 @@ fn truncated_outline(
             );
             truncated.push_str(&continue_read_record(
                 &messages.resolved.reference.canonical(),
+                messages.addresses,
                 &omitted,
                 messages.visibility,
             ));
@@ -1504,6 +1522,8 @@ struct OutlineRecord {
 /// because choosing a segment size renders an outline per candidate size.
 struct OutlineMessages<'a> {
     resolved: &'a ResolvedConversation,
+    /// The addresses the outline prints for the conversation's messages.
+    addresses: &'a MessageAddresses,
     /// The messages the outline's ref names, shown or not: a range, a
     /// sub-agent's launch, messages and reports, or the whole session.
     requested: MessageRuns,
@@ -1539,7 +1559,7 @@ impl<'a> OutlineMessages<'a> {
     fn new(
         request: &ReadRequest<'a>,
         requested: Vec<&'a AgentMessage>,
-        index: &TranscriptIndex<'a>,
+        index: &'a TranscriptIndex<'a>,
         options: ProtocolOptions,
         written_at: DateTime<Zone>,
     ) -> Self {
@@ -1555,7 +1575,7 @@ impl<'a> OutlineMessages<'a> {
                 let mut rendered = shown_message(
                     resolved,
                     message,
-                    &index.links,
+                    index,
                     options,
                     CallLines::Collapsed,
                     zone,
@@ -1590,6 +1610,7 @@ impl<'a> OutlineMessages<'a> {
         }
         Self {
             resolved,
+            addresses: &index.addresses,
             requested: requested_runs,
             chars_before,
             times: RangeSpans::new(visible.iter().map(|message| message.times).collect()),
@@ -1686,6 +1707,7 @@ impl<'a> OutlineMessages<'a> {
         };
         let start = message_record_start(
             &record,
+            self.addresses,
             &time.map(RecordTime::field).unwrap_or_default(),
             true,
         );
@@ -1708,9 +1730,9 @@ impl<'a> OutlineMessages<'a> {
         let subagents = self.subagents_in(covers.clone());
         OutlineRecord {
             line: format!(
-                "seg m{}..m{}{} chars={}{} | {} / {}\n",
-                self.ordinal(first),
-                self.ordinal(last),
+                "seg {}{} chars={}{} | {} / {}\n",
+                self.addresses
+                    .closed_range(self.ordinal(first), self.ordinal(last)),
                 handles_field(&subagents),
                 self.chars(covers.clone()),
                 time_atoms(self.times.of(covers.clone()), self.header_offset, self.zone),
@@ -1802,9 +1824,9 @@ fn requested_messages<'a>(
     match (request.subagent, request.call, request.range) {
         (Some(handle), _, _) => subagent_messages(request.transcript, &index.subagents, handle),
         (None, Some(number), Some(range)) => {
-            call_messages(request.transcript, &index.links, range.start, number)
+            call_messages(request.transcript, index, range.start, number)
         }
-        _ => selected_messages(request.transcript, request.range),
+        _ => selected_messages(request.transcript, &index.addresses, request.range),
     }
 }
 
@@ -1812,15 +1834,22 @@ fn requested_messages<'a>(
 /// holding its result. A call the message does not hold is `out-of-range`.
 fn call_messages<'a>(
     transcript: &'a AgentTranscript,
-    links: &CallLinks<'_>,
+    index: &TranscriptIndex<'_>,
     ordinal: usize,
     number: usize,
 ) -> Result<Vec<&'a AgentMessage>> {
-    let message = selected_messages(transcript, Some(MessageRange::single(ordinal)))?
+    let addresses = &index.addresses;
+    let message = selected_messages(transcript, addresses, Some(MessageRange::single(ordinal)))?
         .into_iter()
         .next()
         .ok_or_else(|| {
-            AgentError::out_of_range(None, format!("message m{ordinal} is not in the transcript"))
+            AgentError::out_of_range(
+                None,
+                format!(
+                    "message {} is not in the transcript",
+                    addresses.message(ordinal)
+                ),
+            )
         })?;
     let calls = numbered_calls(message).collect::<Vec<_>>();
     let call = number.checked_sub(1).and_then(|index| calls.get(index));
@@ -1828,13 +1857,15 @@ fn call_messages<'a>(
         return Err(AgentError::out_of_range(
             None,
             format!(
-                "call m{ordinal}.{number} exceeds message m{ordinal}'s {} calls",
+                "call {} exceeds message {}'s {} calls",
+                addresses.call(CallAddress { ordinal, number }),
+                addresses.message(ordinal),
                 calls.len()
             ),
         )
         .into());
     };
-    let results = links.results_of(message, id);
+    let results = index.links.results_of(message, id);
     Ok(transcript
         .messages
         .iter()
@@ -1842,24 +1873,15 @@ fn call_messages<'a>(
         .collect())
 }
 
-fn selected_messages(
-    transcript: &AgentTranscript,
+fn selected_messages<'a>(
+    transcript: &'a AgentTranscript,
+    addresses: &MessageAddresses,
     range: Option<MessageRange>,
-) -> Result<Vec<&AgentMessage>> {
+) -> Result<Vec<&'a AgentMessage>> {
     let Some(range) = range else {
         return Ok(transcript.messages.iter().collect());
     };
-    let max = transcript.messages.len();
-    if range.end > max {
-        return Err(AgentError::out_of_range(
-            None,
-            format!(
-                "message range m{}..m{} exceeds transcript length m{}",
-                range.start, range.end, max
-            ),
-        )
-        .into());
-    }
+    let range = addresses.messages_in(range)?;
     Ok(transcript
         .messages
         .iter()
@@ -1894,7 +1916,7 @@ fn subagent_messages<'a>(
 fn tail_messages<'a>(
     request: &ReadRequest<'a>,
     mut selected: Vec<&'a AgentMessage>,
-    links: &CallLinks<'a>,
+    index: &'a TranscriptIndex<'a>,
     count: NonZeroUsize,
     shape: &ReadShape<'_>,
 ) -> Vec<&'a AgentMessage> {
@@ -1906,7 +1928,7 @@ fn tail_messages<'a>(
             shown_message(
                 request.resolved,
                 message,
-                links,
+                index,
                 shape.options,
                 CallLines::Collapsed,
                 shape.zone,
@@ -1946,19 +1968,22 @@ struct ReadShape<'s> {
     zone: Zone,
 }
 
-/// The calls, results and sub-agents a read looks up across a whole
-/// transcript.
+/// The calls, results, sub-agents and message addresses a read looks up
+/// across a whole transcript.
 struct TranscriptIndex<'a> {
     links: CallLinks<'a>,
     subagents: Subagents,
+    addresses: MessageAddresses,
 }
 
 impl<'a> TranscriptIndex<'a> {
     fn of(transcript: &'a AgentTranscript) -> Self {
         let links = CallLinks::of(transcript);
+        let addresses = MessageAddresses::of(transcript);
         Self {
-            subagents: Subagents::of(transcript, &links),
+            subagents: Subagents::of(transcript, &links, &addresses),
             links,
+            addresses,
         }
     }
 }
@@ -1970,7 +1995,7 @@ impl<'a> TranscriptIndex<'a> {
 fn read_entries<'a>(
     request: &ReadRequest<'a>,
     messages: Vec<&'a AgentMessage>,
-    index: &TranscriptIndex<'a>,
+    index: &'a TranscriptIndex<'a>,
     shape: &ReadShape<'_>,
 ) -> Result<Vec<ReadEntry<'a>>> {
     let options = shape.options;
@@ -1985,7 +2010,7 @@ fn read_entries<'a>(
         match shown_message(
             request.resolved,
             message,
-            &index.links,
+            index,
             options,
             shape.call_lines,
             shape.zone,
@@ -2037,7 +2062,10 @@ fn read_entries<'a>(
                     _ => {
                         entries.extend(hidden_run_entry(run.take()));
                         run = Some(HiddenRun::new(
-                            request.resolved,
+                            ReadConversation {
+                                resolved: request.resolved,
+                                addresses: &index.addresses,
+                            },
                             options.visibility(),
                             shape.zone,
                             next,
@@ -2132,10 +2160,12 @@ fn part_has_text(part: &AgentMessagePart) -> bool {
     }
 }
 
+/// `message` of the conversation `resolved` as a read with `options` shows
+/// it, its links and addresses from `index`; `None` when it does not show.
 fn shown_message<'a>(
-    conversation: &'a ResolvedConversation,
+    resolved: &'a ResolvedConversation,
     message: &'a AgentMessage,
-    links: &CallLinks<'a>,
+    index: &'a TranscriptIndex<'a>,
     options: ProtocolOptions,
     call_lines: CallLines,
     zone: Zone,
@@ -2143,11 +2173,22 @@ fn shown_message<'a>(
     if !is_in_window(message, options.window) {
         return None;
     }
-    render_message(conversation, message, links, options, call_lines, zone)
+    let conversation = ReadConversation {
+        resolved,
+        addresses: &index.addresses,
+    };
+    render_message(
+        conversation,
+        message,
+        &index.links,
+        options,
+        call_lines,
+        zone,
+    )
 }
 
 fn render_message<'a>(
-    conversation: &'a ResolvedConversation,
+    conversation: ReadConversation<'a>,
     message: &'a AgentMessage,
     links: &CallLinks<'a>,
     options: ProtocolOptions,
@@ -2278,10 +2319,13 @@ fn apply_read_slice<'a>(
                 return Err(AgentError::out_of_range(
                     None,
                     format!(
-                        "content line range {}..{} exceeds message m{} length {}",
+                        "content line range {}..{} exceeds message {} length {}",
                         range.start,
                         range.end,
-                        rendered.message.ordinal,
+                        rendered
+                            .conversation
+                            .addresses
+                            .message(rendered.message.ordinal),
                         lines.len()
                     ),
                 )
@@ -2484,7 +2528,7 @@ impl DaysBetweenEntries {
                     let entry = &entries[index];
                     (
                         index,
-                        entry.conversation().reference.full_ref(),
+                        entry.conversation().resolved.reference.full_ref(),
                         printed_days(entry),
                     )
                 })
@@ -2526,8 +2570,8 @@ const TRUNCATION_FLOOR_CHARS: usize = 200;
 /// A `continue read` record per conversation for the entries not in
 /// `selected`: each run of consecutive messages as one ref, `;` between
 /// refs, then the flags that show every omitted entry.
-fn continuation_records(spans: &[EntrySpan], selected: &BTreeSet<usize>) -> Vec<String> {
-    let mut groups: Vec<OmittedEntries<'_>> = Vec::new();
+fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> Vec<String> {
+    let mut groups: Vec<OmittedEntries<'_, '_>> = Vec::new();
     for (index, span) in spans.iter().enumerate() {
         if selected.contains(&index) {
             continue;
@@ -2550,19 +2594,26 @@ fn continuation_records(spans: &[EntrySpan], selected: &BTreeSet<usize>) -> Vec<
     }
     groups
         .iter()
-        .map(|group| continue_read_record(&group.first.canonical, &group.runs, group.flags))
+        .map(|group| {
+            continue_read_record(
+                &group.first.canonical,
+                group.first.addresses,
+                &group.runs,
+                group.flags,
+            )
+        })
         .collect()
 }
 
 /// The entries a budget omits from one conversation.
-struct OmittedEntries<'s> {
-    first: &'s EntrySpan,
+struct OmittedEntries<'s, 'a> {
+    first: &'s EntrySpan<'a>,
     runs: MessageRuns,
     flags: ContentVisibility,
 }
 
-impl<'s> OmittedEntries<'s> {
-    fn add(&mut self, span: &'s EntrySpan) {
+impl<'s, 'a> OmittedEntries<'s, 'a> {
+    fn add(&mut self, span: &'s EntrySpan<'a>) {
         self.runs.push(span.first, span.last);
         self.flags.merge(span.flags);
     }
@@ -2571,9 +2622,11 @@ impl<'s> OmittedEntries<'s> {
 /// An entry's conversation and messages: the `omit=` atom and the
 /// `continue read` records name them when a budget omits the entry.
 #[derive(Clone, Debug)]
-struct EntrySpan {
+struct EntrySpan<'a> {
     full_ref: String,
     canonical: String,
+    /// The addresses of the conversation's messages.
+    addresses: &'a MessageAddresses,
     first: usize,
     last: usize,
     /// The flags that show the entry's messages: the read's, and for a run
@@ -2584,9 +2637,10 @@ struct EntrySpan {
     is_hidden: bool,
 }
 
-impl EntrySpan {
-    fn of(entry: &ReadEntry<'_>) -> Self {
-        let reference = &entry.conversation().reference;
+impl<'a> EntrySpan<'a> {
+    fn of(entry: &ReadEntry<'a>) -> Self {
+        let conversation = entry.conversation();
+        let reference = &conversation.resolved.reference;
         let (flags, is_hidden) = match entry {
             ReadEntry::Message { rendered, .. } => (rendered.visibility, false),
             ReadEntry::Hidden(run) => (run.flags, true),
@@ -2594,6 +2648,7 @@ impl EntrySpan {
         Self {
             full_ref: reference.full_ref(),
             canonical: reference.canonical(),
+            addresses: conversation.addresses,
             first: entry.first_ordinal(),
             last: entry.last_ordinal(),
             flags,
@@ -2605,7 +2660,10 @@ impl EntrySpan {
 /// The `read` record of each run of one conversation's `selected` entries
 /// whose messages are all hidden, as [`write_entries`] writes it after the
 /// run.
-fn recipes_showing_hidden_messages(spans: &[EntrySpan], selected: &BTreeSet<usize>) -> Vec<String> {
+fn recipes_showing_hidden_messages(
+    spans: &[EntrySpan<'_>],
+    selected: &BTreeSet<usize>,
+) -> Vec<String> {
     let shown = selected
         .iter()
         .map(|&index| &spans[index])
@@ -2613,31 +2671,54 @@ fn recipes_showing_hidden_messages(spans: &[EntrySpan], selected: &BTreeSet<usiz
     shown
         .chunk_by(|first, next| first.full_ref == next.full_ref)
         .filter_map(|run| recipe_showing_hidden_entries(run.iter().copied()))
-        .map(|(reference, runs, flags)| read_record(reference, &runs, flags))
+        .map(|recipe| recipe.record())
         .collect()
 }
 
-/// The conversation of `spans`, consecutive entries of one conversation, the
-/// runs of their messages and the flags that show them, when none of the
-/// entries shows a message: for a `read` record.
-fn recipe_showing_hidden_entries<'s>(
-    spans: impl Iterator<Item = &'s EntrySpan>,
-) -> Option<(&'s str, MessageRuns, ContentVisibility)> {
-    let mut reference = None;
+/// The conversation of `spans`, consecutive entries of one conversation,
+/// with the addresses of its messages, the runs of their messages and the
+/// flags that show them, when none of the entries shows a message: for a
+/// `read` record.
+fn recipe_showing_hidden_entries<'s, 'a: 's>(
+    spans: impl Iterator<Item = &'s EntrySpan<'a>>,
+) -> Option<HiddenEntriesRecipe<'s, 'a>> {
+    let mut conversation = None;
     let mut runs = MessageRuns::default();
     let mut flags = ContentVisibility::default();
     for span in spans {
         if !span.is_hidden {
             return None;
         }
-        reference.get_or_insert(span.canonical.as_str());
+        conversation.get_or_insert((span.canonical.as_str(), span.addresses));
         runs.push(span.first, span.last);
         flags.merge(span.flags);
     }
-    Some((reference?, runs, flags))
+    let (reference, addresses) = conversation?;
+    Some(HiddenEntriesRecipe {
+        reference,
+        addresses,
+        runs,
+        flags,
+    })
 }
 
-fn omitted_message_ranges(spans: &[EntrySpan], selected: &BTreeSet<usize>) -> String {
+/// The `read` record of entries that hide every message: their
+/// conversation's `ref=`, its addresses, the runs of their messages and the
+/// flags that show them.
+struct HiddenEntriesRecipe<'s, 'a> {
+    reference: &'s str,
+    addresses: &'a MessageAddresses,
+    runs: MessageRuns,
+    flags: ContentVisibility,
+}
+
+impl HiddenEntriesRecipe<'_, '_> {
+    fn record(&self) -> String {
+        read_record(self.reference, self.addresses, &self.runs, self.flags)
+    }
+}
+
+fn omitted_message_ranges(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> String {
     let qualify = spans
         .first()
         .is_some_and(|first| spans.iter().any(|span| span.full_ref != first.full_ref));
@@ -2657,11 +2738,16 @@ fn omitted_message_ranges(spans: &[EntrySpan], selected: &BTreeSet<usize>) -> St
                     };
                     ranges.push(format!(
                         "{prefix}{}",
-                        ordinal_range(first_span.first, last_span.last)
+                        first_span.addresses.range(first_span.first, last_span.last)
                     ));
                 } else {
                     for span in &spans[first..index] {
-                        ranges.push(message_range_ref(&span.canonical, span.first, span.last));
+                        ranges.push(message_range_ref(
+                            &span.canonical,
+                            span.addresses,
+                            span.first,
+                            span.last,
+                        ));
                     }
                 }
                 start = None;
@@ -2688,7 +2774,7 @@ fn focused_indices(entries: &[ReadEntry<'_>], focus: Option<&ProtocolFocus>) -> 
             let conversation_matches = focus
                 .conversation_full_ref
                 .as_deref()
-                .is_none_or(|target| entry.conversation().reference.full_ref() == target);
+                .is_none_or(|target| entry.conversation().resolved.reference.full_ref() == target);
             (conversation_matches
                 && focus.range.start <= entry.last_ordinal()
                 && entry.first_ordinal() <= focus.range.end)
@@ -2933,7 +3019,7 @@ struct ReadPartSizes<'h, 'e> {
     /// its legend record. A conversation's run prints each legend record
     /// once.
     legends: Vec<Option<(Handle, usize)>>,
-    spans: Vec<EntrySpan>,
+    spans: Vec<EntrySpan<'e>>,
     /// The parts each entry hides: the header totals them.
     hidden: Vec<HiddenParts<'e>>,
     /// [`ReadHeader::fixed_atoms`].
@@ -2969,7 +3055,11 @@ impl<'h, 'e> ReadPartSizes<'h, 'e> {
             truncated,
             conversation_chars: entries
                 .iter()
-                .map(|entry| conversation_record(entry.conversation()).chars().count())
+                .map(|entry| {
+                    conversation_record(entry.conversation().resolved)
+                        .chars()
+                        .count()
+                })
                 .collect(),
             legends: entries
                 .iter()
@@ -3328,8 +3418,8 @@ mod tests {
     fn shown_entries<'a>(
         resolved: &'a ResolvedConversation,
         transcript: &'a AgentTranscript,
+        index: &'a TranscriptIndex<'a>,
     ) -> Vec<ReadEntry<'a>> {
-        let links = CallLinks::of(transcript);
         transcript
             .messages
             .iter()
@@ -3337,7 +3427,7 @@ mod tests {
                 shown_message(
                     resolved,
                     message,
-                    &links,
+                    index,
                     options(),
                     CallLines::Collapsed,
                     Zone::System,
@@ -3384,10 +3474,10 @@ mod tests {
         let mut selected = BTreeSet::new();
         if let Some(focus) = focus {
             for (index, entry) in messages.iter().enumerate() {
-                let conversation_matches = focus
-                    .conversation_full_ref
-                    .as_deref()
-                    .is_none_or(|target| entry.conversation().reference.full_ref() == target);
+                let conversation_matches =
+                    focus.conversation_full_ref.as_deref().is_none_or(|target| {
+                        entry.conversation().resolved.reference.full_ref() == target
+                    });
                 if conversation_matches
                     && focus.range.start <= entry.first_ordinal()
                     && entry.first_ordinal() <= focus.range.end
@@ -3442,7 +3532,8 @@ mod tests {
                 })
                 .collect(),
         );
-        let messages = shown_entries(&resolved, &transcript);
+        let index = TranscriptIndex::of(&transcript);
+        let messages = shown_entries(&resolved, &transcript, &index);
 
         for budget in (100..=4_000).step_by(37) {
             let focus = ProtocolFocus {
@@ -3480,9 +3571,13 @@ mod tests {
                 .map(|ordinal| text_message(ordinal, AgentMessageRole::User, "beta message"))
                 .collect(),
         );
-        let messages = shown_entries(&first, &first_transcript)
+        let (first_index, second_index) = (
+            TranscriptIndex::of(&first_transcript),
+            TranscriptIndex::of(&second_transcript),
+        );
+        let messages = shown_entries(&first, &first_transcript, &first_index)
             .into_iter()
-            .chain(shown_entries(&second, &second_transcript))
+            .chain(shown_entries(&second, &second_transcript, &second_index))
             .collect::<Vec<_>>();
 
         for budget in (100..=2_000).step_by(29) {
@@ -3522,7 +3617,8 @@ mod tests {
                 })
                 .collect(),
         );
-        let messages = shown_entries(&resolved, &transcript);
+        let index = TranscriptIndex::of(&transcript);
+        let messages = shown_entries(&resolved, &transcript, &index);
         let days_written = written(&messages, &[0, 39])
             .lines()
             .filter(|line| line.starts_with("day "))
@@ -4789,7 +4885,8 @@ mod tests {
             text_message(1, Assistant, &"c".repeat(400)),
             text_message(2, Assistant, &"d".repeat(3_000)),
         ]);
-        let mut entries = shown_entries(&resolved, &transcript);
+        let index = TranscriptIndex::of(&transcript);
+        let mut entries = shown_entries(&resolved, &transcript, &index);
         let selected = [0, 1];
         let render = |entries: &[ReadEntry<'_>], selected: &[usize], _cut: &str, _| {
             written(entries, selected)
@@ -5676,7 +5773,8 @@ mod tests {
         let transcript = long_session(2_000);
         let budget = 6_000;
         let output = format_outline(&resolved, &transcript, with_budget(budget));
-        let messages = whole_session_outline(&resolved, &transcript, with_budget(budget));
+        let index = TranscriptIndex::of(&transcript);
+        let messages = whole_session_outline(&resolved, &transcript, &index, with_budget(budget));
         let record_chars = |size| {
             messages
                 .records(size)
@@ -5733,13 +5831,13 @@ mod tests {
     fn whole_session_outline<'a>(
         resolved: &'a ResolvedConversation,
         transcript: &'a AgentTranscript,
+        index: &'a TranscriptIndex<'a>,
         options: ProtocolOptions,
     ) -> OutlineMessages<'a> {
-        let index = TranscriptIndex::of(transcript);
         OutlineMessages::new(
             &whole_session_request(resolved, transcript),
             transcript.messages.iter().collect(),
-            &index,
+            index,
             options,
             written_at(),
         )
@@ -5767,7 +5865,8 @@ mod tests {
     fn warning_beside_segment_too_long_for_budget_prints_whole_in_its_place() {
         let resolved = resolved("session.jsonl");
         let transcript = long_session(2_000);
-        let one_segment = whole_session_outline(&resolved, &transcript, options())
+        let index = TranscriptIndex::of(&transcript);
+        let one_segment = whole_session_outline(&resolved, &transcript, &index, options())
             .records(2_000)
             .remove(0)
             .line;
@@ -6757,12 +6856,12 @@ mod tests {
             subagent: None,
             call: None,
         };
-        let links = CallLinks::of(transcript);
+        let index = TranscriptIndex::of(transcript);
         let one_message = range.is_some_and(|range| range.is_single());
         let rendered = shown_message(
             request.resolved,
             &transcript.messages[0],
-            &links,
+            &index,
             options,
             request.call_lines(one_message),
             Zone::System,
@@ -6770,6 +6869,7 @@ mod tests {
         .unwrap();
         let truncation = rendered.truncation_keeping(keep);
         let mut writer = RecordWriter::new(RecordSize::Full, Zone::System);
+        writer.enter_conversation(request.resolved, &index.addresses, &[]);
         rendered.write(&HiddenParts::default(), Some(&truncation), &mut writer);
         let output = writer.into_output();
         let lines = output.lines().collect::<Vec<_>>();
@@ -6914,18 +7014,18 @@ mod tests {
             ..options()
         };
         let resolved = resolved("session.jsonl");
-        let links = CallLinks::of(&transcript);
+        let index = TranscriptIndex::of(&transcript);
         let rendered = shown_message(
             &resolved,
             &transcript.messages[0],
-            &links,
+            &index,
             with_tools,
             CallLines::Collapsed,
             Zone::System,
         )
         .unwrap();
         let truncation = rendered.truncation_keeping(8);
-        let mut writer = RecordWriter::new(RecordSize::Full, Zone::System);
+        let mut writer = RecordWriter::measuring(None, &index.addresses, Zone::System);
 
         rendered.write(&HiddenParts::default(), Some(&truncation), &mut writer);
 
@@ -8055,11 +8155,11 @@ mod tests {
             for calls in [1, 2] {
                 for options in call_flags() {
                     let transcript = untimed_calls_after_a_body(body_chars, calls);
-                    let links = CallLinks::of(&transcript);
+                    let index = TranscriptIndex::of(&transcript);
                     let rendered = shown_message(
                         &resolved,
                         &transcript.messages[0],
-                        &links,
+                        &index,
                         options,
                         CallLines::Collapsed,
                         Zone::System,
@@ -8122,11 +8222,11 @@ mod tests {
     fn truncation_keeps_its_floor_when_keeping_fewer_characters_prints_more() {
         let transcript = floor_where_fewer_kept_characters_print_more();
         let resolved = resolved("session.jsonl");
-        let links = CallLinks::of(&transcript);
+        let index = TranscriptIndex::of(&transcript);
         let rendered = shown_message(
             &resolved,
             &transcript.messages[0],
-            &links,
+            &index,
             call_flags()[0],
             CallLines::Collapsed,
             Zone::System,

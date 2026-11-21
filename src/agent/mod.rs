@@ -1,3 +1,4 @@
+pub mod address;
 pub mod call_links;
 pub mod diagnostic;
 pub mod hidden_parts;
