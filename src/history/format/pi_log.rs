@@ -18,6 +18,7 @@ use crate::history::provider::{ResumedWindow, Resumption, TranscriptRead, Transc
 use crate::history::{MalformedLine, ParsePermit, Source};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, TokenUsage, Tool, UserContent, UserMessage,
+    image_placeholder,
 };
 use crate::parallel::ParallelThreshold;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -1254,13 +1255,7 @@ fn content_block(object: &Map<String, Value>) -> Option<ContentBlock> {
             text: string_or_empty(object, "text"),
         }),
         "image" => Some(ContentBlock::Text {
-            text: format!(
-                "[Image: {}]",
-                object
-                    .get("mimeType")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown type")
-            ),
+            text: image_placeholder(object.get("mimeType").and_then(Value::as_str)),
         }),
         _ => None,
     }

@@ -98,48 +98,6 @@ pub(super) fn make_reply_output_id(
         "entry:{entry_index}:parent:{parent}:block:{block_index}:kind:reply"
     ))
 }
-/// Extract text content from tool result for markdown rendering.
-/// Returns Some(text) if content is a string or array of text blocks.
-/// Returns None for JSON structures that should be pretty-printed instead.
-pub(super) fn extract_tool_result_text(content: Option<&serde_json::Value>) -> Option<String> {
-    match content {
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(serde_json::Value::Array(arr)) => {
-            // Handle array of content blocks (e.g., [{type: "text", text: "..."}])
-            let texts: Vec<&str> = arr
-                .iter()
-                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                .collect();
-            if !texts.is_empty() {
-                Some(texts.join("\n\n"))
-            } else {
-                None // Array without text blocks - render as JSON
-            }
-        }
-        _ => None, // Objects, null, etc. - render as JSON
-    }
-}
-
-/// Format tool result content to a string for display (non-text content)
-fn format_tool_result_content(content: Option<&serde_json::Value>) -> String {
-    match content {
-        Some(value) => {
-            if let Ok(formatted) = serde_json::to_string_pretty(value) {
-                formatted
-            } else {
-                "<invalid content>".to_string()
-            }
-        }
-        None => "<no content>".to_string(),
-    }
-}
-
-/// Pick the display text for a tool result: prefer extracted text content,
-/// fall back to a JSON pretty-print for objects, null, or text-less arrays.
-pub(super) fn tool_result_display_text(content: Option<&serde_json::Value>) -> String {
-    extract_tool_result_text(content).unwrap_or_else(|| format_tool_result_content(content))
-}
-
 /// Descriptor for one tool-call rendering pass shared by entry and
 /// summary-expansion render paths.
 pub(super) struct ToolCallRenderSpec<'a> {

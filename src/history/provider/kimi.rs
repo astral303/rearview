@@ -353,7 +353,7 @@ impl SessionStorage for KimiStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "kimi",
-            schema_version: 20,
+            schema_version: 21,
         }
     }
 
@@ -1041,6 +1041,22 @@ pub(super) mod tests {
                         "type": "tool.result", "toolCallId": "TodoList_9",
                         "result": {"output": "Todo list updated"}
                     })),
+                    appended("user", "Show the window", json!({"kind": "user"})),
+                    event(json!({
+                        "type": "tool.call", "toolCallId": "ReadMediaFile_9", "name": "ReadMediaFile",
+                        "args": {"path": "IMAGE_RESULT_SENTINEL.png"}
+                    })),
+                    event(json!({
+                        "type": "tool.result", "toolCallId": "ReadMediaFile_9",
+                        "result": {
+                            "output": [
+                                {"type": "text", "text": "<image path=\"window.png\">"},
+                                {"type": "image_url", "imageUrl": {"url": "blobref:image/png;IMAGE_BLOB_SENTINEL"}},
+                                {"type": "text", "text": "</image>"}
+                            ],
+                            "note": "<system>Read image file. Mime type: image/png.</system>"
+                        }
+                    })),
                 ],
             );
             AgentSession::new(
@@ -1074,9 +1090,15 @@ pub(super) mod tests {
                     Marker::shown("edit diff", "EDIT_DIFF_SENTINEL")
                         .in_summary_row("Edited 1 file, updated the task list 1 time"),
                     Marker::shown("todo list", "TODO_SENTINEL"),
+                    Marker::in_call_or_subagent("read of an image", "IMAGE_RESULT_SENTINEL"),
+                    Marker::shown("image in a result", "[Image: image/png]"),
                 ],
             )
             .with_hidden(&[
+                (
+                    "image's stored reference in a result",
+                    "IMAGE_BLOB_SENTINEL",
+                ),
                 ("injected reminder", "SYSTEM_REMINDER_SENTINEL"),
                 ("model request", "LLM_REQUEST_SENTINEL"),
                 ("tool result's system note", "NOTE_SENTINEL"),

@@ -477,7 +477,7 @@ impl SessionStorage for CodexStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "codex",
-            schema_version: 33,
+            schema_version: 34,
         }
     }
 
@@ -1314,6 +1314,21 @@ pub(super) mod tests {
                         "response_item",
                         json!({"type": "custom_tool_call_output", "id": "ctco_several_commands", "call_id": "call_several_commands", "output": [{"type": "input_text", "text": "src/lib.rs:7"}]}),
                     ),
+                    line(
+                        47,
+                        "response_item",
+                        json!({"type": "message", "id": "msg_u6", "role": "user", "content": [{"type": "input_text", "text": "Show the window"}]}),
+                    ),
+                    line(
+                        48,
+                        "response_item",
+                        json!({"type": "custom_tool_call", "id": "ctc_image", "status": "completed", "call_id": "call_image", "name": "exec", "input": "await tools.view_image({ path: \"window.png\" });"}),
+                    ),
+                    line(
+                        49,
+                        "response_item",
+                        json!({"type": "custom_tool_call_output", "id": "ctco_image", "call_id": "call_image", "output": [{"type": "input_text", "text": "IMAGE_RESULT_SENTINEL: Script completed"}, {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo=", "detail": "high"}]}),
+                    ),
                 ],
             );
             const PATCH_RUN: &str = "Edited 2 files, messaged 1 agent, received 1 message, waited 1 time, asked the user 1 time, updated the task list 1 time";
@@ -1423,9 +1438,12 @@ pub(super) mod tests {
                         "SEVERAL_COMMANDS_SENTINEL",
                     )
                     .in_summary_row(SCRIPT_RUN),
+                    Marker::shown("text beside an image in a result", "IMAGE_RESULT_SENTINEL"),
+                    Marker::shown("image in a result", "[Image: image/png]"),
                 ],
             )
             .with_hidden(&[
+                ("image's data in a result", "iVBORw0KGgo="),
                 ("base instructions", "BASE_INSTRUCTIONS_SENTINEL"),
                 ("environment context", "ENV_CONTEXT_SENTINEL"),
                 ("AGENTS.md instructions", "AGENTS_MD_SENTINEL"),

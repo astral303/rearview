@@ -1,6 +1,6 @@
 $ rearview agent read ch_581699c40efc
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=16 hidden-tool-results=13 hidden-thinking=1 hidden-subagents=5
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagents=5
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=m5 report=m6 : Read the README
 subagent s2 type=Explore launch=m7 span=m8..m10 report=m11 : Check how the plugin starts
@@ -44,15 +44,18 @@ m31 user 06:30:00
 | [Recap] RECAP_SENTINEL: fix the parser, then run the tests.
 m32 user 06:31:00
 | [Notice] NOTICE_SENTINEL: safeguards flagged this message; switched model.
-m33..m34 hidden 06:32:00..06:32:01 tools=1
+m33..m34 hidden 06:32:00..06:32:01 tools=1 tool-results=1
 m35 06:32:02
 | NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 m36 user 06:33:00
 | Fix the tokenizer, then plan the rest
 m37..m46 hidden 06:33:01..06:33:10 tools=5 tool-results=5
-m47 user 06:34:00
+m47 user 06:33:19
+| Show the window
+m48..m49 hidden 06:33:20..06:33:21 tools=1 tool-results=1
+m50 user 06:34:00
 | is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
-m48 user 06:34:01
+m51 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc --tools --tool-results --thinking --subagents --no-budget
 --- stdout
@@ -154,6 +157,8 @@ m32 user 06:31:00
 | [Notice] NOTICE_SENTINEL: safeguards flagged this message; switched model.
 m33.1 06:32:00 result=m34
 | tool ToolSearch input_keys=query (+3 lines)
+m34 06:32:01 call=m33.1
+| [Tool: Read]
 m35 06:32:02
 | NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 m36 user 06:33:00
@@ -178,9 +183,16 @@ m45.1 06:33:09 result=m46
 | tool ExitPlanMode input_keys=plan (+4 lines)
 m46 06:33:10 call=m45.1
 | User has approved your plan.
-m47 user 06:34:00
+m47 user 06:33:19
+| Show the window
+m48.1 06:33:20 result=m49
+| Read: /tmp/claude-every-record-fixture/window.png
+m49 06:33:21 call=m48.1
+| IMAGE_RESULT_SENTINEL: the window after the build
+| [Image: image/png]
+m50 user 06:34:00
 | is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
-m48 user 06:34:01
+m51 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m2..m4
 --- stdout
@@ -206,24 +218,24 @@ m3 hidden 06:00:03 tool-results=1 calls=m2.1
 read ref=ch_581699c40efc:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_581699c40efc --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=5 hidden-tool-results=5
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=1 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
-m36 user 06:33:00
-| Fix the tokenizer, then plan the rest
-m37..m46 hidden 06:33:01..06:33:10 tools=5 tool-results=5
-m47 user 06:34:00
+m47 user 06:33:19
+| Show the window
+m48..m49 hidden 06:33:20..06:33:21 tools=1 tool-results=1
+m50 user 06:34:00
 | is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
-m48 user 06:34:01
+m51 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc --tools --subagents --tail 2
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
-m47 user 06:34:00
+m50 user 06:34:00
 | is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
-m48 user 06:34:01
+m51 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m2.1
 --- stdout
@@ -268,7 +280,7 @@ m5 s1 hidden 06:00:06 subagents=1
 continue read refs=ch_581699c40efc:m1;ch_581699c40efc:m6..m8 tools=true tool-results=true thinking=false subagents=true
 $ rearview agent read ch_581699c40efc --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=2351 policy=text omit=m8..m48 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=1
+protocol agent-read cut=tail chars=900 full=2460 policy=text omit=m8..m51 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=m5 report=m6 : Read the README
 day 2026-09-01
@@ -279,8 +291,8 @@ m2 06:00:02 hidden-tools=Bash hidden-thinking=1
 m3..m4 hidden 06:00:03..06:00:04 launches=s1 tools=1 tool-results=1 calls=m2.1
 m5 s1 hidden 06:00:06 subagents=1
 m6..m7 hidden 06:00:07..06:00:08 launches=s2 tools=1 tool-results=1 calls=m4.1
-continue read refs=ch_581699c40efc:m8..m48 tools=true tool-results=true thinking=false subagents=true
-$ rearview agent read ch_581699c40efc:m8..m48 --tools --tool-results --subagents
+continue read refs=ch_581699c40efc:m8..m51 tools=true tool-results=true thinking=false subagents=true
+$ rearview agent read ch_581699c40efc:m8..m51 --tools --tool-results --subagents
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+tools+tool-results+subagents omit=none tz=-04:00 hidden-thinking=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
@@ -358,6 +370,8 @@ m32 user 06:31:00
 | [Notice] NOTICE_SENTINEL: safeguards flagged this message; switched model.
 m33.1 06:32:00 result=m34
 | tool ToolSearch input_keys=query (+3 lines)
+m34 06:32:01 call=m33.1
+| [Tool: Read]
 m35 06:32:02
 | NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 m36 user 06:33:00
@@ -382,13 +396,20 @@ m45.1 06:33:09 result=m46
 | tool ExitPlanMode input_keys=plan (+4 lines)
 m46 06:33:10 call=m45.1
 | User has approved your plan.
-m47 user 06:34:00
+m47 user 06:33:19
+| Show the window
+m48.1 06:33:20 result=m49
+| Read: /tmp/claude-every-record-fixture/window.png
+m49 06:33:21 call=m48.1
+| IMAGE_RESULT_SENTINEL: the window after the build
+| [Image: image/png]
+m50 user 06:34:00
 | is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
-m48 user 06:34:01
+m51 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_581699c40efc detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m48
+protocol agent-error kind=out-of-range ref=ch_581699c40efc detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m51
 $ rearview agent read ch_581699c40efc:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -397,7 +418,7 @@ $ rearview agent read ch_581699c40efc:s99
 protocol agent-error kind=not-found ref=ch_581699c40efc detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_0b26e45343df
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1 hidden-subagents=3 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagents=3 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=m2..m4 : agent-0
 day 2026-08-06
@@ -432,6 +453,9 @@ m22..m23 hidden 06:03:21 tools=1 tool-results=1
 m24 06:03:21
 | Dating the release steps.
 m25..m28 hidden 06:03:21 tools=2 tool-results=2
+m29 user 06:03:20
+| Show the window
+m30..m31 hidden 06:03:21 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --tools --tool-results --thinking --subagents --no-budget
 --- stdout
@@ -497,6 +521,14 @@ m27.1 06:03:21 result=m28
 | tool TodoList input_keys=todos (+8 lines)
 m28 06:03:21 call=m27.1
 | Todo list updated
+m29 user 06:03:20
+| Show the window
+m30.1 06:03:21 result=m31
+| ReadMediaFile: IMAGE_RESULT_SENTINEL.png
+m31 06:03:21 call=m30.1
+| <image path="window.png">
+| [Image: image/png]
+| </image>
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m2..m4
 --- stdout
@@ -520,30 +552,29 @@ m4 s1 06:00:02 slice=match=the context=3 hits=0 anchor=ma_3200d601e22cb40f
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=4 hidden-tool-results=3 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=4 hidden-tool-results=4 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
-m18 user 06:03:20
-| Is the notes file empty?
-m19..m20 hidden 06:03:21 tools=1
 m21 06:03:21
 | NUMBERED_REPLY_SENTINEL: the command printed nothing.
 m22..m23 hidden 06:03:21 tools=1 tool-results=1
 m24 06:03:21
 | Dating the release steps.
 m25..m28 hidden 06:03:21 tools=2 tool-results=2
+m29 user 06:03:20
+| Show the window
+m30..m31 hidden 06:03:21 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=1 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
-m25.1 06:03:21 result=m26
-| Edit: NOTES.md (+2 lines)
-m26 hidden 06:03:21 tool-results=1
-m27.1 06:03:21 result=m28
-| tool TodoList input_keys=todos (+8 lines)
-m28 hidden 06:03:21 tool-results=1
+m29 user 06:03:20
+| Show the window
+m30.1 06:03:21 result=m31
+| ReadMediaFile: IMAGE_RESULT_SENTINEL.png
+m31 hidden 06:03:21 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m7.1
 --- stdout
@@ -593,7 +624,7 @@ m7..m8 hidden 06:00:05..06:00:06 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=1461 policy=text omit=m11..m28 tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 hidden-subagents=3 warnings=1 warning-records=1
+protocol agent-read cut=tail chars=900 full=1545 policy=text omit=m11..m31 tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 hidden-subagents=3 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=m2..m4 : agent-0
 day 2026-08-06
@@ -608,9 +639,9 @@ m9 user 06:02:00
 | steer follow-up question
 m10 06:02:01
 | final kimi reply
-continue read refs=ch_0b26e45343df:m11..m28 tools=true tool-results=true thinking=false subagents=false
+continue read refs=ch_0b26e45343df:m11..m31 tools=true tool-results=true thinking=false subagents=false
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
-$ rearview agent read ch_0b26e45343df:m11..m28 --tools --tool-results
+$ rearview agent read ch_0b26e45343df:m11..m31 --tools --tool-results
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
@@ -653,10 +684,18 @@ m27.1 06:03:21 result=m28
 | tool TodoList input_keys=todos (+8 lines)
 m28 06:03:21 call=m27.1
 | Todo list updated
+m29 user 06:03:20
+| Show the window
+m30.1 06:03:21 result=m31
+| ReadMediaFile: IMAGE_RESULT_SENTINEL.png
+m31 06:03:21 call=m30.1
+| <image path="window.png">
+| [Image: image/png]
+| </image>
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_0b26e45343df detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m28
+protocol agent-error kind=out-of-range ref=ch_0b26e45343df detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m31
 $ rearview agent read ch_0b26e45343df:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -665,7 +704,7 @@ $ rearview agent read ch_0b26e45343df:s99
 protocol agent-error kind=not-found ref=ch_0b26e45343df detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_74aec3f6df49
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=30 hidden-tool-results=23 hidden-thinking=1 hidden-subagents=5 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagents=5 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 subagent s2 type=grunt span=m11..m13 : child
@@ -714,6 +753,9 @@ m50 user 06:03:28
 | [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
 | </send_user_message_question_reply>
 m51..m70 hidden 06:03:29..06:03:46 tools=10 tool-results=10
+m71 user 06:03:47
+| Show the window
+m72..m73 hidden 06:03:48..06:03:49 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
@@ -882,6 +924,13 @@ m69.1 06:03:45 result=m70
 | exec: rg -n SEVERAL_COMMANDS_SENTINEL src
 m70 06:03:46 call=m69.1
 | src/lib.rs:7
+m71 user 06:03:47
+| Show the window
+m72.1 06:03:48 result=m73
+| exec: window.png
+m73 06:03:49 call=m72.1
+| IMAGE_RESULT_SENTINEL: Script completed
+| [Image: image/png]
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m2..m4
 --- stdout
@@ -906,13 +955,9 @@ m3 s1 06:00:03 slice=match=the context=3 hits=0 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=10 hidden-tool-results=10 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=11 hidden-tool-results=11 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
-m48 user 06:03:26
-| > QUESTION_TITLE_SENTINEL: which profile?
-|
-| PICKED_OPTION_SENTINEL: warm idle
 m49 user 06:03:27
 | > Keep recording once warm?
 |
@@ -923,20 +968,20 @@ m50 user 06:03:28
 | [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
 | </send_user_message_question_reply>
 m51..m70 hidden 06:03:29..06:03:46 tools=10 tool-results=10
+m71 user 06:03:47
+| Show the window
+m72..m73 hidden 06:03:48..06:03:49 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=1 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
-m67.1 06:03:43 result=m68
-| exec: PATHS.md (+1 line)
-m68 hidden 06:03:44 tool-results=1
-m69.1 06:03:45 result=m70
-| exec: git status --short
-| exec: git log -5 --oneline
-| exec: rg -n SEVERAL_COMMANDS_SENTINEL src
-m70 hidden 06:03:46 tool-results=1
+m71 user 06:03:47
+| Show the window
+m72.1 06:03:48 result=m73
+| exec: window.png
+m73 hidden 06:03:49 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m6.1
 --- stdout
@@ -984,7 +1029,7 @@ continue read refs=ch_74aec3f6df49:m1..m3 tools=false tool-results=false thinkin
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=1967 policy=text omit=m11..m70 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
+protocol agent-read cut=tail chars=900 full=2061 policy=text omit=m11..m73 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=m2..m3 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -995,9 +1040,9 @@ m4 hidden 06:00:04 thinking=1
 m5 06:00:05
 | codex answer searchable
 m6..m10 hidden 06:00:07..06:00:11 tools=3 tool-results=2
-continue read refs=ch_74aec3f6df49:m11..m70 tools=true tool-results=true thinking=true subagents=true
+continue read refs=ch_74aec3f6df49:m11..m73 tools=true tool-results=true thinking=true subagents=true
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
-$ rearview agent read ch_74aec3f6df49:m11..m70 --tools --tool-results --thinking --subagents
+$ rearview agent read ch_74aec3f6df49:m11..m73 --tools --tool-results --thinking --subagents
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+tools+tool-results+thinking+subagents omit=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
@@ -1143,10 +1188,17 @@ m69.1 06:03:45 result=m70
 | exec: rg -n SEVERAL_COMMANDS_SENTINEL src
 m70 06:03:46 call=m69.1
 | src/lib.rs:7
+m71 user 06:03:47
+| Show the window
+m72.1 06:03:48 result=m73
+| exec: window.png
+m73 06:03:49 call=m72.1
+| IMAGE_RESULT_SENTINEL: Script completed
+| [Image: image/png]
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m70
+protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m73
 $ rearview agent read ch_74aec3f6df49:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -1155,7 +1207,7 @@ $ rearview agent read ch_74aec3f6df49:s99
 protocol agent-error kind=not-found ref=ch_74aec3f6df49 detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_974c3840e189
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=5 hidden-tool-results=3 hidden-thinking=1 hidden-subagents=2
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagents=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=m4..m5 : worker
 day 2026-01-01
@@ -1185,6 +1237,9 @@ m17 user 22:04:24
 m18..m21 hidden 22:04:25..22:04:28 tools=2 tool-results=2
 m22 22:04:29
 | The release steps are dated.
+m23 user 22:04:30
+| Show the window
+m24..m25 hidden 22:04:31..22:04:32 tools=1 tool-results=1
 $ rearview agent read ch_974c3840e189 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
 protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-05:00
@@ -1236,6 +1291,13 @@ m21 22:04:28 call=m20.1
 | The dates are right.
 m22 22:04:29
 | The release steps are dated.
+m23 user 22:04:30
+| Show the window
+m24.1 22:04:31 result=m25
+| read: window.png
+m25 22:04:32 call=m24.1
+| IMAGE_RESULT_SENTINEL: the window
+| [Image: image/png]
 $ rearview agent read ch_974c3840e189:m2..m4
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-thinking=1 hidden-subagents=1
@@ -1261,24 +1323,24 @@ $ rearview agent read ch_974c3840e189 --tail 3
 protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=3 hidden-tool-results=3
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
-m14 user 22:04:21
-| Show the last commit
-m15..m16 hidden 22:04:22..22:04:23 tools=1 tool-results=1
 m17 user 22:04:24
 | Date the release steps
 m18..m21 hidden 22:04:25..22:04:28 tools=2 tool-results=2
 m22 22:04:29
 | The release steps are dated.
+m23 user 22:04:30
+| Show the window
+m24..m25 hidden 22:04:31..22:04:32 tools=1 tool-results=1
 $ rearview agent read ch_974c3840e189 --tools --subagents --tail 2
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
-m20.1 22:04:27 result=m21
-| tool task input_keys=agent,i,solutionSpace,task (+6 lines)
-m21 hidden 22:04:28 tool-results=1
-m22 22:04:29
-| The release steps are dated.
+m23 user 22:04:30
+| Show the window
+m24.1 22:04:31 result=m25
+| read: window.png
+m25 hidden 22:04:32 tool-results=1
 $ rearview agent read ch_974c3840e189:m9.1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-05:00
@@ -1326,7 +1388,7 @@ m8 user 22:04:15
 | Is the build clean?
 $ rearview agent read ch_974c3840e189 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=959 policy=text omit=m15..m22 tz=-05:00 hidden-tools=2 hidden-thinking=1 hidden-subagents=2
+protocol agent-read cut=tail chars=900 full=1054 policy=text omit=m15..m25 tz=-05:00 hidden-tools=2 hidden-thinking=1 hidden-subagents=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=m4..m5 : worker
 day 2026-01-01
@@ -1350,8 +1412,8 @@ m13 22:04:20
 | NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
 m14 user 22:04:21
 | Show the last commit
-continue read refs=ch_974c3840e189:m15..m22 tools=true tool-results=true thinking=false subagents=false
-$ rearview agent read ch_974c3840e189:m15..m22 --tools --tool-results
+continue read refs=ch_974c3840e189:m15..m25 tools=true tool-results=true thinking=false subagents=false
+$ rearview agent read ch_974c3840e189:m15..m25 --tools --tool-results
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-05:00
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
@@ -1372,9 +1434,16 @@ m21 22:04:28 call=m20.1
 | The dates are right.
 m22 22:04:29
 | The release steps are dated.
+m23 user 22:04:30
+| Show the window
+m24.1 22:04:31 result=m25
+| read: window.png
+m25 22:04:32 call=m24.1
+| IMAGE_RESULT_SENTINEL: the window
+| [Image: image/png]
 $ rearview agent read ch_974c3840e189:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_974c3840e189 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m22
+protocol agent-error kind=out-of-range ref=ch_974c3840e189 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m25
 $ rearview agent read ch_974c3840e189:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -1778,7 +1847,7 @@ $ rearview agent read ch_f04d3718e406:s99
 protocol agent-error kind=not-found ref=ch_f04d3718e406 detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_982349c13ee4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=6 hidden-tool-results=5 hidden-thinking=1 hidden-subagents=3
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagents=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=m2..m4 : explore
 day 1969-12-31
@@ -1795,6 +1864,9 @@ m14..m15 hidden 19:00:01 tools=1 tool-results=1
 m16 19:00:01
 | Dating the release steps.
 m17..m20 hidden 19:00:01 tools=2 tool-results=2
+m21 user 19:00:02
+| Show the window
+m22..m23 hidden 19:00:02 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
 protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-05:00
@@ -1841,6 +1913,12 @@ m19.1 19:00:01 result=m20
 | tool todo_write input_keys=merge,todos (+10 lines)
 m20 19:00:01 call=m19.1
 | Updated 1 todo
+m21 user 19:00:02
+| Show the window
+m22.1 19:00:02 result=m23
+| read_file: /tmp/grok-project/IMAGE_RESULT_SENTINEL.png
+m23 19:00:02 call=m22.1
+| [Image: image/png]
 $ rearview agent read ch_982349c13ee4:m2..m4
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-subagents=3
@@ -1861,29 +1939,28 @@ day 1969-12-31
 m4 s1 19:00:01 slice=match=the context=3 hits=0 anchor=ma_ed09908ea14107f5
 $ rearview agent read ch_982349c13ee4 --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=6 hidden-tool-results=5
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=4 hidden-tool-results=4
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
-m6 19:00:01
-| grok answer searchable
-m7..m12 hidden 19:00:01 tools=3 tool-results=2
 m13 19:00:01
 | NUMBERED_REPLY_SENTINEL: the command printed nothing.
 m14..m15 hidden 19:00:01 tools=1 tool-results=1
 m16 19:00:01
 | Dating the release steps.
 m17..m20 hidden 19:00:01 tools=2 tool-results=2
+m21 user 19:00:02
+| Show the window
+m22..m23 hidden 19:00:02 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4 --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-05:00 hidden-tool-results=2
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
-m17.1 19:00:01 result=m18
-| search_replace: /tmp/grok-project/notes.md (+2 lines)
-m18 hidden 19:00:01 tool-results=1
-m19.1 19:00:01 result=m20
-| tool todo_write input_keys=merge,todos (+10 lines)
-m20 hidden 19:00:01 tool-results=1
+m21 user 19:00:02
+| Show the window
+m22.1 19:00:02 result=m23
+| read_file: /tmp/grok-project/IMAGE_RESULT_SENTINEL.png
+m23 hidden 19:00:02 tool-results=1
 $ rearview agent read ch_982349c13ee4:m7.1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-05:00
@@ -1928,7 +2005,7 @@ m6 19:00:01
 m7..m8 hidden 19:00:01 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4 --budget 900
 --- stdout
-protocol agent-read cut=none chars=900 policy=text omit=none tz=-05:00 hidden-tools=6 hidden-tool-results=5 hidden-thinking=1 hidden-subagents=3
+protocol agent-read cut=none chars=900 policy=text omit=none tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagents=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=m2..m4 : explore
 day 1969-12-31
@@ -1945,9 +2022,12 @@ m14..m15 hidden 19:00:01 tools=1 tool-results=1
 m16 19:00:01
 | Dating the release steps.
 m17..m20 hidden 19:00:01 tools=2 tool-results=2
+m21 user 19:00:02
+| Show the window
+m22..m23 hidden 19:00:02 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_982349c13ee4 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m20
+protocol agent-error kind=out-of-range ref=ch_982349c13ee4 detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m23
 $ rearview agent read ch_982349c13ee4:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end

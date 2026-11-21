@@ -9,6 +9,7 @@
 //! Conversations can be exported to files or copied to the clipboard.
 //! Export respects the current display settings for thinking blocks and tool calls.
 
+use crate::agent::transcript::tool_result_display_text;
 use crate::clock::Zone;
 use crate::history::user_text::user_text;
 use crate::history::{DisplayEntries, user_task_report};
@@ -255,10 +256,7 @@ pub fn extract_call_text<'a>(
     if let Some(result) = result {
         match content_block_at(&entry_at, result) {
             Some(ContentBlock::ToolResult { content, .. }) => {
-                append_separated(
-                    &mut output,
-                    &format_tool_result_for_export(content.as_ref()),
-                );
+                append_separated(&mut output, &tool_result_display_text(content.as_ref()));
             }
             _ => return Err("Result not found".to_string()),
         }
@@ -319,7 +317,7 @@ fn append_clipboard_blocks(output: &mut String, blocks: &[ContentBlock], options
                 append_separated(output, &format_tool_call_for_export(name, *tool, input));
             }
             ContentBlock::ToolResult { content, .. } if options.show_tools => {
-                append_separated(output, &format_tool_result_for_export(content.as_ref()));
+                append_separated(output, &tool_result_display_text(content.as_ref()));
             }
             ContentBlock::Thinking { thinking, .. } if shows_thinking(thinking, options) => {
                 append_separated(output, thinking);
@@ -367,7 +365,7 @@ fn for_user_tool_results(
                 ..
             } = block
             {
-                let content_str = format_tool_result_for_export(content.as_ref());
+                let content_str = tool_result_display_text(content.as_ref());
                 f(&content_str, standalone_tool_name.as_deref());
             }
         }
@@ -841,29 +839,6 @@ fn wrap_plain_text(text: &str, max_width: usize) -> String {
         }
     }
     result
-}
-
-/// Format tool result content for export
-fn format_tool_result_for_export(content: Option<&serde_json::Value>) -> String {
-    match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
-            // Handle array of content blocks
-            let texts: Vec<&str> = arr
-                .iter()
-                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                .collect();
-            if !texts.is_empty() {
-                texts.join("\n\n")
-            } else {
-                serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "<error>".to_string())
-            }
-        }
-        Some(value) => {
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| "<error>".to_string())
-        }
-        None => "<no content>".to_string(),
-    }
 }
 
 #[cfg(test)]

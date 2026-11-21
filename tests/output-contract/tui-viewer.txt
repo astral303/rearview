@@ -43,6 +43,10 @@
 
    Claude │ Edited 1 file, loaded 1 skill, messaged 1 agent, fetched 1 URL, called 1 tool
 
+      You │ Show the window
+
+   Claude │ Read 1 file
+
       You │ is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
 
       You │ Skill: release-notes
@@ -83,6 +87,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
      Kimi │ Dating the release steps.
 
      Kimi │ Edited 1 file, updated the task list 1 time
+
+      You │ Show the window
+
+     Kimi │ Read 1 file
 
 === viewer, tools summary, thinking hidden: codex rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl
       You │ active codex question
@@ -136,6 +144,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
     Codex │ Ran 4 shell commands, ran 2 scripts, edited 2 files, waited 3 times, updated the task list 1 time
 
+      You │ Show the window
+
+    Codex │ Read 1 file
+
 === viewer, tools summary, thinking hidden: omp v3.jsonl
       You │ OMP root question
 
@@ -166,6 +178,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
       OMP │ Edited 1 file, called 1 tool
 
       OMP │ The release steps are dated.
+
+      You │ Show the window
+
+      OMP │ Read 1 file
 
 === viewer, tools summary, thinking hidden: opencode ses_standard.jsonl
       You │ The user made the following comment regarding lines 40 through 68 of errorHandler.ts: COMMENT_SENTINEL this looks messy
@@ -231,6 +247,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
      Grok │ Dating the release steps.
 
      Grok │ Edited 1 file, updated the task list 1 time
+
+      You │ Show the window
+
+     Grok │ Read 1 file
 
 === viewer, tools in full, thinking shown: claude 5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8.jsonl
       You │ Warmup
@@ -331,12 +351,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
           │   "query": "select:Read"
    ┌──────┘ }
    ↓
-   Result ┐ [
-          │   {
-          │     "tool_name": "Read",
-          │     "type": "tool_reference"
-          │   }
-          │ ]
+   Result ┐ [Tool: Read]
 
    Claude │ NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 
@@ -374,6 +389,14 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ }
    ↓
    Result ┐ User has approved your plan.
+
+      You │ Show the window
+
+   Claude ┤ Read: /tmp/claude-every-record-fixture/window.png
+   ↓
+   Result ┐ IMAGE_RESULT_SENTINEL: the window after the build
+          │
+          │ [Image: image/png]
 
       You │ is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
 
@@ -453,6 +476,14 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ }
    ↓
    Result ┐ Todo list updated
+
+      You │ Show the window
+
+     Kimi ┤ ReadMediaFile: IMAGE_RESULT_SENTINEL.png
+   ↓
+   Result ┐ <image path="window.png">
+          │ [Image: image/png]
+          │ </image>
 
 === viewer, tools in full, thinking shown: codex rollout-2026-08-01T10-00-00-019f0000-0000-7000-8000-00000000000a.jsonl
       You │ active codex question
@@ -674,6 +705,13 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ↓
    Result ┐ src/lib.rs:7
 
+      You │ Show the window
+
+    Codex ┤ exec: window.png
+   ↓
+   Result ┐ IMAGE_RESULT_SENTINEL: Script completed
+          │ [Image: image/png]
+
 === viewer, tools in full, thinking shown: omp v3.jsonl
       You │ OMP root question
 
@@ -732,6 +770,13 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    Result ┐ The dates are right.
 
       OMP │ The release steps are dated.
+
+      You │ Show the window
+
+      OMP ┤ read: window.png
+   ↓
+   Result ┐ IMAGE_RESULT_SENTINEL: the window
+          │ [Image: image/png]
 
 === viewer, tools in full, thinking shown: opencode ses_standard.jsonl
       You │ The user made the following comment regarding lines 40 through 68 of errorHandler.ts: COMMENT_SENTINEL this looks messy
@@ -912,4 +957,10 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
    ┌──────┘ }
    ↓
    Result ┐ Updated 1 todo
+
+      You │ Show the window
+
+     Grok ┤ read_file: /tmp/grok-project/IMAGE_RESULT_SENTINEL.png
+   ↓
+   Result ┐ [Image: image/png]
 

@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthStr;
 
+use crate::agent::transcript::tool_result_display_text;
 use crate::duration::elapsed;
 use crate::history::RecordedIdentity;
 use crate::log_entry::{ContentBlock, LogEntry, QuotedAnswer, SubagentIdentity, Tool, UserContent};
@@ -18,7 +19,6 @@ use crate::tool_format::asked_questions;
 use super::NAME_WIDTH;
 use super::ledger::fitted_name;
 use super::style::subagent_label;
-use super::tools::tool_result_display_text;
 
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct ConversationLinks {

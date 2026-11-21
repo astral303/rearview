@@ -518,7 +518,7 @@ impl SessionStorage for GrokStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "grok",
-            schema_version: 12,
+            schema_version: 13,
         }
     }
 
@@ -1078,6 +1078,20 @@ pub(super) mod tests {
                 "completed",
                 json!({"type": "Todo", "TodosUpdated": {"summary_for_prompt": "Updated 1 todo"}}),
             ));
+            records.push(user(2_000, "Show the window", 1));
+            let mut image_read = call(
+                2_100,
+                "read-image",
+                "read_file",
+                "read",
+                json!({"target_file": "/tmp/grok-project/IMAGE_RESULT_SENTINEL.png"}),
+                "completed",
+                json!({"type": "ReadFile", "ImageContent": {"data": "iVBORw0KGgo=", "mime_type": "image/png"}}),
+            );
+            image_read[2]["params"]["update"]["content"] = json!([
+                {"type": "content", "content": {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}}
+            ]);
+            records.extend(image_read);
             let session = write_grok_session(
                 &sessions,
                 PROJECT_DIR,
@@ -1111,8 +1125,11 @@ pub(super) mod tests {
                     Marker::shown("edit diff", "EDIT_DIFF_SENTINEL")
                         .in_summary_row("Edited 1 file, updated the task list 1 time"),
                     Marker::shown("todo list", "TODO_SENTINEL"),
+                    Marker::in_call_or_subagent("read of an image", "IMAGE_RESULT_SENTINEL"),
+                    Marker::shown("image in a result", "[Image: image/png]"),
                 ],
             )
+            .with_hidden(&[("image's data in a result", "iVBORw0KGgo=")])
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 13)
             // The sub-agent's turn: 40 input and 8 output.
             .with_subagent_tokens(48)

@@ -669,12 +669,12 @@ fn every_agents_outputs_render_in_place_as_in_whole_render() {
     // mode.
     let expected = [
         ("Claude", 56),
-        ("Codex", 100),
+        ("Codex", 108),
         ("OpenCode", 44),
-        ("Kimi", 56),
-        ("Grok", 32),
+        ("Kimi", 64),
+        ("Grok", 40),
         ("Pi", 40),
-        ("Omp", 40),
+        ("Omp", 48),
     ]
     .map(|(name, count)| (name.to_owned(), count));
     assert_eq!(

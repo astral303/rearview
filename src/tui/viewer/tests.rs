@@ -6525,6 +6525,88 @@ fn search_doesnt_find_phrase_across_line_break() {
 }
 
 #[test]
+fn search_finds_placeholders_in_their_result_and_doesnt_find_its_json() {
+    let result = serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+            {"type": "text", "text": "the window"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+            {"type": "tool_reference", "tool_name": "Monitor"},
+        ]},
+    ]}});
+    let entries = [
+        tool_use_entry(0, "toolu_1", "Read", r#"{"file_path":"window.png"}"#),
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_value(result).unwrap(),
+        },
+    ];
+    let rendered = render_parsed_entries(&entries, &test_render_options(ToolDisplayMode::Full));
+    let row_text = |row: usize| {
+        rendered.lines[row]
+            .spans
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>()
+    };
+    let result_row = (0..rendered.lines.len())
+        .find(|&row| row_text(row).contains("Result"))
+        .expect("the result has a row");
+
+    for placeholder in ["[Image: image/png]", "[Tool: Monitor]"] {
+        let found = find_matches(&rendered.lines, placeholder);
+        assert!(
+            found.len() == 1 && found[0].first_row() >= result_row,
+            "the search finds {placeholder:?} once, in the result:\n{}",
+            rendered_text(&rendered)
+        );
+    }
+    for raw in ["tool_reference", "source", "iVBORw0KGgo="] {
+        assert!(
+            find_matches(&rendered.lines, raw).is_empty(),
+            "the search doesn't find {raw:?}:\n{}",
+            rendered_text(&rendered)
+        );
+    }
+}
+
+#[test]
+fn four_tool_references_show_whole_in_truncated_mode() {
+    let references: Vec<_> = ["Monitor", "Read", "Grep", "Glob"]
+        .map(|name| serde_json::json!({"type": "tool_reference", "tool_name": name}))
+        .into();
+    let result = serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": references},
+    ]}});
+    let entries = [
+        tool_use_entry(0, "toolu_1", "ToolSearch", r#"{"query":"select:Monitor"}"#),
+        RenderableEntry {
+            entry_index: 1,
+            entry: serde_json::from_value(result).unwrap(),
+        },
+    ];
+
+    let text = rendered_text(&render_parsed_entries(
+        &entries,
+        &test_render_options(ToolDisplayMode::Truncated),
+    ));
+
+    let rows: Vec<&str> = text.lines().collect();
+    let first = rows
+        .iter()
+        .position(|row| row.contains("[Tool: Monitor]"))
+        .unwrap_or_else(|| panic!("the first reference shows:\n{text}"));
+    assert!(
+        rows.len() > first + 3
+            && ["Read", "Grep", "Glob"]
+                .iter()
+                .zip(&rows[first + 1..])
+                .all(|(name, row)| row.contains(&format!("[Tool: {name}]")))
+            && !text.contains("more lines"),
+        "the four references show on four consecutive rows:\n{text}"
+    );
+}
+
+#[test]
 fn search_matches_equal_row_text_join_over_wrapped_interleaved_output() {
     use super::output::RowContinuation;
     use super::search_rows::find_matches_by_row_text;

@@ -17,7 +17,7 @@ use crate::agent::time_span::{
 };
 use crate::agent::transcript::{
     AgentMessage, AgentMessagePart, AgentMessageRole, AgentTranscript, CallLines,
-    tool_call_read_text,
+    tool_call_read_text, tool_result_texts,
 };
 use crate::agent::visibility::ContentVisibility;
 use crate::clock::Zone;
@@ -2126,7 +2126,7 @@ fn part_has_text(part: &AgentMessagePart) -> bool {
         AgentMessagePart::Text { text, .. } => !text.trim().is_empty(),
         AgentMessagePart::ToolUse { .. } => true,
         AgentMessagePart::ToolResult { content, .. } => {
-            content.as_ref().is_some_and(tool_result_has_text)
+            content.as_ref().is_some_and(read_result_has_text)
         }
         AgentMessagePart::Thinking { thinking, .. } => !thinking.trim().is_empty(),
     }
@@ -2171,7 +2171,7 @@ fn render_message<'a>(
                 content: Some(content),
                 source,
             } => {
-                let text = sanitize_agent_text(&tool_result_text(content));
+                let text = sanitize_agent_text(&read_result_text(content));
                 if let Some(call) = links.call_in_own_message(message, tool_use_id) {
                     results.push(ShownResult {
                         call,
@@ -3243,37 +3243,19 @@ pub(crate) fn full_atom(cut: &str, full: Option<usize>) -> String {
     }
 }
 
-fn tool_result_text(content: &Value) -> String {
-    match content {
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| match item {
-                Value::String(text) => Some(text.clone()),
-                Value::Object(map) => map
-                    .get("text")
-                    .and_then(|value| value.as_str())
-                    .map(ToOwned::to_owned),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => content.to_string(),
+/// A tool result as `agent read` prints it: its texts
+/// ([`tool_result_texts`]) on lines of their own, or, for content of another
+/// shape, the content as JSON.
+fn read_result_text(content: &Value) -> String {
+    match tool_result_texts(content) {
+        Some(texts) => texts.join("\n"),
+        None => content.to_string(),
     }
 }
 
-/// True when [`tool_result_text`] is not blank, without building the text.
-fn tool_result_has_text(content: &Value) -> bool {
-    let is_text = |text: &str| !text.trim().is_empty();
-    match content {
-        Value::String(text) => is_text(text),
-        Value::Array(items) => items.iter().any(|item| match item {
-            Value::String(text) => is_text(text),
-            Value::Object(map) => map.get("text").and_then(Value::as_str).is_some_and(is_text),
-            _ => false,
-        }),
-        _ => true,
-    }
+/// True when [`read_result_text`] is not blank, without joining the texts.
+fn read_result_has_text(content: &Value) -> bool {
+    tool_result_texts(content).is_none_or(|texts| texts.iter().any(|text| !text.trim().is_empty()))
 }
 
 /// The first `SNIPPET_LIMIT` characters of `body`, without its leading and
@@ -4489,18 +4471,20 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_has_text_when_its_read_text_is_not_blank() {
+    fn read_result_has_text_when_its_text_is_not_blank() {
         for content in [
             json!("ok"),
             json!(" \n"),
             json!(["", {"text": " "}]),
             json!([{"type": "image"}, {"text": "done"}]),
+            json!([{"type": "tool_reference", "tool_name": "Read"}]),
+            json!([{"type": "document"}]),
             json!({"exit": 0}),
             json!(null),
         ] {
             assert_eq!(
-                tool_result_has_text(&content),
-                !tool_result_text(&content).trim().is_empty(),
+                read_result_has_text(&content),
+                !read_result_text(&content).trim().is_empty(),
                 "{content}"
             );
         }

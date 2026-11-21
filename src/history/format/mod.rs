@@ -419,10 +419,30 @@ pub(crate) fn block_texts(content: Option<&Value>) -> Vec<String> {
     };
     blocks
         .iter()
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
+        .filter_map(non_empty_text_field)
         .map(str::to_owned)
         .collect()
+}
+
+/// A content block's `text` field; `None` when it is missing or empty.
+pub(crate) fn non_empty_text_field(block: &Value) -> Option<&str> {
+    block
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+/// The media type a `data:` URL names: `image/png` in
+/// `data:image/png;base64,…`. `None` for another URL.
+pub(crate) fn data_url_media_type(url: &str) -> Option<&str> {
+    Some(leading_media_type(url.strip_prefix("data:")?))
+}
+
+/// The text `text` opens with up to its first `;` or `,`: the media type of
+/// a URL that names one there. `image_placeholder` checks its form.
+pub(crate) fn leading_media_type(text: &str) -> &str {
+    let end = text.find([';', ',']).unwrap_or(text.len());
+    &text[..end]
 }
 
 /// `text` without the lines at either end that hold only whitespace. The lines

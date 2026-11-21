@@ -13,8 +13,8 @@ use crate::history::{TaskReport, blocks_task_report, parse_task_report, user_tas
 use crate::log_entry::{
     AgentContent, AgentMessage as ProgressMessage, AgentProgressData, AssistantMessage,
     ContentBlock, LogEntry, SubagentIdentity, Tool, UserContent, UserMessage,
-    agent_progress_identity, labeled_metadata_text, parse_agent_progress, progress_launch_call,
-    progress_timestamp,
+    agent_progress_identity, image_placeholder, labeled_metadata_text, parse_agent_progress,
+    progress_launch_call, progress_timestamp, tool_reference_placeholder,
 };
 use crate::tool_format::{
     ToolCallBody, ToolCallHeader, launch_prompt, tool_call_body, tool_call_header,
@@ -1317,7 +1317,7 @@ pub(crate) fn bounded_tool_result_text_with_limit(
     let mut acc = BoundedHeadTail::new(max_chars);
     for text in tool_result_texts(content)? {
         acc.push_separator('\n');
-        acc.push_str(text);
+        acc.push_str(&text);
     }
     non_empty_text(&acc.finish())
 }
@@ -1332,40 +1332,103 @@ pub(crate) fn tool_result_text(content: &Value) -> Option<String> {
 /// read it: terminal codes are stripped from each text before they are
 /// joined. The formats keep a result's codes, so the viewer can show them.
 pub(crate) fn tool_result_search_text(content: &Value) -> Option<String> {
-    let texts: Vec<Cow<str>> = tool_result_texts(content)?
-        .into_iter()
-        .map(without_terminal_codes)
+    let texts = tool_result_texts(content)?;
+    let stripped: Vec<Cow<str>> = texts
+        .iter()
+        .map(|text| without_terminal_codes(text))
         .collect();
-    unless_blank(texts.join("\n"))
+    unless_blank(stripped.join("\n"))
+}
+
+/// The text the viewer, the exports and the clipboard show for a tool
+/// result: its items separated by blank lines, a placeholder after another
+/// placeholder by a line break. Content without a shown item shows as
+/// indented JSON, and a result without content as `<no content>`.
+pub(crate) fn tool_result_display_text(content: Option<&Value>) -> String {
+    let items: Vec<ShownItem> = match content {
+        Some(Value::String(text)) => return text.clone(),
+        Some(Value::Array(items)) => items.iter().filter_map(shown_item).collect(),
+        Some(_) | None => Vec::new(),
+    };
+    let Some((first, later)) = items.split_first() else {
+        return match content {
+            Some(value) => serde_json::to_string_pretty(value)
+                .unwrap_or_else(|_| "<invalid content>".to_string()),
+            None => "<no content>".to_string(),
+        };
+    };
+    let mut text = first.text.to_string();
+    for (previous, item) in items.iter().zip(later) {
+        let consecutive_placeholders = previous.is_placeholder && item.is_placeholder;
+        text.push_str(if consecutive_placeholders {
+            "\n"
+        } else {
+            "\n\n"
+        });
+        text.push_str(&item.text);
+    }
+    text
 }
 
 fn unless_blank(text: String) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-/// The texts a tool result holds: the string itself, or each string and
-/// text block of an array. `None` for any other shape.
-fn tool_result_texts(content: &Value) -> Option<Vec<&str>> {
+/// The texts a tool result shows: the string itself, or the text of each
+/// item of an array that shows one ([`tool_result_item_text`]). `None` for
+/// any other shape.
+pub(crate) fn tool_result_texts(content: &Value) -> Option<Vec<Cow<'_, str>>> {
     match content {
-        Value::String(text) => Some(vec![text.as_str()]),
+        Value::String(text) => Some(vec![Cow::Borrowed(text.as_str())]),
         Value::Array(items) => Some(items.iter().filter_map(tool_result_item_text).collect()),
         _ => None,
     }
 }
 
-/// The text a tool result array's `item` holds: a string, or a text item's
-/// text. `None` for any other item.
-pub(crate) fn tool_result_item_text(item: &Value) -> Option<&str> {
-    match item {
-        Value::String(text) => Some(text.as_str()),
-        Value::Object(map) => {
-            let ty = map.get("type").and_then(|value| value.as_str());
-            if ty.is_none() || ty == Some("text") {
-                map.get("text").and_then(|value| value.as_str())
-            } else {
-                None
-            }
+/// The text a tool result array's `item` shows: a string, a text item's
+/// text, an image's [`image_placeholder`] or a tool reference's
+/// [`tool_reference_placeholder`]. `None` for any other item.
+pub(crate) fn tool_result_item_text(item: &Value) -> Option<Cow<'_, str>> {
+    shown_item(item).map(|shown| shown.text)
+}
+
+/// The text an item of a tool result array shows, and whether it is a
+/// placeholder for content that isn't text.
+struct ShownItem<'a> {
+    text: Cow<'a, str>,
+    is_placeholder: bool,
+}
+
+impl<'a> ShownItem<'a> {
+    fn text(text: &'a str) -> Self {
+        Self {
+            text: Cow::Borrowed(text),
+            is_placeholder: false,
         }
+    }
+
+    fn placeholder(text: String) -> Self {
+        Self {
+            text: Cow::Owned(text),
+            is_placeholder: true,
+        }
+    }
+}
+
+fn shown_item(item: &Value) -> Option<ShownItem<'_>> {
+    let field = move |key: &str| item.get(key).and_then(Value::as_str);
+    match item {
+        Value::String(text) => Some(ShownItem::text(text)),
+        Value::Object(_) => match field("type") {
+            None | Some("text") => field("text").map(ShownItem::text),
+            Some("image") => {
+                let media_type = item.pointer("/source/media_type").and_then(Value::as_str);
+                Some(ShownItem::placeholder(image_placeholder(media_type)))
+            }
+            Some("tool_reference") => field("tool_name")
+                .map(|name| ShownItem::placeholder(tool_reference_placeholder(name))),
+            Some(_) => None,
+        },
         _ => None,
     }
 }
@@ -2396,7 +2459,7 @@ items: [{"text":"Map the cache.","type":"text"}]"#
     }
 
     #[test]
-    fn agent_search_text_joins_every_text_item_of_tool_result_array() {
+    fn agent_search_text_joins_every_string_text_item_and_image_placeholder_of_tool_result() {
         let blocks = vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
             standalone_tool_name: None,
@@ -2412,7 +2475,158 @@ items: [{"text":"Map the cache.","type":"text"}]"#
 
         assert_eq!(
             text,
-            format!("HEAD\n{}\nTAIL", "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2))
+            format!(
+                "HEAD\n{}\n[Image]\nTAIL",
+                "x".repeat(MAX_AGENT_SEGMENT_CHARS * 2)
+            )
+        );
+    }
+
+    fn image_item(media_type: &str) -> Value {
+        serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": "iVBORw0KGgo="}})
+    }
+
+    fn tool_reference_item(tool_name: &str) -> Value {
+        serde_json::json!({"type": "tool_reference", "tool_name": tool_name})
+    }
+
+    fn text_item(text: &str) -> Value {
+        serde_json::json!({"type": "text", "text": text})
+    }
+
+    #[test]
+    fn image_alone_shows_its_placeholder() {
+        let content = Value::Array(vec![image_item("image/png")]);
+
+        assert_eq!(
+            tool_result_text(&content).as_deref(),
+            Some("[Image: image/png]")
+        );
+    }
+
+    #[test]
+    fn image_without_stated_media_type_shows_placeholder_without_one() {
+        let content = serde_json::json!([
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/shot.png"}}
+        ]);
+
+        assert_eq!(tool_result_text(&content).as_deref(), Some("[Image]"));
+    }
+
+    #[test]
+    fn multiple_images_show_one_placeholder_per_line() {
+        let content = Value::Array(vec![image_item("image/png"), image_item("image/jpeg")]);
+
+        assert_eq!(
+            tool_result_text(&content).as_deref(),
+            Some("[Image: image/png]\n[Image: image/jpeg]")
+        );
+    }
+
+    #[test]
+    fn text_beside_image_shows_in_block_order() {
+        let content = Value::Array(vec![
+            text_item("before"),
+            image_item("image/png"),
+            text_item("after"),
+        ]);
+
+        assert_eq!(
+            tool_result_text(&content).as_deref(),
+            Some("before\n[Image: image/png]\nafter")
+        );
+    }
+
+    #[test]
+    fn tool_references_alone_show_one_line_per_reference() {
+        let content = Value::Array(vec![
+            tool_reference_item("Monitor"),
+            tool_reference_item("Read"),
+        ]);
+
+        assert_eq!(
+            tool_result_text(&content).as_deref(),
+            Some("[Tool: Monitor]\n[Tool: Read]")
+        );
+    }
+
+    #[test]
+    fn text_beside_tool_references_shows_in_block_order() {
+        let content = Value::Array(vec![
+            text_item("Found 1 tool"),
+            tool_reference_item("Monitor"),
+        ]);
+
+        assert_eq!(
+            tool_result_text(&content).as_deref(),
+            Some("Found 1 tool\n[Tool: Monitor]")
+        );
+    }
+
+    #[test]
+    fn search_text_of_image_doesnt_contain_its_data_or_json_keys() {
+        let content = Value::Array(vec![image_item("image/png"), tool_reference_item("Read")]);
+
+        let text = tool_result_search_text(&content).unwrap();
+
+        for raw in ["iVBORw0KGgo=", "source", "tool_reference", "media_type"] {
+            assert!(
+                !text.contains(raw),
+                "the search text leaves out {raw}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_kind_beside_text_shows_text_alone() {
+        let document =
+            serde_json::json!({"type": "document", "source": {"media_type": "application/pdf"}});
+        let content = Value::Array(vec![text_item("the report"), document.clone()]);
+
+        assert_eq!(tool_result_text(&content).as_deref(), Some("the report"));
+        assert_eq!(
+            tool_result_text(&Value::Array(vec![document])),
+            None,
+            "a result of an unknown kind alone has no text"
+        );
+    }
+
+    #[test]
+    fn display_text_separates_items_by_blank_line_and_consecutive_placeholders_by_line_break() {
+        let content = Value::Array(vec![
+            text_item("before"),
+            image_item("image/png"),
+            image_item("image/jpeg"),
+            text_item("after"),
+            tool_reference_item("Monitor"),
+        ]);
+
+        assert_eq!(
+            tool_result_display_text(Some(&content)),
+            "before\n\n[Image: image/png]\n[Image: image/jpeg]\n\nafter\n\n[Tool: Monitor]"
+        );
+    }
+
+    #[test]
+    fn display_text_of_image_alone_is_its_placeholder_without_its_data() {
+        let content = Value::Array(vec![image_item("image/png")]);
+
+        let text = tool_result_display_text(Some(&content));
+
+        assert_eq!(text, "[Image: image/png]");
+        assert!(
+            !text.contains("iVBORw0KGgo="),
+            "the image's data is left out"
+        );
+    }
+
+    #[test]
+    fn display_text_of_unknown_kind_alone_is_indented_json() {
+        let content = serde_json::json!([{"type": "document", "title": "report"}]);
+
+        assert_eq!(
+            tool_result_display_text(Some(&content)),
+            serde_json::to_string_pretty(&content).unwrap()
         );
     }
 
