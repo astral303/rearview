@@ -297,6 +297,14 @@ a user message holding its text. The row is built from the entries the viewer
 shows. `agent read` shows a command's output and error as the viewer does,
 each as a message; empty output, such as `/clear`'s, is left out.
 
+The viewer, exports, `agent read`, `agent outline`, `agent within`, the list's
+search and `agent search` by words read each user text block through
+`history::user_text::user_block_text`: the caveat before a command's records
+and `/clear` show nothing, a command shows as `name args`, its output without
+the tags, and skill text as one `*Skill: name*` line. A user message that
+shows nothing is not numbered. Semantic search reads a user message through
+its own filter.
+
 From 2.1.97 Claude Code writes a `queued_command` attachment for each message
 that arrives while Claude is working. The record's `timestamp` is when the
 message was queued, often earlier than the record before it. `origin.kind`, or

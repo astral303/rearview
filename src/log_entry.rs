@@ -484,15 +484,6 @@ pub fn extract_text_from_user(content: &UserContent) -> String {
     }
 }
 
-/// [`search_texts_of_blocks`] for a user record: a plain-string record is one
-/// part.
-pub fn search_texts_of_user(content: &UserContent) -> Vec<String> {
-    match content {
-        UserContent::String(text) => vec![text.clone()],
-        UserContent::Blocks(blocks) => search_texts_of_blocks(blocks),
-    }
-}
-
 pub fn extract_text_from_assistant(message: &AssistantMessage) -> String {
     extract_text_from_blocks(&message.content)
 }

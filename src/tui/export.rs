@@ -10,12 +10,13 @@
 //! Export respects the current display settings for thinking blocks and tool calls.
 
 use crate::clock::Zone;
+use crate::history::user_text::user_text;
 use crate::history::{DisplayEntries, user_task_report};
 use crate::log_entry::{
     AssistantMessage, ContentBlock, LogEntry, RECAP_LABEL, Tool, UserContent, UserMessage,
 };
 use crate::tool_format;
-use crate::tui::viewer::{BlockLocation, ConversationLinks, user_text};
+use crate::tui::viewer::{BlockLocation, ConversationLinks};
 use chrono::DateTime;
 use crossterm::clipboard::CopyToClipboard;
 use std::ffi::OsString;

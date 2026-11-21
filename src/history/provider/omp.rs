@@ -275,7 +275,7 @@ impl SessionStorage for OmpStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "omp",
-            schema_version: 20,
+            schema_version: 21,
         }
     }
 

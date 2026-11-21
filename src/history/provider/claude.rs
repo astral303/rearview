@@ -221,7 +221,7 @@ impl SessionStorage for ClaudeStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "claude",
-            schema_version: 20,
+            schema_version: 21,
         }
     }
 
@@ -1001,6 +1001,8 @@ pub(crate) mod tests {
                     Marker::shown("message to an agent", "AGENT_MESSAGE_SENTINEL")
                         .in_summary_row(EDIT_RUN),
                     Marker::shown("plan call's input shown as JSON", "PLAN_SENTINEL"),
+                    Marker::shown("prompt quoting a command tag", "QUOTED_TAG_SENTINEL"),
+                    Marker::shown("skill text", "Skill: release-notes"),
                 ],
             )
             .with_hidden(&[
@@ -1019,6 +1021,9 @@ pub(crate) mod tests {
                     "fork's copy of its launching call",
                     "FORK_CALL_COPY_SENTINEL",
                 ),
+                ("skill text's body", "SKILL_BODY_SENTINEL"),
+                ("caveat before a slash command", "CAVEAT_SENTINEL"),
+                ("`/clear`'s arguments", "CLEAR_SENTINEL"),
             ])
             .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 35)
             // 90 input and 15 output in the Explore sub-agent's reply, 20 and

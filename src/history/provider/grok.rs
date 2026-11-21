@@ -518,7 +518,7 @@ impl SessionStorage for GrokStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "grok",
-            schema_version: 11,
+            schema_version: 12,
         }
     }
 

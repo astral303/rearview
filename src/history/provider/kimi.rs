@@ -353,7 +353,7 @@ impl SessionStorage for KimiStorage {
     fn cache(&self) -> SessionCache {
         SessionCache {
             directory: "kimi",
-            schema_version: 19,
+            schema_version: 20,
         }
     }
 

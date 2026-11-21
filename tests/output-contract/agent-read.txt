@@ -50,6 +50,10 @@ m35 06:32:02
 m36 user 06:33:00
 | Fix the tokenizer, then plan the rest
 m37..m46 hidden 06:33:01..06:33:10 tools=5 tool-results=5
+m47 user 06:34:00
+| is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
+m48 user 06:34:01
+| *Skill: release-notes*
 $ rearview agent read ch_581699c40efc --tools --tool-results --thinking --subagents --no-budget
 --- stdout
 protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-04:00
@@ -173,6 +177,10 @@ m45.1 06:33:09 result=m46
 | tool ExitPlanMode input_keys=plan (+4 lines)
 m46 06:33:10 call=m45.1
 | User has approved your plan.
+m47 user 06:34:00
+| is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
+m48 user 06:34:01
+| *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m2..m4
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=2 hidden-tool-results=1 hidden-thinking=1
@@ -197,28 +205,25 @@ m3 hidden 06:00:03 tool-results=1 calls=m2.1
 read ref=ch_581699c40efc:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_581699c40efc --tail 3
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=6 hidden-tool-results=5
+protocol agent-read cut=none chars=6000 policy=text omit=none tz=-04:00 hidden-tools=5 hidden-tool-results=5
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
-m32 user 06:31:00
-| [Notice] NOTICE_SENTINEL: safeguards flagged this message; switched model.
-m33..m34 hidden 06:32:00..06:32:01 tools=1
-m35 06:32:02
-| NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
 m36 user 06:33:00
 | Fix the tokenizer, then plan the rest
 m37..m46 hidden 06:33:01..06:33:10 tools=5 tool-results=5
+m47 user 06:34:00
+| is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
+m48 user 06:34:01
+| *Skill: release-notes*
 $ rearview agent read ch_581699c40efc --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=2
+protocol agent-read cut=none chars=6000 policy=text+tools+subagents omit=none tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
-m43.1 06:33:07 result=m44
-| SendMessage: researcher (+1 line)
-m44 hidden 06:33:08 tool-results=1
-m45.1 06:33:09 result=m46
-| tool ExitPlanMode input_keys=plan (+4 lines)
-m46 hidden 06:33:10 tool-results=1
+m47 user 06:34:00
+| is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
+m48 user 06:34:01
+| *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m2.1
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+tool-results omit=none tz=-04:00
@@ -262,7 +267,7 @@ m5 s1 hidden 06:00:06 subagents=1
 continue read refs=ch_581699c40efc:m1;ch_581699c40efc:m6..m8 tools=true tool-results=true thinking=false subagents=true
 $ rearview agent read ch_581699c40efc --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 policy=text omit=m8..m46 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=1
+protocol agent-read cut=tail chars=900 policy=text omit=m8..m48 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagents=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=m5 report=m6 : Read the README
 day 2026-09-01
@@ -273,8 +278,8 @@ m2 06:00:02 hidden-tools=Bash hidden-thinking=1
 m3..m4 hidden 06:00:03..06:00:04 launches=s1 tools=1 tool-results=1 calls=m2.1
 m5 s1 hidden 06:00:06 subagents=1
 m6..m7 hidden 06:00:07..06:00:08 launches=s2 tools=1 tool-results=1 calls=m4.1
-continue read refs=ch_581699c40efc:m8..m46 tools=true tool-results=true thinking=false subagents=true
-$ rearview agent read ch_581699c40efc:m8..m46 --tools --tool-results --subagents
+continue read refs=ch_581699c40efc:m8..m48 tools=true tool-results=true thinking=false subagents=true
+$ rearview agent read ch_581699c40efc:m8..m48 --tools --tool-results --subagents
 --- stdout
 protocol agent-read cut=none chars=6000 policy=text+tools+tool-results+subagents omit=none tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
@@ -376,9 +381,13 @@ m45.1 06:33:09 result=m46
 | tool ExitPlanMode input_keys=plan (+4 lines)
 m46 06:33:10 call=m45.1
 | User has approved your plan.
+m47 user 06:34:00
+| is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
+m48 user 06:34:01
+| *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m9999
 --- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_581699c40efc detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m46
+protocol agent-error kind=out-of-range ref=ch_581699c40efc detail=message%20range%20m9999..m9999%20exceeds%20transcript%20length%20m48
 $ rearview agent read ch_581699c40efc:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end

@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::history::user_text::SlashCommand;
 use crate::log_entry::{ContentBlock, LogEntry, UserContent};
-use crate::tui::parse_command_name;
 
 const SKILL_TEXT_PREFIX: &str = "Base directory for this skill:";
 
@@ -48,9 +48,9 @@ pub(crate) fn skill_text_directory(content: &UserContent) -> Option<&str> {
 /// The slash command a user message ran, as `/name`.
 fn slash_command(content: &UserContent) -> Option<&str> {
     match content {
-        UserContent::String(text) => parse_command_name(text),
+        UserContent::String(text) => SlashCommand::of(text).map(|command| command.name),
         UserContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
-            ContentBlock::Text { text } => parse_command_name(text),
+            ContentBlock::Text { text } => SlashCommand::of(text).map(|command| command.name),
             _ => None,
         }),
     }
@@ -217,6 +217,13 @@ mod tests {
         let [command, skill_text] = SLASH_COMMAND_LOAD;
         let other_command = command.replace("frontend-design:frontend-design", "consult");
         assert_eq!(kept_lines(&[&other_command, skill_text]), [0, 1]);
+    }
+
+    #[test]
+    fn skill_text_after_prompt_quoting_its_command_tag_is_kept() {
+        let [_, skill_text] = SLASH_COMMAND_LOAD;
+        let prompt = r#"{"type":"user","timestamp":"2026-10-03T12:00:02.000Z","message":{"role":"user","content":"why does <command-name>/frontend-design:frontend-design</command-name> load twice?"}}"#;
+        assert_eq!(kept_lines(&[prompt, skill_text]), [0, 1]);
     }
 
     #[test]

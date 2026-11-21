@@ -14,12 +14,9 @@ use std::path::Path;
 use crate::tui::theme::{self, Theme};
 
 mod calls;
-mod commands;
 mod connectors;
 mod days;
 mod entry;
-
-pub(crate) use commands::{local_command_output, user_text};
 mod ledger;
 mod links;
 mod markdown;

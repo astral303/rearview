@@ -9,9 +9,9 @@ use crate::history::provider::contract_tests::registered_fixtures;
 
 /// The lines of a Claude session holding a text of each kind of layout:
 /// a title and a summary, a reply written as two records, a tool result's
-/// items ahead of a text block in its entry, a command's derived text, and
-/// texts outside the dialogue: thinking, a tool call and a sub-agent's
-/// reply.
+/// items ahead of a text block in its entry, each kind of user text the
+/// viewer hides or rewrites, and texts outside the dialogue: thinking, a
+/// tool call and a sub-agent's reply.
 fn every_layout_kind_lines() -> Vec<String> {
     let user = |content: serde_json::Value| serde_json::json!({"type": "user", "message": {"role": "user", "content": content}});
     let reply = |content: serde_json::Value| {
@@ -39,6 +39,24 @@ fn every_layout_kind_lines() -> Vec<String> {
         ])),
         user(serde_json::json!(
             "<command-name>/model</command-name>\n<command-args>opus</command-args>"
+        )),
+        user(serde_json::json!(
+            "<local-command-caveat>Caveat: generated while running local commands</local-command-caveat>"
+        )),
+        user(serde_json::json!(
+            "<command-name>/clear</command-name>\n<command-message>clear</command-message>\n<command-args></command-args>"
+        )),
+        user(serde_json::json!(
+            "<local-command-stdout>\u{1b}[2mcommand output\u{1b}[22m</local-command-stdout>"
+        )),
+        user(serde_json::json!("<local-command-stdout></local-command-stdout>")),
+        user(serde_json::json!(
+            "<command-message>init</command-message>\n<command-name>init</command-name>"
+        )),
+        user(serde_json::json!([{"type": "text",
+            "text": "Base directory for this skill: /skills/officecli\n\n# Office CLI\n\nskill body"}])),
+        user(serde_json::json!(
+            "why does <command-name>/model</command-name> show twice?"
         )),
         serde_json::json!({"type": "progress", "parentToolUseID": "call",
             "data": {"type": "agent_progress", "agentId": "a7777777",
@@ -78,6 +96,10 @@ fn parse_and_cache_lay_out_texts_in_block_order() {
         "item one\nitem two",
         "after the result",
         "/model opus",
+        "command output",
+        "init",
+        "*Skill: officecli*",
+        "why does <command-name>/model</command-name> show twice?",
         "sub-agent reply",
         "weigh the layout",
         "Bash: ls",
