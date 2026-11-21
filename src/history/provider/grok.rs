@@ -811,6 +811,13 @@ pub(super) mod tests {
             ),
             &[
                 user(1_020, "the spawn prompt", 0),
+                agent_chunk(
+                    1_040,
+                    "agent_thought_chunk",
+                    "SUBAGENT_THINKING_SENTINEL: read the notes first",
+                    "c",
+                    1_040,
+                ),
                 reply(1_050, "grok child answer searchable", "c"),
                 turn_completed(1_060, "grok-4.6", 40, 8),
             ],
@@ -1096,6 +1103,7 @@ pub(super) mod tests {
                         "sub-agent message",
                         "grok child answer searchable",
                     ),
+                    Marker::in_subagent_thinking("SUBAGENT_THINKING_SENTINEL"),
                     Marker::in_call_or_subagent("directory listing", "GROK_LIST_DIR_SENTINEL")
                         .in_summary_row(CALLS),
                     Marker::in_call_or_subagent("launch prompt", "LAUNCH_PROMPT_SENTINEL")
@@ -1105,7 +1113,7 @@ pub(super) mod tests {
                     Marker::shown("todo list", "TODO_SENTINEL"),
                 ],
             )
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 12)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 13)
             // The sub-agent's turn: 40 input and 8 output.
             .with_subagent_tokens(48)
             .kept_in(storage)

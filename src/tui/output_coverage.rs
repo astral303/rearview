@@ -48,6 +48,14 @@ fn address_of(row: &Conversation) -> &crate::history::sqlite_cache::SessionAddre
 }
 
 fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
+    viewer_text_with_thinking(row, tool_display, true)
+}
+
+fn viewer_text_with_thinking(
+    row: &Conversation,
+    tool_display: ToolDisplayMode,
+    show_thinking: bool,
+) -> String {
     let conversation = current_copy(parse_conversation_file_interactively(
         &InteractiveCache::at(test_cache_base()),
         address_of(row),
@@ -56,7 +64,7 @@ fn viewer_text(row: &Conversation, tool_display: ToolDisplayMode) -> String {
     .conversation;
     let options = RenderOptions {
         tool_display,
-        show_thinking: true,
+        show_thinking,
         show_timing: false,
         content_width: 200,
         expanded_tool_outputs: BTreeSet::new(),
@@ -159,6 +167,60 @@ fn every_display_output_shows_each_agents_record_kinds_and_no_hidden_one() {
         .collect();
 
     assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+}
+
+/// Each marker of `session` in a sub-agent's thinking that the viewer, in a
+/// tools mode, doesn't show with thinking shown or shows with thinking
+/// hidden; and how many such markers `session` has.
+fn subagent_thinking_gaps(session: &AgentSession) -> (Vec<String>, usize) {
+    let agent = session.row.source;
+    let row = cache_every_record_session(session);
+    let markers: Vec<_> = session
+        .markers
+        .iter()
+        .filter(|marker| marker.is_in_subagent_thinking)
+        .collect();
+    let mut gaps = Vec::new();
+    for tool_display in [
+        ToolDisplayMode::Hidden,
+        ToolDisplayMode::Truncated,
+        ToolDisplayMode::Full,
+    ] {
+        let shown = viewer_text_with_thinking(&row, tool_display, true);
+        let hidden = viewer_text_with_thinking(&row, tool_display, false);
+        for marker in &markers {
+            if !shown.contains(marker.text) {
+                gaps.push(format!(
+                    "{agent:?} {tool_display:?} with thinking shown is missing {}",
+                    marker.text
+                ));
+            }
+            if hidden.contains(marker.text) {
+                gaps.push(format!(
+                    "{agent:?} {tool_display:?} with thinking hidden shows {}",
+                    marker.text
+                ));
+            }
+        }
+    }
+    (gaps, markers.len())
+}
+
+#[test]
+fn viewer_shows_each_agents_subagent_thinking_in_every_tools_mode_only_with_thinking_shown() {
+    let mut gaps = Vec::new();
+    let mut markers = 0;
+    for session in every_record_sessions() {
+        let (session_gaps, session_markers) = subagent_thinking_gaps(&session);
+        gaps.extend(session_gaps);
+        markers += session_markers;
+    }
+
+    assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+    assert!(
+        markers > 0,
+        "some agent's fixture contains a sub-agent's thinking"
+    );
 }
 
 /// Each call marker whose run shows another summary-mode row than the

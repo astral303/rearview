@@ -376,12 +376,14 @@ fn child_process_writes_outputs() {
 }
 
 /// The TUI's search queries: a word every agent's session holds, a phrase,
-/// a quoted phrase, a sub-agent's marker, and a word not in any session.
+/// a quoted phrase, a sub-agent's marker, a marker in a sub-agent's
+/// thinking, and a word not in any session.
 const TUI_QUERIES: &[&str] = &[
     "answer",
     "tool output",
     "\"answer searchable\"",
     "SPLICED_SUBAGENT_SENTINEL",
+    "SUBAGENT_THINKING_SENTINEL",
     "zzqqxx",
 ];
 
@@ -440,6 +442,7 @@ const SEARCH_CASES: &[&[&str]] = &[
     &["agent", "search", "SPLICED_SUBAGENT_SENTINEL"],
     &["agent", "search", "TOOL_CALL_SENTINEL"],
     &["agent", "search", "THINKING_SENTINEL"],
+    &["agent", "search", "SUBAGENT_THINKING_SENTINEL"],
     &["agent", "search", "LAUNCH_PROMPT_SENTINEL", "--no-budget"],
     &[
         "agent",
@@ -500,8 +503,12 @@ impl AgentOutputs {
         for session in &listed {
             let reference = session.reference.as_str();
             outputs.within.push_str(&within_records_of(reference));
-            outputs.read.push_str(&read_records_of(reference));
-            outputs.outline.push_str(&outline_records_of(reference));
+            outputs
+                .read
+                .push_str(&read_records_of(reference, &session.agent));
+            outputs
+                .outline
+                .push_str(&outline_records_of(reference, &session.agent));
         }
         for window in &WINDOWS {
             let session = listed
@@ -548,8 +555,20 @@ fn within_records_of(reference: &str) -> String {
     .collect()
 }
 
-/// Every `agent read` case of the session `reference` names.
-fn read_records_of(reference: &str) -> String {
+/// The message the one-message `agent read` cases of `agent`'s session read,
+/// and the range its ranged `agent outline` case reads. Kimi Code's and Grok
+/// Build's cases read one message further on, because their sub-agent's
+/// thinking is a message of its own ahead of its answer.
+fn case_messages_of(agent: &str) -> (&'static str, &'static str) {
+    match agent {
+        "kimi" | "grok" => ("m4", "m2..m6"),
+        _ => ("m3", "m2..m5"),
+    }
+}
+
+/// Every `agent read` case of `agent`'s session `reference` names.
+fn read_records_of(reference: &str, agent: &str) -> String {
+    let (message, _) = case_messages_of(agent);
     let mut records = String::new();
     let mut run = |args: &[&str]| {
         let command = agent_command(args);
@@ -571,14 +590,14 @@ fn read_records_of(reference: &str) -> String {
     run(&[
         "agent",
         "read",
-        &format!("{reference}:m3"),
+        &format!("{reference}:{message}"),
         "--lines",
         "1..2",
     ]);
     run(&[
         "agent",
         "read",
-        &format!("{reference}:m3"),
+        &format!("{reference}:{message}"),
         "--match",
         "the",
     ]);
@@ -624,8 +643,9 @@ fn read_records_of(reference: &str) -> String {
     records
 }
 
-/// Every `agent outline` case of the session `reference` names.
-fn outline_records_of(reference: &str) -> String {
+/// Every `agent outline` case of `agent`'s session `reference` names.
+fn outline_records_of(reference: &str, agent: &str) -> String {
+    let (_, range) = case_messages_of(agent);
     let mut records = String::new();
     let mut run = |args: &[&str]| {
         let command = agent_command(args);
@@ -644,7 +664,7 @@ fn outline_records_of(reference: &str) -> String {
         "--no-budget",
     ]);
     run(&["agent", "outline", reference, "--budget", "500"]);
-    run(&["agent", "outline", &format!("{reference}:m2..m5")]);
+    run(&["agent", "outline", &format!("{reference}:{range}")]);
     if outline.lines().any(|line| line.starts_with("subagent s1 ")) {
         run(&["agent", "outline", &format!("{reference}:s1")]);
     }

@@ -805,14 +805,14 @@ fn search_bar_text(app: &super::App) -> String {
         .expect("the search bar shows the result count")
 }
 
-/// Adds a model reply holding `block`, sent `minute` past noon, to the
+/// Adds a model reply containing `blocks`, sent `minute` past noon, to the
 /// transcript at `path`.
-fn append_reply_block(path: &std::path::Path, minute: u32, block: serde_json::Value) {
+fn append_reply_blocks(path: &std::path::Path, minute: u32, blocks: &[serde_json::Value]) {
     let mut transcript = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     let line = serde_json::json!({
         "type": "assistant",
         "timestamp": format!("2026-10-01T12:{minute:02}:59Z"),
-        "message": {"role": "assistant", "content": [block]},
+        "message": {"role": "assistant", "content": blocks},
     });
     std::io::Write::write_all(&mut transcript, format!("{line}\n").as_bytes()).unwrap();
 }
@@ -823,18 +823,22 @@ fn list_finds_sessions_matching_in_tool_call_thinking_and_subagent_text_and_show
     use crossterm::event::{KeyCode, KeyModifiers};
     let home = ClaudeHome::new();
     let tool_call = home.write("tool-call", 30, &["check the build"]);
-    append_reply_block(
+    append_reply_blocks(
         &tool_call,
         30,
-        serde_json::json!({"type": "tool_use", "id": "call", "name": "Bash",
+        &[
+            serde_json::json!({"type": "tool_use", "id": "call", "name": "Bash",
             "input": {"command": "grep granite build.log"}}),
+        ],
     );
     let thinking = home.write("thinking", 20, &["plan the release"]);
-    append_reply_block(
+    append_reply_blocks(
         &thinking,
         20,
-        serde_json::json!({"type": "thinking", "thinking": "weigh the granite option first",
+        &[
+            serde_json::json!({"type": "thinking", "thinking": "weigh the granite option first",
             "signature": "sig"}),
+        ],
     );
     let subagent_parent = home.write("sub-agent", 10, &["delegate the survey"]);
     home.write_subagent(&subagent_parent, "a1", 10, &["survey the granite quarry"]);
@@ -867,6 +871,67 @@ fn list_finds_sessions_matching_in_tool_call_thinking_and_subagent_text_and_show
             "a row's context line shows {context:?}:\n{frame}"
         );
     }
+}
+
+#[test]
+fn session_found_in_subagents_thinking_shows_match_in_subagents_message_with_thinking_shown() {
+    use super::refresh_tests::listed_names;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let home = ClaudeHome::new();
+    let parent = home.write("sub-agent", 10, &["delegate the survey"]);
+    let subagent = home.write_subagent(&parent, "a1", 10, &["survey the quarry"]);
+    append_reply_blocks(
+        &subagent,
+        10,
+        &[
+            serde_json::json!({"type": "thinking", "thinking": "weigh the granite seam first",
+                "signature": "sig"}),
+            serde_json::json!({"type": "text", "text": "the seam is sound"}),
+        ],
+    );
+    home.write("dialogue-only", 5, &["water the plants"]);
+    let (_cache, environment) = caching_environment(&home);
+    let rows = cached_rows(&home, &environment);
+    let mut app = super::claude_home::app_reading(rows, environment);
+    receive_until(&mut app, |app| !app.is_reading_search_texts());
+    for character in "granite".chars() {
+        app.handle_key(KeyCode::Char(character), KeyModifiers::NONE, 20);
+    }
+    receive_until(&mut app, |app| !app.has_search_work_in_flight());
+    assert_eq!(
+        listed_names(&app),
+        ["sub-agent"],
+        "the list finds the session by its sub-agent's thinking"
+    );
+
+    app.selected = Some(0);
+    app.enter_view_mode(80);
+    app.toggle_view_thinking();
+    super::test_waits::finish_view_render(&mut app, 20);
+
+    let super::AppMode::View(state) = app.app_mode() else {
+        unreachable!("the viewer is open")
+    };
+    let matches = crate::tui::viewer::find_matches(&state.rendered_lines, "granite");
+    assert_eq!(
+        matches.len(),
+        1,
+        "the viewer's search finds the sub-agent's thinking once"
+    );
+    let row = matches[0].first_row();
+    let message = state
+        .message_ranges
+        .iter()
+        .find(|message| message.rows().contains(&row))
+        .expect("the match is in a message");
+    let message_text: String = state.rendered_lines[message.rows()]
+        .iter()
+        .map(crate::tui::viewer::RenderedLine::text)
+        .collect();
+    assert!(
+        message_text.contains("the seam is sound"),
+        "the match is in the sub-agent's message: {message_text:?}"
+    );
 }
 
 /// Longer than the text reader takes to read a fixture session.

@@ -158,6 +158,9 @@
   sub-agent transcripts. The session list missed all three, and the list and
   `agent search` both missed a tool call's body, such as an edit's diff, a
   skill's arguments or a plan.
+- Fix a sub-agent's thinking missing from the viewer, the `Ctrl+O` printout
+  and `--render`. With thinking shown, it now shows under `↳Thinking`, dimmed
+  like the sub-agent's other rows, and the viewer's search (`/`) finds it.
 - Fix one unreadable directory hiding all of an agent's sessions from the list
   and agent commands (Codex, Grok Build, Kimi Code, OMP and Pi). Its cached
   sessions now stay listed and readable, agent commands report the directory

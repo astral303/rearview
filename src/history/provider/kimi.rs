@@ -1059,6 +1059,7 @@ pub(super) mod tests {
                         "sub-agent message",
                         "kimi child answer searchable",
                     ),
+                    Marker::in_subagent_thinking("SUBAGENT_THINKING_SENTINEL"),
                     Marker::shown("task notice", "TASK_NOTICE_SENTINEL"),
                     Marker::shown("hook output", "HOOK_RESULT_SENTINEL"),
                     Marker::shown("blocking hook output", "BLOCKED_HOOK_SENTINEL"),
@@ -1086,7 +1087,7 @@ pub(super) mod tests {
                 ("model-run skill's file", "MODEL_SKILL_FILE_SENTINEL"),
                 ("user-run skill's file", "USER_SKILL_FILE_SENTINEL"),
             ])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 20)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 21)
             // The sub-agent's turn usage: 20 input and 10 output.
             .with_subagent_tokens(30)
             .kept_in(storage)

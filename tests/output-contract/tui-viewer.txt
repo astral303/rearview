@@ -258,6 +258,8 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
           │
    ┌──────┘ LAUNCH_PROMPT_SENTINEL: check how the plugin starts
    │
+↳Thinking │ SUBAGENT_THINKING_SENTINEL: read plugin.json first.
+   │
  ↳Explore │ SPLICED_SUBAGENT_SENTINEL: the plugin starts from plugin.json.
    │
  ↳Explore │ SubagentHandback:
@@ -382,6 +384,8 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
 
  ↳agent-0 │ kimi child task question
 
+↳Thinking │ SUBAGENT_THINKING_SENTINEL: read the notes first
+
  ↳agent-0 │ kimi child answer searchable
 
  Thinking │ THINKING_VISIBLE kimi reasoning
@@ -480,6 +484,8 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
           │ INTER_AGENT_TASK_TEXT
 
 ↳Fixture³ │ inter_agent_message: new task from /root · text encrypted by Codex
+
+↳Thinking │ SUBAGENT_THINKING_SENTINEL: read the notes file first.
 
 ↳Fixture³ │ TASKED_SUBAGENT_SENTINEL: the notes file lists the release steps.
 
@@ -679,6 +685,7 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
   ↳worker │ OMP sub-agent task question
 
   ↳worker │ OMP sub-agent answer searchable
+↳Thinking │ SUBAGENT_THINKING_SENTINEL: read the notes first
 
       OMP │ OMP active answer
 
@@ -738,6 +745,8 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
  ↳ses_sub │ sub-agent task
 
  ↳ses_sub │ sub-agent answer
+
+↳Thinking │ SUBAGENT_THINKING_SENTINEL: read the notes first
 
  Thinking │ considering the fixture layout
 
@@ -850,6 +859,8 @@ Scheduled │ SCHEDULED_SENTINEL: check the build.
       You │ active grok question
 
  ↳explore │ the spawn prompt
+
+↳Thinking │ SUBAGENT_THINKING_SENTINEL: read the notes first
 
  ↳explore │ grok child answer searchable
 

@@ -1337,6 +1337,7 @@ pub(super) mod tests {
                         "message of a sub-agent without user text",
                         "TASKED_SUBAGENT_SENTINEL",
                     ),
+                    Marker::in_subagent_thinking("SUBAGENT_THINKING_SENTINEL"),
                     Marker::shown("interrupted-turn notice", "Conversation interrupted"),
                     Marker::shown("goal", "GOAL_SENTINEL"),
                     Marker::in_call_or_subagent("web search", "WEB_SEARCH_SENTINEL")
@@ -1437,7 +1438,7 @@ pub(super) mod tests {
                 ("sub-agent's inherited reply", "INHERITED_ANSWER_SENTINEL"),
                 ("sub-agent's developer message", "DEVELOPER_TASK_SENTINEL"),
             ])
-            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 27)
+            .with_reply_after_records_without_text("NUMBERED_REPLY_SENTINEL", 28)
             // 500 input, 400 of them cached, and 25 output in the sub-agent
             // without user text; 0 in the other, without a `token_count` event.
             .with_subagent_tokens(525)
