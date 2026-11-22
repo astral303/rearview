@@ -1503,7 +1503,8 @@ pub(crate) fn outline_segments(
 /// The outline of the messages `request` names: a range, a sub-agent's
 /// alone, or the whole session, its times in `written_at`'s zone.
 /// `written_at` sets the `tz=` offset of an outline that does not show a
-/// time.
+/// time. The header's `hidden-` atoms count what `options` hide in those
+/// messages, as an unbudgeted read with them counts it.
 pub fn format_outline_with_warnings(
     request: &ReadRequest<'_>,
     options: ProtocolOptions,
@@ -1514,19 +1515,22 @@ pub fn format_outline_with_warnings(
     let (resolved, transcript) = (request.resolved, request.transcript);
     let index = TranscriptIndex::of(transcript);
     let requested = requested_messages(request, &index)?;
-    let in_window = window_atom(
-        options.window,
-        ThreadCounts::of(
-            requested
-                .iter()
-                .copied()
-                .filter(|message| is_in_window(message, options.window)),
-        ),
-    );
+    let requested_in_window = || {
+        requested
+            .iter()
+            .copied()
+            .filter(|message| is_in_window(message, options.window))
+    };
+    let in_window = window_atom(options.window, ThreadCounts::of(requested_in_window()));
+    let mut hidden = HiddenParts::default();
+    for message in requested_in_window() {
+        hidden.add(&hidden_parts(message, options.visibility()));
+    }
+    let hidden_atoms = hidden.total_atoms();
     let messages = OutlineMessages::new(request, requested, &index, options, written_at);
     let offset = messages.header_offset;
     let header_fields = format!(
-        "policy={}{}{}{}{}{in_window}",
+        "policy={}{}{}{}{}{in_window}{hidden_atoms}",
         options.visibility().atom(),
         last_atom(std::slice::from_ref(request)),
         session_count_atoms(
