@@ -107,6 +107,57 @@ Dependency policy:
   the length Linux keeps. Crash reports, debuggers and profilers show the
   name.
 
+## Agent protocol design
+
+Coding agents read the output of the `rearview agent` commands and type
+the next command. An agent composes that command from parts: the addresses
+and flags that the output and the skill showed it, and the conventions of
+tools it already knows, such as grep. Every command it can compose from
+those parts is the interface it expects.
+
+First principles:
+
+- **Least surprise.** A part means what it meant where the agent last saw
+  it.
+- **Consistency.** The same input causes the same action on every command.
+- **Nothing to memorise.** The output and the skill text are enough to
+  compose a command. A difference between commands that the agent has to
+  remember from documentation is a defect.
+
+git shows both sides. `HEAD~10` names the same commit in every git command
+that accepts a revision. `a..b` and `a...b` select different commits in
+`git log` and in `git diff`: for the changes on `b` since it left `a`, the
+user types two dots in one command and three in the other, and has to
+remember which.
+
+Rules that follow from them. A pull request that decides a new rule for
+the protocol adds it here, in the same pull request:
+
+- **Output gives the agent what its next step needs.** Leave content out
+  only to fit the budget or the request, and print how to read it: an
+  address, a recipe or a flag. Leave out what the agent cannot act on.
+- **A command the agent can compose works.** rearview runs it, or gives the
+  nearest useful answer and reports what it did:
+  - Every command that accepts a ref accepts every address a command
+    prints, and applies to the messages at that address.
+  - A flag has one meaning on every command. A command accepts a flag that
+    changes nothing for it.
+  - Where grep or another common tool has a name and a behaviour for a
+    feature, use both: a hit, its context, `-A`, `-B` and `-C`, inclusive
+    ranges. One spelling has one meaning.
+  - A clear request that cannot be met exactly gets what exists and a
+    record of the difference: a range that ends past the last message is
+    read to the last message.
+  - An error is for a request without any answer. It names the command
+    that works, and it does not fault a ref the output printed.
+- **An address names its container first:** `s3:m5`, not `m5 s3`.
+- **Fill the grid before adding an address form or a flag.** List each
+  agent command against each address form and each flag. A rejected cell
+  is a decision the pull request states, not a default of the parser.
+- **A command rearview rejected in an agent test is a finding.** Report
+  rejected commands, grouped by shape, beside the answers: a run whose
+  answers are all correct can contain them.
+
 ## Tests
 
 Unit tests are fast, isolated and repeatable. The target: the test suite runs
