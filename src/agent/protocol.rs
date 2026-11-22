@@ -1150,7 +1150,7 @@ struct ReadHeader {
 impl ReadHeader {
     fn new(
         options: ProtocolOptions,
-        messages_in_window: usize,
+        messages_in_window: ThreadCounts,
         warning_count: usize,
         warning_records: &[String],
     ) -> Self {
@@ -1224,7 +1224,7 @@ pub fn format_read_with_warnings(
     let mut header_options = options;
     let mut entries = Vec::new();
     let mut request_entry_counts = Vec::with_capacity(requests.len());
-    let mut messages_in_window = 0;
+    let mut messages_in_window = ThreadCounts::default();
     let indexes = requests
         .iter()
         .map(|request| TranscriptIndex::of(request.transcript))
@@ -1240,10 +1240,12 @@ pub fn format_read_with_warnings(
             zone,
         };
         let mut selected = requested_messages(request, index)?;
-        messages_in_window += selected
-            .iter()
-            .filter(|message| is_in_window(message, options.window))
-            .count();
+        messages_in_window = messages_in_window.add(ThreadCounts::of(
+            selected
+                .iter()
+                .copied()
+                .filter(|message| is_in_window(message, options.window)),
+        ));
         if let ReadPriority::Tail(count) = &priority {
             selected = tail_messages(request, selected, index, *count, &shape);
         }
@@ -1361,6 +1363,43 @@ pub fn format_outline(
     .expect("an outline of a whole session")
 }
 
+/// The segments of `request`'s outline with every part shown, at
+/// `segment_size` messages each, also in a session too short for segments:
+/// each segment's address and the addresses of the messages it covers.
+#[cfg(test)]
+pub(crate) fn outline_segments(
+    request: &ReadRequest<'_>,
+    segment_size: usize,
+) -> Vec<(String, Vec<String>)> {
+    let options = request.options(crate::agent::test_support::EVERY_PART);
+    let index = TranscriptIndex::of(request.transcript);
+    let requested = requested_messages(request, &index).unwrap();
+    let messages = OutlineMessages::new(
+        request,
+        requested,
+        &index,
+        options,
+        crate::agent::test_support::written_at(),
+    );
+    messages
+        .segment_records(segment_size)
+        .into_iter()
+        .map(|record| {
+            let address = record
+                .line
+                .strip_prefix("seg ")
+                .and_then(|line| line.split(' ').next())
+                .unwrap()
+                .to_owned();
+            let covered = record
+                .covers
+                .map(|position| messages.addresses.message(messages.ordinal(position)))
+                .collect();
+            (address, covered)
+        })
+        .collect()
+}
+
 /// The outline of the messages `request` names: a range, a sub-agent's
 /// alone, or the whole session, its times in `written_at`'s zone.
 /// `written_at` sets the `tz=` offset of an outline that does not show a
@@ -1375,23 +1414,27 @@ pub fn format_outline_with_warnings(
     let (resolved, transcript) = (request.resolved, request.transcript);
     let index = TranscriptIndex::of(transcript);
     let requested = requested_messages(request, &index)?;
-    let messages_in_window = requested
-        .iter()
-        .filter(|message| is_in_window(message, options.window))
-        .count();
+    let in_window = window_atom(
+        options.window,
+        ThreadCounts::of(
+            requested
+                .iter()
+                .copied()
+                .filter(|message| is_in_window(message, options.window)),
+        ),
+    );
     let messages = OutlineMessages::new(request, requested, &index, options, written_at);
     let offset = messages.header_offset;
     let header_fields = format!(
-        "policy={} messages={}{}{}{}",
+        "policy={}{}{}{}{in_window}",
         options.visibility().atom(),
-        transcript.messages.len(),
+        ThreadCounts::of(&transcript.messages).atoms("messages"),
         time_atoms(
             TimeSpan::of_messages(&transcript.messages),
             offset,
             messages.zone
         ),
         tz_atom(offset),
-        window_atom(options.window, messages_in_window)
     );
     let (warning_count, warning_records) = format_warning_records(warnings);
     let warning_suffix = warning_atoms(warning_count, &warning_records);
@@ -1560,10 +1603,15 @@ struct OutlineMessages<'a> {
     subagent_runs: Vec<SubagentRun>,
     /// The sub-agent of each handle a visible message carries.
     subagents: HashMap<Handle, SubagentTag>,
-    /// In an outline of the session's own messages, the index of each visible
-    /// message that starts a group, then the count of visible messages; a
-    /// segment holds whole groups. `None` for a sub-agent's outline.
-    group_starts: Option<Vec<usize>>,
+    /// The index of each visible message a segment may start at, then the
+    /// count of visible messages: in an outline of the session's own
+    /// messages each group's first, as a segment holds whole groups; in a
+    /// sub-agent's outline each message of another thread than the one
+    /// before it, as a segment holds one thread's messages.
+    segment_starts: Vec<usize>,
+    /// True for an outline of the session's own messages; false for a
+    /// sub-agent's.
+    of_own_messages: bool,
     /// The offset the header's `tz=` names: that of the outline's first time
     /// and of its first `day` record.
     header_offset: FixedOffset,
@@ -1636,23 +1684,26 @@ impl<'a> OutlineMessages<'a> {
             }
             subagents.insert(tag.handle, tag.clone());
         }
-        let group_starts = request.subagent.is_none().then(|| {
-            let mut starts = Vec::new();
-            let mut last_group = None;
-            for (position, rendered) in visible.iter().enumerate() {
-                let group = index.addresses.group_of(rendered.message.ordinal);
-                if last_group != Some(group) {
-                    starts.push(position);
-                    last_group = Some(group);
-                }
+        let of_own_messages = request.subagent.is_none();
+        let mut segment_starts = Vec::new();
+        let mut last_start_key = None;
+        for (position, rendered) in visible.iter().enumerate() {
+            let start_key = if of_own_messages {
+                Some(index.addresses.group_of(rendered.message.ordinal))
+            } else {
+                rendered.subagent.as_ref().map(|tag| tag.handle)
+            };
+            if position == 0 || last_start_key != Some(start_key) {
+                segment_starts.push(position);
+                last_start_key = Some(start_key);
             }
-            starts.push(visible.len());
-            starts
-        });
+        }
+        segment_starts.push(visible.len());
         Self {
             resolved,
             addresses: &index.addresses,
-            group_starts,
+            segment_starts,
+            of_own_messages,
             requested: requested_runs,
             chars_before,
             times: RangeSpans::new(visible.iter().map(|message| message.times).collect()),
@@ -1729,6 +1780,12 @@ impl<'a> OutlineMessages<'a> {
         if count <= OUTLINE_SHORT_MESSAGE_LIMIT {
             return (0..count).map(|index| self.message_record(index)).collect();
         }
+        self.segment_records(segment_size)
+    }
+
+    /// One record per `segment_size` messages, as [`Self::records`] ends each.
+    fn segment_records(&self, segment_size: usize) -> Vec<OutlineRecord> {
+        let count = self.len();
         let mut records = Vec::new();
         let mut start = 0;
         while start < count {
@@ -1742,17 +1799,20 @@ impl<'a> OutlineMessages<'a> {
     /// The index after the last visible message of the segment from `start`:
     /// `segment_size` messages on, moved back to the last group's end before
     /// it, or on to the end of the group holding `start` when that group
-    /// alone is longer.
+    /// alone is longer. A sub-agent's outline ends the segment earlier where
+    /// the thread changes.
     fn segment_end(&self, start: usize, segment_size: usize) -> usize {
         let limit = self.len().min(start + segment_size);
-        let Some(starts) = &self.group_starts else {
-            return limit;
-        };
+        let starts = &self.segment_starts;
+        let next_start = starts[starts.partition_point(|&position| position <= start)];
+        if !self.of_own_messages {
+            return limit.min(next_start);
+        }
         let before_limit = starts[starts.partition_point(|&group| group <= limit) - 1];
         if before_limit > start {
             before_limit
         } else {
-            starts[starts.partition_point(|&group| group <= start)]
+            next_start
         }
     }
 
@@ -1794,8 +1854,13 @@ impl<'a> OutlineMessages<'a> {
         let (first, last) = (covers.start, covers.end - 1);
         let subagents = self.subagents_in(covers.clone());
         let (first_ordinal, last_ordinal) = (self.ordinal(first), self.ordinal(last));
-        let address = if self.group_starts.is_some() {
+        // In a sub-agent's outline, a segment holds one thread's messages:
+        // one message of the session's own prints as `m5`, as `m5..m5` reads
+        // its group.
+        let address = if self.of_own_messages {
             self.addresses.groups(first_ordinal, last_ordinal)
+        } else if first == last {
+            self.addresses.message(first_ordinal)
         } else {
             self.addresses.closed_range(first_ordinal, last_ordinal)
         };
@@ -1819,10 +1884,49 @@ fn is_in_window(message: &AgentMessage, window: TimeFilter) -> bool {
     window.contains_message(TimeSpan::of_message(message))
 }
 
-/// ` messages-in-window=N` for a window with bounds; empty without one.
-fn window_atom(window: TimeFilter, messages_in_window: usize) -> String {
+/// A count of messages: the session's own, and its sub-agents'.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ThreadCounts {
+    pub own: usize,
+    pub subagents: usize,
+}
+
+impl ThreadCounts {
+    pub fn of<'m>(messages: impl IntoIterator<Item = &'m AgentMessage>) -> Self {
+        let mut counts = Self::default();
+        for message in messages {
+            if message.subagent.is_some() {
+                counts.subagents += 1;
+            } else {
+                counts.own += 1;
+            }
+        }
+        counts
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            own: self.own + other.own,
+            subagents: self.subagents + other.subagents,
+        }
+    }
+
+    /// ` messages=30 subagent-messages=18` for `name` `messages`; the second
+    /// atom is left out at 0.
+    pub fn atoms(self, name: &str) -> String {
+        let mut atoms = format!(" {name}={}", self.own);
+        if self.subagents > 0 {
+            atoms.push_str(&format!(" subagent-{name}={}", self.subagents));
+        }
+        atoms
+    }
+}
+
+/// ` messages-in-window=N subagent-messages-in-window=M` for a window with
+/// bounds; empty without one.
+fn window_atom(window: TimeFilter, messages_in_window: ThreadCounts) -> String {
     if window.is_active() {
-        format!(" messages-in-window={messages_in_window}")
+        messages_in_window.atoms("messages-in-window")
     } else {
         String::new()
     }
@@ -7020,6 +7124,39 @@ mod tests {
                 assert_eq!(own, ["m1", "m2"], "{output}");
             }
         }
+    }
+
+    /// alpha writes between the session's own m1 and m2, and once more
+    /// after m2.
+    #[test]
+    fn outline_header_counts_own_and_subagent_messages_apart() {
+        use AgentMessageRole::User;
+        let with_subagent = transcript(vec![
+            text_message(1, User, "first"),
+            subagent_text_message(2, "alpha", "alpha one"),
+            text_message(3, User, "second"),
+            subagent_text_message(4, "alpha", "alpha two"),
+        ]);
+        let own_alone = transcript(vec![text_message(1, User, "first")]);
+
+        let header = |transcript: &AgentTranscript| {
+            format_outline(&resolved("session.jsonl"), transcript, every_flag())
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+
+        assert!(
+            header(&with_subagent).contains(" messages=2 subagent-messages=2 "),
+            "{}",
+            header(&with_subagent)
+        );
+        assert!(
+            !header(&own_alone).contains("subagent-messages="),
+            "a session without sub-agent messages leaves the count out: {}",
+            header(&own_alone)
+        );
     }
 
     /// alpha writes before the session's first message.

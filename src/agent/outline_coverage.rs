@@ -1,5 +1,6 @@
-//! An outline's header shows the session's message count as the session list
-//! does, and its first and last time as `agent read` shows them. Checked over
+//! An outline's header counts the session's own and sub-agent messages, which
+//! together are the list's message count, and shows its first and last time
+//! as `agent read` shows them. Checked over
 //! each registered agent's every-record session, read with its sub-agent
 //! transcripts.
 
@@ -34,10 +35,12 @@ fn header_gaps(session: &AgentSession) -> Vec<String> {
     let read_times = read_times(&read);
 
     let mut gaps = Vec::new();
-    let listed = row.message_count.to_string();
-    if atom(header, "messages") != Some(listed.as_str()) {
+    let count = |name| atom(header, name).map_or(0, |count| count.parse::<usize>().unwrap());
+    let counted = count("messages") + count("subagent-messages");
+    if counted != row.message_count {
         gaps.push(format!(
-            "{agent:?}: the list counts {listed} messages, the outline header: {header}"
+            "{agent:?}: the list counts {} messages, the outline header: {header}",
+            row.message_count
         ));
     }
     match read_times {

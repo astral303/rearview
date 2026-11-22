@@ -2494,8 +2494,9 @@ mod agent_command_tests {
             let read = session.read("", window);
 
             assert_eq!(ordinals_shown(&read), expected, "{case}");
-            let in_window = format!("messages-in-window={}", expected.len());
-            assert!(header_has(&read, &in_window), "{case}: {read}");
+            for in_window in in_window_atoms(&expected) {
+                assert!(header_has(&read, &in_window), "{case}: {read}");
+            }
         }
     }
 
@@ -2510,7 +2511,20 @@ mod agent_command_tests {
 
         assert_eq!(ordinals_shown(&unbounded), ["m4", "s1:m1", "m5"]);
         assert_eq!(ordinals_shown(&windowed), ["m3", "m4", "s1:m1"]);
-        assert!(header_has(&windowed, "messages-in-window=5"), "{windowed}");
+        for in_window in in_window_atoms(&["m1", "m2", "m3", "m4", "s1:m1"]) {
+            assert!(header_has(&windowed, &in_window), "{windowed}");
+        }
+    }
+
+    /// The header's `messages-in-window=` and `subagent-messages-in-window=`
+    /// atoms for the messages `shown`, `m4` or `s1:m1`, inside a window.
+    fn in_window_atoms(shown: &[&str]) -> Vec<String> {
+        let subagents = shown.iter().filter(|address| address.contains(':')).count();
+        let mut atoms = vec![format!("messages-in-window={}", shown.len() - subagents)];
+        if subagents > 0 {
+            atoms.push(format!("subagent-messages-in-window={subagents}"));
+        }
+        atoms
     }
 
     #[test]
@@ -2521,7 +2535,9 @@ mod agent_command_tests {
         let range_alone = session.read(":m4..m5", cli::MessageTimeArgs::default());
 
         assert_eq!(ordinals_shown(&both), ["m4", "s1:m1"]);
-        assert!(header_has(&both, "messages-in-window=2"), "{both}");
+        for in_window in in_window_atoms(&["m4", "s1:m1"]) {
+            assert!(header_has(&both, &in_window), "{both}");
+        }
         assert_eq!(ordinals_shown(&range_alone), ["m4", "s1:m1", "m5"]);
         assert!(!range_alone.contains("messages-in-window"), "{range_alone}");
     }
@@ -2537,7 +2553,10 @@ mod agent_command_tests {
             let outline = session.outline(window);
 
             assert_eq!(ordinals_shown(&outline), expected, "{case}");
-            assert!(header_has(&outline, "messages=6"), "{case}: {outline}");
+            assert!(
+                header_has(&outline, "messages=5") && header_has(&outline, "subagent-messages=1"),
+                "the session's own five messages and its sub-agent's one, {case}: {outline}"
+            );
             let in_window = format!("messages-in-window={}", expected.len());
             assert!(header_has(&outline, &in_window), "{case}: {outline}");
         }

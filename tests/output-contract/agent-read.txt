@@ -2060,7 +2060,7 @@ $ rearview agent read ch_982349c13ee4:s99
 protocol agent-error kind=not-found ref=ch_982349c13ee4 detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_581699c40efc --tools --tool-results --after 2026-09-01T06:00:30 --before 2026-09-01T06:05
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00 messages-in-window=19 hidden-subagents=1
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00 messages-in-window=18 subagent-messages-in-window=1 hidden-subagents=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s3 type=fork span=s3:m1 : fork
 day 2026-09-01

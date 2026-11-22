@@ -27,7 +27,7 @@
 //!   legend record names. An outline segment names each sub-agent whose
 //!   messages it shows, and no other.
 //! - A read of one sub-agent shows exactly its messages, its launch and its
-//!   reports.
+//!   reports. Each segment of its outline reads back exactly its messages.
 //! - Handles number the sub-agents in the order they start: at their
 //!   launch, else at their first message.
 //! - When exact search finds a marker in a message, a read of that message
@@ -534,6 +534,55 @@ fn misread_subagents(session: &AgentSession) -> (Vec<String>, HashMap<String, Le
         })
         .collect();
     (misread, legend)
+}
+
+/// Each segment of the outline of each of `session`'s sub-agents, at two
+/// messages a segment, whose address does not read back exactly the
+/// messages it covers; and the count of segments.
+fn segments_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
+    let loaded = LoadedSession::of(session);
+    let reference = loaded.resolved.reference.canonical();
+    let mut misread = Vec::new();
+    let mut segments = 0;
+    for handle in legend(&read(session, EVERY_FLAG)).keys() {
+        let number = handle.strip_prefix('s').unwrap().parse().unwrap();
+        let request = ReadRequest {
+            resolved: &loaded.resolved,
+            transcript: &loaded.transcript,
+            range: None,
+            subagent: Some(number),
+            call: None,
+        };
+        for (address, covered) in crate::agent::protocol::outline_segments(&request, 2) {
+            segments += 1;
+            let expected = covered
+                .iter()
+                .flat_map(|message| addressed_messages(message))
+                .collect::<BTreeSet<_>>();
+            let output = loaded.read_ref(&format!("{reference}:{address}"), EVERY_FLAG);
+            if covered_addresses(&output) != expected {
+                misread.push(format!(
+                    "{:?}: {handle}'s seg {address} covers {covered:?}:\n{output}",
+                    session.row.source
+                ));
+            }
+        }
+    }
+    (misread, segments)
+}
+
+#[test]
+fn every_agents_subagent_outline_segment_reads_back_its_messages() {
+    let mut misread = Vec::new();
+    let mut segments = 0;
+    for session in every_record_sessions() {
+        let (session_misread, session_segments) = segments_not_read_back(&session);
+        misread.extend(session_misread);
+        segments += session_segments;
+    }
+
+    assert!(misread.is_empty(), "{}", misread.join("\n"));
+    assert!(segments > 0, "a sub-agent's outline has segments");
 }
 
 #[test]
