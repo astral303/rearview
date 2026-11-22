@@ -1,4 +1,4 @@
-use crate::agent::address::{HitAddresses, HitPlaces, MessageAddresses};
+use crate::agent::address::{HitAddresses, HitContext, HitPlaces, MessageAddresses};
 use crate::agent::diagnostic::{
     AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms, warning_chars,
 };
@@ -273,8 +273,8 @@ pub struct AgentOutputHit {
     /// The times on the parts of the messages in `hit_range`. A semantic
     /// hit gets them with its anchors, once its transcript is read.
     pub times: Option<TimeSpan>,
-    /// The hit's `hit=` and the range its `read ref=` recipe reads. A
-    /// semantic hit gets them with its anchors; `None` when its read failed.
+    /// The hit's `hit=` and its thread's length. A semantic hit gets them
+    /// with its anchors; `None` when its read failed.
     pub addresses: Option<HitAddresses>,
 }
 
@@ -376,14 +376,20 @@ pub fn effective_agent_mode(
 
 #[cfg(test)]
 pub fn format_agent_output(output: &AgentSearchOutput) -> String {
-    format_agent_output_with_warnings(output, &[], crate::agent::test_support::written_at())
+    format_agent_output_with_warnings(
+        output,
+        HitContext::default(),
+        &[],
+        crate::agent::test_support::written_at(),
+    )
 }
 
 /// The records of `output` and `warnings`, their times in `written_at`'s
-/// zone. `written_at` sets the `tz=` offset of an output that does not show
-/// a time.
+/// zone, each hit's `read` recipe covering `context`. `written_at` sets the
+/// `tz=` offset of an output that does not show a time.
 pub fn format_agent_output_with_warnings(
     output: &AgentSearchOutput,
+    context: HitContext,
     warnings: &[AgentWarning],
     written_at: DateTime<Zone>,
 ) -> String {
@@ -445,7 +451,7 @@ pub fn format_agent_output_with_warnings(
                 protocol_snippet(&group.title, AGENT_SEARCH_TITLE_CHARS)
             ));
             for hit in &group.hits {
-                push_hit_lines(&mut rendered, hit, offset, zone);
+                push_hit_lines(&mut rendered, hit, context, offset, zone);
             }
         }
         return bound_agent_output(output, rendered, header, &warning_records);
@@ -462,7 +468,7 @@ pub fn format_agent_output_with_warnings(
                 protocol_snippet(&hit.title, AGENT_SEARCH_TITLE_CHARS)
             ));
         }
-        push_hit_lines(&mut rendered, hit, offset, zone);
+        push_hit_lines(&mut rendered, hit, context, offset, zone);
     }
     bound_agent_output(output, rendered, header, &warning_records)
 }
@@ -584,12 +590,14 @@ fn score_breakdown_atoms(breakdown: Option<SemanticScoreBreakdown>) -> String {
     })
 }
 
-/// The `hit` record and its `read` recipe, its times in `zone`, below a
-/// header whose `tz=` names `header_offset`. A hit without addresses, one
-/// whose session failed to read, prints neither `hit=` nor the recipe.
+/// The `hit` record and its `read` recipe covering `context`, its times in
+/// `zone`, below a header whose `tz=` names `header_offset`. A hit without
+/// addresses prints neither `hit=` nor the recipe: its session failed to
+/// read.
 fn push_hit_lines(
     rendered: &mut String,
     hit: &AgentOutputHit,
+    context: HitContext,
     header_offset: FixedOffset,
     zone: Zone,
 ) {
@@ -612,7 +620,7 @@ fn push_hit_lines(
     if let Some(addresses) = hit.addresses {
         rendered.push_str(&format!(
             "read ref={reference}:{}{hit_atom}{}\n",
-            addresses.read,
+            addresses.recipe_range(context),
             hit.render_options.recipe_atoms()
         ));
     }
@@ -1832,14 +1840,14 @@ mod tests {
         }
     }
 
-    /// The addresses of a hit on `hit` reading `read`, ordinals of a
-    /// session without sub-agents.
+    /// The addresses of a hit on `hit`, ordinals of a session without
+    /// sub-agents whose last message is `read`'s end: the hit's recipe reads
+    /// `read` at the default context when `read` starts one message before
+    /// the hit, or at m1.
     fn parent_addresses(hit: MessageRange, read: MessageRange) -> HitAddresses {
-        let range =
-            |range: MessageRange| ThreadRange::closed(Thread::Parent, range.start, range.end);
         HitAddresses {
-            hit: range(hit),
-            read: range(read),
+            hit: ThreadRange::closed(Thread::Parent, hit.start, hit.end),
+            thread_length: read.end,
         }
     }
 
@@ -2353,20 +2361,18 @@ mod tests {
             ],
         );
 
-        assert_eq!(output.hits.len(), 2);
+        let recipe_reads = output
+            .hits
+            .iter()
+            .map(|hit| {
+                hit.addresses
+                    .map(|addresses| addresses.recipe_range(HitContext::default()).to_string())
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            output.hits[0].addresses,
-            Some(parent_addresses(
-                MessageRange::single(1),
-                MessageRange { start: 1, end: 2 }
-            ))
-        );
-        assert_eq!(
-            output.hits[1].addresses,
-            Some(parent_addresses(
-                MessageRange::single(3),
-                MessageRange { start: 2, end: 4 }
-            ))
+            recipe_reads,
+            [Some("m1..m2".to_owned()), Some("m2..m4".to_owned())],
+            "each recipe reads its hit and the message before and after it"
         );
     }
 
@@ -2443,7 +2449,9 @@ mod tests {
         assert_eq!(hits[0].preview, "lexical preview");
         assert_eq!(hits[0].semantic_score_breakdown.unwrap().semantic, 0.9);
         assert_eq!(
-            hits[0].addresses.map(|addresses| addresses.read),
+            hits[0]
+                .addresses
+                .map(|addresses| addresses.recipe_range(HitContext::default())),
             Some(ThreadRange::closed(Thread::Parent, 1, 3))
         );
     }
@@ -3111,6 +3119,7 @@ mod tests {
         };
         let unbudgeted = format_agent_output_with_warnings(
             &output(None),
+            HitContext::default(),
             std::slice::from_ref(&warning),
             written_at(),
         );
@@ -3123,8 +3132,12 @@ mod tests {
             .sum::<usize>();
         let budget = unbudgeted.chars().count() - hit_lines + 80;
 
-        let rendered =
-            format_agent_output_with_warnings(&output(Some(budget)), &[warning], written_at());
+        let rendered = format_agent_output_with_warnings(
+            &output(Some(budget)),
+            HitContext::default(),
+            &[warning],
+            written_at(),
+        );
 
         assert!(rendered.chars().count() <= budget, "{rendered}");
         assert!(!rendered.contains("\nhit "), "{rendered}");
@@ -3156,13 +3169,23 @@ mod tests {
             coverage: None,
         };
         let warnings = warnings_of_two_kinds();
-        let roomy = format_agent_output_with_warnings(&output(None), &warnings, written_at())
-            .chars()
-            .count()
+        let roomy = format_agent_output_with_warnings(
+            &output(None),
+            HitContext::default(),
+            &warnings,
+            written_at(),
+        )
+        .chars()
+        .count()
             + 10;
 
         assert_each_budget_cuts_short_or_ends_with_warnings(roomy, &warnings, |budget| {
-            format_agent_output_with_warnings(&output(Some(budget)), &warnings, written_at())
+            format_agent_output_with_warnings(
+                &output(Some(budget)),
+                HitContext::default(),
+                &warnings,
+                written_at(),
+            )
         });
     }
 
@@ -3212,7 +3235,12 @@ mod tests {
                     budget,
                     coverage: None,
                 };
-                format_agent_output_with_warnings(&output, warnings, written_at())
+                format_agent_output_with_warnings(
+                    &output,
+                    HitContext::default(),
+                    warnings,
+                    written_at(),
+                )
             };
             let budgets =
                 |unbudgeted: usize| (300..unbudgeted).step_by(37).chain([unbudgeted + 10]);

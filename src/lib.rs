@@ -1452,7 +1452,7 @@ mod agent_command_tests {
                 times: None,
                 addresses: Some(agent::address::HitAddresses {
                     hit: agent::refs::ThreadRange::one(agent::refs::Thread::Parent, 2),
-                    read: agent::refs::ThreadRange::closed(agent::refs::Thread::Parent, 1, 3),
+                    thread_length: 3,
                 }),
             }],
             groups: vec![],
@@ -1543,6 +1543,7 @@ mod agent_command_tests {
             perf_stats: false,
             search_mode: cli::AgentSearchModeArgs::explicit(SearchMode::Lexical),
             time: cli::MessageTimeArgs::default(),
+            context: cli::HitContextArgs::default(),
         };
         let within_request = agent::search::AgentWithinRequest {
             query: within_args.query.clone(),

@@ -1858,7 +1858,7 @@ impl AgentService {
                 let mut output = run.output;
                 apply_configured_render_policy(&mut output, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
-                Ok(self.render_search(&output, warnings))
+                Ok(self.render_search(&output, args.context.hit_context(), warnings))
             }
             SearchMode::Semantic => {
                 let (mut output, semantic_warnings) = perf.time(Stage::Semantic, || {
@@ -1875,7 +1875,7 @@ impl AgentService {
                 let mut warnings = warnings.into_inner();
                 warnings.extend(semantic_warnings);
                 let warnings = self.with_stale_cache_record(warnings, &output);
-                Ok(self.render_search(&output, warnings))
+                Ok(self.render_search(&output, args.context.hit_context(), warnings))
             }
             SearchMode::Hybrid => {
                 let inputs = agent_inputs_for_indices(&conversations, &keys, &scoped)?;
@@ -1929,7 +1929,7 @@ impl AgentService {
                 };
                 apply_configured_render_policy(&mut output, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
-                Ok(self.render_search(&output, warnings))
+                Ok(self.render_search(&output, args.context.hit_context(), warnings))
             }
         }
     }
@@ -1978,11 +1978,13 @@ impl AgentService {
     fn render_search(
         &self,
         output: &agent::search::AgentSearchOutput,
+        context: agent::address::HitContext,
         warnings: Vec<AgentWarning>,
     ) -> CommandOutput {
         let records = self.perf.time(Stage::Render, || {
             agent::search::format_agent_output_with_warnings(
                 output,
+                context,
                 &warnings,
                 self.clock().local_wall(),
             )
@@ -2161,6 +2163,7 @@ impl AgentService {
             apply_configured_render_policy(&mut output, &agent_config);
             agent::search::format_agent_output_with_warnings(
                 &output,
+                args.context.hit_context(),
                 &warnings,
                 self.clock().local_wall(),
             )

@@ -1549,6 +1549,61 @@ fn assert_shows_user_question_and_agent_answer(output: &str) {
     );
 }
 
+/// The session is the question `context needle`, m1, and its answer, m2.
+#[test]
+fn search_and_within_hit_recipe_covers_context_flags_messages() {
+    let config = tempfile::tempdir().expect("config");
+    write_transcript(
+        &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
+        "context needle",
+    );
+    let recipe = |command: &[&str]| {
+        let output = stdout_of(&run(config.path(), command));
+        output
+            .lines()
+            .find(|line| line.starts_with("read ref="))
+            .unwrap_or_else(|| panic!("a hit prints a recipe: {output}"))
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let search = |flags: &[&str]| {
+        let mut command = vec!["agent", "search", "--lexical", "context needle"];
+        command.extend_from_slice(flags);
+        recipe(&command)
+    };
+    let reference = first_ref(&stdout_of(&run(
+        config.path(),
+        &["agent", "search", "--lexical", "context needle"],
+    )));
+
+    assert_eq!(
+        search(&[]),
+        format!("read ref={reference}:m1..m2 hit=m1"),
+        "one message after the hit by default"
+    );
+    assert_eq!(
+        search(&["-A", "0"]),
+        format!("read ref={reference}:m1 hit=m1")
+    );
+    assert_eq!(
+        recipe(&[
+            "agent",
+            "within",
+            &reference,
+            "context needle",
+            "--lexical",
+            "--before-context",
+            "3",
+            "--after-context",
+            "0",
+        ]),
+        format!("read ref={reference}:m1 hit=m1"),
+        "the session's first message ends the context before the hit"
+    );
+}
+
 /// Writes a session under `config` and returns its ref. The transcript is
 /// the question `partial transcript needle`, a malformed line, then the
 /// answer.

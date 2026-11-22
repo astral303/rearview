@@ -428,6 +428,7 @@ const SESSIONS_CASES: &[&[&str]] = &[
 /// without hits, and errors.
 const SEARCH_CASES: &[&[&str]] = &[
     &["agent", "search", "answer"],
+    &["agent", "search", "answer", "-C", "2"],
     &["agent", "search", "searchable", "--top", "3"],
     &["agent", "search", "searchable", "--flat"],
     &["agent", "search", "searchable", "--all-hits"],
@@ -546,6 +547,7 @@ fn records_of(cases: &[&[&str]]) -> String {
 fn within_records_of(reference: &str) -> String {
     [
         vec!["agent", "within", reference, "answer"],
+        vec!["agent", "within", reference, "answer", "-B", "0", "-A", "2"],
         vec!["agent", "within", reference, "searchable", "--top", "2"],
         vec!["agent", "within", reference, "--mode", "exact", "Sentinel"],
         vec!["agent", "within", reference, "the", "--budget", "400"],

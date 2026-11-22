@@ -1,3 +1,4 @@
+use crate::agent::address::HitContext;
 use crate::agent::protocol::MessageLineRange;
 use crate::clock::Clock;
 use crate::history::Source;
@@ -199,6 +200,41 @@ pub struct AgentSearchArgs {
     pub search_mode: AgentSearchModeArgs,
     #[command(flatten)]
     pub time: MessageTimeArgs,
+    #[command(flatten)]
+    pub context: HitContextArgs,
+}
+
+// The messages of a hit's thread before and after the hit that its `read`
+// recipe covers, counted as grep's -B, -A and -C count lines around a match.
+#[derive(Debug, Default, ClapArgs)]
+pub struct HitContextArgs {
+    /// Messages of the hit's thread before the hit that its `read` recipe
+    /// covers; 1 by default
+    #[arg(short = 'B', long, value_name = "N")]
+    pub before_context: Option<usize>,
+    /// Messages of the hit's thread after the hit that its `read` recipe
+    /// covers; 1 by default
+    #[arg(short = 'A', long, value_name = "N")]
+    pub after_context: Option<usize>,
+    /// Messages of the hit's thread before and after the hit that its `read`
+    /// recipe covers; -B and -A set one side
+    #[arg(short = 'C', long, value_name = "N")]
+    pub context: Option<usize>,
+}
+
+impl HitContextArgs {
+    /// The context each hit's recipe covers: `-B` and `-A` for their side,
+    /// else `-C`, else one message.
+    pub fn hit_context(&self) -> HitContext {
+        let default = HitContext::default();
+        HitContext {
+            before: self
+                .before_context
+                .or(self.context)
+                .unwrap_or(default.before),
+            after: self.after_context.or(self.context).unwrap_or(default.after),
+        }
+    }
 }
 
 #[derive(Debug, ClapArgs)]
@@ -263,6 +299,8 @@ pub struct AgentWithinArgs {
     pub search_mode: AgentSearchModeArgs,
     #[command(flatten)]
     pub time: MessageTimeArgs,
+    #[command(flatten)]
+    pub context: HitContextArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -801,6 +839,52 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_search_and_within_take_hit_context_as_grep_takes_context() {
+        let context_of = |flags: &[&str]| {
+            let parse = |command: &[&str]| {
+                let mut args = vec!["rearview", "agent"];
+                args.extend_from_slice(command);
+                args.extend_from_slice(flags);
+                agent_command(Args::try_parse_from(args).unwrap())
+            };
+            let search = match parse(&["search", "cache"]) {
+                AgentCommand::Search(search) => search.context.hit_context(),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            let within = match parse(&["within", "ch_abc123", "cache"]) {
+                AgentCommand::Within(within) => within.context.hit_context(),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(search, within, "{flags:?} means the same on both");
+            (search.before, search.after)
+        };
+
+        assert_eq!(context_of(&[]), (1, 1), "one message on each side");
+        assert_eq!(context_of(&["-B", "2", "-A", "3"]), (2, 3));
+        assert_eq!(
+            context_of(&["--before-context", "2", "--after-context", "3"]),
+            (2, 3)
+        );
+        assert_eq!(context_of(&["-C", "4"]), (4, 4));
+        assert_eq!(context_of(&["--context", "4"]), (4, 4));
+        assert_eq!(
+            context_of(&["-C", "4", "-A", "0"]),
+            (4, 0),
+            "-A sets its side whatever -C"
+        );
+        assert_eq!(
+            context_of(&["-B", "0", "-C", "2"]),
+            (0, 2),
+            "-B sets its side whatever the order"
+        );
+        assert_eq!(
+            context_of(&["--before", "2026-07-20", "-A", "2"]),
+            (1, 2),
+            "--before stays the time window"
+        );
     }
 
     #[test]
