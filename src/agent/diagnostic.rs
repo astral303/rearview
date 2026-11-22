@@ -53,6 +53,16 @@ impl AgentError {
         Self::new(AgentErrorKind::OutOfRange, reference, detail)
     }
 
+    /// `sub-agent s9 was not found in the conversation`, for a handle the
+    /// conversation doesn't give.
+    pub fn unknown_subagent(handle: usize) -> Self {
+        Self::new(
+            AgentErrorKind::NotFound,
+            Some(&format!("s{handle}")),
+            format!("sub-agent s{handle} was not found in the conversation"),
+        )
+    }
+
     pub fn io(reference: Option<&str>, detail: impl Into<String>) -> Self {
         Self::new(AgentErrorKind::Io, reference, detail)
     }

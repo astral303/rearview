@@ -178,10 +178,14 @@ impl Subagents {
         self.get(handle).map(|subagent| &subagent.tag)
     }
 
+    /// The handle of the sub-agent message `ordinal` belongs to.
+    pub fn handle_of(&self, ordinal: usize) -> Option<Handle> {
+        self.by_message.get(&ordinal).copied()
+    }
+
     /// The sub-agent message `ordinal` belongs to.
     pub fn tag_of(&self, ordinal: usize) -> Option<SubagentTag> {
-        let handle = *self.by_message.get(&ordinal)?;
-        self.tag(handle).cloned()
+        self.tag(self.handle_of(ordinal)?).cloned()
     }
 
     /// The sub-agent the call at `address` launches: `launches=`.
@@ -380,45 +384,54 @@ impl<'a> SubagentHandles<'a> {
                 .as_deref()
                 .and_then(|id| calls.get(id).copied());
         }
-        let starts = threads.iter().map(ThreadStart::of).collect::<Vec<_>>();
-        let linked = threads
+        let thread_launches = threads
             .iter()
-            .filter_map(|thread| Some(thread.launch?.address))
-            .collect::<HashSet<_>>();
-        let mut launches = calls
-            .values()
-            .filter(|call| call.tool == Tool::Agent)
-            .copied()
-            .collect::<Vec<_>>();
-        launches.sort_by_key(|call| call.address);
-        let threadless = threadless_launches(launches, &linked);
-        let owners = (0..threads.len())
-            .map(HandleOwner::Thread)
-            .chain(threadless.into_iter().map(HandleOwner::Launch))
-            .collect::<Vec<_>>();
-        let orders = owners
-            .iter()
-            .map(|owner| match *owner {
-                HandleOwner::Thread(index) => LaunchOrder {
-                    start: starts[index],
-                    first_message: Some(threads[index].messages[0]),
-                },
-                HandleOwner::Launch(call) => LaunchOrder {
-                    start: ThreadStart::of_call(call.address),
-                    first_message: None,
-                },
+            .map(|thread| ThreadLaunch {
+                first_message: thread.messages[0],
+                launch: thread.launch.map(|call| call.address),
             })
             .collect::<Vec<_>>();
-        let handles = handles_in_launch_order(&orders);
-        let thread_handles = handles[..threads.len()].to_vec();
-        let mut by_handle = owners.into_iter().zip(handles).collect::<Vec<_>>();
-        by_handle.sort_by_key(|&(_, handle)| handle);
+        let starts = thread_launches
+            .iter()
+            .map(|&thread| ThreadStart::of(thread))
+            .collect::<Vec<_>>();
+        let launches = calls
+            .values()
+            .filter(|call| call.tool == Tool::Agent)
+            .map(|call| (call.address, *call))
+            .collect::<HashMap<_, _>>();
+        let launch_order = handles_at_launch(&thread_launches, launches.keys().copied().collect());
+        let mut owners = (0..threads.len())
+            .map(HandleOwner::Thread)
+            .zip(launch_order.threads.iter().copied())
+            .chain(
+                launch_order
+                    .threadless
+                    .iter()
+                    .map(|&(address, handle)| (HandleOwner::Launch(launches[&address]), handle)),
+            )
+            .collect::<Vec<_>>();
+        owners.sort_by_key(|&(_, handle)| handle);
         Self {
             threads,
             starts,
-            thread_handles,
-            owners: by_handle.into_iter().map(|(owner, _)| owner).collect(),
+            thread_handles: launch_order.threads,
+            owners: owners.into_iter().map(|(owner, _)| owner).collect(),
         }
+    }
+
+    /// Each sub-agent that has written messages: its handle and the
+    /// ordinals of its messages, in order.
+    pub fn threads(&self) -> impl Iterator<Item = (Handle, &[usize])> {
+        self.thread_handles
+            .iter()
+            .zip(&self.threads)
+            .map(|(&handle, thread)| (handle, thread.messages.as_slice()))
+    }
+
+    /// The number of handles, those of sub-agents without messages included.
+    pub fn count(&self) -> usize {
+        self.owners.len()
     }
 }
 
@@ -441,11 +454,11 @@ struct ThreadStart {
 }
 
 impl ThreadStart {
-    fn of(thread: &Thread<'_>) -> Self {
+    fn of(thread: ThreadLaunch) -> Self {
         match thread.launch {
-            Some(call) => Self::of_call(call.address),
+            Some(call) => Self::of_call(call),
             None => Self {
-                ordinal: thread.messages[0],
+                ordinal: thread.first_message,
                 call: None,
             },
         }
@@ -497,21 +510,72 @@ fn threads_of(messages: &[AgentMessage]) -> Vec<Thread<'_>> {
     threads
 }
 
+/// A sub-agent thread as launch order counts it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ThreadLaunch {
+    pub first_message: usize,
+    /// The call that launched it, when the transcript links the two.
+    pub launch: Option<CallAddress>,
+}
+
+/// The handles [`handles_at_launch`] gives.
+#[derive(Debug)]
+pub(crate) struct LaunchOrderHandles {
+    /// The handle of each thread, in the threads' order.
+    pub threads: Vec<Handle>,
+    /// Each launching call that holds a handle without a thread, with it.
+    pub threadless: Vec<(CallAddress, Handle)>,
+}
+
+/// The handle of each of `threads`, and of each of `launches` that holds one
+/// without a thread, numbered from 1 in launch order. `launches` are the
+/// session's launching calls, each id's first call alone: a later call with
+/// the same id is a copy. Reads and search's cache lookup both count handles
+/// here, so a hit names the sub-agent a read of it names.
+pub(crate) fn handles_at_launch(
+    threads: &[ThreadLaunch],
+    mut launches: Vec<CallAddress>,
+) -> LaunchOrderHandles {
+    launches.sort_unstable();
+    let linked = threads
+        .iter()
+        .filter_map(|thread| thread.launch)
+        .collect::<HashSet<_>>();
+    let threadless = threadless_launches(launches, &linked);
+    let orders = threads
+        .iter()
+        .map(|&thread| LaunchOrder {
+            start: ThreadStart::of(thread),
+            first_message: Some(thread.first_message),
+        })
+        .chain(threadless.iter().map(|&call| LaunchOrder {
+            start: ThreadStart::of_call(call),
+            first_message: None,
+        }))
+        .collect::<Vec<_>>();
+    let mut handles = handles_in_launch_order(&orders);
+    let threadless_handles = handles.split_off(threads.len());
+    LaunchOrderHandles {
+        threads: handles,
+        threadless: threadless.into_iter().zip(threadless_handles).collect(),
+    }
+}
+
 /// The launching calls, of `launches` in session order, that hold a handle
 /// without a thread: from the session's first call `linked` to a thread
 /// onwards, each one not linked to a thread. A launching call before that
 /// call, or in a session without a link, doesn't hold a handle; its thread,
 /// once it writes, gets one by its first message.
-fn threadless_launches<'a>(
-    launches: Vec<IndexedCall<'a>>,
+fn threadless_launches(
+    launches: Vec<CallAddress>,
     linked: &HashSet<CallAddress>,
-) -> Vec<IndexedCall<'a>> {
+) -> Vec<CallAddress> {
     let Some(&first_linked) = linked.iter().min() else {
         return Vec::new();
     };
     launches
         .into_iter()
-        .filter(|call| call.address >= first_linked && !linked.contains(&call.address))
+        .filter(|call| *call >= first_linked && !linked.contains(call))
         .collect()
 }
 

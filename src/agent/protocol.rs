@@ -1,6 +1,6 @@
 use crate::agent::address::MessageAddresses;
 use crate::agent::call_links::{AnsweredCall, Call, CallAddress, CallLinks, numbered_calls};
-use crate::agent::diagnostic::{AgentError, AgentErrorKind};
+use crate::agent::diagnostic::AgentError;
 use crate::agent::diagnostic::{
     AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms, warning_chars,
 };
@@ -8,7 +8,7 @@ use crate::agent::hidden_parts::HiddenParts;
 use crate::agent::record_writer::{
     CallCopy, CallRecord, CallResultRecord, HiddenRecord, MessageRecord, MessageRuns,
     OmittedRecord, RecordSize, RecordWriter, continue_read_record, conversation_record,
-    handles_field, message_range_ref, message_record_start, read_record,
+    handles_field, message_record_start, read_record,
 };
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
@@ -110,8 +110,9 @@ pub struct ReadRequest<'a> {
     pub resolved: &'a ResolvedConversation,
     pub transcript: &'a AgentTranscript,
     pub range: Option<MessageRange>,
-    /// A sub-agent read alone: its launch, its messages and its reports, in
-    /// place of `range`.
+    /// A sub-agent read alone: its messages, and without `range` its launch
+    /// and its reports too. With `range` (`REF:s3:m2..m5`), its messages in
+    /// that range.
     pub subagent: Option<Handle>,
     /// The number of the call read alone, in the message `range` names,
     /// with the messages holding its result.
@@ -170,6 +171,24 @@ impl ReadRequest<'_> {
 pub struct ProtocolFocus {
     pub conversation_full_ref: Option<String>,
     pub range: MessageRange,
+    /// The sub-agent of a `--focus sN:mA..mB`: its messages alone are
+    /// focused. `None` for the session's own messages.
+    pub subagent: Option<Handle>,
+}
+
+impl ProtocolFocus {
+    /// True when `entry` is of the focused conversation and, for a
+    /// sub-agent's focus, holds that sub-agent's messages.
+    fn is_of_focused_thread(&self, entry: &ReadEntry<'_>) -> bool {
+        self.conversation_full_ref
+            .as_deref()
+            .is_none_or(|target| entry.conversation().resolved.reference.full_ref() == target)
+            && self.subagent.is_none_or(|handle| {
+                entry
+                    .subagent()
+                    .is_some_and(|subagent| subagent.handle == handle)
+            })
+    }
 }
 
 /// The messages a read keeps first when its budget cannot hold every message.
@@ -355,10 +374,9 @@ impl<'a> RenderedMessage<'a> {
                         copy,
                     );
                 }
-                BlockOwner::Result(result) => writer.write_call_result_record(
-                    &content.results[result].record(self.subagent.as_ref()),
-                    block_lines,
-                ),
+                BlockOwner::Result(result) => {
+                    writer.write_call_result_record(&content.results[result].record(), block_lines)
+                }
             }
         }
         if let Some(omission) = truncation.and_then(|truncation| truncation.omission.as_ref()) {
@@ -480,7 +498,6 @@ impl<'a> RenderedMessage<'a> {
     ) -> OmittedRecord<'r> {
         OmittedRecord {
             ordinal: self.message.ordinal,
-            subagent: self.subagent.as_ref(),
             reference,
             first_line: omission.first_line,
             last_line: omission.last_line,
@@ -823,10 +840,9 @@ struct ShownResult<'a> {
 }
 
 impl ShownResult<'_> {
-    fn record<'r>(&'r self, subagent: Option<&'r SubagentTag>) -> CallResultRecord<'r> {
+    fn record(&self) -> CallResultRecord<'_> {
         CallResultRecord {
             call: self.call,
-            subagent,
             time: self.time,
         }
     }
@@ -1107,7 +1123,6 @@ impl<'a> HiddenRun<'a> {
         writer.write_hidden_record(&HiddenRecord {
             first: self.first,
             last: self.last,
-            subagent: self.subagent.as_ref(),
             time: self.times,
             launches: &self.launches,
             targets: &self.targets,
@@ -1545,6 +1560,10 @@ struct OutlineMessages<'a> {
     subagent_runs: Vec<SubagentRun>,
     /// The sub-agent of each handle a visible message carries.
     subagents: HashMap<Handle, SubagentTag>,
+    /// In an outline of the session's own messages, the index of each visible
+    /// message that starts a group, then the count of visible messages; a
+    /// segment holds whole groups. `None` for a sub-agent's outline.
+    group_starts: Option<Vec<usize>>,
     /// The offset the header's `tz=` names: that of the outline's first time
     /// and of its first `day` record.
     header_offset: FixedOffset,
@@ -1617,9 +1636,23 @@ impl<'a> OutlineMessages<'a> {
             }
             subagents.insert(tag.handle, tag.clone());
         }
+        let group_starts = request.subagent.is_none().then(|| {
+            let mut starts = Vec::new();
+            let mut last_group = None;
+            for (position, rendered) in visible.iter().enumerate() {
+                let group = index.addresses.group_of(rendered.message.ordinal);
+                if last_group != Some(group) {
+                    starts.push(position);
+                    last_group = Some(group);
+                }
+            }
+            starts.push(visible.len());
+            starts
+        });
         Self {
             resolved,
             addresses: &index.addresses,
+            group_starts,
             requested: requested_runs,
             chars_before,
             times: RangeSpans::new(visible.iter().map(|message| message.times).collect()),
@@ -1688,16 +1721,39 @@ impl<'a> OutlineMessages<'a> {
     }
 
     /// One record per message in a short session; otherwise one per
-    /// `segment_size` messages.
+    /// `segment_size` messages. An outline of the session's own messages
+    /// ends each segment at a group's end: a segment holds whole groups, at
+    /// most `segment_size` messages, or one group longer than that.
     fn records(&self, segment_size: usize) -> Vec<OutlineRecord> {
         let count = self.len();
         if count <= OUTLINE_SHORT_MESSAGE_LIMIT {
             return (0..count).map(|index| self.message_record(index)).collect();
         }
-        (0..count)
-            .step_by(segment_size)
-            .map(|start| self.segment_record(start..count.min(start + segment_size)))
-            .collect()
+        let mut records = Vec::new();
+        let mut start = 0;
+        while start < count {
+            let end = self.segment_end(start, segment_size);
+            records.push(self.segment_record(start..end));
+            start = end;
+        }
+        records
+    }
+
+    /// The index after the last visible message of the segment from `start`:
+    /// `segment_size` messages on, moved back to the last group's end before
+    /// it, or on to the end of the group holding `start` when that group
+    /// alone is longer.
+    fn segment_end(&self, start: usize, segment_size: usize) -> usize {
+        let limit = self.len().min(start + segment_size);
+        let Some(starts) = &self.group_starts else {
+            return limit;
+        };
+        let before_limit = starts[starts.partition_point(|&group| group <= limit) - 1];
+        if before_limit > start {
+            before_limit
+        } else {
+            starts[starts.partition_point(|&group| group <= start)]
+        }
     }
 
     /// `m12 user 14:30:12 chars=340 | snippet`. An outline does not print
@@ -1737,11 +1793,15 @@ impl<'a> OutlineMessages<'a> {
     fn segment_record(&self, covers: Range<usize>) -> OutlineRecord {
         let (first, last) = (covers.start, covers.end - 1);
         let subagents = self.subagents_in(covers.clone());
+        let (first_ordinal, last_ordinal) = (self.ordinal(first), self.ordinal(last));
+        let address = if self.group_starts.is_some() {
+            self.addresses.groups(first_ordinal, last_ordinal)
+        } else {
+            self.addresses.closed_range(first_ordinal, last_ordinal)
+        };
         OutlineRecord {
             line: format!(
-                "seg {}{} chars={}{} | {} / {}\n",
-                self.addresses
-                    .closed_range(self.ordinal(first), self.ordinal(last)),
+                "seg {address}{} chars={}{} | {} / {}\n",
                 handles_field(&subagents),
                 self.chars(covers.clone()),
                 time_atoms(self.times.of(covers.clone()), self.header_offset, self.zone),
@@ -1824,18 +1884,23 @@ pub(crate) fn title_for_conversation(conversation: &crate::history::Conversation
         .to_string()
 }
 
-/// The messages `request` names: a sub-agent's alone, a call's and its
-/// results', its range, or the whole transcript.
+/// The messages `request` names: a call's and its results', a sub-agent's
+/// launch, messages and reports, a sub-agent's messages in its range, its
+/// range, or the whole transcript.
 fn requested_messages<'a>(
     request: &ReadRequest<'a>,
     index: &TranscriptIndex<'_>,
 ) -> Result<Vec<&'a AgentMessage>> {
     match (request.subagent, request.call, request.range) {
-        (Some(handle), _, _) => subagent_messages(request.transcript, &index.subagents, handle),
-        (None, Some(number), Some(range)) => {
+        (_, Some(number), Some(range)) => {
             call_messages(request.transcript, index, range.start, number)
         }
-        _ => selected_messages(request.transcript, &index.addresses, request.range),
+        (Some(handle), _, None) => subagent_messages(request.transcript, &index.subagents, handle),
+        (Some(handle), _, Some(range)) => Ok(selected_messages(request.transcript, Some(range))
+            .into_iter()
+            .filter(|message| index.subagents.handle_of(message.ordinal) == Some(handle))
+            .collect()),
+        (None, _, range) => Ok(selected_messages(request.transcript, range)),
     }
 }
 
@@ -1848,7 +1913,7 @@ fn call_messages<'a>(
     number: usize,
 ) -> Result<Vec<&'a AgentMessage>> {
     let addresses = &index.addresses;
-    let message = selected_messages(transcript, addresses, Some(MessageRange::single(ordinal)))?
+    let message = selected_messages(transcript, Some(MessageRange::single(ordinal)))
         .into_iter()
         .next()
         .ok_or_else(|| {
@@ -1882,20 +1947,20 @@ fn call_messages<'a>(
         .collect())
 }
 
-fn selected_messages<'a>(
-    transcript: &'a AgentTranscript,
-    addresses: &MessageAddresses,
+/// The messages of `transcript` in `range`, a resolved ref's, or every
+/// message.
+fn selected_messages(
+    transcript: &AgentTranscript,
     range: Option<MessageRange>,
-) -> Result<Vec<&'a AgentMessage>> {
+) -> Vec<&AgentMessage> {
     let Some(range) = range else {
-        return Ok(transcript.messages.iter().collect());
+        return transcript.messages.iter().collect();
     };
-    let range = addresses.messages_in(range)?;
-    Ok(transcript
+    transcript
         .messages
         .iter()
         .filter(|message| range.start <= message.ordinal && message.ordinal <= range.end)
-        .collect())
+        .collect()
 }
 
 /// The messages a read of sub-agent `handle` alone shows: its launch, its
@@ -1906,13 +1971,9 @@ fn subagent_messages<'a>(
     subagents: &Subagents,
     handle: Handle,
 ) -> Result<Vec<&'a AgentMessage>> {
-    let ordinals = subagents.messages_read_with(handle).ok_or_else(|| {
-        AgentError::new(
-            AgentErrorKind::NotFound,
-            Some(&format!("s{handle}")),
-            format!("sub-agent s{handle} was not found in the conversation"),
-        )
-    })?;
+    let ordinals = subagents
+        .messages_read_with(handle)
+        .ok_or_else(|| AgentError::unknown_subagent(handle))?;
     Ok(transcript
         .messages
         .iter()
@@ -1920,8 +1981,9 @@ fn subagent_messages<'a>(
         .collect())
 }
 
-/// `selected` from its `count`th-last shown message onwards; all of
-/// `selected` when fewer than `count` messages show.
+/// `selected` from its `count`th-last shown message of the counted thread
+/// onwards; all of `selected` when fewer than `count` of them show. A read
+/// of a sub-agent counts its messages, any other read the session's own.
 fn tail_messages<'a>(
     request: &ReadRequest<'a>,
     mut selected: Vec<&'a AgentMessage>,
@@ -1933,6 +1995,7 @@ fn tail_messages<'a>(
         .iter()
         .enumerate()
         .rev()
+        .filter(|(_, message)| index.subagents.handle_of(message.ordinal) == request.subagent)
         .filter(|(_, message)| {
             shown_message(
                 request.resolved,
@@ -1989,7 +2052,7 @@ impl<'a> TranscriptIndex<'a> {
     fn of(transcript: &'a AgentTranscript) -> Self {
         let links = CallLinks::of(transcript);
         let handles = SubagentHandles::of(transcript);
-        let addresses = MessageAddresses::of(transcript);
+        let addresses = MessageAddresses::of(transcript, &handles);
         Self {
             subagents: Subagents::of(transcript, &links, &handles, &addresses),
             links,
@@ -2734,47 +2797,41 @@ impl HiddenEntriesRecipe<'_, '_> {
     }
 }
 
+/// The `omit=` atom: the refs reading exactly the messages of the entries
+/// not in `selected`, each run of consecutive omitted entries of one
+/// conversation named on its own, each ref after its conversation's when the
+/// read shows several.
 fn omitted_message_ranges(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> String {
     let qualify = spans
         .first()
         .is_some_and(|first| spans.iter().any(|span| span.full_ref != first.full_ref));
-    let mut ranges = Vec::new();
-    let mut start = None;
-    for index in 0..=spans.len() {
-        let omitted = index < spans.len() && !selected.contains(&index);
-        match (start, omitted) {
-            (None, true) => start = Some(index),
-            (Some(first), false) => {
-                let (first_span, last_span) = (&spans[first], &spans[index - 1]);
-                if first_span.full_ref == last_span.full_ref {
-                    let prefix = if qualify {
-                        format!("{}:", first_span.canonical)
-                    } else {
-                        String::new()
-                    };
-                    ranges.push(format!(
-                        "{prefix}{}",
-                        first_span.addresses.range(first_span.first, last_span.last)
-                    ));
-                } else {
-                    for span in &spans[first..index] {
-                        ranges.push(message_range_ref(
-                            &span.canonical,
-                            span.addresses,
-                            span.first,
-                            span.last,
-                        ));
-                    }
-                }
-                start = None;
-            }
-            _ => {}
+    let omitted = (0..spans.len())
+        .filter(|index| !selected.contains(index))
+        .collect::<Vec<_>>();
+    let mut refs = Vec::new();
+    for run in omitted.chunk_by(|&first, &next| {
+        next == first + 1 && spans[first].full_ref == spans[next].full_ref
+    }) {
+        let first = &spans[run[0]];
+        let mut runs = MessageRuns::default();
+        for &index in run {
+            runs.push(spans[index].first, spans[index].last);
         }
+        let prefix = if qualify {
+            format!("{}:", first.canonical)
+        } else {
+            String::new()
+        };
+        refs.extend(
+            runs.named(first.addresses)
+                .into_iter()
+                .map(|messages| format!("{prefix}{messages}")),
+        );
     }
-    if ranges.is_empty() {
+    if refs.is_empty() {
         "none".to_string()
     } else {
-        ranges.join(",")
+        refs.join(",")
     }
 }
 
@@ -2787,11 +2844,7 @@ fn focused_indices(entries: &[ReadEntry<'_>], focus: Option<&ProtocolFocus>) -> 
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| {
-            let conversation_matches = focus
-                .conversation_full_ref
-                .as_deref()
-                .is_none_or(|target| entry.conversation().resolved.reference.full_ref() == target);
-            (conversation_matches
+            (focus.is_of_focused_thread(entry)
                 && focus.range.start <= entry.last_ordinal()
                 && entry.first_ordinal() <= focus.range.end)
                 .then_some(index)
@@ -3386,11 +3439,12 @@ fn snippet(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::diagnostic::AgentErrorKind;
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{
         assert_each_budget_cuts_short_or_ends_with_warnings, cuts_checking_full, day_record,
-        local_time, record_time, source, text_message, text_message_at, warnings_of_two_kinds,
-        written_at,
+        local_time, record_time, source, subagent_text_message, text_message, text_message_at,
+        warnings_of_two_kinds, written_at,
     };
     use crate::agent::transcript::AgentPartSource;
     use crate::log_entry::Tool;
@@ -3490,11 +3544,7 @@ mod tests {
         let mut selected = BTreeSet::new();
         if let Some(focus) = focus {
             for (index, entry) in messages.iter().enumerate() {
-                let conversation_matches =
-                    focus.conversation_full_ref.as_deref().is_none_or(|target| {
-                        entry.conversation().resolved.reference.full_ref() == target
-                    });
-                if conversation_matches
+                if focus.is_of_focused_thread(entry)
                     && focus.range.start <= entry.first_ordinal()
                     && entry.first_ordinal() <= focus.range.end
                 {
@@ -3553,6 +3603,7 @@ mod tests {
 
         for budget in (100..=4_000).step_by(37) {
             let focus = ProtocolFocus {
+                subagent: None,
                 conversation_full_ref: Some(resolved.reference.full_ref()),
                 range: MessageRange::single(20),
             };
@@ -3643,6 +3694,7 @@ mod tests {
 
         for budget in (100..=3_000).step_by(31) {
             let focus = ProtocolFocus {
+                subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(20),
             };
@@ -3784,6 +3836,7 @@ mod tests {
                 call: None,
             }],
             Some(ProtocolFocus {
+                subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(4),
             }),
@@ -4119,6 +4172,7 @@ mod tests {
                 call: None,
             }],
             Some(ProtocolFocus {
+                subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(2),
             }),
@@ -4164,6 +4218,7 @@ mod tests {
                 call: None,
             }],
             Some(ProtocolFocus {
+                subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange { start: 2, end: 3 },
             }),
@@ -4250,6 +4305,7 @@ mod tests {
                     whole_session_request(&second, &second_transcript),
                 ],
                 Some(ProtocolFocus {
+                    subagent: None,
                     conversation_full_ref: Some(second.reference.full_ref()),
                     range: MessageRange::single(2),
                 }),
@@ -4421,7 +4477,11 @@ mod tests {
             .filter(|record| !is_omitted_record(record))
             .filter_map(|record| record.split_whitespace().next())
             .filter(|address| {
-                address
+                let message = match address.split_once(':') {
+                    Some((handle, message)) if handle.starts_with('s') => message,
+                    _ => address,
+                };
+                message
                     .strip_prefix('m')
                     .is_some_and(|rest| rest.starts_with(|first: char| first.is_ascii_digit()))
             })
@@ -4973,6 +5033,7 @@ mod tests {
                 call: None,
             }],
             Some(ProtocolFocus {
+                subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(1),
             }),
@@ -5078,6 +5139,7 @@ mod tests {
                     call: None,
                 }],
                 Some(ProtocolFocus {
+                    subagent: None,
                     conversation_full_ref: None,
                     range: MessageRange::single(3),
                 }),
@@ -5572,6 +5634,7 @@ mod tests {
 
     fn focus_on(message: usize) -> Option<ProtocolFocus> {
         Some(ProtocolFocus {
+            subagent: None,
             conversation_full_ref: None,
             range: MessageRange::single(message),
         })
@@ -5601,9 +5664,8 @@ mod tests {
     }
 
     /// The read of the scout keeps the focus, its launch m2, and omits its
-    /// text m3, its call and result m4..m5, and its report m7; m6 is not
-    /// the scout's. Longer texts make omitting them shorter than showing
-    /// them.
+    /// text, its call and result, and its report m4; m3 is not the scout's.
+    /// Longer texts make omitting them shorter than showing them.
     #[test]
     fn sub_agent_reads_continue_read_names_its_omitted_messages_alone_with_subagents() {
         let mut transcript = session_with_a_scout();
@@ -5630,7 +5692,7 @@ mod tests {
         );
         assert!(
             output.ends_with(&format!(
-                "\ncontinue read refs={reference}:m3..m5;{reference}:m7 tools=true tool-results=true thinking=false subagents=true\n"
+                "\ncontinue read refs={reference}:s1:m1..m3;{reference}:m4 tools=true tool-results=true thinking=false subagents=true\n"
             )),
             "{output}"
         );
@@ -6268,10 +6330,11 @@ mod tests {
         ])
     }
 
-    const SCOUT_LEGEND: &str = "subagent s1 type=Explore launch=m2 span=m3..m5 report=m7 : scout";
+    const SCOUT_LEGEND: &str =
+        "subagent s1 type=Explore launch=m2 span=s1:m1..m3 report=m4 : scout";
 
     #[test]
-    fn read_names_each_sub_agent_in_legend_and_in_position_2_of_its_records() {
+    fn read_names_each_subagent_in_legend_and_in_its_records_addresses() {
         let output = read(&session_with_a_scout(), None, every_flag());
 
         assert_eq!(
@@ -6280,12 +6343,12 @@ mod tests {
                 SCOUT_LEGEND,
                 "m1 user",
                 "m2.1 launches=s1",
-                "m3 s1",
-                "m4.1 s1 result=m5",
-                "m5 s1 call=m4.1",
-                "m6.1 target=s1",
-                "m7 report from=s1",
-                "m8",
+                "s1:m1",
+                "s1:m2.1 result=s1:m3",
+                "s1:m3 call=s1:m2.1",
+                "m3.1 target=s1",
+                "m4 report from=s1",
+                "m5",
             ],
             "{output}"
         );
@@ -6300,7 +6363,7 @@ mod tests {
         );
 
         assert!(output.contains(&format!("\n{SCOUT_LEGEND}\n")), "{output}");
-        assert!(output.contains("\nm4.1 s1 result=m5\n"), "{output}");
+        assert!(output.contains("\ns1:m2.1 result=s1:m3\n"), "{output}");
     }
 
     fn read_subagent(transcript: &AgentTranscript, handle: Handle) -> Result<String> {
@@ -6327,10 +6390,10 @@ mod tests {
             [
                 SCOUT_LEGEND,
                 "m2.1 launches=s1",
-                "m3 s1",
-                "m4.1 s1 result=m5",
-                "m5 s1 call=m4.1",
-                "m7 report from=s1",
+                "s1:m1",
+                "s1:m2.1 result=s1:m3",
+                "s1:m3 call=s1:m2.1",
+                "m4 report from=s1",
             ],
             "{output}"
         );
@@ -6354,7 +6417,7 @@ mod tests {
 
         assert!(output.contains(" policy=text+subagents "), "{output}");
         assert!(
-            output.contains("\nm3 s1\n| Reading the tree.\n"),
+            output.contains("\ns1:m1\n| Reading the tree.\n"),
             "{output}"
         );
     }
@@ -6375,7 +6438,7 @@ mod tests {
         );
     }
 
-    /// Without `--tools`, m2's launching call and m6's message are hidden.
+    /// Without `--tools`, m2's launching call and m3's message are hidden.
     #[test]
     fn hidden_run_names_sub_agents_its_calls_launch_and_send_to() {
         let output = read(&session_with_a_scout(), None, options());
@@ -6385,13 +6448,14 @@ mod tests {
             "{output}"
         );
         assert!(
-            output.contains("\nm6 hidden target=s1 tools=1\n"),
+            output.contains("\nm3 hidden target=s1 tools=1\n"),
             "{output}"
         );
     }
 
-    /// Without `--tools` and `--subagents`, m2 to m6 are hidden: the
-    /// session's m2, the scout's m3 to m5, and the session's m6.
+    /// Without `--tools` and `--subagents`, m2 to m3 and the scout's
+    /// messages between them are hidden: the session's m2, the scout's m1 to
+    /// m3, and the session's m3.
     #[test]
     fn hidden_run_ends_where_owner_of_its_messages_changes() {
         let output = read(&session_with_a_scout(), None, options());
@@ -6402,16 +6466,16 @@ mod tests {
                 SCOUT_LEGEND,
                 "m1 user",
                 "m2 hidden launches=s1 tools=1",
-                "m3..m5 s1 hidden subagents=3",
-                "m6 hidden target=s1 tools=1",
-                "m7 report from=s1",
-                "m8",
+                "s1:m1..m3 hidden subagents=3",
+                "m3 hidden target=s1 tools=1",
+                "m4 report from=s1",
+                "m5",
             ],
             "{output}"
         );
     }
 
-    /// m3 to m5 are the sub-agent's text, call and result.
+    /// Ordinals 3 to 5 are the sub-agent's text, call and result.
     #[test]
     fn read_whose_messages_are_all_hidden_ends_with_read_that_shows_them() {
         let output = read(
@@ -6422,7 +6486,7 @@ mod tests {
 
         assert!(
             output.ends_with(&format!(
-                "\nm3..m5 s1 hidden subagents=3\nread ref={}:m3..m5 tools=true tool-results=true thinking=false subagents=true\n",
+                "\ns1:m1..m3 hidden subagents=3\nread ref={}:s1:m1..m3 tools=true tool-results=true thinking=false subagents=true\n",
                 resolved("session.jsonl").reference.canonical()
             )),
             "{output}"
@@ -6451,11 +6515,11 @@ mod tests {
         let output = read(&transcript, None, every_flag());
 
         assert!(
-            output.contains("\nsubagent s2 type=Plan launch=m4 span=m9 in=s1 : checker\n"),
+            output.contains("\nsubagent s2 type=Plan launch=s1:m2 span=s2:m1 in=s1 : checker\n"),
             "{output}"
         );
-        assert!(output.contains("\nm4.2 s1 launches=s2\n"), "{output}");
-        assert!(output.contains("\nm9 s2\n"), "{output}");
+        assert!(output.contains("\ns1:m2.2 launches=s2\n"), "{output}");
+        assert!(output.contains("\ns2:m1\n"), "{output}");
     }
 
     /// m2 launches `scout`, in the background when `in_background`; m3 is
@@ -6504,11 +6568,11 @@ mod tests {
         assert_eq!(
             records_after_conversation(&output),
             [
-                "subagent s1 type=Explore launch=m2 span=m3 report=m4 : scout",
+                "subagent s1 type=Explore launch=m2 span=s1:m1 report=m3 : scout",
                 "m1 user",
-                "m2.1 launches=s1 result=m4",
-                "m3 s1",
-                "m4 from=s1 call=m2.1",
+                "m2.1 launches=s1 result=m3",
+                "s1:m1",
+                "m3 from=s1 call=m2.1",
             ],
             "{output}"
         );
@@ -6523,13 +6587,14 @@ mod tests {
         );
 
         assert!(
-            output.contains("\nsubagent s1 type=Explore launch=m2 span=m3 : scout\n"),
+            output.contains("\nsubagent s1 type=Explore launch=m2 span=s1:m1 : scout\n"),
             "{output}"
         );
-        assert!(output.contains("\nm4 call=m2.1\n"), "{output}");
+        assert!(output.contains("\nm3 call=m2.1\n"), "{output}");
     }
 
-    /// m9 notes that the scout finished, after its report in m7.
+    /// The session's m6 notes that the scout finished, after its report in
+    /// m4.
     #[test]
     fn finish_notice_names_its_sub_agent_and_stays_out_of_legends_reports() {
         use crate::history::task_notification::ReportSender;
@@ -6545,7 +6610,7 @@ mod tests {
         let output = read(&transcript, None, every_flag());
 
         assert!(output.contains(&format!("\n{SCOUT_LEGEND}\n")), "{output}");
-        assert!(output.contains("\nm9 report from=s1\n"), "{output}");
+        assert!(output.contains("\nm6 report from=s1\n"), "{output}");
     }
 
     fn spawn_call(id: &str) -> AgentMessagePart {
@@ -6632,8 +6697,8 @@ mod tests {
         assert_eq!(
             records[..2],
             [
-                "subagent s1 type=Explore launch=m2 span=m4 : alpha",
-                "subagent s2 type=Explore launch=m2 span=m3 : beta",
+                "subagent s1 type=Explore launch=m2 span=s1:m1 : alpha",
+                "subagent s2 type=Explore launch=m2 span=s2:m1 : beta",
             ],
             "{output}"
         );
@@ -6642,9 +6707,9 @@ mod tests {
     }
 
     /// m2.1 launches `alpha` and m2.2 `ghost`, whose call fails in m3
-    /// without a message of its own; m4.1 launches `beta`, which writes m5
-    /// before alpha writes m6. `launch` makes the call with an id, and
-    /// `written` a message of the sub-agent that call launched.
+    /// without a message of its own; m4.1 launches `beta`, which writes its
+    /// message before alpha writes its own. `launch` makes the call with an
+    /// id, and `written` a message of the sub-agent that call launched.
     fn session_with_a_launch_without_messages(
         launch: impl Fn(&str) -> AgentMessagePart,
         written: impl Fn(usize, &str) -> AgentMessage,
@@ -6699,13 +6764,13 @@ mod tests {
         for (transcript, alpha, beta) in [
             (
                 claude_session_with_a_launch_without_messages(),
-                "subagent s1 type=Explore launch=m2 span=m6 : alpha",
-                "subagent s3 type=Explore launch=m4 span=m5 : beta",
+                "subagent s1 type=Explore launch=m2 span=s1:m1 : alpha",
+                "subagent s3 type=Explore launch=m4 span=s3:m1 : beta",
             ),
             (
                 codex_session_with_a_launch_without_messages(),
-                "subagent s1 launch=m2 span=m6 : scout",
-                "subagent s3 launch=m4 span=m5 : scout",
+                "subagent s1 launch=m2 span=s1:m1 : scout",
+                "subagent s3 launch=m4 span=s3:m1 : scout",
             ),
         ] {
             let output = read(&transcript, None, every_flag());
@@ -6716,8 +6781,8 @@ mod tests {
                 "m2.1 launches=s1",
                 "m2.2 launches=s2 result=m3",
                 "m4.1 launches=s3",
-                "m5 s3",
-                "m6 s1",
+                "s3:m1",
+                "s1:m1",
             ] {
                 assert!(
                     records.contains(&record),
@@ -6779,15 +6844,15 @@ mod tests {
 
         let records = records_after_conversation(&output);
         assert_eq!(
-            records[0], "subagent s1 type=Explore launch=m3 span=m4 : alpha",
+            records[0], "subagent s1 type=Explore launch=m3 span=s1:m1 : alpha",
             "{output}"
         );
         assert!(records.contains(&"m2.1"), "{output}");
         assert!(records.contains(&"m3.1 launches=s1"), "{output}");
     }
 
-    /// m2.1 launches the fork `forked`; its transcript opens in m3 with a
-    /// copy of m2, whose call carries m2.1's id.
+    /// m2.1 launches the fork `forked`; its transcript opens with a copy of
+    /// m2, whose call carries m2.1's id.
     #[test]
     fn fork_links_to_first_call_with_its_id_and_copy_launches_nothing() {
         use AgentMessageRole::{Assistant, User};
@@ -6809,13 +6874,13 @@ mod tests {
         assert_eq!(
             records[..2],
             [
-                "subagent s1 type=fork launch=m2 span=m3 : forked",
+                "subagent s1 type=fork launch=m2 span=s1:m1 : forked",
                 "m1 user",
             ],
             "{output}"
         );
         assert!(records.contains(&"m2.1 launches=s1"), "{output}");
-        assert!(records.contains(&"m3.1 s1"), "{output}");
+        assert!(records.contains(&"s1:m1.1"), "{output}");
     }
 
     /// m2 launches the scout, m3 sends to it, and m4 is the scout's first
@@ -6881,7 +6946,7 @@ mod tests {
 
         let output = read(&transcript, None, every_flag());
 
-        assert!(output.contains("\nm4.1 target=s1\n"), "{output}");
+        assert!(output.contains("\nm3.1 target=s1\n"), "{output}");
     }
 
     /// m2 and m5 spawn `/root/scout`: the first thread writes m3 and
@@ -6906,18 +6971,74 @@ mod tests {
         assert_eq!(
             records[..2],
             [
-                "subagent s1 launch=m2 span=m3 report=m4 : scout",
-                "subagent s2 launch=m5 span=m6 report=m7 : scout",
+                "subagent s1 launch=m2 span=s1:m1 report=m3 : scout",
+                "subagent s2 launch=m4 span=s2:m1 report=m5 : scout",
             ],
             "{output}"
         );
         assert!(
             records
                 .iter()
-                .any(|record| record.starts_with("m7 report from=s2")),
+                .any(|record| record.starts_with("m5 report from=s2")),
             "{output}"
         );
-        assert_eq!(addresses(&second), ["m5.1", "m6", "m7"], "{second}");
+        assert_eq!(addresses(&second), ["m4.1", "s2:m1", "m5"], "{second}");
+    }
+
+    /// The ordinals `reference`, such as `m1..m1`, names in `transcript`.
+    fn ordinals_of_ref(transcript: &AgentTranscript, reference: &str) -> MessageRange {
+        crate::agent::address::MessageAddresses::of_transcript(transcript)
+            .resolve(crate::agent::refs::parse_messages(reference).unwrap())
+            .unwrap()
+            .range
+    }
+
+    /// alpha writes between the session's own m1 and m2, and once more in
+    /// `grown`.
+    #[test]
+    fn own_numbers_stay_with_subagents_shown_or_grown() {
+        use AgentMessageRole::User;
+        let before = transcript(vec![
+            text_message(1, User, "first"),
+            subagent_text_message(2, "alpha", "alpha one"),
+            text_message(3, User, "second"),
+        ]);
+        let grown = transcript(vec![
+            text_message(1, User, "first"),
+            subagent_text_message(2, "alpha", "alpha one"),
+            subagent_text_message(3, "alpha", "alpha two"),
+            text_message(4, User, "second"),
+        ]);
+
+        for transcript in [&before, &grown] {
+            for flags in [options(), every_flag()] {
+                let output = read(transcript, None, flags);
+                let own = addresses(&output)
+                    .into_iter()
+                    .filter(|address| !address.contains(':'))
+                    .collect::<Vec<_>>();
+                assert_eq!(own, ["m1", "m2"], "{output}");
+            }
+        }
+    }
+
+    /// alpha writes before the session's first message.
+    #[test]
+    fn first_own_range_reads_subagent_messages_before_it() {
+        use AgentMessageRole::User;
+        let transcript = transcript(vec![
+            subagent_text_message(1, "alpha", "early"),
+            text_message(2, User, "first"),
+            text_message(3, User, "second"),
+        ]);
+
+        let output = read(
+            &transcript,
+            Some(ordinals_of_ref(&transcript, "m1..m1")),
+            every_flag(),
+        );
+
+        assert_eq!(addresses(&output), ["s1:m1", "m1"], "{output}");
     }
 
     /// The user's shell command, `true` at 15:41:20, and its output at
@@ -7713,7 +7834,7 @@ mod tests {
     }
 
     /// m2 launches `alpha` and `beta`; each hands back the same final
-    /// answer, alpha's in m3 and beta's in m4.
+    /// answer in its first message.
     #[test]
     fn sub_agents_body_doesnt_repeat_another_sub_agents_copy() {
         use AgentMessageRole::{Assistant, User};
@@ -7746,7 +7867,7 @@ mod tests {
         let output = read(&transcript, None, every_flag());
 
         assert!(
-            output.ends_with("\nm4 s2\n| The notes list the release steps.\n"),
+            output.ends_with("\ns2:m1\n| The notes list the release steps.\n"),
             "{output}"
         );
     }
@@ -8149,6 +8270,7 @@ mod tests {
         }
         cuts.extend(cuts_at_sampled_budgets(12, |budget| {
             let focus = ProtocolFocus {
+                subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(6),
             };
@@ -8656,7 +8778,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_names_each_sub_agent_in_legend_and_in_position_2_of_its_records() {
+    fn outline_names_each_subagent_in_legend_and_in_its_records_addresses() {
         let output = format_outline(
             &resolved("session.jsonl"),
             &session_with_a_scout(),
@@ -8667,13 +8789,13 @@ mod tests {
         assert!(records[1].starts_with("conversation "), "{output}");
         assert_eq!(records[2], SCOUT_LEGEND, "{output}");
         assert!(
-            records.contains(&"m3 s1 chars=17 | Reading the tree."),
+            records.contains(&"s1:m1 chars=17 | Reading the tree."),
             "{output}"
         );
         assert!(
             records
                 .iter()
-                .any(|record| record.starts_with("m7 report from=s1 chars=")),
+                .any(|record| record.starts_with("m4 report from=s1 chars=")),
             "{output}"
         );
         assert!(
@@ -8682,8 +8804,8 @@ mod tests {
         );
     }
 
-    /// m2 launches `alpha` and `beta`. m3 to m12 alternate between alpha's
-    /// messages and beta's; m13 to m30 are the session's.
+    /// m2 launches `alpha` and `beta`. The ten messages after it alternate
+    /// between alpha's and beta's; the session's m3 to m20 follow.
     #[test]
     fn outline_segment_names_sub_agents_whose_messages_it_covers() {
         use AgentMessageRole::{Assistant, User};
@@ -8725,23 +8847,23 @@ mod tests {
 
         let records = records(&output);
         assert!(
-            records[2].starts_with("subagent s1 type=Explore launch=m2 span=m3..m11 "),
+            records[2].starts_with("subagent s1 type=Explore launch=m2 span=s1:m1..m5 "),
             "{output}"
         );
         assert!(
-            records[3].starts_with("subagent s2 type=Explore launch=m2 span=m4..m12 "),
-            "{output}"
-        );
-        assert!(
-            records
-                .iter()
-                .any(|record| record.starts_with("seg m1..m10 s1,s2 chars=")),
+            records[3].starts_with("subagent s2 type=Explore launch=m2 span=s2:m1..m5 "),
             "{output}"
         );
         assert!(
             records
                 .iter()
-                .any(|record| record.starts_with("seg m21..m30 chars=")),
+                .any(|record| record.starts_with("seg m2..m2 s1,s2 chars=")),
+            "m2's group of 11 messages is a segment of its own: {output}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.starts_with("seg m13..m20 chars=")),
             "{output}"
         );
     }
@@ -8749,8 +8871,13 @@ mod tests {
     fn outline_addresses(output: &str) -> Vec<&str> {
         output
             .lines()
-            .filter(|line| line.starts_with('m'))
             .filter_map(|line| line.split_whitespace().next())
+            .filter(|first| {
+                crate::agent::test_support::split_handle(first)
+                    .1
+                    .strip_prefix('m')
+                    .is_some_and(|number| number.starts_with(|digit: char| digit.is_ascii_digit()))
+            })
             .collect()
     }
 
@@ -8768,7 +8895,7 @@ mod tests {
 
         assert_eq!(
             outline_addresses(&output),
-            ["m4", "m5", "m6", "m7"],
+            ["s1:m2", "s1:m3", "m3", "m4"],
             "{output}"
         );
     }
@@ -8786,12 +8913,12 @@ mod tests {
 
         assert!(output.contains(" policy=text+subagents "), "{output}");
         assert!(output.contains(&format!("\n{SCOUT_LEGEND}\n")), "{output}");
-        assert_eq!(outline_addresses(&output), ["m3", "m7"], "{output}");
+        assert_eq!(outline_addresses(&output), ["s1:m1", "m4"], "{output}");
     }
 
-    /// The scout's outline holds its launch m2, its messages m3 to m5 and its
-    /// report m7; m6 is not the scout's. Longer texts make omitting m4 to m7
-    /// shorter than showing them.
+    /// The scout's outline holds its launch m2, its messages and its report
+    /// m4; m3 is not the scout's. Longer texts make omitting its m2 to the
+    /// report shorter than showing them.
     #[test]
     fn truncated_outline_of_sub_agent_continues_with_its_omitted_messages_alone() {
         let mut transcript = session_with_a_scout();
@@ -8822,14 +8949,14 @@ mod tests {
 
         let output = (100..2_000)
             .map(outline_with_budget)
-            .find(|output| output.contains("\nm3 s1 "))
+            .find(|output| output.contains("\ns1:m1 "))
             .unwrap();
 
         let reference = resolved.reference.canonical();
-        assert!(!output.contains("\nm4 s1 "), "{output}");
+        assert!(!output.contains("\ns1:m2 "), "{output}");
         assert!(
             output.ends_with(&format!(
-                "\ncontinue read refs={reference}:m4..m5;{reference}:m7 tools=true tool-results=true thinking=true subagents=true\n"
+                "\ncontinue read refs={reference}:s1:m2..m3;{reference}:m4 tools=true tool-results=true thinking=true subagents=true\n"
             )),
             "{output}"
         );
@@ -9243,7 +9370,7 @@ mod tests {
         );
     }
 
-    /// m3 is the scout's text, and m4.1 its call, answered in m5.
+    /// The scout's text is its m1, and its m2.1 its call, answered in its m3.
     #[test]
     fn read_of_one_message_or_one_call_shows_it_whoever_wrote_it() {
         let transcript = session_with_a_scout();
@@ -9252,11 +9379,66 @@ mod tests {
         let call = read_call(&transcript, 4, 1, options()).unwrap();
 
         assert!(message.contains(" policy=text+subagents "), "{message}");
-        assert!(message.contains("\nm3 s1 anchor="), "{message}");
+        assert!(message.contains("\ns1:m1 anchor="), "{message}");
         assert!(message.ends_with("\n| Reading the tree.\n"), "{message}");
         assert!(
-            call.ends_with("\nm4.1 s1 result=m5\n| Bash: ls\nm5 s1 call=m4.1\n| a.rs\n"),
+            call.ends_with("\ns1:m2.1 result=s1:m3\n| Bash: ls\ns1:m3 call=s1:m2.1\n| a.rs\n"),
             "{call}"
         );
+    }
+
+    /// Eight lines of sub-agent `label`'s `n`th finding.
+    fn finding(label: &str, n: usize) -> String {
+        (1..=8)
+            .map(|line| format!("{label} finding {n}, line {line} of the review"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The session's m1, sub-agents s1 and s2 writing in turn after it and
+    /// after m2, then m3.
+    fn session_with_two_reviews() -> AgentTranscript {
+        use crate::agent::test_support::subagent_text_message;
+        transcript(vec![
+            text_message(1, AgentMessageRole::User, "Review the branch."),
+            subagent_text_message(2, "a", &finding("a", 1)),
+            subagent_text_message(3, "b", &finding("b", 1)),
+            text_message(4, AgentMessageRole::Assistant, "Both reviews are running."),
+            subagent_text_message(5, "a", &finding("a", 2)),
+            subagent_text_message(6, "b", &finding("b", 2)),
+            text_message(7, AgentMessageRole::Assistant, "Both reviews finished."),
+        ])
+    }
+
+    /// `--focus s1:m1..m2` keeps s1's messages first, not s2's written
+    /// between them.
+    #[test]
+    fn subagent_focus_keeps_that_subagents_messages_first() {
+        let transcript = session_with_two_reviews();
+        let resolved = resolved("session.jsonl");
+        let request = whole_session_request(&resolved, &transcript);
+        let focus = ProtocolFocus {
+            conversation_full_ref: None,
+            range: MessageRange { start: 2, end: 5 },
+            subagent: Some(1),
+        };
+        let options = ProtocolOptions {
+            budget: Some(1_000),
+            subagents: true,
+            ..options()
+        };
+
+        let output =
+            format_read(std::slice::from_ref(&request), Some(focus), None, options).unwrap();
+
+        for kept in ["a finding 1, line 8", "a finding 2, line 8"] {
+            assert!(output.contains(kept), "the read keeps {kept:?}:\n{output}");
+        }
+        for left_out in ["b finding 1", "b finding 2"] {
+            assert!(
+                !output.contains(left_out),
+                "the read leaves out {left_out:?}:\n{output}"
+            );
+        }
     }
 }

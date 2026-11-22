@@ -32,22 +32,30 @@
 //!   launch, else at their first message.
 //! - When exact search finds a marker in a message, a read of that message
 //!   alone with `--match <marker>` reports a hit.
+//! - The `read ref=` recipe of each hit an exact `agent within` search for a
+//!   marker prints reads the hit's `focus=` messages.
 
+use crate::agent::address::MessageAddresses;
 use crate::agent::protocol::{
     ProtocolOptions, ReadRequest, ReadSlice, format_outline, format_read,
 };
 use crate::agent::refs::{
-    AgentConversationKey, MessageRange, parse_read_ref, resolved_conversation_for_key,
+    AgentConversationKey, MessageRange, ResolvedConversation, parse_messages, parse_read_ref,
+    resolved_conversation_for_key,
 };
 use crate::agent::retrieval::{
     AgentRetrievalOptions, AgentTranscriptSearchTarget, retrieve_agent_hits_for_target,
 };
-use crate::agent::search::exact_phrase_query;
+use crate::agent::search::{
+    AgentWithinRequest, exact_phrase_query, format_agent_output, run_within_search,
+};
 use crate::agent::test_support::{
-    PositionalRecord, atom, outline_records, read_records, segment_records,
+    MessageKey, PositionalRecord, addressed_messages, atom, message_address, outline_records,
+    read_records, segment_records,
 };
 use crate::agent::transcript::AgentTranscript;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
+use crate::search::mode::SearchMode;
 use crate::time_filter::TimeFilter;
 use std::collections::{BTreeSet, HashMap};
 
@@ -126,15 +134,6 @@ fn outline(session: &AgentSession) -> String {
 
 /// `agent read` of the whole of `session`, with its sub-agent transcripts.
 fn read(session: &AgentSession, options: ProtocolOptions) -> String {
-    read_range(session, None, options)
-}
-
-/// `agent read` of `range`, or the whole, of `session`.
-fn read_range(
-    session: &AgentSession,
-    range: Option<MessageRange>,
-    options: ProtocolOptions,
-) -> String {
     let row = &session.row;
     let transcript =
         AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
@@ -144,7 +143,7 @@ fn read_range(
         &[ReadRequest {
             resolved: &resolved,
             transcript: &transcript,
-            range,
+            range: None,
             subagent: None,
             call: None,
         }],
@@ -153,6 +152,54 @@ fn read_range(
         options,
     )
     .unwrap()
+}
+
+/// `agent read` of `reference`, `ch_…:m3..m5` or `ch_…:s3:m2`, a ref of
+/// `session` a read printed.
+fn read_ref(session: &AgentSession, reference: &str, options: ProtocolOptions) -> String {
+    LoadedSession::of(session).read_ref(reference, options)
+}
+
+/// A session's transcript, loaded once for many reads of its refs.
+struct LoadedSession {
+    transcript: AgentTranscript,
+    resolved: ResolvedConversation,
+    addresses: MessageAddresses,
+}
+
+impl LoadedSession {
+    fn of(session: &AgentSession) -> Self {
+        let row = &session.row;
+        let transcript =
+            AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
+        let key = key_of_listed(row);
+        Self {
+            resolved: resolved_conversation_for_key(std::slice::from_ref(&key), &key),
+            addresses: MessageAddresses::of_transcript(&transcript),
+            transcript,
+        }
+    }
+
+    /// `agent read` of `reference`, as [`read_ref`] reads it.
+    fn read_ref(&self, reference: &str, options: ProtocolOptions) -> String {
+        let read_ref = parse_read_ref(reference).unwrap();
+        let range = read_ref
+            .range
+            .map(|range| self.addresses.resolve(range).unwrap());
+        format_read(
+            &[ReadRequest {
+                resolved: &self.resolved,
+                transcript: &self.transcript,
+                range: range.map(|range| range.range),
+                subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
+                call: read_ref.call,
+            }],
+            None,
+            None,
+            options,
+        )
+        .unwrap()
+    }
 }
 
 /// Each marker of `session` in a call's header, a launch prompt or a
@@ -169,45 +216,107 @@ fn unshown_call_and_subagent_markers(session: &AgentSession) -> Vec<String> {
         .collect()
 }
 
-/// The message numbers a read covers: those of its message and call
+/// The addresses of `session`'s messages, and the ordinal of each message by
+/// the address its records print.
+struct SessionAddresses {
+    addresses: MessageAddresses,
+    ordinals: HashMap<MessageKey, usize>,
+    /// The thread of each sub-agent message, by ordinal: its label and
+    /// transcript.
+    threads: HashMap<usize, String>,
+}
+
+impl SessionAddresses {
+    fn of(session: &AgentSession) -> Self {
+        let row = &session.row;
+        let transcript =
+            AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
+        let addresses = MessageAddresses::of_transcript(&transcript);
+        let ordinals = transcript
+            .messages
+            .iter()
+            .map(|message| {
+                let address = addresses.message(message.ordinal);
+                (addressed_messages(&address)[0], message.ordinal)
+            })
+            .collect();
+        let threads = transcript
+            .messages
+            .iter()
+            .filter_map(|message| {
+                let (label, transcript) = message.subagent.as_deref()?.key();
+                Some((message.ordinal, format!("{label} {transcript:?}")))
+            })
+            .collect();
+        Self {
+            addresses,
+            ordinals,
+            threads,
+        }
+    }
+
+    /// The ordinals of the messages a record's `address` names.
+    fn ordinals_of(&self, address: &str) -> Vec<usize> {
+        addressed_messages(address)
+            .into_iter()
+            .map(|key| self.ordinals[&key])
+            .collect()
+    }
+
+    /// The ordinals of the messages a segment's `address` covers.
+    fn segment_ordinals(&self, address: &str) -> std::ops::RangeInclusive<usize> {
+        let range = self
+            .addresses
+            .resolve(parse_messages(address).unwrap())
+            .unwrap()
+            .range;
+        range.start..=range.end
+    }
+}
+
+/// The ordinals of the messages a read covers: those of its message and call
 /// records, and the ranges of its hidden records.
-fn covered_messages(output: &str) -> BTreeSet<usize> {
+fn covered_messages(output: &str, addresses: &SessionAddresses) -> BTreeSet<usize> {
     read_records(output)
         .iter()
-        .flat_map(|record| addressed_messages(record.address))
+        .flat_map(|record| addresses.ordinals_of(record.address))
         .collect()
 }
 
-/// `7..=7` for `m7` and `m7.2`; `7..=9` for `m7..m9`.
-fn addressed_messages(address: &str) -> std::ops::RangeInclusive<usize> {
-    let ordinal = |address: &str| {
-        let message = address.strip_prefix('m').unwrap();
-        let message = message
-            .split_once('.')
-            .map_or(message, |(message, _)| message);
-        message.parse::<usize>().unwrap()
-    };
-    let (first, last) = address.split_once("..").unwrap_or((address, address));
-    ordinal(first)..=ordinal(last)
+/// The ordinals of the messages a read's call records name in `result=`.
+fn result_messages(output: &str, addresses: &SessionAddresses) -> BTreeSet<usize> {
+    read_records(output)
+        .iter()
+        .filter_map(|record| record.atom("result"))
+        .flat_map(|results| results.split(','))
+        .flat_map(|address| addresses.ordinals_of(address))
+        .collect()
 }
 
 /// Each message of `session` that a read with every flag covers and a read
 /// with default flags does not.
 fn uncovered_messages(session: &AgentSession) -> Vec<String> {
-    let covered = covered_messages(&read(session, DEFAULT_FLAGS));
-    covered_messages(&read(session, EVERY_FLAG))
+    let addresses = SessionAddresses::of(session);
+    let covered = covered_messages(&read(session, DEFAULT_FLAGS), &addresses);
+    covered_messages(&read(session, EVERY_FLAG), &addresses)
         .difference(&covered)
-        .map(|ordinal| format!("{:?}: m{ordinal}", session.row.source))
+        .map(|&ordinal| {
+            format!(
+                "{:?}: {}",
+                session.row.source,
+                addresses.addresses.message(ordinal)
+            )
+        })
         .collect()
 }
 
 /// The launch, first and report messages a legend record names.
 #[derive(Default)]
 struct LegendLinks {
-    launch: Option<usize>,
+    launch: Option<MessageKey>,
     /// The first message of `span=`.
-    first: Option<usize>,
-    reports: Vec<usize>,
+    first: Option<MessageKey>,
+    reports: Vec<MessageKey>,
 }
 
 /// The handles a read's legend records name, with the launch and report
@@ -216,7 +325,7 @@ fn legend(output: &str) -> HashMap<String, LegendLinks> {
     let ordinals = |values: &str| {
         values
             .split(',')
-            .map(|address| address.strip_prefix('m').unwrap().parse::<usize>().unwrap())
+            .map(|address| addressed_messages(address)[0])
             .collect::<Vec<_>>()
     };
     output
@@ -231,27 +340,12 @@ fn legend(output: &str) -> HashMap<String, LegendLinks> {
                 if let Some(launch) = field.strip_prefix("launch=") {
                     links.launch = ordinals(launch).first().copied();
                 } else if let Some(span) = field.strip_prefix("span=") {
-                    links.first = Some(*addressed_messages(span).start());
+                    links.first = Some(addressed_messages(span)[0]);
                 } else if let Some(reports) = field.strip_prefix("report=") {
                     links.reports = ordinals(reports);
                 }
             }
             (handle, links)
-        })
-        .collect()
-}
-
-/// The thread of each of `session`'s sub-agent messages, by ordinal: its
-/// label and transcript.
-fn subagent_threads(session: &AgentSession) -> HashMap<usize, String> {
-    let row = &session.row;
-    AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents)
-        .unwrap()
-        .messages
-        .iter()
-        .filter_map(|message| {
-            let (label, transcript) = message.subagent.as_deref()?.key();
-            Some((message.ordinal, format!("{label} {transcript:?}")))
         })
         .collect()
 }
@@ -269,7 +363,8 @@ type RecordParser = fn(&str) -> Vec<PositionalRecord<'_>>;
 /// messages it shows; and how many handles the read with every flag names in
 /// its legend, and how many the outline's segments name.
 fn misnamed_subagents(session: &AgentSession) -> (Vec<String>, usize, usize) {
-    let threads = subagent_threads(session);
+    let addresses = SessionAddresses::of(session);
+    let threads = &addresses.threads;
     let outputs: [(String, RecordParser); 3] = [
         (read(session, EVERY_FLAG), read_records),
         (read(session, DEFAULT_FLAGS), read_records),
@@ -283,7 +378,9 @@ fn misnamed_subagents(session: &AgentSession) -> (Vec<String>, usize, usize) {
             records(output)
                 .iter()
                 .filter(|record| {
-                    let owners = addressed_messages(record.address)
+                    let owners = addresses
+                        .ordinals_of(record.address)
+                        .into_iter()
                         .map(|ordinal| threads.get(&ordinal))
                         .collect::<BTreeSet<_>>();
                     if owners.len() != 1 {
@@ -302,7 +399,7 @@ fn misnamed_subagents(session: &AgentSession) -> (Vec<String>, usize, usize) {
         );
     }
     let (segment_gaps, segment_handles) =
-        misnamed_segment_subagents(session, &threads, &outputs[0].0, &outputs[2].0);
+        misnamed_segment_subagents(session, &addresses, &outputs[0].0, &outputs[2].0);
     gaps.extend(segment_gaps);
     (gaps, legend(&outputs[0].0).len(), segment_handles)
 }
@@ -310,20 +407,20 @@ fn misnamed_subagents(session: &AgentSession) -> (Vec<String>, usize, usize) {
 /// The segments of `outline` whose handles do not name exactly the
 /// sub-agents of their messages shown in `read`, a read with every flag; and
 /// how many handles the segments name. A handle names the thread of the
-/// messages its records hold in `read`; `threads` gives each sub-agent
-/// message's thread.
+/// messages its records hold in `read`.
 fn misnamed_segment_subagents(
     session: &AgentSession,
-    threads: &HashMap<usize, String>,
+    addresses: &SessionAddresses,
     read: &str,
     outline: &str,
 ) -> (Vec<String>, usize) {
+    let threads = &addresses.threads;
     let records = read_records(read);
-    let shown = covered_messages(read);
+    let shown = covered_messages(read, addresses);
     let thread_of_handle = records
         .iter()
         .filter_map(|record| {
-            let ordinal = *addressed_messages(record.address).start();
+            let ordinal = addresses.ordinals_of(record.address)[0];
             Some((record.subagent?, threads.get(&ordinal)?))
         })
         .collect::<HashMap<_, _>>();
@@ -332,7 +429,8 @@ fn misnamed_segment_subagents(
     let gaps = segments
         .iter()
         .filter(|segment| {
-            let sub_agents_shown = addressed_messages(segment.address)
+            let sub_agents_shown = addresses
+                .segment_ordinals(segment.address)
                 .filter(|ordinal| shown.contains(ordinal))
                 .filter_map(|ordinal| threads.get(&ordinal))
                 .collect::<BTreeSet<_>>();
@@ -392,11 +490,20 @@ fn read_subagent(session: &AgentSession, handle: usize) -> String {
     .unwrap()
 }
 
-/// The ordinals of the records of `output` carrying `handle`.
-fn messages_of(output: &str, handle: &str) -> BTreeSet<usize> {
+/// The messages of the records of `output` carrying `handle`.
+fn messages_of(output: &str, handle: &str) -> BTreeSet<MessageKey> {
     read_records(output)
         .iter()
         .filter(|record| record.subagent == Some(handle))
+        .flat_map(|record| addressed_messages(record.address))
+        .collect()
+}
+
+/// The messages a read covers: those of its message and call records, and
+/// the ranges of its hidden records.
+fn covered_addresses(output: &str) -> BTreeSet<MessageKey> {
+    read_records(output)
+        .iter()
         .flat_map(|record| addressed_messages(record.address))
         .collect()
 }
@@ -417,7 +524,7 @@ fn misread_subagents(session: &AgentSession) -> (Vec<String>, HashMap<String, Le
             let mut expected = own.clone();
             expected.extend(links.launch);
             expected.extend(&links.reports);
-            let shown = covered_messages(&alone);
+            let shown = covered_addresses(&alone);
             (messages_of(&alone, handle) != own || shown != expected).then(|| {
                 format!(
                     "{:?}: {handle} shows {shown:?}, expected {expected:?} with its own {own:?}\n{alone}",
@@ -455,12 +562,14 @@ fn every_agents_sub_agent_read_alone_shows_exactly_its_messages_launch_and_repor
 /// start out of order, a sub-agent starting at its launch, else at its first
 /// message; and how many pairs there are.
 fn subagents_out_of_launch_order(session: &AgentSession) -> (Vec<String>, usize) {
+    let addresses = SessionAddresses::of(session);
     let legend = legend(&read(session, EVERY_FLAG));
     let mut starts = legend
         .iter()
         .map(|(handle, links)| {
             let number = handle.strip_prefix('s').unwrap().parse::<usize>().unwrap();
-            (number, links.launch.or(links.first).unwrap())
+            let start = links.launch.or(links.first).unwrap();
+            (number, addresses.ordinals[&start], start)
         })
         .collect::<Vec<_>>();
     starts.sort_unstable();
@@ -469,8 +578,12 @@ fn subagents_out_of_launch_order(session: &AgentSession) -> (Vec<String>, usize)
         .filter(|pair| pair[0].1 > pair[1].1)
         .map(|pair| {
             format!(
-                "{:?}: s{} starts at m{}, after s{} at m{}",
-                session.row.source, pair[0].0, pair[0].1, pair[1].0, pair[1].1
+                "{:?}: s{} starts at {}, after s{} at {}",
+                session.row.source,
+                pair[0].0,
+                message_address(pair[0].2),
+                pair[1].0,
+                message_address(pair[1].2)
             )
         })
         .collect();
@@ -645,8 +758,9 @@ fn budget_gap(session: &AgentSession) -> Option<String> {
             ..EVERY_FLAG
         },
     );
-    let covered = covered_messages(&output);
-    let leading = covered_messages(&unbudgeted)
+    let addresses = SessionAddresses::of(session);
+    let covered = covered_messages(&output, &addresses);
+    let leading = covered_messages(&unbudgeted, &addresses)
         .into_iter()
         .take(covered.len().max(1))
         .collect::<BTreeSet<_>>();
@@ -655,17 +769,23 @@ fn budget_gap(session: &AgentSession) -> Option<String> {
         .then(|| format!("{:?}: covers {covered:?}\n{output}", session.row.source))
 }
 
-/// Each message of `session` with text that its read with default flags and
-/// half that read's length as the budget omits, and that the reads its
-/// `continue read` record names do not show; and whether the read printed
-/// such a record. A read of each ref in `refs=` uses the record's flags.
-fn messages_a_continue_read_doesnt_show(session: &AgentSession) -> (Vec<String>, bool) {
-    let unbudgeted = read(session, DEFAULT_FLAGS);
+/// The messages of `session` that its read with `options` and half that
+/// read's length as the budget omits, and that the reads its `continue read`
+/// record names do not read exactly: a message they miss, one they read
+/// twice, or one they read though the budgeted read covers it; and whether
+/// the read printed such a record. A read of each ref in `refs=` uses the
+/// record's flags; it reads a message it prints only as a call's `result=`,
+/// such as an empty result, that the budgeted read's flags hid in a run.
+fn messages_a_continue_read_misreads(
+    session: &AgentSession,
+    options: ProtocolOptions,
+) -> (Vec<String>, bool) {
+    let unbudgeted = read(session, options);
     let budgeted = read(
         session,
         ProtocolOptions {
             budget: Some(unbudgeted.chars().count() / 2),
-            ..DEFAULT_FLAGS
+            ..options
         },
     );
     let Some(record) = budgeted
@@ -682,40 +802,201 @@ fn messages_a_continue_read_doesnt_show(session: &AgentSession) -> (Vec<String>,
         subagents: flag("subagents"),
         ..DEFAULT_FLAGS
     };
-    let shown = atom(record, "refs")
-        .unwrap()
-        .split(';')
-        .flat_map(|reference| {
-            let range = parse_read_ref(reference).unwrap().range;
-            let output = read_range(session, range, flags);
-            read_records(&output)
-                .iter()
-                .filter(|record| record.word != Some("hidden"))
-                .flat_map(|record| addressed_messages(record.address))
-                .collect::<Vec<_>>()
-        })
+    let addresses = SessionAddresses::of(session);
+    let mut read_back = Vec::new();
+    let mut results = BTreeSet::new();
+    for reference in atom(record, "refs").unwrap().split(';') {
+        let output = read_ref(session, reference, flags);
+        read_back.extend(covered_messages(&output, &addresses));
+        results.extend(result_messages(&output, &addresses));
+    }
+    let budgeted_covers = covered_messages(&budgeted, &addresses);
+    let omitted = covered_messages(&unbudgeted, &addresses)
+        .difference(&budgeted_covers)
+        .copied()
         .collect::<BTreeSet<_>>();
-    let budgeted_covers = covered_messages(&budgeted);
-    let unshown = covered_messages(&read(session, EVERY_FLAG))
-        .intersection(&covered_messages(&unbudgeted))
-        .filter(|ordinal| !budgeted_covers.contains(ordinal) && !shown.contains(ordinal))
-        .map(|ordinal| format!("{:?}: m{ordinal}\n{record}", session.row.source))
-        .collect();
-    (unshown, true)
+    let mut read_once = read_back.iter().copied().collect::<BTreeSet<_>>();
+    read_once.extend(results);
+    let name = |ordinal: &usize| {
+        let side = if omitted.contains(ordinal) {
+            "omitted and not read back"
+        } else {
+            "read back and not omitted"
+        };
+        format!(
+            "{:?}: {} {side}\n{record}",
+            session.row.source,
+            addresses.addresses.message(*ordinal)
+        )
+    };
+    let mut misread = omitted
+        .symmetric_difference(&read_once)
+        .map(name)
+        .collect::<Vec<_>>();
+    if read_back.len() != read_back.iter().collect::<BTreeSet<_>>().len() {
+        misread.push(format!(
+            "{:?}: a message read twice\n{record}",
+            session.row.source
+        ));
+    }
+    (misread, true)
 }
 
 #[test]
-fn every_agents_continue_read_shows_each_message_its_budget_omits() {
-    let mut unshown = Vec::new();
+fn every_agents_continue_read_reads_exactly_messages_its_budget_omits() {
+    let mut misread = Vec::new();
     let mut continuations = 0;
     for session in every_record_sessions() {
-        let (session_unshown, continues) = messages_a_continue_read_doesnt_show(&session);
-        unshown.extend(session_unshown);
-        continuations += usize::from(continues);
+        for options in [DEFAULT_FLAGS, WITH_SUBAGENTS] {
+            let (session_misread, continues) = messages_a_continue_read_misreads(&session, options);
+            misread.extend(session_misread);
+            continuations += usize::from(continues);
+        }
     }
 
-    assert!(unshown.is_empty(), "{}", unshown.join("\n"));
+    assert!(misread.is_empty(), "{}", misread.join("\n"));
     assert!(continuations > 0, "no budgeted read continues");
+}
+
+/// Each address `session`'s reads with every flag and with default flags
+/// print that a read of it alone with the same flags does not read back: a
+/// message or call whose record the read lacks, or a run whose messages it
+/// does not cover; and how many addresses were read. The addresses are those
+/// of records, `result=`, `call=` and `same=`, and a legend's `launch=`,
+/// `span=` and `report=`. A message a read prints without a record of its
+/// own must still read without an error.
+fn addresses_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
+    let conversation = key_of_listed(&session.row).conversation_ref().canonical();
+    let loaded = LoadedSession::of(session);
+    let mut gaps = Vec::new();
+    let mut count = 0;
+    for options in [EVERY_FLAG, DEFAULT_FLAGS] {
+        let output = read(session, options);
+        let records = read_records(&output);
+        let recorded = records
+            .iter()
+            .map(|record| record.address)
+            .collect::<BTreeSet<_>>();
+        let mut printed = recorded
+            .iter()
+            .map(|address| (*address).to_owned())
+            .collect::<BTreeSet<_>>();
+        for record in &records {
+            for name in ["result", "call", "same"] {
+                printed.extend(record.atom(name).map(linked_addresses).unwrap_or_default());
+            }
+        }
+        for legend in output
+            .lines()
+            .filter_map(|line| line.strip_prefix("subagent "))
+        {
+            for field in legend.split(" : ").next().unwrap().split_whitespace() {
+                for name in ["launch=", "span=", "report="] {
+                    if let Some(values) = field.strip_prefix(name) {
+                        printed.extend(values.split(',').map(str::to_owned));
+                    }
+                }
+            }
+        }
+        for address in printed {
+            count += 1;
+            let alone = loaded.read_ref(&format!("{conversation}:{address}"), options);
+            let read_back = if address.contains("..") {
+                let covered = covered_addresses(&alone);
+                addressed_messages(&address)
+                    .iter()
+                    .all(|message| covered.contains(message))
+            } else {
+                !recorded.contains(address.as_str())
+                    || read_records(&alone)
+                        .iter()
+                        .any(|record| record.address == address)
+            };
+            if !read_back {
+                gaps.push(format!("{:?}: {address}\n{alone}", session.row.source));
+            }
+        }
+    }
+    (gaps, count)
+}
+
+#[test]
+fn every_agents_printed_address_reads_back_its_record() {
+    let mut gaps = Vec::new();
+    let mut addresses = 0;
+    for session in every_record_sessions() {
+        let (session_gaps, session_addresses) = addresses_not_read_back(&session);
+        gaps.extend(session_gaps);
+        addresses += session_addresses;
+    }
+
+    assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+    assert!(addresses > 0, "a read prints an address");
+}
+
+/// Each `read ref=` recipe that an exact `agent within` search of `session`
+/// for one of its markers prints, and whose read with the recipe's flags
+/// does not cover the hit's `focus=` messages; and how many recipes ran.
+fn hit_recipes_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
+    let row = &session.row;
+    let loaded = LoadedSession::of(session);
+    let addresses = SessionAddresses::of(session);
+    let mut gaps = Vec::new();
+    let mut recipes = 0;
+    for marker in &session.markers {
+        let request = AgentWithinRequest {
+            query: exact_phrase_query(marker.text),
+            top: usize::MAX,
+            cli_mode: Some(SearchMode::Exact),
+            config_mode: None,
+            tui_semantic_search: None,
+            budget: None,
+            window: TimeFilter::default(),
+        };
+        let output = format_agent_output(&run_within_search(
+            &request,
+            row,
+            &loaded.resolved,
+            &loaded.transcript,
+            &[],
+        ));
+        for recipe in output.lines().filter(|line| line.starts_with("read ref=")) {
+            recipes += 1;
+            let flag = |name| atom(recipe, name) == Some("true");
+            let flags = ProtocolOptions {
+                tools: flag("tools"),
+                tool_results: flag("tool-results"),
+                thinking: flag("thinking"),
+                subagents: flag("subagents"),
+                ..DEFAULT_FLAGS
+            };
+            let read = loaded.read_ref(atom(recipe, "ref").unwrap(), flags);
+            let mut covered = covered_messages(&read, &addresses);
+            covered.extend(result_messages(&read, &addresses));
+            let focus = addresses.segment_ordinals(atom(recipe, "focus").unwrap());
+            if !focus.clone().all(|ordinal| covered.contains(&ordinal)) {
+                gaps.push(format!(
+                    "{:?} {}: {recipe}\n{read}",
+                    row.source, marker.record
+                ));
+            }
+        }
+    }
+    (gaps, recipes)
+}
+
+#[test]
+fn every_agents_within_hit_recipe_reads_its_focus_messages() {
+    let mut gaps = Vec::new();
+    let mut recipes = 0;
+    for session in every_record_sessions() {
+        let (session_gaps, session_recipes) = hit_recipes_not_read_back(&session);
+        gaps.extend(session_gaps);
+        recipes += session_recipes;
+    }
+
+    assert!(gaps.is_empty(), "{}", gaps.join("\n"));
+    assert!(recipes > 0, "a marker search prints a recipe");
 }
 
 #[test]

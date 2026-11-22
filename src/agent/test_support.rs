@@ -285,12 +285,13 @@ pub fn read_times(read: &str) -> Option<RecordTimes> {
 }
 
 /// A record of `agent read` or `agent outline` that opens with its address:
-/// `m7`, a message; `m7.2`, a call; `m7..m9`, a run of hidden messages.
+/// `m7` or `s3:m2`, a message; `m7.2`, a call; `m7..m9`, a run of hidden
+/// messages.
 #[derive(Debug)]
 pub struct PositionalRecord<'a> {
     pub address: &'a str,
-    /// The handle in position 2, `s326`, of the sub-agent whose messages
-    /// the record holds.
+    /// The handle its address opens with, `s326`, of the sub-agent whose
+    /// messages the record holds.
     pub subagent: Option<&'a str>,
     /// `user`, `report`, `result`, `hidden` or `omitted`, after the address
     /// and any handles.
@@ -544,7 +545,8 @@ fn positional_records(output: &str, grammar: Grammar) -> Vec<PositionalRecord<'_
                 .unwrap_or_else(|| panic!("a day record that does not parse: {line}\n{output}"));
             date = Some(day_date);
             offset = day_offset.or(offset);
-        } else if line
+        } else if split_handle(line)
+            .1
             .strip_prefix('m')
             .is_some_and(|rest| rest.starts_with(|second: char| second.is_ascii_digit()))
         {
@@ -772,7 +774,7 @@ fn positional_record<'a>(
     let address = fields.next().unwrap();
     let address_kind = AddressKind::of(address)
         .unwrap_or_else(|| panic!("a record without an address: {line}\n{output}"));
-    let subagent = fields.next_if(|field| is_handle(field));
+    let subagent = split_handle(address).0;
     let word = fields.next_if(|field| {
         field.starts_with(|first: char| first.is_ascii_lowercase()) && !field.contains('=')
     });
@@ -816,9 +818,49 @@ fn positional_record<'a>(
     }
 }
 
-/// True for `s326`: the handle position 2 of a record holds.
+/// True for `s326`: a sub-agent's handle.
 fn is_handle(field: &str) -> bool {
     field.strip_prefix('s').is_some_and(is_digits)
+}
+
+/// The handle `s3` of an address `s3:m2`, and the address after it; `None`
+/// and the whole address for a message of the session's own.
+pub fn split_handle(address: &str) -> (Option<&str>, &str) {
+    match address.split_once(':') {
+        Some((handle, rest)) if is_handle(handle) => (Some(handle), rest),
+        _ => (None, address),
+    }
+}
+
+/// A message as a record's address names it: its sub-agent's handle number,
+/// `None` for the session's own, and its number among that thread's
+/// messages.
+pub type MessageKey = (Option<usize>, usize);
+
+/// The messages a record's `address` names: `m7` and `m7.2` name message 7,
+/// `s3:m2..m4` sub-agent s3's messages 2 to 4.
+pub fn addressed_messages(address: &str) -> Vec<MessageKey> {
+    let (handle, address) = split_handle(address);
+    let handle = handle.map(|handle| handle[1..].parse::<usize>().unwrap());
+    let number = |address: &str| {
+        let message = address.strip_prefix('m').unwrap();
+        let message = message
+            .split_once('.')
+            .map_or(message, |(message, _)| message);
+        message.parse::<usize>().unwrap()
+    };
+    let (first, last) = address.split_once("..").unwrap_or((address, address));
+    (number(first)..=number(last))
+        .map(|number| (handle, number))
+        .collect()
+}
+
+/// `m7` or `s3:m2`: the address of `message`.
+pub fn message_address((handle, number): MessageKey) -> String {
+    match handle {
+        Some(handle) => format!("s{handle}:m{number}"),
+        None => format!("m{number}"),
+    }
 }
 
 fn is_digits(text: &str) -> bool {
@@ -991,9 +1033,11 @@ enum AddressKind {
 }
 
 impl AddressKind {
-    /// The kind of `address`; `None` for text that is not an address, a
-    /// message or call numbered 0, and a run ending before it starts.
+    /// The kind of `address`, after a sub-agent's `s3:`; `None` for text that
+    /// is not an address, a message or call numbered 0, and a run ending
+    /// before it starts.
     fn of(address: &str) -> Option<Self> {
+        let address = split_handle(address).1;
         let is_ordinal = |text: &str| text.strip_prefix('m').and_then(one_based).is_some();
         if let Some((first, last)) = address.split_once("..") {
             let is_run = first
@@ -1124,6 +1168,23 @@ pub fn assistant_jsonl_line(text: &str) -> String {
         "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
     })
     .to_string()
+}
+
+/// Message `ordinal` of the sub-agent thread `label`, holding `text`. The
+/// thread does not record the call that launched it.
+pub fn subagent_text_message(ordinal: usize, label: &str, text: &str) -> AgentMessage {
+    AgentMessage {
+        parent_tool_use_id: Some(label.to_owned()),
+        subagent: Some(std::sync::Arc::new(
+            crate::agent::transcript::SubagentOrigin {
+                label: label.to_owned(),
+                transcript: None,
+                launch_call: None,
+                identity: crate::log_entry::SubagentIdentity::default(),
+            },
+        )),
+        ..text_message(ordinal, AgentMessageRole::Assistant, text)
+    }
 }
 
 pub fn transcript(messages: Vec<AgentMessage>, path: &str) -> AgentTranscript {
@@ -1281,18 +1342,18 @@ mod tests {
     #[test]
     fn read_of_every_record_kind_parses() {
         let output = concat!(
-            "protocol agent-read cut=body+tail chars=900 policy=text+tools+subagents omit=m9 tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1\n",
+            "protocol agent-read cut=body+tail chars=900 policy=text+tools+subagents omit=m9,s1:m6 tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1\n",
             "conversation project=pr_0 uuid=u ref=ch_0a1\n",
-            "subagent s1 type=Explore launch=m2 span=m3..m5 report=m6 : scout\n",
+            "subagent s1 type=Explore launch=m2 span=s1:m1..m3 report=m3 : scout\n",
             "day 2026-11-01\n",
-            "m2.1 01:50:00 launches=s1 result=m4,m5 same=m1.1\n",
+            "m2.1 01:50:00 launches=s1 result=s1:m2,s1:m3 same=m1.1\n",
             "| Agent (Explore): scout\n",
-            "m3 s1 01:50:01 call=m2.1..2 tool=Agent hidden-tools=Read%20File anchor=ma_1\n",
+            "s1:m1 01:50:01 call=m2.1..2 tool=Agent hidden-tools=Read%20File anchor=ma_1\n",
             "day 2026-11-01 tz=-05:00\n",
-            "m6 report 01:10:00 from=s1 slice=match=cargo%20test context=1 hits=2\n",
-            "m7..m8 hidden 01:10:01..01:10:05 tools=1 calls=m2.3\n",
-            "read refs=ch_0a1:m7;ch_0a1:m8 tools=true tool-results=true thinking=false subagents=false\n",
-            "continue read refs=ch_0a1:m9 tools=true tool-results=false thinking=false subagents=true\n",
+            "m3 report 01:10:00 from=s1 slice=match=cargo%20test context=1 hits=2\n",
+            "s1:m4..m5 hidden 01:10:01..01:10:05 tools=1 calls=s1:m2.3\n",
+            "read refs=ch_0a1:s1:m4;ch_0a1:m4..m5 tools=true tool-results=true thinking=false subagents=false\n",
+            "continue read refs=ch_0a1:m9;ch_0a1:s1:m6 tools=true tool-results=false thinking=false subagents=true\n",
             "protocol agent-warning kind=skipped ref=ch_c detail=empty%20transcript\n",
         );
 

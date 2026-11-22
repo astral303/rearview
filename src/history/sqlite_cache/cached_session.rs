@@ -156,18 +156,59 @@ impl HeldCopy<'_> {
 
     /// Other message bodies contain only the context needed to render this
     /// range's links, handles and header. Do not render outside `range`.
+    ///
+    /// Test-only: the cache tests name a range by session ordinals, which
+    /// [`Self::agent_refs`] reaches only through a per-thread ref resolved
+    /// against the copy's addresses first.
+    #[cfg(test)]
     pub(crate) fn agent_range(
         &self,
         path: &Path,
         range: crate::agent::refs::MessageRange,
     ) -> Result<crate::agent::transcript::AgentTranscript> {
-        entries::read_range(
+        let context = entries::read_context(self.connection, self.session, self.places, path)?;
+        entries::with_bodies(
             self.connection,
             self.session,
             self.places,
             path,
+            context,
             range.start as u64..=range.end as u64,
         )
+    }
+
+    /// The transcript with the bodies of the messages each of `references`
+    /// names, each resolved against every message's context in this copy
+    /// before their bodies are read: refs into one session print through one
+    /// copy's addresses. Other message bodies contain only the context needed
+    /// to render their links, handles and header. Do not render outside
+    /// them.
+    pub(crate) fn agent_refs(
+        &self,
+        path: &Path,
+        references: &[crate::agent::refs::ThreadRange],
+    ) -> Result<(
+        crate::agent::transcript::AgentTranscript,
+        Vec<crate::agent::address::ResolvedRange>,
+    )> {
+        let mut transcript =
+            entries::read_context(self.connection, self.session, self.places, path)?;
+        let addresses = crate::agent::address::MessageAddresses::of_transcript(&transcript);
+        let resolved = references
+            .iter()
+            .map(|&reference| addresses.resolve(reference))
+            .collect::<Result<Vec<_>>>()?;
+        for range in resolved.iter().map(|resolved| resolved.range) {
+            transcript = entries::with_bodies(
+                self.connection,
+                self.session,
+                self.places,
+                path,
+                transcript,
+                range.start as u64..=range.end as u64,
+            )?;
+        }
+        Ok((transcript, resolved))
     }
 
     /// This copy's currency for a row built by the reading command, whose
@@ -302,8 +343,9 @@ impl HeldCopy<'_> {
     }
 
     /// The messages numbered `ordinals`, each whole, as the viewer shows
-    /// them, read through the index on the message numbers. `path` is the
-    /// session's transcript.
+    /// them, read through the index on the message numbers, with their
+    /// places for the addresses of hits on them. `path` is the session's
+    /// transcript.
     pub(crate) fn agent_messages(
         &self,
         path: &Path,
@@ -312,7 +354,7 @@ impl HeldCopy<'_> {
         let stored = entries::read_messages(self.connection, self.session, self.places, ordinals)?;
         Ok(crate::agent::search::SearchedTranscript {
             transcript: crate::agent::transcript::AgentTranscript::from_stored(path, stored)?,
-            message_count: self.message_count()?,
+            places: entries::read_hit_places(self.connection, self.session, ordinals)?,
             copy_generation: Some(self.generation),
         })
     }

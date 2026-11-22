@@ -1,3 +1,4 @@
+use crate::agent::address::{HitAddresses, HitPlaces, MessageAddresses};
 use crate::agent::diagnostic::{
     AgentWarning, budget_beside_warnings, format_warning_records, warning_atoms, warning_chars,
 };
@@ -10,8 +11,7 @@ use crate::agent::protocol::{
 use crate::agent::refs::{AgentConversationKey, MessageRange, ResolvedConversation};
 use crate::agent::retrieval::{
     AgentHitRenderOptions, AgentHitSource, AgentRetrievalOptions, AgentSearchHit as RetrievalHit,
-    AgentTranscriptSearchTarget, format_evidence_preview, read_range_for_focus,
-    retrieve_agent_hits_for_target,
+    AgentTranscriptSearchTarget, format_evidence_preview, retrieve_agent_hits_for_target,
 };
 use crate::agent::time_span::{TimeSpan, output_offset, time_atoms, tz_atom};
 use crate::agent::transcript::{AgentMessage, AgentTranscript};
@@ -185,12 +185,12 @@ pub struct LexicalSearchRun {
     pub copies_read: HashMap<String, i64>,
 }
 
-/// A ranked session's transcript as a lexical search reads it.
+/// A ranked session's transcript as a search reads it.
 pub struct SearchedTranscript {
     /// Every message, or the messages holding the query's terms alone.
     pub transcript: AgentTranscript,
-    /// The session's message count.
-    pub message_count: usize,
+    /// The places of the messages of `transcript`.
+    pub places: HitPlaces,
     /// The generation of the cached copy the messages were read from;
     /// `None` for a transcript read whole.
     pub copy_generation: Option<i64>,
@@ -200,7 +200,7 @@ impl From<AgentTranscript> for SearchedTranscript {
     /// Every message of `transcript`.
     fn from(transcript: AgentTranscript) -> Self {
         Self {
-            message_count: transcript.messages.len(),
+            places: places_in_whole(&transcript),
             transcript,
             copy_generation: None,
         }
@@ -208,16 +208,25 @@ impl From<AgentTranscript> for SearchedTranscript {
 }
 
 impl SearchedTranscript {
-    /// The messages as retrieval's target, without the session's reference
-    /// or time: [`retrieval_hits`] adds them.
-    fn target(&self) -> AgentTranscriptSearchTarget<'_> {
-        AgentTranscriptSearchTarget {
+    pub fn with_places(&self) -> TranscriptPlaces<'_> {
+        TranscriptPlaces {
             transcript: &self.transcript,
-            message_count: self.message_count,
-            conversation_ref: None,
-            timestamp: None,
+            places: &self.places,
         }
     }
+}
+
+/// A session's messages a search read, and their places.
+#[derive(Clone, Copy)]
+pub struct TranscriptPlaces<'a> {
+    pub transcript: &'a AgentTranscript,
+    pub places: &'a HitPlaces,
+}
+
+/// The places of every message of `transcript`, a session read whole.
+pub fn places_in_whole(transcript: &AgentTranscript) -> HitPlaces {
+    MessageAddresses::of_transcript(transcript)
+        .hit_places(transcript.messages.iter().map(|message| message.ordinal))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -264,7 +273,9 @@ pub struct AgentOutputHit {
     /// The times on the parts of the messages in `focus_range`. A semantic
     /// hit gets them with its anchors, once its transcript is read.
     pub times: Option<TimeSpan>,
-    pub read_range: MessageRange,
+    /// The hit's `focus=` and the range its `read ref=` recipe reads. A
+    /// semantic hit gets them with its anchors; `None` when its read failed.
+    pub addresses: Option<HitAddresses>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,7 +297,7 @@ struct RankedHit {
 pub fn attach_transcript_metadata(
     output: &mut AgentSearchOutput,
     resolved: &ResolvedConversation,
-    transcript: &AgentTranscript,
+    searched: TranscriptPlaces<'_>,
 ) {
     let reference = resolved.reference.canonical();
     if output.protocol == AgentProtocolKind::Within {
@@ -303,7 +314,7 @@ pub fn attach_transcript_metadata(
         hit.project_id = resolved.key.project_id();
         hit.conversation_uuid = resolved.reference.uuid();
         hit.session = resolved.key.session_filename.clone();
-        attach_focus_metadata(hit, transcript, resolved);
+        attach_focus_metadata(hit, searched, resolved);
     }
     for group in output
         .groups
@@ -317,30 +328,31 @@ pub fn attach_transcript_metadata(
 }
 
 /// Gives each semantic-only hit of `resolved`'s session in `output` the
-/// anchors and times of its focus messages in `transcript`. Every other hit
-/// keeps those its lexical retrieval found.
+/// anchors, times and addresses of its focus messages in `searched`. Every
+/// other hit keeps those its lexical retrieval found.
 pub fn attach_semantic_hit_metadata(
     output: &mut AgentSearchOutput,
     resolved: &ResolvedConversation,
-    transcript: &AgentTranscript,
+    searched: TranscriptPlaces<'_>,
 ) {
     let reference = resolved.reference.canonical();
     for hit in output
         .every_hit_mut()
         .filter(|hit| hit.conversation_ref == reference && hit.source == AgentHitKind::Semantic)
     {
-        attach_focus_metadata(hit, transcript, resolved);
+        attach_focus_metadata(hit, searched, resolved);
     }
 }
 
 fn attach_focus_metadata(
     hit: &mut AgentOutputHit,
-    transcript: &AgentTranscript,
+    searched: TranscriptPlaces<'_>,
     resolved: &ResolvedConversation,
 ) {
-    let focus = FocusMetadata::of(transcript, resolved, hit.focus_range);
+    let focus = FocusMetadata::of(searched, resolved, hit.focus_range);
     hit.anchors = focus.anchors;
     hit.times = focus.times;
+    hit.addresses = focus.addresses;
     hit.render_options.merge(focus.flags);
 }
 
@@ -573,36 +585,37 @@ fn score_breakdown_atoms(breakdown: Option<SemanticScoreBreakdown>) -> String {
 }
 
 /// The `hit` record and its `read` recipe, its times in `zone`, below a
-/// header whose `tz=` names `header_offset`.
+/// header whose `tz=` names `header_offset`. A hit without addresses, one
+/// whose session failed to read, prints neither `focus=` nor the recipe.
 fn push_hit_lines(
     rendered: &mut String,
     hit: &AgentOutputHit,
     header_offset: FixedOffset,
     zone: Zone,
 ) {
+    let reference = crate::agent::protocol::escape_atom(&hit.conversation_ref);
+    let focus = hit
+        .addresses
+        .map(|addresses| format!(" focus={}", addresses.focus))
+        .unwrap_or_default();
     rendered.push_str(&format!(
-        "hit project={} uuid={} ref={} anchors={} source={} score={:.6}{} focus=m{}..m{}{} | {}\n",
+        "hit project={} uuid={} ref={reference} anchors={} source={} score={:.6}{}{focus}{} | {}\n",
         crate::agent::protocol::escape_atom(&hit.project_id),
         crate::agent::protocol::escape_atom(&hit.conversation_uuid),
-        crate::agent::protocol::escape_atom(&hit.conversation_ref),
         hit.anchors.join(","),
         output_source_atom(hit),
         hit.score,
         score_breakdown_atoms(hit.semantic_score_breakdown),
-        hit.focus_range.start,
-        hit.focus_range.end,
         time_atoms(hit.times, header_offset, zone),
         protocol_snippet(&hit.preview, AGENT_SEARCH_HIT_CHARS)
     ));
-    rendered.push_str(&format!(
-        "read ref={}:m{}..m{} focus=m{}..m{}{}\n",
-        crate::agent::protocol::escape_atom(&hit.conversation_ref),
-        hit.read_range.start,
-        hit.read_range.end,
-        hit.focus_range.start,
-        hit.focus_range.end,
-        hit.render_options.recipe_atoms()
-    ));
+    if let Some(addresses) = hit.addresses {
+        rendered.push_str(&format!(
+            "read ref={reference}:{}{focus}{}\n",
+            addresses.read,
+            hit.render_options.recipe_atoms()
+        ));
+    }
 }
 
 pub fn run_within_search(
@@ -623,13 +636,18 @@ pub fn run_within_search(
         resolved: resolved.clone(),
         original_index: 0,
     }];
+    let places = places_in_whole(transcript);
+    let searched = TranscriptPlaces {
+        transcript,
+        places: &places,
+    };
     let hits = match mode {
         SearchMode::Lexical | SearchMode::Exact => retrieval_hits(
             &request.query,
             request.top,
             conversation,
             resolved,
-            AgentTranscriptSearchTarget::whole(transcript, None, None),
+            searched,
             mode,
             request.window,
         ),
@@ -644,7 +662,7 @@ pub fn run_within_search(
                     candidate_depth,
                     conversation,
                     resolved,
-                    AgentTranscriptSearchTarget::whole(transcript, None, None),
+                    searched,
                     SearchMode::Lexical,
                     request.window,
                 ),
@@ -665,7 +683,7 @@ pub fn run_within_search(
         budget: request.budget,
         coverage: None,
     };
-    attach_transcript_metadata(&mut output, resolved, transcript);
+    attach_transcript_metadata(&mut output, resolved, searched);
     output
 }
 
@@ -792,7 +810,7 @@ pub fn run_global_lexical_search_reporting(
                     hits_per_session,
                     conversation,
                     resolved,
-                    searched.target(),
+                    searched.with_places(),
                     retrieval_mode,
                     request.window,
                 )
@@ -1065,7 +1083,7 @@ fn retrieval_hits(
     limit: usize,
     conversation: &Conversation,
     resolved: &ResolvedConversation,
-    messages: AgentTranscriptSearchTarget<'_>,
+    searched: TranscriptPlaces<'_>,
     mode: SearchMode,
     window: TimeFilter,
 ) -> Vec<AgentOutputHit> {
@@ -1074,13 +1092,12 @@ fn retrieval_hits(
     } else {
         query.to_string()
     };
-    let transcript = messages.transcript;
     retrieve_agent_hits_for_target(
-        AgentTranscriptSearchTarget {
-            conversation_ref: Some(&resolved.reference.canonical()),
-            timestamp: Some(conversation.timestamp),
-            ..messages
-        },
+        AgentTranscriptSearchTarget::whole(
+            searched.transcript,
+            Some(&resolved.reference.canonical()),
+            Some(conversation.timestamp),
+        ),
         &search_query,
         AgentRetrievalOptions {
             limit,
@@ -1089,7 +1106,7 @@ fn retrieval_hits(
         },
     )
     .into_iter()
-    .map(|hit| retrieval_output_hit(hit, conversation, resolved, transcript, mode))
+    .map(|hit| retrieval_output_hit(hit, conversation, resolved, searched, mode))
     .collect()
 }
 
@@ -1097,10 +1114,10 @@ fn retrieval_output_hit(
     hit: RetrievalHit,
     conversation: &Conversation,
     resolved: &ResolvedConversation,
-    transcript: &AgentTranscript,
+    searched: TranscriptPlaces<'_>,
     mode: SearchMode,
 ) -> AgentOutputHit {
-    let focus = FocusMetadata::of(transcript, resolved, hit.focus_range);
+    let focus = FocusMetadata::of(searched, resolved, hit.focus_range);
     let mut render_options = hit.render_options;
     render_options.merge(focus.flags);
     AgentOutputHit {
@@ -1123,24 +1140,26 @@ fn retrieval_output_hit(
         preview: hit.preview,
         focus_range: hit.focus_range,
         times: focus.times,
-        read_range: hit.read_range,
+        addresses: focus.addresses,
     }
 }
 
-/// The anchors and times a hit shows for the messages in its focus range,
-/// and the flags its `read` recipe needs to show them.
+/// The anchors, times and addresses a hit shows for the messages in its
+/// focus range, and the flags its `read` recipe needs to show them.
 struct FocusMetadata {
     anchors: Vec<String>,
     times: Option<TimeSpan>,
     flags: AgentHitRenderOptions,
+    addresses: Option<HitAddresses>,
 }
 
 impl FocusMetadata {
     fn of(
-        transcript: &AgentTranscript,
+        searched: TranscriptPlaces<'_>,
         resolved: &ResolvedConversation,
         focus: MessageRange,
     ) -> Self {
+        let TranscriptPlaces { transcript, places } = searched;
         let messages: Vec<&AgentMessage> = transcript
             .messages
             .iter()
@@ -1157,6 +1176,7 @@ impl FocusMetadata {
                 .collect(),
             times: TimeSpan::of_messages(messages),
             flags,
+            addresses: places.hit_addresses(focus),
         }
     }
 }
@@ -1207,11 +1227,7 @@ fn semantic_output_hit_candidates(
                 preview: format_evidence_preview(&hit.snippet),
                 focus_range,
                 times: None,
-                read_range: read_range_for_focus(
-                    focus_range,
-                    input.conversation.message_count.max(focus_range.end),
-                    1,
-                ),
+                addresses: None,
             })
         })
         .collect()
@@ -1380,7 +1396,7 @@ fn merge_score_breakdown(
 
 fn merge_duplicate_hit(existing: &mut AgentOutputHit, candidate: &AgentOutputHit) {
     existing.render_options.merge(candidate.render_options);
-    existing.read_range = existing.read_range.union(&candidate.read_range);
+    existing.addresses = existing.addresses.or(candidate.addresses);
     existing.score = existing.score.max(candidate.score);
     existing.evidence_score = existing.evidence_score.max(candidate.evidence_score);
     merge_score_breakdown(
@@ -1494,7 +1510,6 @@ fn hybrid_hits_with_semantic_order(
                 hit.semantic_score_breakdown,
             );
             existing.hit.render_options.merge(hit.render_options);
-            existing.hit.read_range = existing.hit.read_range.union(&hit.read_range);
         } else {
             ranked.push(RankedHit {
                 hit,
@@ -1622,7 +1637,7 @@ fn hit_source_atom(source: AgentHitKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::refs::AgentConversationKey;
+    use crate::agent::refs::{AgentConversationKey, Thread, ThreadRange};
     use crate::agent::test_support::{
         assert_each_budget_cuts_short_or_ends_with_warnings, cuts_checking_full, text_message,
         text_message_at, warnings_of_two_kinds, written_at,
@@ -1813,7 +1828,21 @@ mod tests {
             preview: preview.to_string(),
             focus_range,
             times: None,
-            read_range,
+            addresses: Some(parent_addresses(focus_range, read_range)),
+        }
+    }
+
+    /// The addresses of a hit on `focus` reading `read`, ordinals of a
+    /// session without sub-agents.
+    fn parent_addresses(focus: MessageRange, read: MessageRange) -> HitAddresses {
+        let range = |range| ThreadRange {
+            thread: Thread::Parent,
+            range,
+            is_range: true,
+        };
+        HitAddresses {
+            focus: range(focus),
+            read: range(read),
         }
     }
 
@@ -1841,7 +1870,7 @@ mod tests {
             preview: preview.to_string(),
             focus_range,
             times: None,
-            read_range,
+            addresses: Some(parent_addresses(focus_range, read_range)),
         }
     }
 
@@ -1869,7 +1898,7 @@ mod tests {
             preview: preview.to_string(),
             focus_range,
             times: None,
-            read_range,
+            addresses: Some(parent_addresses(focus_range, read_range)),
         }
     }
 
@@ -1900,9 +1929,13 @@ mod tests {
             budget: None,
             coverage: None,
         };
-        let semantic_focus = transcript(vec![message(3, AgentMessageRole::User, "cache")]);
+        let semantic_focus = SearchedTranscript::from(transcript(vec![message(
+            3,
+            AgentMessageRole::User,
+            "cache",
+        )]));
 
-        attach_semantic_hit_metadata(&mut output, &resolved, &semantic_focus);
+        attach_semantic_hit_metadata(&mut output, &resolved, semantic_focus.with_places());
 
         let anchors = output
             .hits
@@ -1920,7 +1953,12 @@ mod tests {
             anchors[2],
             (
                 AgentHitKind::Semantic,
-                FocusMetadata::of(&semantic_focus, &resolved, MessageRange::single(3)).anchors
+                FocusMetadata::of(
+                    semantic_focus.with_places(),
+                    &resolved,
+                    MessageRange::single(3)
+                )
+                .anchors
             )
         );
         assert_ne!(anchors[2].1, retrieval_anchors);
@@ -2302,7 +2340,11 @@ mod tests {
         let mut conv = conversation(&format!("{TEST_UUID}.jsonl"), "semantic title");
         conv.message_count = 4;
         let resolved = resolved(&format!("{TEST_UUID}.jsonl"));
-        let transcript = transcript(vec![message(1, AgentMessageRole::User, "placeholder")]);
+        let transcript = transcript(
+            (1..=4)
+                .map(|ordinal| message(ordinal, AgentMessageRole::User, "placeholder"))
+                .collect(),
+        );
         let output = run_within_search(
             &request("semantic", Some(SearchMode::Semantic)),
             &conv,
@@ -2315,10 +2357,20 @@ mod tests {
         );
 
         assert_eq!(output.hits.len(), 2);
-        assert_eq!(output.hits[0].focus_range, MessageRange::single(1));
-        assert_eq!(output.hits[0].read_range, MessageRange { start: 1, end: 2 });
-        assert_eq!(output.hits[1].focus_range, MessageRange::single(3));
-        assert_eq!(output.hits[1].read_range, MessageRange { start: 2, end: 4 });
+        assert_eq!(
+            output.hits[0].addresses,
+            Some(parent_addresses(
+                MessageRange::single(1),
+                MessageRange { start: 1, end: 2 }
+            ))
+        );
+        assert_eq!(
+            output.hits[1].addresses,
+            Some(parent_addresses(
+                MessageRange::single(3),
+                MessageRange { start: 2, end: 4 }
+            ))
+        );
     }
 
     #[test]
@@ -2346,8 +2398,7 @@ mod tests {
 
     #[test]
     fn semantic_hits_use_shared_evidence_format_without_changing_recipes() {
-        let mut conv = conversation("session.jsonl", "semantic title");
-        conv.message_count = 5;
+        let conv = conversation("session.jsonl", "semantic title");
         let resolved = resolved("session.jsonl");
         let raw = format!("semantic\n\u{1b}[31m{} tail", "🙂 ".repeat(200));
 
@@ -2366,7 +2417,6 @@ mod tests {
         assert_eq!(hits[0].preview.chars().count(), 160);
         assert_eq!(hits[0].evidence_source, AgentHitSource::Dialogue);
         assert_eq!(hits[0].focus_range, MessageRange::single(3));
-        assert_eq!(hits[0].read_range, MessageRange { start: 2, end: 4 });
         assert_eq!(hits[0].render_options, AgentHitRenderOptions::default());
     }
 
@@ -2395,7 +2445,10 @@ mod tests {
         assert_eq!(hits[0].source, AgentHitKind::Hybrid);
         assert_eq!(hits[0].preview, "lexical preview");
         assert_eq!(hits[0].semantic_score_breakdown.unwrap().semantic, 0.9);
-        assert_eq!(hits[0].read_range, MessageRange { start: 1, end: 3 });
+        assert_eq!(
+            hits[0].addresses.map(|addresses| addresses.read.range),
+            Some(MessageRange { start: 1, end: 3 })
+        );
     }
 
     #[test]
@@ -2575,7 +2628,10 @@ mod tests {
             preview: "The file /tmp/a has been updated successfully.".to_string(),
             focus_range: MessageRange::single(focus),
             times: None,
-            read_range: MessageRange::single(focus),
+            addresses: Some(parent_addresses(
+                MessageRange::single(focus),
+                MessageRange::single(focus),
+            )),
         };
 
         let groups = build_conversation_groups(vec![hit(1), hit(2)], 10, 10, false);
@@ -3006,7 +3062,15 @@ mod tests {
                 budget: None,
                 coverage: None,
             };
-            attach_transcript_metadata(&mut output, &resolved, &transcript);
+            let places = places_in_whole(&transcript);
+            attach_transcript_metadata(
+                &mut output,
+                &resolved,
+                TranscriptPlaces {
+                    transcript: &transcript,
+                    places: &places,
+                },
+            );
             output.hits[0].render_options
         };
         let flags = |tools, tool_results, subagents| AgentHitRenderOptions {

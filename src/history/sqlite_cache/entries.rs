@@ -6,6 +6,7 @@ mod context;
 mod diff;
 mod digest;
 mod hashes;
+mod hit_places;
 mod messages;
 mod parts;
 mod rows;
@@ -430,17 +431,38 @@ pub(super) fn read_messages(
     read_selected(connection, session, places, &selected)
 }
 
-/// The transcript of `session`, with message bodies for the messages in
-/// `messages` alone. Every other message holds the reference context of
-/// [`context::read`]; its empty bodies are not its content.
-pub(super) fn read_range(
+/// The places of the messages of `session` numbered `ordinals`, for the
+/// addresses of search hits on them.
+pub(super) fn read_hit_places(
+    connection: &Connection,
+    session: i64,
+    ordinals: &[usize],
+) -> Result<crate::agent::address::HitPlaces> {
+    hit_places::read(connection, session, ordinals)
+}
+
+/// The transcript of `session`, every message holding the reference context
+/// of [`context::read`] in place of its content: its empty bodies are not
+/// its content.
+pub(super) fn read_context(
     connection: &Connection,
     session: i64,
     places: &Places,
     path: &Path,
+) -> Result<crate::agent::transcript::AgentTranscript> {
+    context::read(connection, session, places, path)
+}
+
+/// `transcript`, a [`read_context`] of `session`, with the bodies of the
+/// messages in `messages` alone.
+pub(super) fn with_bodies(
+    connection: &Connection,
+    session: i64,
+    places: &Places,
+    path: &Path,
+    mut transcript: crate::agent::transcript::AgentTranscript,
     messages: RangeInclusive<u64>,
 ) -> Result<crate::agent::transcript::AgentTranscript> {
-    let mut transcript = context::read(connection, session, places, path)?;
     let selected = crate::agent::transcript::AgentTranscript::from_stored(
         path,
         read_numbered(connection, session, places, Some(messages))?,

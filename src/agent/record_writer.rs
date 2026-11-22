@@ -28,10 +28,11 @@ pub enum RecordSize {
     Full,
 }
 
-/// The fields of a message's own record: `m1021 01:35:31 call=m1006.15`.
+/// The fields of a message's own record: `s3:m9 01:35:31 call=s3:m5.15`.
 pub struct MessageRecord<'r> {
     pub ordinal: usize,
-    /// The sub-agent the message belongs to, in position 2.
+    /// The sub-agent the message belongs to: `same=` names a copy of its
+    /// own.
     pub subagent: Option<&'r SubagentTag>,
     /// ` user`, ` report` or ` result`; empty for the agent's own message
     /// and for a tool result naming its call in `call=`.
@@ -46,10 +47,11 @@ pub struct MessageRecord<'r> {
     pub trailing_atoms: String,
 }
 
-/// The fields of a call's record: `m1006.15 01:35:07 result=m1021`.
+/// The fields of a call's record: `s3:m5.15 01:35:07 result=s3:m9`.
 pub struct CallRecord<'e> {
     pub address: CallAddress,
-    /// The sub-agent whose message holds the call, in position 2.
+    /// The sub-agent whose message holds the call: `same=` names a copy of
+    /// its own.
     pub subagent: Option<&'e SubagentTag>,
     pub time: Option<TimeSpan>,
     /// The sub-agent the call launches: `launches=`.
@@ -79,18 +81,14 @@ pub enum CallCopy {
 /// `m5.1 result 10:00:00 tool=bash`.
 pub struct CallResultRecord<'r> {
     pub call: Call<'r>,
-    /// The sub-agent whose message holds the result, in position 2.
-    pub subagent: Option<&'r SubagentTag>,
     pub time: Option<TimeSpan>,
 }
 
-/// The record of consecutive messages hidden whole:
-/// `m3..m5 s2 hidden 11:41:32..11:41:40 tool-results=2 calls=m2.1..2`.
+/// The record of consecutive messages of one thread hidden whole:
+/// `s2:m3..m5 hidden 11:41:32..11:41:40 tool-results=2 calls=s2:m2.1..2`.
 pub struct HiddenRecord<'r> {
     pub first: usize,
     pub last: usize,
-    /// The sub-agent whose messages the run holds, in position 2.
-    pub subagent: Option<&'r SubagentTag>,
     pub time: Option<TimeSpan>,
     /// The sub-agents its hidden calls launch: `launches=`.
     pub launches: &'r [Handle],
@@ -108,8 +106,6 @@ pub struct HiddenRecord<'r> {
 /// `read ref=ch_…:m1006 lines=41..230 tools=true tool-results=false …`.
 pub struct OmittedRecord<'r> {
     pub ordinal: usize,
-    /// The sub-agent the message belongs to, in position 2.
-    pub subagent: Option<&'r SubagentTag>,
     /// The `ref=` of the message's conversation.
     pub reference: &'r str,
     /// The first and last omitted line, in the numbering `--lines` reads.
@@ -259,9 +255,8 @@ impl<'e> RecordWriter<'e> {
             .map(|&ordinal| addresses.message(ordinal))
             .collect::<Vec<_>>();
         self.output.push_str(&format!(
-            "{}{}{time}{}{}{}{}\n",
+            "{}{time}{}{}{}{}\n",
             addresses.call(record.address),
-            subagent_field(record.subagent),
             handle_atom("launches", record.launches),
             handle_atom("target", record.target),
             list_atom("result", &results),
@@ -284,9 +279,8 @@ impl<'e> RecordWriter<'e> {
             format!(" tool={}", escape_atom(call.tool))
         };
         self.output.push_str(&format!(
-            "{}{} result{time}{tool}\n",
-            self.addresses().call(call.address),
-            subagent_field(record.subagent)
+            "{} result{time}{tool}\n",
+            self.addresses().call(call.address)
         ));
         self.write_content_lines(lines);
     }
@@ -299,8 +293,7 @@ impl<'e> RecordWriter<'e> {
         let lines = format!("{}..{}", record.first_line, record.last_line);
         let message = addresses.message(record.ordinal);
         self.output.push_str(&format!(
-            "{message}{} omitted lines={lines}{}\n",
-            subagent_field(record.subagent),
+            "{message} omitted lines={lines}{}\n",
             calls_atom(addresses, record.dropped_calls)
         ));
         self.output.push_str(&format!(
@@ -332,9 +325,8 @@ impl<'e> RecordWriter<'e> {
             .filter(|&call| !self.has_call_record(call))
             .collect::<Vec<_>>();
         self.output.push_str(&format!(
-            "{}{} hidden{time}{}{}{}{}\n",
+            "{} hidden{time}{}{}{}{}\n",
             addresses.range(record.first, record.last),
-            subagent_field(record.subagent),
             handles_atom("launches", record.launches),
             handles_atom("target", record.targets),
             record.count_atoms,
@@ -483,20 +475,13 @@ pub(crate) fn message_record_start(
         .map(|call| escape_atom(call.tool))
         .collect::<Vec<_>>();
     format!(
-        "{}{}{}{time}{}{}{}",
+        "{}{}{time}{}{}{}",
         addresses.message(record.ordinal),
-        subagent_field(record.subagent),
         record.source_word,
         handle_atom("from", record.from),
         list_atom("call", &calls),
         list_atom("tool", &tools)
     )
-}
-
-/// ` s326`: position 2 of a record of the sub-agent's; empty for the
-/// session's own records.
-fn subagent_field(subagent: Option<&SubagentTag>) -> String {
-    handles_field(subagent.map(|subagent| subagent.handle).as_slice())
 }
 
 /// ` s326,s327`: the handles after the address of a record covering these
@@ -573,34 +558,35 @@ impl MessageRuns {
         runs
     }
 
-    /// `ch_…:m3..m5;ch_…:m9`: a ref per run of the messages of the
-    /// conversation at `reference`, whose messages `addresses` names.
-    fn refs(&self, reference: &str, addresses: &MessageAddresses) -> String {
-        self.0
-            .iter()
-            .map(|&(first, last)| {
-                escape_atom(&message_range_ref(reference, addresses, first, last))
-            })
-            .collect::<Vec<_>>()
-            .join(";")
+    /// `m3..m5`, `s3:m2`: the refs, after the conversation's, that read
+    /// exactly the runs' messages, as [`MessageAddresses::refs`] names them.
+    pub(crate) fn named(&self, addresses: &MessageAddresses) -> Vec<String> {
+        addresses.refs(&self.0)
+    }
+
+    /// `ch_…:m3..m5;ch_…:s3:m2`: the refs, [`MessageAddresses::refs`], that
+    /// read exactly the runs' messages of the conversation at `reference`.
+    fn refs(&self, reference: &str, addresses: &MessageAddresses) -> Vec<String> {
+        self.named(addresses)
+            .into_iter()
+            .map(|messages| escape_atom(&format!("{reference}:{messages}")))
+            .collect()
     }
 }
 
 /// `read ref=ch_…:m7..m9 tools=true tool-results=false thinking=false
-/// subagents=true`, or `read refs=ch_…:m3..m5;ch_…:m9 …` for several runs:
-/// the read showing `runs` of the messages at `reference` with `flags`.
+/// subagents=true`, or `read refs=ch_…:m3..m5;ch_…:s3:m2 …` for several
+/// refs: the read showing `runs` of the messages at `reference` with
+/// `flags`.
 pub(crate) fn read_record(
     reference: &str,
     addresses: &MessageAddresses,
     runs: &MessageRuns,
     flags: ContentVisibility,
 ) -> String {
-    let key = if runs.0.len() == 1 { "ref" } else { "refs" };
-    format!(
-        "read {key}={}{}\n",
-        runs.refs(reference, addresses),
-        flags.recipe_atoms()
-    )
+    let refs = runs.refs(reference, addresses);
+    let key = if refs.len() == 1 { "ref" } else { "refs" };
+    format!("read {key}={}{}\n", refs.join(";"), flags.recipe_atoms())
 }
 
 /// `continue read refs=ch_…:m3..m5;ch_…:m9 tools=true tool-results=false
@@ -614,20 +600,9 @@ pub(crate) fn continue_read_record(
 ) -> String {
     format!(
         "continue read refs={}{}\n",
-        runs.refs(reference, addresses),
+        runs.refs(reference, addresses).join(";"),
         flags.recipe_atoms()
     )
-}
-
-/// `ch_…:m7..m9`: the ref of messages `start` to `end` of the conversation at
-/// `reference`.
-pub(crate) fn message_range_ref(
-    reference: &str,
-    addresses: &MessageAddresses,
-    start: usize,
-    end: usize,
-) -> String {
-    format!("{reference}:{}", addresses.range(start, end))
 }
 
 pub(crate) fn conversation_record(resolved: &ResolvedConversation) -> String {

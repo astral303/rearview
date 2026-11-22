@@ -556,12 +556,14 @@ fn within_records_of(reference: &str) -> String {
 }
 
 /// The message the one-message `agent read` cases of `agent`'s session read,
-/// and the range its ranged `agent outline` case reads. Kimi Code's and Grok
-/// Build's cases read one message further on, because their sub-agent's
+/// and the range its ranged `agent outline` case reads. The one-message cases
+/// of Codex, Kimi Code and Grok Build read their sub-agent's answer: Kimi
+/// Code's and Grok Build's one message further on, because their sub-agent's
 /// thinking is a message of its own ahead of its answer.
 fn case_messages_of(agent: &str) -> (&'static str, &'static str) {
     match agent {
-        "kimi" | "grok" => ("m4", "m2..m6"),
+        "kimi" | "grok" => ("s1:m3", "m2..m6"),
+        "codex" => ("s1:m2", "m2..m5"),
         _ => ("m3", "m2..m5"),
     }
 }

@@ -1242,19 +1242,33 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn read_validation_rejects_focus_outside_range() {
-        let keys = vec![key(
+    fn read_rejects_focus_outside_its_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_jsonl(
+            &dir,
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            &(1..=5)
+                .map(|number| user(&format!("question {number}")))
+                .collect::<Vec<_>>(),
+        );
+        let keys = vec![AgentConversationKey::new(
             "project-a",
             "12345678-1234-4234-9234-123456789abc.jsonl",
+            path,
         )];
         let conversation = keys[0].conversation_ref().canonical();
         let args = read_args(
             vec![format!("{conversation}:m2..m4")],
             Some("m5".to_string()),
         );
-        let err =
-            resolve_agent_read_args(&args, &keys, &SystemCanonicaliser::shared()).unwrap_err();
-        assert!(err.to_string().contains("outside"));
+
+        let err = run_agent_read(&args, Some(&keys)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("focus m5 is outside the requested read range"),
+            "the error names the focus: {err}"
+        );
     }
 
     fn write_jsonl(dir: &tempfile::TempDir, filename: &str, lines: &[String]) -> PathBuf {
@@ -1436,7 +1450,18 @@ mod agent_command_tests {
                 preview: "cache warming answer".to_string(),
                 focus_range: agent::refs::MessageRange::single(2),
                 times: None,
-                read_range: agent::refs::MessageRange { start: 1, end: 3 },
+                addresses: Some(agent::address::HitAddresses {
+                    focus: agent::refs::ThreadRange {
+                        thread: agent::refs::Thread::Parent,
+                        range: agent::refs::MessageRange::single(2),
+                        is_range: true,
+                    },
+                    read: agent::refs::ThreadRange {
+                        thread: agent::refs::Thread::Parent,
+                        range: agent::refs::MessageRange { start: 1, end: 3 },
+                        is_range: true,
+                    },
+                }),
             }],
             groups: vec![],
             flat: true,
@@ -1775,14 +1800,17 @@ mod agent_command_tests {
             &[semantic_hit],
         ));
 
-        assert!(within.contains("focus=m5..m5"));
+        assert!(
+            within.contains("focus=m4..m4"),
+            "the session's own fourth message follows a sub-agent's: {within}"
+        );
         let read_line = within
             .lines()
             .find(|line| line.starts_with("read ref="))
             .expect("within output should include a read ref");
         let output = run_agent_read(&read_args_from_line(read_line), Some(&keys)).unwrap();
 
-        assert!(is_agent_record(record_of(&output, "m5")), "{output}");
+        assert!(is_agent_record(record_of(&output, "m4")), "{output}");
         assert!(output.contains("final assistant text"));
     }
 
@@ -2127,15 +2155,15 @@ mod agent_command_tests {
             at("2026-10-14T15:42:00Z"),
             String::new(),
         ];
-        for (index, time) in expected.iter().enumerate() {
-            let address = format!("m{}", index + 1);
+        let addresses = ["m1", "m2", "m3", "m4", "s1:m1", "m5"];
+        for (address, time) in addresses.into_iter().zip(&expected) {
             assert_eq!(
-                positional_time(record_of(&read, &address)),
+                positional_time(record_of(&read, address)),
                 *time,
                 "read {address}"
             );
             assert_eq!(
-                positional_time(record_of(&outline, &address)),
+                positional_time(record_of(&outline, address)),
                 *time,
                 "outline {address}"
             );
@@ -2177,7 +2205,7 @@ mod agent_command_tests {
     }
 
     /// m2 shows its text and hides its two calls; m3 and m4 hold a result
-    /// alone, and m5 is a sub-agent's reply.
+    /// alone, and a sub-agent's reply follows m4.
     #[test]
     fn read_reports_what_its_flags_hide() {
         let dir = tempfile::tempdir().unwrap();
@@ -2210,9 +2238,9 @@ mod agent_command_tests {
             )
         );
         assert_eq!(
-            record_of(&read, "m5"),
+            record_of(&read, "s1:m1"),
             format!(
-                "m5 s1 hidden{} subagents=1",
+                "s1:m1 hidden{} subagents=1",
                 record_time("2026-10-14T15:42:00Z", "2026-10-14T15:42:00Z")
             )
         );
@@ -2340,15 +2368,18 @@ mod agent_command_tests {
         }
     }
 
-    /// The `mN` of each message record of a read or an outline.
+    /// The `mN` or `sN:mK` of each message record of a read or an outline.
     fn ordinals_shown(output: &str) -> Vec<&str> {
         output
             .lines()
             .filter_map(|line| line.split_whitespace().next())
             .filter(|atom| {
-                atom.strip_prefix('m').is_some_and(|digits| {
-                    !digits.is_empty() && digits.chars().all(|digit| digit.is_ascii_digit())
-                })
+                agent::test_support::split_handle(atom)
+                    .1
+                    .strip_prefix('m')
+                    .is_some_and(|digits| {
+                        !digits.is_empty() && digits.chars().all(|digit| digit.is_ascii_digit())
+                    })
             })
             .collect()
     }
@@ -2424,17 +2455,20 @@ mod agent_command_tests {
         window_args("2026-10-14T15:39:00Z", "2026-10-14T15:40:00Z")
     }
 
-    /// m4 at 15:41:31 and m5 at 15:42:00 fall on the bounds.
+    /// m4 at 15:41:31 and the sub-agent's reply at 15:42:00 fall on the
+    /// bounds.
     fn window_bounded_by_m4_and_m5() -> cli::MessageTimeArgs {
         window_args("2026-10-14T15:41:31Z", "2026-10-14T15:42:00Z")
     }
 
-    /// After m4 and before m5: messages on either side, none inside.
+    /// After m4 and before the sub-agent's reply: messages on either side,
+    /// none inside.
     fn window_between_m4_and_m5() -> cli::MessageTimeArgs {
         window_args("2026-10-14T15:41:32Z", "2026-10-14T15:41:59Z")
     }
 
-    /// m1 to m5. m6 does not have a time, so it falls outside.
+    /// m1 to m4 and the sub-agent's reply. m5 does not have a time, so it
+    /// falls outside.
     fn window_around_every_timed_message() -> cli::MessageTimeArgs {
         window_args("2026-10-14T15:00:00Z", "2026-10-14T16:00:00Z")
     }
@@ -2448,13 +2482,13 @@ mod agent_command_tests {
             (
                 "on the bounds",
                 window_bounded_by_m4_and_m5(),
-                vec!["m4", "m5"],
+                vec!["m4", "s1:m1"],
             ),
             ("idle", window_between_m4_and_m5(), vec![]),
             (
                 "every timed message",
                 window_around_every_timed_message(),
-                vec!["m1", "m2", "m3", "m4", "m5"],
+                vec!["m1", "m2", "m3", "m4", "s1:m1"],
             ),
         ] {
             let read = session.read("", window);
@@ -2465,6 +2499,8 @@ mod agent_command_tests {
         }
     }
 
+    /// `--tail` counts the session's own messages; the sub-agent's reply
+    /// after m4 prints with them.
     #[test]
     fn read_with_tail_holds_last_messages_inside_window() {
         let session = WindowedSession::new();
@@ -2472,8 +2508,8 @@ mod agent_command_tests {
         let unbounded = session.read_tail(2, cli::MessageTimeArgs::default());
         let windowed = session.read_tail(2, window_around_every_timed_message());
 
-        assert_eq!(ordinals_shown(&unbounded), ["m5", "m6"]);
-        assert_eq!(ordinals_shown(&windowed), ["m4", "m5"]);
+        assert_eq!(ordinals_shown(&unbounded), ["m4", "s1:m1", "m5"]);
+        assert_eq!(ordinals_shown(&windowed), ["m3", "m4", "s1:m1"]);
         assert!(header_has(&windowed, "messages-in-window=5"), "{windowed}");
     }
 
@@ -2482,11 +2518,11 @@ mod agent_command_tests {
         let session = WindowedSession::new();
 
         let both = session.read(":m3..m4", window_bounded_by_m4_and_m5());
-        let range_alone = session.read(":m5..m6", cli::MessageTimeArgs::default());
+        let range_alone = session.read(":m4..m5", cli::MessageTimeArgs::default());
 
-        assert_eq!(ordinals_shown(&both), ["m4"]);
-        assert!(header_has(&both, "messages-in-window=1"), "{both}");
-        assert_eq!(ordinals_shown(&range_alone), ["m5", "m6"]);
+        assert_eq!(ordinals_shown(&both), ["m4", "s1:m1"]);
+        assert!(header_has(&both, "messages-in-window=2"), "{both}");
+        assert_eq!(ordinals_shown(&range_alone), ["m4", "s1:m1", "m5"]);
         assert!(!range_alone.contains("messages-in-window"), "{range_alone}");
     }
 
@@ -2589,17 +2625,28 @@ mod agent_command_tests {
             )
             .unwrap()
         };
-        let semantic_search = agent::search::run_global_semantic_search(
+        // A search gives semantic hits their addresses once it reads their
+        // messages, as `agent search` does after ranking.
+        let searched = agent::search::SearchedTranscript::from(load_transcript(&path));
+        let with_addresses = |mut output| {
+            agent::search::attach_semantic_hit_metadata(
+                &mut output,
+                &resolved,
+                searched.with_places(),
+            );
+            output
+        };
+        let semantic_search = with_addresses(agent::search::run_global_semantic_search(
             &search_request(SearchMode::Semantic),
             &inputs,
             &ranked,
-        );
-        let hybrid_search = agent::search::run_global_hybrid_search(
+        ));
+        let hybrid_search = with_addresses(agent::search::run_global_hybrid_search(
             &search_request(SearchMode::Hybrid),
             lexical_search(SearchMode::Lexical),
             &ranked,
             &inputs,
-        );
+        ));
 
         let cases = [
             ("lexical within", within("cache", SearchMode::Lexical)),
@@ -2669,7 +2716,7 @@ mod agent_command_tests {
             &[semantic_hit],
         ));
 
-        assert!(rendered.contains("focus=m2..m2"));
+        assert!(rendered.contains("focus=s1:m1..m1"), "{rendered}");
         assert!(rendered.contains("tools=false tool-results=false thinking=false subagents=true"));
         let read_line = rendered
             .lines()
