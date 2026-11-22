@@ -1,5 +1,5 @@
 use crate::agent::diagnostic::{AgentWarning, format_warning_records};
-use crate::agent::protocol::{MessageLineRange, ProtocolOptions};
+use crate::agent::protocol::{MatchContext, MessageLineRange, ProtocolOptions};
 use crate::agent::refs::{AgentConversationKey, ResolvedConversation};
 use crate::agent::time_span::{DayRecords, RecordTime, TimeSpan};
 use crate::agent::transcript::{
@@ -12,6 +12,15 @@ use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+/// `--context lines` of a `--match` slice: `lines` lines on each side of a
+/// match.
+pub fn lines_around(lines: usize) -> MatchContext {
+    MatchContext {
+        before: lines,
+        after: lines,
+    }
+}
 
 /// Asserts that `row` counts `count` messages, as `transcript` numbers them,
 /// and that each of `markers` sits in a semantic turn carrying the ordinal of
@@ -461,7 +470,8 @@ const READ_RUNS: &[OrderedAtom] = &[
 ];
 
 /// A message's record in a read: `m3 s1 01:50:01 call=m2.1..2 tool=Agent`.
-/// `slice=match=…` is followed by `context=` and `hits=`.
+/// `slice=match=…` is followed by `context=`, or by `before-context=` and
+/// `after-context=`, then by `hits=`.
 const READ_MESSAGE: &[OrderedAtom] = &[
     optional("from", is_handle),
     optional("call", is_call_list),
@@ -472,6 +482,8 @@ const READ_MESSAGE: &[OrderedAtom] = &[
     optional("hidden-thinking", is_digits),
     optional("slice", is_slice),
     optional("context", is_digits),
+    optional("before-context", is_digits),
+    optional("after-context", is_digits),
     optional("hits", is_digits),
     optional("anchor", is_atom),
 ];

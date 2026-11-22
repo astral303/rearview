@@ -51,8 +51,8 @@ use crate::agent::search::{
     AgentWithinRequest, exact_phrase_query, format_agent_output_with_warnings, run_within_search,
 };
 use crate::agent::test_support::{
-    MessageKey, PositionalRecord, addressed_messages, atom, message_address, outline_records,
-    read_records, segment_records, written_at,
+    MessageKey, PositionalRecord, addressed_messages, atom, lines_around, message_address,
+    outline_records, read_records, segment_records, written_at,
 };
 use crate::agent::transcript::AgentTranscript;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
@@ -770,7 +770,7 @@ fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<S
                 None,
                 Some(&ReadSlice::Match {
                     query: marker.text.to_owned(),
-                    context: 0,
+                    context: lines_around(0),
                 }),
                 EVERY_FLAG,
             )

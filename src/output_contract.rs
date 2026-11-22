@@ -605,6 +605,17 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         "--match",
         "the",
     ]);
+    run(&[
+        "agent",
+        "read",
+        &format!("{reference}:{message}"),
+        "--match",
+        "the",
+        "-B",
+        "0",
+        "-A",
+        "1",
+    ]);
     run(&["agent", "read", reference, "--tail", "3"]);
     run(&[
         "agent",

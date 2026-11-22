@@ -1,5 +1,5 @@
 use crate::agent::address::HitContext;
-use crate::agent::protocol::MessageLineRange;
+use crate::agent::protocol::{MatchContext, MessageLineRange};
 use crate::clock::Clock;
 use crate::history::Source;
 use crate::history::provider::providers;
@@ -358,9 +358,22 @@ pub struct AgentReadArgs {
     /// Find text within one message and return matching lines with context
     #[arg(long = "match", value_parser = non_empty_string, conflicts_with = "lines")]
     pub match_query: Option<String>,
-    /// Content lines to include before and after each match
-    #[arg(long, default_value_t = 3, requires = "match_query")]
+    /// Content lines to include before and after each match; -B and -A set
+    /// one side
+    #[arg(
+        short = 'C',
+        long,
+        value_name = "N",
+        default_value_t = 3,
+        requires = "match_query"
+    )]
     pub context: usize,
+    /// Content lines to include before each match; --context by default
+    #[arg(short = 'B', long, value_name = "N", requires = "match_query")]
+    pub before_context: Option<usize>,
+    /// Content lines to include after each match; --context by default
+    #[arg(short = 'A', long, value_name = "N", requires = "match_query")]
+    pub after_context: Option<usize>,
     /// Report time per stage, what was read, and peak memory on stderr
     #[arg(long)]
     pub perf_stats: bool,
@@ -436,6 +449,17 @@ impl MessageTimeArgs {
             self.before.as_ref(),
             clock,
         )
+    }
+}
+
+impl AgentReadArgs {
+    /// The lines `--match` shows around each match: `-B` and `-A` for their
+    /// side, else `--context`.
+    pub fn match_context(&self) -> MatchContext {
+        MatchContext {
+            before: self.before_context.unwrap_or(self.context),
+            after: self.after_context.unwrap_or(self.context),
+        }
     }
 }
 
@@ -1317,6 +1341,50 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_read_match_takes_context_lines_as_grep_takes_them() {
+        let context_of = |flags: &[&str]| {
+            let mut args = vec!["rearview", "agent", "read", "ch_abc123:m7", "--match", "x"];
+            args.extend_from_slice(flags);
+            match agent_command(Args::try_parse_from(args).unwrap()) {
+                AgentCommand::Read(read) => read.match_context(),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            context_of(&[]),
+            crate::agent::test_support::lines_around(3),
+            "three by default"
+        );
+        assert_eq!(
+            context_of(&["-C", "5"]),
+            crate::agent::test_support::lines_around(5)
+        );
+        assert_eq!(
+            context_of(&["-B", "1", "-A", "4"]),
+            MatchContext {
+                before: 1,
+                after: 4
+            }
+        );
+        assert_eq!(
+            context_of(&["--after-context", "0", "-C", "2"]),
+            MatchContext {
+                before: 2,
+                after: 0
+            },
+            "-A sets its side whatever -C"
+        );
+        assert_eq!(
+            context_of(&["--before-context", "6"]),
+            MatchContext {
+                before: 6,
+                after: 3
+            }
+        );
     }
 
     #[test]

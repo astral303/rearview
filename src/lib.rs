@@ -1046,6 +1046,8 @@ mod agent_command_tests {
             lines: None,
             match_query: None,
             context: 3,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: default_output(),
         }
@@ -1506,6 +1508,8 @@ mod agent_command_tests {
             lines: None,
             match_query: None,
             context: 3,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: AgentOutputFlags {
                 budget: Some(6000),

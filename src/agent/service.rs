@@ -4045,7 +4045,7 @@ impl AgentService {
                 .as_ref()
                 .map(|query| agent::protocol::ReadSlice::Match {
                     query: query.clone(),
-                    context: args.context,
+                    context: args.match_context(),
                 })
         };
         let mut warnings = discovery_warnings;
@@ -4538,6 +4538,8 @@ mod tests {
             lines: None,
             match_query: None,
             context: 3,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: output_flags(),
         }
@@ -10282,6 +10284,8 @@ mode = "hybrid"
             lines: None,
             match_query: None,
             context: 3,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: output_flags(),
         };
@@ -10323,6 +10327,8 @@ mode = "hybrid"
             lines: None,
             match_query: None,
             context: 3,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: output_flags(),
         };

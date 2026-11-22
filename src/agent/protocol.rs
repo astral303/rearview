@@ -85,7 +85,33 @@ impl FromStr for MessageLineRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadSlice {
     Lines(MessageLineRange),
-    Match { query: String, context: usize },
+    Match {
+        query: String,
+        context: MatchContext,
+    },
+}
+
+/// The content lines a `--match` slice shows before and after each
+/// matching line: `-B`, `-A` and `-C` of `agent read`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MatchContext {
+    pub before: usize,
+    pub after: usize,
+}
+
+impl MatchContext {
+    /// ` context=3`, or ` before-context=1 after-context=5` when the two
+    /// sides differ.
+    fn atoms(self) -> String {
+        if self.before == self.after {
+            format!(" context={}", self.before)
+        } else {
+            format!(
+                " before-context={} after-context={}",
+                self.before, self.after
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2624,14 +2650,14 @@ fn apply_read_slice<'a>(
             selected = matches
                 .iter()
                 .flat_map(|line| {
-                    line.saturating_sub(*context).max(1)
-                        ..=line.saturating_add(*context).min(lines.len())
+                    line.saturating_sub(context.before).max(1)
+                        ..=line.saturating_add(context.after).min(lines.len())
                 })
                 .collect();
             rendered.slice = Some(format!(
-                "match={} context={} hits={}",
+                "match={}{} hits={}",
                 escape_atom(query),
-                context,
+                context.atoms(),
                 matches.len()
             ));
         }
@@ -3640,8 +3666,8 @@ mod tests {
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{
         assert_each_budget_cuts_short_or_ends_with_warnings, cuts_checking_full, day_record,
-        local_time, record_time, source, subagent_text_message, text_message, text_message_at,
-        warnings_of_two_kinds, written_at,
+        lines_around, local_time, record_time, source, subagent_text_message, text_message,
+        text_message_at, warnings_of_two_kinds, written_at,
     };
     use crate::agent::transcript::AgentPartSource;
     use crate::log_entry::Tool;
@@ -4148,7 +4174,7 @@ mod tests {
             None,
             Some(&ReadSlice::Match {
                 query: "needle".to_string(),
-                context: 1,
+                context: lines_around(1),
             }),
             options(),
         )
@@ -4158,6 +4184,39 @@ mod tests {
         assert!(output.contains("|  1: zero\n| >2: Needle first\n|  3: two\n| ...\n"));
         assert!(output.contains("|  5: four\n| >6: needle second\n|  7: six\n"));
         assert!(!output.contains("4: three"));
+    }
+
+    #[test]
+    fn match_slice_shows_lines_before_and_after_each_match_as_its_sides_count_them() {
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "zero\none\nNeedle\nthree\nfour\nfive",
+        )]);
+        let read_with = |before, after| {
+            read_slice(
+                &transcript,
+                ReadSlice::Match {
+                    query: "needle".to_owned(),
+                    context: MatchContext { before, after },
+                },
+            )
+        };
+
+        let after_only = read_with(0, 2);
+        let past_both_ends = read_with(5, 9);
+
+        assert!(
+            after_only.contains(" slice=match=needle before-context=0 after-context=2 hits=1 ")
+                && after_only.ends_with("\n| >3: Needle\n|  4: three\n|  5: four\n"),
+            "two lines after the match and none before: {after_only}"
+        );
+        assert!(
+            past_both_ends.contains(" before-context=5 after-context=9 hits=1 ")
+                && past_both_ends.contains("\n|  1: zero\n")
+                && past_both_ends.ends_with("\n|  6: five\n"),
+            "the message's first and last lines end the context: {past_both_ends}"
+        );
     }
 
     #[test]
@@ -4176,7 +4235,7 @@ mod tests {
             None,
             Some(&ReadSlice::Match {
                 query: "needle".to_string(),
-                context: 3,
+                context: lines_around(3),
             }),
             options(),
         )
@@ -4258,7 +4317,7 @@ mod tests {
                 None,
                 Some(&ReadSlice::Match {
                     query: "needle".to_string(),
-                    context: 0,
+                    context: lines_around(0),
                 }),
                 ProtocolOptions {
                     budget,
@@ -4327,7 +4386,7 @@ mod tests {
             &text_and_two_calls(),
             ReadSlice::Match {
                 query: "cargo test".to_owned(),
-                context: 0,
+                context: lines_around(0),
             },
         );
 
@@ -7372,7 +7431,7 @@ mod tests {
             ReadSlice::Lines(line_range(2, 2)),
             ReadSlice::Match {
                 query: "line".to_owned(),
-                context: 0,
+                context: lines_around(0),
             },
         ] {
             let output = format_read(
@@ -7667,7 +7726,7 @@ mod tests {
                 &transcript,
                 ReadSlice::Match {
                     query: last_line.to_owned(),
-                    context: 0,
+                    context: lines_around(0),
                 },
             );
 
