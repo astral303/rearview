@@ -233,6 +233,27 @@
 
 #### `rearview agent` commands
 
+- Fix a message's number in `agent` commands changing when a sub-agent writes
+  one more message. A sub-agent's messages are now numbered apart from the
+  session's own: `s3:m5` is sub-agent s3's fifth message, `s3:m5.2` its
+  second call and `s3:m2..m5` a range, and `m5` is the session's own fifth
+  message.
+  - A message number recorded before this change can now read another
+    message. An `anchor=` reads the message it did.
+  - With `--subagents`, `agent read <ref>:m7..m9` now reads m7 to m9 and
+    every sub-agent message written after m7 and before m10. `<ref>:m7` reads
+    one message.
+  - `--tail N` now counts the session's own messages, or the sub-agent's for
+    `<ref>:s3`.
+  - `agent outline` and `agent sessions` now count the two apart, such as
+    `messages=30 subagent-messages=18`, and with a time window
+    `messages-in-window=` and `subagent-messages-in-window=`.
+- Fix a sub-agent's handle, such as `s3`, changing when it writes its first
+  message after a sub-agent launched later, in a session that links each
+  launching call to its sub-agent. A sub-agent now gets its handle at that
+  call.
+  - A launch that failed or never wrote a message now has a handle:
+    `agent read <ref>:s3` prints the launching message and the call's result.
 - Fix semantic and hybrid `agent search` and `agent within` embedding
   passages, and reporting `partial-index`, after the session list's semantic
   search or `--generate-semantic-cache` had embedded every session. They now
