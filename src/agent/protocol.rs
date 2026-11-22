@@ -12,7 +12,7 @@ use crate::agent::record_writer::{
 };
 use crate::agent::refs::{MessageRange, ResolvedConversation};
 use crate::agent::sanitize::sanitize_agent_text;
-use crate::agent::subagents::{Handle, SubagentTag, Subagents};
+use crate::agent::subagents::{Handle, SubagentHandles, SubagentTag, Subagents};
 use crate::agent::time_span::{
     Day, DayRecords, RangeSpans, RecordTime, TimeSpan, output_offset, time_atoms, tz_atom,
 };
@@ -187,6 +187,9 @@ pub enum ReadPriority {
 struct ReadConversation<'a> {
     resolved: &'a ResolvedConversation,
     addresses: &'a MessageAddresses,
+    /// The sub-agent a read of `REF:sN` names. Its legend record prints with
+    /// the read's records, also when none of its messages shows.
+    subagent: Option<&'a SubagentTag>,
 }
 
 #[derive(Clone, Debug)]
@@ -928,6 +931,12 @@ impl<'a> ReadEntry<'a> {
         }
     }
 
+    /// The sub-agent whose legend record prints with the entry: the one
+    /// whose messages it holds, else the one its read names.
+    fn legend(&self) -> Option<&SubagentTag> {
+        self.subagent().or(self.conversation().subagent)
+    }
+
     fn write<'e>(&'e self, writer: &mut RecordWriter<'e>) {
         match self {
             Self::Message { rendered, hidden } => {
@@ -981,7 +990,7 @@ fn write_entries<'e>(
     }) {
         let mut subagents = run
             .iter()
-            .filter_map(|&index| entries[index].subagent())
+            .filter_map(|&index| entries[index].legend())
             .collect::<Vec<_>>();
         subagents.sort_by_key(|subagent| subagent.handle);
         subagents.dedup();
@@ -1979,9 +1988,10 @@ struct TranscriptIndex<'a> {
 impl<'a> TranscriptIndex<'a> {
     fn of(transcript: &'a AgentTranscript) -> Self {
         let links = CallLinks::of(transcript);
+        let handles = SubagentHandles::of(transcript);
         let addresses = MessageAddresses::of(transcript);
         Self {
-            subagents: Subagents::of(transcript, &links, &addresses),
+            subagents: Subagents::of(transcript, &links, &handles, &addresses),
             links,
             addresses,
         }
@@ -1999,6 +2009,13 @@ fn read_entries<'a>(
     shape: &ReadShape<'_>,
 ) -> Result<Vec<ReadEntry<'a>>> {
     let options = shape.options;
+    let conversation = ReadConversation {
+        resolved: request.resolved,
+        addresses: &index.addresses,
+        subagent: request
+            .subagent
+            .and_then(|handle| index.subagents.tag(handle)),
+    };
     let mut entries = Vec::new();
     let mut run: Option<HiddenRun<'a>> = None;
     for message in messages {
@@ -2017,6 +2034,7 @@ fn read_entries<'a>(
         ) {
             Some(mut rendered) => {
                 entries.extend(hidden_run_entry(run.take()));
+                rendered.conversation = conversation;
                 if shape.anchors {
                     rendered.anchor =
                         Some(request.transcript.message_anchor(request.resolved, message));
@@ -2062,10 +2080,7 @@ fn read_entries<'a>(
                     _ => {
                         entries.extend(hidden_run_entry(run.take()));
                         run = Some(HiddenRun::new(
-                            ReadConversation {
-                                resolved: request.resolved,
-                                addresses: &index.addresses,
-                            },
+                            conversation,
                             options.visibility(),
                             shape.zone,
                             next,
@@ -2176,6 +2191,7 @@ fn shown_message<'a>(
     let conversation = ReadConversation {
         resolved,
         addresses: &index.addresses,
+        subagent: None,
     };
     render_message(
         conversation,
@@ -3065,7 +3081,7 @@ impl<'h, 'e> ReadPartSizes<'h, 'e> {
                 .iter()
                 .map(|entry| {
                     entry
-                        .subagent()
+                        .legend()
                         .map(|subagent| (subagent.handle, subagent.legend().chars().count()))
                 })
                 .collect(),
@@ -6623,6 +6639,183 @@ mod tests {
         );
         assert!(records.contains(&"m2.1 launches=s1"), "{output}");
         assert!(records.contains(&"m2.2 launches=s2"), "{output}");
+    }
+
+    /// m2.1 launches `alpha` and m2.2 `ghost`, whose call fails in m3
+    /// without a message of its own; m4.1 launches `beta`, which writes m5
+    /// before alpha writes m6. `launch` makes the call with an id, and
+    /// `written` a message of the sub-agent that call launched.
+    fn session_with_a_launch_without_messages(
+        launch: impl Fn(&str) -> AgentMessagePart,
+        written: impl Fn(usize, &str) -> AgentMessage,
+    ) -> AgentTranscript {
+        use AgentMessageRole::{Assistant, User};
+        transcript(vec![
+            text_message(1, User, "Survey the repo"),
+            message(2, Assistant, vec![launch("alpha"), launch("ghost")]),
+            message(
+                3,
+                User,
+                vec![result_for(
+                    "ghost",
+                    "agent path already exists",
+                    source(User),
+                )],
+            ),
+            message(4, Assistant, vec![launch("beta")]),
+            written(5, "beta"),
+            written(6, "alpha"),
+        ])
+    }
+
+    fn claude_session_with_a_launch_without_messages() -> AgentTranscript {
+        session_with_a_launch_without_messages(
+            |id| agent_call(id, id, "Explore"),
+            |ordinal, id| {
+                let text = AgentMessagePart::Text {
+                    text: format!("{id} reads"),
+                    source: source(AgentMessageRole::Assistant),
+                };
+                subagent_message(ordinal, AgentMessageRole::Assistant, vec![text], id, id)
+            },
+        )
+    }
+
+    fn codex_session_with_a_launch_without_messages() -> AgentTranscript {
+        let spawn = |id: &str| AgentMessagePart::ToolUse {
+            id: id.to_owned(),
+            name: "spawn_agent".to_owned(),
+            tool: Tool::Agent,
+            input: json!({"description": id}),
+            source: source(AgentMessageRole::Assistant),
+        };
+        session_with_a_launch_without_messages(spawn, |ordinal, id| {
+            codex_scout_message(ordinal, "Reading.", &format!("thread-{id}"), id)
+        })
+    }
+
+    #[test]
+    fn launch_without_messages_holds_handle_in_launch_order() {
+        for (transcript, alpha, beta) in [
+            (
+                claude_session_with_a_launch_without_messages(),
+                "subagent s1 type=Explore launch=m2 span=m6 : alpha",
+                "subagent s3 type=Explore launch=m4 span=m5 : beta",
+            ),
+            (
+                codex_session_with_a_launch_without_messages(),
+                "subagent s1 launch=m2 span=m6 : scout",
+                "subagent s3 launch=m4 span=m5 : scout",
+            ),
+        ] {
+            let output = read(&transcript, None, every_flag());
+
+            let records = records_after_conversation(&output);
+            assert_eq!(records[..2], [alpha, beta], "{output}");
+            for record in [
+                "m2.1 launches=s1",
+                "m2.2 launches=s2 result=m3",
+                "m4.1 launches=s3",
+                "m5 s3",
+                "m6 s1",
+            ] {
+                assert!(
+                    records.contains(&record),
+                    "the read shows {record}: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_of_launch_without_messages_shows_its_legend_launch_and_result() {
+        for (transcript, legend) in [
+            (
+                claude_session_with_a_launch_without_messages(),
+                "subagent s2 type=Explore launch=m2 : ghost",
+            ),
+            (
+                codex_session_with_a_launch_without_messages(),
+                "subagent s2 launch=m2 : ghost",
+            ),
+        ] {
+            let output = read_subagent(&transcript, 2).unwrap();
+
+            assert_eq!(
+                records_after_conversation(&output),
+                [
+                    legend,
+                    "m2.1 launches=s1",
+                    "m2.2 launches=s2 result=m3",
+                    "m3 call=m2.2",
+                ],
+                "{output}"
+            );
+        }
+    }
+
+    /// m2.1 launches `ghost`, which never writes, before m3.1 launches the
+    /// first sub-agent the transcript links to its call.
+    #[test]
+    fn launch_without_messages_before_first_linked_launch_doesnt_hold_a_handle() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, "Survey the repo"),
+            message(2, Assistant, vec![agent_call("ghost", "ghost", "Explore")]),
+            message(3, Assistant, vec![agent_call("alpha", "alpha", "Explore")]),
+            subagent_message(
+                4,
+                Assistant,
+                vec![AgentMessagePart::Text {
+                    text: "alpha reads".to_owned(),
+                    source: source(Assistant),
+                }],
+                "alpha",
+                "alpha",
+            ),
+        ]);
+
+        let output = read(&transcript, None, every_flag());
+
+        let records = records_after_conversation(&output);
+        assert_eq!(
+            records[0], "subagent s1 type=Explore launch=m3 span=m4 : alpha",
+            "{output}"
+        );
+        assert!(records.contains(&"m2.1"), "{output}");
+        assert!(records.contains(&"m3.1 launches=s1"), "{output}");
+    }
+
+    /// m2.1 launches the fork `forked`; its transcript opens in m3 with a
+    /// copy of m2, whose call carries m2.1's id.
+    #[test]
+    fn fork_links_to_first_call_with_its_id_and_copy_launches_nothing() {
+        use AgentMessageRole::{Assistant, User};
+        let transcript = transcript(vec![
+            text_message(1, User, "Fix the review findings"),
+            message(2, Assistant, vec![agent_call("fork", "forked", "fork")]),
+            subagent_message(
+                3,
+                Assistant,
+                vec![agent_call("fork", "forked", "fork")],
+                "forked",
+                "fork",
+            ),
+        ]);
+
+        let output = read(&transcript, None, every_flag());
+
+        let records = records_after_conversation(&output);
+        assert_eq!(
+            records[..2],
+            [
+                "subagent s1 type=fork launch=m2 span=m3 : forked",
+                "m1 user",
+            ],
+            "{output}"
+        );
+        assert!(records.contains(&"m2.1 launches=s1"), "{output}");
+        assert!(records.contains(&"m3.1 s1"), "{output}");
     }
 
     /// m2 launches the scout, m3 sends to it, and m4 is the scout's first

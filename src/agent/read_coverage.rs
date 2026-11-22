@@ -28,6 +28,8 @@
 //!   messages it shows, and no other.
 //! - A read of one sub-agent shows exactly its messages, its launch and its
 //!   reports.
+//! - Handles number the sub-agents in the order they start: at their
+//!   launch, else at their first message.
 //! - When exact search finds a marker in a message, a read of that message
 //!   alone with `--match <marker>` reports a hit.
 
@@ -199,10 +201,12 @@ fn uncovered_messages(session: &AgentSession) -> Vec<String> {
         .collect()
 }
 
-/// The launch and report messages a legend record names.
+/// The launch, first and report messages a legend record names.
 #[derive(Default)]
 struct LegendLinks {
     launch: Option<usize>,
+    /// The first message of `span=`.
+    first: Option<usize>,
     reports: Vec<usize>,
 }
 
@@ -226,6 +230,8 @@ fn legend(output: &str) -> HashMap<String, LegendLinks> {
             for field in fields {
                 if let Some(launch) = field.strip_prefix("launch=") {
                     links.launch = ordinals(launch).first().copied();
+                } else if let Some(span) = field.strip_prefix("span=") {
+                    links.first = Some(*addressed_messages(span).start());
                 } else if let Some(reports) = field.strip_prefix("report=") {
                     links.reports = ordinals(reports);
                 }
@@ -443,6 +449,45 @@ fn every_agents_sub_agent_read_alone_shows_exactly_its_messages_launch_and_repor
     assert!(misread.is_empty(), "{}", misread.join("\n"));
     assert!(launches > 0, "no legend names a launch");
     assert!(reports > 0, "no legend names a report");
+}
+
+/// Each pair of consecutive handles in `session`'s legend whose sub-agents
+/// start out of order, a sub-agent starting at its launch, else at its first
+/// message; and how many pairs there are.
+fn subagents_out_of_launch_order(session: &AgentSession) -> (Vec<String>, usize) {
+    let legend = legend(&read(session, EVERY_FLAG));
+    let mut starts = legend
+        .iter()
+        .map(|(handle, links)| {
+            let number = handle.strip_prefix('s').unwrap().parse::<usize>().unwrap();
+            (number, links.launch.or(links.first).unwrap())
+        })
+        .collect::<Vec<_>>();
+    starts.sort_unstable();
+    let unordered = starts
+        .windows(2)
+        .filter(|pair| pair[0].1 > pair[1].1)
+        .map(|pair| {
+            format!(
+                "{:?}: s{} starts at m{}, after s{} at m{}",
+                session.row.source, pair[0].0, pair[0].1, pair[1].0, pair[1].1
+            )
+        })
+        .collect();
+    (unordered, starts.len().saturating_sub(1))
+}
+
+#[test]
+fn every_agents_handles_follow_order_of_subagents_starts() {
+    let (mut unordered, mut pairs) = (Vec::new(), 0);
+    for session in every_record_sessions() {
+        let (session_unordered, session_pairs) = subagents_out_of_launch_order(&session);
+        unordered.extend(session_unordered);
+        pairs += session_pairs;
+    }
+
+    assert!(unordered.is_empty(), "{}", unordered.join("\n"));
+    assert!(pairs > 0, "a session has two sub-agents");
 }
 
 #[test]
