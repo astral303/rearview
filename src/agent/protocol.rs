@@ -210,18 +210,18 @@ impl ReadRequest<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub struct ProtocolFocus {
+pub struct ProtocolHit {
     pub conversation_full_ref: Option<String>,
     pub range: MessageRange,
-    /// The sub-agent of a `--focus sN:mA..mB`: its messages alone are
-    /// focused. `None` for the session's own messages.
+    /// The sub-agent of a `--hit sN:mA..mB`: its messages alone are the
+    /// hit. `None` for the session's own messages.
     pub subagent: Option<Handle>,
 }
 
-impl ProtocolFocus {
-    /// True when `entry` is of the focused conversation and, for a
-    /// sub-agent's focus, holds that sub-agent's messages.
-    fn is_of_focused_thread(&self, entry: &ReadEntry<'_>) -> bool {
+impl ProtocolHit {
+    /// True when `entry` is of the hit's conversation and, for a
+    /// sub-agent's hit, contains that sub-agent's messages.
+    fn is_of_hit_thread(&self, entry: &ReadEntry<'_>) -> bool {
         self.conversation_full_ref
             .as_deref()
             .is_none_or(|target| entry.conversation().resolved.reference.full_ref() == target)
@@ -237,7 +237,7 @@ impl ProtocolFocus {
 #[derive(Clone, Debug)]
 pub enum ReadPriority {
     Start,
-    Focus(ProtocolFocus),
+    Hit(ProtocolHit),
     /// Each request's last N shown messages, and each request's end first.
     Tail(NonZeroUsize),
 }
@@ -1263,11 +1263,11 @@ fn last_atom(requests: &[ReadRequest<'_>]) -> String {
 #[cfg(test)]
 pub fn format_read(
     requests: &[ReadRequest<'_>],
-    focus: Option<ProtocolFocus>,
+    hit: Option<ProtocolHit>,
     slice: Option<&ReadSlice>,
     options: ProtocolOptions,
 ) -> Result<String> {
-    let priority = focus.map_or(ReadPriority::Start, ReadPriority::Focus);
+    let priority = hit.map_or(ReadPriority::Start, ReadPriority::Hit);
     format_read_with_warnings(
         requests,
         priority,
@@ -1333,9 +1333,9 @@ pub fn format_read_with_warnings(
         warning_count,
         &warning_records,
     );
-    let (focus, kept_end) = match priority {
+    let (hit, kept_end) = match priority {
         ReadPriority::Start => (None, KeptEnd::Start),
-        ReadPriority::Focus(focus) => (Some(focus), KeptEnd::Start),
+        ReadPriority::Hit(hit) => (Some(hit), KeptEnd::Start),
         ReadPriority::Tail(_) => (
             None,
             KeptEnd::RequestEnds(TailOrder::new(&request_entry_counts)),
@@ -1343,7 +1343,7 @@ pub fn format_read_with_warnings(
     };
 
     let budget = budget_beside_warnings(options.budget, &warning_records);
-    let protected = focused_indices(&entries, focus.as_ref());
+    let protected = hit_indices(&entries, hit.as_ref());
     let header_atoms = header.fixed_atoms(written_at);
     let fixed_parts = ReadFixedParts {
         header_atoms: &header_atoms,
@@ -1353,7 +1353,7 @@ pub fn format_read_with_warnings(
         mut selected,
         truncated,
         full,
-    } = kept_end.select(&entries, focus, budget, fixed_parts);
+    } = kept_end.select(&entries, hit, budget, fixed_parts);
     header.full = full;
     let spans = entries.iter().map(EntrySpan::of).collect::<Vec<_>>();
     let render = |entries: &[ReadEntry<'_>], selected: &[usize], cut: &str, size| {
@@ -3032,18 +3032,18 @@ fn over_budget_ranges(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> St
     }
 }
 
-/// The entries holding a message inside `focus`.
-fn focused_indices(entries: &[ReadEntry<'_>], focus: Option<&ProtocolFocus>) -> BTreeSet<usize> {
-    let Some(focus) = focus else {
+/// The entries containing a message inside `hit`.
+fn hit_indices(entries: &[ReadEntry<'_>], hit: Option<&ProtocolHit>) -> BTreeSet<usize> {
+    let Some(hit) = hit else {
         return BTreeSet::new();
     };
     entries
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| {
-            (focus.is_of_focused_thread(entry)
-                && focus.range.start <= entry.last_ordinal()
-                && entry.first_ordinal() <= focus.range.end)
+            (hit.is_of_hit_thread(entry)
+                && hit.range.start <= entry.last_ordinal()
+                && entry.first_ordinal() <= hit.range.end)
                 .then_some(index)
         })
         .collect()
@@ -3051,7 +3051,7 @@ fn focused_indices(entries: &[ReadEntry<'_>], focus: Option<&ProtocolFocus>) -> 
 
 /// The part of a read its budget keeps first.
 enum KeptEnd {
-    /// The read's start, or its focus and the entries around it.
+    /// The read's start, or its hit and the entries around it.
     Start,
     RequestEnds(TailOrder),
 }
@@ -3060,12 +3060,12 @@ impl KeptEnd {
     fn select(
         &self,
         entries: &[ReadEntry<'_>],
-        focus: Option<ProtocolFocus>,
+        hit: Option<ProtocolHit>,
         budget: Option<usize>,
         fixed_parts: ReadFixedParts<'_>,
     ) -> BudgetSelection {
         match self {
-            Self::Start => select_for_budget(entries, focus, budget, fixed_parts),
+            Self::Start => select_for_budget(entries, hit, budget, fixed_parts),
             Self::RequestEnds(order) => {
                 select_request_ends_for_budget(entries, order, budget, fixed_parts)
             }
@@ -3409,12 +3409,12 @@ impl<'h, 'e> ReadPartSizes<'h, 'e> {
     }
 }
 
-/// A selection that grows from a read's start or focus, one neighbouring
+/// A selection that grows from a read's start or hit, one neighbouring
 /// entry at a time, while the entries fit `budget`.
 struct GrowingSelection<'l, 'h, 'e> {
     layout: &'l CompactReadLayout<'h, 'e>,
     budget: usize,
-    /// True without a focus: an oversized entry is kept truncated.
+    /// True without a hit: an oversized entry is kept truncated.
     truncates_to_fit: bool,
     selected: BTreeSet<usize>,
     truncated: BTreeSet<usize>,
@@ -3450,21 +3450,21 @@ impl GrowingSelection<'_, '_, '_> {
 
 fn select_for_budget(
     entries: &[ReadEntry<'_>],
-    focus: Option<ProtocolFocus>,
+    hit: Option<ProtocolHit>,
     budget: Option<usize>,
     fixed_parts: ReadFixedParts<'_>,
 ) -> BudgetSelection {
-    select_for_budget_with_work(entries, focus, budget, fixed_parts).0
+    select_for_budget_with_work(entries, hit, budget, fixed_parts).0
 }
 
-/// The read's start, or its focus, then the entries next to it while they
-/// fit `budget`. Without a focus, an oversized entry is kept truncated when
+/// The read's start, or its hit, then the entries next to it while they
+/// fit `budget`. Without a hit, an oversized entry is kept truncated when
 /// its header and its [`TRUNCATION_FLOOR_CHARS`] fit, and the selection
-/// continues with the entries after it. With a focus, the entries around it
+/// continues with the entries after it. With a hit, the entries around it
 /// are shown whole or omitted.
 fn select_for_budget_with_work(
     entries: &[ReadEntry<'_>],
-    focus: Option<ProtocolFocus>,
+    hit: Option<ProtocolHit>,
     budget: Option<usize>,
     fixed_parts: ReadFixedParts<'_>,
 ) -> (BudgetSelection, SelectionWork) {
@@ -3483,14 +3483,14 @@ fn select_for_budget_with_work(
         );
     }
 
-    let mut selected = focused_indices(entries, focus.as_ref());
+    let mut selected = hit_indices(entries, hit.as_ref());
     if selected.is_empty() && !entries.is_empty() {
         selected.insert(0);
     }
     let mut growing = GrowingSelection {
         layout: &layout,
         budget,
-        truncates_to_fit: focus.is_none(),
+        truncates_to_fit: hit.is_none(),
         selected,
         truncated: BTreeSet::new(),
         work,
@@ -3558,7 +3558,7 @@ fn cut_marker(total: usize, selected: &[usize]) -> String {
         parts.push("head");
     }
     if selected.windows(2).any(|pair| pair[1] != pair[0] + 1) || (first > 0 && last + 1 < total) {
-        parts.push("focus");
+        parts.push("hit");
     }
     if last + 1 < total {
         parts.push("tail");
@@ -3721,7 +3721,7 @@ mod tests {
 
     fn legacy_select_for_budget(
         messages: &[ReadEntry<'_>],
-        focus: Option<ProtocolFocus>,
+        hit: Option<ProtocolHit>,
         budget: usize,
     ) -> Vec<usize> {
         let spans = messages.iter().map(EntrySpan::of).collect::<Vec<_>>();
@@ -3747,11 +3747,11 @@ mod tests {
         ));
         let render_chars = |selected: &BTreeSet<usize>| render_chars(selected, full);
         let mut selected = BTreeSet::new();
-        if let Some(focus) = focus {
+        if let Some(hit) = hit {
             for (index, entry) in messages.iter().enumerate() {
-                if focus.is_of_focused_thread(entry)
-                    && focus.range.start <= entry.first_ordinal()
-                    && entry.first_ordinal() <= focus.range.end
+                if hit.is_of_hit_thread(entry)
+                    && hit.range.start <= entry.first_ordinal()
+                    && entry.first_ordinal() <= hit.range.end
                 {
                     selected.insert(index);
                 }
@@ -3807,15 +3807,15 @@ mod tests {
         let messages = shown_entries(&resolved, &transcript, &index);
 
         for budget in (100..=4_000).step_by(37) {
-            let focus = ProtocolFocus {
+            let hit = ProtocolHit {
                 subagent: None,
                 conversation_full_ref: Some(resolved.reference.full_ref()),
                 range: MessageRange::single(20),
             };
-            let expected = legacy_select_for_budget(&messages, Some(focus.clone()), budget);
+            let expected = legacy_select_for_budget(&messages, Some(hit.clone()), budget);
             let (actual, work) = select_for_budget_with_work(
                 &messages,
-                Some(focus),
+                Some(hit),
                 Some(budget),
                 ReadFixedParts::default(),
             );
@@ -3898,15 +3898,15 @@ mod tests {
         assert_eq!(days_written, 2);
 
         for budget in (100..=3_000).step_by(31) {
-            let focus = ProtocolFocus {
+            let hit = ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(20),
             };
-            let expected = legacy_select_for_budget(&messages, Some(focus.clone()), budget);
+            let expected = legacy_select_for_budget(&messages, Some(hit.clone()), budget);
             let (actual, _) = select_for_budget_with_work(
                 &messages,
-                Some(focus),
+                Some(hit),
                 Some(budget),
                 ReadFixedParts::default(),
             );
@@ -4021,7 +4021,7 @@ mod tests {
     }
 
     #[test]
-    fn read_preserves_focus_when_budget_truncates() {
+    fn read_preserves_hit_when_budget_truncates() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(
             (1..=7)
@@ -4043,7 +4043,7 @@ mod tests {
                 call: None,
                 shortened_to: None,
             }],
-            Some(ProtocolFocus {
+            Some(ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(4),
@@ -4368,7 +4368,7 @@ mod tests {
     }
 
     #[test]
-    fn non_focused_oversized_read_respects_budget_with_header_only_cut() {
+    fn oversized_read_without_hit_respects_budget_with_header_only_cut() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(vec![text_message(
             1,
@@ -4398,7 +4398,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_oversized_message_is_truncated_inside_message() {
+    fn oversized_hit_message_is_truncated_inside_message() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(vec![
             text_message(1, AgentMessageRole::User, "before"),
@@ -4414,7 +4414,7 @@ mod tests {
                 call: None,
                 shortened_to: None,
             }],
-            Some(ProtocolFocus {
+            Some(ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(2),
@@ -4439,7 +4439,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_focused_messages_share_hard_budget() {
+    fn multiple_hit_messages_share_hard_budget() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(
             (1..=4)
@@ -4447,7 +4447,7 @@ mod tests {
                     text_message(
                         ordinal,
                         AgentMessageRole::Assistant,
-                        &format!("focus {ordinal} {}", "x".repeat(300)),
+                        &format!("hit {ordinal} {}", "x".repeat(300)),
                     )
                 })
                 .collect(),
@@ -4461,7 +4461,7 @@ mod tests {
                 call: None,
                 shortened_to: None,
             }],
-            Some(ProtocolFocus {
+            Some(ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange { start: 2, end: 3 },
@@ -4532,7 +4532,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_focus_only_matches_target_conversation() {
+    fn qualified_hit_only_matches_target_conversation() {
         let first = resolved("first.jsonl");
         let second = resolved("second.jsonl");
         let first_transcript = transcript(vec![
@@ -4549,7 +4549,7 @@ mod tests {
                     whole_session_request(&first, &first_transcript),
                     whole_session_request(&second, &second_transcript),
                 ],
-                Some(ProtocolFocus {
+                Some(ProtocolHit {
                     subagent: None,
                     conversation_full_ref: Some(second.reference.full_ref()),
                     range: MessageRange::single(2),
@@ -5264,10 +5264,10 @@ mod tests {
     }
 
     #[test]
-    fn focused_read_omits_oversized_neighbour_whole() {
+    fn read_with_hit_omits_oversized_neighbour_whole() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
-            text_message(1, User, "the focused question"),
+            text_message(1, User, "the hit question"),
             text_message(2, Assistant, &"z".repeat(3_000)),
             text_message(3, User, "after"),
         ]);
@@ -5281,7 +5281,7 @@ mod tests {
                 call: None,
                 shortened_to: None,
             }],
-            Some(ProtocolFocus {
+            Some(ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(1),
@@ -5292,7 +5292,7 @@ mod tests {
         .unwrap();
 
         assert!(output.contains(" over-budget=m2..m3"), "{output}");
-        assert!(output.contains("| the focused question\n"), "{output}");
+        assert!(output.contains("| the hit question\n"), "{output}");
         assert!(!output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
@@ -5365,7 +5365,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_inside_hidden_run_keeps_run() {
+    fn hit_inside_hidden_run_keeps_run() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, &"long question ".repeat(50)),
@@ -5378,7 +5378,7 @@ mod tests {
             text_message(4, Assistant, &"long answer ".repeat(50)),
         ]);
 
-        let read_focused = |budget| {
+        let read_with_hit = |budget| {
             format_read(
                 &[ReadRequest {
                     resolved: &resolved("session.jsonl"),
@@ -5388,7 +5388,7 @@ mod tests {
                     call: None,
                     shortened_to: None,
                 }],
-                Some(ProtocolFocus {
+                Some(ProtocolHit {
                     subagent: None,
                     conversation_full_ref: None,
                     range: MessageRange::single(3),
@@ -5402,12 +5402,12 @@ mod tests {
             .unwrap()
         };
 
-        let output = read_focused(Some(400));
+        let output = read_with_hit(Some(400));
 
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=head+focus+tail chars=400{} policy=text over-budget=m1,m4{} hidden-tools=1 hidden-tool-results=1\n",
-                full_atom_printing(&read_focused(None)),
+                "protocol agent-read cut=head+hit+tail chars=400{} policy=text over-budget=m1,m4{} hidden-tools=1 hidden-tool-results=1\n",
+                full_atom_printing(&read_with_hit(None)),
                 tz_now()
             )),
             "{output}"
@@ -5886,15 +5886,15 @@ mod tests {
             .unwrap()
     }
 
-    fn focus_on(message: usize) -> Option<ProtocolFocus> {
-        Some(ProtocolFocus {
+    fn hit_on(message: usize) -> Option<ProtocolHit> {
+        Some(ProtocolHit {
             subagent: None,
             conversation_full_ref: None,
             range: MessageRange::single(message),
         })
     }
 
-    /// The budget keeps the focus, m1, and omits the hidden run m2..m5 and
+    /// The budget keeps the hit, m1, and omits the hidden run m2..m5 and
     /// m6.
     #[test]
     fn continue_read_record_names_flags_its_omitted_messages_need() {
@@ -5904,7 +5904,7 @@ mod tests {
 
         let output = at_smallest_fitting_budget(|budget| {
             let requests = std::slice::from_ref(&request);
-            format_read(requests, focus_on(1), None, with_budget(budget)).unwrap()
+            format_read(requests, hit_on(1), None, with_budget(budget)).unwrap()
         });
 
         assert!(output.contains("\nm1 user\n"), "{output}");
@@ -5917,7 +5917,7 @@ mod tests {
         );
     }
 
-    /// The read of the scout keeps the focus, its launch m2, and omits its
+    /// The read of the scout keeps the hit, its launch m2, and omits its
     /// text, its call and result, and its report m4; m3 is not the scout's.
     /// Longer texts make omitting them shorter than showing them.
     #[test]
@@ -5936,7 +5936,7 @@ mod tests {
 
         let output = at_smallest_fitting_budget(|budget| {
             let requests = std::slice::from_ref(&request);
-            format_read(requests, focus_on(2), None, with_budget(budget)).unwrap()
+            format_read(requests, hit_on(2), None, with_budget(budget)).unwrap()
         });
 
         let reference = resolved.reference.canonical();
@@ -8630,13 +8630,13 @@ mod tests {
             }));
         }
         cuts.extend(cuts_at_sampled_budgets(12, |budget| {
-            let focus = ProtocolFocus {
+            let hit = ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(6),
             };
             let requests = [request(&session, &replies, None)];
-            format_read(&requests, Some(focus), None, with(options(), budget)).unwrap()
+            format_read(&requests, Some(hit), None, with(options(), budget)).unwrap()
         }));
         cuts.extend(cuts_at_sampled_budgets(12, |budget| {
             read_tail(&replies, None, 8, with(options(), budget))
@@ -8676,15 +8676,15 @@ mod tests {
             "none",
             "tail",
             "head",
-            "focus",
-            "head+focus",
-            "head+focus+tail",
+            "hit",
+            "head+hit",
+            "head+hit+tail",
             "body",
             "body+tail",
             "body+head",
-            "body+focus",
-            "body+head+focus",
-            "body+head+focus+tail",
+            "body+hit",
+            "body+head+hit",
+            "body+head+hit+tail",
         ];
         assert_eq!(
             cuts,
@@ -9532,7 +9532,7 @@ mod tests {
     }
 
     /// Known limit: the `continue read` of an omitted m1 reads s1:m1 again
-    /// after the read printed it as its focus. The record names m1's group,
+    /// after the read printed it as its hit. The record names m1's group,
     /// and that group contains the sub-agent messages written before m1.
     #[test]
     fn continue_read_of_omitted_m1_reads_again_subagent_message_printed_before_it() {
@@ -9543,7 +9543,7 @@ mod tests {
             text_message(3, Assistant, "Done."),
         ]);
         let resolved = resolved("session.jsonl");
-        let focus = ProtocolFocus {
+        let hit = ProtocolHit {
             conversation_full_ref: None,
             range: MessageRange::single(1),
             subagent: Some(1),
@@ -9556,7 +9556,7 @@ mod tests {
 
         let output = format_read(
             &[whole_session_request(&resolved, &transcript)],
-            Some(focus),
+            Some(hit),
             None,
             with_subagents,
         )
@@ -9575,7 +9575,7 @@ mod tests {
 
         assert!(
             output.contains("| SCOUT_SENTINEL\n"),
-            "the read prints its focus, s1:m1: {output}"
+            "the read prints its hit, s1:m1: {output}"
         );
         assert!(
             first_ref.ends_with(":m1") || first_ref.contains(":m1.."),
@@ -9965,14 +9965,14 @@ mod tests {
         ])
     }
 
-    /// `--focus s1:m1..m2` keeps s1's messages first, not s2's written
+    /// `--hit s1:m1..m2` keeps s1's messages first, not s2's written
     /// between them.
     #[test]
-    fn subagent_focus_keeps_that_subagents_messages_first() {
+    fn subagent_hit_keeps_that_subagents_messages_first() {
         let transcript = session_with_two_reviews();
         let resolved = resolved("session.jsonl");
         let request = whole_session_request(&resolved, &transcript);
-        let focus = ProtocolFocus {
+        let hit = ProtocolHit {
             conversation_full_ref: None,
             range: MessageRange { start: 2, end: 5 },
             subagent: Some(1),
@@ -9983,8 +9983,7 @@ mod tests {
             ..options()
         };
 
-        let output =
-            format_read(std::slice::from_ref(&request), Some(focus), None, options).unwrap();
+        let output = format_read(std::slice::from_ref(&request), Some(hit), None, options).unwrap();
 
         for kept in ["a finding 1, line 8", "a finding 2, line 8"] {
             assert!(output.contains(kept), "the read keeps {kept:?}:\n{output}");

@@ -428,7 +428,7 @@ fn opens_with_drive(path: &str) -> bool {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FocusRef {
+pub struct HitRef {
     pub conversation: Option<String>,
     pub range: ThreadRange,
 }
@@ -597,9 +597,9 @@ fn parse_subagent_handle(input: &str) -> Result<Option<usize>> {
     }
 }
 
-/// A `--focus`: `mN`, `mA..mB` or a sub-agent's `sN:mA..mB`, after a
+/// A `--hit`: `mN`, `mA..mB` or a sub-agent's `sN:mA..mB`, after a
 /// conversation ref or alone.
-pub fn parse_focus_ref(input: &str) -> Result<FocusRef> {
+pub fn parse_hit_ref(input: &str) -> Result<HitRef> {
     let names_a_thread = input
         .split_once(':')
         .is_some_and(|(handle, _)| matches!(parse_subagent_handle(handle), Ok(Some(_))));
@@ -611,7 +611,7 @@ pub fn parse_focus_ref(input: &str) -> Result<FocusRef> {
         }
         (part, None) => (None, part),
     };
-    Ok(FocusRef {
+    Ok(HitRef {
         conversation,
         range: parse_messages(part)?,
     })
@@ -656,20 +656,18 @@ fn split_message_range(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The conversation a `--focus` names among the read's: its own, or the
-/// read's one conversation for a bare focus. A bare focus over several
+/// The conversation a `--hit` names among the read's: its own, or the
+/// read's one conversation for a bare hit. A bare hit over several
 /// conversations is `invalid-ref`.
-pub fn focus_conversation<'r>(
+pub fn hit_conversation<'r>(
     read_refs: &'r [(ReadRef, ResolvedConversation)],
-    focus_conversation: Option<&'r ResolvedConversation>,
+    hit_conversation: Option<&'r ResolvedConversation>,
 ) -> Result<&'r ResolvedConversation> {
-    if let Some(focus_conversation) = focus_conversation {
-        return Ok(focus_conversation);
+    if let Some(hit_conversation) = hit_conversation {
+        return Ok(hit_conversation);
     }
     let Some((_, first)) = read_refs.first() else {
-        return Err(
-            AgentError::invalid_ref("focus", "focus requires at least one read ref").into(),
-        );
+        return Err(AgentError::invalid_ref("hit", "hit requires at least one read ref").into());
     };
     let first_ref = first.reference.full_ref();
     if read_refs
@@ -677,8 +675,8 @@ pub fn focus_conversation<'r>(
         .any(|(_, resolved)| resolved.reference.full_ref() != first_ref)
     {
         return Err(AgentError::invalid_ref(
-            "focus",
-            "bare focus is ambiguous for multiple conversations; use ch_...:mN",
+            "hit",
+            "bare hit is ambiguous for multiple conversations; use ch_...:mN",
         )
         .into());
     }
@@ -1421,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_session_id_or_file_name_resolves_with_its_range_and_focus() {
+    fn pi_session_id_or_file_name_resolves_with_its_range_and_hit() {
         let uuid = "01a082ad-c8d8-7149-8d3e-dd8f74bb7ed4";
         let file_name = format!("2026-09-08T20-20-22-361Z_{uuid}.jsonl");
         let pi = key_of(Source::Pi, "/tmp/project", &file_name, uuid);
@@ -1434,14 +1432,14 @@ mod tests {
                 resolve_conversation_ref(&keys, &read.conversation, &SystemCanonicaliser::shared())
                     .unwrap();
             assert_eq!(resolved.key, pi);
-            let focus = parse_focus_ref(&format!("{input}:m3")).unwrap();
-            let focused = resolve_conversation_ref(
+            let hit = parse_hit_ref(&format!("{input}:m3")).unwrap();
+            let resolved_hit = resolve_conversation_ref(
                 &keys,
-                focus.conversation.as_deref().unwrap(),
+                hit.conversation.as_deref().unwrap(),
                 &SystemCanonicaliser::shared(),
             )
             .unwrap();
-            focus_conversation(&[(read, resolved)], Some(&focused)).unwrap();
+            hit_conversation(&[(read, resolved)], Some(&resolved_hit)).unwrap();
         }
     }
 
@@ -1660,14 +1658,14 @@ mod tests {
 
         let whole = parse_read_ref(path).unwrap();
         let ranged = parse_read_ref(&format!("{path}:m2..m4")).unwrap();
-        let focus = parse_focus_ref(&format!("{path}:m3")).unwrap();
+        let hit = parse_hit_ref(&format!("{path}:m3")).unwrap();
 
         assert_eq!(whole.conversation, path);
         assert_eq!(whole.range, None);
         assert_eq!(ranged.conversation, path);
         assert_eq!(ranged.range, Some(parent_range(2, 4)));
-        assert_eq!(focus.conversation.as_deref(), Some(path));
-        assert_eq!(focus.range, ThreadRange::one(Thread::Parent, 3));
+        assert_eq!(hit.conversation.as_deref(), Some(path));
+        assert_eq!(hit.range, ThreadRange::one(Thread::Parent, 3));
     }
 
     #[test]
@@ -1742,11 +1740,11 @@ mod tests {
     }
 
     #[test]
-    fn focus_names_subagents_messages_alone_or_after_conversation() {
+    fn hit_names_subagents_messages_alone_or_after_conversation() {
         let range = ThreadRange::one(Thread::Subagent(3), 2);
 
-        let bare = parse_focus_ref("s3:m2..m2").unwrap();
-        let qualified = parse_focus_ref("ch_12345678:s3:m2..m2").unwrap();
+        let bare = parse_hit_ref("s3:m2..m2").unwrap();
+        let qualified = parse_hit_ref("ch_12345678:s3:m2..m2").unwrap();
 
         assert_eq!((bare.conversation, bare.range), (None, range));
         assert_eq!(
@@ -2063,11 +2061,11 @@ mod tests {
                 assert_eq!(parsed.unwrap().range, Some(expected), "{reference}");
             }
         }
-        for focus in ["m3..", "ch_12345678:m3.."] {
+        for hit in ["m3..", "ch_12345678:m3.."] {
             assert_eq!(
-                parse_focus_ref(focus).unwrap().range,
+                parse_hit_ref(hit).unwrap().range,
                 ThreadRange::open(Thread::Parent, 3),
-                "{focus}"
+                "{hit}"
             );
         }
         assert_eq!(
@@ -2077,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_focus_names_reads_conversation() {
+    fn bare_hit_names_reads_conversation() {
         let resolved = ResolvedConversation {
             key: key("project-a", "one.jsonl"),
             reference: AgentConversationRef::from_parts("project-a", "one.jsonl"),
@@ -2087,14 +2085,11 @@ mod tests {
             resolved.clone(),
         )];
 
-        assert_eq!(
-            focus_conversation(&resolved_reads, None).unwrap(),
-            &resolved
-        );
+        assert_eq!(hit_conversation(&resolved_reads, None).unwrap(), &resolved);
     }
 
     #[test]
-    fn bare_focus_is_rejected_for_multiple_conversations() {
+    fn bare_hit_is_rejected_for_multiple_conversations() {
         let reads = [
             parse_read_ref("ch_12345678:m1..m5").unwrap(),
             parse_read_ref("ch_87654321:m1..m5").unwrap(),
@@ -2108,7 +2103,7 @@ mod tests {
             reference: AgentConversationRef::from_parts("project-b", "two.jsonl"),
         };
         let resolved_reads = vec![(reads[0].clone(), first), (reads[1].clone(), second)];
-        let err = focus_conversation(&resolved_reads, None).unwrap_err();
-        assert!(err.to_string().contains("bare focus is ambiguous"));
+        let err = hit_conversation(&resolved_reads, None).unwrap_err();
+        assert!(err.to_string().contains("bare hit is ambiguous"));
     }
 }

@@ -933,7 +933,7 @@ fn is_read_cut(value: &str) -> bool {
     value == "none"
         || value
             .split('+')
-            .all(|part| matches!(part, "body" | "head" | "focus" | "tail"))
+            .all(|part| matches!(part, "body" | "head" | "hit" | "tail"))
 }
 
 fn is_outline_cut(value: &str) -> bool {

@@ -400,10 +400,10 @@ struct HitPlace {
     group: usize,
 }
 
-/// A search hit's `focus=` and the range its `read ref=` recipe reads.
+/// A search hit's `hit=` and the range its `read ref=` recipe reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HitAddresses {
-    pub focus: ThreadRange,
+    pub hit: ThreadRange,
     pub read: ThreadRange,
 }
 
@@ -433,12 +433,12 @@ impl HitPlaces {
         Self { messages, lengths }
     }
 
-    /// The addresses of a hit on the messages of `focus`, ordinals: the
-    /// focus messages' thread range, and the read of the message before and
-    /// after it in that thread. A focus over several threads names the groups
-    /// that hold it. `None` when a focus message is not placed.
-    pub fn hit_addresses(&self, focus: MessageRange) -> Option<HitAddresses> {
-        let places = (focus.start..=focus.end)
+    /// The addresses of a hit on the messages of `hit`, ordinals: the hit
+    /// messages' thread range, and the read of the message before and after
+    /// it in that thread. A hit over several threads names the groups that
+    /// contain it. `None` when a hit message is not placed.
+    pub fn hit_addresses(&self, hit: MessageRange) -> Option<HitAddresses> {
+        let places = (hit.start..=hit.end)
             .map(|ordinal| self.messages.get(&ordinal).copied())
             .collect::<Option<Vec<_>>>()?;
         let (first, last) = (*places.first()?, *places.last()?);
@@ -449,7 +449,7 @@ impl HitPlaces {
         };
         let length = self.lengths.get(&thread).copied().unwrap_or(0);
         Some(HitAddresses {
-            focus: ThreadRange::closed(thread, start, end),
+            hit: ThreadRange::closed(thread, start, end),
             read: ThreadRange::closed(
                 thread,
                 start.saturating_sub(1).max(1),
@@ -646,21 +646,21 @@ mod tests {
         );
     }
 
-    /// The `focus=` and `read ref=` addresses, as printed, of a hit on the
+    /// The `hit=` and `read ref=` addresses, as printed, of a hit on the
     /// messages from ordinal `start` to `end`.
     fn hit(places: &HitPlaces, start: usize, end: usize) -> (String, String) {
         let addresses = places
             .hit_addresses(MessageRange { start, end })
-            .expect("the focus messages are placed");
-        (addresses.focus.to_string(), addresses.read.to_string())
+            .expect("the hit messages are placed");
+        (addresses.hit.to_string(), addresses.read.to_string())
     }
 
     #[test]
-    fn hit_reads_message_before_and_after_its_focus_in_its_thread() {
+    fn hit_reads_message_before_and_after_it_in_its_thread() {
         let addresses = addresses();
         let places = addresses.hit_places(1..=9);
 
-        for (start, end, focus, read) in [
+        for (start, end, hit_address, read) in [
             (3, 3, "s1:m2", "s1:m1..m3"),
             (6, 6, "s1:m3", "s1:m2..m3"),
             (2, 2, "m1", "m1..m2"),
@@ -669,7 +669,7 @@ mod tests {
         ] {
             assert_eq!(
                 hit(&places, start, end),
-                (focus.to_owned(), read.to_owned()),
+                (hit_address.to_owned(), read.to_owned()),
                 "the hit on ordinals {start}..{end}"
             );
         }

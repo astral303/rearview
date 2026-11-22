@@ -27,25 +27,25 @@ use std::sync::Arc;
 
 type ResolvedReadRefs = Vec<(agent::refs::ReadRef, agent::refs::ResolvedConversation)>;
 
-/// A `--focus` range and, when it names one, its resolved conversation.
+/// A `--hit` range and, when it names one, its resolved conversation.
 #[derive(Debug)]
-pub(crate) struct ResolvedFocus {
+pub(crate) struct ResolvedHit {
     conversation: Option<agent::refs::ResolvedConversation>,
     range: agent::refs::ThreadRange,
 }
 
-/// The messages `focus` names in the conversation of `requests` it names, the
-/// read's one conversation for a bare focus: the focus a budget keeps first.
-/// A focus outside every request of that conversation is `out-of-range`.
-fn focused_messages(
-    focus: &ResolvedFocus,
+/// The messages `hit` names in the conversation of `requests` it names, the
+/// read's one conversation for a bare hit: the hit a budget keeps first.
+/// A hit outside every request of that conversation is `out-of-range`.
+fn hit_messages(
+    hit: &ResolvedHit,
     requests: &[agent::protocol::ReadRequest<'_>],
-) -> Result<agent::protocol::ProtocolFocus> {
-    let conversation_full_ref = focus
+) -> Result<agent::protocol::ProtocolHit> {
+    let conversation_full_ref = hit
         .conversation
         .as_ref()
         .map(|conversation| conversation.reference.full_ref());
-    let focused_requests = requests
+    let hit_requests = requests
         .iter()
         .filter(|request| {
             conversation_full_ref
@@ -53,27 +53,27 @@ fn focused_messages(
                 .is_none_or(|full_ref| request.resolved.reference.full_ref() == *full_ref)
         })
         .collect::<Vec<_>>();
-    let reference = focus
+    let reference = hit
         .conversation
         .as_ref()
         .map(|conversation| conversation.reference.canonical());
     let outside = || {
         AgentError::out_of_range(
             reference.as_deref(),
-            format!("focus {} is outside the requested read range", focus.range),
+            format!("hit {} is outside the requested read range", hit.range),
         )
     };
-    let first = focused_requests.first().ok_or_else(outside)?;
+    let first = hit_requests.first().ok_or_else(outside)?;
     let resolved =
-        agent::address::MessageAddresses::of_transcript(first.transcript).resolve(focus.range)?;
+        agent::address::MessageAddresses::of_transcript(first.transcript).resolve(hit.range)?;
     let range = resolved.range;
-    if !focused_requests
+    if !hit_requests
         .iter()
         .any(|request| request.range.is_none_or(|read| read.contains(&range)))
     {
         return Err(outside().into());
     }
-    Ok(agent::protocol::ProtocolFocus {
+    Ok(agent::protocol::ProtocolHit {
         conversation_full_ref,
         range,
         subagent: resolved.subagent,
@@ -676,7 +676,7 @@ trait TargetedArgs: Sized {
 
     fn window(&self) -> &TimeFilter;
 
-    /// Each conversation `resolve` resolves, `--focus`'s included, as given.
+    /// Each conversation `resolve` resolves, `--hit`'s included, as given.
     fn conversations(&self) -> Vec<&str>;
 
     fn resolve(
@@ -3359,7 +3359,7 @@ struct SemanticReads {
 
 impl AgentService {
     /// `fuse`'s output over `semantic`'s hits and `inputs`, each semantic-only
-    /// hit given the anchors and times of its focus messages in the copy its
+    /// hit given the anchors and times of its hit messages in the copy its
     /// session's semantic hits number. A session's semantic hits are dropped,
     /// and the session added to the command's stale sessions, when the
     /// lexical hits number another copy of it (`lexical_copies`), or when
@@ -3447,7 +3447,7 @@ struct AnchorReads<'i, 'c> {
 }
 
 /// Gives each semantic-only hit in `output` the anchors and times of its
-/// focus messages, read from the copy `copies` names for its session. A read
+/// hit messages, read from the copy `copies` names for its session. A read
 /// that fails leaves its hits without anchors.
 fn attach_semantic_hit_anchors<'i, 'c>(
     service: &AgentService,
@@ -3455,15 +3455,15 @@ fn attach_semantic_hit_anchors<'i, 'c>(
     inputs: &'i [agent::search::AgentConversationInput<'c>],
     copies: &HashMap<String, i64>,
 ) -> AnchorReads<'i, 'c> {
-    let mut focused: HashMap<String, std::collections::BTreeSet<usize>> = HashMap::new();
+    let mut hit_ordinals: HashMap<String, std::collections::BTreeSet<usize>> = HashMap::new();
     for hit in output
         .every_hit()
         .filter(|hit| hit.source == agent::search::AgentHitKind::Semantic)
     {
-        focused
+        hit_ordinals
             .entry(hit.conversation_ref.clone())
             .or_default()
-            .extend(hit.focus_range.start..=hit.focus_range.end);
+            .extend(hit.hit_range.start..=hit.hit_range.end);
     }
     let mut reads = AnchorReads {
         no_longer_cached: Vec::new(),
@@ -3471,7 +3471,7 @@ fn attach_semantic_hit_anchors<'i, 'c>(
     };
     for input in inputs {
         let reference = input.resolved.reference.canonical();
-        let Some(ordinals) = focused.get(&reference) else {
+        let Some(ordinals) = hit_ordinals.get(&reference) else {
             continue;
         };
         let ordinals = ordinals.iter().copied().collect::<Vec<_>>();
@@ -3969,7 +3969,7 @@ impl AgentService {
         let perf = &self.perf;
         let OpenedTargets {
             checked: CheckedRead { options, .. },
-            resolved: (resolved_refs, focus),
+            resolved: (resolved_refs, hit),
             operation,
             warnings: discovery_warnings,
             held: refreshed_targets,
@@ -4030,11 +4030,9 @@ impl AgentService {
                 },
             )
             .collect::<Vec<_>>();
-        let priority = match (args.tail, focus) {
+        let priority = match (args.tail, hit) {
             (Some(tail), _) => agent::protocol::ReadPriority::Tail(tail),
-            (None, Some(focus)) => {
-                agent::protocol::ReadPriority::Focus(focused_messages(&focus, &requests)?)
-            }
+            (None, Some(hit)) => agent::protocol::ReadPriority::Hit(hit_messages(&hit, &requests)?),
             (None, None) => agent::protocol::ReadPriority::Start,
         };
         let slice = if let Some(range) = args.lines {
@@ -4134,7 +4132,7 @@ struct CheckedRead {
 
 impl TargetedArgs for CheckedRead {
     type CliArgs = AgentReadArgs;
-    type Resolved = (ResolvedReadRefs, Option<ResolvedFocus>);
+    type Resolved = (ResolvedReadRefs, Option<ResolvedHit>);
 
     fn check(args: &Self::CliArgs, config: config::ConfigFile, clock: &dyn Clock) -> Result<Self> {
         let agent_config = config.agent.unwrap_or_default();
@@ -4154,9 +4152,9 @@ impl TargetedArgs for CheckedRead {
             .map(|reference| reference.conversation.as_str())
             .chain(
                 self.refs
-                    .focus
+                    .hit
                     .as_ref()
-                    .and_then(|focus| focus.conversation.as_deref()),
+                    .and_then(|hit| hit.conversation.as_deref()),
             )
             .collect()
     }
@@ -4215,11 +4213,11 @@ impl TargetedArgs for CheckedOutline {
     }
 }
 
-/// `agent read`'s refs and `--focus`, parsed, with the flags that depend
+/// `agent read`'s refs and `--hit`, parsed, with the flags that depend
 /// on the refs checked against them.
 struct ParsedReadRefs {
     refs: Vec<agent::refs::ReadRef>,
-    focus: Option<agent::refs::FocusRef>,
+    hit: Option<agent::refs::HitRef>,
 }
 
 impl ParsedReadRefs {
@@ -4247,21 +4245,21 @@ impl ParsedReadRefs {
                     .to_string(),
             ));
         }
-        let focus = args
-            .focus
+        let hit = args
+            .hit
             .as_deref()
-            .map(agent::refs::parse_focus_ref)
+            .map(agent::refs::parse_hit_ref)
             .transpose()?;
-        Ok(Self { refs, focus })
+        Ok(Self { refs, hit })
     }
 
-    /// The sessions the refs and `--focus` name among `keys`; fails when a
-    /// bare `--focus` follows refs of several sessions.
+    /// The sessions the refs and `--hit` name among `keys`; fails when a
+    /// bare `--hit` follows refs of several sessions.
     fn resolve(
         &self,
         keys: &[agent::refs::AgentConversationKey],
         canonicaliser: &Arc<dyn Canonicaliser>,
-    ) -> Result<(ResolvedReadRefs, Option<ResolvedFocus>)> {
+    ) -> Result<(ResolvedReadRefs, Option<ResolvedHit>)> {
         let resolved_refs = self
             .refs
             .iter()
@@ -4271,25 +4269,25 @@ impl ParsedReadRefs {
                     .map(|resolved| (reference.clone(), resolved))
             })
             .collect::<Result<Vec<_>>>()?;
-        let focus = self
-            .focus
+        let hit = self
+            .hit
             .as_ref()
-            .map(|focus| -> Result<ResolvedFocus> {
-                let conversation = focus
+            .map(|hit| -> Result<ResolvedHit> {
+                let conversation = hit
                     .conversation
                     .as_ref()
                     .map(|conversation| {
                         agent::refs::resolve_conversation_ref(keys, conversation, canonicaliser)
                     })
                     .transpose()?;
-                agent::refs::focus_conversation(&resolved_refs, conversation.as_ref())?;
-                Ok(ResolvedFocus {
+                agent::refs::hit_conversation(&resolved_refs, conversation.as_ref())?;
+                Ok(ResolvedHit {
                     conversation,
-                    range: focus.range,
+                    range: hit.range,
                 })
             })
             .transpose()?;
-        Ok((resolved_refs, focus))
+        Ok((resolved_refs, hit))
     }
 }
 
@@ -4300,7 +4298,7 @@ pub(crate) fn resolve_agent_read_args(
     args: &AgentReadArgs,
     keys: &[agent::refs::AgentConversationKey],
     canonicaliser: &Arc<dyn Canonicaliser>,
-) -> Result<(ResolvedReadRefs, Option<ResolvedFocus>)> {
+) -> Result<(ResolvedReadRefs, Option<ResolvedHit>)> {
     ParsedReadRefs::parse(args)?.resolve(keys, canonicaliser)
 }
 
@@ -4532,7 +4530,7 @@ mod tests {
         AgentReadArgs {
             refs: vec![reference],
             anchor: None,
-            focus: None,
+            hit: None,
             tail: None,
             lines: None,
             match_query: None,
@@ -6948,11 +6946,11 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
     }
 
-    /// `read` of a printed handle with a `--focus` by the session ID that a
+    /// `read` of a printed handle with a `--hit` by the session ID that a
     /// cached Claude Code session and an uncached Codex session both carry
     /// reports `ambiguous-ref`, as full discovery does.
     #[test]
-    fn read_focused_by_session_id_another_agents_uncached_session_carries_is_ambiguous() {
+    fn read_with_hit_by_session_id_another_agents_uncached_session_carries_is_ambiguous() {
         let sessions = ClaudeAndUncachedCodex::new();
         let codex_id = registered_fixture(history::Source::Codex).ids().session;
         let handle =
@@ -6961,13 +6959,13 @@ mod tests {
         let output = sessions.run(&[
             "read",
             &format!("{handle}:m1..m5"),
-            "--focus",
+            "--hit",
             &format!("{codex_id}:m2"),
         ]);
 
         assert!(
             output.starts_with("protocol agent-error kind=ambiguous-ref "),
-            "the focus's session ID is ambiguous:\n{output}"
+            "the hit's session ID is ambiguous:\n{output}"
         );
     }
 
@@ -7502,11 +7500,11 @@ mod tests {
         (keys, inputs)
     }
 
-    /// A semantic hit on the dialogue of messages `focus` of the session at
-    /// input `index`.
+    /// A semantic hit on the dialogue of messages `messages` of the session
+    /// at input `index`.
     fn semantic_dialogue_hit(
         index: usize,
-        focus: agent::refs::MessageRange,
+        messages: agent::refs::MessageRange,
     ) -> crate::semantic::types::SemanticHit {
         crate::semantic::types::SemanticHit::new(
             crate::semantic::types::SemanticScoreBreakdown::new(0.9, 0.0),
@@ -7520,7 +7518,7 @@ mod tests {
                     conversation_index: index,
                     session: "session".to_owned(),
                     chunk_index: 0,
-                    message_range: focus,
+                    message_range: messages,
                 },
             },
         )
@@ -7696,7 +7694,7 @@ mod tests {
         );
         let hits = output.every_hit().collect::<Vec<_>>();
         assert!(
-            hits.len() == 1 && hits[0].focus_range.start == 3 && !hits[0].anchors.is_empty(),
+            hits.len() == 1 && hits[0].hit_range.start == 3 && !hits[0].anchors.is_empty(),
             "the hit on the appended message is inside the window and gets its anchors: {hits:?}"
         );
     }
@@ -7866,7 +7864,7 @@ mod tests {
         error
     }
 
-    /// A semantic hit gets the anchors of its focus message in the copy the
+    /// A semantic hit gets the anchors of its message in the copy the
     /// semantic stage read. Its session's semantic hits leave the output,
     /// and the stale-cache record names it, when another rearview renumbers
     /// the session before the anchors are read, or the lexical hits read
@@ -7948,7 +7946,7 @@ mod tests {
             } else {
                 assert!(
                     hits.len() == 1 && !hits[0].anchors.is_empty(),
-                    "{case}: the hit gets its focus message's anchors: {hits:?}"
+                    "{case}: the hit gets its message's anchors: {hits:?}"
                 );
                 assert!(
                     records.is_empty(),
@@ -8374,7 +8372,7 @@ mod tests {
             &[
                 &["read", "ch_12"],
                 &["read", &format!("{CHANGED_SESSION}:x9")],
-                &["read", CHANGED_SESSION, "--focus", "x9"],
+                &["read", CHANGED_SESSION, "--hit", "x9"],
                 &["outline", "ch_12"],
                 &["outline", &format!("{CHANGED_SESSION}:x9")],
             ],
@@ -10047,7 +10045,7 @@ mod tests {
             let rendered = agent::search::format_agent_output(&output);
 
             assert!(rendered.contains(" source=tool "), "{mode:?}: {rendered}");
-            assert!(rendered.contains(" focus=m2 "), "{mode:?}: {rendered}");
+            assert!(rendered.contains(" hit=m2 "), "{mode:?}: {rendered}");
             assert!(rendered.contains(query), "{mode:?}: {rendered}");
             assert!(rendered.contains(" tools=true "), "{mode:?}: {rendered}");
         }
@@ -10276,7 +10274,7 @@ mode = "hybrid"
         let args = AgentReadArgs {
             refs: vec![format!("{reference}:m1"), format!("{reference}:m3")],
             anchor: None,
-            focus: None,
+            hit: None,
             tail: None,
             lines: None,
             match_query: None,
@@ -10317,7 +10315,7 @@ mode = "hybrid"
         let args = AgentReadArgs {
             refs: vec![format!("{reference}:m1")],
             anchor: None,
-            focus: None,
+            hit: None,
             tail: None,
             lines: None,
             match_query: None,

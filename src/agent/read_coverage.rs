@@ -33,7 +33,7 @@
 //! - When exact search finds a marker in a message, a read of that message
 //!   alone with `--match <marker>` reports a hit.
 //! - The `read ref=` recipe of each hit an exact `agent within` search for a
-//!   marker prints reads the hit's `focus=` messages.
+//!   marker prints reads the messages of its `hit=`.
 
 use crate::agent::address::MessageAddresses;
 use crate::agent::protocol::{
@@ -754,7 +754,7 @@ fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<S
                 },
             )
             .into_iter()
-            .map(move |hit| (marker, hit.focus_range.start))
+            .map(move |hit| (marker, hit.hit_range.start))
         })
         .filter_map(|(marker, ordinal)| {
             let output = format_read(
@@ -1117,7 +1117,7 @@ fn every_agents_printed_address_reads_back_its_record() {
 
 /// Each `read ref=` recipe that an exact `agent within` search of `session`
 /// for one of its markers prints, and whose read with the recipe's flags
-/// does not cover the hit's `focus=` messages; and how many recipes ran.
+/// does not cover the messages of its `hit=`; and how many recipes ran.
 fn hit_recipes_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
     let row = &session.row;
     let loaded = LoadedSession::of(session);
@@ -1154,8 +1154,8 @@ fn hit_recipes_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
             let read = loaded.read_ref(atom(recipe, "ref").unwrap(), flags);
             let mut covered = covered_messages(&read, &addresses);
             covered.extend(result_messages(&read, &addresses));
-            let focus = addresses.segment_ordinals(atom(recipe, "focus").unwrap());
-            if !focus.clone().all(|ordinal| covered.contains(&ordinal)) {
+            let hit = addresses.segment_ordinals(atom(recipe, "hit").unwrap());
+            if !hit.clone().all(|ordinal| covered.contains(&ordinal)) {
                 gaps.push(format!(
                     "{:?} {}: {recipe}\n{read}",
                     row.source, marker.record
@@ -1167,7 +1167,7 @@ fn hit_recipes_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
 }
 
 #[test]
-fn every_agents_within_hit_recipe_reads_its_focus_messages() {
+fn every_agents_within_hit_recipe_reads_its_hit_messages() {
     let mut gaps = Vec::new();
     let mut recipes = 0;
     for session in every_record_sessions() {

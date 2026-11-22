@@ -629,7 +629,7 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         "agent",
         "read",
         &format!("{reference}:m1..m8"),
-        "--focus",
+        "--hit",
         &format!("{reference}:m5"),
         "--budget",
         "700",

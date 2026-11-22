@@ -269,11 +269,11 @@ pub struct AgentOutputHit {
     pub evidence_source: AgentHitSource,
     pub render_options: AgentHitRenderOptions,
     pub preview: String,
-    pub focus_range: MessageRange,
-    /// The times on the parts of the messages in `focus_range`. A semantic
+    pub hit_range: MessageRange,
+    /// The times on the parts of the messages in `hit_range`. A semantic
     /// hit gets them with its anchors, once its transcript is read.
     pub times: Option<TimeSpan>,
-    /// The hit's `focus=` and the range its `read ref=` recipe reads. A
+    /// The hit's `hit=` and the range its `read ref=` recipe reads. A
     /// semantic hit gets them with its anchors; `None` when its read failed.
     pub addresses: Option<HitAddresses>,
 }
@@ -314,7 +314,7 @@ pub fn attach_transcript_metadata(
         hit.project_id = resolved.key.project_id();
         hit.conversation_uuid = resolved.reference.uuid();
         hit.session = resolved.key.session_filename.clone();
-        attach_focus_metadata(hit, searched, resolved);
+        attach_hit_metadata(hit, searched, resolved);
     }
     for group in output
         .groups
@@ -328,7 +328,7 @@ pub fn attach_transcript_metadata(
 }
 
 /// Gives each semantic-only hit of `resolved`'s session in `output` the
-/// anchors, times and addresses of its focus messages in `searched`. Every
+/// anchors, times and addresses of its hit messages in `searched`. Every
 /// other hit keeps those its lexical retrieval found.
 pub fn attach_semantic_hit_metadata(
     output: &mut AgentSearchOutput,
@@ -340,20 +340,20 @@ pub fn attach_semantic_hit_metadata(
         .every_hit_mut()
         .filter(|hit| hit.conversation_ref == reference && hit.source == AgentHitKind::Semantic)
     {
-        attach_focus_metadata(hit, searched, resolved);
+        attach_hit_metadata(hit, searched, resolved);
     }
 }
 
-fn attach_focus_metadata(
+fn attach_hit_metadata(
     hit: &mut AgentOutputHit,
     searched: TranscriptPlaces<'_>,
     resolved: &ResolvedConversation,
 ) {
-    let focus = FocusMetadata::of(searched, resolved, hit.focus_range);
-    hit.anchors = focus.anchors;
-    hit.times = focus.times;
-    hit.addresses = focus.addresses;
-    hit.render_options.merge(focus.flags);
+    let metadata = HitMetadata::of(searched, resolved, hit.hit_range);
+    hit.anchors = metadata.anchors;
+    hit.times = metadata.times;
+    hit.addresses = metadata.addresses;
+    hit.render_options.merge(metadata.flags);
 }
 
 pub fn effective_agent_mode(
@@ -586,7 +586,7 @@ fn score_breakdown_atoms(breakdown: Option<SemanticScoreBreakdown>) -> String {
 
 /// The `hit` record and its `read` recipe, its times in `zone`, below a
 /// header whose `tz=` names `header_offset`. A hit without addresses, one
-/// whose session failed to read, prints neither `focus=` nor the recipe.
+/// whose session failed to read, prints neither `hit=` nor the recipe.
 fn push_hit_lines(
     rendered: &mut String,
     hit: &AgentOutputHit,
@@ -594,12 +594,12 @@ fn push_hit_lines(
     zone: Zone,
 ) {
     let reference = crate::agent::protocol::escape_atom(&hit.conversation_ref);
-    let focus = hit
+    let hit_atom = hit
         .addresses
-        .map(|addresses| format!(" focus={}", addresses.focus))
+        .map(|addresses| format!(" hit={}", addresses.hit))
         .unwrap_or_default();
     rendered.push_str(&format!(
-        "hit project={} uuid={} ref={reference} anchors={} source={} score={:.6}{}{focus}{} | {}\n",
+        "hit project={} uuid={} ref={reference} anchors={} source={} score={:.6}{}{hit_atom}{} | {}\n",
         crate::agent::protocol::escape_atom(&hit.project_id),
         crate::agent::protocol::escape_atom(&hit.conversation_uuid),
         hit.anchors.join(","),
@@ -611,7 +611,7 @@ fn push_hit_lines(
     ));
     if let Some(addresses) = hit.addresses {
         rendered.push_str(&format!(
-            "read ref={reference}:{}{focus}{}\n",
+            "read ref={reference}:{}{hit_atom}{}\n",
             addresses.read,
             hit.render_options.recipe_atoms()
         ));
@@ -1117,15 +1117,15 @@ fn retrieval_output_hit(
     searched: TranscriptPlaces<'_>,
     mode: SearchMode,
 ) -> AgentOutputHit {
-    let focus = FocusMetadata::of(searched, resolved, hit.focus_range);
+    let metadata = HitMetadata::of(searched, resolved, hit.hit_range);
     let mut render_options = hit.render_options;
-    render_options.merge(focus.flags);
+    render_options.merge(metadata.flags);
     AgentOutputHit {
         conversation_ref: resolved.reference.canonical(),
         project_id: resolved.key.project_id(),
         conversation_uuid: resolved.reference.uuid(),
         session: resolved.key.session_filename.clone(),
-        anchors: focus.anchors,
+        anchors: metadata.anchors,
         title: title_for_conversation(conversation),
         score: hit.score,
         evidence_score: hit.score,
@@ -1138,32 +1138,32 @@ fn retrieval_output_hit(
         evidence_source: hit.source,
         render_options,
         preview: hit.preview,
-        focus_range: hit.focus_range,
-        times: focus.times,
-        addresses: focus.addresses,
+        hit_range: hit.hit_range,
+        times: metadata.times,
+        addresses: metadata.addresses,
     }
 }
 
 /// The anchors, times and addresses a hit shows for the messages in its
-/// focus range, and the flags its `read` recipe needs to show them.
-struct FocusMetadata {
+/// range, and the flags its `read` recipe needs to show them.
+struct HitMetadata {
     anchors: Vec<String>,
     times: Option<TimeSpan>,
     flags: AgentHitRenderOptions,
     addresses: Option<HitAddresses>,
 }
 
-impl FocusMetadata {
+impl HitMetadata {
     fn of(
         searched: TranscriptPlaces<'_>,
         resolved: &ResolvedConversation,
-        focus: MessageRange,
+        hit: MessageRange,
     ) -> Self {
         let TranscriptPlaces { transcript, places } = searched;
         let messages: Vec<&AgentMessage> = transcript
             .messages
             .iter()
-            .filter(|message| focus.start <= message.ordinal && message.ordinal <= focus.end)
+            .filter(|message| hit.start <= message.ordinal && message.ordinal <= hit.end)
             .collect();
         let mut flags = AgentHitRenderOptions::default();
         for message in &messages {
@@ -1176,7 +1176,7 @@ impl FocusMetadata {
                 .collect(),
             times: TimeSpan::of_messages(messages),
             flags,
-            addresses: places.hit_addresses(focus),
+            addresses: places.hit_addresses(hit),
         }
     }
 }
@@ -1194,7 +1194,7 @@ fn semantic_output_hits(
     output
 }
 
-/// A hit for each of `hits` with a message inside `window`, its focus
+/// A hit for each of `hits` with a message inside `window`, its range
 /// narrowed to its first and last such message. A passage can hold messages
 /// on both sides of a bound.
 fn semantic_output_hit_candidates(
@@ -1207,7 +1207,7 @@ fn semantic_output_hit_candidates(
             let input = inputs
                 .iter()
                 .find(|input| input.original_index == hit.conversation_index)?;
-            let focus_range = input
+            let hit_range = input
                 .conversation
                 .message_times
                 .narrowed_to(hit.message_range, &window)?;
@@ -1225,7 +1225,7 @@ fn semantic_output_hit_candidates(
                 evidence_source: AgentHitSource::Dialogue,
                 render_options: AgentHitRenderOptions::default(),
                 preview: format_evidence_preview(&hit.snippet),
-                focus_range,
+                hit_range,
                 times: None,
                 addresses: None,
             })
@@ -1369,7 +1369,7 @@ fn push_group_hit(
 
 fn same_evidence_identity(existing: &AgentOutputHit, candidate: &AgentOutputHit) -> bool {
     existing.conversation_ref == candidate.conversation_ref
-        && existing.focus_range == candidate.focus_range
+        && existing.hit_range == candidate.hit_range
         && existing.evidence_source == candidate.evidence_source
 }
 
@@ -1419,7 +1419,7 @@ fn sort_group_hits(hits: &mut [AgentOutputHit]) {
                     .unwrap_or(Ordering::Equal)
             })
             .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal))
-            .then_with(|| a.focus_range.start.cmp(&b.focus_range.start))
+            .then_with(|| a.hit_range.start.cmp(&b.hit_range.start))
             .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
     });
 }
@@ -1501,7 +1501,7 @@ fn hybrid_hits_with_semantic_order(
     for (rank, hit) in semantic_hits.into_iter().enumerate() {
         if let Some(existing) = ranked.iter_mut().find(|existing| {
             existing.hit.conversation_ref == hit.conversation_ref
-                && existing.hit.focus_range == hit.focus_range
+                && existing.hit.hit_range == hit.hit_range
         }) {
             existing.semantic_rank = Some(rank + 1);
             existing.hit.source = AgentHitKind::Hybrid;
@@ -1539,7 +1539,7 @@ fn hybrid_hits_with_semantic_order(
                     .unwrap_or(Ordering::Equal)
             })
             .then_with(|| a.hit.conversation_ref.cmp(&b.hit.conversation_ref))
-            .then_with(|| a.hit.focus_range.start.cmp(&b.hit.focus_range.start))
+            .then_with(|| a.hit.hit_range.start.cmp(&b.hit.hit_range.start))
     });
     ranked.into_iter().map(|ranked| ranked.hit).collect()
 }
@@ -1585,7 +1585,7 @@ fn sort_output_hits(hits: &mut [AgentOutputHit]) {
             })
             .then_with(|| source_rank(a.source).cmp(&source_rank(b.source)))
             .then_with(|| a.conversation_ref.cmp(&b.conversation_ref))
-            .then_with(|| a.focus_range.start.cmp(&b.focus_range.start))
+            .then_with(|| a.hit_range.start.cmp(&b.hit_range.start))
     });
 }
 
@@ -1809,7 +1809,7 @@ mod tests {
         title: &str,
         score: f64,
         preview: &str,
-        focus_range: MessageRange,
+        hit_range: MessageRange,
         read_range: MessageRange,
     ) -> AgentOutputHit {
         AgentOutputHit {
@@ -1826,19 +1826,19 @@ mod tests {
             evidence_source: AgentHitSource::Dialogue,
             render_options: AgentHitRenderOptions::default(),
             preview: preview.to_string(),
-            focus_range,
+            hit_range,
             times: None,
-            addresses: Some(parent_addresses(focus_range, read_range)),
+            addresses: Some(parent_addresses(hit_range, read_range)),
         }
     }
 
-    /// The addresses of a hit on `focus` reading `read`, ordinals of a
+    /// The addresses of a hit on `hit` reading `read`, ordinals of a
     /// session without sub-agents.
-    fn parent_addresses(focus: MessageRange, read: MessageRange) -> HitAddresses {
+    fn parent_addresses(hit: MessageRange, read: MessageRange) -> HitAddresses {
         let range =
             |range: MessageRange| ThreadRange::closed(Thread::Parent, range.start, range.end);
         HitAddresses {
-            focus: range(focus),
+            hit: range(hit),
             read: range(read),
         }
     }
@@ -1848,7 +1848,7 @@ mod tests {
         title: &str,
         score: f64,
         preview: &str,
-        focus_range: MessageRange,
+        hit_range: MessageRange,
         read_range: MessageRange,
     ) -> AgentOutputHit {
         AgentOutputHit {
@@ -1865,9 +1865,9 @@ mod tests {
             evidence_source: AgentHitSource::Tool,
             render_options: AgentHitRenderOptions::default(),
             preview: preview.to_string(),
-            focus_range,
+            hit_range,
             times: None,
-            addresses: Some(parent_addresses(focus_range, read_range)),
+            addresses: Some(parent_addresses(hit_range, read_range)),
         }
     }
 
@@ -1876,7 +1876,7 @@ mod tests {
         title: &str,
         score: f64,
         preview: &str,
-        focus_range: MessageRange,
+        hit_range: MessageRange,
         read_range: MessageRange,
     ) -> AgentOutputHit {
         AgentOutputHit {
@@ -1893,23 +1893,23 @@ mod tests {
             evidence_source: AgentHitSource::Dialogue,
             render_options: AgentHitRenderOptions::default(),
             preview: preview.to_string(),
-            focus_range,
+            hit_range,
             times: None,
-            addresses: Some(parent_addresses(focus_range, read_range)),
+            addresses: Some(parent_addresses(hit_range, read_range)),
         }
     }
 
-    /// A hybrid search reads its semantic hits' focus messages alone: a
-    /// lexical or fused hit keeps the anchors its retrieval found.
+    /// A hybrid search reads its semantic hits' messages alone: a lexical
+    /// or fused hit keeps the anchors its retrieval found.
     #[test]
     fn semantic_hit_metadata_leaves_lexical_and_fused_hits_anchors() {
         let resolved = resolved("a.jsonl");
         let reference = resolved.reference.canonical();
         let retrieval_anchors = vec!["ma_0000000000000001".to_owned()];
-        let hit = |source, focus| AgentOutputHit {
+        let hit = |source, range| AgentOutputHit {
             source,
             anchors: retrieval_anchors.clone(),
-            ..lexical_dialogue_hit(&reference, "a", 1.0, "text", focus, focus)
+            ..lexical_dialogue_hit(&reference, "a", 1.0, "text", range, range)
         };
         let mut output = AgentSearchOutput {
             protocol: AgentProtocolKind::Search,
@@ -1926,13 +1926,13 @@ mod tests {
             budget: None,
             coverage: None,
         };
-        let semantic_focus = SearchedTranscript::from(transcript(vec![message(
+        let semantic_hit = SearchedTranscript::from(transcript(vec![message(
             3,
             AgentMessageRole::User,
             "cache",
         )]));
 
-        attach_semantic_hit_metadata(&mut output, &resolved, semantic_focus.with_places());
+        attach_semantic_hit_metadata(&mut output, &resolved, semantic_hit.with_places());
 
         let anchors = output
             .hits
@@ -1950,8 +1950,8 @@ mod tests {
             anchors[2],
             (
                 AgentHitKind::Semantic,
-                FocusMetadata::of(
-                    semantic_focus.with_places(),
+                HitMetadata::of(
+                    semantic_hit.with_places(),
                     &resolved,
                     MessageRange::single(3)
                 )
@@ -2234,7 +2234,7 @@ mod tests {
         assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
         assert!(rendered.contains(" | cache warming answer"));
         assert!(rendered.contains("read ref=ch_"));
-        assert!(rendered.contains("focus=m2 "));
+        assert!(rendered.contains("hit=m2 "));
     }
 
     #[test]
@@ -2291,7 +2291,7 @@ mod tests {
         );
         assert_eq!(exact.mode, SearchMode::Exact);
         assert_eq!(exact.hits.len(), 1);
-        assert_eq!(exact.hits[0].focus_range, MessageRange::single(2));
+        assert_eq!(exact.hits[0].hit_range, MessageRange::single(2));
         assert_eq!(exact.hits[0].source, AgentHitKind::Exact);
         assert!(format_agent_output(&exact).contains("source=exact"));
 
@@ -2304,7 +2304,7 @@ mod tests {
         );
         assert_eq!(quoted_only.mode, SearchMode::Exact);
         assert_eq!(quoted_only.hits.len(), 1);
-        assert_eq!(quoted_only.hits[0].focus_range, MessageRange::single(1));
+        assert_eq!(quoted_only.hits[0].hit_range, MessageRange::single(1));
         assert_eq!(quoted_only.hits[0].source, AgentHitKind::Exact);
         assert!(format_agent_output(&quoted_only).contains("source=exact"));
     }
@@ -2413,12 +2413,12 @@ mod tests {
         assert_eq!(hits[0].preview, format_evidence_preview(&raw));
         assert_eq!(hits[0].preview.chars().count(), 160);
         assert_eq!(hits[0].evidence_source, AgentHitSource::Dialogue);
-        assert_eq!(hits[0].focus_range, MessageRange::single(3));
+        assert_eq!(hits[0].hit_range, MessageRange::single(3));
         assert_eq!(hits[0].render_options, AgentHitRenderOptions::default());
     }
 
     #[test]
-    fn hybrid_dedupes_same_focus_and_prefers_lexical_preview() {
+    fn hybrid_dedupes_same_hit_range_and_prefers_lexical_preview() {
         let lexical = vec![lexical_dialogue_hit(
             "ch_123456789abc",
             "title",
@@ -2480,11 +2480,11 @@ mod tests {
         let hits = hybrid_hits(lexical, semantic, 10);
 
         assert_eq!(hits[0].conversation_ref, "ch_bbbbbbbbbbbb");
-        assert_eq!(hits[0].focus_range, MessageRange::single(7));
+        assert_eq!(hits[0].hit_range, MessageRange::single(7));
         assert!(
             hits.iter()
                 .any(|hit| hit.conversation_ref == "ch_bbbbbbbbbbbb"
-                    && hit.focus_range == MessageRange::single(2))
+                    && hit.hit_range == MessageRange::single(2))
         );
     }
 
@@ -2527,7 +2527,7 @@ mod tests {
 
         assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc anchors=ma_0000000000000000 source=tool"));
         assert!(
-            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2 tools=false tool-results=true thinking=false subagents=false")
+            rendered.contains("read ref=ch_123456789abc:m1..m3 hit=m2 tools=false tool-results=true thinking=false subagents=false")
         );
     }
 
@@ -2606,7 +2606,7 @@ mod tests {
 
     #[test]
     fn grouped_search_preserves_duplicate_previews_at_distinct_messages() {
-        let hit = |focus| AgentOutputHit {
+        let hit = |ordinal| AgentOutputHit {
             conversation_ref: "ch_a".to_string(),
             project_id: "pr_test".to_string(),
             conversation_uuid: "uuid-a".to_string(),
@@ -2623,19 +2623,19 @@ mod tests {
                 ..AgentHitRenderOptions::default()
             },
             preview: "The file /tmp/a has been updated successfully.".to_string(),
-            focus_range: MessageRange::single(focus),
+            hit_range: MessageRange::single(ordinal),
             times: None,
             addresses: Some(parent_addresses(
-                MessageRange::single(focus),
-                MessageRange::single(focus),
+                MessageRange::single(ordinal),
+                MessageRange::single(ordinal),
             )),
         };
 
         let groups = build_conversation_groups(vec![hit(1), hit(2)], 10, 10, false);
 
         assert_eq!(groups[0].hits.len(), 2);
-        assert_eq!(groups[0].hits[0].focus_range, MessageRange::single(1));
-        assert_eq!(groups[0].hits[1].focus_range, MessageRange::single(2));
+        assert_eq!(groups[0].hits[0].hit_range, MessageRange::single(1));
+        assert_eq!(groups[0].hits[1].hit_range, MessageRange::single(2));
     }
 
     #[test]
@@ -2699,7 +2699,7 @@ mod tests {
         );
         assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0000000000000000 source=lexical"));
         assert!(rendered.contains(" | cache warming answer\n"), "{rendered}");
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2 tools=false tool-results=false thinking=false subagents=false\n"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 hit=m2 tools=false tool-results=false thinking=false subagents=false\n"));
         assert!(!rendered.contains("similarity="));
         assert!(!rendered.contains("word-match="));
         assert!(!rendered.contains("preview="));
@@ -3005,7 +3005,7 @@ mod tests {
     /// m2 is a sub-agent's message, m3 holds a call alone and m4 its result
     /// alone; m5 holds text beside a call.
     #[test]
-    fn hits_recipe_names_flags_its_focus_message_needs_to_show() {
+    fn hits_recipe_names_flags_its_message_needs_to_show() {
         use crate::agent::transcript::AgentMessagePart;
         use crate::log_entry::Tool;
         use AgentMessageRole::{Assistant, User};
@@ -3861,7 +3861,7 @@ mod tests {
             output.hits[0].conversation_ref,
             output.hits[1].conversation_ref
         );
-        assert_ne!(output.hits[0].focus_range, output.hits[1].focus_range);
+        assert_ne!(output.hits[0].hit_range, output.hits[1].hit_range);
     }
 
     #[test]
@@ -4022,8 +4022,8 @@ mod tests {
 
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].source, AgentHitKind::Hybrid);
-        assert_eq!(hits[0].focus_range, MessageRange::single(1));
-        assert_eq!(hits[1].focus_range, MessageRange::single(2));
+        assert_eq!(hits[0].hit_range, MessageRange::single(1));
+        assert_eq!(hits[1].hit_range, MessageRange::single(2));
     }
 
     #[test]

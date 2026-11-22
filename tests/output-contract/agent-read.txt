@@ -269,9 +269,9 @@ day 2026-09-01
 m1 user 06:00:00
 | USER_TEXT_SENTINEL: check the plugin's files and how it starts
 m3 hidden 06:00:03 tool-results=1 calls=m2.1
-$ rearview agent read ch_581699c40efc:m1..m8 --focus ch_581699c40efc:m5 --budget 700
+$ rearview agent read ch_581699c40efc:m1..m8 --hit ch_581699c40efc:m5 --budget 700
 --- stdout
-protocol agent-read cut=head+focus+tail chars=700 full=1126 policy=text over-budget=m1..m4,s2:m1..m3,m7..m8 tz=-04:00 hidden-tools=1 hidden-tool-results=1
+protocol agent-read cut=head+hit+tail chars=700 full=1126 policy=text over-budget=m1..m4,s2:m1..m3,m7..m8 tz=-04:00 hidden-tools=1 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m5..m6 hidden 06:00:07..06:00:08 launches=s2 tools=1 tool-results=1 calls=m4.1
@@ -687,9 +687,9 @@ s1:m1..m3 hidden 06:00:02 subagent-messages=3
 m3 06:00:04
 | kimi answer searchable
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
-$ rearview agent read ch_0b26e45343df:m1..m8 --focus ch_0b26e45343df:m5 --budget 700
+$ rearview agent read ch_0b26e45343df:m1..m8 --hit ch_0b26e45343df:m5 --budget 700
 --- stdout
-protocol agent-read cut=head+focus+tail chars=700 full=847 policy=text over-budget=m1,m6..m8 tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 warnings=1 warning-records=1
+protocol agent-read cut=head+hit+tail chars=700 full=847 policy=text over-budget=m1,m6..m8 tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m2 hidden 06:00:03 thinking=1
@@ -1132,9 +1132,9 @@ s1:m1..m2 hidden 06:00:03 subagent-messages=2
 m3 06:00:05
 | codex answer searchable
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
-$ rearview agent read ch_74aec3f6df49:m1..m8 --focus ch_74aec3f6df49:m5 --budget 700
+$ rearview agent read ch_74aec3f6df49:m1..m8 --hit ch_74aec3f6df49:m5 --budget 700
 --- stdout
-protocol agent-read cut=head+focus+tail chars=700 full=829 policy=text over-budget=m1,s2:m1..m3 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 warnings=1 warning-records=1
+protocol agent-read cut=head+hit+tail chars=700 full=829 policy=text over-budget=m1,s2:m1..m3 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m2 hidden 06:00:04 thinking=1
@@ -1566,7 +1566,7 @@ m1 user 22:04:06
 m3 user 22:04:12
 | OMP active question
 s1:m1..m2 hidden 22:04:12 subagent-messages=2
-$ rearview agent read ch_974c3840e189:m1..m8 --focus ch_974c3840e189:m5 --budget 700
+$ rearview agent read ch_974c3840e189:m1..m8 --hit ch_974c3840e189:m5 --budget 700
 --- stdout
 protocol agent-read cut=none chars=700 policy=text over-budget=none tz=-05:00 hidden-tools=1 hidden-thinking=1 hidden-subagent-messages=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
@@ -1827,7 +1827,7 @@ m1 user 08:01:40
 | find the fixture defect
 m3 hidden 08:01:40 tool-results=1 calls=m2.1
 s1:m1..m3 hidden 08:03:10..08:03:20 subagent-messages=3
-$ rearview agent read ch_efbbec792ccc:m1..m8 --focus ch_efbbec792ccc:m5 --budget 700
+$ rearview agent read ch_efbbec792ccc:m1..m8 --hit ch_efbbec792ccc:m5 --budget 700
 --- stdout
 protocol agent-read cut=none chars=700 policy=text over-budget=none tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
@@ -2054,7 +2054,7 @@ day 2024-02-29
 m1 user 19:01:00
 | active root question
 m3 hidden 19:06:00 tool-results=1 calls=m2.1
-$ rearview agent read ch_f04d3718e406:m1..m8 --focus ch_f04d3718e406:m5 --budget 700
+$ rearview agent read ch_f04d3718e406:m1..m8 --hit ch_f04d3718e406:m5 --budget 700
 --- stdout
 protocol agent-read cut=none chars=700 policy=text over-budget=none tz=-05:00 hidden-tools=4 hidden-tool-results=3 hidden-thinking=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
@@ -2292,7 +2292,7 @@ m1 user 19:00:01
 s1:m1..m3 hidden 19:00:01 subagent-messages=3
 m3 19:00:01
 | grok answer searchable
-$ rearview agent read ch_982349c13ee4:m1..m8 --focus ch_982349c13ee4:m5 --budget 700
+$ rearview agent read ch_982349c13ee4:m1..m8 --hit ch_982349c13ee4:m5 --budget 700
 --- stdout
 protocol agent-read cut=none chars=700 policy=text over-budget=none tz=-05:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4

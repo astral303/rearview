@@ -300,16 +300,17 @@ pub struct AgentReadArgs {
     /// Durable message anchor to read within one conversation
     #[arg(long, value_parser = non_empty_string)]
     pub anchor: Option<String>,
-    /// Message or range to prioritize when budgeted output is truncated
+    /// The hit's message or range, as a search hit's `hit=` prints it, kept
+    /// first when budgeted output is truncated
     #[arg(long, value_parser = non_empty_string)]
-    pub focus: Option<String>,
+    pub hit: Option<String>,
     /// Read the last N of each ref's or range's own messages (a sub-agent's for
     /// :sN), not counting hidden messages
     #[arg(
         long,
         value_name = "N",
         value_parser = non_zero_count,
-        conflicts_with_all = ["anchor", "focus", "lines", "match_query"]
+        conflicts_with_all = ["anchor", "hit", "lines", "match_query"]
     )]
     pub tail: Option<NonZeroUsize>,
     /// Inclusive content line range within one message; START.. reads to its
@@ -1122,7 +1123,7 @@ mod tests {
             "read",
             "ch_abc123:m1..m3",
             "ch_def456:m4",
-            "--focus",
+            "--hit",
             "m2",
             "--budget",
             "1234",
@@ -1137,7 +1138,7 @@ mod tests {
             AgentCommand::Read(read) => {
                 assert_eq!(read.refs, vec!["ch_abc123:m1..m3", "ch_def456:m4"]);
                 assert_eq!(read.anchor, None);
-                assert_eq!(read.focus.as_deref(), Some("m2"));
+                assert_eq!(read.hit.as_deref(), Some("m2"));
                 assert_eq!(read.lines, None);
                 assert_eq!(read.match_query, None);
                 assert_eq!(read.context, 3);
@@ -1273,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_read_tail_accepts_nonzero_count_and_conflicts_with_anchor_focus_lines_and_match() {
+    fn agent_read_tail_accepts_nonzero_count_and_conflicts_with_anchor_hit_lines_and_match() {
         let parse_read = |extra: &[&str]| {
             Args::try_parse_from(
                 ["rearview", "agent", "read", "ch_abc123"]
@@ -1290,12 +1291,12 @@ mod tests {
         assert!(parse_read(&["--tail", "0"]).is_err());
         for other in [
             &["--anchor", "ma_1234"][..],
-            &["--focus", "m2"],
+            &["--hit", "m2"],
             &["--lines", "1..2"],
             &["--match", "needle"],
         ] {
             let error = parse_read(&[&["--tail", "5"][..], other].concat())
-                .expect_err("--tail conflicts with --anchor, --focus, --lines and --match");
+                .expect_err("--tail conflicts with --anchor, --hit, --lines and --match");
             assert!(error.to_string().contains("cannot be used with"), "{error}");
         }
     }
