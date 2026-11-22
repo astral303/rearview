@@ -87,13 +87,15 @@ impl MessageAddresses {
         ThreadRange::one(place.thread, place.number).to_string()
     }
 
-    /// `m7`, `m7..m9` or `s3:m2..m4`: messages `first` to `last` of one
-    /// thread, printed as [`Self::closed_range`] prints two.
+    /// `m7`, `m7..m9` or `s3:m2..m4`: messages `first` to `last`. Messages of
+    /// two threads print as the groups that contain them, `m7..m9`.
     pub fn range(&self, first: usize, last: usize) -> String {
-        if first == last {
-            self.message(first)
+        let (first_place, last_place) = (self.place(first), self.place(last));
+        if first_place.thread == last_place.thread {
+            ThreadRange::closed(first_place.thread, first_place.number, last_place.number)
+                .to_string()
         } else {
-            self.closed_range(first, last)
+            self.groups(first, last)
         }
     }
 
@@ -109,19 +111,6 @@ impl MessageAddresses {
             self.call(call(first))
         } else {
             format!("{}..{last}", self.call(call(first)))
-        }
-    }
-
-    /// `m7..m9` or `s3:m2..m4`, and `m7..m7` for one message: the form of an
-    /// outline's segment. Messages of two threads print as the groups that
-    /// hold them, `m7..m9`.
-    pub fn closed_range(&self, first: usize, last: usize) -> String {
-        let (first_place, last_place) = (self.place(first), self.place(last));
-        if first_place.thread == last_place.thread {
-            ThreadRange::closed(first_place.thread, first_place.number, last_place.number)
-                .to_string()
-        } else {
-            self.groups(first, last)
         }
     }
 
@@ -144,14 +133,16 @@ impl MessageAddresses {
         HitPlaces::of(&self.threads, &ordinals.into_iter().collect::<Vec<_>>())
     }
 
-    /// The refs, after the conversation's, that read exactly the messages of
-    /// `runs`, consecutive ordinals, in order:
-    /// - every message of consecutive groups as one range, `m119..m125`, or
-    ///   `m7` for a group of one message;
-    /// - of a group with messages left out, its own message as `m7`, and
-    ///   each sub-agent's consecutive messages as one range, `s3:m4..m9`.
+    /// The refs, after the conversation's, that read the messages of `runs`,
+    /// consecutive ordinals, in order:
+    /// - the groups containing the session's own messages of `runs` as one range
+    ///   per run of consecutive groups, `m119..m125` or `m7`;
+    /// - the other sub-agent messages as one range per sub-agent's
+    ///   consecutive messages, `s3:m4..m9`.
     ///
-    /// The refs come in the order of their first messages.
+    /// The refs come in the order of their first messages. A ref of the
+    /// session's own messages reads their whole groups with `--subagents`: in
+    /// a group with messages left out, it reads them too.
     pub fn refs(&self, runs: &[(usize, usize)]) -> Vec<String> {
         self.ref_ranges(&self.indices_of(runs))
             .into_iter()
@@ -171,46 +162,41 @@ impl MessageAddresses {
         indices
     }
 
-    /// The ranges of the refs that read exactly the messages at the sorted
-    /// `indices`, in the order of their first messages.
+    /// The ranges of the refs that read the messages at the sorted `indices`,
+    /// in the order of their first messages.
     fn ref_ranges(&self, indices: &[usize]) -> Vec<RefRange> {
         let mut ranges = RefRanges::default();
         for group in indices.chunk_by(|&left, &right| self.group_at(left) == self.group_at(right)) {
-            if self.is_whole_group(group) {
+            if self.contains_own_message(group) {
                 ranges.add_group(self.ordinals[group[0]], self.group_at(group[0]));
             } else {
                 for &index in group {
-                    ranges.add_message(self.ordinals[index], self.places[index]);
+                    ranges.add_subagent_message(self.ordinals[index], self.places[index]);
                 }
             }
         }
         ranges.in_order()
     }
 
-    /// True when `indices`, of messages of one group, hold every message of
-    /// that group.
-    fn is_whole_group(&self, indices: &[usize]) -> bool {
-        !self.thread_messages(Thread::Parent).is_empty()
-            && indices.len() == self.group_len(self.group_at(indices[0]))
+    /// True when one of the messages at `indices` is the session's own.
+    fn contains_own_message(&self, indices: &[usize]) -> bool {
+        indices
+            .iter()
+            .any(|&index| self.places[index].thread == Thread::Parent)
     }
 
     /// `m7`, `m7..m9` or `s3:m4..m9`: the ref reading `range`.
     fn ref_address(&self, range: RefRange) -> ThreadRange {
         match range {
-            RefRange::Groups(first, last) if first == last && self.group_len(first) == 1 => {
-                ThreadRange::one(Thread::Parent, first)
-            }
             RefRange::Groups(first, last) => ThreadRange::closed(Thread::Parent, first, last),
-            RefRange::Run(thread, first, last) if first == last => ThreadRange::one(thread, first),
             RefRange::Run(thread, first, last) => ThreadRange::closed(thread, first, last),
         }
     }
 
     /// The messages `reference` names, or the error naming what it misses:
-    /// - `mN` is the session's own message N;
     /// - `mA..mB` is messages A to B of the session's own with the
     ///   sub-agent messages written after mA, from the session's start when
-    ///   A is 1, and before m(B+1);
+    ///   A is 1, and before m(B+1); `mN` is `mN..mN`;
     /// - `sN:mA..mB` is sub-agent N's messages A to B alone.
     pub fn resolve(&self, reference: ThreadRange) -> Result<ResolvedRange> {
         let MessageRange { start, end } = reference.range;
@@ -224,18 +210,8 @@ impl MessageAddresses {
             return Err(AgentError::out_of_range(None, self.past_end(reference)).into());
         }
         let range = match reference.thread {
-            Thread::Parent if reference.is_range => MessageRange {
-                start: if start == 1 {
-                    self.ordinals[0]
-                } else {
-                    messages[start - 1]
-                },
-                end: match messages.get(end) {
-                    Some(&next) => self.ordinals[self.index(next) - 1],
-                    None => *self.ordinals.last().expect("the range ends in a message"),
-                },
-            },
-            _ => MessageRange {
+            Thread::Parent => self.groups_span(start, end),
+            Thread::Subagent(_) => MessageRange {
                 start: messages[start - 1],
                 end: messages[end - 1],
             },
@@ -296,31 +272,21 @@ impl MessageAddresses {
         self.group_of(self.ordinals[index])
     }
 
-    /// The indices, in `ordinals`, of the group holding message `ordinal`.
-    fn group_indices(&self, ordinal: usize) -> std::ops::RangeInclusive<usize> {
+    /// The ordinals of the first and last messages of the groups of the
+    /// session's own messages `first` to `last`.
+    fn groups_span(&self, first: usize, last: usize) -> MessageRange {
         let parent = self.thread_messages(Thread::Parent);
-        if parent.is_empty() {
-            let index = self.index(ordinal);
-            return index..=index;
+        MessageRange {
+            start: if first == 1 {
+                self.ordinals[0]
+            } else {
+                parent[first - 1]
+            },
+            end: match parent.get(last) {
+                Some(&next) => self.ordinals[self.index(next) - 1],
+                None => *self.ordinals.last().expect("a group contains a message"),
+            },
         }
-        let group = self.group_of(ordinal);
-        let start = if group == 1 {
-            0
-        } else {
-            self.index(parent[group - 1])
-        };
-        let end = match parent.get(group) {
-            Some(&next) => self.index(next) - 1,
-            None => self.ordinals.len() - 1,
-        };
-        start..=end
-    }
-
-    /// The number of messages in the group of the session's own message
-    /// `number`.
-    fn group_len(&self, number: usize) -> usize {
-        let parent = self.thread_messages(Thread::Parent);
-        self.group_indices(parent[number - 1]).count()
     }
 }
 
@@ -330,7 +296,9 @@ enum RefRange {
     /// Every message of the groups of the session's own messages `first` to
     /// `last`.
     Groups(usize, usize),
-    /// Messages `first` to `last` of one thread alone.
+    /// Messages `first` to `last` of one thread alone. `ref_ranges` adds a
+    /// run for the messages of a group without its own message, all of
+    /// them sub-agent messages.
     Run(Thread, usize, usize),
 }
 
@@ -357,16 +325,10 @@ impl RefRanges {
         }
     }
 
-    /// Add message `ordinal`, at `place` in a group with messages left out:
-    /// the session's own as a range of its own, a sub-agent's to its thread's
-    /// run when it follows that run's last message.
-    fn add_message(&mut self, ordinal: usize, place: Place) {
+    /// Add sub-agent message `ordinal`, at `place`, to its thread's run when
+    /// it follows that run's last message.
+    fn add_subagent_message(&mut self, ordinal: usize, place: Place) {
         let Place { thread, number } = place;
-        if thread == Thread::Parent {
-            self.ranges
-                .push((ordinal, RefRange::Run(thread, number, number)));
-            return;
-        }
         match self.open_runs.get_mut(&thread) {
             Some((_, _, last)) if *last + 1 == number => *last = number,
             _ => {
@@ -533,11 +495,13 @@ mod tests {
     }
 
     #[test]
-    fn range_of_own_messages_holds_subagent_messages_written_during_it() {
+    fn own_messages_contain_subagent_messages_written_during_them() {
         for (reference, expected) in [
             ("m1..m1", ordinals(1, 3, None)),
+            ("m1", ordinals(1, 3, None)),
             ("m2..m2", ordinals(4, 6, None)),
             ("m2..m3", ordinals(4, 8, None)),
+            ("m3", ordinals(7, 8, None)),
             ("m4..m4", ordinals(9, 9, None)),
         ] {
             assert_eq!(resolved(reference).unwrap(), expected, "{reference}");
@@ -545,12 +509,11 @@ mod tests {
     }
 
     #[test]
-    fn single_own_message_and_subagent_range_name_their_messages_alone() {
+    fn subagent_ref_names_its_messages_alone() {
         for (reference, expected) in [
-            ("m1", ordinals(2, 2, None)),
-            ("m3", ordinals(7, 7, None)),
             ("s1:m2..m3", ordinals(3, 6, Some(1))),
             ("s2:m2", ordinals(8, 8, Some(2))),
+            ("s2:m2..m2", ordinals(8, 8, Some(2))),
         ] {
             assert_eq!(resolved(reference).unwrap(), expected, "{reference}");
         }
@@ -608,11 +571,11 @@ mod tests {
         let places = addresses.hit_places(1..=9);
 
         for (start, end, focus, read) in [
-            (3, 3, "s1:m2..m2", "s1:m1..m3"),
-            (6, 6, "s1:m3..m3", "s1:m2..m3"),
-            (2, 2, "m1..m1", "m1..m2"),
-            (7, 7, "m3..m3", "m2..m4"),
-            (9, 9, "m4..m4", "m3..m4"),
+            (3, 3, "s1:m2", "s1:m1..m3"),
+            (6, 6, "s1:m3", "s1:m2..m3"),
+            (2, 2, "m1", "m1..m2"),
+            (7, 7, "m3", "m2..m4"),
+            (9, 9, "m4", "m3..m4"),
         ] {
             assert_eq!(
                 hit(&places, start, end),
@@ -649,25 +612,33 @@ mod tests {
         let addresses = addresses();
 
         assert_eq!(addresses.refs(&[(1, 9)]), ["m1..m4"]);
-        assert_eq!(addresses.refs(&[(4, 6)]), ["m2..m2"]);
+        assert_eq!(addresses.refs(&[(4, 6)]), ["m2"]);
         assert_eq!(addresses.refs(&[(7, 9)]), ["m3..m4"]);
         assert_eq!(addresses.refs(&[(9, 9)]), ["m4"]);
     }
 
     #[test]
-    fn refs_name_messages_of_group_partly_named_by_thread() {
+    fn refs_name_group_of_each_own_message_named_without_its_subagent_messages() {
         let addresses = addresses();
 
-        assert_eq!(addresses.refs(&[(7, 7)]), ["m3"]);
         assert_eq!(
-            addresses.refs(&[(5, 6), (8, 8)]),
-            ["s2:m1..m2", "s1:m3"],
-            "beta's m1 and m2 are one run beside alpha's m3"
+            addresses.refs(&[(7, 7)]),
+            ["m3"],
+            "m3 without beta's m2 is m3's group"
         );
         assert_eq!(
             addresses.refs(&[(3, 7)]),
-            ["s1:m2", "m2..m2", "m3"],
-            "alpha's m2 is in m1's group, and m3 without beta's m2"
+            ["s1:m2", "m2..m3"],
+            "alpha's m2 is in m1's group, and m3 without beta's m2 is m3's group"
+        );
+    }
+
+    #[test]
+    fn refs_name_subagent_messages_of_group_without_its_own_message_by_thread() {
+        assert_eq!(
+            addresses().refs(&[(5, 6), (8, 8)]),
+            ["s2:m1..m2", "s1:m3"],
+            "beta's m1 and m2 are one run beside alpha's m3"
         );
     }
 }

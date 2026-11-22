@@ -1451,16 +1451,8 @@ mod agent_command_tests {
                 focus_range: agent::refs::MessageRange::single(2),
                 times: None,
                 addresses: Some(agent::address::HitAddresses {
-                    focus: agent::refs::ThreadRange {
-                        thread: agent::refs::Thread::Parent,
-                        range: agent::refs::MessageRange::single(2),
-                        is_range: true,
-                    },
-                    read: agent::refs::ThreadRange {
-                        thread: agent::refs::Thread::Parent,
-                        range: agent::refs::MessageRange { start: 1, end: 3 },
-                        is_range: true,
-                    },
+                    focus: agent::refs::ThreadRange::one(agent::refs::Thread::Parent, 2),
+                    read: agent::refs::ThreadRange::closed(agent::refs::Thread::Parent, 1, 3),
                 }),
             }],
             groups: vec![],
@@ -1481,7 +1473,7 @@ mod agent_command_tests {
         assert!(rendered.contains(
             "hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678"
         ));
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false\n"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2 tools=false tool-results=false thinking=false subagents=false\n"));
     }
 
     fn read_args_from_line(read_line: &str) -> AgentReadArgs {
@@ -1801,7 +1793,7 @@ mod agent_command_tests {
         ));
 
         assert!(
-            within.contains("focus=m4..m4"),
+            within.contains("focus=m4 "),
             "the session's own fourth message follows a sub-agent's: {within}"
         );
         let read_line = within
@@ -1857,7 +1849,7 @@ mod agent_command_tests {
             &[semantic_hit],
         ));
 
-        assert!(within.contains("focus=m2..m2"));
+        assert!(within.contains("focus=m2 "));
         let read_line = within
             .lines()
             .find(|line| line.starts_with("read ref="))
@@ -1995,7 +1987,7 @@ mod agent_command_tests {
         )
         .unwrap();
         let rendered = agent::search::format_agent_output(&output);
-        assert!(rendered.contains("focus=m2..m2"), "{rendered}");
+        assert!(rendered.contains("focus=m2 "), "{rendered}");
 
         let whole_reply = format!(
             "read ref={}:m2 tools=true thinking=true",
@@ -2693,7 +2685,7 @@ mod agent_command_tests {
             let focuses = hit_focuses(&output);
             assert!(!focuses.is_empty(), "{case}: {output}");
             assert!(
-                focuses.iter().all(|focus| *focus == "m4..m4"),
+                focuses.iter().all(|focus| *focus == "m4"),
                 "{case}: {output}"
             );
         }
@@ -2735,7 +2727,7 @@ mod agent_command_tests {
             &[semantic_hit],
         ));
 
-        assert!(rendered.contains("focus=s1:m1..m1"), "{rendered}");
+        assert!(rendered.contains("focus=s1:m1 "), "{rendered}");
         assert!(rendered.contains("tools=false tool-results=false thinking=false subagents=true"));
         let read_line = rendered
             .lines()

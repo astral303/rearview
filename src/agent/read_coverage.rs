@@ -95,6 +95,11 @@ const EVERY_FLAG: ProtocolOptions = ProtocolOptions {
     },
 };
 
+const EVERY_FLAG_BUT_SUBAGENTS: ProtocolOptions = ProtocolOptions {
+    subagents: false,
+    ..EVERY_FLAG
+};
+
 const WITH_SUBAGENTS: ProtocolOptions = ProtocolOptions {
     subagents: true,
     ..DEFAULT_FLAGS
@@ -538,7 +543,10 @@ fn misread_subagents(session: &AgentSession) -> (Vec<String>, HashMap<String, Le
 
 /// Each segment of the outline of each of `session`'s sub-agents, at two
 /// messages a segment, whose address does not read back exactly the
-/// messages it covers; and the count of segments.
+/// messages it covers; and the count of segments. A segment of the
+/// session's own messages reads back without `--subagents`: with it, `m5`
+/// also shows the sub-agent messages written after m5, which the segment
+/// does not cover.
 fn segments_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
     let loaded = LoadedSession::of(session);
     let reference = loaded.resolved.reference.canonical();
@@ -559,10 +567,21 @@ fn segments_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
                 .iter()
                 .flat_map(|message| addressed_messages(message))
                 .collect::<BTreeSet<_>>();
-            let output = loaded.read_ref(&format!("{reference}:{address}"), EVERY_FLAG);
-            if covered_addresses(&output) != expected {
+            let is_of_own_messages = addressed_messages(&address)[0].0.is_none();
+            let read_ref = |options| {
+                covered_addresses(&loaded.read_ref(&format!("{reference}:{address}"), options))
+            };
+            let read_back = if is_of_own_messages {
+                read_ref(EVERY_FLAG_BUT_SUBAGENTS)
+                    .into_iter()
+                    .filter(|&(handle, _)| handle.is_none())
+                    .collect()
+            } else {
+                read_ref(EVERY_FLAG)
+            };
+            if read_back != expected {
                 misread.push(format!(
-                    "{:?}: {handle}'s seg {address} covers {covered:?}:\n{output}",
+                    "{:?}: {handle}'s seg {address} covers {covered:?}, reads back {read_back:?}",
                     session.row.source
                 ));
             }
@@ -905,6 +924,58 @@ fn every_agents_continue_read_reads_exactly_messages_its_budget_omits() {
 
     assert!(misread.is_empty(), "{}", misread.join("\n"));
     assert!(continuations > 0, "no budgeted read continues");
+}
+
+/// Each message of the session's own in `session` whose read as `mN`
+/// differs from its read as `mN..mN`, with sub-agents shown or hidden; and
+/// how many of those reads show a sub-agent's message.
+fn own_messages_read_apart_from_their_closed_range(session: &AgentSession) -> (Vec<String>, usize) {
+    let conversation = key_of_listed(&session.row).conversation_ref().canonical();
+    let loaded = LoadedSession::of(session);
+    let own_numbers = SessionAddresses::of(session)
+        .ordinals
+        .into_keys()
+        .filter_map(|(handle, number)| handle.is_none().then_some(number))
+        .collect::<BTreeSet<_>>();
+    let mut differing = Vec::new();
+    let mut showing_subagents = 0;
+    for options in [WITH_SUBAGENTS, DEFAULT_FLAGS] {
+        for number in &own_numbers {
+            let single = loaded.read_ref(&format!("{conversation}:m{number}"), options);
+            let closed = loaded.read_ref(&format!("{conversation}:m{number}..m{number}"), options);
+            if single != closed {
+                differing.push(format!(
+                    "{:?}: m{number} reads\n{single}\nm{number}..m{number} reads\n{closed}",
+                    session.row.source
+                ));
+            }
+            if read_records(&single)
+                .iter()
+                .any(|record| record.subagent.is_some() && record.word != Some("hidden"))
+            {
+                showing_subagents += 1;
+            }
+        }
+    }
+    (differing, showing_subagents)
+}
+
+#[test]
+fn every_agents_own_message_reads_as_its_closed_range_with_and_without_subagents() {
+    let mut differing = Vec::new();
+    let mut showing_subagents = 0;
+    for session in every_record_sessions() {
+        let (session_differing, session_showing) =
+            own_messages_read_apart_from_their_closed_range(&session);
+        differing.extend(session_differing);
+        showing_subagents += session_showing;
+    }
+
+    assert!(differing.is_empty(), "{}", differing.join("\n"));
+    assert!(
+        showing_subagents > 0,
+        "a read of one own message shows the sub-agent messages written after it"
+    );
 }
 
 /// Each address `session`'s reads with every flag and with default flags

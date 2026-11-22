@@ -33,7 +33,7 @@ seg m7..m15 s3 chars=512 at=2026-09-01T06:00:20 to=2026-09-01T06:02:03 | The plu
 seg m16..m25 chars=570 at=2026-09-01T06:02:03 to=2026-09-01T06:02:10 | Reference: src/REFERENCE_SENTINEL.rs / Found 1 new diagnostic issue in 1 file src/main.rs: [Line 3:5] DIAGNOSTICS_SENTI
 seg m26..m35 chars=514 at=2026-09-01T06:30:00 to=2026-09-01T06:33:04 | [Recap] RECAP_SENTINEL: fix the parser, then run the tests. / Launching skill: write-commit-messages
 seg m36..m45 chars=403 at=2026-09-01T06:33:05 to=2026-09-01T06:34:00 | WebFetch: https://example.com/grammar (+1 line) / is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
-seg m46..m46 chars=22 at=2026-09-01T06:34:01 | *Skill: release-notes* / *Skill: release-notes*
+seg m46 chars=22 at=2026-09-01T06:34:01 | *Skill: release-notes* / *Skill: release-notes*
 $ rearview agent outline ch_581699c40efc --budget 500
 --- stdout
 protocol agent-outline cut=tail chars=500 full=1733 policy=text messages=46 subagent-messages=5 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 tz=-04:00 omitted-records=18 warnings=0 warning-records=0

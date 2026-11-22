@@ -10037,7 +10037,7 @@ mod tests {
             let rendered = agent::search::format_agent_output(&output);
 
             assert!(rendered.contains(" source=tool "), "{mode:?}: {rendered}");
-            assert!(rendered.contains(" focus=m2..m2"), "{mode:?}: {rendered}");
+            assert!(rendered.contains(" focus=m2 "), "{mode:?}: {rendered}");
             assert!(rendered.contains(query), "{mode:?}: {rendered}");
             assert!(rendered.contains(" tools=true "), "{mode:?}: {rendered}");
         }

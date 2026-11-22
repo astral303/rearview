@@ -691,9 +691,10 @@ pub fn segment_records(output: &str) -> Vec<SegmentRecord<'_>> {
 
 /// `line`, a segment: `seg m1..m20 s3,s4 chars=900 at=… to=… | first /
 /// last`, the handles and times present when the outline has them. Panics
-/// on an address that is not a run of messages, a missing or malformed
-/// `chars=`, a time that does not parse, a `to=` without `at=` or before
-/// it, any other token, and an excerpt without its first and last snippet.
+/// on an address that is not a message or a run of messages, a missing or
+/// malformed `chars=`, a time that does not parse, a `to=` without `at=` or
+/// before it, any other token, and an excerpt without its first and last
+/// snippet.
 fn segment_record<'a>(line: &'a str, output: &str) -> SegmentRecord<'a> {
     let line_fields = &line[SEGMENT_PREFIX.len()..];
     let (fields, excerpt) = match line_fields.split_once(" | ") {
@@ -703,8 +704,11 @@ fn segment_record<'a>(line: &'a str, output: &str) -> SegmentRecord<'a> {
     let mut fields = fields.split(' ').peekable();
     let address = fields.next().unwrap();
     assert!(
-        matches!(AddressKind::of(address), Some(AddressKind::Run)),
-        "a segment without a run of messages: {line}\n{output}"
+        matches!(
+            AddressKind::of(address),
+            Some(AddressKind::Message | AddressKind::Run)
+        ),
+        "a segment without a message or a run of messages: {line}\n{output}"
     );
     let subagents = fields
         .next_if(|field| field.split(',').all(is_handle))

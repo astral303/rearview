@@ -18,7 +18,7 @@ With a `ref=ch_...` handle, read or outline it directly:
 
 ```sh
 rearview agent outline ch_1234abcd5678
-rearview agent read ch_1234abcd5678:m7..m9 --focus m8..m8
+rearview agent read ch_1234abcd5678:m7..m9 --focus m8
 rearview agent read ch_1234abcd5678 --anchor ma_0123456789abcdef
 rearview agent read ch_1234abcd5678:m7.2
 rearview agent read ch_1234abcd5678:s3
@@ -114,8 +114,8 @@ protocol agent-search mode=lexical cut=none chars=6000 policy=per-hit groups=1 h
 query text=auth%20cache%20bug hits=1
 groups count=1
 conversation rank=1 project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000 hits=1 total=1 : fix auth cache
-hit project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0123456789abcdef source=lexical score=12.500000 focus=m8..m8 at=2026-07-20T14:30:12 | auth cache bug repro
-read ref=ch_1234abcd5678:m7..m9 focus=m8..m8 tools=false tool-results=false thinking=false subagents=false
+hit project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0123456789abcdef source=lexical score=12.500000 focus=m8 at=2026-07-20T14:30:12 | auth cache bug repro
+read ref=ch_1234abcd5678:m7..m9 focus=m8 tools=false tool-results=false thinking=false subagents=false
 ```
 
 Copy an emitted `read ref=...` or `refs=...` recipe into the next command.
@@ -139,8 +139,8 @@ rearview agent within ch_1234abcd5678 "auth cache bug" --mode lexical
 To choose a section, outline it, then read only the emitted range. An outline
 spans the whole session, its messages inside the window, or a ref's `:m7..m9`,
 `:s3` or `:s3:m2..m5`. With `--subagents`, `:m7..m9` reads m7 to m9 and every
-sub-agent message written after m7 and before m10; `:m7` alone is one message,
-`:m7..m7` m7 and the sub-agent messages after it. `--tail 20` reads the last
+sub-agent message written after m7 and before m10, and `:m7` m7 and the
+sub-agent messages after it. `--tail 20` reads the last
 20 of the session's own messages a read shows (of s3's for `:s3`) and, with
 `--subagents`, the sub-agent messages written after the first of them.
 

@@ -1838,7 +1838,6 @@ mod tests {
         let range = |range| ThreadRange {
             thread: Thread::Parent,
             range,
-            is_range: true,
         };
         HitAddresses {
             focus: range(focus),
@@ -2237,7 +2236,7 @@ mod tests {
         assert!(rendered.contains(&format!("uuid={TEST_UUID} ref=ch_")));
         assert!(rendered.contains(" | cache warming answer"));
         assert!(rendered.contains("read ref=ch_"));
-        assert!(rendered.contains("focus=m2..m2"));
+        assert!(rendered.contains("focus=m2 "));
     }
 
     #[test]
@@ -2530,7 +2529,7 @@ mod tests {
 
         assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_123456789abc anchors=ma_0000000000000000 source=tool"));
         assert!(
-            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2..m2 tools=false tool-results=true thinking=false subagents=false")
+            rendered.contains("read ref=ch_123456789abc:m1..m3 focus=m2 tools=false tool-results=true thinking=false subagents=false")
         );
     }
 
@@ -2702,7 +2701,7 @@ mod tests {
         );
         assert!(rendered.contains("hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0000000000000000 source=lexical"));
         assert!(rendered.contains(" | cache warming answer\n"), "{rendered}");
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2..m2 tools=false tool-results=false thinking=false subagents=false\n"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2 tools=false tool-results=false thinking=false subagents=false\n"));
         assert!(!rendered.contains("similarity="));
         assert!(!rendered.contains("word-match="));
         assert!(!rendered.contains("preview="));

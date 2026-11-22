@@ -323,29 +323,21 @@ impl Thread {
     }
 }
 
-/// Messages of one thread a ref names, by their numbers in that thread:
-/// `m5`, `m5..m9`, `s3:m2` or `s3:m2..m4`.
+/// Messages of one thread a ref names, by their numbers in that thread,
+/// both ends included: `m5`, `m5..m9`, `s3:m2` or `s3:m2..m4`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ThreadRange {
     pub thread: Thread,
     pub range: MessageRange,
-    /// True for `mA..mB`, false for `mN`. A range of the session's own
-    /// messages also names the sub-agent messages written during it; `mN`
-    /// names one message.
-    pub is_range: bool,
 }
 
 impl ThreadRange {
     /// `mN` or `sN:mK`.
     pub fn one(thread: Thread, number: usize) -> Self {
-        Self {
-            thread,
-            range: MessageRange::single(number),
-            is_range: false,
-        }
+        Self::closed(thread, number, number)
     }
 
-    /// `mA..mB` or `sN:mA..mB`, and `mA..mA` when `first` is `last`.
+    /// `mA..mB` or `sN:mA..mB`; `mA` when `first` is `last`.
     pub fn closed(thread: Thread, first: usize, last: usize) -> Self {
         Self {
             thread,
@@ -353,13 +345,12 @@ impl ThreadRange {
                 start: first,
                 end: last,
             },
-            is_range: true,
         }
     }
 
-    /// True when the ref names one message: `mN`, `sN:mK` or `sN:mK..mK`.
+    /// True when the ref names one message: `mN`, `mN..mN` or `sN:mK`.
     pub fn names_one_message(&self) -> bool {
-        self.range.is_single() && (!self.is_range || self.thread != Thread::Parent)
+        self.range.is_single()
     }
 }
 
@@ -367,7 +358,7 @@ impl std::fmt::Display for ThreadRange {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let MessageRange { start, end } = self.range;
         write!(formatter, "{}m{start}", self.thread.prefix())?;
-        if self.is_range {
+        if end != start {
             write!(formatter, "..m{end}")?;
         }
         Ok(())
@@ -570,7 +561,6 @@ fn parse_thread_range(thread: Thread, input: &str) -> Result<ThreadRange> {
     Ok(ThreadRange {
         thread,
         range: parse_message_range(&format!("{start}..{end}"))?,
-        is_range: true,
     })
 }
 
@@ -1702,11 +1692,7 @@ mod tests {
 
     /// `mA..mB` of the session's own messages.
     fn parent_range(start: usize, end: usize) -> ThreadRange {
-        ThreadRange {
-            thread: Thread::Parent,
-            range: MessageRange { start, end },
-            is_range: true,
-        }
+        ThreadRange::closed(Thread::Parent, start, end)
     }
 
     #[test]
@@ -1727,11 +1713,7 @@ mod tests {
     #[test]
     fn subagent_message_refs_name_messages_in_its_thread() {
         let thread = Thread::Subagent(3);
-        let range = ThreadRange {
-            thread,
-            range: MessageRange { start: 2, end: 9 },
-            is_range: true,
-        };
+        let range = ThreadRange::closed(thread, 2, 9);
 
         assert_eq!(
             parse_read_ref("ch_12345678:s3:m2").unwrap().range,
@@ -1767,11 +1749,7 @@ mod tests {
 
     #[test]
     fn focus_names_subagents_messages_alone_or_after_conversation() {
-        let range = ThreadRange {
-            thread: Thread::Subagent(3),
-            range: MessageRange::single(2),
-            is_range: true,
-        };
+        let range = ThreadRange::one(Thread::Subagent(3), 2);
 
         let bare = parse_focus_ref("s3:m2..m2").unwrap();
         let qualified = parse_focus_ref("ch_12345678:s3:m2..m2").unwrap();

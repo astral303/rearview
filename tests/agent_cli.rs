@@ -1576,7 +1576,7 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
         config.path(),
         &["agent", "search", "--lexical", "partial transcript needle"],
     ));
-    assert_shows(&search_stdout, "focus=m1..m1");
+    assert_shows(&search_stdout, "focus=m1 ");
     assert_shows(&search_stdout, "kind=malformed-transcript");
 
     let within_text = stdout_of(&run(
@@ -1589,7 +1589,7 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
             "--lexical",
         ],
     ));
-    assert_shows(&within_text, "focus=m1..m1");
+    assert_shows(&within_text, "focus=m1 ");
 
     let read_text = stdout_of(&run(
         config.path(),
