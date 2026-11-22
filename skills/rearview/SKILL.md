@@ -121,9 +121,15 @@ read ref=ch_1234abcd5678:m7..m9 hit=m8 tools=false tool-results=false thinking=f
 
 Copy an emitted `read ref=...` or `refs=...` recipe into the next command.
 Preserve its visibility policy: add the CLI flag for each `=true` and leave
-`=false` categories hidden; `lines=K..N` is `--lines K..N`. A
+`=false` categories hidden; `lines=K..N` is `--lines K..N`, and `hit=m8` is
+`--hit m8`, which keeps the hit first when the budget truncates the read. A
 read hiding every message ends with one. Do not treat hit order, scores,
 ranks, or chunks as stable addresses.
+
+A hit's recipe reads one message of context before and after the hit, in
+the hit's thread. `-B N` sets the messages before, `-A N` those after and
+`-C N` both, on `search` and `within`; `--before` and `--after` set the
+time window.
 
 The `project=pr_...` plus `uuid=...` pair is reporting identity. Commands accept
 the `ref=ch_...` handle, the `uuid=` value a record prints, or a transcript path.
@@ -156,7 +162,8 @@ rearview agent read ch_1234abcd5678:m8 --match "historical correction" --context
 
 Sliced output numbers content lines, each below its message's or call's
 record. A `>` marks a matching line, and `...` marks omitted lines between
-match windows. Both options require one single-message ref.
+match windows. With `--match`, `-B N` and `-A N` set the lines before and
+after each match. `--lines` and `--match` require one single-message ref.
 
 Failures exit nonzero and write one typed compact line to stderr, after any
 warning records:
@@ -187,9 +194,10 @@ project exclusions, and visibility policy. Command flags override config;
 
 Do not read a full transcript by default. Prefer search, then within or outline,
 then a bounded read. Use `--tools`, `--tool-results`, `--thinking`, or
-`--subagents` only when that content is relevant. `read` reports what
-they hide as `hidden-tools=`, `hidden-tool-results=`, `hidden-thinking=`
-and `hidden-subagent-messages=` counts and `hidden` records. `--tools`
+`--subagents` only when that content is relevant. `read` and `outline`
+headers report what they hide as `hidden-tools=`, `hidden-tool-results=`,
+`hidden-thinking=` and `hidden-subagent-messages=` counts, and `read`
+prints `hidden` records. `--tools`
 shows each tool call's command, file or pattern, such as `Bash: cargo test`;
 `(+N lines)` counts the call's other lines: search matches them, and
 `read ch_1234abcd5678:m7.2` shows them.

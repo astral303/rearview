@@ -208,16 +208,16 @@ pub struct AgentSearchArgs {
 // recipe covers, counted as grep's -B, -A and -C count lines around a match.
 #[derive(Debug, Default, ClapArgs)]
 pub struct HitContextArgs {
-    /// Messages of the hit's thread before the hit that its `read` recipe
-    /// covers; 1 by default
+    /// Messages of context before the hit, in the hit's thread, that its
+    /// `read` recipe covers; 1 by default
     #[arg(short = 'B', long, value_name = "N")]
     pub before_context: Option<usize>,
-    /// Messages of the hit's thread after the hit that its `read` recipe
-    /// covers; 1 by default
+    /// Messages of context after the hit, in the hit's thread, that its
+    /// `read` recipe covers; 1 by default
     #[arg(short = 'A', long, value_name = "N")]
     pub after_context: Option<usize>,
-    /// Messages of the hit's thread before and after the hit that its `read`
-    /// recipe covers; -B and -A set one side
+    /// Messages of context before and after the hit, in the hit's thread,
+    /// that its `read` recipe covers; -B and -A set one side
     #[arg(short = 'C', long, value_name = "N")]
     pub context: Option<usize>,
 }
@@ -358,7 +358,7 @@ pub struct AgentReadArgs {
     /// Find text within one message and return matching lines with context
     #[arg(long = "match", value_parser = non_empty_string, conflicts_with = "lines")]
     pub match_query: Option<String>,
-    /// Content lines to include before and after each match; -B and -A set
+    /// Content lines of context before and after each match; -B and -A set
     /// one side
     #[arg(
         short = 'C',
@@ -368,10 +368,10 @@ pub struct AgentReadArgs {
         requires = "match_query"
     )]
     pub context: usize,
-    /// Content lines to include before each match; --context by default
+    /// Content lines of context before each match; --context by default
     #[arg(short = 'B', long, value_name = "N", requires = "match_query")]
     pub before_context: Option<usize>,
-    /// Content lines to include after each match; --context by default
+    /// Content lines of context after each match; --context by default
     #[arg(short = 'A', long, value_name = "N", requires = "match_query")]
     pub after_context: Option<usize>,
     /// Report time per stage, what was read, and peak memory on stderr
