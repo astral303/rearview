@@ -118,6 +118,10 @@
   than `none` prints it after `chars=`.
 - Raise the default budget of `agent read` and `agent outline` from 6,000 to
   20,000 characters. `[agent].output_chars = 6000` sets the earlier default.
+- Read a range to the end in `agent read` and `agent outline`:
+  `<ref>:m300..` reads from m300 to the last message, and
+  `<ref>:s3:m10..` to the sub-agent's last. `agent read --lines 40..` reads
+  from line 40 to the message's last line.
 - Copy one block of a message in the viewer. In message navigation, focus a
   message's blocks (`→`), step between them (`J`/`K`) and copy the focused
   paragraph, heading, code block, quote, list or table (`y`).
@@ -238,16 +242,21 @@
   session's own: `s3:m5` is sub-agent s3's fifth message, `s3:m5.2` its
   second call and `s3:m2..m5` a range, and `m5` is the session's own fifth
   message.
-  - A message number recorded before this change can now read another
-    message. An `anchor=` reads the message it did.
   - With `--subagents`, `agent read <ref>:m7..m9` now reads m7 to m9 and
-    every sub-agent message written after m7 and before m10. `<ref>:m7` reads
-    one message.
+    every sub-agent message written after m7 and before m10, and `<ref>:m7`
+    reads m7 and the sub-agent messages written after it and before m8.
   - `--tail N` now counts the session's own messages, or the sub-agent's for
     `<ref>:s3`.
-  - `agent outline` and `agent sessions` now count the two apart, such as
-    `messages=30 subagent-messages=18`, and with a time window
+  - `agent outline` and `agent sessions` now count a session's own messages,
+    its sub-agents and their messages, such as
+    `messages=30 subagents=2 subagent-messages=18`, and with a time window
     `messages-in-window=` and `subagent-messages-in-window=`.
+- Fix `agent read` and `agent outline` rejecting a range whose end is past
+  the last message, such as `<ref>:m300..m900` in a session of 409 messages.
+  They now read to the last message, and the header prints it as
+  `last=m409`.
+  - `agent read --lines 4..90` past a message's last line now reads to that
+    line.
 - Fix a sub-agent's handle, such as `s3`, changing when it writes its first
   message after a sub-agent launched later, in a session that links each
   launching call to its sub-agent. A sub-agent now gets its handle at that
@@ -378,6 +387,9 @@
   `agent sessions` or `agent search` printed no longer print other agents'
   `io` warnings about sessions that could not be listed or directories that
   could not be read.
+- `agent read` now names its count of hidden sub-agent messages
+  `hidden-subagent-messages=` in the header and `subagent-messages=` in a
+  `hidden` record. Before, they were `hidden-subagents=` and `subagents=`.
 - The first run after upgrading parses every session once to build the new
   session cache, then removes the old cache's files. It takes about 1.9x as
   long as a first run did before, with about 3.4x less memory (on one example
