@@ -42,7 +42,18 @@ const SNIPPET_LIMIT: usize = 80;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MessageLineRange {
     pub start: usize,
-    pub end: usize,
+    /// `None` for an open end, `K..`: the message's last line.
+    pub end: Option<usize>,
+}
+
+impl std::fmt::Display for MessageLineRange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}..", self.start)?;
+        match self.end {
+            Some(end) => write!(formatter, "{end}"),
+            None => Ok(()),
+        }
+    }
 }
 
 impl FromStr for MessageLineRange {
@@ -51,17 +62,20 @@ impl FromStr for MessageLineRange {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         let (start, end) = value
             .split_once("..")
-            .ok_or_else(|| "line range must use START..END".to_string())?;
-        let start = start
-            .parse::<usize>()
-            .map_err(|_| "line range must contain positive integers".to_string())?;
-        let end = end
-            .parse::<usize>()
-            .map_err(|_| "line range must contain positive integers".to_string())?;
-        if start == 0 || end == 0 {
+            .ok_or_else(|| "line range must use START..END or START..".to_string())?;
+        let number = |text: &str| {
+            text.parse::<usize>()
+                .map_err(|_| "line range must contain positive integers".to_string())
+        };
+        let start = number(start)?;
+        let end = match end {
+            "" => None,
+            end => Some(number(end)?),
+        };
+        if start == 0 || end == Some(0) {
             return Err("line range starts at line 1".to_string());
         }
-        if start > end {
+        if end.is_some_and(|end| start > end) {
             return Err("line range start must not exceed its end".to_string());
         }
         Ok(Self { start, end })
@@ -2555,13 +2569,11 @@ fn apply_read_slice<'a>(
     let mut matches = Vec::new();
     match slice {
         ReadSlice::Lines(range) => {
-            if range.end > lines.len() {
+            if range.start > lines.len() {
                 return Err(AgentError::out_of_range(
                     None,
                     format!(
-                        "content line range {}..{} exceeds message {} length {}",
-                        range.start,
-                        range.end,
+                        "content line range {range} starts after message {}'s last line, {}",
                         rendered
                             .conversation
                             .addresses
@@ -2571,8 +2583,9 @@ fn apply_read_slice<'a>(
                 )
                 .into());
             }
-            selected = (range.start..=range.end).collect();
-            rendered.slice = Some(format!("lines={}..{}", range.start, range.end));
+            let end = range.end.unwrap_or(lines.len()).min(lines.len());
+            selected = (range.start..=end).collect();
+            rendered.slice = Some(format!("lines={}..{end}", range.start));
         }
         ReadSlice::Match { query, context } => {
             let query_lower = query.to_lowercase();
@@ -3625,6 +3638,14 @@ mod tests {
         crate::agent::test_support::transcript(messages, "test.jsonl")
     }
 
+    /// `--lines start..end`.
+    fn line_range(start: usize, end: usize) -> MessageLineRange {
+        MessageLineRange {
+            start,
+            end: Some(end),
+        }
+    }
+
     fn options() -> ProtocolOptions {
         ProtocolOptions {
             budget: Some(6000),
@@ -4070,7 +4091,7 @@ mod tests {
                 shortened_to: None,
             }],
             None,
-            Some(&ReadSlice::Lines(MessageLineRange { start: 2, end: 4 })),
+            Some(&ReadSlice::Lines(line_range(2, 4))),
             options(),
         )
         .unwrap();
@@ -4142,13 +4163,12 @@ mod tests {
         assert!(!output.contains("haystack"));
     }
 
-    #[test]
-    fn line_slice_rejects_ranges_past_message_end() {
-        let resolved = resolved("session.jsonl");
+    /// The read of `lines` of m1, `one` and `two`.
+    fn read_lines_of_two_line_message(lines: MessageLineRange) -> Result<String> {
         let transcript = transcript(vec![text_message(1, AgentMessageRole::User, "one\ntwo")]);
-        let error = format_read(
+        format_read(
             &[ReadRequest {
-                resolved: &resolved,
+                resolved: &resolved("session.jsonl"),
                 transcript: &transcript,
                 range: Some(MessageRange::single(1)),
                 subagent: None,
@@ -4156,12 +4176,42 @@ mod tests {
                 shortened_to: None,
             }],
             None,
-            Some(&ReadSlice::Lines(MessageLineRange { start: 2, end: 3 })),
+            Some(&ReadSlice::Lines(lines)),
             options(),
         )
-        .unwrap_err();
+    }
 
-        assert!(error.to_string().contains("exceeds message m1 length 2"));
+    #[test]
+    fn line_slice_ending_past_message_end_reads_to_its_last_line() {
+        let output = read_lines_of_two_line_message(line_range(2, 9)).unwrap();
+
+        assert!(output.contains(" slice=lines=2..2 "), "{output}");
+        assert!(output.contains(" 2: two\n"), "{output}");
+        assert!(!output.contains(" 1: one"), "{output}");
+    }
+
+    #[test]
+    fn open_line_slice_reads_to_messages_last_line() {
+        let open = read_lines_of_two_line_message(MessageLineRange {
+            start: 2,
+            end: None,
+        })
+        .unwrap();
+        let closed = read_lines_of_two_line_message(line_range(2, 2)).unwrap();
+
+        assert_eq!(open, closed, "`2..` reads as `2..2`");
+    }
+
+    #[test]
+    fn line_slice_starting_past_message_end_is_out_of_range() {
+        let error = read_lines_of_two_line_message(line_range(3, 4)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("starts after message m1's last line, 2"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4282,10 +4332,7 @@ mod tests {
 
     #[test]
     fn line_slice_numbers_its_lines_as_message_does_across_records() {
-        let output = read_slice(
-            &text_and_two_calls(),
-            ReadSlice::Lines(MessageLineRange { start: 2, end: 4 }),
-        );
+        let output = read_slice(&text_and_two_calls(), ReadSlice::Lines(line_range(2, 4)));
 
         let lines = output.lines().skip(3).collect::<Vec<_>>();
         assert!(lines[0].contains(" slice=lines=2..4 "), "{output}");
@@ -7295,7 +7342,7 @@ mod tests {
         let transcript = own_message_with_subagent_messages_after_it();
         let range = ordinals_of_ref(&transcript, "m1");
         for slice in [
-            ReadSlice::Lines(MessageLineRange { start: 2, end: 2 }),
+            ReadSlice::Lines(line_range(2, 2)),
             ReadSlice::Match {
                 query: "line".to_owned(),
                 context: 0,
@@ -7554,10 +7601,7 @@ mod tests {
             let inside_first_call = omitted_records_keeping(&transcript, several, with_tools, 8);
             let inside_second_call =
                 omitted_records_keeping(&transcript, several, with_tools, intro_and_first_call + 3);
-            let reread = read_slice(
-                &transcript,
-                ReadSlice::Lines(MessageLineRange { start: 5, end: 5 }),
-            );
+            let reread = read_slice(&transcript, ReadSlice::Lines(line_range(5, 5)));
 
             assert_eq!(
                 inside_first_call,
@@ -9371,7 +9415,7 @@ mod tests {
         let lines = read_typed_ref(
             &transcript,
             "m1",
-            Some(&ReadSlice::Lines(MessageLineRange { start: 1, end: 1 })),
+            Some(&ReadSlice::Lines(line_range(1, 1))),
             options(),
         );
         let message = read_typed_ref(&transcript, "m1", None, options());
@@ -9810,7 +9854,7 @@ mod tests {
                 ..whole_session_request(&resolved, &transcript)
             }],
             None,
-            Some(&ReadSlice::Lines(MessageLineRange { start: 4, end: 4 })),
+            Some(&ReadSlice::Lines(line_range(4, 4))),
             ProtocolOptions {
                 tools: true,
                 tool_results: true,

@@ -312,7 +312,8 @@ pub struct AgentReadArgs {
         conflicts_with_all = ["anchor", "focus", "lines", "match_query"]
     )]
     pub tail: Option<NonZeroUsize>,
-    /// Inclusive content line range within one message
+    /// Inclusive content line range within one message; START.. reads to its
+    /// last line
     #[arg(long, value_name = "START..END", conflicts_with = "match_query")]
     pub lines: Option<MessageLineRange>,
     /// Find text within one message and return matching lines with context
@@ -1180,12 +1181,35 @@ mod tests {
         ])
         .unwrap();
         match agent_command(lines) {
+            AgentCommand::Read(read) => {
+                assert_eq!(
+                    read.lines,
+                    Some(MessageLineRange {
+                        start: 40,
+                        end: Some(120)
+                    })
+                )
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let open_lines = Args::try_parse_from([
+            "rearview",
+            "agent",
+            "read",
+            "ch_abc123:m7",
+            "--lines",
+            "40..",
+        ])
+        .unwrap();
+        match agent_command(open_lines) {
             AgentCommand::Read(read) => assert_eq!(
                 read.lines,
                 Some(MessageLineRange {
                     start: 40,
-                    end: 120
-                })
+                    end: None
+                }),
+                "`40..` reads from line 40 to the message's last line"
             ),
             other => panic!("unexpected command: {other:?}"),
         }

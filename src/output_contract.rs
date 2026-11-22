@@ -642,6 +642,13 @@ fn read_records_of(reference: &str, agent: &str) -> String {
     run(&["agent", "read", &format!("{reference}:m17..m9999")]);
     run(&["agent", "read", &format!("{reference}:m17..")]);
     run(&["agent", "read", &format!("{reference}:m9999")]);
+    run(&[
+        "agent",
+        "read",
+        &format!("{reference}:{message}"),
+        "--lines",
+        "9999..9999",
+    ]);
     run(&["agent", "read", &format!("{reference}:m5..m2")]);
     run(&["agent", "read", &format!("{reference}:s99")]);
     records

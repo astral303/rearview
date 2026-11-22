@@ -473,6 +473,13 @@ m46 user 06:34:01
 $ rearview agent read ch_581699c40efc:m9999
 --- stderr, exit 1
 protocol agent-error kind=out-of-range ref=ch_581699c40efc detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m46%3B%20sub-agent%20messages%20are%20numbered%20sN:mK
+$ rearview agent read ch_581699c40efc:m3 --lines 9999..9999
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+day 2026-09-01
+m3 hidden 06:00:03 tool-results=1 calls=m2.1
+read ref=ch_581699c40efc:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_581699c40efc:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -604,8 +611,14 @@ m3 06:00:04
 m4 hidden 06:00:05 tools=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:s1:m3 --lines 1..2
---- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_0b26e45343df detail=content%20line%20range%201..2%20exceeds%20message%20s1:m3%20length%201
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
+subagent s1 span=s1:m1..m3 : agent-0
+day 2026-08-06
+s1:m3 06:00:02 slice=lines=1..1 anchor=ma_3200d601e22cb40f
+|  1: kimi child answer searchable
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:s1:m3 --match the
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-04:00 warnings=1 warning-records=1
@@ -790,6 +803,9 @@ protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skip
 $ rearview agent read ch_0b26e45343df:m9999
 --- stderr, exit 1
 protocol agent-error kind=out-of-range ref=ch_0b26e45343df detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m28%3B%20sub-agent%20messages%20are%20numbered%20sN:mK
+$ rearview agent read ch_0b26e45343df:s1:m3 --lines 9999..9999
+--- stderr, exit 1
+protocol agent-error kind=out-of-range ref=ch_0b26e45343df detail=content%20line%20range%209999..9999%20starts%20after%20message%20s1:m3%27s%20last%20line%2C%201
 $ rearview agent read ch_0b26e45343df:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -1037,8 +1053,14 @@ m3 06:00:05
 m4 hidden 06:00:07 tools=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:s1:m2 --lines 1..2
---- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=content%20line%20range%201..2%20exceeds%20message%20s1:m2%20length%201
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
+subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
+day 2026-08-01
+s1:m2 06:00:03 slice=lines=1..1 anchor=ma_4f60426316166883
+|  1: child answer searchable
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:s1:m2 --match the
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-04:00 warnings=1 warning-records=1
@@ -1366,6 +1388,9 @@ protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skip
 $ rearview agent read ch_74aec3f6df49:m9999
 --- stderr, exit 1
 protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m68%3B%20sub-agent%20messages%20are%20numbered%20sN:mK
+$ rearview agent read ch_74aec3f6df49:s1:m2 --lines 9999..9999
+--- stderr, exit 1
+protocol agent-error kind=out-of-range ref=ch_74aec3f6df49 detail=content%20line%20range%209999..9999%20starts%20after%20message%20s1:m2%27s%20last%20line%2C%201
 $ rearview agent read ch_74aec3f6df49:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -1479,8 +1504,12 @@ s1:m1..m2 hidden 22:04:12 subagents=2
 m4 22:04:13
 | OMP active answer
 $ rearview agent read ch_974c3840e189:m3 --lines 1..2
---- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_974c3840e189 detail=content%20line%20range%201..2%20exceeds%20message%20m3%20length%201
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00
+conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+day 2026-01-01
+m3 user 22:04:12 slice=lines=1..1 anchor=ma_1399308a5c280b78
+|  1: OMP active question
 $ rearview agent read ch_974c3840e189:m3 --match the
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00
@@ -1638,6 +1667,9 @@ m22..m23 hidden 22:04:31..22:04:32 tools=1 tool-results=1
 $ rearview agent read ch_974c3840e189:m9999
 --- stderr, exit 1
 protocol agent-error kind=out-of-range ref=ch_974c3840e189 detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m23%3B%20sub-agent%20messages%20are%20numbered%20sN:mK
+$ rearview agent read ch_974c3840e189:m3 --lines 9999..9999
+--- stderr, exit 1
+protocol agent-error kind=out-of-range ref=ch_974c3840e189 detail=content%20line%20range%209999..9999%20starts%20after%20message%20m3%27s%20last%20line%2C%201
 $ rearview agent read ch_974c3840e189:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -1868,6 +1900,13 @@ read ref=ch_efbbec792ccc:m17..m20 tools=true tool-results=true thinking=false su
 $ rearview agent read ch_efbbec792ccc:m9999
 --- stderr, exit 1
 protocol agent-error kind=out-of-range ref=ch_efbbec792ccc detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m20%3B%20sub-agent%20messages%20are%20numbered%20sN:mK
+$ rearview agent read ch_efbbec792ccc:m3 --lines 9999..9999
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+day 2025-08-12
+m3 hidden 08:01:40 tool-results=1 calls=m2.1
+read ref=ch_efbbec792ccc:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_efbbec792ccc:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -2088,6 +2127,13 @@ m19 19:20:03
 $ rearview agent read ch_f04d3718e406:m9999
 --- stderr, exit 1
 protocol agent-error kind=out-of-range ref=ch_f04d3718e406 detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m19
+$ rearview agent read ch_f04d3718e406:m3 --lines 9999..9999
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tool-results=1
+conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+day 2024-02-29
+m3 hidden 19:06:00 tool-results=1 calls=m2.1
+read ref=ch_f04d3718e406:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_f04d3718e406:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
@@ -2178,8 +2224,13 @@ m3 19:00:01
 | grok answer searchable
 m4 hidden 19:00:01 tools=1
 $ rearview agent read ch_982349c13ee4:s1:m3 --lines 1..2
---- stderr, exit 1
-protocol agent-error kind=out-of-range ref=ch_982349c13ee4 detail=content%20line%20range%201..2%20exceeds%20message%20s1:m3%20length%201
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-05:00
+conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+subagent s1 span=s1:m1..m3 : explore
+day 1969-12-31
+s1:m3 19:00:01 slice=lines=1..1 anchor=ma_ed09908ea14107f5
+|  1: grok child answer searchable
 $ rearview agent read ch_982349c13ee4:s1:m3 --match the
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-05:00
@@ -2298,6 +2349,9 @@ m19..m20 hidden 19:00:02 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4:m9999
 --- stderr, exit 1
 protocol agent-error kind=out-of-range ref=ch_982349c13ee4 detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m20%3B%20sub-agent%20messages%20are%20numbered%20sN:mK
+$ rearview agent read ch_982349c13ee4:s1:m3 --lines 9999..9999
+--- stderr, exit 1
+protocol agent-error kind=out-of-range ref=ch_982349c13ee4 detail=content%20line%20range%209999..9999%20starts%20after%20message%20s1:m3%27s%20last%20line%2C%201
 $ rearview agent read ch_982349c13ee4:m5..m2
 --- stderr, exit 1
 protocol agent-error kind=invalid-ref ref=m5..m2 detail=message%20range%20start%20must%20be%20before%20end
