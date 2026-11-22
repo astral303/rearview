@@ -375,7 +375,7 @@ enum HandleOwner<'a> {
 
 impl<'a> SubagentHandles<'a> {
     pub fn of(transcript: &'a AgentTranscript) -> Self {
-        let calls = calls_by_id(&transcript.messages);
+        let calls = launches_by_id(&transcript.messages);
         let mut threads = threads_of(&transcript.messages);
         for thread in &mut threads {
             thread.launch = thread
@@ -388,7 +388,7 @@ impl<'a> SubagentHandles<'a> {
             .iter()
             .map(|thread| ThreadLaunch {
                 first_message: thread.messages[0],
-                launch: thread.launch.map(|call| call.address),
+                launch: thread.launch.map(|call| call.address.into()),
             })
             .collect::<Vec<_>>();
         let starts = thread_launches
@@ -397,8 +397,7 @@ impl<'a> SubagentHandles<'a> {
             .collect::<Vec<_>>();
         let launches = calls
             .values()
-            .filter(|call| call.tool == Tool::Agent)
-            .map(|call| (call.address, *call))
+            .map(|call| (CallPosition::from(call.address), *call))
             .collect::<HashMap<_, _>>();
         let launch_order = handles_at_launch(&thread_launches, launches.keys().copied().collect());
         let mut owners = (0..threads.len())
@@ -443,13 +442,13 @@ struct Thread<'a> {
     launch: Option<IndexedCall<'a>>,
 }
 
-/// The start of a sub-agent in the session: the address of the call that
+/// The start of a sub-agent in the session: the position of the call that
 /// launched it, or its thread's first message when the launch is unknown. A
 /// first message orders before the calls it holds.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ThreadStart {
     ordinal: usize,
-    /// The launching call's number; `None` for a first message.
+    /// The launching call's rank in its message; `None` for a first message.
     call: Option<usize>,
 }
 
@@ -464,10 +463,10 @@ impl ThreadStart {
         }
     }
 
-    fn of_call(address: CallAddress) -> Self {
+    fn of_call(position: CallPosition) -> Self {
         Self {
-            ordinal: address.ordinal,
-            call: Some(address.number),
+            ordinal: position.ordinal,
+            call: Some(position.rank),
         }
     }
 
@@ -476,7 +475,7 @@ impl ThreadStart {
     }
 
     fn precedes_call(self, address: CallAddress) -> bool {
-        self < Self::of_call(address)
+        self < Self::of_call(address.into())
     }
 }
 
@@ -510,12 +509,31 @@ fn threads_of(messages: &[AgentMessage]) -> Vec<Thread<'_>> {
     threads
 }
 
+/// A launching call's position in session order: its message's ordinal,
+/// then its rank among that message's calls. [`handles_at_launch`] reads
+/// their order and nothing else: a read ranks a call among every call of its
+/// message, and search's cache lookup among the message's launching calls.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CallPosition {
+    pub ordinal: usize,
+    pub rank: usize,
+}
+
+impl From<CallAddress> for CallPosition {
+    fn from(address: CallAddress) -> Self {
+        Self {
+            ordinal: address.ordinal,
+            rank: address.number,
+        }
+    }
+}
+
 /// A sub-agent thread as launch order counts it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ThreadLaunch {
     pub first_message: usize,
     /// The call that launched it, when the transcript links the two.
-    pub launch: Option<CallAddress>,
+    pub launch: Option<CallPosition>,
 }
 
 /// The handles [`handles_at_launch`] gives.
@@ -524,7 +542,7 @@ pub(crate) struct LaunchOrderHandles {
     /// The handle of each thread, in the threads' order.
     pub threads: Vec<Handle>,
     /// Each launching call that holds a handle without a thread, with it.
-    pub threadless: Vec<(CallAddress, Handle)>,
+    pub threadless: Vec<(CallPosition, Handle)>,
 }
 
 /// The handle of each of `threads`, and of each of `launches` that holds one
@@ -534,7 +552,7 @@ pub(crate) struct LaunchOrderHandles {
 /// here, so a hit names the sub-agent a read of it names.
 pub(crate) fn handles_at_launch(
     threads: &[ThreadLaunch],
-    mut launches: Vec<CallAddress>,
+    mut launches: Vec<CallPosition>,
 ) -> LaunchOrderHandles {
     launches.sort_unstable();
     let linked = threads
@@ -567,9 +585,9 @@ pub(crate) fn handles_at_launch(
 /// call, or in a session without a link, doesn't hold a handle; its thread,
 /// once it writes, gets one by its first message.
 fn threadless_launches(
-    launches: Vec<CallAddress>,
-    linked: &HashSet<CallAddress>,
-) -> Vec<CallAddress> {
+    launches: Vec<CallPosition>,
+    linked: &HashSet<CallPosition>,
+) -> Vec<CallPosition> {
     let Some(&first_linked) = linked.iter().min() else {
         return Vec::new();
     };
@@ -591,17 +609,18 @@ fn handles_in_launch_order(orders: &[LaunchOrder]) -> Vec<Handle> {
     handles
 }
 
-/// The first call of each id in session order. A later call with the same id
-/// is a copy, such as the parent's history a Claude Code fork opens with: it
-/// launches nothing.
-fn calls_by_id(messages: &[AgentMessage]) -> HashMap<&str, IndexedCall<'_>> {
+/// The first launching call, of tool kind `Agent`, of each id in session
+/// order. A later call with the same id is a copy, such as the parent's
+/// history a Claude Code fork opens with: it launches nothing. The cache's
+/// index on launching calls reads the same calls for search.
+fn launches_by_id(messages: &[AgentMessage]) -> HashMap<&str, IndexedCall<'_>> {
     let mut calls: HashMap<&str, IndexedCall<'_>> = HashMap::new();
     for message in messages {
         for (number, part) in numbered_calls(message) {
             let AgentMessagePart::ToolUse {
                 id,
                 name,
-                tool,
+                tool: tool @ Tool::Agent,
                 input,
                 ..
             } = part

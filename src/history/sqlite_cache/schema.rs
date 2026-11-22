@@ -5,7 +5,7 @@ use crate::semantic::filter::SEMANTIC_TURN_VERSION;
 
 /// The version of the tables below, stored in `meta` under
 /// [`SCHEMA_VERSION_KEY`].
-pub(super) const SCHEMA_VERSION: u32 = 42;
+pub(super) const SCHEMA_VERSION: u32 = 43;
 pub(super) const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// The `meta` key holding the [`SEMANTIC_TURN_VERSION`] of the stored
 /// `semantic_turns`. A database holding another is emptied and rebuilt, as
@@ -445,6 +445,11 @@ CREATE INDEX IF NOT EXISTS parts_by_message ON parts (session, message_ordinal);
 -- One session's parts, and a scan of some sessions' parts in each row range,
 -- are read through this index, in the rows' order.
 CREATE INDEX IF NOT EXISTS parts_by_session ON parts (session);
+-- Search reads a session's launching calls through this index, for the
+-- handles of sub-agent hits, without the rows of its other parts. It holds
+-- every column that read needs from `parts`.
+CREATE INDEX IF NOT EXISTS parts_launching_calls ON parts (session, entry, part, call_id)
+    WHERE kind = 'call' AND tool = 'agent';
 -- A write of a session's parts outside every entry matches them by `part`.
 CREATE UNIQUE INDEX IF NOT EXISTS parts_outside_entries ON parts (session, part)
     WHERE entry IS NULL;
@@ -484,8 +489,8 @@ mod tests {
     /// with. A change to either fails `schema_text_matches_its_version`
     /// until both are set again.
     const PINNED_SCHEMA: (u32, &str) = (
-        42,
-        "19f02bdafd8b6658def4d75587a4e6c65e271fec4963513c887ab4db5b0edced",
+        43,
+        "c8546bbac3b4444e90194f0e7877129d07033cfb2a6f6b9fec95ca10872c7a4a",
     );
 
     /// [`CREATE`] without its `--` comments and with its whitespace
