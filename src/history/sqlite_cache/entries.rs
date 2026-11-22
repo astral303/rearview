@@ -482,6 +482,12 @@ pub(super) fn count_own_messages(
     })
 }
 
+/// The number of the session's sub-agent handles, as a read of the session
+/// numbers them.
+pub(super) fn count_subagents(connection: &Connection, session: i64) -> Result<usize> {
+    hit_places::count_subagents(connection, session)
+}
+
 /// The transcript of `session`, every message holding the reference context
 /// of [`context::read`] in place of its content: its empty bodies are not
 /// its content.

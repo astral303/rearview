@@ -16,6 +16,7 @@ mod record_from_parse;
 mod search_texts;
 mod sources;
 mod stored_rows;
+mod subagent_count;
 mod transcript_references;
 
 const CACHE_KEY: &str = "every-record";

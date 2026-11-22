@@ -4,7 +4,7 @@
 use crate::agent::diagnostic::{AgentWarning, format_warning_records, warning_atoms};
 use crate::agent::protocol::{
     ThreadCounts, budget_atom, cut_short, decimal_digits, escape_atom, full_atom, protocol_snippet,
-    smallest_budget_fitting, title_for_conversation,
+    session_count_atoms, smallest_budget_fitting, title_for_conversation,
 };
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::time_span::{output_offset, time_atoms, tz_atom};
@@ -25,6 +25,9 @@ pub struct ListedSession {
     pub reference: String,
     pub agent: &'static str,
     pub messages: ThreadCounts,
+    /// The session's sub-agent handles, those of sub-agents without messages
+    /// included.
+    pub subagents: usize,
     /// The count and times of the messages inside the window.
     pub in_window: MessagesInWindow,
     /// [`Self::in_window`]'s count of the session's own messages and its
@@ -76,16 +79,24 @@ impl OwnMessageCounts {
     }
 }
 
+/// The counts a listed session's record prints beside its row's: its own
+/// messages, and its sub-agent handles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListedCounts {
+    pub own: OwnMessageCounts,
+    pub subagents: usize,
+}
+
 /// The page of `candidates` from `offset`, at most `limit`: each session with a
 /// message inside `window`, newest first by its last message inside it. For a
-/// window without bounds, every session counts. `own_messages` counts a listed
-/// session's own messages; its `messages=` and `messages-in-window=` split
-/// by them.
+/// window without bounds, every session counts. `counts` counts a listed
+/// session's own messages and sub-agents; its `messages=` and
+/// `messages-in-window=` split by its own messages.
 pub fn list_sessions<'a>(
     candidates: impl IntoIterator<Item = (&'a Conversation, &'a ResolvedConversation)>,
     window: &TimeFilter,
     page: SessionPage,
-    own_messages: impl Fn(&Conversation, &ResolvedConversation, &TimeFilter) -> Result<OwnMessageCounts>,
+    counts: impl Fn(&Conversation, &ResolvedConversation, &TimeFilter) -> Result<ListedCounts>,
 ) -> Result<SessionListing> {
     let SessionPage { offset, limit } = page;
     let mut matching = candidates
@@ -121,7 +132,7 @@ pub fn list_sessions<'a>(
             .skip(offset)
             .take(limit)
             .map(|(conversation, resolved, in_window)| {
-                let own = own_messages(conversation, resolved, window)?;
+                let ListedCounts { own, subagents } = counts(conversation, resolved, window)?;
                 let split = |count: usize, own: usize| ThreadCounts {
                     own,
                     subagents: count.saturating_sub(own),
@@ -132,6 +143,7 @@ pub fn list_sessions<'a>(
                     reference: resolved.reference.canonical(),
                     agent: resolved.key.source.provider().labels().name,
                     messages: split(conversation.message_count, own.messages),
+                    subagents,
                     in_window_messages: split(in_window.count, own.messages_in_window),
                     in_window,
                     title: title_for_conversation(conversation),
@@ -143,18 +155,21 @@ pub fn list_sessions<'a>(
     })
 }
 
-/// The [`list_sessions`] counts of a session without sub-agent messages.
+/// The [`list_sessions`] counts of a session without sub-agents.
 #[cfg(test)]
 pub fn every_message_own(
     conversation: &Conversation,
     _: &ResolvedConversation,
     window: &TimeFilter,
-) -> Result<OwnMessageCounts> {
-    Ok(OwnMessageCounts::of_ordinals(
-        1..=conversation.message_count,
-        &conversation.message_times,
-        window,
-    ))
+) -> Result<ListedCounts> {
+    Ok(ListedCounts {
+        own: OwnMessageCounts::of_ordinals(
+            1..=conversation.message_count,
+            &conversation.message_times,
+            window,
+        ),
+        subagents: 0,
+    })
 }
 
 #[cfg(test)]
@@ -262,7 +277,7 @@ fn session_record(
         escape_atom(&session.conversation_uuid),
         escape_atom(&session.reference),
         session.agent,
-        session.messages.atoms("messages"),
+        session_count_atoms(session.messages, session.subagents),
         time_atoms(session.in_window.times, header_offset, zone),
         protocol_snippet(&session.title, AGENT_SESSIONS_TITLE_CHARS)
     )

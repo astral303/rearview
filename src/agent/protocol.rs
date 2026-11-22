@@ -1497,7 +1497,10 @@ pub fn format_outline_with_warnings(
         "policy={}{}{}{}{}{in_window}",
         options.visibility().atom(),
         last_atom(std::slice::from_ref(request)),
-        ThreadCounts::of(&transcript.messages).atoms("messages"),
+        session_count_atoms(
+            ThreadCounts::of(&transcript.messages),
+            index.subagents.count()
+        ),
         time_atoms(
             TimeSpan::of_messages(&transcript.messages),
             offset,
@@ -1984,6 +1987,20 @@ impl ThreadCounts {
         }
         atoms
     }
+}
+
+/// ` messages=409 subagents=7 subagent-messages=215`: a session's own
+/// messages, its sub-agent handles and their messages; the last two are left
+/// out at 0.
+pub fn session_count_atoms(messages: ThreadCounts, subagents: usize) -> String {
+    let mut atoms = format!(" messages={}", messages.own);
+    if subagents > 0 {
+        atoms.push_str(&format!(" subagents={subagents}"));
+    }
+    if messages.subagents > 0 {
+        atoms.push_str(&format!(" subagent-messages={}", messages.subagents));
+    }
+    atoms
 }
 
 /// ` messages-in-window=N subagent-messages-in-window=M` for a window with
@@ -7256,7 +7273,7 @@ mod tests {
     /// alpha writes between the session's own m1 and m2, and once more
     /// after m2.
     #[test]
-    fn outline_header_counts_own_and_subagent_messages_apart() {
+    fn outline_header_counts_own_messages_subagents_and_their_messages_apart() {
         use AgentMessageRole::User;
         let with_subagent = transcript(vec![
             text_message(1, User, "first"),
@@ -7275,13 +7292,14 @@ mod tests {
         };
 
         assert!(
-            header(&with_subagent).contains(" messages=2 subagent-messages=2 "),
+            header(&with_subagent).contains(" messages=2 subagents=1 subagent-messages=2 "),
             "{}",
             header(&with_subagent)
         );
         assert!(
-            !header(&own_alone).contains("subagent-messages="),
-            "a session without sub-agent messages leaves the count out: {}",
+            !header(&own_alone).contains(" subagents=")
+                && !header(&own_alone).contains(" subagent-messages="),
+            "a session without sub-agents leaves their counts out: {}",
             header(&own_alone)
         );
     }

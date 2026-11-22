@@ -350,6 +350,12 @@ impl HeldCopy<'_> {
         entries::count_own_messages(self.connection, self.session, window)
     }
 
+    /// The number of the session's sub-agent handles, those of sub-agents
+    /// without messages included.
+    pub(crate) fn subagent_count(&self) -> Result<usize> {
+        entries::count_subagents(self.connection, self.session)
+    }
+
     /// The messages numbered `ordinals`, each whole, as the viewer shows
     /// them, read through the index on the message numbers, with their
     /// places for the addresses of hits on them. `path` is the session's

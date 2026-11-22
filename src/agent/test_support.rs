@@ -399,6 +399,7 @@ const OUTLINE_HEADER: &[OrderedAtom] = &[
     required("policy", is_policy),
     optional("last", is_message_list),
     required("messages", is_digits),
+    optional("subagents", is_digits),
     optional("subagent-messages", is_digits),
     optional("at", is_full_time),
     optional("to", is_full_time),

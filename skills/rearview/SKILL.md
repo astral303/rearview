@@ -65,7 +65,8 @@ rearview agent sessions --after 2026-07-20T14:00 --before 2026-07-20T15:00
 rearview agent read ch_1234abcd5678 --after 2026-07-20T14:00 --before 2026-07-20T15:00 --tools
 ```
 
-`messages=` counts a session's own messages, without its sub-agents'.
+`messages=` counts a session's own messages, without its sub-agents';
+`subagents=` counts its sub-agents, s1 to sN.
 
 Values are a duration back from now (`45s`, `30m`, `2d`, `1w`, `6mo`, `1y`, or
 combined as `1d6h`), an absolute local time (`2026-07-20`,

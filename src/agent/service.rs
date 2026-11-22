@@ -466,16 +466,16 @@ impl SessionSelection {
     }
 
     /// The page of the scoped sessions `agent sessions` lists, their own
-    /// messages counted by `own_messages`.
+    /// messages and sub-agents counted by `counts`.
     fn listing(
         &self,
         window: &TimeFilter,
         page: agent::sessions::SessionPage,
-        own_messages: impl Fn(
+        counts: impl Fn(
             &history::Conversation,
             &agent::refs::ResolvedConversation,
             &TimeFilter,
-        ) -> Result<agent::sessions::OwnMessageCounts>,
+        ) -> Result<agent::sessions::ListedCounts>,
     ) -> Result<agent::sessions::SessionListing> {
         let inputs = agent_inputs_for_indices(&self.conversations, &self.keys, &self.scoped)?;
         agent::sessions::list_sessions(
@@ -484,7 +484,7 @@ impl SessionSelection {
                 .map(|input| (input.conversation, &input.resolved)),
             window,
             page,
-            own_messages,
+            counts,
         )
     }
 }
@@ -1935,21 +1935,24 @@ impl AgentService {
     }
 
     /// The counts of `conversation`'s own messages, without its sub-agents',
-    /// counted in its cached copy; in its transcript, read whole, for a row
-    /// without a copy or a copy another write replaced.
-    fn own_message_counts(
+    /// and of its sub-agents, counted in its cached copy; in its transcript,
+    /// read whole, for a row without a copy or a copy another write replaced.
+    fn listed_counts(
         &self,
         conversation: &history::Conversation,
         key: &agent::refs::AgentConversationKey,
         window: &TimeFilter,
-    ) -> Result<agent::sessions::OwnMessageCounts> {
+    ) -> Result<agent::sessions::ListedCounts> {
         if let Some(copy) = &conversation.cached_session {
             let read = self.read_copy_when_unlocked(|| {
                 copy.read_copy(|held| {
                     if held.generation() != copy.generation() {
                         return Ok(None);
                     }
-                    held.own_message_counts(window).map(Some)
+                    Ok(Some(agent::sessions::ListedCounts {
+                        own: held.own_message_counts(window)?,
+                        subagents: held.subagent_count()?,
+                    }))
                 })
             });
             if let Some(counts) = history::sqlite_cache::found(read)?.flatten() {
@@ -1962,11 +1965,14 @@ impl AgentService {
             .iter()
             .filter(|message| message.subagent.is_none())
             .map(|message| message.ordinal);
-        Ok(agent::sessions::OwnMessageCounts::of_ordinals(
-            own,
-            &conversation.message_times,
-            window,
-        ))
+        Ok(agent::sessions::ListedCounts {
+            own: agent::sessions::OwnMessageCounts::of_ordinals(
+                own,
+                &conversation.message_times,
+                window,
+            ),
+            subagents: agent::subagents::SubagentHandles::of(&transcript).count(),
+        })
     }
 
     fn render_search(
@@ -2024,7 +2030,7 @@ impl AgentService {
                     limit: args.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT),
                 },
                 |conversation, resolved, window| {
-                    self.own_message_counts(conversation, &resolved.key, window)
+                    self.listed_counts(conversation, &resolved.key, window)
                 },
             )?;
             let warnings =
@@ -7559,8 +7565,9 @@ mod tests {
             .zip(&keys)
             .map(|(row, key)| {
                 service
-                    .own_message_counts(row, key, &TimeFilter::default())
+                    .listed_counts(row, key, &TimeFilter::default())
                     .unwrap()
+                    .own
                     .messages
             })
             .collect::<Vec<_>>();

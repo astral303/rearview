@@ -173,6 +173,12 @@ impl Subagents {
         handle.checked_sub(1).and_then(|index| self.list.get(index))
     }
 
+    /// The number of sub-agents, those without messages included: the
+    /// highest handle.
+    pub fn count(&self) -> usize {
+        self.list.len()
+    }
+
     /// The sub-agent with `handle`.
     pub fn tag(&self, handle: Handle) -> Option<&SubagentTag> {
         self.get(handle).map(|subagent| &subagent.tag)

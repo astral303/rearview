@@ -1,9 +1,12 @@
-//! The places of a session's search hit messages, read from the message and
-//! thread rows without the messages' bodies.
+//! The places of a session's search hit messages, and the number of its
+//! sub-agent handles, read from the message, thread and launching-call rows
+//! without the messages' bodies.
 
 use crate::agent::address::HitPlaces;
 use crate::agent::refs::Thread;
-use crate::agent::subagents::{CallPosition, Handle, ThreadLaunch, handles_at_launch};
+use crate::agent::subagents::{
+    CallPosition, Handle, LaunchOrderHandles, ThreadLaunch, handles_at_launch,
+};
 use crate::error::Result;
 use rusqlite::{Connection, params};
 use std::collections::{BTreeSet, HashMap};
@@ -56,9 +59,33 @@ fn thread_numbers(connection: &Connection, session: i64, ordinals: &[usize]) -> 
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// The number of `session`'s sub-agent handles, counted as
+/// [`handles_at_launch`] counts a read's: one per thread, and one per
+/// launching call that has a handle without a thread.
+pub(super) fn count_subagents(connection: &Connection, session: i64) -> Result<usize> {
+    let handles = launch_order(connection, session)?.handles;
+    Ok(handles.threads.len() + handles.threadless.len())
+}
+
 /// The handle of each sub-agent thread of `session`, by its thread number,
 /// counted as [`handles_at_launch`] counts a read's.
 fn handles(connection: &Connection, session: i64) -> Result<HashMap<i64, Handle>> {
+    let SessionLaunchOrder {
+        thread_numbers,
+        handles,
+    } = launch_order(connection, session)?;
+    Ok(thread_numbers.into_iter().zip(handles.threads).collect())
+}
+
+/// The handles [`handles_at_launch`] gives a session's sub-agents, and the
+/// number of each thread, in the order of `handles.threads`.
+struct SessionLaunchOrder {
+    thread_numbers: Vec<i64>,
+    handles: LaunchOrderHandles,
+}
+
+/// The launch order of `session`'s sub-agent threads and launching calls.
+fn launch_order(connection: &Connection, session: i64) -> Result<SessionLaunchOrder> {
     let mut statement = connection.prepare_cached(
         "SELECT t.number, t.launch_call, MIN(m.ordinal) FROM threads t \
          JOIN messages m ON m.thread = t.id \
@@ -85,12 +112,10 @@ fn handles(connection: &Connection, session: i64) -> Result<HashMap<i64, Handle>
         })
         .collect::<Vec<_>>();
     let launches = calls.values().copied().collect();
-    let handles = handles_at_launch(&thread_launches, launches).threads;
-    Ok(threads
-        .iter()
-        .map(|&(number, _, _)| number)
-        .zip(handles)
-        .collect())
+    Ok(SessionLaunchOrder {
+        thread_numbers: threads.iter().map(|&(number, _, _)| number).collect(),
+        handles: handles_at_launch(&thread_launches, launches),
+    })
 }
 
 /// The first launching call of each id of `session` in session order, read
