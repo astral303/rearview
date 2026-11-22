@@ -3,14 +3,15 @@
 
 use crate::agent::diagnostic::{AgentWarning, format_warning_records, warning_atoms};
 use crate::agent::protocol::{
-    budget_atom, cut_short, decimal_digits, escape_atom, full_atom, protocol_snippet,
+    ThreadCounts, budget_atom, cut_short, decimal_digits, escape_atom, full_atom, protocol_snippet,
     smallest_budget_fitting, title_for_conversation,
 };
 use crate::agent::refs::ResolvedConversation;
 use crate::agent::time_span::{output_offset, time_atoms, tz_atom};
 use crate::clock::Zone;
+use crate::error::Result;
 use crate::history::listing::{self, SessionOrigin, SessionTimes};
-use crate::history::{Conversation, MessagesInWindow};
+use crate::history::{Conversation, MessageTimes, MessagesInWindow};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset};
 use std::cmp::Reverse;
@@ -23,8 +24,12 @@ pub struct ListedSession {
     pub conversation_uuid: String,
     pub reference: String,
     pub agent: &'static str,
-    pub message_count: usize,
+    pub messages: ThreadCounts,
+    /// The count and times of the messages inside the window.
     pub in_window: MessagesInWindow,
+    /// [`Self::in_window`]'s count of the session's own messages and its
+    /// sub-agents'.
+    pub in_window_messages: ThreadCounts,
     pub title: String,
 }
 
@@ -38,15 +43,51 @@ pub struct SessionListing {
     pub window: TimeFilter,
 }
 
+/// The sessions a listing pages to: `limit` of them after skipping `offset`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionPage {
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// A listed session's own messages, without its sub-agents': how many it has,
+/// and how many of them are inside the window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnMessageCounts {
+    pub messages: usize,
+    pub messages_in_window: usize,
+}
+
+impl OwnMessageCounts {
+    /// The counts of the own messages numbered `ordinals`, their times read
+    /// from `times`.
+    pub fn of_ordinals(
+        ordinals: impl IntoIterator<Item = usize>,
+        times: &MessageTimes,
+        window: &TimeFilter,
+    ) -> Self {
+        ordinals
+            .into_iter()
+            .fold(Self::default(), |counts, ordinal| Self {
+                messages: counts.messages + 1,
+                messages_in_window: counts.messages_in_window
+                    + usize::from(window.contains_message(times.span(ordinal))),
+            })
+    }
+}
+
 /// The page of `candidates` from `offset`, at most `limit`: each session with a
 /// message inside `window`, newest first by its last message inside it. For a
-/// window without bounds, every session counts.
+/// window without bounds, every session counts. `own_messages` counts a listed
+/// session's own messages; its `messages=` and `messages-in-window=` split
+/// by them.
 pub fn list_sessions<'a>(
     candidates: impl IntoIterator<Item = (&'a Conversation, &'a ResolvedConversation)>,
     window: &TimeFilter,
-    offset: usize,
-    limit: usize,
-) -> SessionListing {
+    page: SessionPage,
+    own_messages: impl Fn(&Conversation, &ResolvedConversation, &TimeFilter) -> Result<OwnMessageCounts>,
+) -> Result<SessionListing> {
+    let SessionPage { offset, limit } = page;
     let mut matching = candidates
         .into_iter()
         .filter(|(conversation, _)| {
@@ -73,25 +114,47 @@ pub fn list_sessions<'a>(
             conversation.path.clone(),
         )
     });
-    SessionListing {
+    Ok(SessionListing {
         matched: matching.len(),
         sessions: matching
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|(conversation, resolved, in_window)| ListedSession {
-                project_id: resolved.key.project_id(),
-                conversation_uuid: resolved.reference.uuid(),
-                reference: resolved.reference.canonical(),
-                agent: resolved.key.source.provider().labels().name,
-                message_count: conversation.message_count,
-                in_window,
-                title: title_for_conversation(conversation),
+            .map(|(conversation, resolved, in_window)| {
+                let own = own_messages(conversation, resolved, window)?;
+                let split = |count: usize, own: usize| ThreadCounts {
+                    own,
+                    subagents: count.saturating_sub(own),
+                };
+                Ok(ListedSession {
+                    project_id: resolved.key.project_id(),
+                    conversation_uuid: resolved.reference.uuid(),
+                    reference: resolved.reference.canonical(),
+                    agent: resolved.key.source.provider().labels().name,
+                    messages: split(conversation.message_count, own.messages),
+                    in_window_messages: split(in_window.count, own.messages_in_window),
+                    in_window,
+                    title: title_for_conversation(conversation),
+                })
             })
-            .collect(),
+            .collect::<Result<_>>()?,
         offset,
         window: *window,
-    }
+    })
+}
+
+/// The [`list_sessions`] counts of a session without sub-agent messages.
+#[cfg(test)]
+pub fn every_message_own(
+    conversation: &Conversation,
+    _: &ResolvedConversation,
+    window: &TimeFilter,
+) -> Result<OwnMessageCounts> {
+    Ok(OwnMessageCounts::of_ordinals(
+        1..=conversation.message_count,
+        &conversation.message_times,
+        window,
+    ))
 }
 
 #[cfg(test)]
@@ -189,17 +252,17 @@ fn session_record(
     zone: Zone,
 ) -> String {
     let in_window = if window.is_active() {
-        format!(" messages-in-window={}", session.in_window.count)
+        session.in_window_messages.atoms("messages-in-window")
     } else {
         String::new()
     };
     format!(
-        "session project={} uuid={} ref={} agent={} messages={}{in_window}{} : {}\n",
+        "session project={} uuid={} ref={} agent={}{}{in_window}{} : {}\n",
         escape_atom(&session.project_id),
         escape_atom(&session.conversation_uuid),
         escape_atom(&session.reference),
         session.agent,
-        session.message_count,
+        session.messages.atoms("messages"),
         time_atoms(session.in_window.times, header_offset, zone),
         protocol_snippet(&session.title, AGENT_SESSIONS_TITLE_CHARS)
     )
@@ -268,7 +331,14 @@ mod tests {
             .iter()
             .map(resolved_conversation)
             .collect::<Vec<_>>();
-        list_sessions(sessions.iter().zip(&resolved), window, offset, limit)
+        // These sessions do not have sub-agents.
+        list_sessions(
+            sessions.iter().zip(&resolved),
+            window,
+            SessionPage { offset, limit },
+            every_message_own,
+        )
+        .unwrap()
     }
 
     fn titles(listing: &SessionListing) -> Vec<&str> {
@@ -364,7 +434,13 @@ mod tests {
         let listing = listing(&sessions(), &window((11, 38), (11, 45)), 0, 10);
         let late = &listing.sessions[1];
 
-        assert_eq!(late.message_count, 2);
+        assert_eq!(
+            late.messages,
+            ThreadCounts {
+                own: 2,
+                subagents: 0
+            }
+        );
         assert_eq!(
             late.in_window,
             MessagesInWindow {

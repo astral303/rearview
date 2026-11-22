@@ -19,24 +19,29 @@ pub(super) fn read(connection: &Connection, session: i64, ordinals: &[usize]) ->
     } else {
         HashMap::new()
     };
-    let mut statement = connection.prepare_cached(
-        "SELECT m.ordinal FROM threads t JOIN messages m ON m.thread = t.id \
-         WHERE t.session = ?1 AND t.number = ?2 AND m.ordinal IS NOT NULL ORDER BY m.ordinal",
-    )?;
     let mut threads = HashMap::new();
     for number in numbers {
         let thread = match number {
             0 => Thread::Parent,
             number => Thread::Subagent(handles[&number]),
         };
-        let messages = statement
-            .query_map(params![session, number], |row| {
-                row.get::<_, i64>(0).map(|ordinal| ordinal as usize)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        threads.insert(thread, messages);
+        threads.insert(thread, thread_ordinals(connection, session, number)?);
     }
     Ok(HitPlaces::of(&threads, ordinals))
+}
+
+/// The ordinals of the messages of `session`'s thread `number`, in order:
+/// thread 0 is the session's own.
+fn thread_ordinals(connection: &Connection, session: i64, number: i64) -> Result<Vec<usize>> {
+    Ok(connection
+        .prepare_cached(
+            "SELECT m.ordinal FROM threads t JOIN messages m ON m.thread = t.id \
+             WHERE t.session = ?1 AND t.number = ?2 AND m.ordinal IS NOT NULL ORDER BY m.ordinal",
+        )?
+        .query_map(params![session, number], |row| {
+            row.get::<_, i64>(0).map(|ordinal| ordinal as usize)
+        })?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// The thread number of each message of `session` numbered `ordinals`.

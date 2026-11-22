@@ -441,6 +441,47 @@ pub(super) fn read_hit_places(
     hit_places::read(connection, session, ordinals)
 }
 
+/// The count of the session's own messages, without its sub-agents', and of
+/// those inside `window`.
+pub(super) fn count_own_messages(
+    connection: &Connection,
+    session: i64,
+    window: &crate::time_filter::TimeFilter,
+) -> Result<crate::agent::sessions::OwnMessageCounts> {
+    const OWN_MESSAGES: &str = "FROM threads t JOIN messages m ON m.thread = t.id \
+         WHERE t.session = ?1 AND t.number = 0 AND m.ordinal IS NOT NULL";
+    let messages = connection
+        .prepare_cached(&format!("SELECT COUNT(*) {OWN_MESSAGES}"))?
+        .query_row([session], |row| row.get::<_, i64>(0))? as usize;
+    if !window.is_active() {
+        return Ok(crate::agent::sessions::OwnMessageCounts {
+            messages,
+            messages_in_window: messages,
+        });
+    }
+    // `TimeFilter::contains_message` over the whole seconds the stored
+    // times are read as (`stored_message_times`): the message's last second
+    // at or after the window's start, its first at or before the window's end.
+    let messages_in_window = connection
+        .prepare_cached(&format!(
+            "SELECT COUNT(*) {OWN_MESSAGES} AND m.first_ms IS NOT NULL AND m.last_ms IS NOT NULL \
+             AND (?2 IS NULL OR m.last_ms >= ?2 * 1000) \
+             AND (?3 IS NULL OR m.first_ms < (?3 + 1) * 1000)"
+        ))?
+        .query_row(
+            rusqlite::params![
+                session,
+                window.after.map(|after| after.timestamp()),
+                window.before.map(|before| before.timestamp()),
+            ],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+    Ok(crate::agent::sessions::OwnMessageCounts {
+        messages,
+        messages_in_window,
+    })
+}
+
 /// The transcript of `session`, every message holding the reference context
 /// of [`context::read`] in place of its content: its empty bodies are not
 /// its content.

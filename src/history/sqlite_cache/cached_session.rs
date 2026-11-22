@@ -342,6 +342,14 @@ impl HeldCopy<'_> {
         Ok((message_count, times))
     }
 
+    /// The counts of the session's own messages, without its sub-agents'.
+    pub(crate) fn own_message_counts(
+        &self,
+        window: &crate::time_filter::TimeFilter,
+    ) -> Result<crate::agent::sessions::OwnMessageCounts> {
+        entries::count_own_messages(self.connection, self.session, window)
+    }
+
     /// The messages numbered `ordinals`, each whole, as the viewer shows
     /// them, read through the index on the message numbers, with their
     /// places for the addresses of hits on them. `path` is the session's

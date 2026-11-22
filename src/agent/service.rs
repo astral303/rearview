@@ -465,22 +465,27 @@ impl SessionSelection {
         Ok((selection, stale_coverage))
     }
 
-    /// The page of the scoped sessions `agent sessions` lists.
+    /// The page of the scoped sessions `agent sessions` lists, their own
+    /// messages counted by `own_messages`.
     fn listing(
         &self,
         window: &TimeFilter,
-        offset: usize,
-        limit: usize,
+        page: agent::sessions::SessionPage,
+        own_messages: impl Fn(
+            &history::Conversation,
+            &agent::refs::ResolvedConversation,
+            &TimeFilter,
+        ) -> Result<agent::sessions::OwnMessageCounts>,
     ) -> Result<agent::sessions::SessionListing> {
         let inputs = agent_inputs_for_indices(&self.conversations, &self.keys, &self.scoped)?;
-        Ok(agent::sessions::list_sessions(
+        agent::sessions::list_sessions(
             inputs
                 .iter()
                 .map(|input| (input.conversation, &input.resolved)),
             window,
-            offset,
-            limit,
-        ))
+            page,
+            own_messages,
+        )
     }
 }
 
@@ -1929,6 +1934,41 @@ impl AgentService {
         }
     }
 
+    /// The counts of `conversation`'s own messages, without its sub-agents',
+    /// counted in its cached copy; in its transcript, read whole, for a row
+    /// without a copy or a copy another write replaced.
+    fn own_message_counts(
+        &self,
+        conversation: &history::Conversation,
+        key: &agent::refs::AgentConversationKey,
+        window: &TimeFilter,
+    ) -> Result<agent::sessions::OwnMessageCounts> {
+        if let Some(copy) = &conversation.cached_session {
+            let read = self.read_copy_when_unlocked(|| {
+                copy.read_copy(|held| {
+                    if held.generation() != copy.generation() {
+                        return Ok(None);
+                    }
+                    held.own_message_counts(window).map(Some)
+                })
+            });
+            if let Some(counts) = history::sqlite_cache::found(read)?.flatten() {
+                return Ok(counts);
+            }
+        }
+        let transcript = self.load_transcript(key)?;
+        let own = transcript
+            .messages
+            .iter()
+            .filter(|message| message.subagent.is_none())
+            .map(|message| message.ordinal);
+        Ok(agent::sessions::OwnMessageCounts::of_ordinals(
+            own,
+            &conversation.message_times,
+            window,
+        ))
+    }
+
     fn render_search(
         &self,
         output: &agent::search::AgentSearchOutput,
@@ -1979,8 +2019,13 @@ impl AgentService {
         self.perf.time(Stage::Render, || {
             let listing = selection.listing(
                 &rules.window,
-                args.offset,
-                args.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT),
+                agent::sessions::SessionPage {
+                    offset: args.offset,
+                    limit: args.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT),
+                },
+                |conversation, resolved, window| {
+                    self.own_message_counts(conversation, &resolved.key, window)
+                },
             )?;
             let warnings =
                 self.with_stale_cache_record(std::mem::take(&mut selection.warnings), &listing);
@@ -4782,7 +4827,11 @@ mod tests {
         )
         .unwrap()
         .0
-        .listing(&rules.window, 0, 10)
+        .listing(
+            &rules.window,
+            FIRST_TEN_SESSIONS,
+            agent::sessions::every_message_own,
+        )
         .unwrap();
 
         assert_eq!(
@@ -4923,7 +4972,13 @@ mod tests {
             let mut warnings = selection.warnings.clone();
             warnings.extend(stale_coverage.record(Zone::System, &CommandTargets));
             agent::sessions::format_sessions_with_warnings(
-                &selection.listing(&rules.window, 0, 10).unwrap(),
+                &selection
+                    .listing(
+                        &rules.window,
+                        FIRST_TEN_SESSIONS,
+                        agent::sessions::every_message_own,
+                    )
+                    .unwrap(),
                 None,
                 &warnings,
                 agent::test_support::written_at(),
@@ -7402,6 +7457,11 @@ mod tests {
     use crate::search::test_fixtures::october_messages;
 
     /// Each of `rows`' keys, and its search input.
+    const FIRST_TEN_SESSIONS: agent::sessions::SessionPage = agent::sessions::SessionPage {
+        offset: 0,
+        limit: 10,
+    };
+
     fn keyed_inputs(
         rows: &[history::Conversation],
     ) -> (
@@ -7472,6 +7532,46 @@ mod tests {
             session_offset: 0,
             window: TimeFilter::default(),
         }
+    }
+
+    /// `agent sessions` counts a row's own messages in the copy the row
+    /// read, and in its transcript once another rearview replaced that copy
+    /// or for a row without one.
+    #[test]
+    fn own_message_counts_read_rows_copy_and_transcript_when_copy_is_replaced_or_absent() {
+        use crate::search::test_fixtures::{cached_claude_sessions, october_messages};
+        let sessions = cached_claude_sessions(&[
+            ("current", october_messages(&["one", "two"])),
+            ("replaced", october_messages(&["one"])),
+            ("uncopied", october_messages(&["one", "two", "three"])),
+        ]);
+        sessions.rewrite(1, &october_messages(&["inserted", "one"]));
+        let mut rows = sessions.rows.clone();
+        rows[2].cached_session = None;
+        let (keys, _) = keyed_inputs(&rows);
+        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
+
+        let counts = rows
+            .iter()
+            .zip(&keys)
+            .map(|(row, key)| {
+                service
+                    .own_message_counts(row, key, &TimeFilter::default())
+                    .unwrap()
+                    .messages
+            })
+            .collect::<Vec<_>>();
+
+        let parsed = keys
+            .iter()
+            .map(|key| service.transcripts.borrow().contains_key(&key.path))
+            .collect::<Vec<_>>();
+        assert_eq!(counts, [2, 2, 3]);
+        assert_eq!(
+            parsed,
+            [false, true, true],
+            "the replaced and the uncopied sessions' transcripts are read"
+        );
     }
 
     /// The semantic stage reads a session another rearview wrote again since
