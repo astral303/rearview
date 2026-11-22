@@ -324,11 +324,13 @@ impl Thread {
 }
 
 /// Messages of one thread a ref names, by their numbers in that thread,
-/// both ends included: `m5`, `m5..m9`, `s3:m2` or `s3:m2..m4`.
+/// both ends included: `m5`, `m5..m9`, `m5..`, `s3:m2` or `s3:m2..m4`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ThreadRange {
     pub thread: Thread,
-    pub range: MessageRange,
+    pub first: usize,
+    /// `None` for an open end, `m5..`: to the thread's last message.
+    pub last: Option<usize>,
 }
 
 impl ThreadRange {
@@ -341,27 +343,34 @@ impl ThreadRange {
     pub fn closed(thread: Thread, first: usize, last: usize) -> Self {
         Self {
             thread,
-            range: MessageRange {
-                start: first,
-                end: last,
-            },
+            first,
+            last: Some(last),
+        }
+    }
+
+    /// `mA..` or `sN:mA..`: from `first` to the thread's last message.
+    pub fn open(thread: Thread, first: usize) -> Self {
+        Self {
+            thread,
+            first,
+            last: None,
         }
     }
 
     /// True when the ref names one message: `mN`, `mN..mN` or `sN:mK`.
     pub fn names_one_message(&self) -> bool {
-        self.range.is_single()
+        self.last == Some(self.first)
     }
 }
 
 impl std::fmt::Display for ThreadRange {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let MessageRange { start, end } = self.range;
-        write!(formatter, "{}m{start}", self.thread.prefix())?;
-        if end != start {
-            write!(formatter, "..m{end}")?;
+        write!(formatter, "{}m{}", self.thread.prefix(), self.first)?;
+        match self.last {
+            None => write!(formatter, ".."),
+            Some(last) if last != self.first => write!(formatter, "..m{last}"),
+            Some(_) => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -438,10 +447,10 @@ impl RefCommand {
     fn forms(self) -> &'static str {
         match self {
             Self::Read => {
-                "after the conversation ref, use mN, mA..mB, mN.K for one call, sN, or sN:mN, sN:mA..mB, sN:mN.K for a sub-agent's messages; pass an ma_ anchor with --anchor"
+                "after the conversation ref, use mN, mA..mB, mA.., mN.K for one call, sN, or sN:mN, sN:mA..mB, sN:mA.., sN:mN.K for a sub-agent's messages; pass an ma_ anchor with --anchor"
             }
             Self::Outline => {
-                "after the conversation ref, use mN, mA..mB, sN, or sN:mN, sN:mA..mB for a sub-agent's messages"
+                "after the conversation ref, use mN, mA..mB, mA.., sN, or sN:mN, sN:mA..mB, sN:mA.. for a sub-agent's messages"
             }
         }
     }
@@ -450,26 +459,16 @@ impl RefCommand {
     fn takes_a_call(self) -> bool {
         self == Self::Read
     }
-
-    /// The detail of the error for an open-ended range, `mN..`.
-    fn open_end(self) -> &'static str {
-        match self {
-            Self::Read => {
-                "open-ended message ranges are not supported; use mN..mM, or --tail N to read the end"
-            }
-            Self::Outline => self.forms(),
-        }
-    }
 }
 
-/// An `agent read` ref: a conversation, then `:mN`, `:mA..mB`, `:mN.K`,
-/// `:sN`, or one of the message forms after `:sN`.
+/// An `agent read` ref: a conversation, then `:mN`, `:mA..mB`, `:mA..`,
+/// `:mN.K`, `:sN`, or one of the message forms after `:sN`.
 pub fn parse_read_ref(input: &str) -> Result<ReadRef> {
     parse_ref(input, RefCommand::Read)
 }
 
-/// An `agent outline` ref: a conversation, then `:mN`, `:mA..mB`, `:sN`,
-/// `:sN:mN` or `:sN:mA..mB`.
+/// An `agent outline` ref: a conversation, then `:mN`, `:mA..mB`, `:mA..`,
+/// `:sN`, or one of the message forms after `:sN` but a call.
 pub fn parse_outline_ref(input: &str) -> Result<ReadRef> {
     parse_ref(input, RefCommand::Outline)
 }
@@ -486,9 +485,6 @@ fn parse_ref(input: &str, command: RefCommand) -> Result<ReadRef> {
     if let Some(part) = part {
         if !is_message_or_subagent_ref(part) {
             return Err(AgentError::invalid_ref(part, command.forms()).into());
-        }
-        if has_open_end(part) {
-            return Err(AgentError::invalid_ref(part, command.open_end()).into());
         }
         let (thread, messages) = split_thread(part)?;
         match messages {
@@ -533,8 +529,9 @@ fn split_thread(part: &str) -> Result<(Thread, Option<&str>)> {
     Ok((Thread::Subagent(handle), messages))
 }
 
-/// `mN` or `mA..mB` of `thread`. The end of a sub-agent's range may repeat
-/// its thread, `s3:m2..s3:m9`; a range across two threads is `invalid-ref`.
+/// `mN`, `mA..mB` or `mA..` of `thread`. The end of a sub-agent's range may
+/// repeat its thread, `s3:m2..s3:m9`; a range across two threads is
+/// `invalid-ref`.
 fn parse_thread_range(thread: Thread, input: &str) -> Result<ThreadRange> {
     let mixed = || {
         AgentError::invalid_ref(
@@ -558,9 +555,9 @@ fn parse_thread_range(thread: Thread, input: &str) -> Result<ThreadRange> {
     if start.contains(':') || end.contains(':') {
         return Err(mixed().into());
     }
-    Ok(ThreadRange {
-        thread,
-        range: parse_message_range(&format!("{start}..{end}"))?,
+    Ok(match parse_message_range(start, end)? {
+        (first, Some(last)) => ThreadRange::closed(thread, first, last),
+        (first, None) => ThreadRange::open(thread, first),
     })
 }
 
@@ -966,38 +963,35 @@ fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
     Ok(ConversationRefInput::IdOrFileName(reference.to_owned()))
 }
 
-/// True for `mN..`; false for `..mN` and `mN...`.
-fn has_open_end(range: &str) -> bool {
-    range
-        .strip_suffix("..")
-        .is_some_and(|start| !start.is_empty() && !start.ends_with('.'))
-}
-
-fn parse_message_range(input: &str) -> Result<MessageRange> {
-    if input.contains("...") {
+/// The first and last message numbers of the range from `start` to `end`,
+/// the two sides of its `..`; the last is `None` for an open end, `mA..`.
+fn parse_message_range(start: &str, end: &str) -> Result<(usize, Option<usize>)> {
+    let input = format!("{start}..{end}");
+    if end.starts_with('.') {
+        return Err(AgentError::invalid_ref(
+            &input,
+            "invalid message range; use mN, mA..mB or mA..",
+        )
+        .into());
+    }
+    if start.is_empty() {
+        return Err(AgentError::invalid_ref(
+            &input,
+            "a message range starts at a message; use mA..mB, or mA.. to read to the end",
+        )
+        .into());
+    }
+    let first = parse_message_number(start)?;
+    if end.is_empty() {
+        return Ok((first, None));
+    }
+    let last = parse_message_number(end)?;
+    if first > last {
         return Err(
-            AgentError::invalid_ref(input, "invalid message range; use mN or mN..mM").into(),
+            AgentError::invalid_ref(&input, "message range start must be before end").into(),
         );
     }
-    if let Some((start, end)) = input.split_once("..") {
-        if start.is_empty() || end.is_empty() {
-            return Err(AgentError::invalid_ref(
-                input,
-                "open-ended message ranges are not supported",
-            )
-            .into());
-        }
-        let start = parse_message_number(start)?;
-        let end = parse_message_number(end)?;
-        if start > end {
-            return Err(
-                AgentError::invalid_ref(input, "message range start must be before end").into(),
-            );
-        }
-        Ok(MessageRange { start, end })
-    } else {
-        Ok(MessageRange::single(parse_message_number(input)?))
-    }
+    Ok((first, Some(last)))
 }
 
 fn parse_message_number(input: &str) -> Result<usize> {
@@ -1891,12 +1885,11 @@ mod tests {
                 .to_string()
                 .contains("too short")
         );
-        let open_end = parse_read_ref("ch_12345678:m1..").unwrap_err().to_string();
-        assert!(open_end.contains("open-ended"), "{open_end}");
-        assert!(open_end.contains("--tail N"), "{open_end}");
         let open_start = parse_read_ref("ch_12345678:..m5").unwrap_err().to_string();
-        assert!(open_start.contains("open-ended"), "{open_start}");
-        assert!(!open_start.contains("--tail"), "{open_start}");
+        assert!(
+            open_start.contains("a message range starts at a message"),
+            "{open_start}"
+        );
         assert!(
             parse_read_ref("ch_12345678:m..m2")
                 .unwrap_err()
@@ -2028,7 +2021,6 @@ mod tests {
     fn outline_ref_outline_doesnt_accept_names_forms_it_accepts() {
         for reference in [
             "ch_12345678:REF:s3",
-            "ch_12345678:m3..",
             "ch_12345678:m3.1",
             "ch_12345678:/s3",
             r"ch_12345678:\s3",
@@ -2059,12 +2051,29 @@ mod tests {
     }
 
     #[test]
-    fn open_ended_focus_doesnt_suggest_tail() {
-        for focus in ["m3..", "ch_12345678:m3.."] {
-            let error = parse_focus_ref(focus).unwrap_err().to_string();
-            assert!(error.contains("open-ended"), "{error}");
-            assert!(!error.contains("--tail"), "{error}");
+    fn open_ended_ref_names_its_first_message_and_threads_end() {
+        for (reference, expected) in [
+            ("ch_12345678:m3..", ThreadRange::open(Thread::Parent, 3)),
+            (
+                "ch_12345678:s4:m10..",
+                ThreadRange::open(Thread::Subagent(4), 10),
+            ),
+        ] {
+            for parsed in [parse_read_ref(reference), parse_outline_ref(reference)] {
+                assert_eq!(parsed.unwrap().range, Some(expected), "{reference}");
+            }
         }
+        for focus in ["m3..", "ch_12345678:m3.."] {
+            assert_eq!(
+                parse_focus_ref(focus).unwrap().range,
+                ThreadRange::open(Thread::Parent, 3),
+                "{focus}"
+            );
+        }
+        assert_eq!(
+            ThreadRange::open(Thread::Subagent(4), 10).to_string(),
+            "s4:m10.."
+        );
     }
 
     #[test]

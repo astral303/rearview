@@ -25,6 +25,7 @@ fn header_gaps(session: &AgentSession) -> Vec<String> {
             range: None,
             subagent: None,
             call: None,
+            shortened_to: None,
         }],
         None,
         None,

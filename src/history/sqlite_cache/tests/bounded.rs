@@ -55,6 +55,7 @@ fn bounded_reads_and_outlines_keep_global_links_handles_and_times_for_every_prov
                             range: Some(range),
                             subagent: None,
                             call: None,
+                            shortened_to: None,
                         };
                         assert_eq!(
                             format_read(&[request(&actual)], None, None, options).unwrap(),

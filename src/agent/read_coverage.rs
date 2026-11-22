@@ -151,6 +151,7 @@ fn read(session: &AgentSession, options: ProtocolOptions) -> String {
             range: None,
             subagent: None,
             call: None,
+            shortened_to: None,
         }],
         None,
         None,
@@ -198,6 +199,7 @@ impl LoadedSession {
                 range: range.map(|range| range.range),
                 subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
                 call: read_ref.call,
+                shortened_to: range.and_then(|range| range.shortened_to),
             }],
             None,
             None,
@@ -487,6 +489,7 @@ fn read_subagent(session: &AgentSession, handle: usize) -> String {
             range: None,
             subagent: Some(handle),
             call: None,
+            shortened_to: None,
         }],
         None,
         None,
@@ -560,6 +563,7 @@ fn segments_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
             range: None,
             subagent: Some(number),
             call: None,
+            shortened_to: None,
         };
         for (address, covered) in crate::agent::protocol::outline_segments(&request, 2) {
             segments += 1;
@@ -760,6 +764,7 @@ fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<S
                     range: Some(MessageRange::single(ordinal)),
                     subagent: None,
                     call: None,
+                    shortened_to: None,
                 }],
                 None,
                 Some(&ReadSlice::Match {
@@ -976,6 +981,62 @@ fn every_agents_own_message_reads_as_its_closed_range_with_and_without_subagents
         showing_subagents > 0,
         "a read of one own message shows the sub-agent messages written after it"
     );
+}
+
+/// Each thread of `session`, the session's own and each sub-agent's, where
+/// three reads from its second-last message differ: the range ending at its
+/// last message, the range ending past it, and the open range. Also how
+/// many sub-agent threads were read. The range ending past the last message
+/// prints `last=` with that message.
+fn ranges_to_thread_end_read_apart(session: &AgentSession) -> (Vec<String>, usize) {
+    let conversation = key_of_listed(&session.row).conversation_ref().canonical();
+    let loaded = LoadedSession::of(session);
+    let mut lengths = HashMap::<Option<usize>, usize>::new();
+    for (handle, number) in SessionAddresses::of(session).ordinals.into_keys() {
+        let length = lengths.entry(handle).or_default();
+        *length = (*length).max(number);
+    }
+    let mut misread = Vec::new();
+    for (&handle, &length) in &lengths {
+        let thread = handle.map_or_else(String::new, |handle| format!("s{handle}:"));
+        let first = length.saturating_sub(1).max(1);
+        let read = |messages: String| {
+            loaded.read_ref(&format!("{conversation}:{thread}{messages}"), EVERY_FLAG)
+        };
+        let to_last = read(format!("m{first}..m{length}"));
+        let past_last = read(format!("m{first}..m{}", length + 5));
+        let open = read(format!("m{first}.."));
+        let last = format!(" last={thread}m{length}");
+        if !past_last
+            .lines()
+            .next()
+            .unwrap()
+            .contains(&format!("{last} "))
+            || past_last.replacen(&last, "", 1) != to_last
+            || open != to_last
+        {
+            misread.push(format!(
+                "{:?}: {thread}m{first}..m{length} reads\n{to_last}\npast its end\n{past_last}\nopen\n{open}",
+                session.row.source
+            ));
+        }
+    }
+    let subagent_threads = lengths.keys().filter(|handle| handle.is_some()).count();
+    (misread, subagent_threads)
+}
+
+#[test]
+fn every_agents_range_past_or_open_to_threads_end_reads_to_its_last_message() {
+    let mut misread = Vec::new();
+    let mut subagent_threads = 0;
+    for session in every_record_sessions() {
+        let (session_misread, session_threads) = ranges_to_thread_end_read_apart(&session);
+        misread.extend(session_misread);
+        subagent_threads += session_threads;
+    }
+
+    assert!(misread.is_empty(), "{}", misread.join("\n"));
+    assert!(subagent_threads > 0, "a session has a sub-agent's thread");
 }
 
 /// Each address `session`'s reads with every flag and with default flags

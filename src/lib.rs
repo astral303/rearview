@@ -2737,25 +2737,75 @@ mod agent_command_tests {
         assert!(read_output.contains("progress_only_semantic_needle"));
     }
 
-    #[test]
-    fn read_command_rejects_out_of_range_loaded_messages() {
-        let dir = tempfile::tempdir().unwrap();
+    /// The key of a session of one message, `question`.
+    fn one_message_session(dir: &tempfile::TempDir) -> Vec<AgentConversationKey> {
         let path = write_jsonl(
-            &dir,
+            dir,
             "12345678-1234-4234-9234-123456789abc.jsonl",
             &[user("question")],
         );
-        let keys = vec![AgentConversationKey::new(
+        vec![AgentConversationKey::new(
             "project-a",
             "12345678-1234-4234-9234-123456789abc.jsonl",
             path,
-        )];
+        )]
+    }
+
+    #[test]
+    fn read_command_rejects_range_starting_after_last_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = one_message_session(&dir);
         let conversation = keys[0].conversation_ref().canonical();
-        let args = read_args(vec![format!("{conversation}:m1..m2")], None);
+        let args = read_args(vec![format!("{conversation}:m2..m3")], None);
 
         let err = run_agent_read(&args, Some(&keys)).unwrap_err();
 
-        assert!(err.to_string().contains("exceeds transcript length"));
+        assert!(
+            err.to_string()
+                .contains("starts after the last message, m1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn read_command_shortens_range_ending_after_last_message_and_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = one_message_session(&dir);
+        let conversation = keys[0].conversation_ref().canonical();
+
+        let shortened = run_agent_read(
+            &read_args(vec![format!("{conversation}:m1..m9")], None),
+            Some(&keys),
+        )
+        .unwrap();
+        let open = run_agent_read(
+            &read_args(vec![format!("{conversation}:m1..")], None),
+            Some(&keys),
+        )
+        .unwrap();
+
+        let outline = run_agent_outline(
+            &AgentOutlineArgs {
+                conversation: format!("{conversation}:m1..m9"),
+                perf_stats: false,
+                output: default_output(),
+            },
+            Some(&keys),
+        )
+        .unwrap();
+
+        let header = shortened.lines().next().unwrap();
+        assert!(header.contains(" last=m1 "), "{shortened}");
+        assert!(shortened.contains("\nm1 user "), "{shortened}");
+        assert_eq!(
+            open,
+            shortened.replacen(" last=m1", "", 1),
+            "an open end reads to the last message without `last=`"
+        );
+        assert!(
+            outline.lines().next().unwrap().contains(" last=m1 "),
+            "{outline}"
+        );
     }
 
     /// A stderr whose write or flush fails, as a closed pipe's does.

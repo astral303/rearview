@@ -10,7 +10,7 @@ use crate::agent::record_writer::{
     OmittedRecord, RecordSize, RecordWriter, continue_read_record, conversation_record,
     handles_field, message_record_start, read_record,
 };
-use crate::agent::refs::{MessageRange, ResolvedConversation};
+use crate::agent::refs::{MessageRange, ResolvedConversation, ThreadRange};
 use crate::agent::sanitize::sanitize_agent_text;
 use crate::agent::subagents::{Handle, SubagentHandles, SubagentTag, Subagents};
 use crate::agent::time_span::{
@@ -117,6 +117,9 @@ pub struct ReadRequest<'a> {
     /// The number of the call read alone, in the message `range` names,
     /// with the messages holding its result.
     pub call: Option<usize>,
+    /// The thread's last message, when the ref's range ended past it and
+    /// was shortened to it: `last=` in the header.
+    pub shortened_to: Option<ThreadRange>,
 }
 
 impl ReadRequest<'_> {
@@ -1166,6 +1169,8 @@ struct ReadHeader {
     /// `cut=` is not `none`.
     full: Option<usize>,
     policy: String,
+    /// ` last=m409`, or empty when no ref's range was shortened.
+    last: String,
     /// ` messages-in-window=N`, or empty without a window.
     window: String,
     /// ` warnings=N warning-records=M`, or empty without warning records.
@@ -1175,6 +1180,7 @@ struct ReadHeader {
 impl ReadHeader {
     fn new(
         options: ProtocolOptions,
+        requests: &[ReadRequest<'_>],
         messages_in_window: ThreadCounts,
         warning_count: usize,
         warning_records: &[String],
@@ -1183,6 +1189,7 @@ impl ReadHeader {
             budget: options.budget,
             full: None,
             policy: options.visibility().atom(),
+            last: last_atom(requests),
             window: window_atom(options.window, messages_in_window),
             warnings: warning_atoms(warning_count, warning_records),
         }
@@ -1190,11 +1197,12 @@ impl ReadHeader {
 
     fn line(&self, cut: &str, omit: &str, offset: FixedOffset, hidden_atoms: &str) -> String {
         format!(
-            "protocol agent-read cut={} chars={}{} policy={} omit={omit}{}{}{hidden_atoms}{}\n",
+            "protocol agent-read cut={} chars={}{} policy={}{} omit={omit}{}{}{hidden_atoms}{}\n",
             escape_atom(cut),
             budget_atom(self.budget),
             full_atom(cut, self.full),
             self.policy,
+            self.last,
             tz_atom(offset),
             self.window,
             self.warnings
@@ -1206,12 +1214,29 @@ impl ReadHeader {
     /// the offset of `written_at`.
     fn fixed_atoms(&self, written_at: DateTime<Zone>) -> String {
         format!(
-            " policy={}{}{}{}",
+            " policy={}{}{}{}{}",
             self.policy,
+            self.last,
             tz_atom(output_offset(None, written_at)),
             self.window,
             self.warnings
         )
+    }
+}
+
+/// ` last=m409`, or ` last=m409,s3:m16` for several refs: for each request
+/// whose range ended past its thread's last message, that last message.
+/// Empty when no range did.
+fn last_atom(requests: &[ReadRequest<'_>]) -> String {
+    let last = requests
+        .iter()
+        .filter_map(|request| request.shortened_to)
+        .map(|last| last.to_string())
+        .collect::<Vec<_>>();
+    if last.is_empty() {
+        String::new()
+    } else {
+        format!(" last={}", last.join(","))
     }
 }
 
@@ -1283,6 +1308,7 @@ pub fn format_read_with_warnings(
     let (warning_count, warning_records) = format_warning_records(warnings);
     let mut header = ReadHeader::new(
         header_options,
+        requests,
         messages_in_window,
         warning_count,
         &warning_records,
@@ -1380,6 +1406,7 @@ pub fn format_outline(
         range: None,
         subagent: None,
         call: None,
+        shortened_to: None,
     };
     format_outline_with_warnings(
         &request,
@@ -1453,8 +1480,9 @@ pub fn format_outline_with_warnings(
     let messages = OutlineMessages::new(request, requested, &index, options, written_at);
     let offset = messages.header_offset;
     let header_fields = format!(
-        "policy={}{}{}{}{in_window}",
+        "policy={}{}{}{}{}{in_window}",
         options.visibility().atom(),
+        last_atom(std::slice::from_ref(request)),
         ThreadCounts::of(&transcript.messages).atoms("messages"),
         time_atoms(
             TimeSpan::of_messages(&transcript.messages),
@@ -3892,6 +3920,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -3930,6 +3959,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -3967,6 +3997,7 @@ mod tests {
                 range: Some(MessageRange { start: 1, end: 7 }),
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             Some(ProtocolFocus {
                 subagent: None,
@@ -4002,6 +4033,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -4035,6 +4067,7 @@ mod tests {
                 range: Some(MessageRange::single(1)),
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             Some(&ReadSlice::Lines(MessageLineRange { start: 2, end: 4 })),
@@ -4066,6 +4099,7 @@ mod tests {
                 range: Some(MessageRange::single(1)),
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             Some(&ReadSlice::Match {
@@ -4093,6 +4127,7 @@ mod tests {
                 range: Some(MessageRange::single(1)),
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             Some(&ReadSlice::Match {
@@ -4118,6 +4153,7 @@ mod tests {
                 range: Some(MessageRange::single(1)),
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             Some(&ReadSlice::Lines(MessageLineRange { start: 2, end: 3 })),
@@ -4144,6 +4180,7 @@ mod tests {
                     range: Some(MessageRange::single(1)),
                     subagent: None,
                     call: None,
+                    shortened_to: None,
                 }],
                 None,
                 Some(&ReadSlice::Match {
@@ -4199,6 +4236,7 @@ mod tests {
                 range: Some(MessageRange::single(1)),
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             Some(&slice),
@@ -4274,6 +4312,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -4303,6 +4342,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             Some(ProtocolFocus {
                 subagent: None,
@@ -4349,6 +4389,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             Some(ProtocolFocus {
                 subagent: None,
@@ -4399,6 +4440,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -4488,6 +4530,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -4501,6 +4544,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -4575,6 +4619,7 @@ mod tests {
                 range,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -5164,6 +5209,7 @@ mod tests {
                 range: None,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             Some(ProtocolFocus {
                 subagent: None,
@@ -5270,6 +5316,7 @@ mod tests {
                     range: None,
                     subagent: None,
                     call: None,
+                    shortened_to: None,
                 }],
                 Some(ProtocolFocus {
                     subagent: None,
@@ -5404,6 +5451,7 @@ mod tests {
                 range,
                 subagent: None,
                 call: None,
+                shortened_to: None,
             }],
             tail,
             options,
@@ -5841,6 +5889,7 @@ mod tests {
             range: None,
             subagent: None,
             call: None,
+            shortened_to: None,
         }
     }
 
@@ -6507,6 +6556,7 @@ mod tests {
                 range: None,
                 subagent: Some(handle),
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -6541,6 +6591,7 @@ mod tests {
                 range: None,
                 subagent: Some(1),
                 call: None,
+                shortened_to: None,
             }],
             None,
             None,
@@ -7257,6 +7308,7 @@ mod tests {
                     range: Some(range),
                     subagent: None,
                     call: None,
+                    shortened_to: None,
                 }],
                 None,
                 Some(&slice),
@@ -7396,6 +7448,7 @@ mod tests {
             range,
             subagent: None,
             call: None,
+            shortened_to: None,
         };
         let index = TranscriptIndex::of(transcript);
         let message = &transcript.messages[0];
@@ -8486,6 +8539,7 @@ mod tests {
             range,
             subagent: None,
             call: None,
+            shortened_to: None,
         };
         let with = |options: ProtocolOptions, budget| ProtocolOptions { budget, ..options };
         let mut cuts = BTreeSet::new();
@@ -9243,6 +9297,7 @@ mod tests {
         let request = ReadRequest {
             range: Some(MessageRange::single(ordinal)),
             call: Some(number),
+            shortened_to: None,
             ..whole_session_request(&resolved, transcript)
         };
         format_read(&[request], None, None, options)
@@ -9488,6 +9543,7 @@ mod tests {
         let first_call_of = |ordinal| ReadRequest {
             range: Some(MessageRange::single(ordinal)),
             call: Some(1),
+            shortened_to: None,
             ..whole_session_request(&resolved, &transcript)
         };
 
@@ -9558,6 +9614,7 @@ mod tests {
             let second_call = ReadRequest {
                 range: Some(MessageRange::single(3)),
                 call: Some(1),
+                shortened_to: None,
                 ..whole_session_request(&resolved, &transcript)
             };
             let with_tools = ProtocolOptions {
@@ -9586,6 +9643,7 @@ mod tests {
             let first_call = ReadRequest {
                 range: Some(MessageRange::single(1)),
                 call: Some(1),
+                shortened_to: None,
                 ..whole_session_request(&resolved, &transcript)
             };
             let second_run = ReadRequest {
@@ -9675,6 +9733,7 @@ mod tests {
             &[ReadRequest {
                 range: Some(MessageRange::single(1)),
                 call: Some(1),
+                shortened_to: None,
                 ..whole_session_request(&resolved, &transcript)
             }],
             None,

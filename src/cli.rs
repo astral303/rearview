@@ -292,8 +292,9 @@ pub struct AgentOutputFlags {
 #[derive(Debug, ClapArgs)]
 pub struct AgentReadArgs {
     /// Conversations to read, each a ch_ handle, a session ID, or a transcript
-    /// path, optionally followed by :mN, :mN..mM, :mN.K for one call, :sN for
-    /// one sub-agent, or :sN:mN, :sN:mN..mM, :sN:mN.K for its messages
+    /// path, optionally followed by :mN, :mN..mM, :mN.. to the end, :mN.K for
+    /// one call, :sN for one sub-agent, or :sN:mN, :sN:mN..mM, :sN:mN..,
+    /// :sN:mN.K for its messages
     #[arg(required = true, value_parser = non_empty_string)]
     pub refs: Vec<String>,
     /// Durable message anchor to read within one conversation
@@ -330,8 +331,8 @@ pub struct AgentReadArgs {
 #[derive(Debug, ClapArgs)]
 pub struct AgentOutlineArgs {
     /// Conversation to outline: a ch_ handle, a session ID, or a transcript
-    /// path, optionally followed by :mN, :mN..mM, :sN for one sub-agent, or
-    /// :sN:mN or :sN:mN..mM for its messages
+    /// path, optionally followed by :mN, :mN..mM, :mN.. to the end, :sN for
+    /// one sub-agent, or :sN:mN, :sN:mN..mM or :sN:mN.. for its messages
     #[arg(value_parser = non_empty_string)]
     pub conversation: String,
     /// Report time per stage, what was read, and peak memory on stderr

@@ -1835,10 +1835,8 @@ mod tests {
     /// The addresses of a hit on `focus` reading `read`, ordinals of a
     /// session without sub-agents.
     fn parent_addresses(focus: MessageRange, read: MessageRange) -> HitAddresses {
-        let range = |range| ThreadRange {
-            thread: Thread::Parent,
-            range,
-        };
+        let range =
+            |range: MessageRange| ThreadRange::closed(Thread::Parent, range.start, range.end);
         HitAddresses {
             focus: range(focus),
             read: range(read),
@@ -2445,8 +2443,8 @@ mod tests {
         assert_eq!(hits[0].preview, "lexical preview");
         assert_eq!(hits[0].semantic_score_breakdown.unwrap().semantic, 0.9);
         assert_eq!(
-            hits[0].addresses.map(|addresses| addresses.read.range),
-            Some(MessageRange { start: 1, end: 3 })
+            hits[0].addresses.map(|addresses| addresses.read),
+            Some(ThreadRange::closed(Thread::Parent, 1, 3))
         );
     }
 

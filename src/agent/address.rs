@@ -40,6 +40,9 @@ struct Place {
 pub struct ResolvedRange {
     pub range: MessageRange,
     pub subagent: Option<Handle>,
+    /// The thread's last message, when the ref's range ended past it and
+    /// was shortened to it: `last=` in the header.
+    pub shortened_to: Option<ThreadRange>,
 }
 
 impl MessageAddresses {
@@ -198,57 +201,75 @@ impl MessageAddresses {
     ///   sub-agent messages written after mA, from the session's start when
     ///   A is 1, and before m(B+1); `mN` is `mN..mN`;
     /// - `sN:mA..mB` is sub-agent N's messages A to B alone.
+    ///
+    /// An open end, or an end past the thread's last message, is that last
+    /// message. A start past it is `out-of-range`.
     pub fn resolve(&self, reference: ThreadRange) -> Result<ResolvedRange> {
-        let MessageRange { start, end } = reference.range;
-        let messages = self.thread_messages(reference.thread);
-        if let Thread::Subagent(handle) = reference.thread
+        let thread = reference.thread;
+        if let Thread::Subagent(handle) = thread
             && (handle == 0 || handle > self.handles)
         {
             return Err(AgentError::unknown_subagent(handle).into());
         }
-        if end > messages.len() {
+        let messages = self.thread_messages(thread);
+        let length = messages.len();
+        if reference.first > length {
             return Err(AgentError::out_of_range(None, self.past_end(reference)).into());
         }
-        let range = match reference.thread {
-            Thread::Parent => self.groups_span(start, end),
+        let (first, last) = (
+            reference.first,
+            reference.last.unwrap_or(length).min(length),
+        );
+        let range = match thread {
+            Thread::Parent => self.groups_span(first, last),
             Thread::Subagent(_) => MessageRange {
-                start: messages[start - 1],
-                end: messages[end - 1],
+                start: messages[first - 1],
+                end: messages[last - 1],
             },
         };
         Ok(ResolvedRange {
             range,
-            subagent: match reference.thread {
+            subagent: match thread {
                 Thread::Parent => None,
                 Thread::Subagent(handle) => Some(handle),
             },
+            shortened_to: reference
+                .last
+                .is_some_and(|named_last| named_last > length)
+                .then(|| ThreadRange::one(thread, length)),
         })
     }
 
-    /// The detail of the error for `reference` ending past its thread's last
-    /// message.
+    /// The detail of the error for `reference` starting past its thread's
+    /// last message.
     fn past_end(&self, reference: ThreadRange) -> String {
         let length = self.thread_messages(reference.thread).len();
         let last = ThreadRange::one(reference.thread, length);
-        match reference.thread {
-            Thread::Parent => {
-                let has_subagent_messages =
-                    self.threads.keys().any(|&thread| thread != Thread::Parent);
-                let numbering = if has_subagent_messages {
-                    "; sub-agent messages are numbered sN:mK"
-                } else {
-                    ""
-                };
-                format!("message range {reference} exceeds transcript length {last}{numbering}")
+        match (reference.thread, length) {
+            (Thread::Parent, 0) => format!(
+                "message range {reference}: the session does not have messages of its own{}",
+                self.subagent_numbering_note()
+            ),
+            (Thread::Parent, _) => format!(
+                "message range {reference} starts after the last message, {last}{}",
+                self.subagent_numbering_note()
+            ),
+            (Thread::Subagent(handle), 0) => {
+                format!("message range {reference}: s{handle} has not written a message")
             }
-            Thread::Subagent(handle) if length == 0 => {
-                format!(
-                    "message range {reference} exceeds s{handle}'s length: it has not written a message"
-                )
+            (Thread::Subagent(handle), _) => {
+                format!("message range {reference} starts after s{handle}'s last message, {last}")
             }
-            Thread::Subagent(handle) => {
-                format!("message range {reference} exceeds s{handle}'s length {last}")
-            }
+        }
+    }
+
+    /// `; sub-agent messages are numbered sN:mK` in a transcript with
+    /// sub-agent messages; empty otherwise.
+    fn subagent_numbering_note(&self) -> &'static str {
+        if self.threads.keys().any(|&thread| thread != Thread::Parent) {
+            "; sub-agent messages are numbered sN:mK"
+        } else {
+            ""
         }
     }
 
@@ -474,6 +495,7 @@ mod tests {
         ResolvedRange {
             range: MessageRange { start, end },
             subagent,
+            shortened_to: None,
         }
     }
 
@@ -520,24 +542,92 @@ mod tests {
     }
 
     #[test]
-    fn ref_past_its_threads_end_names_threads_length() {
+    fn ref_ending_past_its_threads_end_is_shortened_to_its_last_message() {
+        for (reference, expected, last) in [
+            ("m3..m9", ordinals(7, 9, None), "m4"),
+            ("s1:m2..m9", ordinals(3, 6, Some(1)), "s1:m3"),
+        ] {
+            let resolved = resolved(reference).unwrap();
+
+            assert_eq!(
+                (resolved.range, resolved.subagent),
+                (expected.range, expected.subagent),
+                "{reference}"
+            );
+            assert_eq!(
+                resolved
+                    .shortened_to
+                    .map(|last| last.to_string())
+                    .as_deref(),
+                Some(last),
+                "{reference} names its thread's last message"
+            );
+        }
+    }
+
+    #[test]
+    fn open_ended_ref_reads_to_its_threads_end_without_being_shortened() {
+        for (reference, closed) in [("m3..", "m3..m4"), ("s1:m2..", "s1:m2..m3")] {
+            assert_eq!(
+                resolved(reference).unwrap(),
+                resolved(closed).unwrap(),
+                "{reference} reads as {closed}"
+            );
+        }
+    }
+
+    #[test]
+    fn ref_starting_past_its_threads_end_names_its_last_message() {
         for (reference, detail) in [
             (
                 "m5",
-                "message range m5 exceeds transcript length m4; sub-agent messages are numbered sN:mK",
+                "message range m5 starts after the last message, m4; sub-agent messages are numbered sN:mK",
             ),
             (
-                "s1:m3..m9",
-                "message range s1:m3..m9 exceeds s1's length s1:m3",
+                "m5..m9",
+                "message range m5..m9 starts after the last message, m4; sub-agent messages are numbered sN:mK",
+            ),
+            (
+                "s1:m4..",
+                "message range s1:m4.. starts after s1's last message, s1:m3",
             ),
         ] {
             let error = resolved(reference).unwrap_err();
 
             assert!(
                 error.to_string().contains(detail),
-                "{reference} names its thread's length: {error}"
+                "{reference} names its thread's last message: {error}"
+            );
+            assert!(
+                matches!(
+                    &error,
+                    crate::error::AppError::Agent(AgentError {
+                        kind: AgentErrorKind::OutOfRange,
+                        ..
+                    })
+                ),
+                "{reference} is out of range: {error}"
             );
         }
+    }
+
+    #[test]
+    fn own_ref_in_session_without_own_messages_reports_it_has_none() {
+        let addresses = MessageAddresses::of_transcript(&transcript(
+            vec![subagent_text_message(1, "alpha", "alpha")],
+            "session.jsonl",
+        ));
+
+        let error = addresses
+            .resolve(parse_messages("m1").unwrap())
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "message range m1: the session does not have messages of its own; sub-agent messages are numbered sN:mK"
+            ),
+            "the detail names the missing messages, not m0: {error}"
+        );
     }
 
     #[test]

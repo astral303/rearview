@@ -140,7 +140,8 @@ To choose a section, outline it, then read only the emitted range. An outline
 spans the whole session, its messages inside the window, or a ref's `:m7..m9`,
 `:s3` or `:s3:m2..m5`. With `--subagents`, `:m7..m9` reads m7 to m9 and every
 sub-agent message written after m7 and before m10, and `:m7` m7 and the
-sub-agent messages after it. `--tail 20` reads the last
+sub-agent messages after it. `:m7..` reads to the end, as does an end past
+the last message. `--tail 20` reads the last
 20 of the session's own messages a read shows (of s3's for `:s3`) and, with
 `--subagents`, the sub-agent messages written after the first of them.
 

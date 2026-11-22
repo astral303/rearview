@@ -4007,6 +4007,7 @@ impl AgentService {
             ranges[0] = Some(agent::address::ResolvedRange {
                 range: agent::refs::MessageRange::single(ordinal),
                 subagent: None,
+                shortened_to: None,
             });
         }
         let requests = resolved_refs
@@ -4019,6 +4020,7 @@ impl AgentService {
                     range: range.map(|range| range.range),
                     subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
                     call: read_ref.call,
+                    shortened_to: range.and_then(|range| range.shortened_to),
                 },
             )
             .collect::<Vec<_>>();
@@ -4101,6 +4103,7 @@ impl AgentService {
                 .subagent
                 .or(range.and_then(|range| range.subagent)),
             call: None,
+            shortened_to: range.and_then(|range| range.shortened_to),
         };
         let records = perf
             .time(Stage::Render, || {

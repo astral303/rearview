@@ -639,6 +639,8 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         let continued: Vec<&str> = continued.iter().map(String::as_str).collect();
         run(&continued);
     }
+    run(&["agent", "read", &format!("{reference}:m17..m9999")]);
+    run(&["agent", "read", &format!("{reference}:m17..")]);
     run(&["agent", "read", &format!("{reference}:m9999")]);
     run(&["agent", "read", &format!("{reference}:m5..m2")]);
     run(&["agent", "read", &format!("{reference}:s99")]);
@@ -667,6 +669,7 @@ fn outline_records_of(reference: &str, agent: &str) -> String {
     ]);
     run(&["agent", "outline", reference, "--budget", "500"]);
     run(&["agent", "outline", &format!("{reference}:{range}")]);
+    run(&["agent", "outline", &format!("{reference}:m17..m9999")]);
     if outline.lines().any(|line| line.starts_with("subagent s1 ")) {
         run(&["agent", "outline", &format!("{reference}:s1")]);
     }
