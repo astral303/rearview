@@ -7,7 +7,7 @@ use crate::agent::diagnostic::{
 use crate::agent::hidden_parts::HiddenParts;
 use crate::agent::record_writer::{
     CallCopy, CallRecord, CallResultRecord, HiddenRecord, MessageRecord, MessageRuns,
-    OmittedRecord, RecordSize, RecordWriter, continue_read_record, conversation_record,
+    OverBudgetRecord, RecordSize, RecordWriter, continue_read_record, conversation_record,
     handles_field, message_record_start, read_record,
 };
 use crate::agent::refs::{MessageRange, ResolvedConversation, ThreadRange};
@@ -269,7 +269,7 @@ struct RenderedMessage<'a> {
     /// True when the message prints a record of its own. A message with a
     /// body always does.
     has_own_record: bool,
-    /// The read's flags, repeated in the read an omission marker names.
+    /// The read's flags, repeated in the read an `over-budget` record names.
     visibility: ContentVisibility,
     /// The sub-agent the message belongs to, in position 2.
     subagent: Option<SubagentTag>,
@@ -423,7 +423,7 @@ impl<'a> RenderedMessage<'a> {
         }
         if let Some(omission) = truncation.and_then(|truncation| truncation.omission.as_ref()) {
             let reference = self.conversation.resolved.reference.canonical();
-            writer.write_omitted_records(&self.omitted_record(&reference, omission));
+            writer.write_over_budget_records(&self.over_budget_record(&reference, omission));
         }
     }
 
@@ -463,9 +463,9 @@ impl<'a> RenderedMessage<'a> {
 
     /// The truncation that keeps the most of the content within `room`, as
     /// `chars` counts the output of each; `None` when the whole content fits.
-    /// When no truncation fits, the omission marker alone: a read never drops
-    /// content without naming the read that shows it. `chars` counts at
-    /// least the characters a truncation keeps.
+    /// When no truncation fits, the `over-budget` record alone: a read never
+    /// drops content without naming the read that shows it. `chars` counts
+    /// at least the characters a truncation keeps.
     fn truncated_to_fit(
         &self,
         room: usize,
@@ -533,12 +533,12 @@ impl<'a> RenderedMessage<'a> {
 
     /// The fields of the records naming what `omission` leaves out of the
     /// message's content.
-    fn omitted_record<'r>(
+    fn over_budget_record<'r>(
         &'r self,
         reference: &'r str,
         omission: &'r Omission,
-    ) -> OmittedRecord<'r> {
-        OmittedRecord {
+    ) -> OverBudgetRecord<'r> {
+        OverBudgetRecord {
             ordinal: self.message.ordinal,
             reference,
             first_line: omission.first_line,
@@ -1174,9 +1174,9 @@ impl<'a> HiddenRun<'a> {
     }
 }
 
-/// The `agent read` header. `cut=`, `omit=`, `tz=` and the `hidden-` atoms
-/// depend on the entries the budget selects, and `full=` is set once they
-/// are selected; the other atoms are fixed when the header is made.
+/// The `agent read` header. `cut=`, `over-budget=`, `tz=` and the `hidden-`
+/// atoms depend on the entries the budget selects, and `full=` is set once
+/// they are selected; the other atoms are fixed when the header is made.
 struct ReadHeader {
     budget: Option<usize>,
     /// The budget printing every entry whole: `full=` on a header whose
@@ -1209,9 +1209,15 @@ impl ReadHeader {
         }
     }
 
-    fn line(&self, cut: &str, omit: &str, offset: FixedOffset, hidden_atoms: &str) -> String {
+    fn line(
+        &self,
+        cut: &str,
+        over_budget: &str,
+        offset: FixedOffset,
+        hidden_atoms: &str,
+    ) -> String {
         format!(
-            "protocol agent-read cut={} chars={}{} policy={}{} omit={omit}{}{}{hidden_atoms}{}\n",
+            "protocol agent-read cut={} chars={}{} policy={}{} over-budget={over_budget}{}{}{hidden_atoms}{}\n",
             escape_atom(cut),
             budget_atom(self.budget),
             full_atom(cut, self.full),
@@ -1224,8 +1230,8 @@ impl ReadHeader {
     }
 
     /// The fixed atoms: the header a budget estimate counts beyond `cut=`,
-    /// `chars=`, `full=`, `omit=` and the `hidden-` atoms. Every offset is as long as
-    /// the offset of `written_at`.
+    /// `chars=`, `full=`, `over-budget=` and the `hidden-` atoms. Every
+    /// offset is as long as the offset of `written_at`.
     fn fixed_atoms(&self, written_at: DateTime<Zone>) -> String {
         format!(
             " policy={}{}{}{}{}",
@@ -1357,7 +1363,7 @@ pub fn format_read_with_warnings(
         let hidden_atoms = hidden_in(entries, selected.iter().copied()).total_atoms();
         let mut output = header.line(
             cut,
-            &omitted_message_ranges(&spans, &selected_set),
+            &over_budget_ranges(&spans, &selected_set),
             writer.header_offset(written_at),
             &hidden_atoms,
         );
@@ -2841,7 +2847,7 @@ const TRUNCATION_FLOOR_CHARS: usize = 200;
 /// `selected`: each run of consecutive messages as one ref, `;` between
 /// refs, then the flags that show every omitted entry.
 fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> Vec<String> {
-    let mut groups: Vec<OmittedEntries<'_, '_>> = Vec::new();
+    let mut groups: Vec<OverBudgetEntries<'_, '_>> = Vec::new();
     for (index, span) in spans.iter().enumerate() {
         if selected.contains(&index) {
             continue;
@@ -2852,7 +2858,7 @@ fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> 
         {
             Some(group) => group.add(span),
             None => {
-                let mut group = OmittedEntries {
+                let mut group = OverBudgetEntries {
                     first: span,
                     runs: MessageRuns::default(),
                     flags: ContentVisibility::default(),
@@ -2876,20 +2882,20 @@ fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> 
 }
 
 /// The entries a budget omits from one conversation.
-struct OmittedEntries<'s, 'a> {
+struct OverBudgetEntries<'s, 'a> {
     first: &'s EntrySpan<'a>,
     runs: MessageRuns,
     flags: ContentVisibility,
 }
 
-impl<'s, 'a> OmittedEntries<'s, 'a> {
+impl<'s, 'a> OverBudgetEntries<'s, 'a> {
     fn add(&mut self, span: &'s EntrySpan<'a>) {
         self.runs.push(span.first, span.last);
         self.flags.merge(span.flags);
     }
 }
 
-/// An entry's conversation and messages: the `omit=` atom and the
+/// An entry's conversation and messages: the `over-budget=` atom and the
 /// `continue read` records name them when a budget omits the entry.
 #[derive(Clone, Debug)]
 struct EntrySpan<'a> {
@@ -2988,11 +2994,11 @@ impl HiddenEntriesRecipe<'_, '_> {
     }
 }
 
-/// The `omit=` atom: the refs reading exactly the messages of the entries
-/// not in `selected`, each run of consecutive omitted entries of one
-/// conversation named on its own, each ref after its conversation's when the
-/// read shows several.
-fn omitted_message_ranges(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> String {
+/// The `over-budget=` atom: the refs reading exactly the messages of the
+/// entries not in `selected`, each run of consecutive omitted entries of one
+/// conversation named on its own, each ref after its conversation's when
+/// the read shows several.
+fn over_budget_ranges(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> String {
     let qualify = spans
         .first()
         .is_some_and(|first| spans.iter().any(|span| span.full_ref != first.full_ref));
@@ -3360,13 +3366,13 @@ impl<'h, 'e> ReadPartSizes<'h, 'e> {
             &selected.iter().copied().collect::<Vec<_>>(),
             !truncated.is_empty(),
         );
-        let omitted = omitted_message_ranges(&self.spans, selected);
+        let omitted = over_budget_ranges(&self.spans, selected);
         let mut hidden = HiddenParts::default();
         for &index in selected {
             hidden.add(&self.hidden[index]);
         }
         let mut chars = format!(
-            "protocol agent-read cut={cut} chars={} omit={omitted}{header_atoms}{}\n",
+            "protocol agent-read cut={cut} chars={} over-budget={omitted}{header_atoms}{}\n",
             full_atom(&cut, full),
             hidden.total_atoms()
         )
@@ -3723,9 +3729,9 @@ mod tests {
             let selected_list = selected.iter().copied().collect::<Vec<_>>();
             let cut = read_cut(messages.len(), &selected_list, false);
             let header = format!(
-                "protocol agent-read cut={cut} chars={budget}{} omit={}\n",
+                "protocol agent-read cut={cut} chars={budget}{} over-budget={}\n",
                 full_atom(&cut, full),
-                omitted_message_ranges(&spans, selected)
+                over_budget_ranges(&spans, selected)
             );
             let records = written(messages, &selected_list);
             let continuation = continuation_records(&spans, selected).concat();
@@ -3967,7 +3973,7 @@ mod tests {
         .unwrap();
 
         assert!(output.starts_with(&format!(
-            "protocol agent-read cut=none chars=6000 policy=text omit=none{} hidden-tools=1 hidden-thinking=1\n",
+            "protocol agent-read cut=none chars=6000 policy=text over-budget=none{} hidden-tools=1 hidden-thinking=1\n",
             tz_now()
         )));
         assert!(output.contains("project=pr_"));
@@ -4052,7 +4058,7 @@ mod tests {
 
         assert!(output.starts_with("protocol agent-read cut="));
         assert!(output.lines().next().unwrap().contains("chars=800"));
-        assert!(output.lines().next().unwrap().contains("omit="));
+        assert!(output.lines().next().unwrap().contains("over-budget="));
         assert!(output.contains("\nm4 user\n"), "{output}");
         assert!(output.contains("message 4 with padding"));
     }
@@ -4083,7 +4089,7 @@ mod tests {
         .unwrap();
 
         assert!(output.starts_with(&format!(
-            "protocol agent-read cut=none chars=none policy=text omit=none{}\n",
+            "protocol agent-read cut=none chars=none policy=text over-budget=none{}\n",
             tz_now()
         )));
         assert!(output.contains("\nm1 user\n| one\n"), "{output}");
@@ -4265,7 +4271,7 @@ mod tests {
         let output = sliced(Some(400));
 
         assert!(output.starts_with(&format!(
-            "protocol agent-read cut=body chars=400{} policy=text omit=none{}\n",
+            "protocol agent-read cut=body chars=400{} policy=text over-budget=none{}\n",
             full_atom_printing(&sliced(None)),
             tz_now()
         )));
@@ -4274,7 +4280,7 @@ mod tests {
         assert!(
             output
                 .lines()
-                .any(|line| is_omitted_record(line) && line.ends_with("..20")),
+                .any(|line| is_over_budget_record(line) && line.ends_with("..20")),
             "{output}"
         );
     }
@@ -4425,7 +4431,7 @@ mod tests {
         assert!(output.contains("\nm2\n"), "{output}");
         assert!(
             output.contains(&format!(
-                "\nm2 omitted lines=1..1\nread ref={}:m2 lines=1..1 tools=false tool-results=false thinking=false subagents=false\n",
+                "\nm2 over-budget lines=1..1\nread ref={}:m2 lines=1..1 tools=false tool-results=false thinking=false subagents=false\n",
                 resolved.reference.canonical()
             )),
             "{output}"
@@ -4471,7 +4477,7 @@ mod tests {
         assert!(output.chars().count() <= 420);
         assert!(output.contains("\nm2\n"), "{output}");
         assert!(output.contains("\nm3\n"), "{output}");
-        assert!(output.contains("omit=m1,m4"));
+        assert!(output.contains("over-budget=m1,m4"));
     }
 
     #[test]
@@ -4711,12 +4717,12 @@ mod tests {
     }
 
     /// The address opening each message, call and hidden record of `output`:
-    /// `m7`, `m7.2` or `m7..m9`. A truncated message's `omitted` record is
+    /// `m7`, `m7.2` or `m7..m9`. A truncated message's `over-budget` record is
     /// left out.
     fn addresses(output: &str) -> Vec<&str> {
         records(output)
             .into_iter()
-            .filter(|record| !is_omitted_record(record))
+            .filter(|record| !is_over_budget_record(record))
             .filter_map(|record| record.split_whitespace().next())
             .filter(|address| {
                 let message = match address.split_once(':') {
@@ -4785,7 +4791,7 @@ mod tests {
         assert_eq!(
             records[0],
             format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{} hidden-tools=2 hidden-tool-results=2 hidden-thinking=1",
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none{} hidden-tools=2 hidden-tool-results=2 hidden-thinking=1",
                 tz_at("2026-10-14T15:41:28Z")
             )
         );
@@ -4968,7 +4974,7 @@ mod tests {
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=tail chars={budget}{} policy=text omit=m3..m5{}\n",
+                "protocol agent-read cut=tail chars={budget}{} policy=text over-budget=m3..m5{}\n",
                 full_atom_printing(&unbudgeted),
                 tz_now()
             )),
@@ -5028,9 +5034,9 @@ mod tests {
             output.starts_with("protocol agent-read cut=tail "),
             "{output}"
         );
-        assert!(output.contains(" omit=m2 "), "{output}");
+        assert!(output.contains(" over-budget=m2 "), "{output}");
         assert!(output.contains("| short answer\n"), "{output}");
-        assert!(!output.contains(OMISSION_MARKER), "{output}");
+        assert!(!output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
     /// From 15:40 to 15:45 UTC on 2026-10-14, both included.
@@ -5069,26 +5075,26 @@ mod tests {
 
         assert!(
             unbudgeted.starts_with(&format!(
-                "protocol agent-read cut=none chars=none policy=text omit=none{} messages-in-window=2\n",
+                "protocol agent-read cut=none chars=none policy=text over-budget=none{} messages-in-window=2\n",
                 tz_at(at)
             )),
             "{unbudgeted}"
         );
         assert!(output.chars().count() <= budget, "{output}");
-        assert!(output.contains(" omit=m2 "), "{output}");
+        assert!(output.contains(" over-budget=m2 "), "{output}");
         assert!(output.contains("| short answer\n"), "{output}");
-        assert!(!output.contains(OMISSION_MARKER), "{output}");
+        assert!(!output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
-    /// Part of a truncated message's `omitted` record.
-    const OMISSION_MARKER: &str = " omitted lines=";
+    /// Part of a truncated message's `over-budget` record.
+    const OVER_BUDGET_MARKER: &str = " over-budget lines=";
 
-    fn is_omitted_record(line: &str) -> bool {
-        !line.starts_with('|') && line.contains(OMISSION_MARKER)
+    fn is_over_budget_record(line: &str) -> bool {
+        !line.starts_with('|') && line.contains(OVER_BUDGET_MARKER)
     }
 
     /// The characters each truncated content of `output` keeps: the content
-    /// lines between a message's first record and its `omitted` record,
+    /// lines between a message's first record and its `over-budget` record,
     /// joined by line breaks. The lines below its call records count too,
     /// across a `day` record between them.
     fn kept_chars_of_truncations(output: &str) -> Vec<usize> {
@@ -5096,7 +5102,7 @@ mod tests {
         let mut content: Vec<&str> = Vec::new();
         let mut message = None;
         for line in output.lines() {
-            if is_omitted_record(line) {
+            if is_over_budget_record(line) {
                 kept.push(content.join("\n").chars().count());
             } else if let Some(text) = line.strip_prefix("| ").or((line == "|").then_some("")) {
                 content.push(text);
@@ -5138,14 +5144,14 @@ mod tests {
         assert!(output.chars().count() > budget - 40, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=body chars=1000{} policy=text omit=none{}\n",
+                "protocol agent-read cut=body chars=1000{} policy=text over-budget=none{}\n",
                 full_atom_printing(&unbudgeted),
                 tz_now()
             )),
             "{output}"
         );
         assert!(output.contains("| long output line\n"), "{output}");
-        assert!(output.contains(OMISSION_MARKER), "{output}");
+        assert!(output.contains(OVER_BUDGET_MARKER), "{output}");
         assert!(output.contains("| question three\n"), "{output}");
     }
 
@@ -5285,9 +5291,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.contains(" omit=m2..m3"), "{output}");
+        assert!(output.contains(" over-budget=m2..m3"), "{output}");
         assert!(output.contains("| the focused question\n"), "{output}");
-        assert!(!output.contains(OMISSION_MARKER), "{output}");
+        assert!(!output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
     /// m3 has no time and m6 falls after the window: both are outside it.
@@ -5340,7 +5346,7 @@ mod tests {
         let at = |utc| record_time(utc, utc);
         assert!(
             records[0].ends_with(&format!(
-                " omit=none{} messages-in-window=4 hidden-tools=2",
+                " over-budget=none{} messages-in-window=4 hidden-tools=2",
                 tz_at("2026-10-14T15:41:00Z")
             )),
             "{output}"
@@ -5400,7 +5406,7 @@ mod tests {
 
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=head+focus+tail chars=400{} policy=text omit=m1,m4{} hidden-tools=1 hidden-tool-results=1\n",
+                "protocol agent-read cut=head+focus+tail chars=400{} policy=text over-budget=m1,m4{} hidden-tools=1 hidden-tool-results=1\n",
                 full_atom_printing(&read_focused(None)),
                 tz_now()
             )),
@@ -5438,7 +5444,7 @@ mod tests {
 
         assert!(
             default.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{} hidden-subagent-messages=1\n",
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none{} hidden-subagent-messages=1\n",
                 tz_now()
             )),
             "{default}"
@@ -5449,7 +5455,7 @@ mod tests {
         );
         assert!(
             with_subagents.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text+subagents omit=none{} hidden-tools=1\n",
+                "protocol agent-read cut=none chars=6000 policy=text+subagents over-budget=none{} hidden-tools=1\n",
                 tz_now()
             )),
             "{with_subagents}"
@@ -5654,7 +5660,7 @@ mod tests {
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=head chars={budget}{} policy=text omit=m1..m3{}\n",
+                "protocol agent-read cut=head chars={budget}{} policy=text over-budget=m1..m3{}\n",
                 full_atom_printing(&unbudgeted),
                 tz_at("2026-10-14T15:44:00Z")
             )),
@@ -5693,7 +5699,7 @@ mod tests {
         assert!(output.chars().count() <= 1_000, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=body chars=1000{} policy=text omit=none{}\n",
+                "protocol agent-read cut=body chars=1000{} policy=text over-budget=none{}\n",
                 full_atom_printing(&unbudgeted),
                 tz_now()
             )),
@@ -5701,7 +5707,7 @@ mod tests {
         );
         assert!(output.contains("| run the tests\n"), "{output}");
         assert!(output.contains("| and show the output\n"), "{output}");
-        assert!(output.contains(OMISSION_MARKER), "{output}");
+        assert!(output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
     /// At the smallest budget that keeps a message, m2 truncated to its
@@ -5721,7 +5727,7 @@ mod tests {
 
         assert!(output.chars().count() <= budget, "{output}");
         assert_eq!(addresses(&output), ["m2"], "{output}");
-        assert!(output.contains(OMISSION_MARKER), "{output}");
+        assert!(output.contains(OVER_BUDGET_MARKER), "{output}");
         assert!(!output.contains("short reply"), "{output}");
     }
 
@@ -7500,10 +7506,10 @@ mod tests {
         transcript(vec![reply, text_message(2, User, "thanks")])
     }
 
-    /// The `omitted` and `read` records of m1 in `transcript`, read with
+    /// The `over-budget` and `read` records of m1 in `transcript`, read with
     /// `options` over `range`, its content truncated to its first `keep`
     /// characters.
-    fn omitted_records_keeping(
+    fn over_budget_records_keeping(
         transcript: &AgentTranscript,
         range: Option<MessageRange>,
         options: ProtocolOptions,
@@ -7542,7 +7548,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_record_names_omitted_lines_and_read_record_shows_them() {
+    fn over_budget_record_names_its_lines_and_read_record_shows_them() {
         let body = (1..=50)
             .map(|line| format!("line {line:02}"))
             .collect::<Vec<_>>()
@@ -7550,26 +7556,27 @@ mod tests {
         let transcript = transcript(vec![text_message(1, AgentMessageRole::Assistant, &body)]);
         let reference = resolved("session.jsonl").reference.canonical();
 
-        let after_ten_lines = omitted_records_keeping(&transcript, None, options(), 80);
-        let inside_the_eleventh = omitted_records_keeping(&transcript, None, options(), 83);
+        let after_ten_lines = over_budget_records_keeping(&transcript, None, options(), 80);
+        let inside_the_eleventh = over_budget_records_keeping(&transcript, None, options(), 83);
 
         let expected = format!(
-            "m1 omitted lines=11..50\nread ref={reference}:m1 lines=11..50 tools=false tool-results=false thinking=false subagents=false"
+            "m1 over-budget lines=11..50\nread ref={reference}:m1 lines=11..50 tools=false tool-results=false thinking=false subagents=false"
         );
         assert_eq!(after_ten_lines, expected);
         assert_eq!(inside_the_eleventh, expected);
     }
 
     #[test]
-    fn omitted_record_names_call_records_it_drops_and_its_read_repeats_flags() {
+    fn over_budget_record_names_call_records_it_drops_and_its_read_repeats_flags() {
         let reference = resolved("session.jsonl").reference.canonical();
 
-        let records = omitted_records_keeping(&a_command_of_three_lines(), None, every_flag(), 3);
+        let records =
+            over_budget_records_keeping(&a_command_of_three_lines(), None, every_flag(), 3);
 
         assert_eq!(
             records,
             format!(
-                "m1 omitted lines=1..5 calls=m1.1..2\nread ref={reference}:m1 lines=1..5 tools=true tool-results=true thinking=true subagents=true"
+                "m1 over-budget lines=1..5 calls=m1.1..2\nread ref={reference}:m1 lines=1..5 tools=true tool-results=true thinking=true subagents=true"
             )
         );
     }
@@ -7605,7 +7612,7 @@ mod tests {
     /// header of an edit; the one-message read the `read` record names shows
     /// every line of each.
     #[test]
-    fn omitted_record_numbers_lines_as_one_message_read_does() {
+    fn over_budget_record_numbers_lines_as_one_message_read_does() {
         let reference = resolved("session.jsonl").reference.canonical();
         let with_tools = ProtocolOptions {
             tools: true,
@@ -7619,21 +7626,26 @@ mod tests {
         ] {
             let intro_and_first_call = format!("intro\n{first_call}\n").chars().count();
 
-            let inside_first_call = omitted_records_keeping(&transcript, several, with_tools, 8);
-            let inside_second_call =
-                omitted_records_keeping(&transcript, several, with_tools, intro_and_first_call + 3);
+            let inside_first_call =
+                over_budget_records_keeping(&transcript, several, with_tools, 8);
+            let inside_second_call = over_budget_records_keeping(
+                &transcript,
+                several,
+                with_tools,
+                intro_and_first_call + 3,
+            );
             let reread = read_slice(&transcript, ReadSlice::Lines(line_range(5, 5)));
 
             assert_eq!(
                 inside_first_call,
                 format!(
-                    "m1 omitted lines=2..5 calls=m1.2\nread ref={reference}:m1 lines=2..5 {flags}"
+                    "m1 over-budget lines=2..5 calls=m1.2\nread ref={reference}:m1 lines=2..5 {flags}"
                 ),
                 "{first_call}"
             );
             assert_eq!(
                 inside_second_call,
-                format!("m1 omitted lines=5..5\nread ref={reference}:m1 lines=5..5 {flags}"),
+                format!("m1 over-budget lines=5..5\nread ref={reference}:m1 lines=5..5 {flags}"),
                 "{first_call}"
             );
             assert!(
@@ -7666,10 +7678,10 @@ mod tests {
         }
     }
 
-    /// The omitted records follow the last line the truncation keeps, below
-    /// the call record it belongs to.
+    /// The `over-budget` and `read` records follow the last line the
+    /// truncation keeps, below the call record it belongs to.
     #[test]
-    fn omitted_records_follow_last_kept_line_of_call() {
+    fn over_budget_records_follow_last_kept_line_of_call() {
         let transcript = a_command_of_three_lines();
         let with_tools = ProtocolOptions {
             tools: true,
@@ -7694,7 +7706,7 @@ mod tests {
         let output = writer.into_output();
         assert!(
             output.starts_with(
-                "m1\n| intro\nm1.1\n| Ba\nm1 omitted lines=2..5 calls=m1.2\nread ref="
+                "m1\n| intro\nm1.1\n| Ba\nm1 over-budget lines=2..5 calls=m1.2\nread ref="
             ),
             "{output}"
         );
@@ -8258,7 +8270,7 @@ mod tests {
 
         let output = read(&replies(&|_| "ok".to_owned()), None, with_budget(full_size));
 
-        assert!(output.contains(" omit=none"), "{output}");
+        assert!(output.contains(" over-budget=none"), "{output}");
         assert_eq!(output.matches("\n| ok\n").count(), 30, "{output}");
     }
 
@@ -8279,7 +8291,7 @@ mod tests {
 
         assert!(whole.contains("\nm3 same=m1\n"), "{whole}");
         assert_eq!(addresses(&truncated), ["m1", "m2", "m3"], "{truncated}");
-        assert!(truncated.contains(OMISSION_MARKER), "{truncated}");
+        assert!(truncated.contains(OVER_BUDGET_MARKER), "{truncated}");
         assert!(
             truncated.ends_with(&format!("\nm3\n| {body}\n")),
             "{truncated}"
@@ -8311,8 +8323,8 @@ mod tests {
 
         assert!(identical_read.contains(" same=m1\n"), "{identical_read}");
         assert_eq!(
-            header_atom(&identical_read, "omit"),
-            header_atom(&distinct_read, "omit")
+            header_atom(&identical_read, "over-budget"),
+            header_atom(&distinct_read, "over-budget")
         );
         assert!(identical_read.chars().count() < distinct_read.chars().count());
     }
@@ -8361,7 +8373,7 @@ mod tests {
 
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{}\n",
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none{}\n",
                 tz_at("2026-10-14T12:00:00Z")
             )),
             "{output}"
@@ -8918,15 +8930,15 @@ mod tests {
             &reply_back_on_the_first_date(),
             None,
             ProtocolOptions {
-                budget: Some(839),
+                budget: Some(850),
                 tools: true,
                 ..options()
             },
         );
 
-        assert!(output.chars().count() <= 839, "{output}");
+        assert!(output.chars().count() <= 850, "{output}");
         assert!(
-            output.contains(OMISSION_MARKER),
+            output.contains(OVER_BUDGET_MARKER),
             "m1 is truncated: {output}"
         );
         assert!(
@@ -8938,12 +8950,12 @@ mod tests {
 
     #[test]
     fn floor_holding_records_on_both_sides_of_midnight_is_kept_beside_next_days_reply() {
-        assert_m1_keeps_its_floor_beside_m2(&floor_across_midnight(), 672);
+        assert_m1_keeps_its_floor_beside_m2(&floor_across_midnight(), 683);
     }
 
     #[test]
     fn floor_ending_before_midnight_is_kept_beside_next_days_reply() {
-        assert_m1_keeps_its_floor_beside_m2(&floor_before_midnight(), 636);
+        assert_m1_keeps_its_floor_beside_m2(&floor_before_midnight(), 647);
     }
 
     /// Asserts that `budget` is the smallest budget showing m2 in the read of
@@ -9010,7 +9022,7 @@ mod tests {
 
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{}\n",
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none{}\n",
                 tz_at(WINTER)
             )),
             "{output}"
@@ -9056,7 +9068,7 @@ mod tests {
 
         let records = records(&output);
         assert!(
-            records[0].ends_with(&format!(" omit=none{}", tz_at(WINTER))),
+            records[0].ends_with(&format!(" over-budget=none{}", tz_at(WINTER))),
             "{output}"
         );
         assert_eq!(records[2], day_record(WINTER), "{output}");
@@ -9843,7 +9855,7 @@ mod tests {
     /// m1 holds text, a command of two lines and a long command of one line,
     /// m1.2: lines 1 to 4 of a read of m1.
     #[test]
-    fn truncated_call_read_names_its_omitted_lines_as_read_of_its_message_numbers_them() {
+    fn truncated_call_read_names_its_over_budget_lines_as_read_of_its_message_numbers_them() {
         use AgentMessageRole::{Assistant, User};
         let long_command = format!("cargo clippy {}", "--warn unused ".repeat(60));
         let mut reply = text_message(1, Assistant, "Running the checks.");
@@ -9887,7 +9899,7 @@ mod tests {
         let reference = resolved.reference.canonical();
         assert!(
             truncated.contains(&format!(
-                "\nm1 omitted lines=4..4\nread ref={reference}:m1 lines=4..4 {flags}\n"
+                "\nm1 over-budget lines=4..4\nread ref={reference}:m1 lines=4..4 {flags}\n"
             )),
             "{truncated}"
         );

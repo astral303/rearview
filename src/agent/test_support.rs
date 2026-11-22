@@ -293,7 +293,7 @@ pub struct PositionalRecord<'a> {
     /// The handle its address opens with, `s326`, of the sub-agent whose
     /// messages the record holds.
     pub subagent: Option<&'a str>,
-    /// `user`, `report`, `result`, `hidden` or `omitted`, after the address
+    /// `user`, `report`, `result`, `hidden` or `over-budget`, after the address
     /// and any handles.
     pub word: Option<&'a str>,
     /// The time in position, completed with the date of the `day` record
@@ -331,7 +331,7 @@ impl Grammar {
             (Self::Read, RecordKind::Call) => Some(CALL),
             (Self::Read, RecordKind::CallResult) => Some(CALL_RESULT),
             (Self::Read, RecordKind::Hidden) => Some(HIDDEN),
-            (Self::Read, RecordKind::Omitted) => Some(OMITTED),
+            (Self::Read, RecordKind::OverBudget) => Some(OVER_BUDGET),
             (Self::Outline, RecordKind::Message) => Some(OUTLINE_MESSAGE),
             (Self::Outline, _) => None,
         }
@@ -380,7 +380,7 @@ const READ_HEADER: &[OrderedAtom] = &[
     optional("full", is_digits),
     required("policy", is_policy),
     optional("last", is_message_list),
-    required("omit", is_omitted_runs),
+    required("over-budget", is_over_budget_runs),
     required("tz", is_offset),
     optional("messages-in-window", is_digits),
     optional("subagent-messages-in-window", is_digits),
@@ -442,7 +442,7 @@ const CONTINUE_READ: &[OrderedAtom] = &[
 ];
 
 /// A `read` record of one run of messages, with the lines a truncation
-/// omitted when it follows an `omitted` record.
+/// omitted when it follows an `over-budget` record.
 const READ_ONE_RUN: &[OrderedAtom] = &[
     required("ref", is_message_run),
     optional("lines", is_line_range),
@@ -507,8 +507,8 @@ const HIDDEN: &[OrderedAtom] = &[
 ];
 
 /// The record of what a truncation left out of a message:
-/// `m1006 omitted lines=41..230 calls=m1006.4..15`.
-const OMITTED: &[OrderedAtom] = &[
+/// `m1006 over-budget lines=41..230 calls=m1006.4..15`.
+const OVER_BUDGET: &[OrderedAtom] = &[
     required("lines", is_line_range),
     optional("calls", is_call_list),
 ];
@@ -1010,10 +1010,10 @@ fn is_message_runs(value: &str) -> bool {
     value.split(';').all(is_message_run)
 }
 
-/// True for `none`, or a header's omitted runs separated by commas, each
-/// qualified with its conversation when the read holds several:
+/// True for `none`, or a header's over-budget runs separated by commas,
+/// each qualified with its conversation when the read contains several:
 /// `m3..m5,m9` or `ch_…:m3..m5,ch_…:m9`.
-fn is_omitted_runs(value: &str) -> bool {
+fn is_over_budget_runs(value: &str) -> bool {
     value == "none"
         || value
             .split(',')
@@ -1077,8 +1077,8 @@ enum RecordKind {
     CallResult,
     /// `m7 hidden` or `m7..m9 hidden`.
     Hidden,
-    /// `m7 omitted`.
-    Omitted,
+    /// `m7 over-budget`.
+    OverBudget,
 }
 
 impl RecordKind {
@@ -1089,7 +1089,7 @@ impl RecordKind {
                 Some(Self::Message)
             }
             (AddressKind::Message | AddressKind::Run, Some("hidden")) => Some(Self::Hidden),
-            (AddressKind::Message, Some("omitted")) => Some(Self::Omitted),
+            (AddressKind::Message, Some("over-budget")) => Some(Self::OverBudget),
             (AddressKind::Call, None) => Some(Self::Call),
             (AddressKind::Call, Some("result")) => Some(Self::CallResult),
             _ => None,
@@ -1224,7 +1224,7 @@ pub fn agent_command(args: &[&str]) -> crate::cli::AgentCommand {
 mod tests {
     use super::*;
 
-    const HEADER: &str = "protocol agent-read cut=none chars=none policy=text omit=none tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-10-14\n";
+    const HEADER: &str = "protocol agent-read cut=none chars=none policy=text over-budget=none tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-10-14\n";
     const OUTLINE_HEADER: &str = "protocol agent-outline cut=none chars=none policy=text messages=30 tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-10-14\n";
 
     #[test]
@@ -1252,9 +1252,9 @@ mod tests {
     }
 
     #[test]
-    fn truncated_messages_omitted_record_parses_and_its_read_record_is_not_content() {
+    fn truncated_messages_over_budget_record_parses_and_its_read_record_is_not_content() {
         let output = format!(
-            "{HEADER}m1 11:41:25\n| first line\nm1 omitted lines=2..9 calls=m1.1\nread ref=ch_0:m1 lines=2..9 tools=true tool-results=false thinking=false subagents=false\n"
+            "{HEADER}m1 11:41:25\n| first line\nm1 over-budget lines=2..9 calls=m1.1\nread ref=ch_0:m1 lines=2..9 tools=true tool-results=false thinking=false subagents=false\n"
         );
 
         let records = read_records(&output);
@@ -1267,7 +1267,7 @@ mod tests {
                 records[1].atom("lines"),
                 records[1].atom("calls")
             ),
-            (Some("omitted"), Some("2..9"), Some("m1.1"))
+            (Some("over-budget"), Some("2..9"), Some("m1.1"))
         );
         assert!(records[1].content.is_empty());
     }
@@ -1278,7 +1278,7 @@ mod tests {
 
     #[test]
     fn spans_end_in_another_offset_parses_as_instant_it_shows() {
-        let output = "protocol agent-read cut=none chars=none policy=text omit=none tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-11-01\nm1 01:50:00..2026-11-01T01:10:00-05:00\n| first line\n";
+        let output = "protocol agent-read cut=none chars=none policy=text over-budget=none tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-11-01\nm1 01:50:00..2026-11-01T01:10:00-05:00\n| first line\n";
 
         let records = read_records(output);
 
@@ -1295,7 +1295,7 @@ mod tests {
     /// wall-clock time is earlier than m1's.
     #[test]
     fn reads_first_and_last_time_are_its_earliest_and_latest_instants_across_offset_change() {
-        let output = "protocol agent-read cut=none chars=none policy=text omit=none tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-11-01\nm1 01:50:00\n| before\nday 2026-11-01 tz=-05:00\nm2 01:10:00\n| after\n";
+        let output = "protocol agent-read cut=none chars=none policy=text over-budget=none tz=-04:00\nconversation project=pr_0 uuid=u ref=ch_0\nday 2026-11-01\nm1 01:50:00\n| before\nday 2026-11-01 tz=-05:00\nm2 01:10:00\n| after\n";
 
         assert_eq!(
             read_times(output),
@@ -1352,7 +1352,7 @@ mod tests {
     #[test]
     fn read_of_every_record_kind_parses() {
         let output = concat!(
-            "protocol agent-read cut=body+tail chars=900 policy=text+tools+subagents omit=m9,s1:m6 tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1\n",
+            "protocol agent-read cut=body+tail chars=900 policy=text+tools+subagents over-budget=m9,s1:m6 tz=-04:00 hidden-tool-results=2 warnings=1 warning-records=1\n",
             "conversation project=pr_0 uuid=u ref=ch_0a1\n",
             "subagent s1 type=Explore launch=m2 span=s1:m1..m3 report=m3 : scout\n",
             "day 2026-11-01\n",
@@ -1483,7 +1483,7 @@ mod tests {
     #[should_panic(expected = "a protocol record that does not parse")]
     fn header_with_token_after_its_atoms_doesnt_parse() {
         read_records(
-            "protocol agent-read cut=none chars=none policy=text omit=none tz=-04:00 bogus\n",
+            "protocol agent-read cut=none chars=none policy=text over-budget=none tz=-04:00 bogus\n",
         );
     }
 

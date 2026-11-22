@@ -105,7 +105,7 @@ Read and outline records:
   and `report=`.
 - `launches=s3`, `target=s3` and `from=s3` mark s3's launch, a call sending
   to it and its report.
-- A truncated message prints `m7 omitted lines=4..9 calls=m7.2..3` and a
+- A truncated message prints `m7 over-budget lines=4..9 calls=m7.2..3` and a
   `read` record showing them.
 
 A grouped result looks like:

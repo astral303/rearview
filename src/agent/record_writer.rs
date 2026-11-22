@@ -102,9 +102,9 @@ pub struct HiddenRecord<'r> {
 
 /// The fields of the records naming what a truncation leaves out of a
 /// message's content, and the read that shows it:
-/// `m1006 omitted lines=41..230 calls=m1006.4..15`, then
+/// `m1006 over-budget lines=41..230 calls=m1006.4..15`, then
 /// `read ref=ch_…:m1006 lines=41..230 tools=true tool-results=false …`.
-pub struct OmittedRecord<'r> {
+pub struct OverBudgetRecord<'r> {
     pub ordinal: usize,
     /// The `ref=` of the message's conversation.
     pub reference: &'r str,
@@ -288,12 +288,12 @@ impl<'e> RecordWriter<'e> {
     /// Write the record naming what a truncation leaves out of a message's
     /// content, then the `read` record showing it. `lines=` on the `read`
     /// record maps to `--lines`.
-    pub fn write_omitted_records(&mut self, record: &OmittedRecord<'_>) {
+    pub fn write_over_budget_records(&mut self, record: &OverBudgetRecord<'_>) {
         let addresses = self.addresses();
         let lines = format!("{}..{}", record.first_line, record.last_line);
         let message = addresses.message(record.ordinal);
         self.output.push_str(&format!(
-            "{message} omitted lines={lines}{}\n",
+            "{message} over-budget lines={lines}{}\n",
             calls_atom(addresses, record.dropped_calls)
         ));
         self.output.push_str(&format!(
