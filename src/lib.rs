@@ -2211,7 +2211,7 @@ mod agent_command_tests {
 
         assert!(
             line_starting(&read, "protocol agent-read ")
-                .ends_with(" hidden-tools=2 hidden-tool-results=2 hidden-subagents=1"),
+                .ends_with(" hidden-tools=2 hidden-tool-results=2 hidden-subagent-messages=1"),
             "{read}"
         );
         assert_eq!(
@@ -2232,7 +2232,7 @@ mod agent_command_tests {
         assert_eq!(
             record_of(&read, "s1:m1"),
             format!(
-                "s1:m1 hidden{} subagents=1",
+                "s1:m1 hidden{} subagent-messages=1",
                 record_time("2026-10-14T15:42:00Z", "2026-10-14T15:42:00Z")
             )
         );

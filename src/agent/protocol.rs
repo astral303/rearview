@@ -5438,12 +5438,15 @@ mod tests {
 
         assert!(
             default.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{} hidden-subagents=1\n",
+                "protocol agent-read cut=none chars=6000 policy=text omit=none{} hidden-subagent-messages=1\n",
                 tz_now()
             )),
             "{default}"
         );
-        assert!(default.contains("\nm2 hidden subagents=1\n"), "{default}");
+        assert!(
+            default.contains("\nm2 hidden subagent-messages=1\n"),
+            "{default}"
+        );
         assert!(
             with_subagents.starts_with(&format!(
                 "protocol agent-read cut=none chars=6000 policy=text+subagents omit=none{} hidden-tools=1\n",
@@ -6714,7 +6717,7 @@ mod tests {
                 SCOUT_LEGEND,
                 "m1 user",
                 "m2 hidden launches=s1 tools=1",
-                "s1:m1..m3 hidden subagents=3",
+                "s1:m1..m3 hidden subagent-messages=3",
                 "m3 hidden target=s1 tools=1",
                 "m4 report from=s1",
                 "m5",
@@ -6734,7 +6737,7 @@ mod tests {
 
         assert!(
             output.ends_with(&format!(
-                "\ns1:m1..m3 hidden subagents=3\nread ref={}:s1:m1..m3 tools=true tool-results=true thinking=false subagents=true\n",
+                "\ns1:m1..m3 hidden subagent-messages=3\nread ref={}:s1:m1..m3 tools=true tool-results=true thinking=false subagents=true\n",
                 resolved("session.jsonl").reference.canonical()
             )),
             "{output}"

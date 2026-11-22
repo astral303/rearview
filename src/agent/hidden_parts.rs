@@ -79,13 +79,15 @@ impl<'a> HiddenParts<'a> {
         atoms
     }
 
-    /// Each kind and its count, in the order of the `policy=` atom.
+    /// Each kind and its count, in the order of the `policy=` atom. Hidden
+    /// sub-agent messages count as `subagent-messages`: `subagents=` counts
+    /// sub-agents.
     fn counts(&self) -> [(&'static str, usize); 4] {
         [
             ("tools", self.tool_names.len()),
             ("tool-results", self.tool_results),
             ("thinking", self.thinking),
-            ("subagents", self.subagent_messages),
+            ("subagent-messages", self.subagent_messages),
         ]
     }
 }
@@ -171,8 +173,11 @@ mod tests {
 
         assert_eq!(
             total.total_atoms(),
-            " hidden-tools=2 hidden-tool-results=1 hidden-subagents=1"
+            " hidden-tools=2 hidden-tool-results=1 hidden-subagent-messages=1"
         );
-        assert_eq!(total.count_atoms(), " tools=2 tool-results=1 subagents=1");
+        assert_eq!(
+            total.count_atoms(),
+            " tools=2 tool-results=1 subagent-messages=1"
+        );
     }
 }

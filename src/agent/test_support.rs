@@ -387,7 +387,7 @@ const READ_HEADER: &[OrderedAtom] = &[
     optional("hidden-tools", is_digits),
     optional("hidden-tool-results", is_digits),
     optional("hidden-thinking", is_digits),
-    optional("hidden-subagents", is_digits),
+    optional("hidden-subagent-messages", is_digits),
     optional("warnings", is_digits),
     optional("warning-records", is_digits),
 ];
@@ -502,7 +502,7 @@ const HIDDEN: &[OrderedAtom] = &[
     optional("tools", is_digits),
     optional("tool-results", is_digits),
     optional("thinking", is_digits),
-    optional("subagents", is_digits),
+    optional("subagent-messages", is_digits),
     optional("calls", is_call_list),
 ];
 
