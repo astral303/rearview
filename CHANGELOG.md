@@ -403,9 +403,16 @@
 - A search hit and its `read` recipe now print the hit as `hit=m8`, and
   `agent read` takes it as `--hit m8`. Before, they were `focus=m8` and
   `--focus m8`. A read truncated around the hit prints `cut=head+hit+tail`.
-- `agent read` now names the messages its budget left out `over-budget=` in
-  the header, and a truncated message's lines `m7 over-budget lines=4..9`.
-  Before, they were `omit=` and `m7 omitted lines=4..9`.
+- `agent read`, `agent outline`, `agent search` and `agent within` now name
+  what their budget left out `over-budget`. Before, the word was `omit` or
+  `omitted`:
+  - `agent read` prints `over-budget=` in the header and
+    `m7 over-budget lines=4..9` for a truncated message. Before, they were
+    `omit=` and `m7 omitted lines=4..9`.
+  - A truncated `agent outline` header prints `over-budget-records=`.
+    Before, it was `omitted-records=`.
+  - A truncated `agent search` or `agent within` header prints
+    `over-budget-lines=`. Before, it was `omitted-lines=`.
 - The first run after upgrading parses every session once to build the new
   session cache, then removes the old cache's files. It takes about 1.9x as
   long as a first run did before, with about 3.4x less memory (on one example

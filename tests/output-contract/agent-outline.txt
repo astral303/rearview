@@ -194,7 +194,7 @@ seg m10..m19 chars=291 at=2026-01-01T22:04:19 to=2026-01-01T22:04:28 | [note] / 
 seg m20..m23 chars=111 at=2026-01-01T22:04:29 to=2026-01-01T22:04:32 | The release steps are dated. / IMAGE_RESULT_SENTINEL: the window [Image: image/png]
 $ rearview agent outline ch_974c3840e189 --budget 500
 --- stdout
-protocol agent-outline cut=tail chars=500 full=946 policy=text messages=23 subagents=1 subagent-messages=2 at=2026-01-01T22:04:06 to=2026-01-01T22:04:32 tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2 omitted-records=12 warnings=0 warning-records=0
+protocol agent-outline cut=tail chars=500 full=946 policy=text messages=23 subagents=1 subagent-messages=2 at=2026-01-01T22:04:06 to=2026-01-01T22:04:32 tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2 over-budget-records=12 warnings=0 warning-records=0
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 continue read refs=ch_974c3840e189:m1..m21 tools=false tool-results=false thinking=false subagents=false
 $ rearview agent outline ch_974c3840e189:m2..m5
@@ -232,7 +232,7 @@ seg m8..m18 chars=388 at=2025-08-12T08:05:00 to=2025-08-12T08:05:50 | list: /tmp
 seg m19..m20 chars=90 at=2025-08-12T08:05:00 | tool context7_resolve-library-id input_keys=libraryName (+3 lines) / Resolved /example/parser
 $ rearview agent outline ch_efbbec792ccc --budget 500
 --- stdout
-protocol agent-outline cut=tail chars=500 full=618 policy=text messages=20 subagents=1 subagent-messages=3 at=2025-08-12T08:01:40 to=2025-08-12T08:05:50 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 omitted-records=4 warnings=0 warning-records=0
+protocol agent-outline cut=tail chars=500 full=618 policy=text messages=20 subagents=1 subagent-messages=3 at=2025-08-12T08:01:40 to=2025-08-12T08:05:50 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 over-budget-records=4 warnings=0 warning-records=0
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 continue read refs=ch_efbbec792ccc:m1..m15 tools=false tool-results=false thinking=false subagents=false
 $ rearview agent outline ch_efbbec792ccc:m2..m5
@@ -282,7 +282,7 @@ m18 19:20:02 call=m17.1 tool=edit chars=46 | Successfully replaced 1 block(s) in
 m19 19:20:03 chars=28 | The release steps are dated.
 $ rearview agent outline ch_f04d3718e406 --budget 500
 --- stdout
-protocol agent-outline cut=tail chars=500 full=801 policy=text messages=19 at=2024-02-29T19:01:00 to=2024-02-29T19:20:03 tz=-05:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1 omitted-records=9 warnings=0 warning-records=0
+protocol agent-outline cut=tail chars=500 full=801 policy=text messages=19 at=2024-02-29T19:01:00 to=2024-02-29T19:20:03 tz=-05:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1 over-budget-records=9 warnings=0 warning-records=0
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 continue read refs=ch_f04d3718e406:m1..m19 tools=false tool-results=false thinking=false subagents=false
 $ rearview agent outline ch_f04d3718e406:m2..m5
@@ -317,10 +317,8 @@ seg m1..m7 s1 chars=316 at=1969-12-31T19:00:01 | active grok question / a.rs b.r
 seg m8..m18 chars=392 at=1969-12-31T19:00:01 to=1969-12-31T19:00:02 | run_terminal_command: cat notes.txt / Show the window
 seg m19..m20 chars=72 at=1969-12-31T19:00:02 | read_file: /tmp/grok-project/IMAGE_RESULT_SENTINEL.png / [Image: image/png]
 $ rearview agent outline ch_982349c13ee4 --budget 500
---- stdout
-protocol agent-outline cut=tail chars=500 full=622 policy=text messages=20 subagents=1 subagent-messages=3 at=1969-12-31T19:00:01 to=1969-12-31T19:00:02 tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 omitted-records=5 warnings=0 warning-records=0
-conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
-continue read refs=ch_982349c13ee4:m1..m18 tools=false tool-results=false thinking=false subagents=false
+--- stderr, exit 1
+protocol agent-error kind=budget-too-small detail=output%20budget%20cannot%20fit%20a%20complete%20compact%20record%3B%20increase%20--budget
 $ rearview agent outline ch_982349c13ee4:m2..m6
 --- stdout
 protocol agent-outline cut=none chars=20000 policy=text messages=20 subagents=1 subagent-messages=3 at=1969-12-31T19:00:01 to=1969-12-31T19:00:02 tz=-05:00 hidden-tools=2 hidden-tool-results=1 hidden-thinking=1

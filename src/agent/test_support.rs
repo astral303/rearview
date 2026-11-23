@@ -419,7 +419,7 @@ const OUTLINE_HEADER: &[OrderedAtom] = &[
     optional("hidden-tool-results", is_digits),
     optional("hidden-thinking", is_digits),
     optional("hidden-subagent-messages", is_digits),
-    optional("omitted-records", is_digits),
+    optional("over-budget-records", is_digits),
     optional("warnings", is_digits),
     optional("warning-records", is_digits),
 ];

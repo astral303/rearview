@@ -1652,9 +1652,9 @@ fn truncated_outline(
     } = header;
     let warning_record_count = warning_records.len();
     let keeping = |keep: usize| {
-        let omitted = records.len() - keep;
+        let over_budget_records = records.len() - keep;
         let mut truncated = format!(
-            "protocol agent-outline cut=tail chars={budget}{} {header_fields} omitted-records={omitted} warnings={warning_count} warning-records={warning_record_count}\n",
+            "protocol agent-outline cut=tail chars={budget}{} {header_fields} over-budget-records={over_budget_records} warnings={warning_count} warning-records={warning_record_count}\n",
             full_atom("tail", Some(full))
         );
         truncated.push_str(&conversation);
@@ -6208,7 +6208,7 @@ mod tests {
             "{output}"
         );
         assert!(header.contains(" messages=2000 at="), "{output}");
-        assert!(header.contains(" omitted-records=1 "), "{output}");
+        assert!(header.contains(" over-budget-records=1 "), "{output}");
         assert!(!output.contains("\nseg "), "{output}");
         assert!(
             output.ends_with(&format!(
@@ -6283,7 +6283,7 @@ mod tests {
             "{output}"
         );
         assert!(
-            header.ends_with(" omitted-records=1 warnings=1 warning-records=1"),
+            header.ends_with(" over-budget-records=1 warnings=1 warning-records=1"),
             "{output}"
         );
         assert!(one_segment.starts_with("seg m1..m2000 "), "{one_segment}");

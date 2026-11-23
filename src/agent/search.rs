@@ -500,8 +500,8 @@ fn bound_agent_output(
         rendered_chars - decimal_digits(header_budget) + warning_chars(warning_records),
     );
     let lines = rendered.lines().collect::<Vec<_>>();
-    let truncated_header = |omitted_lines: usize| {
-        header("tail", Some(full)) + &format!(" omitted-lines={omitted_lines}\n")
+    let truncated_header = |over_budget_lines: usize| {
+        header("tail", Some(full)) + &format!(" over-budget-lines={over_budget_lines}\n")
     };
     let mut records = Vec::new();
     let mut index = 1;
@@ -523,13 +523,13 @@ fn bound_agent_output(
         "continue search action=narrow-scope-or-increase-budget\n".to_string()
     };
     while !records.is_empty() {
-        let omitted = lines.len().saturating_sub(
+        let over_budget_lines = lines.len().saturating_sub(
             1 + records
                 .iter()
                 .map(|record| record.lines().count())
                 .sum::<usize>(),
         );
-        let candidate = truncated_header(omitted) + &records.concat() + &recovery;
+        let candidate = truncated_header(over_budget_lines) + &records.concat() + &recovery;
         if candidate.chars().count() <= budget {
             return with_warnings(candidate);
         }
@@ -2997,7 +2997,7 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains(" policy=per-hit "), "{rendered}");
-        assert!(rendered.contains("omitted-lines="));
+        assert!(rendered.contains("over-budget-lines="));
         assert_eq!(
             rendered
                 .lines()
