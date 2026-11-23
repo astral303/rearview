@@ -2370,7 +2370,7 @@ items: [{"text":"Map the cache.","type":"text"}]"#
             AgentRetrievalOptions::default(),
         )
         .iter()
-        .map(|hit| hit.focus_range.start)
+        .map(|hit| hit.hit_range.start)
         .collect()
     }
 

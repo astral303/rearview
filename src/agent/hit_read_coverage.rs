@@ -276,8 +276,8 @@ fn hit_messages_hold_every_message_retrieval_finds_for_every_agent() {
     );
 }
 
-/// A semantic hit's anchors, times and `read` flags come from its focus
-/// messages read alone; each must be the message a whole read holds.
+/// A semantic hit's anchors, times and `read` flags come from its messages
+/// read alone; each must be the message a whole read contains.
 #[test]
 fn messages_read_alone_are_the_whole_transcripts_messages_for_every_agent() {
     let base = tempfile::tempdir().unwrap();
@@ -646,7 +646,7 @@ fn retrieved_messages(
         },
     )
     .into_iter()
-    .map(|hit| hit.focus_range.start)
+    .map(|hit| hit.hit_range.start)
     .collect()
 }
 

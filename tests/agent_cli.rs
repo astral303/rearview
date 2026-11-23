@@ -1549,6 +1549,61 @@ fn assert_shows_user_question_and_agent_answer(output: &str) {
     );
 }
 
+/// The session is the question `context needle`, m1, and its answer, m2.
+#[test]
+fn search_and_within_hit_recipe_covers_context_flags_messages() {
+    let config = tempfile::tempdir().expect("config");
+    write_transcript(
+        &project(config.path()).join("12345678-1234-4234-9234-123456789abc.jsonl"),
+        "context needle",
+    );
+    let recipe = |command: &[&str]| {
+        let output = stdout_of(&run(config.path(), command));
+        output
+            .lines()
+            .find(|line| line.starts_with("read ref="))
+            .unwrap_or_else(|| panic!("a hit prints a recipe: {output}"))
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let search = |flags: &[&str]| {
+        let mut command = vec!["agent", "search", "--lexical", "context needle"];
+        command.extend_from_slice(flags);
+        recipe(&command)
+    };
+    let reference = first_ref(&stdout_of(&run(
+        config.path(),
+        &["agent", "search", "--lexical", "context needle"],
+    )));
+
+    assert_eq!(
+        search(&[]),
+        format!("read ref={reference}:m1..m2 hit=m1"),
+        "one message after the hit by default"
+    );
+    assert_eq!(
+        search(&["-A", "0"]),
+        format!("read ref={reference}:m1 hit=m1")
+    );
+    assert_eq!(
+        recipe(&[
+            "agent",
+            "within",
+            &reference,
+            "context needle",
+            "--lexical",
+            "--before-context",
+            "3",
+            "--after-context",
+            "0",
+        ]),
+        format!("read ref={reference}:m1 hit=m1"),
+        "the session's first message ends the context before the hit"
+    );
+}
+
 /// Writes a session under `config` and returns its ref. The transcript is
 /// the question `partial transcript needle`, a malformed line, then the
 /// answer.
@@ -1576,7 +1631,7 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
         config.path(),
         &["agent", "search", "--lexical", "partial transcript needle"],
     ));
-    assert_shows(&search_stdout, "focus=m1 ");
+    assert_shows(&search_stdout, "hit=m1 ");
     assert_shows(&search_stdout, "kind=malformed-transcript");
 
     let within_text = stdout_of(&run(
@@ -1589,7 +1644,7 @@ fn selected_partial_transcript_recovers_records_and_reports_warning() {
             "--lexical",
         ],
     ));
-    assert_shows(&within_text, "focus=m1 ");
+    assert_shows(&within_text, "hit=m1 ");
 
     let read_text = stdout_of(&run(
         config.path(),
@@ -1939,7 +1994,7 @@ fn pi_session_id_file_name_or_path_resolves_where_its_handle_does() {
             "agent",
             "read",
             &format!("{identity}:m1..m2"),
-            "--focus",
+            "--hit",
             &format!("{uuid}:m1"),
         ]);
         assert_shows(&read, "active root question");
@@ -1996,7 +2051,7 @@ fn session_id_two_sessions_carry_is_ambiguous_with_handles_to_retry() {
 }
 
 #[test]
-fn session_id_focus_keeps_what_handle_focus_keeps_across_conversations() {
+fn session_id_hit_keeps_what_handle_hit_keeps_across_conversations() {
     let config = tempfile::tempdir().expect("config");
     let dir = project(config.path());
     let first = "12345678-1234-4234-9234-123456789abc";
@@ -2012,21 +2067,21 @@ fn session_id_focus_keeps_what_handle_focus_keeps_across_conversations() {
         &["agent", "outline", second],
     )));
 
-    let reads = [format!("{second}:m1"), format!("{handle}:m1")].map(|focus| {
+    let reads = [format!("{second}:m1"), format!("{handle}:m1")].map(|hit| {
         stdout_of(&run(
             config.path(),
             &[
-                "agent", "read", first, second, "--focus", &focus, "--budget", "1200",
+                "agent", "read", first, second, "--hit", &hit, "--budget", "1200",
             ],
         ))
     });
-    let unfocused = stdout_of(&run(
+    let without_hit = stdout_of(&run(
         config.path(),
         &["agent", "read", first, second, "--budget", "1200"],
     ));
 
     assert_eq!(reads[0], reads[1]);
-    assert_ne!(reads[0], unfocused);
+    assert_ne!(reads[0], without_hit);
 }
 
 #[test]

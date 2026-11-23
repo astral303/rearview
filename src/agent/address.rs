@@ -400,11 +400,46 @@ struct HitPlace {
     group: usize,
 }
 
-/// A search hit's `focus=` and the range its `read ref=` recipe reads.
+/// A search hit's `hit=` and the length of its thread. The range its
+/// `read ref=` recipe reads ends at that length at the latest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HitAddresses {
-    pub focus: ThreadRange,
-    pub read: ThreadRange,
+    pub hit: ThreadRange,
+    pub thread_length: usize,
+}
+
+impl HitAddresses {
+    /// The range the hit's `read ref=` recipe reads: the hit and `context`'s
+    /// messages of its thread before and after it, shortened at the
+    /// thread's ends.
+    pub fn recipe_range(&self, context: HitContext) -> ThreadRange {
+        let first = self.hit.first;
+        let last = self.hit.last.unwrap_or(first);
+        ThreadRange::closed(
+            self.hit.thread,
+            first.saturating_sub(context.before).max(1),
+            last.saturating_add(context.after).min(self.thread_length),
+        )
+    }
+}
+
+/// The messages of a hit's thread before and after the hit that its
+/// `read ref=` recipe covers: `-B`, `-A` and `-C` of `agent search` and
+/// `agent within`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HitContext {
+    pub before: usize,
+    pub after: usize,
+}
+
+impl Default for HitContext {
+    /// One message before the hit and one after it.
+    fn default() -> Self {
+        Self {
+            before: 1,
+            after: 1,
+        }
+    }
 }
 
 impl HitPlaces {
@@ -433,12 +468,12 @@ impl HitPlaces {
         Self { messages, lengths }
     }
 
-    /// The addresses of a hit on the messages of `focus`, ordinals: the
-    /// focus messages' thread range, and the read of the message before and
-    /// after it in that thread. A focus over several threads names the groups
-    /// that hold it. `None` when a focus message is not placed.
-    pub fn hit_addresses(&self, focus: MessageRange) -> Option<HitAddresses> {
-        let places = (focus.start..=focus.end)
+    /// The addresses of a hit on the messages of `hit`, ordinals: the hit
+    /// messages' thread range and that thread's length. A hit over several
+    /// threads names the groups that contain it, in the session's own
+    /// thread. `None` when a hit message is not placed.
+    pub fn hit_addresses(&self, hit: MessageRange) -> Option<HitAddresses> {
+        let places = (hit.start..=hit.end)
             .map(|ordinal| self.messages.get(&ordinal).copied())
             .collect::<Option<Vec<_>>>()?;
         let (first, last) = (*places.first()?, *places.last()?);
@@ -447,14 +482,9 @@ impl HitPlaces {
         } else {
             (Thread::Parent, first.group, last.group)
         };
-        let length = self.lengths.get(&thread).copied().unwrap_or(0);
         Some(HitAddresses {
-            focus: ThreadRange::closed(thread, start, end),
-            read: ThreadRange::closed(
-                thread,
-                start.saturating_sub(1).max(1),
-                (end + 1).min(length),
-            ),
+            hit: ThreadRange::closed(thread, start, end),
+            thread_length: self.lengths.get(&thread).copied().unwrap_or(0),
         })
     }
 }
@@ -646,21 +676,60 @@ mod tests {
         );
     }
 
-    /// The `focus=` and `read ref=` addresses, as printed, of a hit on the
-    /// messages from ordinal `start` to `end`.
+    /// The `hit=` and `read ref=` addresses, as printed, of a hit on the
+    /// messages from ordinal `start` to `end`, the recipe covering the
+    /// default context.
     fn hit(places: &HitPlaces, start: usize, end: usize) -> (String, String) {
+        hit_with_context(places, start, end, HitContext::default())
+    }
+
+    /// [`hit`], the recipe covering `context`.
+    fn hit_with_context(
+        places: &HitPlaces,
+        start: usize,
+        end: usize,
+        context: HitContext,
+    ) -> (String, String) {
         let addresses = places
             .hit_addresses(MessageRange { start, end })
-            .expect("the focus messages are placed");
-        (addresses.focus.to_string(), addresses.read.to_string())
+            .expect("the hit messages are placed");
+        (
+            addresses.hit.to_string(),
+            addresses.recipe_range(context).to_string(),
+        )
+    }
+
+    /// Alpha (s1) writes ordinals 1, 3 and 6: its m1 is its thread's first
+    /// message and its m3 its last; m1 and m4 are the session's own first
+    /// and last.
+    #[test]
+    fn hit_context_counts_messages_of_its_thread_shortened_at_its_ends() {
+        let places = addresses().hit_places(1..=9);
+        let context = |before, after| HitContext { before, after };
+
+        for (start, end, context, hit_address, read) in [
+            (1, 1, context(2, 1), "s1:m1", "s1:m1..m2"),
+            (6, 6, context(1, 2), "s1:m3", "s1:m2..m3"),
+            (6, 6, context(0, 0), "s1:m3", "s1:m3"),
+            (2, 2, context(3, 2), "m1", "m1..m3"),
+            (9, 9, context(2, 3), "m4", "m2..m4"),
+            (4, 4, context(0, 9), "m2", "m2..m4"),
+            (5, 7, context(1, 0), "m2..m3", "m1..m3"),
+        ] {
+            assert_eq!(
+                hit_with_context(&places, start, end, context),
+                (hit_address.to_owned(), read.to_owned()),
+                "the hit on ordinals {start}..{end} with {context:?}"
+            );
+        }
     }
 
     #[test]
-    fn hit_reads_message_before_and_after_its_focus_in_its_thread() {
+    fn hit_reads_message_before_and_after_it_in_its_thread() {
         let addresses = addresses();
         let places = addresses.hit_places(1..=9);
 
-        for (start, end, focus, read) in [
+        for (start, end, hit_address, read) in [
             (3, 3, "s1:m2", "s1:m1..m3"),
             (6, 6, "s1:m3", "s1:m2..m3"),
             (2, 2, "m1", "m1..m2"),
@@ -669,7 +738,7 @@ mod tests {
         ] {
             assert_eq!(
                 hit(&places, start, end),
-                (focus.to_owned(), read.to_owned()),
+                (hit_address.to_owned(), read.to_owned()),
                 "the hit on ordinals {start}..{end}"
             );
         }

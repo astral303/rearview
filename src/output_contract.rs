@@ -428,6 +428,8 @@ const SESSIONS_CASES: &[&[&str]] = &[
 /// without hits, and errors.
 const SEARCH_CASES: &[&[&str]] = &[
     &["agent", "search", "answer"],
+    &["agent", "search", "answer", "-C", "2"],
+    &["agent", "search", "answer", "--tools", "--subagents"],
     &["agent", "search", "searchable", "--top", "3"],
     &["agent", "search", "searchable", "--flat"],
     &["agent", "search", "searchable", "--all-hits"],
@@ -546,6 +548,8 @@ fn records_of(cases: &[&[&str]]) -> String {
 fn within_records_of(reference: &str) -> String {
     [
         vec!["agent", "within", reference, "answer"],
+        vec!["agent", "within", reference, "answer", "-B", "0", "-A", "2"],
+        vec!["agent", "within", reference, "answer", "--subagents"],
         vec!["agent", "within", reference, "searchable", "--top", "2"],
         vec!["agent", "within", reference, "--mode", "exact", "Sentinel"],
         vec!["agent", "within", reference, "the", "--budget", "400"],
@@ -603,6 +607,17 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         "--match",
         "the",
     ]);
+    run(&[
+        "agent",
+        "read",
+        &format!("{reference}:{message}"),
+        "--match",
+        "the",
+        "-B",
+        "0",
+        "-A",
+        "1",
+    ]);
     run(&["agent", "read", reference, "--tail", "3"]);
     run(&[
         "agent",
@@ -629,7 +644,7 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         "agent",
         "read",
         &format!("{reference}:m1..m8"),
-        "--focus",
+        "--hit",
         &format!("{reference}:m5"),
         "--budget",
         "700",

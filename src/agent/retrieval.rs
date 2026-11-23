@@ -52,7 +52,7 @@ pub struct AgentSearchHit {
     pub score: f64,
     pub source: AgentHitSource,
     pub preview: String,
-    pub focus_range: MessageRange,
+    pub hit_range: MessageRange,
     pub render_options: AgentHitRenderOptions,
 }
 
@@ -338,7 +338,7 @@ fn candidate_from_ranges(input: CandidateInput<'_>) -> Candidate {
         .min_by_key(|range| source_rank(range.source))
         .map(|range| range.source)
         .unwrap_or(AgentHitSource::Dialogue);
-    let focus_range = MessageRange::single(input.message_ordinal);
+    let hit_range = MessageRange::single(input.message_ordinal);
     let unique_terms = input
         .ranges
         .iter()
@@ -358,7 +358,7 @@ fn candidate_from_ranges(input: CandidateInput<'_>) -> Candidate {
             score,
             source,
             preview: preview(input.body, first_start, last_end),
-            focus_range,
+            hit_range,
             render_options,
         },
         timestamp: input.target.timestamp,
@@ -664,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_tool_result_query_returns_tool_hit_with_readable_focus() {
+    fn exact_tool_result_query_returns_tool_hit_on_readable_message() {
         let transcript = transcript(vec![
             text_message(1, AgentMessageRole::User, "question"),
             tool_result_message(2, json!("hidden_exact_tool_needle")),
@@ -675,12 +675,12 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source, AgentHitSource::Tool);
         assert!(hits[0].render_options.tool_results);
-        assert_eq!(hits[0].focus_range, MessageRange::single(2));
+        assert_eq!(hits[0].hit_range, MessageRange::single(2));
         assert!(hits[0].preview.contains("hidden_exact_tool_needle"));
     }
 
     #[test]
-    fn lexical_terms_cluster_to_tight_message_focus() {
+    fn lexical_terms_cluster_to_tight_hit_range() {
         let transcript = transcript(vec![
             text_message(1, AgentMessageRole::User, "alpha only"),
             text_message(2, AgentMessageRole::Assistant, "near alpha beta evidence"),
@@ -689,8 +689,8 @@ mod tests {
 
         let hits = retrieve_agent_hits(&transcript, "alpha beta", options());
 
-        assert_eq!(hits[0].focus_range, MessageRange::single(2));
-        assert_ne!(hits[0].focus_range, MessageRange { start: 1, end: 3 });
+        assert_eq!(hits[0].hit_range, MessageRange::single(2));
+        assert_ne!(hits[0].hit_range, MessageRange { start: 1, end: 3 });
     }
 
     #[test]
@@ -707,7 +707,7 @@ mod tests {
         let hits = retrieve_agent_hits(&transcript, "alpha beta \"exact_literal\"", options());
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].focus_range, MessageRange::single(2));
+        assert_eq!(hits[0].hit_range, MessageRange::single(2));
         assert!(hits[0].preview.contains("exact_literal"));
     }
 

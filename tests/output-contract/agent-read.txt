@@ -1,6 +1,6 @@
 $ rearview agent read ch_581699c40efc
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagent-messages=5
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagent-messages=5
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=s1:m1 report=m5 : Read the README
 subagent s2 type=Explore launch=m6 span=s2:m1..m3 report=m7 : Check how the plugin starts
@@ -59,7 +59,7 @@ m46 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc --tools --tool-results --thinking --subagents --no-budget
 --- stdout
-protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-04:00
+protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents over-budget=none tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=s1:m1 report=m5 : Read the README
 subagent s2 type=Explore launch=m6 span=s2:m1..m3 report=m7 : Check how the plugin starts
@@ -196,7 +196,7 @@ m46 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m2..m4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=2 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=2 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=s1:m1 report=m5 : Read the README
 day 2026-09-01
@@ -206,21 +206,28 @@ m3..m4 hidden 06:00:03..06:00:04 launches=s1 tools=1 tool-results=1 calls=m2.1
 s1:m1 hidden 06:00:06 subagent-messages=1
 $ rearview agent read ch_581699c40efc:m3 --lines 1..2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m3 hidden 06:00:03 tool-results=1 calls=m2.1
 read ref=ch_581699c40efc:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_581699c40efc:m3 --match the
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
+conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+day 2026-09-01
+m3 hidden 06:00:03 tool-results=1 calls=m2.1
+read ref=ch_581699c40efc:m3 tools=false tool-results=true thinking=false subagents=false
+$ rearview agent read ch_581699c40efc:m3 --match the -B 0 -A 1
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m3 hidden 06:00:03 tool-results=1 calls=m2.1
 read ref=ch_581699c40efc:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_581699c40efc --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=1 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=1 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m42 user 06:33:19
@@ -232,7 +239,7 @@ m46 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m45 user 06:34:00
@@ -241,7 +248,7 @@ m46 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m2.1
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-04:00
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m2.1 06:00:02 result=m3
@@ -251,7 +258,7 @@ m3 06:00:03 call=m2.1
 | plugin.json
 $ rearview agent read ch_581699c40efc:s1 --tools
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=s1:m1 report=m5 : Read the README
 day 2026-09-01
@@ -263,15 +270,15 @@ s1:m1 06:00:06
 m5 hidden 06:00:07 tool-results=1
 $ rearview agent read ch_581699c40efc:m1 ch_581699c40efc:m3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m1 user 06:00:00
 | USER_TEXT_SENTINEL: check the plugin's files and how it starts
 m3 hidden 06:00:03 tool-results=1 calls=m2.1
-$ rearview agent read ch_581699c40efc:m1..m8 --focus ch_581699c40efc:m5 --budget 700
+$ rearview agent read ch_581699c40efc:m1..m8 --hit ch_581699c40efc:m5 --budget 700
 --- stdout
-protocol agent-read cut=head+focus+tail chars=700 full=1119 policy=text omit=m1..m4,s2:m1..m3,m7..m8 tz=-04:00 hidden-tools=1 hidden-tool-results=1
+protocol agent-read cut=head+hit+tail chars=700 full=1126 policy=text over-budget=m1..m4,s2:m1..m3,m7..m8 tz=-04:00 hidden-tools=1 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m5..m6 hidden 06:00:07..06:00:08 launches=s2 tools=1 tool-results=1 calls=m4.1
@@ -279,7 +286,7 @@ read ref=ch_581699c40efc:m5..m6 tools=true tool-results=true thinking=false suba
 continue read refs=ch_581699c40efc:m1..m4;ch_581699c40efc:s2:m1..m3;ch_581699c40efc:m7..m8 tools=true tool-results=true thinking=false subagents=true
 $ rearview agent read ch_581699c40efc --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=2493 policy=text omit=s2:m1..m3,m7..m46 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=1
+protocol agent-read cut=tail chars=900 full=2500 policy=text over-budget=s2:m1..m3,m7..m46 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s1 type=general-purpose launch=m4 span=s1:m1 report=m5 : Read the README
 day 2026-09-01
@@ -293,7 +300,7 @@ m5..m6 hidden 06:00:07..06:00:08 launches=s2 tools=1 tool-results=1 calls=m4.1
 continue read refs=ch_581699c40efc:s2:m1..m3;ch_581699c40efc:m7..m46 tools=true tool-results=true thinking=false subagents=true
 $ rearview agent read ch_581699c40efc:s2:m1..m3 ch_581699c40efc:m7..m46 --tools --tool-results --subagents
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results+subagents omit=none tz=-04:00 hidden-thinking=1
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results+subagents over-budget=none tz=-04:00 hidden-thinking=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s2 type=Explore launch=m6 span=s2:m1..m3 report=m7 : Check how the plugin starts
 subagent s3 type=fork span=s3:m1 : fork
@@ -408,7 +415,7 @@ m46 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m17..m9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text last=m46 omit=none tz=-04:00 hidden-tools=11 hidden-tool-results=10
+protocol agent-read cut=none chars=20000 policy=text last=m46 over-budget=none tz=-04:00 hidden-tools=11 hidden-tool-results=10
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m17..m22 hidden 06:02:03..06:02:06 tools=4 tool-results=3
@@ -440,7 +447,7 @@ m46 user 06:34:01
 | *Skill: release-notes*
 $ rearview agent read ch_581699c40efc:m17..
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=11 hidden-tool-results=10
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=11 hidden-tool-results=10
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m17..m22 hidden 06:02:03..06:02:06 tools=4 tool-results=3
@@ -475,7 +482,7 @@ $ rearview agent read ch_581699c40efc:m9999
 protocol agent-error kind=out-of-range ref=ch_581699c40efc detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m46%3B%20sub-agent%20messages%20are%20numbered%20sN:mK
 $ rearview agent read ch_581699c40efc:m3 --lines 9999..9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m3 hidden 06:00:03 tool-results=1 calls=m2.1
@@ -488,7 +495,7 @@ $ rearview agent read ch_581699c40efc:s99
 protocol agent-error kind=not-found ref=ch_581699c40efc detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_0b26e45343df
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
@@ -529,7 +536,7 @@ m27..m28 hidden 06:03:21 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --tools --tool-results --thinking --subagents --no-budget
 --- stdout
-protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
@@ -602,7 +609,7 @@ m28 06:03:21 call=m27.1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m2..m4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=1 hidden-thinking=1 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=1 hidden-thinking=1 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m2 hidden 06:00:03 thinking=1
@@ -612,7 +619,7 @@ m4 hidden 06:00:05 tools=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:s1:m3 --lines 1..2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
@@ -621,15 +628,23 @@ s1:m3 06:00:02 slice=lines=1..1 anchor=ma_3200d601e22cb40f
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:s1:m3 --match the
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
 s1:m3 06:00:02 slice=match=the context=3 hits=0 anchor=ma_3200d601e22cb40f
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
+$ rearview agent read ch_0b26e45343df:s1:m3 --match the -B 0 -A 1
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
+conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
+subagent s1 span=s1:m1..m3 : agent-0
+day 2026-08-06
+s1:m3 06:00:02 slice=match=the before-context=0 after-context=1 hits=0 anchor=ma_3200d601e22cb40f
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=4 hidden-tool-results=4 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=4 hidden-tool-results=4 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m18 06:03:21
@@ -644,7 +659,7 @@ m27..m28 hidden 06:03:21 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=1 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-04:00 hidden-tool-results=1 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m26 user 06:03:20
@@ -655,7 +670,7 @@ m28 hidden 06:03:21 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m4.1
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m4.1 06:00:05 result=m5
@@ -665,7 +680,7 @@ m5 06:00:06 call=m4.1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:s1 --tools
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-thinking=1 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-04:00 hidden-thinking=1 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
@@ -677,7 +692,7 @@ s1:m3 06:00:02
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m1 ch_0b26e45343df:m3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-subagent-messages=3 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-subagent-messages=3 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
@@ -687,21 +702,20 @@ s1:m1..m3 hidden 06:00:02 subagent-messages=3
 m3 06:00:04
 | kimi answer searchable
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
-$ rearview agent read ch_0b26e45343df:m1..m8 --focus ch_0b26e45343df:m5 --budget 700
+$ rearview agent read ch_0b26e45343df:m1..m8 --hit ch_0b26e45343df:m5 --budget 700
 --- stdout
-protocol agent-read cut=head+focus+tail chars=700 full=840 policy=text omit=m1..m2,m7..m8 tz=-04:00 hidden-tools=1 hidden-tool-results=1 warnings=1 warning-records=1
+protocol agent-read cut=head+hit+tail chars=700 full=847 policy=text over-budget=m1,m6..m8 tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
+m2 hidden 06:00:03 thinking=1
 m3 06:00:04
 | kimi answer searchable
 m4..m5 hidden 06:00:05..06:00:06 tools=1 tool-results=1
-m6 user 06:02:00
-| steer follow-up question
-continue read refs=ch_0b26e45343df:m1..m2;ch_0b26e45343df:m7..m8 tools=false tool-results=false thinking=true subagents=true
+continue read refs=ch_0b26e45343df:m1;ch_0b26e45343df:m6..m8 tools=false tool-results=false thinking=true subagents=true
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=1561 policy=text omit=m8..m28 tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
+protocol agent-read cut=tail chars=900 full=1568 policy=text over-budget=m8..m28 tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
@@ -720,7 +734,7 @@ continue read refs=ch_0b26e45343df:m8..m28 tools=true tool-results=true thinking
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m8..m28 --tools --tool-results
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m8 report 06:03:20
@@ -772,7 +786,7 @@ m28 06:03:21 call=m27.1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m17..m9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text last=m28 omit=none tz=-04:00 hidden-tools=4 hidden-tool-results=4 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text last=m28 over-budget=none tz=-04:00 hidden-tools=4 hidden-tool-results=4 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m18 06:03:21
@@ -787,7 +801,7 @@ m27..m28 hidden 06:03:21 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:m17..
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=4 hidden-tool-results=4 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=4 hidden-tool-results=4 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 day 2026-08-06
 m18 06:03:21
@@ -814,7 +828,7 @@ $ rearview agent read ch_0b26e45343df:s99
 protocol agent-error kind=not-found ref=ch_0b26e45343df detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_74aec3f6df49
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagent-messages=5 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagent-messages=5 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 subagent s2 type=grunt span=s2:m1..m3 : child
@@ -869,7 +883,7 @@ m67..m68 hidden 06:03:48..06:03:49 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
-protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 subagent s2 type=grunt span=s2:m1..m3 : child
@@ -1044,7 +1058,7 @@ m68 06:03:49 call=m67.1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m2..m4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=1 hidden-thinking=1 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=1 hidden-thinking=1 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m2 hidden 06:00:04 thinking=1
@@ -1054,7 +1068,7 @@ m4 hidden 06:00:07 tools=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:s1:m2 --lines 1..2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -1063,15 +1077,23 @@ s1:m2 06:00:03 slice=lines=1..1 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:s1:m2 --match the
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
 s1:m2 06:00:03 slice=match=the context=3 hits=0 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
+$ rearview agent read ch_74aec3f6df49:s1:m2 --match the -B 0 -A 1
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
+conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
+subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
+day 2026-08-01
+s1:m2 06:00:03 slice=match=the before-context=0 after-context=1 hits=0 anchor=ma_4f60426316166883
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=11 hidden-tool-results=11 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=11 hidden-tool-results=11 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m44 user 06:03:27
@@ -1090,7 +1112,7 @@ m67..m68 hidden 06:03:48..06:03:49 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=1 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-04:00 hidden-tool-results=1 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m66 user 06:03:47
@@ -1101,7 +1123,7 @@ m68 hidden 06:03:49 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m4.1
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m4.1 06:00:07 result=m5
@@ -1112,7 +1134,7 @@ m5 06:00:08 call=m4.1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:s1 --tools
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -1123,7 +1145,7 @@ s1:m2 06:00:03
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m1 ch_74aec3f6df49:m3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-subagent-messages=2 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-subagent-messages=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -1133,9 +1155,9 @@ s1:m1..m2 hidden 06:00:03 subagent-messages=2
 m3 06:00:05
 | codex answer searchable
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
-$ rearview agent read ch_74aec3f6df49:m1..m8 --focus ch_74aec3f6df49:m5 --budget 700
+$ rearview agent read ch_74aec3f6df49:m1..m8 --hit ch_74aec3f6df49:m5 --budget 700
 --- stdout
-protocol agent-read cut=head+focus+tail chars=700 full=822 policy=text omit=m1,s2:m1..m3 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 warnings=1 warning-records=1
+protocol agent-read cut=head+hit+tail chars=700 full=829 policy=text over-budget=m1,s2:m1..m3 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m2 hidden 06:00:04 thinking=1
@@ -1146,7 +1168,7 @@ continue read refs=ch_74aec3f6df49:m1;ch_74aec3f6df49:s2:m1..m3 tools=true tool-
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=2085 policy=text omit=s2:m1..m3,m9..m68 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=2 warnings=1 warning-records=1
+protocol agent-read cut=tail chars=900 full=2092 policy=text over-budget=s2:m1..m3,m9..m68 tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=2 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
@@ -1161,7 +1183,7 @@ continue read refs=ch_74aec3f6df49:s2:m1..m3;ch_74aec3f6df49:m9..m68 tools=true 
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:s2:m1..m3 ch_74aec3f6df49:m9..m68 --tools --tool-results --thinking --subagents
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results+thinking+subagents omit=none tz=-04:00 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results+thinking+subagents over-budget=none tz=-04:00 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s2 type=grunt span=s2:m1..m3 : child
 day 2026-08-01
@@ -1315,7 +1337,7 @@ m68 06:03:49 call=m67.1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m17..m9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text last=m68 omit=none tz=-04:00 hidden-tools=25 hidden-tool-results=18 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text last=m68 over-budget=none tz=-04:00 hidden-tools=25 hidden-tool-results=18 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m17..m19 hidden 06:03:02..06:03:04 tools=3
@@ -1351,7 +1373,7 @@ m67..m68 hidden 06:03:48..06:03:49 tools=1 tool-results=1
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:m17..
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=25 hidden-tool-results=18 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=25 hidden-tool-results=18 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m17..m19 hidden 06:03:02..06:03:04 tools=3
@@ -1399,7 +1421,7 @@ $ rearview agent read ch_74aec3f6df49:s99
 protocol agent-error kind=not-found ref=ch_74aec3f6df49 detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_974c3840e189
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=s1:m1..m2 : worker
 day 2026-01-01
@@ -1434,7 +1456,7 @@ m21 user 22:04:30
 m22..m23 hidden 22:04:31..22:04:32 tools=1 tool-results=1
 $ rearview agent read ch_974c3840e189 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
-protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-05:00
+protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents over-budget=none tz=-05:00
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=s1:m1..m2 : worker
 day 2026-01-01
@@ -1492,7 +1514,7 @@ m23 22:04:32 call=m22.1
 | [Image: image/png]
 $ rearview agent read ch_974c3840e189:m2..m4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-thinking=1 hidden-subagent-messages=2
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-thinking=1 hidden-subagent-messages=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=s1:m1..m2 : worker
 day 2026-01-01
@@ -1505,20 +1527,26 @@ m4 22:04:13
 | OMP active answer
 $ rearview agent read ch_974c3840e189:m3 --lines 1..2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m3 user 22:04:12 slice=lines=1..1 anchor=ma_1399308a5c280b78
 |  1: OMP active question
 $ rearview agent read ch_974c3840e189:m3 --match the
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m3 user 22:04:12 slice=match=the context=3 hits=0 anchor=ma_1399308a5c280b78
+$ rearview agent read ch_974c3840e189:m3 --match the -B 0 -A 1
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00
+conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+day 2026-01-01
+m3 user 22:04:12 slice=match=the before-context=0 after-context=1 hits=0 anchor=ma_1399308a5c280b78
 $ rearview agent read ch_974c3840e189 --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=3 hidden-tool-results=3
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=3 hidden-tool-results=3
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m15 user 22:04:24
@@ -1531,7 +1559,7 @@ m21 user 22:04:30
 m22..m23 hidden 22:04:31..22:04:32 tools=1 tool-results=1
 $ rearview agent read ch_974c3840e189 --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-05:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m21 user 22:04:30
@@ -1541,14 +1569,14 @@ m22.1 22:04:31 result=m23
 m23 hidden 22:04:32 tool-results=1
 $ rearview agent read ch_974c3840e189:m7.1
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-05:00
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m7.1 22:04:16 result=m8
 | read: notes.txt
 $ rearview agent read ch_974c3840e189:s1 --tools
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-05:00 hidden-thinking=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-05:00 hidden-thinking=1
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=s1:m1..m2 : worker
 day 2026-01-01
@@ -1558,7 +1586,7 @@ s1:m2 22:04:12 hidden-thinking=1
 | OMP sub-agent answer searchable
 $ rearview agent read ch_974c3840e189:m1 ch_974c3840e189:m3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-subagent-messages=2
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-subagent-messages=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=s1:m1..m2 : worker
 day 2026-01-01
@@ -1567,9 +1595,9 @@ m1 user 22:04:06
 m3 user 22:04:12
 | OMP active question
 s1:m1..m2 hidden 22:04:12 subagent-messages=2
-$ rearview agent read ch_974c3840e189:m1..m8 --focus ch_974c3840e189:m5 --budget 700
+$ rearview agent read ch_974c3840e189:m1..m8 --hit ch_974c3840e189:m5 --budget 700
 --- stdout
-protocol agent-read cut=none chars=700 policy=text omit=none tz=-05:00 hidden-tools=1 hidden-thinking=1 hidden-subagent-messages=2
+protocol agent-read cut=none chars=700 policy=text over-budget=none tz=-05:00 hidden-tools=1 hidden-thinking=1 hidden-subagent-messages=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=s1:m1..m2 : worker
 day 2026-01-01
@@ -1589,7 +1617,7 @@ m6 user 22:04:15
 m7..m8 hidden 22:04:16..22:04:17 tools=1
 $ rearview agent read ch_974c3840e189 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=1072 policy=text omit=m13..m23 tz=-05:00 hidden-tools=2 hidden-thinking=1 hidden-subagent-messages=2
+protocol agent-read cut=tail chars=900 full=1079 policy=text over-budget=m13..m23 tz=-05:00 hidden-tools=2 hidden-thinking=1 hidden-subagent-messages=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 subagent s1 span=s1:m1..m2 : worker
 day 2026-01-01
@@ -1616,7 +1644,7 @@ m12 user 22:04:21
 continue read refs=ch_974c3840e189:m13..m23 tools=true tool-results=true thinking=false subagents=false
 $ rearview agent read ch_974c3840e189:m13..m23 --tools --tool-results
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-05:00
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m13.1 22:04:22 result=m14
@@ -1644,7 +1672,7 @@ m23 22:04:32 call=m22.1
 | [Image: image/png]
 $ rearview agent read ch_974c3840e189:m17..m9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text last=m23 omit=none tz=-05:00 hidden-tools=2 hidden-tool-results=3
+protocol agent-read cut=none chars=20000 policy=text last=m23 over-budget=none tz=-05:00 hidden-tools=2 hidden-tool-results=3
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m17..m19 hidden 22:04:26..22:04:28 tools=1 tool-results=2 calls=m16.1
@@ -1655,7 +1683,7 @@ m21 user 22:04:30
 m22..m23 hidden 22:04:31..22:04:32 tools=1 tool-results=1
 $ rearview agent read ch_974c3840e189:m17..
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=2 hidden-tool-results=3
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=2 hidden-tool-results=3
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
 m17..m19 hidden 22:04:26..22:04:28 tools=1 tool-results=2 calls=m16.1
@@ -1678,7 +1706,7 @@ $ rearview agent read ch_974c3840e189:s99
 protocol agent-error kind=not-found ref=ch_974c3840e189 detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_efbbec792ccc
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 subagent s1 span=s1:m1..m3 : ses_subagent
 day 2025-08-12
@@ -1699,7 +1727,7 @@ m15 08:05:50
 m16..m20 hidden 08:05:00 tools=3 tool-results=2
 $ rearview agent read ch_efbbec792ccc --tools --tool-results --thinking --subagents --no-budget
 --- stdout
-protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-04:00
+protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents over-budget=none tz=-04:00
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 subagent s1 span=s1:m1..m3 : ses_subagent
 day 2025-08-12
@@ -1751,7 +1779,7 @@ m20 08:05:00 call=m19.1
 | Resolved /example/parser
 $ rearview agent read ch_efbbec792ccc:m2..m4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=3
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 subagent s1 span=s1:m1..m3 : ses_subagent
 day 2025-08-12
@@ -1761,21 +1789,28 @@ m4 hidden 08:03:30 thinking=1
 read ref=ch_efbbec792ccc:m2..m4 tools=true tool-results=true thinking=true subagents=true
 $ rearview agent read ch_efbbec792ccc:m3 --lines 1..2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m3 hidden 08:01:40 tool-results=1 calls=m2.1
 read ref=ch_efbbec792ccc:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_efbbec792ccc:m3 --match the
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
+conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+day 2025-08-12
+m3 hidden 08:01:40 tool-results=1 calls=m2.1
+read ref=ch_efbbec792ccc:m3 tools=false tool-results=true thinking=false subagents=false
+$ rearview agent read ch_efbbec792ccc:m3 --match the -B 0 -A 1
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m3 hidden 08:01:40 tool-results=1 calls=m2.1
 read ref=ch_efbbec792ccc:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_efbbec792ccc --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=6 hidden-tool-results=4
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=6 hidden-tool-results=4
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m7 08:03:50
@@ -1789,7 +1824,7 @@ m15 08:05:50
 m16..m20 hidden 08:05:00 tools=3 tool-results=2
 $ rearview agent read ch_efbbec792ccc --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m18.1 08:05:00
@@ -1799,7 +1834,7 @@ m19.1 08:05:00 result=m20
 m20 hidden 08:05:00 tool-results=1
 $ rearview agent read ch_efbbec792ccc:m2.1
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-04:00
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m2.1 08:01:40 result=m3
@@ -1808,7 +1843,7 @@ m3 08:01:40 call=m2.1
 | <content>SYNTHETIC_INJECTION_SENTINEL fn defect() {}</content>
 $ rearview agent read ch_efbbec792ccc:s1 --tools
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-04:00 hidden-thinking=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-04:00 hidden-thinking=1
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 subagent s1 span=s1:m1..m3 : ses_subagent
 day 2025-08-12
@@ -1819,7 +1854,7 @@ s1:m2 08:03:20
 s1:m3 hidden 08:03:20 thinking=1
 $ rearview agent read ch_efbbec792ccc:m1 ch_efbbec792ccc:m3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1 hidden-subagent-messages=3
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 subagent s1 span=s1:m1..m3 : ses_subagent
 day 2025-08-12
@@ -1828,9 +1863,9 @@ m1 user 08:01:40
 | find the fixture defect
 m3 hidden 08:01:40 tool-results=1 calls=m2.1
 s1:m1..m3 hidden 08:03:10..08:03:20 subagent-messages=3
-$ rearview agent read ch_efbbec792ccc:m1..m8 --focus ch_efbbec792ccc:m5 --budget 700
+$ rearview agent read ch_efbbec792ccc:m1..m8 --hit ch_efbbec792ccc:m5 --budget 700
 --- stdout
-protocol agent-read cut=none chars=700 policy=text omit=none tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=3
+protocol agent-read cut=none chars=700 policy=text over-budget=none tz=-04:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 subagent s1 span=s1:m1..m3 : ses_subagent
 day 2025-08-12
@@ -1845,7 +1880,7 @@ m7 08:03:50
 m8 hidden 08:05:00 tools=1
 $ rearview agent read ch_efbbec792ccc --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=917 policy=text omit=m13..m20 tz=-04:00 hidden-tools=4 hidden-tool-results=3 hidden-thinking=1 hidden-subagent-messages=3
+protocol agent-read cut=tail chars=900 full=924 policy=text over-budget=m12..m20 tz=-04:00 hidden-tools=4 hidden-tool-results=3 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 subagent s1 span=s1:m1..m3 : ses_subagent
 day 2025-08-12
@@ -1858,14 +1893,14 @@ m4..m6 hidden 08:03:20..08:03:30 tools=1 tool-results=1 thinking=1
 m7 08:03:50
 | the defect hides in lib.rs
 m8..m11 hidden 08:05:00 tools=2 tool-results=1
-m12 08:05:30
-| NUMBERED_REPLY_SENTINEL: the command printed nothing.
-continue read refs=ch_efbbec792ccc:m13..m20 tools=true tool-results=true thinking=false subagents=false
-$ rearview agent read ch_efbbec792ccc:m13..m20 --tools --tool-results
+continue read refs=ch_efbbec792ccc:m12..m20 tools=true tool-results=true thinking=false subagents=false
+$ rearview agent read ch_efbbec792ccc:m12..m20 --tools --tool-results
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-04:00
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
+m12 08:05:30
+| NUMBERED_REPLY_SENTINEL: the command printed nothing.
 m13.1 08:05:00 result=m14
 | task (explore): List the release steps
 | LAUNCH_PROMPT_SENTINEL: list the release steps.
@@ -1885,14 +1920,14 @@ m20 08:05:00 call=m19.1
 | Resolved /example/parser
 $ rearview agent read ch_efbbec792ccc:m17..m9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text last=m20 omit=none tz=-04:00 hidden-tools=2 hidden-tool-results=2
+protocol agent-read cut=none chars=20000 policy=text last=m20 over-budget=none tz=-04:00 hidden-tools=2 hidden-tool-results=2
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m17..m20 hidden 08:05:00 tools=2 tool-results=2 calls=m16.1
 read ref=ch_efbbec792ccc:m17..m20 tools=true tool-results=true thinking=false subagents=false
 $ rearview agent read ch_efbbec792ccc:m17..
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tools=2 hidden-tool-results=2
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=2 hidden-tool-results=2
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m17..m20 hidden 08:05:00 tools=2 tool-results=2 calls=m16.1
@@ -1902,7 +1937,7 @@ $ rearview agent read ch_efbbec792ccc:m9999
 protocol agent-error kind=out-of-range ref=ch_efbbec792ccc detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m20%3B%20sub-agent%20messages%20are%20numbered%20sN:mK
 $ rearview agent read ch_efbbec792ccc:m3 --lines 9999..9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-04:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tool-results=1
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 day 2025-08-12
 m3 hidden 08:01:40 tool-results=1 calls=m2.1
@@ -1915,7 +1950,7 @@ $ rearview agent read ch_efbbec792ccc:s99
 protocol agent-error kind=not-found ref=ch_efbbec792ccc detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_f04d3718e406
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m1 user 19:01:00
@@ -1943,7 +1978,7 @@ m19 19:20:03
 | The release steps are dated.
 $ rearview agent read ch_f04d3718e406 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
-protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-05:00
+protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents over-budget=none tz=-05:00
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m1 user 19:01:00
@@ -1995,7 +2030,7 @@ m19 19:20:03
 | The release steps are dated.
 $ rearview agent read ch_f04d3718e406:m2..m4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=2 hidden-tool-results=2 hidden-thinking=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=2 hidden-tool-results=2 hidden-thinking=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m2 19:02:00 hidden-tools=read hidden-thinking=1
@@ -2003,21 +2038,28 @@ m2 19:02:00 hidden-tools=read hidden-thinking=1
 m3..m4 hidden 19:06:00..19:07:00 tools=1 tool-results=2 calls=m2.1
 $ rearview agent read ch_f04d3718e406:m3 --lines 1..2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m3 hidden 19:06:00 tool-results=1 calls=m2.1
 read ref=ch_f04d3718e406:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_f04d3718e406:m3 --match the
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tool-results=1
+conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+day 2024-02-29
+m3 hidden 19:06:00 tool-results=1 calls=m2.1
+read ref=ch_f04d3718e406:m3 tools=false tool-results=true thinking=false subagents=false
+$ rearview agent read ch_f04d3718e406:m3 --match the -B 0 -A 1
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m3 hidden 19:06:00 tool-results=1 calls=m2.1
 read ref=ch_f04d3718e406:m3 tools=false tool-results=true thinking=false subagents=false
 $ rearview agent read ch_f04d3718e406 --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=1 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=1 hidden-tool-results=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m15 19:19:05
@@ -2029,7 +2071,7 @@ m19 19:20:03
 | The release steps are dated.
 $ rearview agent read ch_f04d3718e406 --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-05:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m17.1 19:20:01 result=m18
@@ -2039,7 +2081,7 @@ m19 19:20:03
 | The release steps are dated.
 $ rearview agent read ch_f04d3718e406:m2.1
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-05:00
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m2.1 19:02:00 result=m3
@@ -2049,15 +2091,15 @@ m3 19:06:00 call=m2.1
 | [Image: image/jpeg]
 $ rearview agent read ch_f04d3718e406:m1 ch_f04d3718e406:m3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m1 user 19:01:00
 | active root question
 m3 hidden 19:06:00 tool-results=1 calls=m2.1
-$ rearview agent read ch_f04d3718e406:m1..m8 --focus ch_f04d3718e406:m5 --budget 700
+$ rearview agent read ch_f04d3718e406:m1..m8 --hit ch_f04d3718e406:m5 --budget 700
 --- stdout
-protocol agent-read cut=none chars=700 policy=text omit=none tz=-05:00 hidden-tools=4 hidden-tool-results=3 hidden-thinking=1
+protocol agent-read cut=none chars=700 policy=text over-budget=none tz=-05:00 hidden-tools=4 hidden-tool-results=3 hidden-thinking=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m1 user 19:01:00
@@ -2073,7 +2115,7 @@ m6 user 19:18:00
 m7..m8 hidden 19:18:01..19:18:02 tools=2 tool-results=1
 $ rearview agent read ch_f04d3718e406 --budget 900
 --- stdout
-protocol agent-read cut=tail chars=900 full=932 policy=text omit=m15..m19 tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1
+protocol agent-read cut=tail chars=900 full=939 policy=text over-budget=m15..m19 tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m1 user 19:01:00
@@ -2095,7 +2137,7 @@ m14 user 19:19:04
 continue read refs=ch_f04d3718e406:m15..m19 tools=true tool-results=true thinking=false subagents=false
 $ rearview agent read ch_f04d3718e406:m15..m19 --tools --tool-results
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-05:00
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m15 19:19:05
@@ -2110,7 +2152,7 @@ m19 19:20:03
 | The release steps are dated.
 $ rearview agent read ch_f04d3718e406:m17..m9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text last=m19 omit=none tz=-05:00 hidden-tools=1 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text last=m19 over-budget=none tz=-05:00 hidden-tools=1 hidden-tool-results=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m17..m18 hidden 19:20:01..19:20:02 tools=1 tool-results=1
@@ -2118,7 +2160,7 @@ m19 19:20:03
 | The release steps are dated.
 $ rearview agent read ch_f04d3718e406:m17..
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=1 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=1 hidden-tool-results=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m17..m18 hidden 19:20:01..19:20:02 tools=1 tool-results=1
@@ -2129,7 +2171,7 @@ $ rearview agent read ch_f04d3718e406:m9999
 protocol agent-error kind=out-of-range ref=ch_f04d3718e406 detail=message%20range%20m9999%20starts%20after%20the%20last%20message%2C%20m19
 $ rearview agent read ch_f04d3718e406:m3 --lines 9999..9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
 day 2024-02-29
 m3 hidden 19:06:00 tool-results=1 calls=m2.1
@@ -2142,7 +2184,7 @@ $ rearview agent read ch_f04d3718e406:s99
 protocol agent-error kind=not-found ref=ch_f04d3718e406 detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_982349c13ee4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
@@ -2164,7 +2206,7 @@ m18 user 19:00:02
 m19..m20 hidden 19:00:02 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4 --tools --tool-results --thinking --subagents --no-budget
 --- stdout
-protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents omit=none tz=-05:00
+protocol agent-read cut=none chars=none policy=text+tools+tool-results+thinking+subagents over-budget=none tz=-05:00
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
@@ -2216,7 +2258,7 @@ m20 19:00:02 call=m19.1
 | [Image: image/png]
 $ rearview agent read ch_982349c13ee4:m2..m4
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=1 hidden-thinking=1
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=1 hidden-thinking=1
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
 m2 hidden 19:00:01 thinking=1
@@ -2225,7 +2267,7 @@ m3 19:00:01
 m4 hidden 19:00:01 tools=1
 $ rearview agent read ch_982349c13ee4:s1:m3 --lines 1..2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-05:00
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
@@ -2233,14 +2275,21 @@ s1:m3 19:00:01 slice=lines=1..1 anchor=ma_ed09908ea14107f5
 |  1: grok child answer searchable
 $ rearview agent read ch_982349c13ee4:s1:m3 --match the
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+subagents omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-05:00
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
 s1:m3 19:00:01 slice=match=the context=3 hits=0 anchor=ma_ed09908ea14107f5
+$ rearview agent read ch_982349c13ee4:s1:m3 --match the -B 0 -A 1
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-05:00
+conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+subagent s1 span=s1:m1..m3 : explore
+day 1969-12-31
+s1:m3 19:00:01 slice=match=the before-context=0 after-context=1 hits=0 anchor=ma_ed09908ea14107f5
 $ rearview agent read ch_982349c13ee4 --tail 3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=4 hidden-tool-results=4
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=4 hidden-tool-results=4
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
 m10 19:00:01
@@ -2254,7 +2303,7 @@ m18 user 19:00:02
 m19..m20 hidden 19:00:02 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4 --tools --subagents --tail 2
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-05:00 hidden-tool-results=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-05:00 hidden-tool-results=1
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
 m18 user 19:00:02
@@ -2264,7 +2313,7 @@ m19.1 19:00:02 result=m20
 m20 hidden 19:00:02 tool-results=1
 $ rearview agent read ch_982349c13ee4:m4.1
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-05:00
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-05:00
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
 m4.1 19:00:01 result=m5
@@ -2273,7 +2322,7 @@ m5 19:00:01 call=m4.1
 | grok tool output searchable
 $ rearview agent read ch_982349c13ee4:s1 --tools
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+subagents omit=none tz=-05:00 hidden-thinking=1
+protocol agent-read cut=none chars=20000 policy=text+tools+subagents over-budget=none tz=-05:00 hidden-thinking=1
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
@@ -2284,7 +2333,7 @@ s1:m3 19:00:01
 | grok child answer searchable
 $ rearview agent read ch_982349c13ee4:m1 ch_982349c13ee4:m3
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-subagent-messages=3
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-subagent-messages=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
@@ -2293,9 +2342,9 @@ m1 user 19:00:01
 s1:m1..m3 hidden 19:00:01 subagent-messages=3
 m3 19:00:01
 | grok answer searchable
-$ rearview agent read ch_982349c13ee4:m1..m8 --focus ch_982349c13ee4:m5 --budget 700
+$ rearview agent read ch_982349c13ee4:m1..m8 --hit ch_982349c13ee4:m5 --budget 700
 --- stdout
-protocol agent-read cut=none chars=700 policy=text omit=none tz=-05:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=3
+protocol agent-read cut=none chars=700 policy=text over-budget=none tz=-05:00 hidden-tools=3 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
@@ -2308,7 +2357,7 @@ m3 19:00:01
 m4..m8 hidden 19:00:01 tools=3 tool-results=2
 $ rearview agent read ch_982349c13ee4 --budget 900
 --- stdout
-protocol agent-read cut=none chars=900 policy=text omit=none tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
+protocol agent-read cut=none chars=900 policy=text over-budget=none tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
@@ -2330,7 +2379,7 @@ m18 user 19:00:02
 m19..m20 hidden 19:00:02 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4:m17..m9999
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text last=m20 omit=none tz=-05:00 hidden-tools=1 hidden-tool-results=2
+protocol agent-read cut=none chars=20000 policy=text last=m20 over-budget=none tz=-05:00 hidden-tools=1 hidden-tool-results=2
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
 m17 hidden 19:00:01 tool-results=1 calls=m16.1
@@ -2339,7 +2388,7 @@ m18 user 19:00:02
 m19..m20 hidden 19:00:02 tools=1 tool-results=1
 $ rearview agent read ch_982349c13ee4:m17..
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text omit=none tz=-05:00 hidden-tools=1 hidden-tool-results=2
+protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=1 hidden-tool-results=2
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
 m17 hidden 19:00:01 tool-results=1 calls=m16.1
@@ -2360,7 +2409,7 @@ $ rearview agent read ch_982349c13ee4:s99
 protocol agent-error kind=not-found ref=ch_982349c13ee4 detail=sub-agent%20s99%20was%20not%20found%20in%20the%20conversation
 $ rearview agent read ch_581699c40efc --tools --tool-results --after 2026-09-01T06:00:30 --before 2026-09-01T06:05
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00 messages-in-window=18 subagent-messages-in-window=1 hidden-subagent-messages=1
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-04:00 messages-in-window=18 subagent-messages-in-window=1 hidden-subagent-messages=1
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 subagent s3 type=fork span=s3:m1 : fork
 day 2026-09-01
@@ -2422,7 +2471,7 @@ m25 user 06:02:10
 | [Line 3:5] DIAGNOSTICS_SENTINEL: cannot find value `x` in this scope [E0425] (rustc)
 $ rearview agent read ch_74aec3f6df49 --tools --tool-results --after 2026-08-01T06:01 --before 2026-08-01T06:02
 --- stdout
-protocol agent-read cut=none chars=20000 policy=text+tools+tool-results omit=none tz=-04:00 messages-in-window=6 warnings=1 warning-records=1
+protocol agent-read cut=none chars=20000 policy=text+tools+tool-results over-budget=none tz=-04:00 messages-in-window=6 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 day 2026-08-01
 m9 user 06:02:00

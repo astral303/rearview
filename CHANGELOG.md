@@ -122,6 +122,19 @@
   `<ref>:m300..` reads from m300 to the last message, and
   `<ref>:s3:m10..` to the sub-agent's last. `agent read --lines 40..` reads
   from line 40 to the message's last line.
+- Add search hit context flags to `agent search` and `agent within`. A hit's
+  `read` recipe reads one message before the hit and one after it; the flags
+  set those two counts:
+  - `-B N` sets the messages before the hit to N.
+  - `-A N` sets the messages after the hit to N.
+  - `-C N` sets both to N. `-B` or `-A` beside `-C` sets its own side.
+  - `agent read --match` takes `-B` and `-A` for the lines before and after
+    each match, and `-C` as the short form of `--context`.
+- Accept the visibility flags on `agent search` and `agent within`: `--tools`,
+  `--tool-results`, `--thinking` and `--subagents`. Each sets its value in
+  every hit's `read` recipe, such as `subagents=true`; the hits don't change.
+- Count in the `agent outline` header what its flags hide, such as
+  `hidden-tools=17 hidden-tool-results=15 hidden-thinking=1`.
 - Copy one block of a message in the viewer. In message navigation, focus a
   message's blocks (`→`), step between them (`J`/`K`) and copy the focused
   paragraph, heading, code block, quote, list or table (`y`).
@@ -390,6 +403,19 @@
 - `agent read` now names its count of hidden sub-agent messages
   `hidden-subagent-messages=` in the header and `subagent-messages=` in a
   `hidden` record. Before, they were `hidden-subagents=` and `subagents=`.
+- A search hit and its `read` recipe now print the hit as `hit=m8`, and
+  `agent read` takes it as `--hit m8`. Before, they were `focus=m8` and
+  `--focus m8`. A read truncated around the hit prints `cut=head+hit+tail`.
+- `agent read`, `agent outline`, `agent search` and `agent within` now name
+  what their budget left out `over-budget`. Before, the word was `omit` or
+  `omitted`:
+  - `agent read` prints `over-budget=` in the header and
+    `m7 over-budget lines=4..9` for a truncated message. Before, they were
+    `omit=` and `m7 omitted lines=4..9`.
+  - A truncated `agent outline` header prints `over-budget-records=`.
+    Before, it was `omitted-records=`.
+  - A truncated `agent search` or `agent within` header prints
+    `over-budget-lines=`. Before, it was `omitted-lines=`.
 - The first run after upgrading parses every session once to build the new
   session cache, then removes the old cache's files. It takes about 1.9x as
   long as a first run did before, with about 3.4x less memory (on one example

@@ -1037,15 +1037,17 @@ mod agent_command_tests {
         }
     }
 
-    fn read_args(refs: Vec<String>, focus: Option<String>) -> AgentReadArgs {
+    fn read_args(refs: Vec<String>, hit: Option<String>) -> AgentReadArgs {
         AgentReadArgs {
             refs,
             anchor: None,
-            focus,
+            hit,
             tail: None,
             lines: None,
             match_query: None,
             context: 3,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: default_output(),
         }
@@ -1242,7 +1244,7 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn read_rejects_focus_outside_its_range() {
+    fn read_rejects_hit_outside_its_range() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
@@ -1266,8 +1268,8 @@ mod agent_command_tests {
 
         assert!(
             err.to_string()
-                .contains("focus m5 is outside the requested read range"),
-            "the error names the focus: {err}"
+                .contains("hit m5 is outside the requested read range"),
+            "the error names the hit: {err}"
         );
     }
 
@@ -1290,11 +1292,11 @@ mod agent_command_tests {
             resolve_agent_read_args(&read, &keys, &SystemCanonicaliser::shared()).unwrap();
         assert_eq!(resolved[0].1.key, keys[0]);
 
-        let focus = read_args(
+        let hit = read_args(
             vec![format!("{}:m1..m2", keys[0].conversation_ref().canonical())],
             Some(format!("{uuid}:m1")),
         );
-        assert!(resolve_agent_read_args(&focus, &keys, &SystemCanonicaliser::shared()).is_ok());
+        assert!(resolve_agent_read_args(&hit, &keys, &SystemCanonicaliser::shared()).is_ok());
 
         assert_eq!(
             resolve_agent_conversation_arg(uuid, &keys, &SystemCanonicaliser::shared())
@@ -1428,7 +1430,7 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn search_output_emits_read_ref_with_focus_recipe() {
+    fn search_output_emits_read_ref_with_hit_recipe() {
         let output = agent::search::AgentSearchOutput {
             protocol: agent::search::AgentProtocolKind::Search,
             target: None,
@@ -1448,11 +1450,11 @@ mod agent_command_tests {
                 evidence_source: agent::retrieval::AgentHitSource::Dialogue,
                 render_options: agent::retrieval::AgentHitRenderOptions::default(),
                 preview: "cache warming answer".to_string(),
-                focus_range: agent::refs::MessageRange::single(2),
+                hit_range: agent::refs::MessageRange::single(2),
                 times: None,
                 addresses: Some(agent::address::HitAddresses {
-                    focus: agent::refs::ThreadRange::one(agent::refs::Thread::Parent, 2),
-                    read: agent::refs::ThreadRange::closed(agent::refs::Thread::Parent, 1, 3),
+                    hit: agent::refs::ThreadRange::one(agent::refs::Thread::Parent, 2),
+                    thread_length: 3,
                 }),
             }],
             groups: vec![],
@@ -1473,12 +1475,12 @@ mod agent_command_tests {
         assert!(rendered.contains(
             "hit project=pr_test uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678"
         ));
-        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 focus=m2 tools=false tool-results=false thinking=false subagents=false\n"));
+        assert!(rendered.contains("read ref=ch_1234abcd5678:m1..m3 hit=m2 tools=false tool-results=false thinking=false subagents=false\n"));
     }
 
     fn read_args_from_line(read_line: &str) -> AgentReadArgs {
         let mut read_ref = None;
-        let mut focus = None;
+        let mut hit = None;
         let mut tools = false;
         let mut tool_results = false;
         let mut thinking = false;
@@ -1486,8 +1488,8 @@ mod agent_command_tests {
         for field in read_line.split_whitespace().skip(1) {
             if let Some(value) = field.strip_prefix("ref=") {
                 read_ref = Some(value.to_string());
-            } else if let Some(value) = field.strip_prefix("focus=") {
-                focus = Some(value.to_string());
+            } else if let Some(value) = field.strip_prefix("hit=") {
+                hit = Some(value.to_string());
             } else if field == "tools=true" {
                 tools = true;
             } else if field == "tool-results=true" {
@@ -1501,11 +1503,13 @@ mod agent_command_tests {
         AgentReadArgs {
             refs: vec![read_ref.expect("read ref field")],
             anchor: None,
-            focus,
+            hit,
             tail: None,
             lines: None,
             match_query: None,
             context: 3,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: AgentOutputFlags {
                 budget: Some(6000),
@@ -1520,7 +1524,7 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn within_read_ref_can_drive_focused_read() {
+    fn within_read_ref_can_drive_read_with_hit() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
             &dir,
@@ -1543,6 +1547,8 @@ mod agent_command_tests {
             perf_stats: false,
             search_mode: cli::AgentSearchModeArgs::explicit(SearchMode::Lexical),
             time: cli::MessageTimeArgs::default(),
+            context: cli::HitContextArgs::default(),
+            recipe_visibility: cli::RecipeVisibilityArgs::default(),
         };
         let within_request = agent::search::AgentWithinRequest {
             query: within_args.query.clone(),
@@ -1793,7 +1799,7 @@ mod agent_command_tests {
         ));
 
         assert!(
-            within.contains("focus=m4 "),
+            within.contains("hit=m4 "),
             "the session's own fourth message follows a sub-agent's: {within}"
         );
         let read_line = within
@@ -1849,7 +1855,7 @@ mod agent_command_tests {
             &[semantic_hit],
         ));
 
-        assert!(within.contains("focus=m2 "));
+        assert!(within.contains("hit=m2 "));
         let read_line = within
             .lines()
             .find(|line| line.starts_with("read ref="))
@@ -1987,7 +1993,7 @@ mod agent_command_tests {
         )
         .unwrap();
         let rendered = agent::search::format_agent_output(&output);
-        assert!(rendered.contains("focus=m2 "), "{rendered}");
+        assert!(rendered.contains("hit=m2 "), "{rendered}");
 
         let whole_reply = format!(
             "read ref={}:m2 tools=true thinking=true",
@@ -2557,14 +2563,14 @@ mod agent_command_tests {
         assert!(!unbounded.contains("messages-in-window"), "{unbounded}");
     }
 
-    /// The focus of each hit of a search or within output.
-    fn hit_focuses(output: &str) -> Vec<&str> {
+    /// The `hit=` address of each hit of a search or within output.
+    fn hit_addresses(output: &str) -> Vec<&str> {
         output
             .lines()
             .filter(|line| line.starts_with("hit "))
             .filter_map(|line| {
                 line.split_whitespace()
-                    .find_map(|atom| atom.strip_prefix("focus="))
+                    .find_map(|atom| atom.strip_prefix("hit="))
             })
             .collect()
     }
@@ -2682,10 +2688,10 @@ mod agent_command_tests {
             ),
         ];
         for (case, output) in cases {
-            let focuses = hit_focuses(&output);
-            assert!(!focuses.is_empty(), "{case}: {output}");
+            let addresses = hit_addresses(&output);
+            assert!(!addresses.is_empty(), "{case}: {output}");
             assert!(
-                focuses.iter().all(|focus| *focus == "m4"),
+                addresses.iter().all(|address| *address == "m4"),
                 "{case}: {output}"
             );
         }
@@ -2727,7 +2733,7 @@ mod agent_command_tests {
             &[semantic_hit],
         ));
 
-        assert!(rendered.contains("focus=s1:m1 "), "{rendered}");
+        assert!(rendered.contains("hit=s1:m1 "), "{rendered}");
         assert!(rendered.contains("tools=false tool-results=false thinking=false subagents=true"));
         let read_line = rendered
             .lines()

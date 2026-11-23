@@ -33,25 +33,26 @@
 //! - When exact search finds a marker in a message, a read of that message
 //!   alone with `--match <marker>` reports a hit.
 //! - The `read ref=` recipe of each hit an exact `agent within` search for a
-//!   marker prints reads the hit's `focus=` messages.
+//!   marker prints reads the messages of its `hit=`, and the `-B` and `-A`
+//!   messages of its thread before and after it, up to the thread's ends.
 
-use crate::agent::address::MessageAddresses;
+use crate::agent::address::{HitContext, MessageAddresses};
 use crate::agent::protocol::{
     ProtocolOptions, ReadRequest, ReadSlice, format_outline, format_read,
 };
 use crate::agent::refs::{
-    AgentConversationKey, MessageRange, ResolvedConversation, parse_messages, parse_read_ref,
-    resolved_conversation_for_key,
+    AgentConversationKey, MessageRange, ResolvedConversation, ThreadRange, parse_messages,
+    parse_read_ref, resolved_conversation_for_key,
 };
 use crate::agent::retrieval::{
     AgentRetrievalOptions, AgentTranscriptSearchTarget, retrieve_agent_hits_for_target,
 };
 use crate::agent::search::{
-    AgentWithinRequest, exact_phrase_query, format_agent_output, run_within_search,
+    AgentWithinRequest, exact_phrase_query, format_agent_output_with_warnings, run_within_search,
 };
 use crate::agent::test_support::{
-    MessageKey, PositionalRecord, addressed_messages, atom, message_address, outline_records,
-    read_records, segment_records,
+    MessageKey, PositionalRecord, addressed_messages, atom, lines_around, message_address,
+    outline_records, read_records, segment_records, written_at,
 };
 use crate::agent::transcript::AgentTranscript;
 use crate::history::provider::contract_tests::{AgentSession, every_record_sessions};
@@ -754,7 +755,7 @@ fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<S
                 },
             )
             .into_iter()
-            .map(move |hit| (marker, hit.focus_range.start))
+            .map(move |hit| (marker, hit.hit_range.start))
         })
         .filter_map(|(marker, ordinal)| {
             let output = format_read(
@@ -769,7 +770,7 @@ fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<S
                 None,
                 Some(&ReadSlice::Match {
                     query: marker.text.to_owned(),
-                    context: 0,
+                    context: lines_around(0),
                 }),
                 EVERY_FLAG,
             )
@@ -1115,15 +1116,29 @@ fn every_agents_printed_address_reads_back_its_record() {
     assert!(addresses > 0, "a read prints an address");
 }
 
-/// Each `read ref=` recipe that an exact `agent within` search of `session`
-/// for one of its markers prints, and whose read with the recipe's flags
-/// does not cover the hit's `focus=` messages; and how many recipes ran.
-fn hit_recipes_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
+/// The `read ref=` recipes that exact `agent within` searches of `session`
+/// for its markers print with `context`, and how many of them a thread's
+/// end shortened.
+#[derive(Default)]
+struct HitRecipes {
+    /// Each recipe whose ref is not its `hit=` with `context`'s messages of
+    /// its thread around it, shortened at the thread's ends, or whose read
+    /// with the recipe's flags does not cover its `hit=` messages.
+    gaps: Vec<String>,
+    count: usize,
+    /// Recipes starting at their thread's first message, which `context`
+    /// would have started before it.
+    shortened_at_first: usize,
+    /// Recipes ending at their thread's last message, which `context` would
+    /// have ended past.
+    shortened_at_last: usize,
+}
+
+fn hit_recipes(session: &AgentSession, context: HitContext) -> HitRecipes {
     let row = &session.row;
     let loaded = LoadedSession::of(session);
     let addresses = SessionAddresses::of(session);
-    let mut gaps = Vec::new();
-    let mut recipes = 0;
+    let mut recipes = HitRecipes::default();
     for marker in &session.markers {
         let request = AgentWithinRequest {
             query: exact_phrase_query(marker.text),
@@ -1134,15 +1149,14 @@ fn hit_recipes_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
             budget: None,
             window: TimeFilter::default(),
         };
-        let output = format_agent_output(&run_within_search(
-            &request,
-            row,
-            &loaded.resolved,
-            &loaded.transcript,
+        let output = format_agent_output_with_warnings(
+            &run_within_search(&request, row, &loaded.resolved, &loaded.transcript, &[]),
+            context,
             &[],
-        ));
+            written_at(),
+        );
         for recipe in output.lines().filter(|line| line.starts_with("read ref=")) {
-            recipes += 1;
+            recipes.count += 1;
             let flag = |name| atom(recipe, name) == Some("true");
             let flags = ProtocolOptions {
                 tools: flag("tools"),
@@ -1151,33 +1165,75 @@ fn hit_recipes_not_read_back(session: &AgentSession) -> (Vec<String>, usize) {
                 subagents: flag("subagents"),
                 ..DEFAULT_FLAGS
             };
-            let read = loaded.read_ref(atom(recipe, "ref").unwrap(), flags);
+            let recipe_ref = atom(recipe, "ref").unwrap();
+            let read = loaded.read_ref(recipe_ref, flags);
             let mut covered = covered_messages(&read, &addresses);
             covered.extend(result_messages(&read, &addresses));
-            let focus = addresses.segment_ordinals(atom(recipe, "focus").unwrap());
-            if !focus.clone().all(|ordinal| covered.contains(&ordinal)) {
-                gaps.push(format!(
-                    "{:?} {}: {recipe}\n{read}",
+            let hit_atom = atom(recipe, "hit").unwrap();
+            let hit = addresses.segment_ordinals(hit_atom);
+            let hit_range = parse_messages(hit_atom).unwrap();
+            let hit_last = hit_range.last.unwrap_or(hit_range.first);
+            let widened = addresses
+                .addresses
+                .resolve(ThreadRange::closed(
+                    hit_range.thread,
+                    hit_range.first.saturating_sub(context.before).max(1),
+                    hit_last + context.after,
+                ))
+                .unwrap();
+            let named = addresses
+                .addresses
+                .resolve(parse_read_ref(recipe_ref).unwrap().range.unwrap())
+                .unwrap();
+            recipes.shortened_at_first += usize::from(hit_range.first <= context.before);
+            recipes.shortened_at_last += usize::from(widened.shortened_to.is_some());
+            if !hit.clone().all(|ordinal| covered.contains(&ordinal))
+                || named.range != widened.range
+                || named.shortened_to.is_some()
+            {
+                recipes.gaps.push(format!(
+                    "{:?} {} with {context:?}: {recipe}\n{read}",
                     row.source, marker.record
                 ));
             }
         }
     }
-    (gaps, recipes)
+    recipes
 }
 
 #[test]
-fn every_agents_within_hit_recipe_reads_its_focus_messages() {
+fn every_agents_within_hit_recipe_reads_its_hit_and_its_context() {
     let mut gaps = Vec::new();
-    let mut recipes = 0;
+    let mut count = 0;
+    let (mut shortened_at_first, mut shortened_at_last) = (0, 0);
+    let contexts = [
+        HitContext::default(),
+        HitContext {
+            before: 0,
+            after: 0,
+        },
+        HitContext {
+            before: 3,
+            after: 2,
+        },
+    ];
     for session in every_record_sessions() {
-        let (session_gaps, session_recipes) = hit_recipes_not_read_back(&session);
-        gaps.extend(session_gaps);
-        recipes += session_recipes;
+        for context in contexts {
+            let recipes = hit_recipes(&session, context);
+            gaps.extend(recipes.gaps);
+            count += recipes.count;
+            shortened_at_first += recipes.shortened_at_first;
+            shortened_at_last += recipes.shortened_at_last;
+        }
     }
 
     assert!(gaps.is_empty(), "{}", gaps.join("\n"));
-    assert!(recipes > 0, "a marker search prints a recipe");
+    assert!(count > 0, "a marker search prints a recipe");
+    assert!(
+        shortened_at_first > 0 && shortened_at_last > 0,
+        "a recipe starts at its thread's first message and one ends at its last: \
+         {shortened_at_first} and {shortened_at_last}"
+    );
 }
 
 #[test]

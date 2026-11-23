@@ -7,7 +7,7 @@ use crate::agent::diagnostic::{
 use crate::agent::hidden_parts::HiddenParts;
 use crate::agent::record_writer::{
     CallCopy, CallRecord, CallResultRecord, HiddenRecord, MessageRecord, MessageRuns,
-    OmittedRecord, RecordSize, RecordWriter, continue_read_record, conversation_record,
+    OverBudgetRecord, RecordSize, RecordWriter, continue_read_record, conversation_record,
     handles_field, message_record_start, read_record,
 };
 use crate::agent::refs::{MessageRange, ResolvedConversation, ThreadRange};
@@ -85,7 +85,33 @@ impl FromStr for MessageLineRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadSlice {
     Lines(MessageLineRange),
-    Match { query: String, context: usize },
+    Match {
+        query: String,
+        context: MatchContext,
+    },
+}
+
+/// The content lines a `--match` slice shows before and after each
+/// matching line: `-B`, `-A` and `-C` of `agent read`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MatchContext {
+    pub before: usize,
+    pub after: usize,
+}
+
+impl MatchContext {
+    /// ` context=3`, or ` before-context=1 after-context=5` when the two
+    /// sides differ.
+    fn atoms(self) -> String {
+        if self.before == self.after {
+            format!(" context={}", self.before)
+        } else {
+            format!(
+                " before-context={} after-context={}",
+                self.before, self.after
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,18 +236,18 @@ impl ReadRequest<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub struct ProtocolFocus {
+pub struct ProtocolHit {
     pub conversation_full_ref: Option<String>,
     pub range: MessageRange,
-    /// The sub-agent of a `--focus sN:mA..mB`: its messages alone are
-    /// focused. `None` for the session's own messages.
+    /// The sub-agent of a `--hit sN:mA..mB`: its messages alone are the
+    /// hit. `None` for the session's own messages.
     pub subagent: Option<Handle>,
 }
 
-impl ProtocolFocus {
-    /// True when `entry` is of the focused conversation and, for a
-    /// sub-agent's focus, holds that sub-agent's messages.
-    fn is_of_focused_thread(&self, entry: &ReadEntry<'_>) -> bool {
+impl ProtocolHit {
+    /// True when `entry` is of the hit's conversation and, for a
+    /// sub-agent's hit, contains that sub-agent's messages.
+    fn is_of_hit_thread(&self, entry: &ReadEntry<'_>) -> bool {
         self.conversation_full_ref
             .as_deref()
             .is_none_or(|target| entry.conversation().resolved.reference.full_ref() == target)
@@ -237,7 +263,7 @@ impl ProtocolFocus {
 #[derive(Clone, Debug)]
 pub enum ReadPriority {
     Start,
-    Focus(ProtocolFocus),
+    Hit(ProtocolHit),
     /// Each request's last N shown messages, and each request's end first.
     Tail(NonZeroUsize),
 }
@@ -269,7 +295,7 @@ struct RenderedMessage<'a> {
     /// True when the message prints a record of its own. A message with a
     /// body always does.
     has_own_record: bool,
-    /// The read's flags, repeated in the read an omission marker names.
+    /// The read's flags, repeated in the read an `over-budget` record names.
     visibility: ContentVisibility,
     /// The sub-agent the message belongs to, in position 2.
     subagent: Option<SubagentTag>,
@@ -423,7 +449,7 @@ impl<'a> RenderedMessage<'a> {
         }
         if let Some(omission) = truncation.and_then(|truncation| truncation.omission.as_ref()) {
             let reference = self.conversation.resolved.reference.canonical();
-            writer.write_omitted_records(&self.omitted_record(&reference, omission));
+            writer.write_over_budget_records(&self.over_budget_record(&reference, omission));
         }
     }
 
@@ -463,9 +489,9 @@ impl<'a> RenderedMessage<'a> {
 
     /// The truncation that keeps the most of the content within `room`, as
     /// `chars` counts the output of each; `None` when the whole content fits.
-    /// When no truncation fits, the omission marker alone: a read never drops
-    /// content without naming the read that shows it. `chars` counts at
-    /// least the characters a truncation keeps.
+    /// When no truncation fits, the `over-budget` record alone: a read never
+    /// drops content without naming the read that shows it. `chars` counts
+    /// at least the characters a truncation keeps.
     fn truncated_to_fit(
         &self,
         room: usize,
@@ -533,12 +559,12 @@ impl<'a> RenderedMessage<'a> {
 
     /// The fields of the records naming what `omission` leaves out of the
     /// message's content.
-    fn omitted_record<'r>(
+    fn over_budget_record<'r>(
         &'r self,
         reference: &'r str,
         omission: &'r Omission,
-    ) -> OmittedRecord<'r> {
-        OmittedRecord {
+    ) -> OverBudgetRecord<'r> {
+        OverBudgetRecord {
             ordinal: self.message.ordinal,
             reference,
             first_line: omission.first_line,
@@ -1174,9 +1200,9 @@ impl<'a> HiddenRun<'a> {
     }
 }
 
-/// The `agent read` header. `cut=`, `omit=`, `tz=` and the `hidden-` atoms
-/// depend on the entries the budget selects, and `full=` is set once they
-/// are selected; the other atoms are fixed when the header is made.
+/// The `agent read` header. `cut=`, `over-budget=`, `tz=` and the `hidden-`
+/// atoms depend on the entries the budget selects, and `full=` is set once
+/// they are selected; the other atoms are fixed when the header is made.
 struct ReadHeader {
     budget: Option<usize>,
     /// The budget printing every entry whole: `full=` on a header whose
@@ -1209,9 +1235,15 @@ impl ReadHeader {
         }
     }
 
-    fn line(&self, cut: &str, omit: &str, offset: FixedOffset, hidden_atoms: &str) -> String {
+    fn line(
+        &self,
+        cut: &str,
+        over_budget: &str,
+        offset: FixedOffset,
+        hidden_atoms: &str,
+    ) -> String {
         format!(
-            "protocol agent-read cut={} chars={}{} policy={}{} omit={omit}{}{}{hidden_atoms}{}\n",
+            "protocol agent-read cut={} chars={}{} policy={}{} over-budget={over_budget}{}{}{hidden_atoms}{}\n",
             escape_atom(cut),
             budget_atom(self.budget),
             full_atom(cut, self.full),
@@ -1224,8 +1256,8 @@ impl ReadHeader {
     }
 
     /// The fixed atoms: the header a budget estimate counts beyond `cut=`,
-    /// `chars=`, `full=`, `omit=` and the `hidden-` atoms. Every offset is as long as
-    /// the offset of `written_at`.
+    /// `chars=`, `full=`, `over-budget=` and the `hidden-` atoms. Every
+    /// offset is as long as the offset of `written_at`.
     fn fixed_atoms(&self, written_at: DateTime<Zone>) -> String {
         format!(
             " policy={}{}{}{}{}",
@@ -1257,11 +1289,11 @@ fn last_atom(requests: &[ReadRequest<'_>]) -> String {
 #[cfg(test)]
 pub fn format_read(
     requests: &[ReadRequest<'_>],
-    focus: Option<ProtocolFocus>,
+    hit: Option<ProtocolHit>,
     slice: Option<&ReadSlice>,
     options: ProtocolOptions,
 ) -> Result<String> {
-    let priority = focus.map_or(ReadPriority::Start, ReadPriority::Focus);
+    let priority = hit.map_or(ReadPriority::Start, ReadPriority::Hit);
     format_read_with_warnings(
         requests,
         priority,
@@ -1327,9 +1359,9 @@ pub fn format_read_with_warnings(
         warning_count,
         &warning_records,
     );
-    let (focus, kept_end) = match priority {
+    let (hit, kept_end) = match priority {
         ReadPriority::Start => (None, KeptEnd::Start),
-        ReadPriority::Focus(focus) => (Some(focus), KeptEnd::Start),
+        ReadPriority::Hit(hit) => (Some(hit), KeptEnd::Start),
         ReadPriority::Tail(_) => (
             None,
             KeptEnd::RequestEnds(TailOrder::new(&request_entry_counts)),
@@ -1337,7 +1369,7 @@ pub fn format_read_with_warnings(
     };
 
     let budget = budget_beside_warnings(options.budget, &warning_records);
-    let protected = focused_indices(&entries, focus.as_ref());
+    let protected = hit_indices(&entries, hit.as_ref());
     let header_atoms = header.fixed_atoms(written_at);
     let fixed_parts = ReadFixedParts {
         header_atoms: &header_atoms,
@@ -1347,7 +1379,7 @@ pub fn format_read_with_warnings(
         mut selected,
         truncated,
         full,
-    } = kept_end.select(&entries, focus, budget, fixed_parts);
+    } = kept_end.select(&entries, hit, budget, fixed_parts);
     header.full = full;
     let spans = entries.iter().map(EntrySpan::of).collect::<Vec<_>>();
     let render = |entries: &[ReadEntry<'_>], selected: &[usize], cut: &str, size| {
@@ -1357,7 +1389,7 @@ pub fn format_read_with_warnings(
         let hidden_atoms = hidden_in(entries, selected.iter().copied()).total_atoms();
         let mut output = header.line(
             cut,
-            &omitted_message_ranges(&spans, &selected_set),
+            &over_budget_ranges(&spans, &selected_set),
             writer.header_offset(written_at),
             &hidden_atoms,
         );
@@ -1471,7 +1503,8 @@ pub(crate) fn outline_segments(
 /// The outline of the messages `request` names: a range, a sub-agent's
 /// alone, or the whole session, its times in `written_at`'s zone.
 /// `written_at` sets the `tz=` offset of an outline that does not show a
-/// time.
+/// time. The header's `hidden-` atoms count what `options` hide in those
+/// messages, as an unbudgeted read with them counts it.
 pub fn format_outline_with_warnings(
     request: &ReadRequest<'_>,
     options: ProtocolOptions,
@@ -1482,19 +1515,22 @@ pub fn format_outline_with_warnings(
     let (resolved, transcript) = (request.resolved, request.transcript);
     let index = TranscriptIndex::of(transcript);
     let requested = requested_messages(request, &index)?;
-    let in_window = window_atom(
-        options.window,
-        ThreadCounts::of(
-            requested
-                .iter()
-                .copied()
-                .filter(|message| is_in_window(message, options.window)),
-        ),
-    );
+    let requested_in_window = || {
+        requested
+            .iter()
+            .copied()
+            .filter(|message| is_in_window(message, options.window))
+    };
+    let in_window = window_atom(options.window, ThreadCounts::of(requested_in_window()));
+    let mut hidden = HiddenParts::default();
+    for message in requested_in_window() {
+        hidden.add(&hidden_parts(message, options.visibility()));
+    }
+    let hidden_atoms = hidden.total_atoms();
     let messages = OutlineMessages::new(request, requested, &index, options, written_at);
     let offset = messages.header_offset;
     let header_fields = format!(
-        "policy={}{}{}{}{}{in_window}",
+        "policy={}{}{}{}{}{in_window}{hidden_atoms}",
         options.visibility().atom(),
         last_atom(std::slice::from_ref(request)),
         session_count_atoms(
@@ -1616,9 +1652,9 @@ fn truncated_outline(
     } = header;
     let warning_record_count = warning_records.len();
     let keeping = |keep: usize| {
-        let omitted = records.len() - keep;
+        let over_budget_records = records.len() - keep;
         let mut truncated = format!(
-            "protocol agent-outline cut=tail chars={budget}{} {header_fields} omitted-records={omitted} warnings={warning_count} warning-records={warning_record_count}\n",
+            "protocol agent-outline cut=tail chars={budget}{} {header_fields} over-budget-records={over_budget_records} warnings={warning_count} warning-records={warning_record_count}\n",
             full_atom("tail", Some(full))
         );
         truncated.push_str(&conversation);
@@ -2618,14 +2654,14 @@ fn apply_read_slice<'a>(
             selected = matches
                 .iter()
                 .flat_map(|line| {
-                    line.saturating_sub(*context).max(1)
-                        ..=line.saturating_add(*context).min(lines.len())
+                    line.saturating_sub(context.before).max(1)
+                        ..=line.saturating_add(context.after).min(lines.len())
                 })
                 .collect();
             rendered.slice = Some(format!(
-                "match={} context={} hits={}",
+                "match={}{} hits={}",
                 escape_atom(query),
-                context,
+                context.atoms(),
                 matches.len()
             ));
         }
@@ -2841,7 +2877,7 @@ const TRUNCATION_FLOOR_CHARS: usize = 200;
 /// `selected`: each run of consecutive messages as one ref, `;` between
 /// refs, then the flags that show every omitted entry.
 fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> Vec<String> {
-    let mut groups: Vec<OmittedEntries<'_, '_>> = Vec::new();
+    let mut groups: Vec<OverBudgetEntries<'_, '_>> = Vec::new();
     for (index, span) in spans.iter().enumerate() {
         if selected.contains(&index) {
             continue;
@@ -2852,7 +2888,7 @@ fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> 
         {
             Some(group) => group.add(span),
             None => {
-                let mut group = OmittedEntries {
+                let mut group = OverBudgetEntries {
                     first: span,
                     runs: MessageRuns::default(),
                     flags: ContentVisibility::default(),
@@ -2876,20 +2912,20 @@ fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> 
 }
 
 /// The entries a budget omits from one conversation.
-struct OmittedEntries<'s, 'a> {
+struct OverBudgetEntries<'s, 'a> {
     first: &'s EntrySpan<'a>,
     runs: MessageRuns,
     flags: ContentVisibility,
 }
 
-impl<'s, 'a> OmittedEntries<'s, 'a> {
+impl<'s, 'a> OverBudgetEntries<'s, 'a> {
     fn add(&mut self, span: &'s EntrySpan<'a>) {
         self.runs.push(span.first, span.last);
         self.flags.merge(span.flags);
     }
 }
 
-/// An entry's conversation and messages: the `omit=` atom and the
+/// An entry's conversation and messages: the `over-budget=` atom and the
 /// `continue read` records name them when a budget omits the entry.
 #[derive(Clone, Debug)]
 struct EntrySpan<'a> {
@@ -2988,11 +3024,11 @@ impl HiddenEntriesRecipe<'_, '_> {
     }
 }
 
-/// The `omit=` atom: the refs reading exactly the messages of the entries
-/// not in `selected`, each run of consecutive omitted entries of one
-/// conversation named on its own, each ref after its conversation's when the
-/// read shows several.
-fn omitted_message_ranges(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> String {
+/// The `over-budget=` atom: the refs reading exactly the messages of the
+/// entries not in `selected`, each run of consecutive omitted entries of one
+/// conversation named on its own, each ref after its conversation's when
+/// the read shows several.
+fn over_budget_ranges(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> String {
     let qualify = spans
         .first()
         .is_some_and(|first| spans.iter().any(|span| span.full_ref != first.full_ref));
@@ -3026,18 +3062,18 @@ fn omitted_message_ranges(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -
     }
 }
 
-/// The entries holding a message inside `focus`.
-fn focused_indices(entries: &[ReadEntry<'_>], focus: Option<&ProtocolFocus>) -> BTreeSet<usize> {
-    let Some(focus) = focus else {
+/// The entries containing a message inside `hit`.
+fn hit_indices(entries: &[ReadEntry<'_>], hit: Option<&ProtocolHit>) -> BTreeSet<usize> {
+    let Some(hit) = hit else {
         return BTreeSet::new();
     };
     entries
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| {
-            (focus.is_of_focused_thread(entry)
-                && focus.range.start <= entry.last_ordinal()
-                && entry.first_ordinal() <= focus.range.end)
+            (hit.is_of_hit_thread(entry)
+                && hit.range.start <= entry.last_ordinal()
+                && entry.first_ordinal() <= hit.range.end)
                 .then_some(index)
         })
         .collect()
@@ -3045,7 +3081,7 @@ fn focused_indices(entries: &[ReadEntry<'_>], focus: Option<&ProtocolFocus>) -> 
 
 /// The part of a read its budget keeps first.
 enum KeptEnd {
-    /// The read's start, or its focus and the entries around it.
+    /// The read's start, or its hit and the entries around it.
     Start,
     RequestEnds(TailOrder),
 }
@@ -3054,12 +3090,12 @@ impl KeptEnd {
     fn select(
         &self,
         entries: &[ReadEntry<'_>],
-        focus: Option<ProtocolFocus>,
+        hit: Option<ProtocolHit>,
         budget: Option<usize>,
         fixed_parts: ReadFixedParts<'_>,
     ) -> BudgetSelection {
         match self {
-            Self::Start => select_for_budget(entries, focus, budget, fixed_parts),
+            Self::Start => select_for_budget(entries, hit, budget, fixed_parts),
             Self::RequestEnds(order) => {
                 select_request_ends_for_budget(entries, order, budget, fixed_parts)
             }
@@ -3360,13 +3396,13 @@ impl<'h, 'e> ReadPartSizes<'h, 'e> {
             &selected.iter().copied().collect::<Vec<_>>(),
             !truncated.is_empty(),
         );
-        let omitted = omitted_message_ranges(&self.spans, selected);
+        let omitted = over_budget_ranges(&self.spans, selected);
         let mut hidden = HiddenParts::default();
         for &index in selected {
             hidden.add(&self.hidden[index]);
         }
         let mut chars = format!(
-            "protocol agent-read cut={cut} chars={} omit={omitted}{header_atoms}{}\n",
+            "protocol agent-read cut={cut} chars={} over-budget={omitted}{header_atoms}{}\n",
             full_atom(&cut, full),
             hidden.total_atoms()
         )
@@ -3403,12 +3439,12 @@ impl<'h, 'e> ReadPartSizes<'h, 'e> {
     }
 }
 
-/// A selection that grows from a read's start or focus, one neighbouring
+/// A selection that grows from a read's start or hit, one neighbouring
 /// entry at a time, while the entries fit `budget`.
 struct GrowingSelection<'l, 'h, 'e> {
     layout: &'l CompactReadLayout<'h, 'e>,
     budget: usize,
-    /// True without a focus: an oversized entry is kept truncated.
+    /// True without a hit: an oversized entry is kept truncated.
     truncates_to_fit: bool,
     selected: BTreeSet<usize>,
     truncated: BTreeSet<usize>,
@@ -3444,21 +3480,21 @@ impl GrowingSelection<'_, '_, '_> {
 
 fn select_for_budget(
     entries: &[ReadEntry<'_>],
-    focus: Option<ProtocolFocus>,
+    hit: Option<ProtocolHit>,
     budget: Option<usize>,
     fixed_parts: ReadFixedParts<'_>,
 ) -> BudgetSelection {
-    select_for_budget_with_work(entries, focus, budget, fixed_parts).0
+    select_for_budget_with_work(entries, hit, budget, fixed_parts).0
 }
 
-/// The read's start, or its focus, then the entries next to it while they
-/// fit `budget`. Without a focus, an oversized entry is kept truncated when
+/// The read's start, or its hit, then the entries next to it while they
+/// fit `budget`. Without a hit, an oversized entry is kept truncated when
 /// its header and its [`TRUNCATION_FLOOR_CHARS`] fit, and the selection
-/// continues with the entries after it. With a focus, the entries around it
+/// continues with the entries after it. With a hit, the entries around it
 /// are shown whole or omitted.
 fn select_for_budget_with_work(
     entries: &[ReadEntry<'_>],
-    focus: Option<ProtocolFocus>,
+    hit: Option<ProtocolHit>,
     budget: Option<usize>,
     fixed_parts: ReadFixedParts<'_>,
 ) -> (BudgetSelection, SelectionWork) {
@@ -3477,14 +3513,14 @@ fn select_for_budget_with_work(
         );
     }
 
-    let mut selected = focused_indices(entries, focus.as_ref());
+    let mut selected = hit_indices(entries, hit.as_ref());
     if selected.is_empty() && !entries.is_empty() {
         selected.insert(0);
     }
     let mut growing = GrowingSelection {
         layout: &layout,
         budget,
-        truncates_to_fit: focus.is_none(),
+        truncates_to_fit: hit.is_none(),
         selected,
         truncated: BTreeSet::new(),
         work,
@@ -3552,7 +3588,7 @@ fn cut_marker(total: usize, selected: &[usize]) -> String {
         parts.push("head");
     }
     if selected.windows(2).any(|pair| pair[1] != pair[0] + 1) || (first > 0 && last + 1 < total) {
-        parts.push("focus");
+        parts.push("hit");
     }
     if last + 1 < total {
         parts.push("tail");
@@ -3634,8 +3670,8 @@ mod tests {
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{
         assert_each_budget_cuts_short_or_ends_with_warnings, cuts_checking_full, day_record,
-        local_time, record_time, source, subagent_text_message, text_message, text_message_at,
-        warnings_of_two_kinds, written_at,
+        lines_around, local_time, record_time, source, subagent_text_message, text_message,
+        text_message_at, warnings_of_two_kinds, written_at,
     };
     use crate::agent::transcript::AgentPartSource;
     use crate::log_entry::Tool;
@@ -3715,7 +3751,7 @@ mod tests {
 
     fn legacy_select_for_budget(
         messages: &[ReadEntry<'_>],
-        focus: Option<ProtocolFocus>,
+        hit: Option<ProtocolHit>,
         budget: usize,
     ) -> Vec<usize> {
         let spans = messages.iter().map(EntrySpan::of).collect::<Vec<_>>();
@@ -3723,9 +3759,9 @@ mod tests {
             let selected_list = selected.iter().copied().collect::<Vec<_>>();
             let cut = read_cut(messages.len(), &selected_list, false);
             let header = format!(
-                "protocol agent-read cut={cut} chars={budget}{} omit={}\n",
+                "protocol agent-read cut={cut} chars={budget}{} over-budget={}\n",
                 full_atom(&cut, full),
-                omitted_message_ranges(&spans, selected)
+                over_budget_ranges(&spans, selected)
             );
             let records = written(messages, &selected_list);
             let continuation = continuation_records(&spans, selected).concat();
@@ -3741,11 +3777,11 @@ mod tests {
         ));
         let render_chars = |selected: &BTreeSet<usize>| render_chars(selected, full);
         let mut selected = BTreeSet::new();
-        if let Some(focus) = focus {
+        if let Some(hit) = hit {
             for (index, entry) in messages.iter().enumerate() {
-                if focus.is_of_focused_thread(entry)
-                    && focus.range.start <= entry.first_ordinal()
-                    && entry.first_ordinal() <= focus.range.end
+                if hit.is_of_hit_thread(entry)
+                    && hit.range.start <= entry.first_ordinal()
+                    && entry.first_ordinal() <= hit.range.end
                 {
                     selected.insert(index);
                 }
@@ -3801,15 +3837,15 @@ mod tests {
         let messages = shown_entries(&resolved, &transcript, &index);
 
         for budget in (100..=4_000).step_by(37) {
-            let focus = ProtocolFocus {
+            let hit = ProtocolHit {
                 subagent: None,
                 conversation_full_ref: Some(resolved.reference.full_ref()),
                 range: MessageRange::single(20),
             };
-            let expected = legacy_select_for_budget(&messages, Some(focus.clone()), budget);
+            let expected = legacy_select_for_budget(&messages, Some(hit.clone()), budget);
             let (actual, work) = select_for_budget_with_work(
                 &messages,
-                Some(focus),
+                Some(hit),
                 Some(budget),
                 ReadFixedParts::default(),
             );
@@ -3892,15 +3928,15 @@ mod tests {
         assert_eq!(days_written, 2);
 
         for budget in (100..=3_000).step_by(31) {
-            let focus = ProtocolFocus {
+            let hit = ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(20),
             };
-            let expected = legacy_select_for_budget(&messages, Some(focus.clone()), budget);
+            let expected = legacy_select_for_budget(&messages, Some(hit.clone()), budget);
             let (actual, _) = select_for_budget_with_work(
                 &messages,
-                Some(focus),
+                Some(hit),
                 Some(budget),
                 ReadFixedParts::default(),
             );
@@ -3967,7 +4003,7 @@ mod tests {
         .unwrap();
 
         assert!(output.starts_with(&format!(
-            "protocol agent-read cut=none chars=6000 policy=text omit=none{} hidden-tools=1 hidden-thinking=1\n",
+            "protocol agent-read cut=none chars=6000 policy=text over-budget=none{} hidden-tools=1 hidden-thinking=1\n",
             tz_now()
         )));
         assert!(output.contains("project=pr_"));
@@ -4015,7 +4051,7 @@ mod tests {
     }
 
     #[test]
-    fn read_preserves_focus_when_budget_truncates() {
+    fn read_preserves_hit_when_budget_truncates() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(
             (1..=7)
@@ -4037,7 +4073,7 @@ mod tests {
                 call: None,
                 shortened_to: None,
             }],
-            Some(ProtocolFocus {
+            Some(ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(4),
@@ -4052,7 +4088,7 @@ mod tests {
 
         assert!(output.starts_with("protocol agent-read cut="));
         assert!(output.lines().next().unwrap().contains("chars=800"));
-        assert!(output.lines().next().unwrap().contains("omit="));
+        assert!(output.lines().next().unwrap().contains("over-budget="));
         assert!(output.contains("\nm4 user\n"), "{output}");
         assert!(output.contains("message 4 with padding"));
     }
@@ -4083,7 +4119,7 @@ mod tests {
         .unwrap();
 
         assert!(output.starts_with(&format!(
-            "protocol agent-read cut=none chars=none policy=text omit=none{}\n",
+            "protocol agent-read cut=none chars=none policy=text over-budget=none{}\n",
             tz_now()
         )));
         assert!(output.contains("\nm1 user\n| one\n"), "{output}");
@@ -4142,7 +4178,7 @@ mod tests {
             None,
             Some(&ReadSlice::Match {
                 query: "needle".to_string(),
-                context: 1,
+                context: lines_around(1),
             }),
             options(),
         )
@@ -4152,6 +4188,39 @@ mod tests {
         assert!(output.contains("|  1: zero\n| >2: Needle first\n|  3: two\n| ...\n"));
         assert!(output.contains("|  5: four\n| >6: needle second\n|  7: six\n"));
         assert!(!output.contains("4: three"));
+    }
+
+    #[test]
+    fn match_slice_shows_lines_before_and_after_each_match_as_its_sides_count_them() {
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "zero\none\nNeedle\nthree\nfour\nfive",
+        )]);
+        let read_with = |before, after| {
+            read_slice(
+                &transcript,
+                ReadSlice::Match {
+                    query: "needle".to_owned(),
+                    context: MatchContext { before, after },
+                },
+            )
+        };
+
+        let after_only = read_with(0, 2);
+        let past_both_ends = read_with(5, 9);
+
+        assert!(
+            after_only.contains(" slice=match=needle before-context=0 after-context=2 hits=1 ")
+                && after_only.ends_with("\n| >3: Needle\n|  4: three\n|  5: four\n"),
+            "two lines after the match and none before: {after_only}"
+        );
+        assert!(
+            past_both_ends.contains(" before-context=5 after-context=9 hits=1 ")
+                && past_both_ends.contains("\n|  1: zero\n")
+                && past_both_ends.ends_with("\n|  6: five\n"),
+            "the message's first and last lines end the context: {past_both_ends}"
+        );
     }
 
     #[test]
@@ -4170,7 +4239,7 @@ mod tests {
             None,
             Some(&ReadSlice::Match {
                 query: "needle".to_string(),
-                context: 3,
+                context: lines_around(3),
             }),
             options(),
         )
@@ -4252,7 +4321,7 @@ mod tests {
                 None,
                 Some(&ReadSlice::Match {
                     query: "needle".to_string(),
-                    context: 0,
+                    context: lines_around(0),
                 }),
                 ProtocolOptions {
                     budget,
@@ -4265,7 +4334,7 @@ mod tests {
         let output = sliced(Some(400));
 
         assert!(output.starts_with(&format!(
-            "protocol agent-read cut=body chars=400{} policy=text omit=none{}\n",
+            "protocol agent-read cut=body chars=400{} policy=text over-budget=none{}\n",
             full_atom_printing(&sliced(None)),
             tz_now()
         )));
@@ -4274,7 +4343,7 @@ mod tests {
         assert!(
             output
                 .lines()
-                .any(|line| is_omitted_record(line) && line.ends_with("..20")),
+                .any(|line| is_over_budget_record(line) && line.ends_with("..20")),
             "{output}"
         );
     }
@@ -4321,7 +4390,7 @@ mod tests {
             &text_and_two_calls(),
             ReadSlice::Match {
                 query: "cargo test".to_owned(),
-                context: 0,
+                context: lines_around(0),
             },
         );
 
@@ -4362,7 +4431,7 @@ mod tests {
     }
 
     #[test]
-    fn non_focused_oversized_read_respects_budget_with_header_only_cut() {
+    fn oversized_read_without_hit_respects_budget_with_header_only_cut() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(vec![text_message(
             1,
@@ -4392,7 +4461,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_oversized_message_is_truncated_inside_message() {
+    fn oversized_hit_message_is_truncated_inside_message() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(vec![
             text_message(1, AgentMessageRole::User, "before"),
@@ -4408,7 +4477,7 @@ mod tests {
                 call: None,
                 shortened_to: None,
             }],
-            Some(ProtocolFocus {
+            Some(ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(2),
@@ -4425,7 +4494,7 @@ mod tests {
         assert!(output.contains("\nm2\n"), "{output}");
         assert!(
             output.contains(&format!(
-                "\nm2 omitted lines=1..1\nread ref={}:m2 lines=1..1 tools=false tool-results=false thinking=false subagents=false\n",
+                "\nm2 over-budget lines=1..1\nread ref={}:m2 lines=1..1 tools=false tool-results=false thinking=false subagents=false\n",
                 resolved.reference.canonical()
             )),
             "{output}"
@@ -4433,7 +4502,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_focused_messages_share_hard_budget() {
+    fn multiple_hit_messages_share_hard_budget() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(
             (1..=4)
@@ -4441,7 +4510,7 @@ mod tests {
                     text_message(
                         ordinal,
                         AgentMessageRole::Assistant,
-                        &format!("focus {ordinal} {}", "x".repeat(300)),
+                        &format!("hit {ordinal} {}", "x".repeat(300)),
                     )
                 })
                 .collect(),
@@ -4455,7 +4524,7 @@ mod tests {
                 call: None,
                 shortened_to: None,
             }],
-            Some(ProtocolFocus {
+            Some(ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange { start: 2, end: 3 },
@@ -4471,7 +4540,7 @@ mod tests {
         assert!(output.chars().count() <= 420);
         assert!(output.contains("\nm2\n"), "{output}");
         assert!(output.contains("\nm3\n"), "{output}");
-        assert!(output.contains("omit=m1,m4"));
+        assert!(output.contains("over-budget=m1,m4"));
     }
 
     #[test]
@@ -4526,7 +4595,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_focus_only_matches_target_conversation() {
+    fn qualified_hit_only_matches_target_conversation() {
         let first = resolved("first.jsonl");
         let second = resolved("second.jsonl");
         let first_transcript = transcript(vec![
@@ -4543,7 +4612,7 @@ mod tests {
                     whole_session_request(&first, &first_transcript),
                     whole_session_request(&second, &second_transcript),
                 ],
-                Some(ProtocolFocus {
+                Some(ProtocolHit {
                     subagent: None,
                     conversation_full_ref: Some(second.reference.full_ref()),
                     range: MessageRange::single(2),
@@ -4711,12 +4780,12 @@ mod tests {
     }
 
     /// The address opening each message, call and hidden record of `output`:
-    /// `m7`, `m7.2` or `m7..m9`. A truncated message's `omitted` record is
+    /// `m7`, `m7.2` or `m7..m9`. A truncated message's `over-budget` record is
     /// left out.
     fn addresses(output: &str) -> Vec<&str> {
         records(output)
             .into_iter()
-            .filter(|record| !is_omitted_record(record))
+            .filter(|record| !is_over_budget_record(record))
             .filter_map(|record| record.split_whitespace().next())
             .filter(|address| {
                 let message = match address.split_once(':') {
@@ -4785,7 +4854,7 @@ mod tests {
         assert_eq!(
             records[0],
             format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{} hidden-tools=2 hidden-tool-results=2 hidden-thinking=1",
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none{} hidden-tools=2 hidden-tool-results=2 hidden-thinking=1",
                 tz_at("2026-10-14T15:41:28Z")
             )
         );
@@ -4968,7 +5037,7 @@ mod tests {
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=tail chars={budget}{} policy=text omit=m3..m5{}\n",
+                "protocol agent-read cut=tail chars={budget}{} policy=text over-budget=m3..m5{}\n",
                 full_atom_printing(&unbudgeted),
                 tz_now()
             )),
@@ -5028,9 +5097,9 @@ mod tests {
             output.starts_with("protocol agent-read cut=tail "),
             "{output}"
         );
-        assert!(output.contains(" omit=m2 "), "{output}");
+        assert!(output.contains(" over-budget=m2 "), "{output}");
         assert!(output.contains("| short answer\n"), "{output}");
-        assert!(!output.contains(OMISSION_MARKER), "{output}");
+        assert!(!output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
     /// From 15:40 to 15:45 UTC on 2026-10-14, both included.
@@ -5069,26 +5138,26 @@ mod tests {
 
         assert!(
             unbudgeted.starts_with(&format!(
-                "protocol agent-read cut=none chars=none policy=text omit=none{} messages-in-window=2\n",
+                "protocol agent-read cut=none chars=none policy=text over-budget=none{} messages-in-window=2\n",
                 tz_at(at)
             )),
             "{unbudgeted}"
         );
         assert!(output.chars().count() <= budget, "{output}");
-        assert!(output.contains(" omit=m2 "), "{output}");
+        assert!(output.contains(" over-budget=m2 "), "{output}");
         assert!(output.contains("| short answer\n"), "{output}");
-        assert!(!output.contains(OMISSION_MARKER), "{output}");
+        assert!(!output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
-    /// Part of a truncated message's `omitted` record.
-    const OMISSION_MARKER: &str = " omitted lines=";
+    /// Part of a truncated message's `over-budget` record.
+    const OVER_BUDGET_MARKER: &str = " over-budget lines=";
 
-    fn is_omitted_record(line: &str) -> bool {
-        !line.starts_with('|') && line.contains(OMISSION_MARKER)
+    fn is_over_budget_record(line: &str) -> bool {
+        !line.starts_with('|') && line.contains(OVER_BUDGET_MARKER)
     }
 
     /// The characters each truncated content of `output` keeps: the content
-    /// lines between a message's first record and its `omitted` record,
+    /// lines between a message's first record and its `over-budget` record,
     /// joined by line breaks. The lines below its call records count too,
     /// across a `day` record between them.
     fn kept_chars_of_truncations(output: &str) -> Vec<usize> {
@@ -5096,7 +5165,7 @@ mod tests {
         let mut content: Vec<&str> = Vec::new();
         let mut message = None;
         for line in output.lines() {
-            if is_omitted_record(line) {
+            if is_over_budget_record(line) {
                 kept.push(content.join("\n").chars().count());
             } else if let Some(text) = line.strip_prefix("| ").or((line == "|").then_some("")) {
                 content.push(text);
@@ -5138,14 +5207,14 @@ mod tests {
         assert!(output.chars().count() > budget - 40, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=body chars=1000{} policy=text omit=none{}\n",
+                "protocol agent-read cut=body chars=1000{} policy=text over-budget=none{}\n",
                 full_atom_printing(&unbudgeted),
                 tz_now()
             )),
             "{output}"
         );
         assert!(output.contains("| long output line\n"), "{output}");
-        assert!(output.contains(OMISSION_MARKER), "{output}");
+        assert!(output.contains(OVER_BUDGET_MARKER), "{output}");
         assert!(output.contains("| question three\n"), "{output}");
     }
 
@@ -5258,10 +5327,10 @@ mod tests {
     }
 
     #[test]
-    fn focused_read_omits_oversized_neighbour_whole() {
+    fn read_with_hit_omits_oversized_neighbour_whole() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
-            text_message(1, User, "the focused question"),
+            text_message(1, User, "the hit question"),
             text_message(2, Assistant, &"z".repeat(3_000)),
             text_message(3, User, "after"),
         ]);
@@ -5275,7 +5344,7 @@ mod tests {
                 call: None,
                 shortened_to: None,
             }],
-            Some(ProtocolFocus {
+            Some(ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(1),
@@ -5285,9 +5354,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.contains(" omit=m2..m3"), "{output}");
-        assert!(output.contains("| the focused question\n"), "{output}");
-        assert!(!output.contains(OMISSION_MARKER), "{output}");
+        assert!(output.contains(" over-budget=m2..m3"), "{output}");
+        assert!(output.contains("| the hit question\n"), "{output}");
+        assert!(!output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
     /// m3 has no time and m6 falls after the window: both are outside it.
@@ -5340,7 +5409,7 @@ mod tests {
         let at = |utc| record_time(utc, utc);
         assert!(
             records[0].ends_with(&format!(
-                " omit=none{} messages-in-window=4 hidden-tools=2",
+                " over-budget=none{} messages-in-window=4 hidden-tools=2",
                 tz_at("2026-10-14T15:41:00Z")
             )),
             "{output}"
@@ -5359,7 +5428,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_inside_hidden_run_keeps_run() {
+    fn hit_inside_hidden_run_keeps_run() {
         use AgentMessageRole::{Assistant, User};
         let transcript = transcript(vec![
             text_message(1, User, &"long question ".repeat(50)),
@@ -5372,7 +5441,7 @@ mod tests {
             text_message(4, Assistant, &"long answer ".repeat(50)),
         ]);
 
-        let read_focused = |budget| {
+        let read_with_hit = |budget| {
             format_read(
                 &[ReadRequest {
                     resolved: &resolved("session.jsonl"),
@@ -5382,7 +5451,7 @@ mod tests {
                     call: None,
                     shortened_to: None,
                 }],
-                Some(ProtocolFocus {
+                Some(ProtocolHit {
                     subagent: None,
                     conversation_full_ref: None,
                     range: MessageRange::single(3),
@@ -5396,12 +5465,12 @@ mod tests {
             .unwrap()
         };
 
-        let output = read_focused(Some(400));
+        let output = read_with_hit(Some(400));
 
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=head+focus+tail chars=400{} policy=text omit=m1,m4{} hidden-tools=1 hidden-tool-results=1\n",
-                full_atom_printing(&read_focused(None)),
+                "protocol agent-read cut=head+hit+tail chars=400{} policy=text over-budget=m1,m4{} hidden-tools=1 hidden-tool-results=1\n",
+                full_atom_printing(&read_with_hit(None)),
                 tz_now()
             )),
             "{output}"
@@ -5438,7 +5507,7 @@ mod tests {
 
         assert!(
             default.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{} hidden-subagent-messages=1\n",
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none{} hidden-subagent-messages=1\n",
                 tz_now()
             )),
             "{default}"
@@ -5449,7 +5518,7 @@ mod tests {
         );
         assert!(
             with_subagents.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text+subagents omit=none{} hidden-tools=1\n",
+                "protocol agent-read cut=none chars=6000 policy=text+subagents over-budget=none{} hidden-tools=1\n",
                 tz_now()
             )),
             "{with_subagents}"
@@ -5654,7 +5723,7 @@ mod tests {
         assert!(output.chars().count() <= budget, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=head chars={budget}{} policy=text omit=m1..m3{}\n",
+                "protocol agent-read cut=head chars={budget}{} policy=text over-budget=m1..m3{}\n",
                 full_atom_printing(&unbudgeted),
                 tz_at("2026-10-14T15:44:00Z")
             )),
@@ -5693,7 +5762,7 @@ mod tests {
         assert!(output.chars().count() <= 1_000, "{output}");
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=body chars=1000{} policy=text omit=none{}\n",
+                "protocol agent-read cut=body chars=1000{} policy=text over-budget=none{}\n",
                 full_atom_printing(&unbudgeted),
                 tz_now()
             )),
@@ -5701,7 +5770,7 @@ mod tests {
         );
         assert!(output.contains("| run the tests\n"), "{output}");
         assert!(output.contains("| and show the output\n"), "{output}");
-        assert!(output.contains(OMISSION_MARKER), "{output}");
+        assert!(output.contains(OVER_BUDGET_MARKER), "{output}");
     }
 
     /// At the smallest budget that keeps a message, m2 truncated to its
@@ -5721,7 +5790,7 @@ mod tests {
 
         assert!(output.chars().count() <= budget, "{output}");
         assert_eq!(addresses(&output), ["m2"], "{output}");
-        assert!(output.contains(OMISSION_MARKER), "{output}");
+        assert!(output.contains(OVER_BUDGET_MARKER), "{output}");
         assert!(!output.contains("short reply"), "{output}");
     }
 
@@ -5880,15 +5949,15 @@ mod tests {
             .unwrap()
     }
 
-    fn focus_on(message: usize) -> Option<ProtocolFocus> {
-        Some(ProtocolFocus {
+    fn hit_on(message: usize) -> Option<ProtocolHit> {
+        Some(ProtocolHit {
             subagent: None,
             conversation_full_ref: None,
             range: MessageRange::single(message),
         })
     }
 
-    /// The budget keeps the focus, m1, and omits the hidden run m2..m5 and
+    /// The budget keeps the hit, m1, and omits the hidden run m2..m5 and
     /// m6.
     #[test]
     fn continue_read_record_names_flags_its_omitted_messages_need() {
@@ -5898,7 +5967,7 @@ mod tests {
 
         let output = at_smallest_fitting_budget(|budget| {
             let requests = std::slice::from_ref(&request);
-            format_read(requests, focus_on(1), None, with_budget(budget)).unwrap()
+            format_read(requests, hit_on(1), None, with_budget(budget)).unwrap()
         });
 
         assert!(output.contains("\nm1 user\n"), "{output}");
@@ -5911,7 +5980,7 @@ mod tests {
         );
     }
 
-    /// The read of the scout keeps the focus, its launch m2, and omits its
+    /// The read of the scout keeps the hit, its launch m2, and omits its
     /// text, its call and result, and its report m4; m3 is not the scout's.
     /// Longer texts make omitting them shorter than showing them.
     #[test]
@@ -5930,7 +5999,7 @@ mod tests {
 
         let output = at_smallest_fitting_budget(|budget| {
             let requests = std::slice::from_ref(&request);
-            format_read(requests, focus_on(2), None, with_budget(budget)).unwrap()
+            format_read(requests, hit_on(2), None, with_budget(budget)).unwrap()
         });
 
         let reference = resolved.reference.canonical();
@@ -6139,7 +6208,7 @@ mod tests {
             "{output}"
         );
         assert!(header.contains(" messages=2000 at="), "{output}");
-        assert!(header.contains(" omitted-records=1 "), "{output}");
+        assert!(header.contains(" over-budget-records=1 "), "{output}");
         assert!(!output.contains("\nseg "), "{output}");
         assert!(
             output.ends_with(&format!(
@@ -6214,7 +6283,7 @@ mod tests {
             "{output}"
         );
         assert!(
-            header.ends_with(" omitted-records=1 warnings=1 warning-records=1"),
+            header.ends_with(" over-budget-records=1 warnings=1 warning-records=1"),
             "{output}"
         );
         assert!(one_segment.starts_with("seg m1..m2000 "), "{one_segment}");
@@ -7366,7 +7435,7 @@ mod tests {
             ReadSlice::Lines(line_range(2, 2)),
             ReadSlice::Match {
                 query: "line".to_owned(),
-                context: 0,
+                context: lines_around(0),
             },
         ] {
             let output = format_read(
@@ -7500,10 +7569,10 @@ mod tests {
         transcript(vec![reply, text_message(2, User, "thanks")])
     }
 
-    /// The `omitted` and `read` records of m1 in `transcript`, read with
+    /// The `over-budget` and `read` records of m1 in `transcript`, read with
     /// `options` over `range`, its content truncated to its first `keep`
     /// characters.
-    fn omitted_records_keeping(
+    fn over_budget_records_keeping(
         transcript: &AgentTranscript,
         range: Option<MessageRange>,
         options: ProtocolOptions,
@@ -7542,7 +7611,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_record_names_omitted_lines_and_read_record_shows_them() {
+    fn over_budget_record_names_its_lines_and_read_record_shows_them() {
         let body = (1..=50)
             .map(|line| format!("line {line:02}"))
             .collect::<Vec<_>>()
@@ -7550,26 +7619,27 @@ mod tests {
         let transcript = transcript(vec![text_message(1, AgentMessageRole::Assistant, &body)]);
         let reference = resolved("session.jsonl").reference.canonical();
 
-        let after_ten_lines = omitted_records_keeping(&transcript, None, options(), 80);
-        let inside_the_eleventh = omitted_records_keeping(&transcript, None, options(), 83);
+        let after_ten_lines = over_budget_records_keeping(&transcript, None, options(), 80);
+        let inside_the_eleventh = over_budget_records_keeping(&transcript, None, options(), 83);
 
         let expected = format!(
-            "m1 omitted lines=11..50\nread ref={reference}:m1 lines=11..50 tools=false tool-results=false thinking=false subagents=false"
+            "m1 over-budget lines=11..50\nread ref={reference}:m1 lines=11..50 tools=false tool-results=false thinking=false subagents=false"
         );
         assert_eq!(after_ten_lines, expected);
         assert_eq!(inside_the_eleventh, expected);
     }
 
     #[test]
-    fn omitted_record_names_call_records_it_drops_and_its_read_repeats_flags() {
+    fn over_budget_record_names_call_records_it_drops_and_its_read_repeats_flags() {
         let reference = resolved("session.jsonl").reference.canonical();
 
-        let records = omitted_records_keeping(&a_command_of_three_lines(), None, every_flag(), 3);
+        let records =
+            over_budget_records_keeping(&a_command_of_three_lines(), None, every_flag(), 3);
 
         assert_eq!(
             records,
             format!(
-                "m1 omitted lines=1..5 calls=m1.1..2\nread ref={reference}:m1 lines=1..5 tools=true tool-results=true thinking=true subagents=true"
+                "m1 over-budget lines=1..5 calls=m1.1..2\nread ref={reference}:m1 lines=1..5 tools=true tool-results=true thinking=true subagents=true"
             )
         );
     }
@@ -7605,7 +7675,7 @@ mod tests {
     /// header of an edit; the one-message read the `read` record names shows
     /// every line of each.
     #[test]
-    fn omitted_record_numbers_lines_as_one_message_read_does() {
+    fn over_budget_record_numbers_lines_as_one_message_read_does() {
         let reference = resolved("session.jsonl").reference.canonical();
         let with_tools = ProtocolOptions {
             tools: true,
@@ -7619,21 +7689,26 @@ mod tests {
         ] {
             let intro_and_first_call = format!("intro\n{first_call}\n").chars().count();
 
-            let inside_first_call = omitted_records_keeping(&transcript, several, with_tools, 8);
-            let inside_second_call =
-                omitted_records_keeping(&transcript, several, with_tools, intro_and_first_call + 3);
+            let inside_first_call =
+                over_budget_records_keeping(&transcript, several, with_tools, 8);
+            let inside_second_call = over_budget_records_keeping(
+                &transcript,
+                several,
+                with_tools,
+                intro_and_first_call + 3,
+            );
             let reread = read_slice(&transcript, ReadSlice::Lines(line_range(5, 5)));
 
             assert_eq!(
                 inside_first_call,
                 format!(
-                    "m1 omitted lines=2..5 calls=m1.2\nread ref={reference}:m1 lines=2..5 {flags}"
+                    "m1 over-budget lines=2..5 calls=m1.2\nread ref={reference}:m1 lines=2..5 {flags}"
                 ),
                 "{first_call}"
             );
             assert_eq!(
                 inside_second_call,
-                format!("m1 omitted lines=5..5\nread ref={reference}:m1 lines=5..5 {flags}"),
+                format!("m1 over-budget lines=5..5\nread ref={reference}:m1 lines=5..5 {flags}"),
                 "{first_call}"
             );
             assert!(
@@ -7655,7 +7730,7 @@ mod tests {
                 &transcript,
                 ReadSlice::Match {
                     query: last_line.to_owned(),
-                    context: 0,
+                    context: lines_around(0),
                 },
             );
 
@@ -7666,10 +7741,10 @@ mod tests {
         }
     }
 
-    /// The omitted records follow the last line the truncation keeps, below
-    /// the call record it belongs to.
+    /// The `over-budget` and `read` records follow the last line the
+    /// truncation keeps, below the call record it belongs to.
     #[test]
-    fn omitted_records_follow_last_kept_line_of_call() {
+    fn over_budget_records_follow_last_kept_line_of_call() {
         let transcript = a_command_of_three_lines();
         let with_tools = ProtocolOptions {
             tools: true,
@@ -7694,7 +7769,7 @@ mod tests {
         let output = writer.into_output();
         assert!(
             output.starts_with(
-                "m1\n| intro\nm1.1\n| Ba\nm1 omitted lines=2..5 calls=m1.2\nread ref="
+                "m1\n| intro\nm1.1\n| Ba\nm1 over-budget lines=2..5 calls=m1.2\nread ref="
             ),
             "{output}"
         );
@@ -8258,7 +8333,7 @@ mod tests {
 
         let output = read(&replies(&|_| "ok".to_owned()), None, with_budget(full_size));
 
-        assert!(output.contains(" omit=none"), "{output}");
+        assert!(output.contains(" over-budget=none"), "{output}");
         assert_eq!(output.matches("\n| ok\n").count(), 30, "{output}");
     }
 
@@ -8279,7 +8354,7 @@ mod tests {
 
         assert!(whole.contains("\nm3 same=m1\n"), "{whole}");
         assert_eq!(addresses(&truncated), ["m1", "m2", "m3"], "{truncated}");
-        assert!(truncated.contains(OMISSION_MARKER), "{truncated}");
+        assert!(truncated.contains(OVER_BUDGET_MARKER), "{truncated}");
         assert!(
             truncated.ends_with(&format!("\nm3\n| {body}\n")),
             "{truncated}"
@@ -8311,8 +8386,8 @@ mod tests {
 
         assert!(identical_read.contains(" same=m1\n"), "{identical_read}");
         assert_eq!(
-            header_atom(&identical_read, "omit"),
-            header_atom(&distinct_read, "omit")
+            header_atom(&identical_read, "over-budget"),
+            header_atom(&distinct_read, "over-budget")
         );
         assert!(identical_read.chars().count() < distinct_read.chars().count());
     }
@@ -8361,7 +8436,7 @@ mod tests {
 
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{}\n",
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none{}\n",
                 tz_at("2026-10-14T12:00:00Z")
             )),
             "{output}"
@@ -8618,13 +8693,13 @@ mod tests {
             }));
         }
         cuts.extend(cuts_at_sampled_budgets(12, |budget| {
-            let focus = ProtocolFocus {
+            let hit = ProtocolHit {
                 subagent: None,
                 conversation_full_ref: None,
                 range: MessageRange::single(6),
             };
             let requests = [request(&session, &replies, None)];
-            format_read(&requests, Some(focus), None, with(options(), budget)).unwrap()
+            format_read(&requests, Some(hit), None, with(options(), budget)).unwrap()
         }));
         cuts.extend(cuts_at_sampled_budgets(12, |budget| {
             read_tail(&replies, None, 8, with(options(), budget))
@@ -8664,15 +8739,15 @@ mod tests {
             "none",
             "tail",
             "head",
-            "focus",
-            "head+focus",
-            "head+focus+tail",
+            "hit",
+            "head+hit",
+            "head+hit+tail",
             "body",
             "body+tail",
             "body+head",
-            "body+focus",
-            "body+head+focus",
-            "body+head+focus+tail",
+            "body+hit",
+            "body+head+hit",
+            "body+head+hit+tail",
         ];
         assert_eq!(
             cuts,
@@ -8918,15 +8993,15 @@ mod tests {
             &reply_back_on_the_first_date(),
             None,
             ProtocolOptions {
-                budget: Some(839),
+                budget: Some(850),
                 tools: true,
                 ..options()
             },
         );
 
-        assert!(output.chars().count() <= 839, "{output}");
+        assert!(output.chars().count() <= 850, "{output}");
         assert!(
-            output.contains(OMISSION_MARKER),
+            output.contains(OVER_BUDGET_MARKER),
             "m1 is truncated: {output}"
         );
         assert!(
@@ -8938,12 +9013,12 @@ mod tests {
 
     #[test]
     fn floor_holding_records_on_both_sides_of_midnight_is_kept_beside_next_days_reply() {
-        assert_m1_keeps_its_floor_beside_m2(&floor_across_midnight(), 672);
+        assert_m1_keeps_its_floor_beside_m2(&floor_across_midnight(), 683);
     }
 
     #[test]
     fn floor_ending_before_midnight_is_kept_beside_next_days_reply() {
-        assert_m1_keeps_its_floor_beside_m2(&floor_before_midnight(), 636);
+        assert_m1_keeps_its_floor_beside_m2(&floor_before_midnight(), 647);
     }
 
     /// Asserts that `budget` is the smallest budget showing m2 in the read of
@@ -9010,7 +9085,7 @@ mod tests {
 
         assert!(
             output.starts_with(&format!(
-                "protocol agent-read cut=none chars=6000 policy=text omit=none{}\n",
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none{}\n",
                 tz_at(WINTER)
             )),
             "{output}"
@@ -9056,7 +9131,7 @@ mod tests {
 
         let records = records(&output);
         assert!(
-            records[0].ends_with(&format!(" omit=none{}", tz_at(WINTER))),
+            records[0].ends_with(&format!(" over-budget=none{}", tz_at(WINTER))),
             "{output}"
         );
         assert_eq!(records[2], day_record(WINTER), "{output}");
@@ -9520,7 +9595,7 @@ mod tests {
     }
 
     /// Known limit: the `continue read` of an omitted m1 reads s1:m1 again
-    /// after the read printed it as its focus. The record names m1's group,
+    /// after the read printed it as its hit. The record names m1's group,
     /// and that group contains the sub-agent messages written before m1.
     #[test]
     fn continue_read_of_omitted_m1_reads_again_subagent_message_printed_before_it() {
@@ -9531,7 +9606,7 @@ mod tests {
             text_message(3, Assistant, "Done."),
         ]);
         let resolved = resolved("session.jsonl");
-        let focus = ProtocolFocus {
+        let hit = ProtocolHit {
             conversation_full_ref: None,
             range: MessageRange::single(1),
             subagent: Some(1),
@@ -9544,7 +9619,7 @@ mod tests {
 
         let output = format_read(
             &[whole_session_request(&resolved, &transcript)],
-            Some(focus),
+            Some(hit),
             None,
             with_subagents,
         )
@@ -9563,7 +9638,7 @@ mod tests {
 
         assert!(
             output.contains("| SCOUT_SENTINEL\n"),
-            "the read prints its focus, s1:m1: {output}"
+            "the read prints its hit, s1:m1: {output}"
         );
         assert!(
             first_ref.ends_with(":m1") || first_ref.contains(":m1.."),
@@ -9843,7 +9918,7 @@ mod tests {
     /// m1 holds text, a command of two lines and a long command of one line,
     /// m1.2: lines 1 to 4 of a read of m1.
     #[test]
-    fn truncated_call_read_names_its_omitted_lines_as_read_of_its_message_numbers_them() {
+    fn truncated_call_read_names_its_over_budget_lines_as_read_of_its_message_numbers_them() {
         use AgentMessageRole::{Assistant, User};
         let long_command = format!("cargo clippy {}", "--warn unused ".repeat(60));
         let mut reply = text_message(1, Assistant, "Running the checks.");
@@ -9887,7 +9962,7 @@ mod tests {
         let reference = resolved.reference.canonical();
         assert!(
             truncated.contains(&format!(
-                "\nm1 omitted lines=4..4\nread ref={reference}:m1 lines=4..4 {flags}\n"
+                "\nm1 over-budget lines=4..4\nread ref={reference}:m1 lines=4..4 {flags}\n"
             )),
             "{truncated}"
         );
@@ -9953,14 +10028,14 @@ mod tests {
         ])
     }
 
-    /// `--focus s1:m1..m2` keeps s1's messages first, not s2's written
+    /// `--hit s1:m1..m2` keeps s1's messages first, not s2's written
     /// between them.
     #[test]
-    fn subagent_focus_keeps_that_subagents_messages_first() {
+    fn subagent_hit_keeps_that_subagents_messages_first() {
         let transcript = session_with_two_reviews();
         let resolved = resolved("session.jsonl");
         let request = whole_session_request(&resolved, &transcript);
-        let focus = ProtocolFocus {
+        let hit = ProtocolHit {
             conversation_full_ref: None,
             range: MessageRange { start: 2, end: 5 },
             subagent: Some(1),
@@ -9971,8 +10046,7 @@ mod tests {
             ..options()
         };
 
-        let output =
-            format_read(std::slice::from_ref(&request), Some(focus), None, options).unwrap();
+        let output = format_read(std::slice::from_ref(&request), Some(hit), None, options).unwrap();
 
         for kept in ["a finding 1, line 8", "a finding 2, line 8"] {
             assert!(output.contains(kept), "the read keeps {kept:?}:\n{output}");

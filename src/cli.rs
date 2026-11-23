@@ -1,4 +1,5 @@
-use crate::agent::protocol::MessageLineRange;
+use crate::agent::address::HitContext;
+use crate::agent::protocol::{MatchContext, MessageLineRange};
 use crate::clock::Clock;
 use crate::history::Source;
 use crate::history::provider::providers;
@@ -199,6 +200,62 @@ pub struct AgentSearchArgs {
     pub search_mode: AgentSearchModeArgs,
     #[command(flatten)]
     pub time: MessageTimeArgs,
+    #[command(flatten)]
+    pub context: HitContextArgs,
+    #[command(flatten)]
+    pub recipe_visibility: RecipeVisibilityArgs,
+}
+
+// The content each hit's `read` recipe shows beside what the hit's message
+// needs. The flags don't change the hits: a search matches tool calls, tool
+// results, thinking and sub-agent messages without them.
+#[derive(Debug, Default, ClapArgs)]
+pub struct RecipeVisibilityArgs {
+    /// Set tools=true in each hit's `read` recipe
+    #[arg(long)]
+    pub tools: bool,
+    /// Set tool-results=true in each hit's `read` recipe
+    #[arg(long)]
+    pub tool_results: bool,
+    /// Set thinking=true in each hit's `read` recipe
+    #[arg(long)]
+    pub thinking: bool,
+    /// Set subagents=true in each hit's `read` recipe
+    #[arg(long)]
+    pub subagents: bool,
+}
+
+// The messages of a hit's thread before and after the hit that its `read`
+// recipe covers, counted as grep's -B, -A and -C count lines around a match.
+#[derive(Debug, Default, ClapArgs)]
+pub struct HitContextArgs {
+    /// Messages of context before the hit, in the hit's thread, that its
+    /// `read` recipe covers; 1 by default
+    #[arg(short = 'B', long, value_name = "N")]
+    pub before_context: Option<usize>,
+    /// Messages of context after the hit, in the hit's thread, that its
+    /// `read` recipe covers; 1 by default
+    #[arg(short = 'A', long, value_name = "N")]
+    pub after_context: Option<usize>,
+    /// Messages of context before and after the hit, in the hit's thread,
+    /// that its `read` recipe covers; -B and -A set one side
+    #[arg(short = 'C', long, value_name = "N")]
+    pub context: Option<usize>,
+}
+
+impl HitContextArgs {
+    /// The context each hit's recipe covers: `-B` and `-A` for their side,
+    /// else `-C`, else one message.
+    pub fn hit_context(&self) -> HitContext {
+        let default = HitContext::default();
+        HitContext {
+            before: self
+                .before_context
+                .or(self.context)
+                .unwrap_or(default.before),
+            after: self.after_context.or(self.context).unwrap_or(default.after),
+        }
+    }
 }
 
 #[derive(Debug, ClapArgs)]
@@ -263,6 +320,10 @@ pub struct AgentWithinArgs {
     pub search_mode: AgentSearchModeArgs,
     #[command(flatten)]
     pub time: MessageTimeArgs,
+    #[command(flatten)]
+    pub context: HitContextArgs,
+    #[command(flatten)]
+    pub recipe_visibility: RecipeVisibilityArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -300,16 +361,17 @@ pub struct AgentReadArgs {
     /// Durable message anchor to read within one conversation
     #[arg(long, value_parser = non_empty_string)]
     pub anchor: Option<String>,
-    /// Message or range to prioritize when budgeted output is truncated
+    /// The hit's message or range, as a search hit's `hit=` prints it, kept
+    /// first when budgeted output is truncated
     #[arg(long, value_parser = non_empty_string)]
-    pub focus: Option<String>,
+    pub hit: Option<String>,
     /// Read the last N of each ref's or range's own messages (a sub-agent's for
     /// :sN), not counting hidden messages
     #[arg(
         long,
         value_name = "N",
         value_parser = non_zero_count,
-        conflicts_with_all = ["anchor", "focus", "lines", "match_query"]
+        conflicts_with_all = ["anchor", "hit", "lines", "match_query"]
     )]
     pub tail: Option<NonZeroUsize>,
     /// Inclusive content line range within one message; START.. reads to its
@@ -319,9 +381,22 @@ pub struct AgentReadArgs {
     /// Find text within one message and return matching lines with context
     #[arg(long = "match", value_parser = non_empty_string, conflicts_with = "lines")]
     pub match_query: Option<String>,
-    /// Content lines to include before and after each match
-    #[arg(long, default_value_t = 3, requires = "match_query")]
+    /// Content lines of context before and after each match; -B and -A set
+    /// one side
+    #[arg(
+        short = 'C',
+        long,
+        value_name = "N",
+        default_value_t = 3,
+        requires = "match_query"
+    )]
     pub context: usize,
+    /// Content lines of context before each match; --context by default
+    #[arg(short = 'B', long, value_name = "N", requires = "match_query")]
+    pub before_context: Option<usize>,
+    /// Content lines of context after each match; --context by default
+    #[arg(short = 'A', long, value_name = "N", requires = "match_query")]
+    pub after_context: Option<usize>,
     /// Report time per stage, what was read, and peak memory on stderr
     #[arg(long)]
     pub perf_stats: bool,
@@ -397,6 +472,17 @@ impl MessageTimeArgs {
             self.before.as_ref(),
             clock,
         )
+    }
+}
+
+impl AgentReadArgs {
+    /// The lines `--match` shows around each match: `-B` and `-A` for their
+    /// side, else `--context`.
+    pub fn match_context(&self) -> MatchContext {
+        MatchContext {
+            before: self.before_context.unwrap_or(self.context),
+            after: self.after_context.unwrap_or(self.context),
+        }
     }
 }
 
@@ -803,6 +889,88 @@ mod tests {
     }
 
     #[test]
+    fn agent_search_and_within_accept_each_visibility_flag_read_accepts() {
+        let flags_of = |flags: &[&str]| {
+            let parse = |command: &[&str]| {
+                let mut args = vec!["rearview", "agent"];
+                args.extend_from_slice(command);
+                args.extend_from_slice(flags);
+                agent_command(Args::try_parse_from(args).unwrap())
+            };
+            let visibility_of = |flags: &RecipeVisibilityArgs| {
+                [
+                    flags.tools,
+                    flags.tool_results,
+                    flags.thinking,
+                    flags.subagents,
+                ]
+            };
+            let search = match parse(&["search", "cache"]) {
+                AgentCommand::Search(search) => visibility_of(&search.recipe_visibility),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            let within = match parse(&["within", "ch_abc123", "cache"]) {
+                AgentCommand::Within(within) => visibility_of(&within.recipe_visibility),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(search, within, "{flags:?} means the same on both");
+            search
+        };
+
+        assert_eq!(flags_of(&[]), [false; 4]);
+        assert_eq!(flags_of(&["--tools"]), [true, false, false, false]);
+        assert_eq!(flags_of(&["--tool-results"]), [false, true, false, false]);
+        assert_eq!(flags_of(&["--thinking"]), [false, false, true, false]);
+        assert_eq!(flags_of(&["--subagents"]), [false, false, false, true]);
+    }
+
+    #[test]
+    fn agent_search_and_within_take_hit_context_as_grep_takes_context() {
+        let context_of = |flags: &[&str]| {
+            let parse = |command: &[&str]| {
+                let mut args = vec!["rearview", "agent"];
+                args.extend_from_slice(command);
+                args.extend_from_slice(flags);
+                agent_command(Args::try_parse_from(args).unwrap())
+            };
+            let search = match parse(&["search", "cache"]) {
+                AgentCommand::Search(search) => search.context.hit_context(),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            let within = match parse(&["within", "ch_abc123", "cache"]) {
+                AgentCommand::Within(within) => within.context.hit_context(),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(search, within, "{flags:?} means the same on both");
+            (search.before, search.after)
+        };
+
+        assert_eq!(context_of(&[]), (1, 1), "one message on each side");
+        assert_eq!(context_of(&["-B", "2", "-A", "3"]), (2, 3));
+        assert_eq!(
+            context_of(&["--before-context", "2", "--after-context", "3"]),
+            (2, 3)
+        );
+        assert_eq!(context_of(&["-C", "4"]), (4, 4));
+        assert_eq!(context_of(&["--context", "4"]), (4, 4));
+        assert_eq!(
+            context_of(&["-C", "4", "-A", "0"]),
+            (4, 0),
+            "-A sets its side whatever -C"
+        );
+        assert_eq!(
+            context_of(&["-B", "0", "-C", "2"]),
+            (0, 2),
+            "-B sets its side whatever the order"
+        );
+        assert_eq!(
+            context_of(&["--before", "2026-07-20", "-A", "2"]),
+            (1, 2),
+            "--before stays the time window"
+        );
+    }
+
+    #[test]
     fn agent_within_read_and_outline_accept_time_window() {
         let window = [
             "--after",
@@ -1122,7 +1290,7 @@ mod tests {
             "read",
             "ch_abc123:m1..m3",
             "ch_def456:m4",
-            "--focus",
+            "--hit",
             "m2",
             "--budget",
             "1234",
@@ -1137,7 +1305,7 @@ mod tests {
             AgentCommand::Read(read) => {
                 assert_eq!(read.refs, vec!["ch_abc123:m1..m3", "ch_def456:m4"]);
                 assert_eq!(read.anchor, None);
-                assert_eq!(read.focus.as_deref(), Some("m2"));
+                assert_eq!(read.hit.as_deref(), Some("m2"));
                 assert_eq!(read.lines, None);
                 assert_eq!(read.match_query, None);
                 assert_eq!(read.context, 3);
@@ -1235,6 +1403,50 @@ mod tests {
     }
 
     #[test]
+    fn agent_read_match_takes_context_lines_as_grep_takes_them() {
+        let context_of = |flags: &[&str]| {
+            let mut args = vec!["rearview", "agent", "read", "ch_abc123:m7", "--match", "x"];
+            args.extend_from_slice(flags);
+            match agent_command(Args::try_parse_from(args).unwrap()) {
+                AgentCommand::Read(read) => read.match_context(),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            context_of(&[]),
+            crate::agent::test_support::lines_around(3),
+            "three by default"
+        );
+        assert_eq!(
+            context_of(&["-C", "5"]),
+            crate::agent::test_support::lines_around(5)
+        );
+        assert_eq!(
+            context_of(&["-B", "1", "-A", "4"]),
+            MatchContext {
+                before: 1,
+                after: 4
+            }
+        );
+        assert_eq!(
+            context_of(&["--after-context", "0", "-C", "2"]),
+            MatchContext {
+                before: 2,
+                after: 0
+            },
+            "-A sets its side whatever -C"
+        );
+        assert_eq!(
+            context_of(&["--before-context", "6"]),
+            MatchContext {
+                before: 6,
+                after: 3
+            }
+        );
+    }
+
+    #[test]
     fn agent_read_slice_options_validate_arguments() {
         let conflict = Args::try_parse_from([
             "rearview",
@@ -1273,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_read_tail_accepts_nonzero_count_and_conflicts_with_anchor_focus_lines_and_match() {
+    fn agent_read_tail_accepts_nonzero_count_and_conflicts_with_anchor_hit_lines_and_match() {
         let parse_read = |extra: &[&str]| {
             Args::try_parse_from(
                 ["rearview", "agent", "read", "ch_abc123"]
@@ -1290,12 +1502,12 @@ mod tests {
         assert!(parse_read(&["--tail", "0"]).is_err());
         for other in [
             &["--anchor", "ma_1234"][..],
-            &["--focus", "m2"],
+            &["--hit", "m2"],
             &["--lines", "1..2"],
             &["--match", "needle"],
         ] {
             let error = parse_read(&[&["--tail", "5"][..], other].concat())
-                .expect_err("--tail conflicts with --anchor, --focus, --lines and --match");
+                .expect_err("--tail conflicts with --anchor, --hit, --lines and --match");
             assert!(error.to_string().contains("cannot be used with"), "{error}");
         }
     }

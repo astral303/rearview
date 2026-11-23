@@ -147,6 +147,8 @@ the protocol adds it here, in the same pull request:
     ranges. One spelling has one meaning.
   - Two spellings that read as equal are equal (least surprise): `m7` and
     `m7..m7` read the same messages, and `m7..` reads to the last message.
+  - A recipe names a flag's value by the flag's name (nothing to memorise):
+    `hit=m8` is `--hit m8`, and `lines=4..9` is `--lines 4..9`.
   - A clear request that cannot be met exactly gets what exists and a
     record of the difference: a range that ends past the last message is
     read to the last message.
@@ -155,6 +157,9 @@ the protocol adds it here, in the same pull request:
 - **A field name has one meaning in every record** (consistency).
   `subagents=` with a number counts sub-agents; a count of their messages is
   `subagent-messages=`.
+- **The word for content left out names what shows it** (nothing to
+  memorise). A flag shows `hidden` content; a larger `--budget` shows
+  `over-budget` content.
 - **An address names its container first:** `s3:m5`, not `m5 s3`.
 - **Fill the grid before adding an address form or a flag.** List each
   agent command against each address form and each flag. A rejected cell
