@@ -130,6 +130,9 @@
   - `-C N` sets both to N. `-B` or `-A` beside `-C` sets its own side.
   - `agent read --match` takes `-B` and `-A` for the lines before and after
     each match, and `-C` as the short form of `--context`.
+- Accept the visibility flags on `agent search` and `agent within`: `--tools`,
+  `--tool-results`, `--thinking` and `--subagents`. Each sets its value in
+  every hit's `read` recipe, such as `subagents=true`; the hits don't change.
 - Count in the `agent outline` header what its flags hide, such as
   `hidden-tools=17 hidden-tool-results=15 hidden-thinking=1`.
 - Copy one block of a message in the viewer. In message navigation, focus a

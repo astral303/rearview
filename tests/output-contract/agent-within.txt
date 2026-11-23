@@ -8,6 +8,11 @@ $ rearview agent within ch_581699c40efc answer -B 0 -A 2
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=0 tz=-04:00
 query text=answer hits=0
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+$ rearview agent within ch_581699c40efc answer --subagents
+--- stdout
+protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=0 tz=-04:00
+query text=answer hits=0
+conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 $ rearview agent within ch_581699c40efc searchable --top 2
 --- stdout
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=0 tz=-04:00
@@ -45,6 +50,17 @@ hit project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-00000000000
 read ref=ch_0b26e45343df:m3..m5 hit=m3 tools=false tool-results=false thinking=false subagents=false
 hit project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df anchors=ma_3200d601e22cb40f source=lexical score=4.035714 hit=s1:m3 at=2026-08-06T06:00:02 | kimi child answer searchable
 read ref=ch_0b26e45343df:s1:m3 hit=s1:m3 tools=false tool-results=false thinking=false subagents=true
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
+$ rearview agent within ch_0b26e45343df answer --subagents
+--- stdout
+protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=2 tz=-04:00 warnings=1 warning-records=1
+query text=answer hits=2
+conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
+title project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df : kimi title
+hit project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df anchors=ma_71a0c737ae0a7d42 source=lexical score=4.045455 hit=m3 at=2026-08-06T06:00:04 | kimi answer searchable
+read ref=ch_0b26e45343df:m2..m4 hit=m3 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df anchors=ma_3200d601e22cb40f source=lexical score=4.035714 hit=s1:m3 at=2026-08-06T06:00:02 | kimi child answer searchable
+read ref=ch_0b26e45343df:s1:m2..m3 hit=s1:m3 tools=false tool-results=false thinking=false subagents=true
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent within ch_0b26e45343df searchable --top 2
 --- stdout
@@ -103,6 +119,23 @@ read ref=ch_74aec3f6df49:m44..m46 hit=m44 tools=false tool-results=false thinkin
 hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_0a4fc9eaa358ccd0 source=lexical score=4.005952 hit=m45 at=2026-08-01T06:03:28 | user: <send_user_message_question_reply> [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}] </send_user_message_questio
 read ref=ch_74aec3f6df49:m45..m47 hit=m45 tools=false tool-results=false thinking=false subagents=false
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
+$ rearview agent within ch_74aec3f6df49 answer --subagents
+--- stdout
+protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=5 tz=-04:00 warnings=1 warning-records=1
+query text=answer hits=5
+conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
+title project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 : active codex question ... codex answer searchable ... follow-up question
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_7100872509cb233e source=lexical score=4.071429 hit=m14 at=2026-08-01T06:02:30 | closing answer
+read ref=ch_74aec3f6df49:m13..m15 hit=m14 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4f60426316166883 source=lexical score=4.043478 hit=s1:m2 at=2026-08-01T06:00:03 | child answer searchable
+read ref=ch_74aec3f6df49:s1:m1..m2 hit=s1:m2 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_eb1c272f9dd484f3 source=lexical score=4.043478 hit=m3 at=2026-08-01T06:00:05 | codex answer searchable
+read ref=ch_74aec3f6df49:m2..m4 hit=m3 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4e7b5a1be4214e7a source=lexical score=4.010870 hit=m44 at=2026-08-01T06:03:27 | > Keep recording once warm? Yes, until I stop it. TYPED_ANSWER_SENTINEL: then save the log.
+read ref=ch_74aec3f6df49:m43..m45 hit=m44 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_0a4fc9eaa358ccd0 source=lexical score=4.005952 hit=m45 at=2026-08-01T06:03:28 | user: <send_user_message_question_reply> [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}] </send_user_message_questio
+read ref=ch_74aec3f6df49:m44..m46 hit=m45 tools=false tool-results=false thinking=false subagents=true
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent within ch_74aec3f6df49 searchable --top 2
 --- stdout
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=2 tz=-04:00 warnings=1 warning-records=1
@@ -150,6 +183,18 @@ hit project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 a
 read ref=ch_974c3840e189:m4..m6 hit=m4 tools=false tool-results=false thinking=false subagents=false
 hit project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 anchors=ma_8fdb344099216f6f source=lexical score=4.032258 hit=s1:m2 at=2026-01-01T22:04:12 | _THINKING_SENTINEL: read the notes first OMP sub-agent answer searchable
 read ref=ch_974c3840e189:s1:m2 hit=s1:m2 tools=false tool-results=false thinking=false subagents=true
+$ rearview agent within ch_974c3840e189 answer --subagents
+--- stdout
+protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=3 tz=-05:00
+query text=answer hits=3
+conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+title project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 : Updated OMP title
+hit project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 anchors=ma_ae82025b1bde4dd6 source=lexical score=4.066667 hit=m2 at=2026-01-01T22:04:07 | OMP private reasoning OMP root answer
+read ref=ch_974c3840e189:m1..m3 hit=m2 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 anchors=ma_676971aef9ade34e source=lexical score=4.058824 hit=m4 at=2026-01-01T22:04:13 | OMP active answer
+read ref=ch_974c3840e189:m3..m5 hit=m4 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 anchors=ma_8fdb344099216f6f source=lexical score=4.032258 hit=s1:m2 at=2026-01-01T22:04:12 | _THINKING_SENTINEL: read the notes first OMP sub-agent answer searchable
+read ref=ch_974c3840e189:s1:m1..m2 hit=s1:m2 tools=false tool-results=false thinking=false subagents=true
 $ rearview agent within ch_974c3840e189 searchable --top 2
 --- stdout
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=1 tz=-05:00
@@ -185,6 +230,14 @@ conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 title project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc : fixture generated title
 hit project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc anchors=ma_b21b95f69859e61b source=lexical score=4.062500 hit=s1:m2 at=2025-08-12T08:03:20 | sub-agent answer
 read ref=ch_efbbec792ccc:s1:m2..m3 hit=s1:m2 tools=false tool-results=false thinking=false subagents=true
+$ rearview agent within ch_efbbec792ccc answer --subagents
+--- stdout
+protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=1 tz=-04:00
+query text=answer hits=1
+conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+title project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc : fixture generated title
+hit project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc anchors=ma_b21b95f69859e61b source=lexical score=4.062500 hit=s1:m2 at=2025-08-12T08:03:20 | sub-agent answer
+read ref=ch_efbbec792ccc:s1:m1..m3 hit=s1:m2 tools=false tool-results=false thinking=false subagents=true
 $ rearview agent within ch_efbbec792ccc searchable --top 2
 --- stdout
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=0 tz=-04:00
@@ -217,6 +270,14 @@ conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789
 title project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 : Final Pi title
 hit project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 anchors=ma_0763fac584b77a74 source=lexical score=4.090909 hit=m2 at=2024-02-29T19:02:00 | private reasoning root answer read: README.md
 read ref=ch_f04d3718e406:m2..m4 hit=m2 tools=false tool-results=false thinking=false subagents=false
+$ rearview agent within ch_f04d3718e406 answer --subagents
+--- stdout
+protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=1 tz=-05:00
+query text=answer hits=1
+conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+title project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 : Final Pi title
+hit project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 anchors=ma_0763fac584b77a74 source=lexical score=4.090909 hit=m2 at=2024-02-29T19:02:00 | private reasoning root answer read: README.md
+read ref=ch_f04d3718e406:m1..m3 hit=m2 tools=false tool-results=false thinking=false subagents=true
 $ rearview agent within ch_f04d3718e406 searchable --top 2
 --- stdout
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=2 tz=-05:00
@@ -258,6 +319,16 @@ hit project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch
 read ref=ch_982349c13ee4:m3..m5 hit=m3 tools=false tool-results=false thinking=false subagents=false
 hit project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 anchors=ma_ed09908ea14107f5 source=lexical score=4.035714 hit=s1:m3 at=1969-12-31T19:00:01 | grok child answer searchable
 read ref=ch_982349c13ee4:s1:m3 hit=s1:m3 tools=false tool-results=false thinking=false subagents=true
+$ rearview agent within ch_982349c13ee4 answer --subagents
+--- stdout
+protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=2 tz=-05:00
+query text=answer hits=2
+conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+title project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 : summary text
+hit project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 anchors=ma_8def110f79b46925 source=lexical score=4.045455 hit=m3 at=1969-12-31T19:00:01 | grok answer searchable
+read ref=ch_982349c13ee4:m2..m4 hit=m3 tools=false tool-results=false thinking=false subagents=true
+hit project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 anchors=ma_ed09908ea14107f5 source=lexical score=4.035714 hit=s1:m3 at=1969-12-31T19:00:01 | grok child answer searchable
+read ref=ch_982349c13ee4:s1:m2..m3 hit=s1:m3 tools=false tool-results=false thinking=false subagents=true
 $ rearview agent within ch_982349c13ee4 searchable --top 2
 --- stdout
 protocol agent-within mode=lexical cut=none chars=6000 policy=per-hit hits=2 tz=-05:00

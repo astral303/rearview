@@ -1548,6 +1548,7 @@ mod agent_command_tests {
             search_mode: cli::AgentSearchModeArgs::explicit(SearchMode::Lexical),
             time: cli::MessageTimeArgs::default(),
             context: cli::HitContextArgs::default(),
+            recipe_visibility: cli::RecipeVisibilityArgs::default(),
         };
         let within_request = agent::search::AgentWithinRequest {
             query: within_args.query.clone(),

@@ -99,29 +99,36 @@ fn configured_visibility(cli_value: bool, configured: Option<bool>) -> bool {
     cli_value || configured.unwrap_or(false)
 }
 
-fn configured_render_policy(config: &AgentConfig) -> agent::visibility::ContentVisibility {
+/// The atoms `flags` or `config` set to `true` in every hit's `read` recipe.
+fn recipe_visibility(
+    flags: &cli::RecipeVisibilityArgs,
+    config: &AgentConfig,
+) -> agent::visibility::ContentVisibility {
     agent::visibility::ContentVisibility {
-        tools: config.tools.unwrap_or(false),
-        tool_results: config.tool_results.unwrap_or(false),
-        thinking: config.thinking.unwrap_or(false),
-        subagents: config.subagents.unwrap_or(false),
+        tools: configured_visibility(flags.tools, config.tools),
+        tool_results: configured_visibility(flags.tool_results, config.tool_results),
+        thinking: configured_visibility(flags.thinking, config.thinking),
+        subagents: configured_visibility(flags.subagents, config.subagents),
     }
 }
 
-fn apply_configured_render_policy(
+/// Sets to `true` in every hit's `read` recipe each atom `flags` or `config`
+/// sets. An atom the hit's message needs is `true` without them.
+fn set_recipe_visibility(
     output: &mut agent::search::AgentSearchOutput,
+    flags: &cli::RecipeVisibilityArgs,
     config: &AgentConfig,
 ) {
-    let policy = configured_render_policy(config);
+    let visibility = recipe_visibility(flags, config);
     for hit in &mut output.hits {
-        hit.render_options.merge(policy);
+        hit.render_options.merge(visibility);
     }
     for hit in output
         .groups
         .iter_mut()
         .flat_map(|group| group.hits.iter_mut())
     {
-        hit.render_options.merge(policy);
+        hit.render_options.merge(visibility);
     }
 }
 
@@ -1856,7 +1863,7 @@ impl AgentService {
             SearchMode::Lexical | SearchMode::Exact => {
                 let run = search_transcripts(&request)?;
                 let mut output = run.output;
-                apply_configured_render_policy(&mut output, &agent_config);
+                set_recipe_visibility(&mut output, &args.recipe_visibility, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
                 Ok(self.render_search(&output, args.context.hit_context(), warnings))
             }
@@ -1871,7 +1878,7 @@ impl AgentService {
                         embedding_budget,
                     )
                 })?;
-                apply_configured_render_policy(&mut output, &agent_config);
+                set_recipe_visibility(&mut output, &args.recipe_visibility, &agent_config);
                 let mut warnings = warnings.into_inner();
                 warnings.extend(semantic_warnings);
                 let warnings = self.with_stale_cache_record(warnings, &output);
@@ -1927,7 +1934,7 @@ impl AgentService {
                         output
                     }
                 };
-                apply_configured_render_policy(&mut output, &agent_config);
+                set_recipe_visibility(&mut output, &args.recipe_visibility, &agent_config);
                 let warnings = self.with_stale_cache_record(warnings.into_inner(), &output);
                 Ok(self.render_search(&output, args.context.hit_context(), warnings))
             }
@@ -2160,7 +2167,7 @@ impl AgentService {
         })?;
         let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
         let records = perf.time(Stage::Render, || {
-            apply_configured_render_policy(&mut output, &agent_config);
+            set_recipe_visibility(&mut output, &args.recipe_visibility, &agent_config);
             agent::search::format_agent_output_with_warnings(
                 &output,
                 args.context.hit_context(),
@@ -4452,6 +4459,59 @@ mod tests {
         .unwrap();
         operation.finish().fail_if_low_space().unwrap();
         loaded
+    }
+
+    /// The recipe atoms `agent within` sets with `flags` and `config`.
+    fn recipe_atoms_of(flags: &[&str], config: &AgentConfig) -> String {
+        let args = [&["within", "ch_abc123", "cache"][..], flags].concat();
+        match agent_command(&args) {
+            AgentCommand::Within(within) => {
+                recipe_visibility(&within.recipe_visibility, config).recipe_atoms()
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_visibility_flag_sets_its_own_recipe_atom_beside_the_configured_ones() {
+        let cases: [(&[&str], &str); 5] = [
+            (
+                &[],
+                " tools=false tool-results=false thinking=false subagents=false",
+            ),
+            (
+                &["--tools"],
+                " tools=true tool-results=false thinking=false subagents=false",
+            ),
+            (
+                &["--tool-results"],
+                " tools=false tool-results=true thinking=false subagents=false",
+            ),
+            (
+                &["--thinking"],
+                " tools=false tool-results=false thinking=true subagents=false",
+            ),
+            (
+                &["--subagents"],
+                " tools=false tool-results=false thinking=false subagents=true",
+            ),
+        ];
+        for (flags, atoms) in cases {
+            assert_eq!(
+                recipe_atoms_of(flags, &AgentConfig::default()),
+                atoms,
+                "{flags:?}"
+            );
+        }
+
+        let shows_thinking = AgentConfig {
+            thinking: Some(true),
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            recipe_atoms_of(&["--tools"], &shows_thinking),
+            " tools=true tool-results=false thinking=true subagents=false"
+        );
     }
 
     fn output_flags() -> AgentOutputFlags {

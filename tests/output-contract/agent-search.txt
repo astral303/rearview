@@ -64,6 +64,39 @@ read ref=ch_982349c13ee4:m1..m5 hit=m3 tools=false tool-results=false thinking=f
 hit project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 anchors=ma_ed09908ea14107f5 source=lexical score=4.035714 hit=s1:m3 at=1969-12-31T19:00:01 | grok child answer searchable
 read ref=ch_982349c13ee4:s1:m1..m3 hit=s1:m3 tools=false tool-results=false thinking=false subagents=true
 protocol agent-warning kind=malformed-transcript count=2
+$ rearview agent search answer --tools --subagents
+--- stdout
+protocol agent-search mode=lexical cut=none chars=6000 policy=per-hit groups=6 hits=10 tz=-05:00 warnings=2 warning-records=1
+query text=answer hits=10
+sessions matched=6 offset=0 searched=6 failed=0
+groups count=6
+conversation rank=1 project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 score=4.090909 hits=1 total=1 : Final Pi title
+hit project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406 anchors=ma_0763fac584b77a74 source=lexical score=4.090909 hit=m2 at=2024-02-29T19:02:00 | private reasoning root answer read: README.md
+read ref=ch_f04d3718e406:m1..m3 hit=m2 tools=true tool-results=false thinking=false subagents=true
+conversation rank=2 project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 score=4.071429 hits=2 total=5 : active codex question ... codex answer searchable ... follow-up question
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_7100872509cb233e source=lexical score=4.071429 hit=m14 at=2026-08-01T06:02:30-04:00 | closing answer
+read ref=ch_74aec3f6df49:m13..m15 hit=m14 tools=true tool-results=false thinking=false subagents=true
+hit project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49 anchors=ma_4f60426316166883 source=lexical score=4.043478 hit=s1:m2 at=2026-08-01T06:00:03-04:00 | child answer searchable
+read ref=ch_74aec3f6df49:s1:m1..m2 hit=s1:m2 tools=true tool-results=false thinking=false subagents=true
+conversation rank=3 project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 score=4.066667 hits=2 total=3 : Updated OMP title
+hit project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 anchors=ma_ae82025b1bde4dd6 source=lexical score=4.066667 hit=m2 at=2026-01-01T22:04:07 | OMP private reasoning OMP root answer
+read ref=ch_974c3840e189:m1..m3 hit=m2 tools=true tool-results=false thinking=false subagents=true
+hit project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189 anchors=ma_676971aef9ade34e source=lexical score=4.058824 hit=m4 at=2026-01-01T22:04:13 | OMP active answer
+read ref=ch_974c3840e189:m3..m5 hit=m4 tools=true tool-results=false thinking=false subagents=true
+conversation rank=4 project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc score=4.062500 hits=1 total=1 : fixture generated title
+hit project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc anchors=ma_b21b95f69859e61b source=lexical score=4.062500 hit=s1:m2 at=2025-08-12T08:03:20-04:00 | sub-agent answer
+read ref=ch_efbbec792ccc:s1:m1..m3 hit=s1:m2 tools=true tool-results=false thinking=false subagents=true
+conversation rank=5 project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df score=4.045455 hits=2 total=2 : kimi title
+hit project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df anchors=ma_71a0c737ae0a7d42 source=lexical score=4.045455 hit=m3 at=2026-08-06T06:00:04-04:00 | kimi answer searchable
+read ref=ch_0b26e45343df:m2..m4 hit=m3 tools=true tool-results=false thinking=false subagents=true
+hit project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df anchors=ma_3200d601e22cb40f source=lexical score=4.035714 hit=s1:m3 at=2026-08-06T06:00:02-04:00 | kimi child answer searchable
+read ref=ch_0b26e45343df:s1:m2..m3 hit=s1:m3 tools=true tool-results=false thinking=false subagents=true
+conversation rank=6 project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 score=4.045455 hits=2 total=2 : summary text
+hit project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 anchors=ma_8def110f79b46925 source=lexical score=4.045455 hit=m3 at=1969-12-31T19:00:01 | grok answer searchable
+read ref=ch_982349c13ee4:m2..m4 hit=m3 tools=true tool-results=false thinking=false subagents=true
+hit project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4 anchors=ma_ed09908ea14107f5 source=lexical score=4.035714 hit=s1:m3 at=1969-12-31T19:00:01 | grok child answer searchable
+read ref=ch_982349c13ee4:s1:m2..m3 hit=s1:m3 tools=true tool-results=false thinking=false subagents=true
+protocol agent-warning kind=malformed-transcript count=2
 $ rearview agent search searchable --top 3
 --- stdout
 protocol agent-search mode=lexical cut=none chars=6000 policy=per-hit groups=3 hits=6 tz=-04:00 warnings=2 warning-records=1

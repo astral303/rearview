@@ -202,6 +202,27 @@ pub struct AgentSearchArgs {
     pub time: MessageTimeArgs,
     #[command(flatten)]
     pub context: HitContextArgs,
+    #[command(flatten)]
+    pub recipe_visibility: RecipeVisibilityArgs,
+}
+
+// The content each hit's `read` recipe shows beside what the hit's message
+// needs. The flags don't change the hits: a search matches tool calls, tool
+// results, thinking and sub-agent messages without them.
+#[derive(Debug, Default, ClapArgs)]
+pub struct RecipeVisibilityArgs {
+    /// Set tools=true in each hit's `read` recipe
+    #[arg(long)]
+    pub tools: bool,
+    /// Set tool-results=true in each hit's `read` recipe
+    #[arg(long)]
+    pub tool_results: bool,
+    /// Set thinking=true in each hit's `read` recipe
+    #[arg(long)]
+    pub thinking: bool,
+    /// Set subagents=true in each hit's `read` recipe
+    #[arg(long)]
+    pub subagents: bool,
 }
 
 // The messages of a hit's thread before and after the hit that its `read`
@@ -301,6 +322,8 @@ pub struct AgentWithinArgs {
     pub time: MessageTimeArgs,
     #[command(flatten)]
     pub context: HitContextArgs,
+    #[command(flatten)]
+    pub recipe_visibility: RecipeVisibilityArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -863,6 +886,42 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_search_and_within_accept_each_visibility_flag_read_accepts() {
+        let flags_of = |flags: &[&str]| {
+            let parse = |command: &[&str]| {
+                let mut args = vec!["rearview", "agent"];
+                args.extend_from_slice(command);
+                args.extend_from_slice(flags);
+                agent_command(Args::try_parse_from(args).unwrap())
+            };
+            let visibility_of = |flags: &RecipeVisibilityArgs| {
+                [
+                    flags.tools,
+                    flags.tool_results,
+                    flags.thinking,
+                    flags.subagents,
+                ]
+            };
+            let search = match parse(&["search", "cache"]) {
+                AgentCommand::Search(search) => visibility_of(&search.recipe_visibility),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            let within = match parse(&["within", "ch_abc123", "cache"]) {
+                AgentCommand::Within(within) => visibility_of(&within.recipe_visibility),
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(search, within, "{flags:?} means the same on both");
+            search
+        };
+
+        assert_eq!(flags_of(&[]), [false; 4]);
+        assert_eq!(flags_of(&["--tools"]), [true, false, false, false]);
+        assert_eq!(flags_of(&["--tool-results"]), [false, true, false, false]);
+        assert_eq!(flags_of(&["--thinking"]), [false, false, true, false]);
+        assert_eq!(flags_of(&["--subagents"]), [false, false, false, true]);
     }
 
     #[test]
