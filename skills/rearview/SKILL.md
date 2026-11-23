@@ -18,7 +18,7 @@ With a `ref=ch_...` handle, read or outline it directly:
 
 ```sh
 rearview agent outline ch_1234abcd5678
-rearview agent read ch_1234abcd5678:m7..m9 --focus m8..m8
+rearview agent read ch_1234abcd5678:m7..m9 --focus m8
 rearview agent read ch_1234abcd5678 --anchor ma_0123456789abcdef
 rearview agent read ch_1234abcd5678:m7.2
 rearview agent read ch_1234abcd5678:s3
@@ -65,6 +65,9 @@ rearview agent sessions --after 2026-07-20T14:00 --before 2026-07-20T15:00
 rearview agent read ch_1234abcd5678 --after 2026-07-20T14:00 --before 2026-07-20T15:00 --tools
 ```
 
+`messages=` counts a session's own messages, without its sub-agents';
+`subagents=` counts its sub-agents, s1 to sN.
+
 Values are a duration back from now (`45s`, `30m`, `2d`, `1w`, `6mo`, `1y`, or
 combined as `1d6h`), an absolute local time (`2026-07-20`,
 `2026-07-20T14:30`), or one with a time zone offset (`2026-07-20T14:30-05:00`).
@@ -89,8 +92,9 @@ Do not invent opaque pagination state.
 Read and outline records:
 
 - Each opens with an address (`m7`, call `m7.2`, or `m7..m9 hidden`), a
-  sub-agent's handle (`s3`), a source word, then the time under its `day`
-  record; `tz=` is the time zone offset.
+  source word, then the time under its `day` record; `tz=` is the time zone
+  offset. `m7` is the session's own seventh message; sub-agent s3's messages
+  are numbered apart: `s3:m2`, call `s3:m2.1`, range `s3:m2..m5`.
 - A record without `user`, `report` or `result` is the agent's, or a result
   naming its `call=`.
 - `m7.2 result` is a result in its call's own message.
@@ -111,8 +115,8 @@ protocol agent-search mode=lexical cut=none chars=6000 policy=per-hit groups=1 h
 query text=auth%20cache%20bug hits=1
 groups count=1
 conversation rank=1 project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 score=12.500000 hits=1 total=1 : fix auth cache
-hit project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0123456789abcdef source=lexical score=12.500000 focus=m8..m8 at=2026-07-20T14:30:12 | auth cache bug repro
-read ref=ch_1234abcd5678:m7..m9 focus=m8..m8 tools=false tool-results=false thinking=false subagents=false
+hit project=pr_0123456789abcdef uuid=12345678-1234-4234-9234-123456789abc ref=ch_1234abcd5678 anchors=ma_0123456789abcdef source=lexical score=12.500000 focus=m8 at=2026-07-20T14:30:12 | auth cache bug repro
+read ref=ch_1234abcd5678:m7..m9 focus=m8 tools=false tool-results=false thinking=false subagents=false
 ```
 
 Copy an emitted `read ref=...` or `refs=...` recipe into the next command.
@@ -134,8 +138,13 @@ rearview agent within ch_1234abcd5678 "auth cache bug" --mode lexical
 ```
 
 To choose a section, outline it, then read only the emitted range. An outline
-spans the whole session, its messages inside the window, or a ref's `:m7..m9`
-or `:s3`. `--tail 20` reads the last 20 messages a read shows.
+spans the whole session, its messages inside the window, or a ref's `:m7..m9`,
+`:s3` or `:s3:m2..m5`. With `--subagents`, `:m7..m9` reads m7 to m9 and every
+sub-agent message written after m7 and before m10; `:m7` reads as `:m7..m7`.
+`:m7..` reads to the end, as does an end past the last message. `--tail 20`
+reads the last 20 of the session's own messages a read shows (of s3's for
+`:s3`) and, with `--subagents`, the sub-agent messages written after the
+first of them.
 
 A single message can exceed a useful budget. Select inclusive 1-based content
 lines, or find case-insensitive text with context:
@@ -179,7 +188,8 @@ project exclusions, and visibility policy. Command flags override config;
 Do not read a full transcript by default. Prefer search, then within or outline,
 then a bounded read. Use `--tools`, `--tool-results`, `--thinking`, or
 `--subagents` only when that content is relevant. `read` reports what
-they hide as `hidden-<flag>=` atoms and `hidden` records. `--tools`
+they hide as `hidden-tools=`, `hidden-tool-results=`, `hidden-thinking=`
+and `hidden-subagent-messages=` counts and `hidden` records. `--tools`
 shows each tool call's command, file or pattern, such as `Bash: cargo test`;
 `(+N lines)` counts the call's other lines: search matches them, and
 `read ch_1234abcd5678:m7.2` shows them.

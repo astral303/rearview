@@ -275,7 +275,7 @@ pub struct ResolvedConversation {
     pub reference: AgentConversationRef,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct MessageRange {
     pub start: usize,
     pub end: usize,
@@ -305,10 +305,79 @@ impl MessageRange {
     }
 }
 
+/// The thread a message is numbered in: the session's own messages, or a
+/// sub-agent's, by its handle.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Thread {
+    Parent,
+    Subagent(usize),
+}
+
+impl Thread {
+    /// `s3:` for sub-agent s3's messages; empty for the session's own.
+    pub fn prefix(self) -> String {
+        match self {
+            Self::Parent => String::new(),
+            Self::Subagent(handle) => format!("s{handle}:"),
+        }
+    }
+}
+
+/// Messages of one thread a ref names, by their numbers in that thread,
+/// both ends included: `m5`, `m5..m9`, `m5..`, `s3:m2` or `s3:m2..m4`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ThreadRange {
+    pub thread: Thread,
+    pub first: usize,
+    /// `None` for an open end, `m5..`: to the thread's last message.
+    pub last: Option<usize>,
+}
+
+impl ThreadRange {
+    /// `mN` or `sN:mK`.
+    pub fn one(thread: Thread, number: usize) -> Self {
+        Self::closed(thread, number, number)
+    }
+
+    /// `mA..mB` or `sN:mA..mB`; `mA` when `first` is `last`.
+    pub fn closed(thread: Thread, first: usize, last: usize) -> Self {
+        Self {
+            thread,
+            first,
+            last: Some(last),
+        }
+    }
+
+    /// `mA..` or `sN:mA..`: from `first` to the thread's last message.
+    pub fn open(thread: Thread, first: usize) -> Self {
+        Self {
+            thread,
+            first,
+            last: None,
+        }
+    }
+
+    /// True when the ref names one message: `mN`, `mN..mN` or `sN:mK`.
+    pub fn names_one_message(&self) -> bool {
+        self.last == Some(self.first)
+    }
+}
+
+impl std::fmt::Display for ThreadRange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}m{}", self.thread.prefix(), self.first)?;
+        match self.last {
+            None => write!(formatter, ".."),
+            Some(last) if last != self.first => write!(formatter, "..m{last}"),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadRef {
     pub conversation: String,
-    pub range: Option<MessageRange>,
+    pub range: Option<ThreadRange>,
     /// `REF:sN`: the handle of the sub-agent to read alone.
     pub subagent: Option<usize>,
     /// `REF:mN.K`: the number of the call to read alone, in the message
@@ -361,7 +430,7 @@ fn opens_with_drive(path: &str) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FocusRef {
     pub conversation: Option<String>,
-    pub range: MessageRange,
+    pub range: ThreadRange,
 }
 
 /// The command a ref names messages for: each accepts its own forms after
@@ -378,9 +447,11 @@ impl RefCommand {
     fn forms(self) -> &'static str {
         match self {
             Self::Read => {
-                "after the conversation ref, use mN, mA..mB, mN.K for one call, or sN; pass an ma_ anchor with --anchor"
+                "after the conversation ref, use mN, mA..mB, mA.., mN.K for one call, sN, or sN:mN, sN:mA..mB, sN:mA.., sN:mN.K for a sub-agent's messages; pass an ma_ anchor with --anchor"
             }
-            Self::Outline => "after the conversation ref, use mN, mA..mB or sN",
+            Self::Outline => {
+                "after the conversation ref, use mN, mA..mB, mA.., sN, or sN:mN, sN:mA..mB, sN:mA.. for a sub-agent's messages"
+            }
         }
     }
 
@@ -388,25 +459,16 @@ impl RefCommand {
     fn takes_a_call(self) -> bool {
         self == Self::Read
     }
-
-    /// The detail of the error for an open-ended range, `mN..`.
-    fn open_end(self) -> &'static str {
-        match self {
-            Self::Read => {
-                "open-ended message ranges are not supported; use mN..mM, or --tail N to read the end"
-            }
-            Self::Outline => self.forms(),
-        }
-    }
 }
 
-/// An `agent read` ref: a conversation, then `:mN`, `:mA..mB`, `:mN.K` or
-/// `:sN`.
+/// An `agent read` ref: a conversation, then `:mN`, `:mA..mB`, `:mA..`,
+/// `:mN.K`, `:sN`, or one of the message forms after `:sN`.
 pub fn parse_read_ref(input: &str) -> Result<ReadRef> {
     parse_ref(input, RefCommand::Read)
 }
 
-/// An `agent outline` ref: a conversation, then `:mN`, `:mA..mB` or `:sN`.
+/// An `agent outline` ref: a conversation, then `:mN`, `:mA..mB`, `:mA..`,
+/// `:sN`, or one of the message forms after `:sN` but a call.
 pub fn parse_outline_ref(input: &str) -> Result<ReadRef> {
     parse_ref(input, RefCommand::Outline)
 }
@@ -424,24 +486,79 @@ fn parse_ref(input: &str, command: RefCommand) -> Result<ReadRef> {
         if !is_message_or_subagent_ref(part) {
             return Err(AgentError::invalid_ref(part, command.forms()).into());
         }
-        if has_open_end(part) {
-            return Err(AgentError::invalid_ref(part, command.open_end()).into());
-        }
-        if let Some((message, call)) = parse_call_address(part) {
-            if !command.takes_a_call() {
-                return Err(AgentError::invalid_ref(part, command.forms()).into());
-            }
-            reference.range = Some(MessageRange::single(message));
-            reference.call = Some(call);
-        } else {
-            reference.subagent = parse_subagent_handle(part)?;
-            if reference.subagent.is_none() {
-                reference.range = Some(parse_message_range(part)?);
+        let (thread, messages) = split_thread(part)?;
+        match messages {
+            None => reference.subagent = Some(thread_handle(thread)),
+            Some(messages) => {
+                if let Some((message, call)) = parse_call_address(messages) {
+                    if !command.takes_a_call() {
+                        return Err(AgentError::invalid_ref(part, command.forms()).into());
+                    }
+                    reference.range = Some(ThreadRange::one(thread, message));
+                    reference.call = Some(call);
+                } else {
+                    reference.range = Some(parse_thread_range(thread, messages)?);
+                }
             }
         }
     }
     validate_conversation_ref(conversation)?;
     Ok(reference)
+}
+
+/// The handle of a sub-agent's thread.
+fn thread_handle(thread: Thread) -> usize {
+    match thread {
+        Thread::Subagent(handle) => handle,
+        Thread::Parent => unreachable!("only `sN` names a thread without messages"),
+    }
+}
+
+/// The thread a part after the conversation ref names and the messages
+/// after it: `s3:m2..m4` is sub-agent s3's `m2..m4`, `s3` is s3 without
+/// messages, and `m2..m4` is the session's own.
+fn split_thread(part: &str) -> Result<(Thread, Option<&str>)> {
+    if !part.starts_with('s') {
+        return Ok((Thread::Parent, Some(part)));
+    }
+    let (handle, messages) = match part.split_once(':') {
+        Some((handle, messages)) => (handle, Some(messages)),
+        None => (part, None),
+    };
+    let handle = parse_subagent_handle(handle)?.expect("a part opening with `s` names a handle");
+    Ok((Thread::Subagent(handle), messages))
+}
+
+/// `mN`, `mA..mB` or `mA..` of `thread`. The end of a sub-agent's range may
+/// repeat its thread, `s3:m2..s3:m9`; a range across two threads is
+/// `invalid-ref`.
+fn parse_thread_range(thread: Thread, input: &str) -> Result<ThreadRange> {
+    let mixed = || {
+        AgentError::invalid_ref(
+            input,
+            "a range stays in one thread: use mA..mB or sN:mA..mB",
+        )
+    };
+    let Some((start, end)) = input.split_once("..") else {
+        if input.contains(':') {
+            return Err(mixed().into());
+        }
+        return Ok(ThreadRange::one(thread, parse_message_number(input)?));
+    };
+    let end = match end.split_once(':') {
+        Some((handle, end)) => match parse_subagent_handle(handle) {
+            Ok(Some(handle)) if Thread::Subagent(handle) == thread => end,
+            _ => return Err(mixed().into()),
+        },
+        None => end,
+    };
+    if start.contains(':') || end.contains(':') {
+        return Err(mixed().into());
+    }
+    Ok(match parse_message_range(start, end)? {
+        (first, Some(last)) => ThreadRange::closed(thread, first, last),
+        (first, None) => ThreadRange::open(thread, first),
+    })
 }
 
 /// The message and call numbers of a call's address, `m1006.15`; `None`
@@ -460,13 +577,13 @@ fn parse_call_address(part: &str) -> Option<(usize, usize)> {
 }
 
 /// True for a part after the conversation ref that reads as a message ref,
-/// well formed or not (`m7`, `m7..m9`, `..m5`, `1`), or a sub-agent ref
-/// (`s3`).
+/// well formed or not (`m7`, `m7..m9`, `..m5`, `1`, `m5..s3:m7`), or a
+/// sub-agent ref (`s3`, `s3:m2`).
 fn is_message_or_subagent_ref(part: &str) -> bool {
     part.starts_with('s')
         || part
             .chars()
-            .all(|char| char == 'm' || char == '.' || char.is_ascii_digit())
+            .all(|char| matches!(char, 'm' | 's' | '.' | ':') || char.is_ascii_digit())
 }
 
 /// The handle `sN` names; `None` for text that does not open with `s`.
@@ -480,19 +597,36 @@ fn parse_subagent_handle(input: &str) -> Result<Option<usize>> {
     }
 }
 
+/// A `--focus`: `mN`, `mA..mB` or a sub-agent's `sN:mA..mB`, after a
+/// conversation ref or alone.
 pub fn parse_focus_ref(input: &str) -> Result<FocusRef> {
-    match split_message_range(input) {
-        (conversation, Some(range)) => {
+    let names_a_thread = input
+        .split_once(':')
+        .is_some_and(|(handle, _)| matches!(parse_subagent_handle(handle), Ok(Some(_))));
+    let (conversation, part) = match split_message_range(input) {
+        (_, Some(_)) if names_a_thread => (None, input),
+        (conversation, Some(part)) => {
             validate_conversation_ref(conversation)?;
-            Ok(FocusRef {
-                conversation: Some(conversation.to_string()),
-                range: parse_message_range(range)?,
-            })
+            (Some(conversation.to_string()), part)
         }
-        (range, None) => Ok(FocusRef {
-            conversation: None,
-            range: parse_message_range(range)?,
-        }),
+        (part, None) => (None, part),
+    };
+    Ok(FocusRef {
+        conversation,
+        range: parse_messages(part)?,
+    })
+}
+
+/// The messages a part after the conversation ref names: `mN`, `mA..mB`,
+/// `sN:mN` or `sN:mA..mB`.
+pub fn parse_messages(part: &str) -> Result<ThreadRange> {
+    match split_thread(part)? {
+        (thread, Some(messages)) => parse_thread_range(thread, messages),
+        (_, None) => Err(AgentError::invalid_ref(
+            part,
+            "name messages: mN, mA..mB, sN:mN or sN:mA..mB",
+        )
+        .into()),
     }
 }
 
@@ -522,56 +656,33 @@ fn split_message_range(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-pub fn validate_resolved_focus_in_ranges(
-    read_refs: &[(ReadRef, ResolvedConversation)],
-    focus: &FocusRef,
-    focus_conversation: Option<&ResolvedConversation>,
-) -> Result<()> {
-    let target_ref = if let Some(focus_conversation) = focus_conversation {
-        focus_conversation.reference.full_ref()
-    } else {
-        let Some((_, first)) = read_refs.first() else {
-            return Err(
-                AgentError::invalid_ref("focus", "focus requires at least one read ref").into(),
-            );
-        };
-        let first_ref = first.reference.full_ref();
-        if read_refs
-            .iter()
-            .any(|(_, resolved)| resolved.reference.full_ref() != first_ref)
-        {
-            return Err(AgentError::invalid_ref(
-                "focus",
-                "bare focus is ambiguous for multiple conversations; use ch_...:mN",
-            )
-            .into());
-        }
-        first_ref
-    };
-
-    let contained = read_refs.iter().any(|(read_ref, resolved)| {
-        resolved.reference.full_ref() == target_ref
-            && read_ref
-                .range
-                .unwrap_or(MessageRange {
-                    start: 1,
-                    end: usize::MAX,
-                })
-                .contains(&focus.range)
-    });
-
-    if contained {
-        Ok(())
-    } else {
-        Err(AgentError::out_of_range(
-            focus.conversation.as_deref(),
-            format!(
-                "focus m{}..m{} is outside the requested read range",
-                focus.range.start, focus.range.end
-            ),
-        )
-        .into())
+/// The conversation a `--focus` names among the read's: its own, or the
+/// read's one conversation for a bare focus. A bare focus over several
+/// conversations is `invalid-ref`.
+pub fn focus_conversation<'r>(
+    read_refs: &'r [(ReadRef, ResolvedConversation)],
+    focus_conversation: Option<&'r ResolvedConversation>,
+) -> Result<&'r ResolvedConversation> {
+    if let Some(focus_conversation) = focus_conversation {
+        return Ok(focus_conversation);
     }
+    let Some((_, first)) = read_refs.first() else {
+        return Err(
+            AgentError::invalid_ref("focus", "focus requires at least one read ref").into(),
+        );
+    };
+    let first_ref = first.reference.full_ref();
+    if read_refs
+        .iter()
+        .any(|(_, resolved)| resolved.reference.full_ref() != first_ref)
+    {
+        return Err(AgentError::invalid_ref(
+            "focus",
+            "bare focus is ambiguous for multiple conversations; use ch_...:mN",
+        )
+        .into());
+    }
+    Ok(first)
 }
 
 /// The session `reference` names among `keys`. A key without a file
@@ -852,38 +963,35 @@ fn validate_conversation_ref(reference: &str) -> Result<ConversationRefInput> {
     Ok(ConversationRefInput::IdOrFileName(reference.to_owned()))
 }
 
-/// True for `mN..`; false for `..mN` and `mN...`.
-fn has_open_end(range: &str) -> bool {
-    range
-        .strip_suffix("..")
-        .is_some_and(|start| !start.is_empty() && !start.ends_with('.'))
-}
-
-fn parse_message_range(input: &str) -> Result<MessageRange> {
-    if input.contains("...") {
+/// The first and last message numbers of the range from `start` to `end`,
+/// the two sides of its `..`; the last is `None` for an open end, `mA..`.
+fn parse_message_range(start: &str, end: &str) -> Result<(usize, Option<usize>)> {
+    let input = format!("{start}..{end}");
+    if end.starts_with('.') {
+        return Err(AgentError::invalid_ref(
+            &input,
+            "invalid message range; use mN, mA..mB or mA..",
+        )
+        .into());
+    }
+    if start.is_empty() {
+        return Err(AgentError::invalid_ref(
+            &input,
+            "a message range starts at a message; use mA..mB, or mA.. to read to the end",
+        )
+        .into());
+    }
+    let first = parse_message_number(start)?;
+    if end.is_empty() {
+        return Ok((first, None));
+    }
+    let last = parse_message_number(end)?;
+    if first > last {
         return Err(
-            AgentError::invalid_ref(input, "invalid message range; use mN or mN..mM").into(),
+            AgentError::invalid_ref(&input, "message range start must be before end").into(),
         );
     }
-    if let Some((start, end)) = input.split_once("..") {
-        if start.is_empty() || end.is_empty() {
-            return Err(AgentError::invalid_ref(
-                input,
-                "open-ended message ranges are not supported",
-            )
-            .into());
-        }
-        let start = parse_message_number(start)?;
-        let end = parse_message_number(end)?;
-        if start > end {
-            return Err(
-                AgentError::invalid_ref(input, "message range start must be before end").into(),
-            );
-        }
-        Ok(MessageRange { start, end })
-    } else {
-        Ok(MessageRange::single(parse_message_number(input)?))
-    }
+    Ok((first, Some(last)))
 }
 
 fn parse_message_number(input: &str) -> Result<usize> {
@@ -1321,24 +1429,19 @@ mod tests {
 
         for input in [uuid, file_name.as_str()] {
             let read = parse_read_ref(&format!("{input}:m2..m4")).unwrap();
-            assert_eq!(read.range, Some(MessageRange { start: 2, end: 4 }));
+            assert_eq!(read.range, Some(parent_range(2, 4)));
             let resolved =
                 resolve_conversation_ref(&keys, &read.conversation, &SystemCanonicaliser::shared())
                     .unwrap();
             assert_eq!(resolved.key, pi);
             let focus = parse_focus_ref(&format!("{input}:m3")).unwrap();
-            let focus_conversation = resolve_conversation_ref(
+            let focused = resolve_conversation_ref(
                 &keys,
                 focus.conversation.as_deref().unwrap(),
                 &SystemCanonicaliser::shared(),
             )
             .unwrap();
-            validate_resolved_focus_in_ranges(
-                &[(read, resolved)],
-                &focus,
-                Some(&focus_conversation),
-            )
-            .unwrap();
+            focus_conversation(&[(read, resolved)], Some(&focused)).unwrap();
         }
     }
 
@@ -1466,7 +1569,7 @@ mod tests {
         let read = parse_read_ref(&format!("{typed}:m2")).unwrap();
 
         assert_eq!(read.conversation, typed);
-        assert_eq!(read.range, Some(MessageRange::single(2)));
+        assert_eq!(read.range, Some(ThreadRange::one(Thread::Parent, 2)));
         assert_eq!(
             resolve_conversation_ref(&keys, &read.conversation, &SystemCanonicaliser::shared())
                 .unwrap()
@@ -1562,9 +1665,9 @@ mod tests {
         assert_eq!(whole.conversation, path);
         assert_eq!(whole.range, None);
         assert_eq!(ranged.conversation, path);
-        assert_eq!(ranged.range, Some(MessageRange { start: 2, end: 4 }));
+        assert_eq!(ranged.range, Some(parent_range(2, 4)));
         assert_eq!(focus.conversation.as_deref(), Some(path));
-        assert_eq!(focus.range, MessageRange::single(3));
+        assert_eq!(focus.range, ThreadRange::one(Thread::Parent, 3));
     }
 
     #[test]
@@ -1577,8 +1680,13 @@ mod tests {
         assert_eq!((read.conversation.as_str(), read.subagent), (path, Some(3)));
         assert_eq!(
             (outline.conversation.as_str(), outline.range),
-            (path, Some(MessageRange { start: 2, end: 4 }))
+            (path, Some(parent_range(2, 4)))
         );
+    }
+
+    /// `mA..mB` of the session's own messages.
+    fn parent_range(start: usize, end: usize) -> ThreadRange {
+        ThreadRange::closed(Thread::Parent, start, end)
     }
 
     #[test]
@@ -1594,6 +1702,57 @@ mod tests {
         ] {
             assert!(parse_read_ref(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn subagent_message_refs_name_messages_in_its_thread() {
+        let thread = Thread::Subagent(3);
+        let range = ThreadRange::closed(thread, 2, 9);
+
+        assert_eq!(
+            parse_read_ref("ch_12345678:s3:m2").unwrap().range,
+            Some(ThreadRange::one(thread, 2))
+        );
+        for reference in ["ch_12345678:s3:m2..m9", "ch_12345678:s3:m2..s3:m9"] {
+            let read = parse_read_ref(reference).unwrap();
+            assert_eq!(
+                (read.range, read.subagent),
+                (Some(range), None),
+                "{reference} names s3's m2..m9"
+            );
+        }
+        let call = parse_read_ref("ch_12345678:s3:m5.2").unwrap();
+        assert_eq!(
+            (call.range, call.call),
+            (Some(ThreadRange::one(thread, 5)), Some(2))
+        );
+    }
+
+    #[test]
+    fn range_across_two_threads_is_invalid_ref() {
+        for reference in ["ch_12345678:m5..s3:m2", "ch_12345678:s3:m2..s4:m1"] {
+            let error = parse_read_ref(reference).unwrap_err();
+
+            assert!(
+                error.to_string().contains("a range stays in one thread"),
+                "{reference} is a range of two threads: {error}"
+            );
+            assert_eq!(agent_error_kind(error), AgentErrorKind::InvalidRef);
+        }
+    }
+
+    #[test]
+    fn focus_names_subagents_messages_alone_or_after_conversation() {
+        let range = ThreadRange::one(Thread::Subagent(3), 2);
+
+        let bare = parse_focus_ref("s3:m2..m2").unwrap();
+        let qualified = parse_focus_ref("ch_12345678:s3:m2..m2").unwrap();
+
+        assert_eq!((bare.conversation, bare.range), (None, range));
+        assert_eq!(
+            (qualified.conversation.as_deref(), qualified.range),
+            (Some("ch_12345678"), range)
+        );
     }
 
     #[test]
@@ -1726,12 +1885,11 @@ mod tests {
                 .to_string()
                 .contains("too short")
         );
-        let open_end = parse_read_ref("ch_12345678:m1..").unwrap_err().to_string();
-        assert!(open_end.contains("open-ended"), "{open_end}");
-        assert!(open_end.contains("--tail N"), "{open_end}");
         let open_start = parse_read_ref("ch_12345678:..m5").unwrap_err().to_string();
-        assert!(open_start.contains("open-ended"), "{open_start}");
-        assert!(!open_start.contains("--tail"), "{open_start}");
+        assert!(
+            open_start.contains("a message range starts at a message"),
+            "{open_start}"
+        );
         assert!(
             parse_read_ref("ch_12345678:m..m2")
                 .unwrap_err()
@@ -1775,8 +1933,7 @@ mod tests {
                 agent_error_kind_and_detail(error),
                 (
                     AgentErrorKind::InvalidRef,
-                    "after the conversation ref, use mN, mA..mB, mN.K for one call, or sN; pass an ma_ anchor with --anchor"
-                        .to_owned()
+                    RefCommand::Read.forms().to_owned()
                 ),
                 "{reference}"
             );
@@ -1790,9 +1947,12 @@ mod tests {
             "12345678-1234-4234-9234-123456789abc.jsonl",
         )];
         let reference = r"C:\s\x.jsonl:bad/s3";
-        let not_found = format!(
-            "{reference} was not found as a session ID, transcript path or file name; after the conversation ref, use"
-        );
+        let not_found = |command: RefCommand| {
+            format!(
+                "{reference} was not found as a session ID, transcript path or file name; {}",
+                command.forms()
+            )
+        };
 
         let read = parse_read_ref(reference)
             .unwrap()
@@ -1805,19 +1965,11 @@ mod tests {
 
         assert_eq!(
             agent_error_kind_and_detail(read),
-            (
-                AgentErrorKind::NotFound,
-                format!(
-                    "{not_found} mN, mA..mB, mN.K for one call, or sN; pass an ma_ anchor with --anchor"
-                )
-            )
+            (AgentErrorKind::NotFound, not_found(RefCommand::Read))
         );
         assert_eq!(
             agent_error_kind_and_detail(outline),
-            (
-                AgentErrorKind::NotFound,
-                format!("{not_found} mN, mA..mB or sN")
-            )
+            (AgentErrorKind::NotFound, not_found(RefCommand::Outline))
         );
     }
 
@@ -1852,7 +2004,7 @@ mod tests {
             read.conversation,
             "/tmp/a:b/12345678-1234-4234-9234-123456789abc.jsonl"
         );
-        assert_eq!(read.range, Some(MessageRange::single(2)));
+        assert_eq!(read.range, Some(ThreadRange::one(Thread::Parent, 2)));
     }
 
     #[test]
@@ -1861,7 +2013,7 @@ mod tests {
 
         assert_eq!(
             (reference.range, reference.call),
-            (Some(MessageRange::single(1006)), Some(15))
+            (Some(ThreadRange::one(Thread::Parent, 1006)), Some(15))
         );
     }
 
@@ -1869,7 +2021,6 @@ mod tests {
     fn outline_ref_outline_doesnt_accept_names_forms_it_accepts() {
         for reference in [
             "ch_12345678:REF:s3",
-            "ch_12345678:m3..",
             "ch_12345678:m3.1",
             "ch_12345678:/s3",
             r"ch_12345678:\s3",
@@ -1880,7 +2031,7 @@ mod tests {
                 agent_error_kind_and_detail(error),
                 (
                     AgentErrorKind::InvalidRef,
-                    "after the conversation ref, use mN, mA..mB or sN".to_owned()
+                    RefCommand::Outline.forms().to_owned()
                 ),
                 "{reference}"
             );
@@ -1891,7 +2042,7 @@ mod tests {
     fn outline_ref_accepts_range_or_sub_agent() {
         assert_eq!(
             parse_outline_ref("ch_12345678:m3..m9").unwrap().range,
-            Some(MessageRange { start: 3, end: 9 })
+            Some(parent_range(3, 9))
         );
         assert_eq!(
             parse_outline_ref("ch_12345678:s4").unwrap().subagent,
@@ -1900,31 +2051,46 @@ mod tests {
     }
 
     #[test]
-    fn open_ended_focus_doesnt_suggest_tail() {
-        for focus in ["m3..", "ch_12345678:m3.."] {
-            let error = parse_focus_ref(focus).unwrap_err().to_string();
-            assert!(error.contains("open-ended"), "{error}");
-            assert!(!error.contains("--tail"), "{error}");
+    fn open_ended_ref_names_its_first_message_and_threads_end() {
+        for (reference, expected) in [
+            ("ch_12345678:m3..", ThreadRange::open(Thread::Parent, 3)),
+            (
+                "ch_12345678:s4:m10..",
+                ThreadRange::open(Thread::Subagent(4), 10),
+            ),
+        ] {
+            for parsed in [parse_read_ref(reference), parse_outline_ref(reference)] {
+                assert_eq!(parsed.unwrap().range, Some(expected), "{reference}");
+            }
         }
+        for focus in ["m3..", "ch_12345678:m3.."] {
+            assert_eq!(
+                parse_focus_ref(focus).unwrap().range,
+                ThreadRange::open(Thread::Parent, 3),
+                "{focus}"
+            );
+        }
+        assert_eq!(
+            ThreadRange::open(Thread::Subagent(4), 10).to_string(),
+            "s4:m10.."
+        );
     }
 
     #[test]
-    fn validates_focus_inside_read_ranges() {
-        let reads = [parse_read_ref("ch_12345678:m2..m5").unwrap()];
+    fn bare_focus_names_reads_conversation() {
         let resolved = ResolvedConversation {
             key: key("project-a", "one.jsonl"),
             reference: AgentConversationRef::from_parts("project-a", "one.jsonl"),
         };
-        let resolved_reads = vec![(reads[0].clone(), resolved)];
-        validate_resolved_focus_in_ranges(&resolved_reads, &parse_focus_ref("m3").unwrap(), None)
-            .unwrap();
-        let err = validate_resolved_focus_in_ranges(
-            &resolved_reads,
-            &parse_focus_ref("m6").unwrap(),
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("outside"));
+        let resolved_reads = vec![(
+            parse_read_ref("ch_12345678:m2..m5").unwrap(),
+            resolved.clone(),
+        )];
+
+        assert_eq!(
+            focus_conversation(&resolved_reads, None).unwrap(),
+            &resolved
+        );
     }
 
     #[test]
@@ -1942,12 +2108,7 @@ mod tests {
             reference: AgentConversationRef::from_parts("project-b", "two.jsonl"),
         };
         let resolved_reads = vec![(reads[0].clone(), first), (reads[1].clone(), second)];
-        let err = validate_resolved_focus_in_ranges(
-            &resolved_reads,
-            &parse_focus_ref("m2").unwrap(),
-            None,
-        )
-        .unwrap_err();
+        let err = focus_conversation(&resolved_reads, None).unwrap_err();
         assert!(err.to_string().contains("bare focus is ambiguous"));
     }
 }

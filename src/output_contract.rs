@@ -556,12 +556,14 @@ fn within_records_of(reference: &str) -> String {
 }
 
 /// The message the one-message `agent read` cases of `agent`'s session read,
-/// and the range its ranged `agent outline` case reads. Kimi Code's and Grok
-/// Build's cases read one message further on, because their sub-agent's
+/// and the range its ranged `agent outline` case reads. The one-message cases
+/// of Codex, Kimi Code and Grok Build read their sub-agent's answer: Kimi
+/// Code's and Grok Build's one message further on, because their sub-agent's
 /// thinking is a message of its own ahead of its answer.
 fn case_messages_of(agent: &str) -> (&'static str, &'static str) {
     match agent {
-        "kimi" | "grok" => ("m4", "m2..m6"),
+        "kimi" | "grok" => ("s1:m3", "m2..m6"),
+        "codex" => ("s1:m2", "m2..m5"),
         _ => ("m3", "m2..m5"),
     }
 }
@@ -637,7 +639,16 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         let continued: Vec<&str> = continued.iter().map(String::as_str).collect();
         run(&continued);
     }
+    run(&["agent", "read", &format!("{reference}:m17..m9999")]);
+    run(&["agent", "read", &format!("{reference}:m17..")]);
     run(&["agent", "read", &format!("{reference}:m9999")]);
+    run(&[
+        "agent",
+        "read",
+        &format!("{reference}:{message}"),
+        "--lines",
+        "9999..9999",
+    ]);
     run(&["agent", "read", &format!("{reference}:m5..m2")]);
     run(&["agent", "read", &format!("{reference}:s99")]);
     records
@@ -665,6 +676,7 @@ fn outline_records_of(reference: &str, agent: &str) -> String {
     ]);
     run(&["agent", "outline", reference, "--budget", "500"]);
     run(&["agent", "outline", &format!("{reference}:{range}")]);
+    run(&["agent", "outline", &format!("{reference}:m17..m9999")]);
     if outline.lines().any(|line| line.starts_with("subagent s1 ")) {
         run(&["agent", "outline", &format!("{reference}:s1")]);
     }

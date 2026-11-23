@@ -31,7 +31,53 @@ type ResolvedReadRefs = Vec<(agent::refs::ReadRef, agent::refs::ResolvedConversa
 #[derive(Debug)]
 pub(crate) struct ResolvedFocus {
     conversation: Option<agent::refs::ResolvedConversation>,
-    range: agent::refs::MessageRange,
+    range: agent::refs::ThreadRange,
+}
+
+/// The messages `focus` names in the conversation of `requests` it names, the
+/// read's one conversation for a bare focus: the focus a budget keeps first.
+/// A focus outside every request of that conversation is `out-of-range`.
+fn focused_messages(
+    focus: &ResolvedFocus,
+    requests: &[agent::protocol::ReadRequest<'_>],
+) -> Result<agent::protocol::ProtocolFocus> {
+    let conversation_full_ref = focus
+        .conversation
+        .as_ref()
+        .map(|conversation| conversation.reference.full_ref());
+    let focused_requests = requests
+        .iter()
+        .filter(|request| {
+            conversation_full_ref
+                .as_ref()
+                .is_none_or(|full_ref| request.resolved.reference.full_ref() == *full_ref)
+        })
+        .collect::<Vec<_>>();
+    let reference = focus
+        .conversation
+        .as_ref()
+        .map(|conversation| conversation.reference.canonical());
+    let outside = || {
+        AgentError::out_of_range(
+            reference.as_deref(),
+            format!("focus {} is outside the requested read range", focus.range),
+        )
+    };
+    let first = focused_requests.first().ok_or_else(outside)?;
+    let resolved =
+        agent::address::MessageAddresses::of_transcript(first.transcript).resolve(focus.range)?;
+    let range = resolved.range;
+    if !focused_requests
+        .iter()
+        .any(|request| request.range.is_none_or(|read| read.contains(&range)))
+    {
+        return Err(outside().into());
+    }
+    Ok(agent::protocol::ProtocolFocus {
+        conversation_full_ref,
+        range,
+        subagent: resolved.subagent,
+    })
 }
 
 const DEFAULT_OUTPUT_CHARS: usize = 6000;
@@ -419,22 +465,27 @@ impl SessionSelection {
         Ok((selection, stale_coverage))
     }
 
-    /// The page of the scoped sessions `agent sessions` lists.
+    /// The page of the scoped sessions `agent sessions` lists, their own
+    /// messages and sub-agents counted by `counts`.
     fn listing(
         &self,
         window: &TimeFilter,
-        offset: usize,
-        limit: usize,
+        page: agent::sessions::SessionPage,
+        counts: impl Fn(
+            &history::Conversation,
+            &agent::refs::ResolvedConversation,
+            &TimeFilter,
+        ) -> Result<agent::sessions::ListedCounts>,
     ) -> Result<agent::sessions::SessionListing> {
         let inputs = agent_inputs_for_indices(&self.conversations, &self.keys, &self.scoped)?;
-        Ok(agent::sessions::list_sessions(
+        agent::sessions::list_sessions(
             inputs
                 .iter()
                 .map(|input| (input.conversation, &input.resolved)),
             window,
-            offset,
-            limit,
-        ))
+            page,
+            counts,
+        )
     }
 }
 
@@ -444,8 +495,15 @@ pub struct AgentService {
     transcripts: RefCell<
         HashMap<PathBuf, std::result::Result<agent::transcript::AgentTranscript, AgentError>>,
     >,
-    bounded_transcripts:
-        RefCell<HashMap<(PathBuf, usize, usize), agent::transcript::AgentTranscript>>,
+    bounded_transcripts: RefCell<
+        HashMap<
+            (PathBuf, agent::refs::ThreadRange),
+            (
+                agent::transcript::AgentTranscript,
+                agent::address::ResolvedRange,
+            ),
+        >,
+    >,
     /// The name each target's listed row shows, by path. It replaces the
     /// title, summary and preview of the target's `AgentTranscript`, because
     /// the transcript's title and summary are its last parse's, older than a
@@ -536,7 +594,7 @@ pub(crate) fn read_hit_messages(
                 custom_title: None,
                 preview: None,
             },
-            message_count: conversation.message_count,
+            places: agent::address::HitPlaces::default(),
             copy_generation: Some(hits.generation),
         }));
     }
@@ -1485,37 +1543,122 @@ impl AgentService {
         )
     }
 
+    /// The transcript of `key`, with the bodies of the messages `range`
+    /// names at least, and those messages. A copy in the session cache reads
+    /// only their bodies.
     fn load_transcript_for_range(
         &self,
         key: &agent::refs::AgentConversationKey,
-        range: Option<agent::refs::MessageRange>,
-    ) -> Result<agent::transcript::AgentTranscript> {
+        range: Option<agent::refs::ThreadRange>,
+    ) -> Result<(
+        agent::transcript::AgentTranscript,
+        Option<agent::address::ResolvedRange>,
+    )> {
         let Some(range) = range else {
-            return self.load_transcript(key);
+            return Ok((self.load_transcript(key)?, None));
         };
         if self.transcripts.borrow().contains_key(&key.path) {
-            return self.load_transcript(key);
+            return self.load_transcript_resolving(key, Some(range));
         }
-        let cache_key = (key.path.clone(), range.start, range.end);
-        if let Some(transcript) = self.bounded_transcripts.borrow().get(&cache_key) {
-            return Ok(self.named_as_listed(key, transcript.clone()));
+        let cache_key = (key.path.clone(), range);
+        if let Some((transcript, resolved)) = self.bounded_transcripts.borrow().get(&cache_key) {
+            return Ok((
+                self.named_as_listed(key, transcript.clone()),
+                Some(*resolved),
+            ));
         }
+        if !self.load_bounded_transcripts(key, &[range])? {
+            return self.load_transcript_resolving(key, Some(range));
+        }
+        let (transcript, resolved) = self.bounded_transcripts.borrow()[&cache_key].clone();
+        Ok((self.named_as_listed(key, transcript), Some(resolved)))
+    }
+
+    /// Hold `key`'s transcript with the bodies of the messages each of
+    /// `ranges` names, read from one copy, for [`Self::load_transcript_for_range`]
+    /// of each range. False when the session cache doesn't hold a copy.
+    fn load_bounded_transcripts(
+        &self,
+        key: &agent::refs::AgentConversationKey,
+        ranges: &[agent::refs::ThreadRange],
+    ) -> Result<bool> {
+        let mut resolved = Vec::new();
         let read = self.perf.time_transcript_parse(key, || {
             self.read_copy_when_unlocked(|| {
                 history::sqlite_cache::read_copy_without_waiting(
                     self.environment.cache_base(),
                     &key.address,
-                    |held| held.agent_range(&key.path, range),
+                    |held| {
+                        let (transcript, named) = held.agent_refs(&key.path, ranges)?;
+                        resolved = named;
+                        Ok(transcript)
+                    },
                 )
             })
         });
         let Some(transcript) = history::sqlite_cache::found(read)? else {
-            return self.load_transcript(key);
+            return Ok(false);
         };
-        self.bounded_transcripts
-            .borrow_mut()
-            .insert(cache_key, transcript.clone());
-        Ok(self.named_as_listed(key, transcript))
+        let mut bounded = self.bounded_transcripts.borrow_mut();
+        for (&range, named) in ranges.iter().zip(resolved) {
+            bounded.insert((key.path.clone(), range), (transcript.clone(), named));
+        }
+        Ok(true)
+    }
+
+    /// Load the transcripts of `refs`, each a read's ref and its target, so
+    /// every ref into one session resolves against one copy of it: the whole
+    /// transcript when one of them reads it whole, else one bounded read of
+    /// all their ranges. [`Self::load_transcript_for_range`] and
+    /// [`Self::load_transcript_resolving`] then read what this holds.
+    fn load_transcripts_of_one_copy(
+        &self,
+        refs: &[(
+            &agent::refs::AgentConversationKey,
+            Option<agent::refs::ThreadRange>,
+            bool,
+        )],
+    ) -> Result<()> {
+        let mut bounded: Vec<(
+            &agent::refs::AgentConversationKey,
+            Vec<agent::refs::ThreadRange>,
+        )> = Vec::new();
+        for &(key, range, reads_part) in refs {
+            if !reads_part || range.is_none() {
+                // An error stays held, and the ref's own load reports it.
+                let _ = self.load_transcript(key);
+                continue;
+            }
+            match bounded.iter_mut().find(|(other, _)| other.path == key.path) {
+                Some((_, ranges)) => ranges.extend(range),
+                None => bounded.push((key, range.into_iter().collect())),
+            }
+        }
+        for (key, ranges) in bounded {
+            let read_whole = self.transcripts.borrow().contains_key(&key.path);
+            if ranges.len() > 1 && !read_whole && !self.load_bounded_transcripts(key, &ranges)? {
+                let _ = self.load_transcript(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// The whole transcript of `key`, and the messages `range` names in it.
+    fn load_transcript_resolving(
+        &self,
+        key: &agent::refs::AgentConversationKey,
+        range: Option<agent::refs::ThreadRange>,
+    ) -> Result<(
+        agent::transcript::AgentTranscript,
+        Option<agent::address::ResolvedRange>,
+    )> {
+        let transcript = self.load_transcript(key)?;
+        let resolved = range
+            .map(|range| {
+                agent::address::MessageAddresses::of_transcript(&transcript).resolve(range)
+            })
+            .transpose()?;
+        Ok((transcript, resolved))
     }
 
     /// Runs `command`, writing `protocol agent-progress` records to stderr
@@ -1791,6 +1934,47 @@ impl AgentService {
         }
     }
 
+    /// The counts of `conversation`'s own messages, without its sub-agents',
+    /// and of its sub-agents, counted in its cached copy; in its transcript,
+    /// read whole, for a row without a copy or a copy another write replaced.
+    fn listed_counts(
+        &self,
+        conversation: &history::Conversation,
+        key: &agent::refs::AgentConversationKey,
+        window: &TimeFilter,
+    ) -> Result<agent::sessions::ListedCounts> {
+        if let Some(copy) = &conversation.cached_session {
+            let read = self.read_copy_when_unlocked(|| {
+                copy.read_copy(|held| {
+                    if held.generation() != copy.generation() {
+                        return Ok(None);
+                    }
+                    Ok(Some(agent::sessions::ListedCounts {
+                        own: held.own_message_counts(window)?,
+                        subagents: held.subagent_count()?,
+                    }))
+                })
+            });
+            if let Some(counts) = history::sqlite_cache::found(read)?.flatten() {
+                return Ok(counts);
+            }
+        }
+        let transcript = self.load_transcript(key)?;
+        let own = transcript
+            .messages
+            .iter()
+            .filter(|message| message.subagent.is_none())
+            .map(|message| message.ordinal);
+        Ok(agent::sessions::ListedCounts {
+            own: agent::sessions::OwnMessageCounts::of_ordinals(
+                own,
+                &conversation.message_times,
+                window,
+            ),
+            subagents: agent::subagents::SubagentHandles::of(&transcript).count(),
+        })
+    }
+
     fn render_search(
         &self,
         output: &agent::search::AgentSearchOutput,
@@ -1841,8 +2025,13 @@ impl AgentService {
         self.perf.time(Stage::Render, || {
             let listing = selection.listing(
                 &rules.window,
-                args.offset,
-                args.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT),
+                agent::sessions::SessionPage {
+                    offset: args.offset,
+                    limit: args.limit.unwrap_or(DEFAULT_SESSIONS_LIMIT),
+                },
+                |conversation, resolved, window| {
+                    self.listed_counts(conversation, &resolved.key, window)
+                },
             )?;
             let warnings =
                 self.with_stale_cache_record(std::mem::take(&mut selection.warnings), &listing);
@@ -1969,7 +2158,6 @@ impl AgentService {
         })?;
         let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
         let records = perf.time(Stage::Render, || {
-            agent::search::attach_transcript_metadata(&mut output, &resolved, &transcript);
             apply_configured_render_policy(&mut output, &agent_config);
             agent::search::format_agent_output_with_warnings(
                 &output,
@@ -3288,8 +3476,12 @@ fn attach_semantic_hit_anchors<'i, 'c>(
         };
         let ordinals = ordinals.iter().copied().collect::<Vec<_>>();
         match read_semantic_messages(service, input, copies.get(&reference).copied(), &ordinals) {
-            Ok(transcript) => {
-                agent::search::attach_semantic_hit_metadata(output, &input.resolved, &transcript);
+            Ok(searched) => {
+                agent::search::attach_semantic_hit_metadata(
+                    output,
+                    &input.resolved,
+                    searched.with_places(),
+                );
             }
             Err(UnreadMessages::NoLongerCached) => reads.no_longer_cached.push(input),
             Err(UnreadMessages::Failed(error)) => reads
@@ -3315,13 +3507,17 @@ fn read_semantic_messages(
     input: &agent::search::AgentConversationInput<'_>,
     generation: Option<i64>,
     ordinals: &[usize],
-) -> std::result::Result<agent::transcript::AgentTranscript, UnreadMessages> {
+) -> std::result::Result<agent::search::SearchedTranscript, UnreadMessages> {
     let key = &input.resolved.key;
     let (Some(copy), Some(generation)) = (input.conversation.cached_session.clone(), generation)
     else {
-        return service.load_transcript(key).map_err(UnreadMessages::Failed);
+        return service
+            .load_transcript(key)
+            .map(agent::search::SearchedTranscript::from)
+            .map_err(UnreadMessages::Failed);
     };
-    service.perf.time_transcript_parse(key, || {
+    let mut places = agent::address::HitPlaces::default();
+    let transcript = service.perf.time_transcript_parse(key, || {
         let read = service.read_copy_when_unlocked(|| {
             copy.read_copy(|held| {
                 if held.generation() != generation {
@@ -3330,11 +3526,17 @@ fn read_semantic_messages(
                 held.agent_messages(&key.path, ordinals).map(Some)
             })
         });
-        history::sqlite_cache::found(read)
+        let searched = history::sqlite_cache::found(read)
             .map_err(UnreadMessages::Failed)?
             .flatten()
-            .map(|read| read.transcript)
-            .ok_or(UnreadMessages::NoLongerCached)
+            .ok_or(UnreadMessages::NoLongerCached)?;
+        places = searched.places;
+        Ok(searched.transcript)
+    })?;
+    Ok(agent::search::SearchedTranscript {
+        transcript,
+        places,
+        copy_generation: Some(generation),
     })
 }
 
@@ -3767,52 +3969,71 @@ impl AgentService {
         let perf = &self.perf;
         let OpenedTargets {
             checked: CheckedRead { options, .. },
-            resolved: (mut resolved_refs, focus),
+            resolved: (resolved_refs, focus),
             operation,
             warnings: discovery_warnings,
             held: refreshed_targets,
         } = self.open_targets::<CheckedRead>(args, keys)?;
-        let transcripts = perf.time(Stage::Transcript, || {
+        let reads_part = |read_ref: &agent::refs::ReadRef| {
+            args.anchor.is_none() && read_ref.subagent.is_none() && read_ref.call.is_none()
+        };
+        let loaded = perf.time(Stage::Transcript, || {
+            self.load_transcripts_of_one_copy(
+                &resolved_refs
+                    .iter()
+                    .map(|(read_ref, resolved)| {
+                        (
+                            refreshed_targets.of_target(&resolved.key),
+                            read_ref.range,
+                            reads_part(read_ref),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| match resolved_refs.first() {
+                Some((_, resolved)) => target_error(error, resolved),
+                None => structured_agent_error(error),
+            })?;
             resolved_refs
                 .iter()
                 .map(|(read_ref, resolved)| {
                     let target = refreshed_targets.of_target(&resolved.key);
-                    let range = read_ref.range.filter(|_| {
-                        args.anchor.is_none()
-                            && read_ref.subagent.is_none()
-                            && read_ref.call.is_none()
-                    });
-                    self.load_transcript_for_range(target, range)
-                        .map_err(|error| target_error(error, resolved))
+                    if reads_part(read_ref) {
+                        self.load_transcript_for_range(target, read_ref.range)
+                    } else {
+                        self.load_transcript_resolving(target, read_ref.range)
+                    }
+                    .map_err(|error| target_error(error, resolved))
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
+        let (transcripts, mut ranges): (Vec<_>, Vec<_>) = loaded.into_iter().unzip();
         if let Some(anchor) = args.anchor.as_deref() {
             let ordinal = transcripts[0].resolve_anchor(&resolved_refs[0].1, anchor)?;
-            resolved_refs[0].0.range = Some(agent::refs::MessageRange::single(ordinal));
+            ranges[0] = Some(agent::address::ResolvedRange {
+                range: agent::refs::MessageRange::single(ordinal),
+                subagent: None,
+                shortened_to: None,
+            });
         }
         let requests = resolved_refs
             .iter()
-            .zip(transcripts.iter())
+            .zip(transcripts.iter().zip(&ranges))
             .map(
-                |((read_ref, resolved), transcript)| agent::protocol::ReadRequest {
+                |((read_ref, resolved), (transcript, range))| agent::protocol::ReadRequest {
                     resolved,
                     transcript,
-                    range: read_ref.range,
-                    subagent: read_ref.subagent,
+                    range: range.map(|range| range.range),
+                    subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
                     call: read_ref.call,
+                    shortened_to: range.and_then(|range| range.shortened_to),
                 },
             )
             .collect::<Vec<_>>();
         let priority = match (args.tail, focus) {
             (Some(tail), _) => agent::protocol::ReadPriority::Tail(tail),
             (None, Some(focus)) => {
-                agent::protocol::ReadPriority::Focus(agent::protocol::ProtocolFocus {
-                    conversation_full_ref: focus
-                        .conversation
-                        .map(|conversation| conversation.reference.full_ref()),
-                    range: focus.range,
-                })
+                agent::protocol::ReadPriority::Focus(focused_messages(&focus, &requests)?)
             }
             (None, None) => agent::protocol::ReadPriority::Start,
         };
@@ -3869,12 +4090,9 @@ impl AgentService {
             warnings: discovery_warnings,
             held: targets,
         } = self.open_targets::<CheckedOutline>(args, keys)?;
-        let transcript = perf
+        let (transcript, range) = perf
             .time(Stage::Transcript, || {
-                self.load_transcript_for_range(
-                    targets.of_target(&resolved.key),
-                    outline_ref.range.filter(|_| outline_ref.subagent.is_none()),
-                )
+                self.load_transcript_for_range(targets.of_target(&resolved.key), outline_ref.range)
             })
             .map_err(|error| target_error(error, &resolved))?;
         let mut warnings = discovery_warnings;
@@ -3886,9 +4104,12 @@ impl AgentService {
         let request = agent::protocol::ReadRequest {
             resolved: &resolved,
             transcript: &transcript,
-            range: outline_ref.range,
-            subagent: outline_ref.subagent,
+            range: range.map(|range| range.range),
+            subagent: outline_ref
+                .subagent
+                .or(range.and_then(|range| range.subagent)),
             call: None,
+            shortened_to: range.and_then(|range| range.shortened_to),
         };
         let records = perf
             .time(Stage::Render, || {
@@ -4018,7 +4239,8 @@ impl ParsedReadRefs {
         if (args.lines.is_some() || args.match_query.is_some())
             && (refs.len() != 1
                 || refs[0].call.is_some()
-                || (!refs[0].range.is_some_and(|range| range.is_single()) && args.anchor.is_none()))
+                || (!refs[0].range.is_some_and(|range| range.names_one_message())
+                    && args.anchor.is_none()))
         {
             return Err(AppError::ConfigError(
                 "--lines and --match require exactly one single-message ref such as ch_...:m7"
@@ -4033,8 +4255,8 @@ impl ParsedReadRefs {
         Ok(Self { refs, focus })
     }
 
-    /// The sessions the refs and `--focus` name among `keys`; fails when
-    /// `--focus` is outside the refs' ranges.
+    /// The sessions the refs and `--focus` name among `keys`; fails when a
+    /// bare `--focus` follows refs of several sessions.
     fn resolve(
         &self,
         keys: &[agent::refs::AgentConversationKey],
@@ -4060,11 +4282,7 @@ impl ParsedReadRefs {
                         agent::refs::resolve_conversation_ref(keys, conversation, canonicaliser)
                     })
                     .transpose()?;
-                agent::refs::validate_resolved_focus_in_ranges(
-                    &resolved_refs,
-                    focus,
-                    conversation.as_ref(),
-                )?;
+                agent::refs::focus_conversation(&resolved_refs, conversation.as_ref())?;
                 Ok(ResolvedFocus {
                     conversation,
                     range: focus.range,
@@ -4618,7 +4836,11 @@ mod tests {
         )
         .unwrap()
         .0
-        .listing(&rules.window, 0, 10)
+        .listing(
+            &rules.window,
+            FIRST_TEN_SESSIONS,
+            agent::sessions::every_message_own,
+        )
         .unwrap();
 
         assert_eq!(
@@ -4759,7 +4981,13 @@ mod tests {
             let mut warnings = selection.warnings.clone();
             warnings.extend(stale_coverage.record(Zone::System, &CommandTargets));
             agent::sessions::format_sessions_with_warnings(
-                &selection.listing(&rules.window, 0, 10).unwrap(),
+                &selection
+                    .listing(
+                        &rules.window,
+                        FIRST_TEN_SESSIONS,
+                        agent::sessions::every_message_own,
+                    )
+                    .unwrap(),
                 None,
                 &warnings,
                 agent::test_support::written_at(),
@@ -7238,6 +7466,11 @@ mod tests {
     use crate::search::test_fixtures::october_messages;
 
     /// Each of `rows`' keys, and its search input.
+    const FIRST_TEN_SESSIONS: agent::sessions::SessionPage = agent::sessions::SessionPage {
+        offset: 0,
+        limit: 10,
+    };
+
     fn keyed_inputs(
         rows: &[history::Conversation],
     ) -> (
@@ -7308,6 +7541,47 @@ mod tests {
             session_offset: 0,
             window: TimeFilter::default(),
         }
+    }
+
+    /// `agent sessions` counts a row's own messages in the copy the row
+    /// read, and in its transcript once another rearview replaced that copy
+    /// or for a row without one.
+    #[test]
+    fn own_message_counts_read_rows_copy_and_transcript_when_copy_is_replaced_or_absent() {
+        use crate::search::test_fixtures::{cached_claude_sessions, october_messages};
+        let sessions = cached_claude_sessions(&[
+            ("current", october_messages(&["one", "two"])),
+            ("replaced", october_messages(&["one"])),
+            ("uncopied", october_messages(&["one", "two", "three"])),
+        ]);
+        sessions.rewrite(1, &october_messages(&["inserted", "one"]));
+        let mut rows = sessions.rows.clone();
+        rows[2].cached_session = None;
+        let (keys, _) = keyed_inputs(&rows);
+        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
+
+        let counts = rows
+            .iter()
+            .zip(&keys)
+            .map(|(row, key)| {
+                service
+                    .listed_counts(row, key, &TimeFilter::default())
+                    .unwrap()
+                    .own
+                    .messages
+            })
+            .collect::<Vec<_>>();
+
+        let parsed = keys
+            .iter()
+            .map(|key| service.transcripts.borrow().contains_key(&key.path))
+            .collect::<Vec<_>>();
+        assert_eq!(counts, [2, 2, 3]);
+        assert_eq!(
+            parsed,
+            [false, true, true],
+            "the replaced and the uncopied sessions' transcripts are read"
+        );
     }
 
     /// The semantic stage reads a session another rearview wrote again since
@@ -9773,7 +10047,7 @@ mod tests {
             let rendered = agent::search::format_agent_output(&output);
 
             assert!(rendered.contains(" source=tool "), "{mode:?}: {rendered}");
-            assert!(rendered.contains(" focus=m2..m2"), "{mode:?}: {rendered}");
+            assert!(rendered.contains(" focus=m2 "), "{mode:?}: {rendered}");
             assert!(rendered.contains(query), "{mode:?}: {rendered}");
             assert!(rendered.contains(" tools=true "), "{mode:?}: {rendered}");
         }
@@ -9988,6 +10262,49 @@ mode = "hybrid"
                 .canonical();
         assert_eq!(keys, [row_inside, unlisted_written_after]);
         assert_eq!(reported, [unlisted_written_after_reference]);
+    }
+
+    /// Two refs into one cached session print through one copy's addresses:
+    /// the read loads that copy once for both.
+    #[test]
+    fn read_of_two_refs_into_one_cached_session_loads_one_copy() {
+        use crate::search::test_fixtures::{cached_claude_sessions, october_messages};
+        let sessions =
+            cached_claude_sessions(&[("session", october_messages(&["one", "two", "three"]))]);
+        let (keys, _) = keyed_inputs(&sessions.rows);
+        let reference = keys[0].conversation_ref().canonical();
+        let args = AgentReadArgs {
+            refs: vec![format!("{reference}:m1"), format!("{reference}:m3")],
+            anchor: None,
+            focus: None,
+            tail: None,
+            lines: None,
+            match_query: None,
+            context: 3,
+            perf_stats: false,
+            output: output_flags(),
+        };
+        let service = AgentService::new(test_environment(Vec::new(), Some(sessions.cache_path())));
+
+        let output = service.run_read(&args, Some(&keys)).unwrap().records;
+
+        assert!(
+            output.contains("\n| one\n") && output.contains("\n| three\n"),
+            "{output}"
+        );
+        assert_eq!(
+            service
+                .perf
+                .records(None)
+                .matches("perf transcript ")
+                .count(),
+            1,
+            "the read loads the session's copy once"
+        );
+        assert!(
+            service.transcripts.borrow().is_empty(),
+            "the read loads the copy's bodies of the two messages, not the whole transcript"
+        );
     }
 
     #[test]

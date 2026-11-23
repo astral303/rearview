@@ -292,8 +292,9 @@ pub struct AgentOutputFlags {
 #[derive(Debug, ClapArgs)]
 pub struct AgentReadArgs {
     /// Conversations to read, each a ch_ handle, a session ID, or a transcript
-    /// path, optionally followed by :mN, :mN..mM, :mN.K for one call, or :sN
-    /// for one sub-agent
+    /// path, optionally followed by :mN, :mN..mM, :mN.. to the end, :mN.K for
+    /// one call, :sN for one sub-agent, or :sN:mN, :sN:mN..mM, :sN:mN..,
+    /// :sN:mN.K for its messages
     #[arg(required = true, value_parser = non_empty_string)]
     pub refs: Vec<String>,
     /// Durable message anchor to read within one conversation
@@ -302,7 +303,8 @@ pub struct AgentReadArgs {
     /// Message or range to prioritize when budgeted output is truncated
     #[arg(long, value_parser = non_empty_string)]
     pub focus: Option<String>,
-    /// Read the last N messages of each ref or range, not counting hidden messages
+    /// Read the last N of each ref's or range's own messages (a sub-agent's for
+    /// :sN), not counting hidden messages
     #[arg(
         long,
         value_name = "N",
@@ -310,7 +312,8 @@ pub struct AgentReadArgs {
         conflicts_with_all = ["anchor", "focus", "lines", "match_query"]
     )]
     pub tail: Option<NonZeroUsize>,
-    /// Inclusive content line range within one message
+    /// Inclusive content line range within one message; START.. reads to its
+    /// last line
     #[arg(long, value_name = "START..END", conflicts_with = "match_query")]
     pub lines: Option<MessageLineRange>,
     /// Find text within one message and return matching lines with context
@@ -329,7 +332,8 @@ pub struct AgentReadArgs {
 #[derive(Debug, ClapArgs)]
 pub struct AgentOutlineArgs {
     /// Conversation to outline: a ch_ handle, a session ID, or a transcript
-    /// path, optionally followed by :mN, :mN..mM, or :sN for one sub-agent
+    /// path, optionally followed by :mN, :mN..mM, :mN.. to the end, :sN for
+    /// one sub-agent, or :sN:mN, :sN:mN..mM or :sN:mN.. for its messages
     #[arg(value_parser = non_empty_string)]
     pub conversation: String,
     /// Report time per stage, what was read, and peak memory on stderr
@@ -1177,12 +1181,35 @@ mod tests {
         ])
         .unwrap();
         match agent_command(lines) {
+            AgentCommand::Read(read) => {
+                assert_eq!(
+                    read.lines,
+                    Some(MessageLineRange {
+                        start: 40,
+                        end: Some(120)
+                    })
+                )
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let open_lines = Args::try_parse_from([
+            "rearview",
+            "agent",
+            "read",
+            "ch_abc123:m7",
+            "--lines",
+            "40..",
+        ])
+        .unwrap();
+        match agent_command(open_lines) {
             AgentCommand::Read(read) => assert_eq!(
                 read.lines,
                 Some(MessageLineRange {
                     start: 40,
-                    end: 120
-                })
+                    end: None
+                }),
+                "`40..` reads from line 40 to the message's last line"
             ),
             other => panic!("unexpected command: {other:?}"),
         }

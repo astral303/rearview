@@ -102,16 +102,7 @@ fn hit_messages_give_whole_transcripts_hits_for_every_agent() {
                      whole transcript:\n{from_whole}"
                 ));
             }
-            let narrowed = read.is_some_and(|(messages, message_count)| {
-                if message_count != whole.messages.len() {
-                    differing.push(format!(
-                        "{label}: the hit read's message count {message_count} is the \
-                         transcript's {}",
-                        whole.messages.len()
-                    ));
-                }
-                messages < whole.messages.len()
-            });
+            let narrowed = read.is_some_and(|messages| messages < whole.messages.len());
             (differing, narrowed)
         })
         .collect::<Vec<_>>();
@@ -404,9 +395,9 @@ struct SearchCase<'a> {
 
 impl SearchCase<'_> {
     /// The output from the hit messages, the output from the whole
-    /// transcript, and the hit read's message and message counts when it
-    /// read.
-    fn both_ways(&self) -> (String, String, Option<(usize, usize)>) {
+    /// transcript, and the count of messages the read of the hit messages
+    /// loaded; `None` when the search did not read them.
+    fn both_ways(&self) -> (String, String, Option<usize>) {
         let request = AgentSearchRequest {
             query: self.query.to_owned(),
             top: 100,
@@ -453,8 +444,7 @@ impl SearchCase<'_> {
                         key,
                     )?
                     .expect("the cache holds the session");
-                    *read.lock().unwrap() =
-                        Some((searched.transcript.messages.len(), searched.message_count));
+                    *read.lock().unwrap() = Some(searched.transcript.messages.len());
                     Ok(Some(searched))
                 },
                 bytes: |_, key: &AgentConversationKey| key.transcript_bytes,

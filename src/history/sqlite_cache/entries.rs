@@ -6,6 +6,7 @@ mod context;
 mod diff;
 mod digest;
 mod hashes;
+mod hit_places;
 mod messages;
 mod parts;
 mod rows;
@@ -430,17 +431,85 @@ pub(super) fn read_messages(
     read_selected(connection, session, places, &selected)
 }
 
-/// The transcript of `session`, with message bodies for the messages in
-/// `messages` alone. Every other message holds the reference context of
-/// [`context::read`]; its empty bodies are not its content.
-pub(super) fn read_range(
+/// The places of the messages of `session` numbered `ordinals`, for the
+/// addresses of search hits on them.
+pub(super) fn read_hit_places(
+    connection: &Connection,
+    session: i64,
+    ordinals: &[usize],
+) -> Result<crate::agent::address::HitPlaces> {
+    hit_places::read(connection, session, ordinals)
+}
+
+/// The count of the session's own messages, without its sub-agents', and of
+/// those inside `window`.
+pub(super) fn count_own_messages(
+    connection: &Connection,
+    session: i64,
+    window: &crate::time_filter::TimeFilter,
+) -> Result<crate::agent::sessions::OwnMessageCounts> {
+    const OWN_MESSAGES: &str = "FROM threads t JOIN messages m ON m.thread = t.id \
+         WHERE t.session = ?1 AND t.number = 0 AND m.ordinal IS NOT NULL";
+    let messages = connection
+        .prepare_cached(&format!("SELECT COUNT(*) {OWN_MESSAGES}"))?
+        .query_row([session], |row| row.get::<_, i64>(0))? as usize;
+    if !window.is_active() {
+        return Ok(crate::agent::sessions::OwnMessageCounts {
+            messages,
+            messages_in_window: messages,
+        });
+    }
+    // `TimeFilter::contains_message` over the whole seconds the stored
+    // times are read as (`stored_message_times`): the message's last second
+    // at or after the window's start, its first at or before the window's end.
+    let messages_in_window = connection
+        .prepare_cached(&format!(
+            "SELECT COUNT(*) {OWN_MESSAGES} AND m.first_ms IS NOT NULL AND m.last_ms IS NOT NULL \
+             AND (?2 IS NULL OR m.last_ms >= ?2 * 1000) \
+             AND (?3 IS NULL OR m.first_ms < (?3 + 1) * 1000)"
+        ))?
+        .query_row(
+            rusqlite::params![
+                session,
+                window.after.map(|after| after.timestamp()),
+                window.before.map(|before| before.timestamp()),
+            ],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+    Ok(crate::agent::sessions::OwnMessageCounts {
+        messages,
+        messages_in_window,
+    })
+}
+
+/// The number of the session's sub-agent handles, as a read of the session
+/// numbers them.
+pub(super) fn count_subagents(connection: &Connection, session: i64) -> Result<usize> {
+    hit_places::count_subagents(connection, session)
+}
+
+/// The transcript of `session`, every message holding the reference context
+/// of [`context::read`] in place of its content: its empty bodies are not
+/// its content.
+pub(super) fn read_context(
     connection: &Connection,
     session: i64,
     places: &Places,
     path: &Path,
+) -> Result<crate::agent::transcript::AgentTranscript> {
+    context::read(connection, session, places, path)
+}
+
+/// `transcript`, a [`read_context`] of `session`, with the bodies of the
+/// messages in `messages` alone.
+pub(super) fn with_bodies(
+    connection: &Connection,
+    session: i64,
+    places: &Places,
+    path: &Path,
+    mut transcript: crate::agent::transcript::AgentTranscript,
     messages: RangeInclusive<u64>,
 ) -> Result<crate::agent::transcript::AgentTranscript> {
-    let mut transcript = context::read(connection, session, places, path)?;
     let selected = crate::agent::transcript::AgentTranscript::from_stored(
         path,
         read_numbered(connection, session, places, Some(messages))?,

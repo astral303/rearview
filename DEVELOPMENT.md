@@ -145,11 +145,16 @@ the protocol adds it here, in the same pull request:
   - Where grep or another common tool has a name and a behaviour for a
     feature, use both: a hit, its context, `-A`, `-B` and `-C`, inclusive
     ranges. One spelling has one meaning.
+  - Two spellings that read as equal are equal (least surprise): `m7` and
+    `m7..m7` read the same messages, and `m7..` reads to the last message.
   - A clear request that cannot be met exactly gets what exists and a
     record of the difference: a range that ends past the last message is
     read to the last message.
   - An error is for a request without any answer. It names the command
     that works, and it does not fault a ref the output printed.
+- **A field name has one meaning in every record** (consistency).
+  `subagents=` with a number counts sub-agents; a count of their messages is
+  `subagent-messages=`.
 - **An address names its container first:** `s3:m5`, not `m5 s3`.
 - **Fill the grid before adding an address form or a flag.** List each
   agent command against each address form and each flag. A rejected cell

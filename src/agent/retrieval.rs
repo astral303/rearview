@@ -53,13 +53,11 @@ pub struct AgentSearchHit {
     pub source: AgentHitSource,
     pub preview: String,
     pub focus_range: MessageRange,
-    pub read_range: MessageRange,
     pub render_options: AgentHitRenderOptions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentRetrievalOptions {
-    pub read_context_radius: usize,
     pub limit: usize,
     /// The message count at which a transcript's messages are segmented and
     /// matched on the rayon pool.
@@ -71,7 +69,6 @@ pub struct AgentRetrievalOptions {
 impl Default for AgentRetrievalOptions {
     fn default() -> Self {
         Self {
-            read_context_radius: 1,
             limit: 10,
             parallel: ParallelThreshold::DEFAULT,
             window: TimeFilter::default(),
@@ -84,8 +81,6 @@ pub struct AgentTranscriptSearchTarget<'a> {
     /// The session's messages: every one, or at least every message holding
     /// the query's terms.
     pub transcript: &'a AgentTranscript,
-    /// The session's message count, the end of every hit's read range.
-    pub message_count: usize,
     pub conversation_ref: Option<&'a str>,
     pub timestamp: Option<DateTime<Local>>,
 }
@@ -99,7 +94,6 @@ impl<'a> AgentTranscriptSearchTarget<'a> {
     ) -> Self {
         Self {
             transcript,
-            message_count: transcript.messages.len(),
             conversation_ref,
             timestamp,
         }
@@ -260,8 +254,6 @@ fn lexical_candidates(
             Some(candidate_from_ranges(CandidateInput {
                 target,
                 message_ordinal: message_segments[0].message_ordinal,
-                message_count: target.message_count,
-                options,
                 body: &body,
                 query_words: &query_words,
                 literals: &literal_filters,
@@ -305,8 +297,6 @@ fn exact_candidates_for_literals(
             Some(candidate_from_ranges(CandidateInput {
                 target,
                 message_ordinal: message_segments[0].message_ordinal,
-                message_count: target.message_count,
-                options,
                 body: &body,
                 query_words: &[],
                 literals,
@@ -319,8 +309,6 @@ fn exact_candidates_for_literals(
 struct CandidateInput<'a> {
     target: AgentTranscriptSearchTarget<'a>,
     message_ordinal: usize,
-    message_count: usize,
-    options: AgentRetrievalOptions,
     body: &'a str,
     query_words: &'a [String],
     literals: &'a [Literal],
@@ -351,11 +339,6 @@ fn candidate_from_ranges(input: CandidateInput<'_>) -> Candidate {
         .map(|range| range.source)
         .unwrap_or(AgentHitSource::Dialogue);
     let focus_range = MessageRange::single(input.message_ordinal);
-    let read_range = read_range_for_focus(
-        focus_range,
-        input.message_count,
-        input.options.read_context_radius,
-    );
     let unique_terms = input
         .ranges
         .iter()
@@ -376,7 +359,6 @@ fn candidate_from_ranges(input: CandidateInput<'_>) -> Candidate {
             source,
             preview: preview(input.body, first_start, last_end),
             focus_range,
-            read_range,
             render_options,
         },
         timestamp: input.target.timestamp,
@@ -573,17 +555,6 @@ fn adjacency_score(body: &str, query_words: &[String]) -> usize {
         .count()
 }
 
-pub(crate) fn read_range_for_focus(
-    focus: MessageRange,
-    message_count: usize,
-    radius: usize,
-) -> MessageRange {
-    MessageRange {
-        start: focus.start.saturating_sub(radius).max(1),
-        end: focus.end.saturating_add(radius).min(message_count),
-    }
-}
-
 fn preview(body: &str, start: usize, end: usize) -> String {
     let safe_start = floor_char_boundary(body, start);
     let safe_end = ceil_char_boundary(body, end).max(safe_start);
@@ -705,7 +676,6 @@ mod tests {
         assert_eq!(hits[0].source, AgentHitSource::Tool);
         assert!(hits[0].render_options.tool_results);
         assert_eq!(hits[0].focus_range, MessageRange::single(2));
-        assert!(hits[0].read_range.contains(&hits[0].focus_range));
         assert!(hits[0].preview.contains("hidden_exact_tool_needle"));
     }
 
@@ -720,7 +690,6 @@ mod tests {
         let hits = retrieve_agent_hits(&transcript, "alpha beta", options());
 
         assert_eq!(hits[0].focus_range, MessageRange::single(2));
-        assert!(hits[0].read_range.contains(&MessageRange::single(2)));
         assert_ne!(hits[0].focus_range, MessageRange { start: 1, end: 3 });
     }
 
@@ -949,20 +918,5 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert!(hits[0].preview.contains("API_KEY"));
-    }
-
-    #[test]
-    fn read_ranges_are_clamped_at_transcript_boundaries() {
-        let transcript = transcript(vec![
-            text_message(1, AgentMessageRole::User, "first needle"),
-            text_message(2, AgentMessageRole::Assistant, "middle"),
-            text_message(3, AgentMessageRole::User, "last target"),
-        ]);
-
-        let first = retrieve_agent_hits(&transcript, "needle", options());
-        let last = retrieve_agent_hits(&transcript, "target", options());
-
-        assert_eq!(first[0].read_range, MessageRange { start: 1, end: 2 });
-        assert_eq!(last[0].read_range, MessageRange { start: 2, end: 3 });
     }
 }

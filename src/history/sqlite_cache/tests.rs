@@ -11,10 +11,12 @@ mod diff_write;
 mod file_keys;
 mod lifecycle;
 mod message_schema;
+mod own_message_counts;
 mod record_from_parse;
 mod search_texts;
 mod sources;
 mod stored_rows;
+mod subagent_count;
 mod transcript_references;
 
 const CACHE_KEY: &str = "every-record";
@@ -345,6 +347,15 @@ pub(crate) fn parsed_and_cached_row(
 /// Each agent's every-record session cached in one database in `base`, as
 /// their copies.
 pub(super) fn every_record_copies(base: &Path) -> Vec<super::CachedSession> {
+    every_record_rows(base)
+        .into_iter()
+        .map(|listed| listed.cached_session.unwrap())
+        .collect()
+}
+
+/// Each agent's every-record session cached in one database in `base`, as
+/// the catalogue lists them.
+pub(super) fn every_record_rows(base: &Path) -> Vec<Conversation> {
     let cache = admitted_cache(base);
     every_record_sessions()
         .iter()
@@ -364,7 +375,7 @@ pub(super) fn every_record_copies(base: &Path) -> Vec<super::CachedSession> {
             else {
                 panic!("the fixture session is listed")
             };
-            listed.cached_session.unwrap()
+            *listed
         })
         .collect()
 }
