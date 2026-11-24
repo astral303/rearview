@@ -1043,7 +1043,7 @@ mod agent_command_tests {
             tail: None,
             lines: None,
             match_query: None,
-            context: 3,
+            context: None,
             before_context: None,
             after_context: None,
             perf_stats: false,
@@ -1390,6 +1390,80 @@ mod agent_command_tests {
     }
 
     #[test]
+    fn budgeted_read_around_ref_or_anchor_keeps_the_ref_as_its_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = (1..=9)
+            .map(|number| {
+                let text = format!("message {number} {}", "words ".repeat(100));
+                if number % 2 == 1 {
+                    user(&text)
+                } else {
+                    assistant(&text)
+                }
+            })
+            .collect::<Vec<_>>();
+        let path = write_jsonl(&dir, "12345678-1234-4234-9234-123456789abc.jsonl", &lines);
+        let keys = vec![AgentConversationKey::new(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+            path,
+        )];
+        let conversation = keys[0].conversation_ref().canonical();
+        let read = |args: AgentReadArgs| {
+            run_agent_read(
+                &AgentReadArgs {
+                    output: AgentOutputFlags {
+                        budget: Some(1_500),
+                        ..default_output()
+                    },
+                    ..args
+                },
+                Some(&keys),
+            )
+            .unwrap()
+        };
+        let anchor = {
+            let alone = run_agent_read(
+                &read_args(vec![format!("{conversation}:m5")], None),
+                Some(&keys),
+            )
+            .unwrap();
+            let record = alone.lines().find(|line| line.starts_with("m5 ")).unwrap();
+            crate::agent::test_support::atom(record, "anchor")
+                .expect("a read of one message prints its anchor")
+                .to_owned()
+        };
+        let around_ref = read(AgentReadArgs {
+            context: Some(2),
+            ..read_args(vec![format!("{conversation}:m5")], None)
+        });
+        let around_anchor = read(AgentReadArgs {
+            anchor: Some(anchor),
+            context: Some(2),
+            ..read_args(vec![conversation.clone()], None)
+        });
+        let explicit_hit = read(read_args(
+            vec![format!("{conversation}:m3..m7")],
+            Some("m5".to_owned()),
+        ));
+
+        let header = explicit_hit.lines().next().unwrap();
+        assert!(
+            crate::agent::test_support::atom(header, "cut").is_some_and(|cut| cut.contains("hit"))
+                && explicit_hit.contains("\nm5 "),
+            "the budget truncates m3..m7 around m5 and keeps m5: {explicit_hit}"
+        );
+        assert_eq!(
+            around_ref, explicit_hit,
+            "-C 2 around m5 reads as m3..m7 with --hit m5"
+        );
+        assert_eq!(
+            around_anchor, explicit_hit,
+            "-C 2 around m5's anchor reads as m3..m7 with --hit m5"
+        );
+    }
+
+    #[test]
     fn read_command_slices_large_message_around_matches() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_jsonl(
@@ -1405,7 +1479,7 @@ mod agent_command_tests {
         let conversation = keys[0].conversation_ref().canonical();
         let mut args = read_args(vec![format!("{conversation}:m1")], None);
         args.match_query = Some("historical correction".to_string());
-        args.context = 1;
+        args.context = Some(1);
 
         let output = run_agent_read(&args, Some(&keys)).unwrap();
 
@@ -1430,6 +1504,9 @@ mod agent_command_tests {
         )];
         let args = AgentOutlineArgs {
             conversation: keys[0].conversation_ref().canonical(),
+            context: None,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: default_output(),
         };
@@ -1530,7 +1607,7 @@ mod agent_command_tests {
             tail: None,
             lines: None,
             match_query: None,
-            context: 3,
+            context: None,
             before_context: None,
             after_context: None,
             perf_stats: false,
@@ -2164,6 +2241,9 @@ mod agent_command_tests {
         let outline = run_agent_outline(
             &AgentOutlineArgs {
                 conversation: resolved.reference.canonical(),
+                context: None,
+                before_context: None,
+                after_context: None,
                 perf_stats: false,
                 output: every_part(),
             },
@@ -2469,6 +2549,9 @@ mod agent_command_tests {
         fn outline(&self, window: cli::MessageTimeArgs) -> String {
             let args = AgentOutlineArgs {
                 conversation: self.reference.clone(),
+                context: None,
+                before_context: None,
+                after_context: None,
                 perf_stats: false,
                 output: Self::every_part_within(window),
             };
@@ -2823,6 +2906,9 @@ mod agent_command_tests {
         let outline = run_agent_outline(
             &AgentOutlineArgs {
                 conversation: format!("{conversation}:m1..m9"),
+                context: None,
+                before_context: None,
+                after_context: None,
                 perf_stats: false,
                 output: default_output(),
             },

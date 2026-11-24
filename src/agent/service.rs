@@ -2199,16 +2199,7 @@ pub(crate) fn within_address(
         .range
         .map(|range| agent::address::MessageAddresses::of_transcript(transcript).resolve(range))
         .transpose()?;
-    let request = agent::protocol::ReadRequest {
-        resolved,
-        transcript,
-        range: range.map(|range| range.range),
-        subagent: within_ref
-            .subagent
-            .or(range.and_then(|range| range.subagent)),
-        call: None,
-        shortened_to: None,
-    };
+    let request = read_request(within_ref, resolved, transcript, range)?;
     Ok(Some(agent::search::WithinAddress {
         ref_suffix,
         messages: agent::protocol::requested_ordinals(&request)?,
@@ -4052,28 +4043,46 @@ impl AgentService {
                 .collect::<Result<Vec<_>>>()
         })?;
         let (transcripts, mut ranges): (Vec<_>, Vec<_>) = loaded.into_iter().unzip();
+        let mut hit = hit;
         if let Some(anchor) = args.anchor.as_deref() {
             let ordinal = transcripts[0].resolve_anchor(&resolved_refs[0].1, anchor)?;
-            ranges[0] = Some(agent::address::ResolvedRange {
-                range: agent::refs::MessageRange::single(ordinal),
-                subagent: None,
-                shortened_to: None,
+            ranges[0] = Some(match args.message_context() {
+                None => agent::address::ResolvedRange {
+                    range: agent::refs::MessageRange::single(ordinal),
+                    subagent: None,
+                    shortened_to: None,
+                },
+                Some(context) => {
+                    let addresses =
+                        agent::address::MessageAddresses::of_transcript(&transcripts[0]);
+                    let anchored = resolved_refs[0]
+                        .0
+                        .clone()
+                        .of_messages(addresses.address(ordinal));
+                    let (widened, widened_hit) = widened_refs(vec![anchored], None, context);
+                    hit = hit.or(widened_hit.map(|widened_hit| ResolvedHit {
+                        conversation: None,
+                        range: widened_hit.range,
+                    }));
+                    agent::address::ResolvedRange {
+                        shortened_to: None,
+                        ..addresses.resolve(
+                            widened[0]
+                                .range
+                                .expect("a ref of an anchor's message names messages"),
+                        )?
+                    }
+                }
             });
         }
         let requests = resolved_refs
             .iter()
             .zip(transcripts.iter().zip(&ranges))
-            .map(
-                |((read_ref, resolved), (transcript, range))| agent::protocol::ReadRequest {
-                    resolved,
-                    transcript,
-                    range: range.map(|range| range.range),
-                    subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
-                    call: read_ref.call,
-                    shortened_to: range.and_then(|range| range.shortened_to),
-                },
-            )
-            .collect::<Vec<_>>();
+            .map(|((read_ref, resolved), (transcript, range))| {
+                read_request(read_ref, resolved, transcript, *range)
+                    .map_err(|error| target_error(error, resolved))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let priority = match (args.tail, hit) {
             (Some(tail), _) => agent::protocol::ReadPriority::Tail(tail),
             (None, Some(hit)) => agent::protocol::ReadPriority::Hit(hit_messages(&hit, &requests)?),
@@ -4143,16 +4152,8 @@ impl AgentService {
             &resolved.reference.canonical(),
         ));
         let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
-        let request = agent::protocol::ReadRequest {
-            resolved: &resolved,
-            transcript: &transcript,
-            range: range.map(|range| range.range),
-            subagent: outline_ref
-                .subagent
-                .or(range.and_then(|range| range.subagent)),
-            call: None,
-            shortened_to: range.and_then(|range| range.shortened_to),
-        };
+        let request = read_request(&outline_ref, &resolved, &transcript, range)
+            .map_err(|error| target_error(error, &resolved))?;
         let records = perf
             .time(Stage::Render, || {
                 agent::protocol::format_outline_with_warnings(
@@ -4166,6 +4167,62 @@ impl AgentService {
         operation.finish().fail_if_low_space()?;
         Ok(CommandOutput { records, warnings })
     }
+}
+
+/// The read of `read_ref`'s messages, resolved as `range` in `transcript`.
+fn read_request<'a>(
+    read_ref: &agent::refs::ReadRef,
+    resolved: &'a agent::refs::ResolvedConversation,
+    transcript: &'a agent::transcript::AgentTranscript,
+    range: Option<agent::address::ResolvedRange>,
+) -> Result<agent::protocol::ReadRequest<'a>> {
+    Ok(agent::protocol::ReadRequest {
+        resolved,
+        transcript,
+        range: range.map(|range| range.range),
+        subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
+        call: read_ref.call,
+        shortened_to: shortened_end(read_ref, transcript, range.as_ref())?,
+    })
+}
+
+/// The `last=` of `read_ref`, its messages resolved as `range` in
+/// `transcript`: its thread's last message when the range the ref named ends
+/// past it. A range `-B`, `-A` or `-C` widened resolves again as named, and
+/// fails when that range starts past its thread's last message.
+fn shortened_end(
+    read_ref: &agent::refs::ReadRef,
+    transcript: &agent::transcript::AgentTranscript,
+    range: Option<&agent::address::ResolvedRange>,
+) -> Result<Option<agent::refs::ThreadRange>> {
+    match read_ref.widened_from {
+        Some(named) => Ok(agent::address::MessageAddresses::of_transcript(transcript)
+            .resolve(named)?
+            .shortened_to),
+        None => Ok(range.and_then(|range| range.shortened_to)),
+    }
+}
+
+/// `refs` with `context`'s messages of each ref's thread around the ref, and
+/// the hit a read of them keeps first: `hit`, else the messages a single ref
+/// named before it was widened.
+fn widened_refs(
+    refs: Vec<agent::refs::ReadRef>,
+    hit: Option<agent::refs::HitRef>,
+    context: agent::address::HitContext,
+) -> (Vec<agent::refs::ReadRef>, Option<agent::refs::HitRef>) {
+    let refs = refs
+        .into_iter()
+        .map(|reference| reference.widened(context))
+        .collect::<Vec<_>>();
+    let hit = match (refs.as_slice(), hit) {
+        ([widened], None) => widened.widened_from.map(|range| agent::refs::HitRef {
+            conversation: None,
+            range,
+        }),
+        (_, hit) => hit,
+    };
+    (refs, hit)
 }
 
 /// `agent read`'s arguments, checked.
@@ -4229,7 +4286,10 @@ impl TargetedArgs for CheckedOutline {
     fn check(args: &Self::CliArgs, config: config::ConfigFile, clock: &dyn Clock) -> Result<Self> {
         let agent_config = config.agent.unwrap_or_default();
         let options = agent_protocol_options(&args.output, &agent_config, clock)?;
-        let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
+        let mut outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
+        if let Some(context) = args.message_context() {
+            outline_ref = outline_ref.widened(context);
+        }
         Ok(Self {
             options,
             outline_ref,
@@ -4258,7 +4318,8 @@ impl TargetedArgs for CheckedOutline {
 }
 
 /// `agent read`'s refs and `--hit`, parsed, with the flags that depend
-/// on the refs checked against them.
+/// on the refs checked against them, and widened by [`widened_refs`] for
+/// `-B`, `-A` and `-C` without `--match`.
 struct ParsedReadRefs {
     refs: Vec<agent::refs::ReadRef>,
     hit: Option<agent::refs::HitRef>,
@@ -4300,6 +4361,10 @@ impl ParsedReadRefs {
             .as_deref()
             .map(agent::refs::parse_hit_ref)
             .transpose()?;
+        let (refs, hit) = match args.message_context() {
+            Some(context) => widened_refs(refs, hit, context),
+            None => (refs, hit),
+        };
         Ok(Self { refs, hit })
     }
 
@@ -4629,7 +4694,7 @@ mod tests {
             tail: None,
             lines: None,
             match_query: None,
-            context: 3,
+            context: None,
             before_context: None,
             after_context: None,
             perf_stats: false,
@@ -6456,6 +6521,116 @@ mod tests {
                     wrong.push(format!(
                         "{source:?} {}: lists {source:?} alone:\n{output}\n{records}",
                         args[0]
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
+    /// For every agent's every-record session: `read` and `outline` with
+    /// `-B`, `-A` or `-C` and without `--match` print what the command
+    /// reading their ref widened by those messages of its thread prints, with
+    /// the ref as `--hit` for a read. A whole session, a whole sub-agent
+    /// and a call read as without the flags.
+    #[test]
+    fn every_agents_context_flags_read_and_outline_their_widened_ref() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            let home = tempfile::tempdir().unwrap();
+            fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            let reference = cache_session_and_reference_it(storage, cache.path());
+            let run = |args: &[String]| {
+                let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                AgentService::new(test_environment(vec![storage], Some(cache.path())))
+                    .execute(agent_command(&args))
+                    .unwrap_or_else(crate::error_report)
+            };
+            let command = |words: &[&str]| -> Vec<String> {
+                words
+                    .iter()
+                    .map(|word| match word.strip_prefix(':') {
+                        Some(address) => format!("{reference}:{address}"),
+                        None if *word == "REF" => reference.clone(),
+                        None => (*word).to_owned(),
+                    })
+                    .collect()
+            };
+            let outline = run(&command(&["outline", "REF"]));
+            let own_messages =
+                agent::test_support::atom(outline.lines().next().unwrap(), "messages")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+            let last = format!(":m{own_messages}");
+            let before_last = format!(":m{}..m{own_messages}", own_messages - 1);
+            let hit_last = format!("m{own_messages}");
+            let mut cases = vec![
+                (
+                    vec!["read", ":m3", "-C", "1"],
+                    vec!["read", ":m2..m4", "--hit", "m3"],
+                ),
+                (
+                    vec!["read", ":m1", "-B", "2", "-A", "1"],
+                    vec!["read", ":m1..m2", "--hit", "m1"],
+                ),
+                (
+                    vec!["read", ":m3..m4", "-B", "1"],
+                    vec!["read", ":m2..m4", "--hit", "m3..m4"],
+                ),
+                (
+                    vec!["read", ":m3", "-C", "1", "--hit", "m4"],
+                    vec!["read", ":m2..m4", "--hit", "m4"],
+                ),
+                (
+                    vec!["read", &last, "-B", "1", "-A", "3"],
+                    vec!["read", &before_last, "--hit", &hit_last],
+                ),
+                (vec!["read", "REF", "-C", "2"], vec!["read", "REF"]),
+                (
+                    vec!["outline", ":m3", "-C", "1"],
+                    vec!["outline", ":m2..m4"],
+                ),
+                (vec!["outline", "REF", "-A", "1"], vec!["outline", "REF"]),
+            ];
+            if outline.lines().any(|line| line.starts_with("subagent s1 ")) {
+                cases.push((vec!["read", ":s1", "-C", "2"], vec!["read", ":s1"]));
+            }
+            let with_tools = run(&command(&["read", "REF", "--tools"]));
+            let call = with_tools
+                .lines()
+                .filter_map(|line| line.split(' ').next())
+                .find(|address| address.starts_with('m') && address.contains('.'))
+                .map(|address| format!(":{address}"));
+            if let Some(call) = call.as_deref() {
+                cases.push((vec!["read", call, "-C", "2"], vec!["read", call]));
+            }
+            let every_flag = ["--tools", "--tool-results", "--thinking", "--subagents"];
+            let alone = run(&command(&[&["read", ":m3"][..], &every_flag].concat()));
+            let anchor = alone
+                .lines()
+                .find(|line| line.starts_with("m3 "))
+                .and_then(|record| agent::test_support::atom(record, "anchor"))
+                .unwrap_or_else(|| panic!("{source:?}: m3 has an anchor:\n{alone}"))
+                .to_owned();
+            cases.push((
+                vec!["read", "REF", "--anchor", &anchor, "-C", "1"],
+                vec!["read", ":m2..m4", "--hit", "m3"],
+            ));
+            for (words, equivalent) in &cases {
+                let (output, expected) = (run(&command(words)), run(&command(equivalent)));
+                if output != expected
+                    || [&output, &expected]
+                        .iter()
+                        .any(|read| read.contains("protocol agent-error "))
+                {
+                    wrong.push(format!(
+                        "{source:?} {words:?} prints what {equivalent:?} prints, without an \
+                         error:\n{output}\n{expected}"
                     ));
                 }
             }
@@ -9381,6 +9556,9 @@ mod tests {
                 .run_outline(
                     &AgentOutlineArgs {
                         conversation: reference.clone(),
+                        context: None,
+                        before_context: None,
+                        after_context: None,
                         perf_stats: false,
                         output: output_flags(),
                     },
@@ -10430,7 +10608,7 @@ mode = "hybrid"
             tail: None,
             lines: None,
             match_query: None,
-            context: 3,
+            context: None,
             before_context: None,
             after_context: None,
             perf_stats: false,
@@ -10473,7 +10651,7 @@ mode = "hybrid"
             tail: None,
             lines: None,
             match_query: None,
-            context: 3,
+            context: None,
             before_context: None,
             after_context: None,
             perf_stats: false,
@@ -10522,6 +10700,9 @@ mode = "hybrid"
         let reference = key.conversation_ref().canonical();
         let args = AgentOutlineArgs {
             conversation: reference.clone(),
+            context: None,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: output_flags(),
         };
@@ -10547,6 +10728,9 @@ mode = "hybrid"
         let reference = key.conversation_ref().canonical();
         let args = AgentOutlineArgs {
             conversation: reference.clone(),
+            context: None,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: output_flags(),
         };

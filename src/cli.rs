@@ -247,14 +247,13 @@ impl HitContextArgs {
     /// The context each hit's recipe covers: `-B` and `-A` for their side,
     /// else `-C`, else one message.
     pub fn hit_context(&self) -> HitContext {
-        let default = HitContext::default();
-        HitContext {
-            before: self
-                .before_context
-                .or(self.context)
-                .unwrap_or(default.before),
-            after: self.after_context.or(self.context).unwrap_or(default.after),
-        }
+        let (before, after) = context_sides(
+            self.before_context,
+            self.after_context,
+            self.context,
+            HitContext::default().before,
+        );
+        HitContext { before, after }
     }
 }
 
@@ -375,7 +374,15 @@ pub struct AgentReadArgs {
         long,
         value_name = "N",
         value_parser = non_zero_count,
-        conflicts_with_all = ["anchor", "hit", "lines", "match_query"]
+        conflicts_with_all = [
+            "anchor",
+            "hit",
+            "lines",
+            "match_query",
+            "before_context",
+            "after_context",
+            "context",
+        ]
     )]
     pub tail: Option<NonZeroUsize>,
     /// Inclusive content line range within one message; START.. reads to its
@@ -386,21 +393,19 @@ pub struct AgentReadArgs {
     /// messages with a matching line, those lines numbered with context
     #[arg(long = "match", value_parser = non_empty_string, conflicts_with = "lines")]
     pub match_query: Option<String>,
-    /// Content lines of context before and after each match; -B and -A set
-    /// one side
-    #[arg(
-        short = 'C',
-        long,
-        value_name = "N",
-        default_value_t = 3,
-        requires = "match_query"
-    )]
-    pub context: usize,
-    /// Content lines of context before each match; --context by default
-    #[arg(short = 'B', long, value_name = "N", requires = "match_query")]
+    /// With --match, content lines before and after each match, 3 by
+    /// default; without it, messages of each ref's thread before and after
+    /// the ref, and a read of one ref keeps that ref first as the --hit. -B
+    /// and -A set one side
+    #[arg(short = 'C', long, value_name = "N", conflicts_with = "lines")]
+    pub context: Option<usize>,
+    /// With --match, content lines before each match; without it, messages
+    /// of each ref's thread before the ref; --context by default
+    #[arg(short = 'B', long, value_name = "N", conflicts_with = "lines")]
     pub before_context: Option<usize>,
-    /// Content lines of context after each match; --context by default
-    #[arg(short = 'A', long, value_name = "N", requires = "match_query")]
+    /// With --match, content lines after each match; without it, messages
+    /// of each ref's thread after the ref; --context by default
+    #[arg(short = 'A', long, value_name = "N", conflicts_with = "lines")]
     pub after_context: Option<usize>,
     /// Report time per stage, what was read, and peak memory on stderr
     #[arg(long)]
@@ -416,11 +421,31 @@ pub struct AgentOutlineArgs {
     /// one sub-agent, or :sN:mN, :sN:mN..mM or :sN:mN.. for its messages
     #[arg(value_parser = non_empty_string)]
     pub conversation: String,
+    /// Messages of the ref's thread before and after its messages that the
+    /// outline covers; -B and -A set one side
+    #[arg(short = 'C', long, value_name = "N")]
+    pub context: Option<usize>,
+    /// Messages of the ref's thread before its messages; --context by
+    /// default
+    #[arg(short = 'B', long, value_name = "N")]
+    pub before_context: Option<usize>,
+    /// Messages of the ref's thread after its messages; --context by
+    /// default
+    #[arg(short = 'A', long, value_name = "N")]
+    pub after_context: Option<usize>,
     /// Report time per stage, what was read, and peak memory on stderr
     #[arg(long)]
     pub perf_stats: bool,
     #[command(flatten)]
     pub output: AgentOutputFlags,
+}
+
+impl AgentOutlineArgs {
+    /// The messages `-B`, `-A` and `-C` add around the ref; `None` without
+    /// any of them.
+    pub fn message_context(&self) -> Option<HitContext> {
+        message_context_of_flags(self.before_context, self.after_context, self.context)
+    }
 }
 
 // The session list's time window: a session is listed when one of its
@@ -480,15 +505,59 @@ impl MessageTimeArgs {
     }
 }
 
+/// The lines `--match` shows around each match without `-B`, `-A` or `-C`.
+const DEFAULT_MATCH_CONTEXT: usize = 3;
+
 impl AgentReadArgs {
     /// The lines `--match` shows around each match: `-B` and `-A` for their
     /// side, else `--context`.
     pub fn match_context(&self) -> MatchContext {
-        MatchContext {
-            before: self.before_context.unwrap_or(self.context),
-            after: self.after_context.unwrap_or(self.context),
-        }
+        let (before, after) = context_sides(
+            self.before_context,
+            self.after_context,
+            self.context,
+            DEFAULT_MATCH_CONTEXT,
+        );
+        MatchContext { before, after }
     }
+
+    /// The messages `-B`, `-A` and `-C` add around each ref without
+    /// `--match`; `None` with `--match` or without any of them.
+    pub fn message_context(&self) -> Option<HitContext> {
+        if self.match_query.is_some() {
+            return None;
+        }
+        message_context_of_flags(self.before_context, self.after_context, self.context)
+    }
+}
+
+/// The messages `before`, `after` and `context`, the values of `-B`, `-A`
+/// and `-C`, add around a ref, none on a side without a value; `None`
+/// without any of them.
+fn message_context_of_flags(
+    before: Option<usize>,
+    after: Option<usize>,
+    context: Option<usize>,
+) -> Option<HitContext> {
+    (before.is_some() || after.is_some() || context.is_some()).then(|| {
+        let (before, after) = context_sides(before, after, context, 0);
+        HitContext { before, after }
+    })
+}
+
+/// The counts before and after: `before` and `after`, the values of `-B`
+/// and `-A`, for their side, else `context`, the value of `-C`, else
+/// `default`.
+fn context_sides(
+    before: Option<usize>,
+    after: Option<usize>,
+    context: Option<usize>,
+    default: usize,
+) -> (usize, usize) {
+    (
+        before.or(context).unwrap_or(default),
+        after.or(context).unwrap_or(default),
+    )
 }
 
 impl AgentSearchArgs {
@@ -1313,7 +1382,7 @@ mod tests {
                 assert_eq!(read.hit.as_deref(), Some("m2"));
                 assert_eq!(read.lines, None);
                 assert_eq!(read.match_query, None);
-                assert_eq!(read.context, 3);
+                assert_eq!(read.context, None);
                 assert_eq!(read.output.budget, Some(1234));
                 assert!(!read.output.no_budget);
                 assert!(read.output.tools);
@@ -1401,7 +1470,7 @@ mod tests {
         match agent_command(matching) {
             AgentCommand::Read(read) => {
                 assert_eq!(read.match_query.as_deref(), Some("historical correction"));
-                assert_eq!(read.context, 12);
+                assert_eq!(read.context, Some(12));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -1452,6 +1521,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_read_and_outline_count_context_messages_without_match() {
+        let read_context = |flags: &[&str]| {
+            let mut args = vec!["rearview", "agent", "read", "ch_abc123:m7"];
+            args.extend_from_slice(flags);
+            match agent_command(Args::try_parse_from(args).unwrap()) {
+                AgentCommand::Read(read) => read.message_context(),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        let around = |before, after| Some(HitContext { before, after });
+
+        assert_eq!(read_context(&[]), None, "a read without the flags");
+        assert_eq!(read_context(&["-C", "2"]), around(2, 2));
+        assert_eq!(
+            read_context(&["-B", "1"]),
+            around(1, 0),
+            "-B alone adds no message after"
+        );
+        assert_eq!(read_context(&["-B", "1", "-C", "3"]), around(1, 3));
+        assert_eq!(
+            read_context(&["--match", "x", "-C", "2"]),
+            None,
+            "with --match, -C counts lines"
+        );
+
+        let outline =
+            Args::try_parse_from(["rearview", "agent", "outline", "ch_abc123:m7", "-A", "4"])
+                .unwrap();
+        match agent_command(outline) {
+            AgentCommand::Outline(outline) => {
+                assert_eq!(outline.message_context(), around(0, 4));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn agent_read_slice_options_validate_arguments() {
         let conflict = Args::try_parse_from([
             "rearview",
@@ -1466,16 +1572,22 @@ mod tests {
         .expect_err("line and match slices should conflict");
         assert!(conflict.to_string().contains("cannot be used with"));
 
-        let missing_match = Args::try_parse_from([
+        let lines_with_context = Args::try_parse_from([
             "rearview",
             "agent",
             "read",
             "ch_abc123:m7",
+            "--lines",
+            "1..2",
             "--context",
             "2",
         ])
-        .expect_err("context should require a match query");
-        assert!(missing_match.to_string().contains("required"));
+        .expect_err("line slices and context should conflict");
+        assert!(
+            lines_with_context
+                .to_string()
+                .contains("cannot be used with")
+        );
 
         let invalid_lines = Args::try_parse_from([
             "rearview",
@@ -1490,7 +1602,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_read_tail_accepts_nonzero_count_and_conflicts_with_anchor_hit_lines_and_match() {
+    fn agent_read_tail_accepts_nonzero_count_and_conflicts_with_anchor_hit_lines_match_and_context()
+    {
         let parse_read = |extra: &[&str]| {
             Args::try_parse_from(
                 ["rearview", "agent", "read", "ch_abc123"]
@@ -1510,9 +1623,13 @@ mod tests {
             &["--hit", "m2"],
             &["--lines", "1..2"],
             &["--match", "needle"],
+            &["-B", "1"],
+            &["-A", "1"],
+            &["-C", "1"],
         ] {
-            let error = parse_read(&[&["--tail", "5"][..], other].concat())
-                .expect_err("--tail conflicts with --anchor, --hit, --lines and --match");
+            let error = parse_read(&[&["--tail", "5"][..], other].concat()).expect_err(
+                "--tail conflicts with --anchor, --hit, --lines, --match, -B, -A and -C",
+            );
             assert!(error.to_string().contains("cannot be used with"), "{error}");
         }
     }

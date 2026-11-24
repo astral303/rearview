@@ -644,6 +644,13 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         "agent", "read", reference, "--match", "the", "-C", "0", "--budget", "800",
     ]);
     run(&["agent", "read", reference, "--match", "zzqqxx"]);
+    run(&[
+        "agent",
+        "read",
+        &format!("{reference}:{message}"),
+        "-C",
+        "1",
+    ]);
     run(&["agent", "read", reference, "--tail", "3"]);
     run(&[
         "agent",
@@ -697,7 +704,7 @@ fn read_records_of(reference: &str, agent: &str) -> String {
 
 /// Every `agent outline` case of `agent`'s session `reference` names.
 fn outline_records_of(reference: &str, agent: &str) -> String {
-    let (_, range) = case_messages_of(agent);
+    let (message, range) = case_messages_of(agent);
     let mut records = String::new();
     let mut run = |args: &[&str]| {
         let command = agent_command(args);
@@ -717,6 +724,15 @@ fn outline_records_of(reference: &str, agent: &str) -> String {
     ]);
     run(&["agent", "outline", reference, "--budget", "500"]);
     run(&["agent", "outline", &format!("{reference}:{range}")]);
+    run(&[
+        "agent",
+        "outline",
+        &format!("{reference}:{message}"),
+        "-B",
+        "1",
+        "-A",
+        "2",
+    ]);
     run(&["agent", "outline", &format!("{reference}:m17..m9999")]);
     if outline.lines().any(|line| line.starts_with("subagent s1 ")) {
         run(&["agent", "outline", &format!("{reference}:s1")]);

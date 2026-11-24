@@ -43,6 +43,12 @@ protocol agent-outline cut=none chars=20000 policy=text messages=46 subagents=3 
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
 day 2026-09-01
 m2 06:00:02 chars=49 | ASSISTANT_TEXT_SENTINEL: listing the files first.
+$ rearview agent outline ch_581699c40efc:m3 -B 1 -A 2
+--- stdout
+protocol agent-outline cut=none chars=20000 policy=text messages=46 subagents=3 subagent-messages=5 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 tz=-04:00 hidden-tools=2 hidden-tool-results=2 hidden-thinking=1 hidden-subagent-messages=1
+conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+day 2026-09-01
+m2 06:00:02 chars=49 | ASSISTANT_TEXT_SENTINEL: listing the files first.
 $ rearview agent outline ch_581699c40efc:m17..m9999
 --- stdout
 protocol agent-outline cut=none chars=20000 policy=text last=m46 messages=46 subagents=3 subagent-messages=5 at=2026-09-01T06:00:00 to=2026-09-01T06:34:01 tz=-04:00 hidden-tools=11 hidden-tool-results=10
@@ -97,6 +103,14 @@ conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-00
 day 2026-08-06
 m3 06:00:04 chars=22 | kimi answer searchable
 m6 user 06:02:00 chars=24 | steer follow-up question
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
+$ rearview agent outline ch_0b26e45343df:s1:m3 -B 1 -A 2
+--- stdout
+protocol agent-outline cut=none chars=20000 policy=text+subagents messages=28 subagents=1 subagent-messages=3 at=2026-08-06T06:00:01 to=2026-08-06T06:03:21 tz=-04:00 hidden-thinking=1 warnings=1 warning-records=1
+conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
+subagent s1 span=s1:m1..m3 : agent-0
+day 2026-08-06
+s1:m3 06:00:02 chars=28 | kimi child answer searchable
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent outline ch_0b26e45343df:m17..m9999
 --- stdout
@@ -153,6 +167,15 @@ conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-0000000000
 day 2026-08-01
 m3 06:00:05 chars=23 | codex answer searchable
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
+$ rearview agent outline ch_74aec3f6df49:s1:m2 -B 1 -A 2
+--- stdout
+protocol agent-outline cut=none chars=20000 policy=text+subagents messages=68 subagents=2 subagent-messages=5 at=2026-08-01T06:00:02 to=2026-08-01T06:03:49 tz=-04:00 warnings=1 warning-records=1
+conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
+subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
+day 2026-08-01
+s1:m1 user 06:00:03 chars=19 | child task question
+s1:m2 06:00:03 chars=23 | child answer searchable
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent outline ch_74aec3f6df49:m17..m9999
 --- stdout
 protocol agent-outline cut=none chars=20000 policy=text last=m68 messages=68 subagents=2 subagent-messages=5 at=2026-08-01T06:00:02 to=2026-08-01T06:03:49 tz=-04:00 hidden-tools=25 hidden-tool-results=18 warnings=1 warning-records=1
@@ -206,6 +229,15 @@ m2 22:04:07 chars=15 | OMP root answer
 m3 user 22:04:12 chars=19 | OMP active question
 m4 22:04:13 chars=17 | OMP active answer
 m5 user 22:04:14 chars=24 | [/clear] Context cleared
+$ rearview agent outline ch_974c3840e189:m3 -B 1 -A 2
+--- stdout
+protocol agent-outline cut=none chars=20000 policy=text messages=23 subagents=1 subagent-messages=2 at=2026-01-01T22:04:06 to=2026-01-01T22:04:32 tz=-05:00 hidden-thinking=1 hidden-subagent-messages=2
+conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+day 2026-01-01
+m2 22:04:07 chars=15 | OMP root answer
+m3 user 22:04:12 chars=19 | OMP active question
+m4 22:04:13 chars=17 | OMP active answer
+m5 user 22:04:14 chars=24 | [/clear] Context cleared
 $ rearview agent outline ch_974c3840e189:m17..m9999
 --- stdout
 protocol agent-outline cut=none chars=20000 policy=text last=m23 messages=23 subagents=1 subagent-messages=2 at=2026-01-01T22:04:06 to=2026-01-01T22:04:32 tz=-05:00 hidden-tools=2 hidden-tool-results=3
@@ -236,6 +268,10 @@ protocol agent-outline cut=tail chars=500 full=618 policy=text messages=20 subag
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
 continue read refs=ch_efbbec792ccc:m1..m15 tools=false tool-results=false thinking=false subagents=false
 $ rearview agent outline ch_efbbec792ccc:m2..m5
+--- stdout
+protocol agent-outline cut=none chars=20000 policy=text messages=20 subagents=1 subagent-messages=3 at=2025-08-12T08:01:40 to=2025-08-12T08:05:50 tz=-04:00 hidden-tools=2 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=3
+conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+$ rearview agent outline ch_efbbec792ccc:m3 -B 1 -A 2
 --- stdout
 protocol agent-outline cut=none chars=20000 policy=text messages=20 subagents=1 subagent-messages=3 at=2025-08-12T08:01:40 to=2025-08-12T08:05:50 tz=-04:00 hidden-tools=2 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
@@ -292,6 +328,13 @@ conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789
 day 2024-02-29
 m2 19:02:00 chars=11 | root answer
 m5 user 19:09:00 chars=53 | [notice] visible custom searchable [Image: image/png]
+$ rearview agent outline ch_f04d3718e406:m3 -B 1 -A 2
+--- stdout
+protocol agent-outline cut=none chars=20000 policy=text messages=19 at=2024-02-29T19:01:00 to=2024-02-29T19:20:03 tz=-05:00 hidden-tools=2 hidden-tool-results=2 hidden-thinking=1
+conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+day 2024-02-29
+m2 19:02:00 chars=11 | root answer
+m5 user 19:09:00 chars=53 | [notice] visible custom searchable [Image: image/png]
 $ rearview agent outline ch_f04d3718e406:m17..m9999
 --- stdout
 protocol agent-outline cut=none chars=20000 policy=text last=m19 messages=19 at=2024-02-29T19:01:00 to=2024-02-29T19:20:03 tz=-05:00 hidden-tools=1 hidden-tool-results=1
@@ -325,6 +368,13 @@ protocol agent-outline cut=none chars=20000 policy=text messages=20 subagents=1 
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 day 1969-12-31
 m3 19:00:01 chars=22 | grok answer searchable
+$ rearview agent outline ch_982349c13ee4:s1:m3 -B 1 -A 2
+--- stdout
+protocol agent-outline cut=none chars=20000 policy=text+subagents messages=20 subagents=1 subagent-messages=3 at=1969-12-31T19:00:01 to=1969-12-31T19:00:02 tz=-05:00 hidden-thinking=1
+conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+subagent s1 span=s1:m1..m3 : explore
+day 1969-12-31
+s1:m3 19:00:01 chars=28 | grok child answer searchable
 $ rearview agent outline ch_982349c13ee4:m17..m9999
 --- stdout
 protocol agent-outline cut=none chars=20000 policy=text last=m20 messages=20 subagents=1 subagent-messages=3 at=1969-12-31T19:00:01 to=1969-12-31T19:00:02 tz=-05:00 hidden-tools=1 hidden-tool-results=2

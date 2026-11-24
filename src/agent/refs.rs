@@ -1,3 +1,4 @@
+use crate::agent::address::HitContext;
 use crate::agent::diagnostic::{AgentError, AgentErrorKind};
 use crate::error::{AppError, Result};
 use crate::history::path::CanonicalDirectories;
@@ -383,10 +384,36 @@ pub struct ReadRef {
     /// `REF:mN.K`: the number of the call to read alone, in the message
     /// `range` names.
     pub call: Option<usize>,
+    /// The range the ref named, when `-B`, `-A` or `-C` widened `range`
+    /// around it.
+    pub widened_from: Option<ThreadRange>,
     command: RefCommand,
 }
 
 impl ReadRef {
+    /// The ref with `context`'s messages of its thread around its message
+    /// range. A whole session, a whole sub-agent and a call stay as they
+    /// are.
+    pub fn widened(self, context: HitContext) -> Self {
+        match self.range {
+            Some(range) if self.call.is_none() => Self {
+                range: Some(context.around(range)),
+                widened_from: Some(range),
+                ..self
+            },
+            _ => self,
+        }
+    }
+
+    /// The ref naming the messages `range` of its conversation, such as the
+    /// message an `--anchor` names.
+    pub fn of_messages(self, range: ThreadRange) -> Self {
+        Self {
+            range: Some(range),
+            ..self
+        }
+    }
+
     /// The session the ref's conversation names among `keys`. A transcript
     /// path holding a `:` after its drive may end in a malformed part after
     /// the conversation, as `C:\s\x.jsonl:bad/s3` does: when the path is
@@ -513,6 +540,7 @@ fn parse_ref(input: &str, command: RefCommand) -> Result<ReadRef> {
         range: None,
         subagent: None,
         call: None,
+        widened_from: None,
         command,
     };
     if let Some(part) = part {
