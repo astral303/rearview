@@ -378,7 +378,8 @@ pub struct AgentReadArgs {
     /// last line
     #[arg(long, value_name = "START..END", conflicts_with = "match_query")]
     pub lines: Option<MessageLineRange>,
-    /// Find text within one message and return matching lines with context
+    /// Find text in each message read, case-insensitively, and show the
+    /// messages with a matching line, those lines numbered with context
     #[arg(long = "match", value_parser = non_empty_string, conflicts_with = "lines")]
     pub match_query: Option<String>,
     /// Content lines of context before and after each match; -B and -A set

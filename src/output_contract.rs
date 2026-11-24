@@ -574,7 +574,7 @@ fn case_messages_of(agent: &str) -> (&'static str, &'static str) {
 
 /// Every `agent read` case of `agent`'s session `reference` names.
 fn read_records_of(reference: &str, agent: &str) -> String {
-    let (message, _) = case_messages_of(agent);
+    let (message, range) = case_messages_of(agent);
     let mut records = String::new();
     let mut run = |args: &[&str]| {
         let command = agent_command(args);
@@ -618,6 +618,18 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         "-A",
         "1",
     ]);
+    run(&[
+        "agent",
+        "read",
+        &format!("{reference}:{range}"),
+        "--match",
+        "the",
+    ]);
+    run(&["agent", "read", reference, "--match", "answer", "-C", "0"]);
+    run(&[
+        "agent", "read", reference, "--match", "the", "-C", "0", "--budget", "800",
+    ]);
+    run(&["agent", "read", reference, "--match", "zzqqxx"]);
     run(&["agent", "read", reference, "--tail", "3"]);
     run(&[
         "agent",

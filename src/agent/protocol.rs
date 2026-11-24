@@ -210,10 +210,10 @@ impl ReadRequest<'_> {
     }
 
     /// Each call of `message` whole when read alone, or when `message` is the
-    /// one message a read names, at `one_message_ordinal`; collapsed
-    /// otherwise.
-    fn call_lines(&self, message: &AgentMessage, one_message_ordinal: Option<usize>) -> CallLines {
-        if one_message_ordinal == Some(message.ordinal) || self.call.is_some() {
+    /// message at `shown_alone`, which the read shows as a read of it alone
+    /// does; collapsed otherwise.
+    fn call_lines(&self, message: &AgentMessage, shown_alone: Option<usize>) -> CallLines {
+        if shown_alone == Some(message.ordinal) || self.call.is_some() {
             CallLines::Whole
         } else {
             CallLines::Collapsed
@@ -288,6 +288,11 @@ struct RenderedMessage<'a> {
     /// The content a budget truncated, shown in place of `content`.
     truncation: Option<Truncation>,
     slice: Option<String>,
+    /// The number of lines a `--match` slice matched; `None` without one.
+    matched_lines: Option<usize>,
+    /// In a `--match` read, the read that
+    /// continues from this message when a budget leaves it out.
+    match_continuation: Option<MatchContinuation>,
     /// `anchor=` on the record of a one-message read.
     anchor: Option<String>,
     /// The calls in other messages that its shown results answer: `call=`.
@@ -1006,6 +1011,19 @@ impl<'a> ReadEntry<'a> {
         }
     }
 
+    /// True for a message whose `--match` slice matched a line.
+    fn has_match(&self) -> bool {
+        matches!(self, Self::Message { rendered, .. }
+            if rendered.matched_lines.is_some_and(|lines| lines > 0))
+    }
+
+    fn match_continuation(&mut self) -> Option<&mut MatchContinuation> {
+        match self {
+            Self::Message { rendered, .. } => rendered.match_continuation.as_mut(),
+            Self::Hidden(_) => None,
+        }
+    }
+
     /// The sub-agent whose messages the entry holds; `None` for the
     /// session's own.
     fn subagent(&self) -> Option<&SubagentTag> {
@@ -1213,6 +1231,8 @@ struct ReadHeader {
     last: String,
     /// ` messages-in-window=N`, or empty without a window.
     window: String,
+    /// ` matched-messages=N` on a `--match` read, or empty.
+    matched: String,
     /// ` warnings=N warning-records=M`, or empty without warning records.
     warnings: String,
 }
@@ -1222,6 +1242,7 @@ impl ReadHeader {
         options: ProtocolOptions,
         requests: &[ReadRequest<'_>],
         messages_in_window: ThreadCounts,
+        matched_messages: Option<usize>,
         warning_count: usize,
         warning_records: &[String],
     ) -> Self {
@@ -1231,6 +1252,9 @@ impl ReadHeader {
             policy: options.visibility().atom(),
             last: last_atom(requests),
             window: window_atom(options.window, messages_in_window),
+            matched: matched_messages
+                .map(|count| format!(" matched-messages={count}"))
+                .unwrap_or_default(),
             warnings: warning_atoms(warning_count, warning_records),
         }
     }
@@ -1243,12 +1267,13 @@ impl ReadHeader {
         hidden_atoms: &str,
     ) -> String {
         format!(
-            "protocol agent-read cut={} chars={}{} policy={}{} over-budget={over_budget}{}{}{hidden_atoms}{}\n",
+            "protocol agent-read cut={} chars={}{} policy={}{} over-budget={over_budget}{}{}{}{hidden_atoms}{}\n",
             escape_atom(cut),
             budget_atom(self.budget),
             full_atom(cut, self.full),
             self.policy,
             self.last,
+            self.matched,
             tz_atom(offset),
             self.window,
             self.warnings
@@ -1260,9 +1285,10 @@ impl ReadHeader {
     /// offset is as long as the offset of `written_at`.
     fn fixed_atoms(&self, written_at: DateTime<Zone>) -> String {
         format!(
-            " policy={}{}{}{}{}",
+            " policy={}{}{}{}{}{}",
             self.policy,
             self.last,
+            self.matched,
             tz_atom(output_offset(None, written_at)),
             self.window,
             self.warnings
@@ -1320,10 +1346,16 @@ pub fn format_read_with_warnings(
     let mut entries = Vec::new();
     let mut request_entry_counts = Vec::with_capacity(requests.len());
     let mut messages_in_window = ThreadCounts::default();
+    // The parts hidden in the messages a `--match` read searched and doesn't
+    // show.
+    let mut unshown_hidden = HiddenParts::default();
     let indexes = requests
         .iter()
         .map(|request| TranscriptIndex::of(request.transcript))
         .collect::<Vec<_>>();
+    // A `--match` read slices each message it selects, and shows those with
+    // a matching line alone.
+    let searches_each_message = matches!(slice, Some(ReadSlice::Match { .. }));
     for (request, index) in requests.iter().zip(&indexes) {
         let request_options = request.options(options);
         header_options = header_options.showing(request_options.visibility());
@@ -1331,11 +1363,12 @@ pub fn format_read_with_warnings(
             options: request_options,
             one_message_ordinal,
             slice,
+            searches_each_message,
             zone,
         };
         let mut selected = requested_messages(request, index)?;
-        if slice.is_some() {
-            // `--lines` and `--match` slice the named message alone.
+        if let Some(ReadSlice::Lines(_)) = slice {
+            // `--lines` slices the named message alone.
             selected.retain(|message| Some(message.ordinal) == one_message_ordinal);
         }
         messages_in_window = messages_in_window.add(ThreadCounts::of(
@@ -1347,15 +1380,22 @@ pub fn format_read_with_warnings(
         if let ReadPriority::Tail(count) = &priority {
             selected = tail_messages(request, selected, index, *count, &shape);
         }
-        let request_entries = read_entries(request, selected, index, &shape)?;
+        let mut request_entries = read_entries(request, selected, index, &shape)?;
+        if let Some(ReadSlice::Match { query, context }) = slice {
+            request_entries =
+                matched_entries(request_entries, query, *context, &mut unshown_hidden);
+        }
         request_entry_counts.push(request_entries.len());
         entries.extend(request_entries);
     }
     let (warning_count, warning_records) = format_warning_records(warnings);
+    let matched_messages =
+        searches_each_message.then(|| entries.iter().filter(|entry| entry.has_match()).count());
     let mut header = ReadHeader::new(
         header_options,
         requests,
         messages_in_window,
+        matched_messages,
         warning_count,
         &warning_records,
     );
@@ -1384,9 +1424,16 @@ pub fn format_read_with_warnings(
     let spans = entries.iter().map(EntrySpan::of).collect::<Vec<_>>();
     let render = |entries: &[ReadEntry<'_>], selected: &[usize], cut: &str, size| {
         let mut writer = RecordWriter::new(size, zone);
+        if entries.is_empty() && searches_each_message {
+            for (request, index) in requests.iter().zip(&indexes) {
+                writer.enter_conversation(request.resolved, &index.addresses, &[]);
+            }
+        }
         write_entries(&mut writer, entries, selected);
         let selected_set = selected.iter().copied().collect::<BTreeSet<_>>();
-        let hidden_atoms = hidden_in(entries, selected.iter().copied()).total_atoms();
+        let mut hidden = hidden_in(entries, selected.iter().copied());
+        hidden.add(&unshown_hidden);
+        let hidden_atoms = hidden.total_atoms();
         let mut output = header.line(
             cut,
             &over_budget_ranges(&spans, &selected_set),
@@ -1669,6 +1716,7 @@ fn truncated_outline(
                 &messages.resolved.reference.canonical(),
                 messages.addresses,
                 &omitted,
+                "",
                 messages.visibility,
             ));
         }
@@ -2257,6 +2305,47 @@ fn named_message_ordinal(requests: &[ReadRequest<'_>]) -> Option<usize> {
     }
 }
 
+/// The entries of `entries` showing a message with a matching line, each
+/// continued by `--match` with `context` through the entries up to the next
+/// of them. The parts the others hide are added to `unshown_hidden`.
+fn matched_entries<'a>(
+    entries: Vec<ReadEntry<'a>>,
+    query: &str,
+    context: MatchContext,
+    unshown_hidden: &mut HiddenParts<'a>,
+) -> Vec<ReadEntry<'a>> {
+    let mut matched = Vec::new();
+    for mut entry in entries {
+        let last = entry.last_ordinal();
+        if !entry.has_match() {
+            unshown_hidden.add(entry.hidden());
+            if let Some(continuation) = matched.last_mut().and_then(ReadEntry::match_continuation) {
+                continuation.through = last;
+            }
+            continue;
+        }
+        if let ReadEntry::Message { rendered, .. } = &mut entry {
+            rendered.match_continuation = Some(MatchContinuation {
+                atoms: format!(" {}", match_atoms(query, context)),
+                through: last,
+            });
+        }
+        matched.push(entry);
+    }
+    matched
+}
+
+/// The `continue read` recipe of a matched message a budget leaves out of a
+/// `--match` read: it reads from that message through the
+/// messages up to the next matched one, with the read's `--match`.
+#[derive(Clone, Debug)]
+struct MatchContinuation {
+    /// ` match=B9 context=3`.
+    atoms: String,
+    /// The ordinal of the last message the recipe reads.
+    through: usize,
+}
+
 /// The options a read renders each message with.
 struct ReadShape<'s> {
     options: ProtocolOptions,
@@ -2264,8 +2353,19 @@ struct ReadShape<'s> {
     /// whole, and its record carries `anchor=`.
     one_message_ordinal: Option<usize>,
     slice: Option<&'s ReadSlice>,
+    /// True for a `--match` read: it shows each message with a matching
+    /// line as a read of it alone shows it.
+    searches_each_message: bool,
     /// The zone the read shows its times in.
     zone: Zone,
+}
+
+impl ReadShape<'_> {
+    /// True when the read shows message `ordinal` as a read of it alone
+    /// shows it: its calls whole and its record carrying `anchor=`.
+    fn shows_as_alone(&self, ordinal: usize) -> bool {
+        self.one_message_ordinal == Some(ordinal) || self.searches_each_message
+    }
 }
 
 /// The calls, results, sub-agents and message addresses a read looks up
@@ -2315,18 +2415,21 @@ fn read_entries<'a>(
             continue;
         }
         let hidden = hidden_parts(message, options.visibility());
+        let shown_alone = shape
+            .shows_as_alone(message.ordinal)
+            .then_some(message.ordinal);
         match shown_message(
             request.resolved,
             message,
             index,
             options,
-            request.call_lines(message, shape.one_message_ordinal),
+            request.call_lines(message, shown_alone),
             shape.zone,
         ) {
             Some(mut rendered) => {
                 entries.extend(hidden_run_entry(run.take()));
                 rendered.conversation = conversation;
-                if shape.one_message_ordinal == Some(message.ordinal) && request.call.is_none() {
+                if shown_alone.is_some() && request.call.is_none() {
                     rendered.anchor =
                         Some(request.transcript.message_anchor(request.resolved, message));
                 }
@@ -2597,6 +2700,8 @@ fn render_message<'a>(
             content,
             truncation: None,
             slice: None,
+            matched_lines: None,
+            match_continuation: None,
             anchor: None,
             answered,
             visibility,
@@ -2659,16 +2764,23 @@ fn apply_read_slice<'a>(
                 })
                 .collect();
             rendered.slice = Some(format!(
-                "match={}{} matches={}",
-                escape_atom(query),
-                context.atoms(),
+                "{} matches={}",
+                match_atoms(query, *context),
                 matches.len()
             ));
+            rendered.matched_lines = Some(matches.len());
         }
     }
     rendered.content = rendered.content.sliced(&selected, &matches);
     rendered.has_own_record = true;
     Ok(rendered)
+}
+
+/// `match=B9 context=3`: a `--match` query, percent-encoded, and the lines
+/// around each match, as a slice record and a `continue read` recipe print
+/// them.
+fn match_atoms(query: &str, context: MatchContext) -> String {
+    format!("match={}{}", escape_atom(query), context.atoms())
 }
 
 /// The `selected` lines of `lines`, each numbered from 1 and marked `>` when
@@ -2875,7 +2987,8 @@ const TRUNCATION_FLOOR_CHARS: usize = 200;
 
 /// A `continue read` record per conversation for the entries not in
 /// `selected`: each run of consecutive messages as one ref, `;` between
-/// refs, then the flags that show every omitted entry.
+/// refs, then the read's `--match` when it has one, then the
+/// flags that show every omitted entry.
 fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> Vec<String> {
     let mut groups: Vec<OverBudgetEntries<'_, '_>> = Vec::new();
     for (index, span) in spans.iter().enumerate() {
@@ -2905,6 +3018,7 @@ fn continuation_records(spans: &[EntrySpan<'_>], selected: &BTreeSet<usize>) -> 
                 &group.first.canonical,
                 group.first.addresses,
                 &group.runs,
+                &group.first.match_atoms,
                 group.flags,
             )
         })
@@ -2941,24 +3055,34 @@ struct EntrySpan<'a> {
     /// True for a run of hidden messages; false for a message the read
     /// shows.
     is_hidden: bool,
+    /// ` match=B9 context=3` for a matched message of a `--match` read;
+    /// empty otherwise.
+    match_atoms: String,
 }
 
 impl<'a> EntrySpan<'a> {
     fn of(entry: &ReadEntry<'a>) -> Self {
         let conversation = entry.conversation();
         let reference = &conversation.resolved.reference;
-        let (flags, is_hidden) = match entry {
-            ReadEntry::Message { rendered, .. } => (rendered.visibility, false),
-            ReadEntry::Hidden(run) => (run.flags, true),
+        let (flags, is_hidden, continuation) = match entry {
+            ReadEntry::Message { rendered, .. } => (
+                rendered.visibility,
+                false,
+                rendered.match_continuation.as_ref(),
+            ),
+            ReadEntry::Hidden(run) => (run.flags, true, None),
         };
         Self {
             full_ref: reference.full_ref(),
             canonical: reference.canonical(),
             addresses: conversation.addresses,
             first: entry.first_ordinal(),
-            last: entry.last_ordinal(),
+            last: continuation.map_or(entry.last_ordinal(), |continuation| continuation.through),
             flags,
             is_hidden,
+            match_atoms: continuation
+                .map(|continuation| continuation.atoms.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -3669,7 +3793,7 @@ mod tests {
     use crate::agent::diagnostic::AgentErrorKind;
     use crate::agent::refs::{AgentConversationKey, AgentConversationRef};
     use crate::agent::test_support::{
-        assert_each_budget_cuts_short_or_ends_with_warnings, cuts_checking_full, day_record,
+        assert_each_budget_cuts_short_or_ends_with_warnings, atom, cuts_checking_full, day_record,
         lines_around, local_time, record_time, source, subagent_text_message, text_message,
         text_message_at, warnings_of_two_kinds, written_at,
     };
@@ -4224,29 +4348,338 @@ mod tests {
     }
 
     #[test]
-    fn match_slice_reports_zero_matches_without_dumping_message() {
+    fn match_read_of_one_message_without_a_match_prints_header_and_conversation_alone() {
+        use AgentMessageRole::{Assistant, User};
         let resolved = resolved("session.jsonl");
-        let transcript = transcript(vec![text_message(1, AgentMessageRole::User, "haystack")]);
-        let output = format_read(
-            &[ReadRequest {
-                resolved: &resolved,
-                transcript: &transcript,
-                range: Some(MessageRange::single(1)),
-                subagent: None,
-                call: None,
-                shortened_to: None,
-            }],
+        let transcript = transcript(vec![
+            text_message(1, User, "haystack"),
+            message(
+                2,
+                Assistant,
+                vec![call_with_id("t", "Bash", "cargo test", source(Assistant))],
+            ),
+        ]);
+        let read_of = |ordinal| {
+            format_read(
+                &[ReadRequest {
+                    resolved: &resolved,
+                    transcript: &transcript,
+                    range: Some(MessageRange::single(ordinal)),
+                    subagent: None,
+                    call: None,
+                    shortened_to: None,
+                }],
+                None,
+                Some(&ReadSlice::Match {
+                    query: "needle".to_string(),
+                    context: lines_around(3),
+                }),
+                options(),
+            )
+            .unwrap()
+        };
+
+        for (ordinal, hidden) in [(1, ""), (2, " hidden-tools=1")] {
+            let output = read_of(ordinal);
+            let lines = output.lines().collect::<Vec<_>>();
+            assert!(
+                lines.len() == 2
+                    && lines[0].contains(" matched-messages=0 ")
+                    && lines[0].ends_with(&format!("{}{hidden}", tz_now()))
+                    && lines[1].starts_with("conversation "),
+                "m{ordinal} without a match prints the header, counting what it hides, \
+                 and the conversation record alone: {output}"
+            );
+        }
+    }
+
+    /// The `--match needle` read of every message of `transcript`, with
+    /// `options`.
+    fn whole_session_match(transcript: &AgentTranscript, options: ProtocolOptions) -> String {
+        format_read(
+            &[whole_session_request(
+                &resolved("session.jsonl"),
+                transcript,
+            )],
             None,
             Some(&ReadSlice::Match {
-                query: "needle".to_string(),
-                context: lines_around(3),
+                query: "needle".to_owned(),
+                context: lines_around(0),
             }),
-            options(),
+            options,
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        assert!(output.contains("slice=match=needle context=3 matches=0 anchor=ma_"));
-        assert!(!output.contains("haystack"));
+    /// m1 and m3 contain `needle`; m2 and m4 don't, and m4 contains a call.
+    fn needles_in_first_and_third_message() -> AgentTranscript {
+        use AgentMessageRole::{Assistant, User};
+        let mut calling = text_message(4, Assistant, "no match here");
+        calling
+            .parts
+            .push(call_with_id("t", "Bash", "cargo test", source(Assistant)));
+        transcript(vec![
+            text_message(1, User, "find the needle"),
+            text_message(2, Assistant, "haystack"),
+            text_message(3, User, "first line\nNeedle again"),
+            calling,
+        ])
+    }
+
+    #[test]
+    fn match_read_of_several_messages_shows_each_with_a_matching_line_alone() {
+        let output = whole_session_match(&needles_in_first_and_third_message(), options());
+
+        let records = output
+            .lines()
+            .filter(|line| line.starts_with('m'))
+            .collect::<Vec<_>>();
+        assert!(
+            output.starts_with(
+                "protocol agent-read cut=none chars=6000 policy=text over-budget=none matched-messages=2 "
+            ),
+            "the header counts m1 and m3 as matched messages: {output}"
+        );
+        assert_eq!(records.len(), 2, "m1 and m3 alone print a record: {output}");
+        assert!(
+            records[0].starts_with("m1 user ")
+                && records[0].contains(" slice=match=needle context=0 matches=1 anchor=ma_"),
+            "m1 prints as a --match read of it alone prints it: {output}"
+        );
+        assert!(
+            records[1].starts_with("m3 user ") && records[1].contains(" matches=1 anchor=ma_"),
+            "m3 prints as a --match read of it alone prints it: {output}"
+        );
+        assert!(
+            output.contains("| >2: Needle again\n"),
+            "m3's matching line prints numbered: {output}"
+        );
+        assert!(
+            !output.contains("haystack"),
+            "m2, without a matching line, doesn't print: {output}"
+        );
+    }
+
+    #[test]
+    fn match_read_counts_parts_hidden_in_messages_it_doesnt_show() {
+        let output = whole_session_match(&needles_in_first_and_third_message(), options());
+
+        assert!(
+            output.lines().next().unwrap().ends_with(" hidden-tools=1"),
+            "m4's hidden call counts though m4 doesn't match: {output}"
+        );
+    }
+
+    #[test]
+    fn match_read_without_a_match_prints_header_and_conversation_record_alone() {
+        let haystack = transcript(vec![
+            text_message(1, AgentMessageRole::User, "hay"),
+            text_message(2, AgentMessageRole::Assistant, "stack"),
+        ]);
+
+        let output = whole_session_match(&haystack, options());
+
+        let lines = output.lines().collect::<Vec<_>>();
+        assert!(
+            lines.len() == 2
+                && lines[0].contains(" matched-messages=0 ")
+                && lines[1].starts_with("conversation "),
+            "the header, counting 0 matched messages, and the conversation record \
+             alone print: {output}"
+        );
+    }
+
+    #[test]
+    fn budgeted_match_read_names_matched_messages_it_leaves_out_over_budget() {
+        let long_match = vec!["needle in a long line of text"; 20].join("\n");
+        let transcript = transcript(vec![
+            text_message(1, AgentMessageRole::User, "find the needle"),
+            text_message(2, AgentMessageRole::Assistant, "haystack"),
+            text_message(3, AgentMessageRole::User, &long_match),
+        ]);
+
+        let leaving_out_m3 = (1..4_000)
+            .map(|budget| whole_session_match(&transcript, with_budget(budget)))
+            .find(|output| output.contains(" over-budget=m3 "))
+            .expect("a budget leaves out the second matched message alone");
+
+        assert!(
+            leaving_out_m3.contains("\nm1 user ")
+                && leaving_out_m3.contains("\ncontinue read refs=")
+                && leaving_out_m3.contains(":m3 match=needle context=0 tools=false "),
+            "m1 shows, and a `continue read` record reads m3 with the match: {leaving_out_m3}"
+        );
+    }
+
+    /// m1 launches the sub-agent s1, whose 60 messages are m2 to m61; the
+    /// session's own m2 to m301 follow. Every third of the sub-agent's
+    /// messages and every fourth of the session's own contain `needle`.
+    fn sparse_needles_in_long_session() -> AgentTranscript {
+        let subagent = (2..=61).map(|ordinal| {
+            let text = if ordinal % 3 == 0 { "needle" } else { "hay" };
+            subagent_text_message(ordinal, "scout", &format!("{text} {ordinal}"))
+        });
+        let own = (62..=361).map(|ordinal| {
+            let role = if ordinal % 2 == 0 {
+                AgentMessageRole::User
+            } else {
+                AgentMessageRole::Assistant
+            };
+            let text = if ordinal % 4 == 0 { "needle" } else { "hay" };
+            text_message(ordinal, role, &format!("{text} {ordinal}"))
+        });
+        transcript(
+            std::iter::once(text_message(1, AgentMessageRole::User, "find the needles"))
+                .chain(subagent)
+                .chain(own)
+                .collect(),
+        )
+    }
+
+    /// The `--match needle` read of `references`, each the session's ref or
+    /// an address after it, in `transcript`.
+    fn match_read_of_refs(
+        transcript: &AgentTranscript,
+        references: &[String],
+        options: ProtocolOptions,
+    ) -> String {
+        let resolved = resolved("session.jsonl");
+        let addresses = MessageAddresses::of_transcript(transcript);
+        let read_refs = references
+            .iter()
+            .map(|reference| crate::agent::refs::parse_read_ref(reference).unwrap())
+            .collect::<Vec<_>>();
+        let requests = read_refs
+            .iter()
+            .map(|read_ref| {
+                let range = read_ref
+                    .range
+                    .map(|range| addresses.resolve(range).unwrap());
+                ReadRequest {
+                    resolved: &resolved,
+                    transcript,
+                    range: range.map(|range| range.range),
+                    subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
+                    call: None,
+                    shortened_to: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        format_read(
+            &requests,
+            None,
+            Some(&ReadSlice::Match {
+                query: "needle".to_owned(),
+                context: lines_around(0),
+            }),
+            options,
+        )
+        .unwrap()
+    }
+
+    /// The records and content lines of the messages `read` prints.
+    fn printed_messages(read: &str) -> Vec<&str> {
+        read.lines()
+            .filter(|line| {
+                let kind = line.split(' ').next().unwrap_or_default();
+                ![
+                    "protocol",
+                    "conversation",
+                    "subagent",
+                    "day",
+                    "continue",
+                    "read",
+                ]
+                .contains(&kind)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn budgeted_match_read_continues_from_first_left_out_match_to_address_end() {
+        let transcript = sparse_needles_in_long_session();
+        let reference = resolved("session.jsonl").reference.canonical();
+        let budget = 1_200;
+        for (address, options) in [
+            (reference.clone(), every_flag()),
+            (format!("{reference}:m2.."), options()),
+            (format!("{reference}:s1"), options()),
+        ] {
+            let unbudgeted = match_read_of_refs(
+                &transcript,
+                std::slice::from_ref(&address),
+                ProtocolOptions {
+                    budget: None,
+                    ..options
+                },
+            );
+            let budgeted = |references: &[String], options| {
+                match_read_of_refs(
+                    &transcript,
+                    references,
+                    ProtocolOptions {
+                        budget: Some(budget),
+                        ..options
+                    },
+                )
+            };
+            let first_page = budgeted(std::slice::from_ref(&address), options);
+            let header = first_page.lines().next().unwrap();
+            let over_budget = atom(header, "over-budget").unwrap();
+            assert!(
+                over_budget.split(',').count() <= 2,
+                "{address}: one range of the session's own messages and one of a \
+                 sub-agent's: {header}"
+            );
+            assert_eq!(
+                atom(header, "matched-messages"),
+                atom(unbudgeted.lines().next().unwrap(), "matched-messages"),
+                "{address}: the header counts the matched messages left out too"
+            );
+
+            let mut printed = Vec::new();
+            let mut page = first_page.clone();
+            loop {
+                assert!(
+                    page.chars().count() <= budget,
+                    "{address}: each page fits the budget: {page}"
+                );
+                printed.extend(printed_messages(&page).into_iter().map(str::to_owned));
+                let Some(recipe) = page.lines().find(|line| line.starts_with("continue read "))
+                else {
+                    break;
+                };
+                assert!(
+                    recipe.contains(" match=needle context=0 "),
+                    "{address}: the recipe carries the match: {recipe}"
+                );
+                let flag = |name| atom(recipe, name) == Some("true");
+                let refs = atom(recipe, "refs")
+                    .unwrap()
+                    .split(';')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                page = budgeted(
+                    &refs,
+                    ProtocolOptions {
+                        tools: flag("tools"),
+                        tool_results: flag("tool-results"),
+                        thinking: flag("thinking"),
+                        subagents: flag("subagents"),
+                        ..options
+                    },
+                );
+            }
+            assert!(
+                first_page.contains("\ncontinue read "),
+                "{address}: the budget leaves matched messages out: {first_page}"
+            );
+            assert_eq!(
+                printed,
+                printed_messages(&unbudgeted),
+                "{address}: following the recipes prints what the unbudgeted read prints"
+            );
+        }
     }
 
     /// The read of `lines` of m1, `one` and `two`.
@@ -4331,15 +4764,18 @@ mod tests {
             .unwrap()
         };
 
-        let output = sliced(Some(400));
+        let output = sliced(Some(420));
 
         assert!(output.starts_with(&format!(
-            "protocol agent-read cut=body chars=400{} policy=text over-budget=none{}\n",
+            "protocol agent-read cut=body chars=420{} policy=text over-budget=none matched-messages=1{}\n",
             full_atom_printing(&sliced(None)),
             tz_now()
         )));
-        assert!(output.contains("| >1: needle line 1"));
-        assert!(output.chars().count() <= 400);
+        assert!(
+            output.contains("| >1: needle line 1"),
+            "the truncated body keeps the first matching line: {output}"
+        );
+        assert!(output.chars().count() <= 420);
         assert!(
             output
                 .lines()

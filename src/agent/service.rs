@@ -4244,15 +4244,21 @@ impl ParsedReadRefs {
                 "--anchor requires exactly one conversation ref without an mN range".to_string(),
             ));
         }
-        if (args.lines.is_some() || args.match_query.is_some())
+        if args.lines.is_some()
             && (refs.len() != 1
                 || refs[0].call.is_some()
                 || (!refs[0].range.is_some_and(|range| range.names_one_message())
                     && args.anchor.is_none()))
         {
             return Err(AppError::ConfigError(
-                "--lines and --match require exactly one single-message ref such as ch_...:m7"
-                    .to_string(),
+                "--lines requires exactly one single-message ref such as ch_...:m7".to_string(),
+            ));
+        }
+        if args.match_query.is_some()
+            && let Some(message_ref) = refs.iter().find_map(agent::refs::ReadRef::call_message_ref)
+        {
+            return Err(AppError::ConfigError(
+                agent::refs::whole_message_searcher_rejects_call("--match", &message_ref),
             ));
         }
         let hit = args
@@ -8460,6 +8466,7 @@ mod tests {
             &[
                 &["read", CHANGED_SESSION, OTHER_SESSION, "--anchor", "ma_1"],
                 &["read", CHANGED_SESSION, "--lines", "1..2"],
+                &["read", &format!("{CHANGED_SESSION}:m1.1"), "--match", "x"],
             ],
         );
 

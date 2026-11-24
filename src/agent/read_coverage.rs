@@ -72,7 +72,7 @@ const WITH_TOOLS_AND_SUBAGENTS: ProtocolOptions = ProtocolOptions {
     },
 };
 
-const DEFAULT_FLAGS: ProtocolOptions = ProtocolOptions {
+pub(super) const DEFAULT_FLAGS: ProtocolOptions = ProtocolOptions {
     budget: None,
     tools: false,
     tool_results: false,
@@ -84,7 +84,7 @@ const DEFAULT_FLAGS: ProtocolOptions = ProtocolOptions {
     },
 };
 
-const EVERY_FLAG: ProtocolOptions = ProtocolOptions {
+pub(super) const EVERY_FLAG: ProtocolOptions = ProtocolOptions {
     budget: None,
     tools: true,
     tool_results: true,
@@ -168,14 +168,14 @@ fn read_ref(session: &AgentSession, reference: &str, options: ProtocolOptions) -
 }
 
 /// A session's transcript, loaded once for many reads of its refs.
-struct LoadedSession {
-    transcript: AgentTranscript,
-    resolved: ResolvedConversation,
-    addresses: MessageAddresses,
+pub(super) struct LoadedSession {
+    pub(super) transcript: AgentTranscript,
+    pub(super) resolved: ResolvedConversation,
+    pub(super) addresses: MessageAddresses,
 }
 
 impl LoadedSession {
-    fn of(session: &AgentSession) -> Self {
+    pub(super) fn of(session: &AgentSession) -> Self {
         let row = &session.row;
         let transcript =
             AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
@@ -189,6 +189,16 @@ impl LoadedSession {
 
     /// `agent read` of `reference`, as [`read_ref`] reads it.
     fn read_ref(&self, reference: &str, options: ProtocolOptions) -> String {
+        self.read_sliced(reference, None, options)
+    }
+
+    /// `agent read` of `reference` with `slice`, `--lines` or `--match`.
+    pub(super) fn read_sliced(
+        &self,
+        reference: &str,
+        slice: Option<&ReadSlice>,
+        options: ProtocolOptions,
+    ) -> String {
         let read_ref = parse_read_ref(reference).unwrap();
         let range = read_ref
             .range
@@ -203,7 +213,7 @@ impl LoadedSession {
                 shortened_to: range.and_then(|range| range.shortened_to),
             }],
             None,
-            None,
+            slice,
             options,
         )
         .unwrap()

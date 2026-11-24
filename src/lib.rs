@@ -1351,19 +1351,40 @@ mod agent_command_tests {
     }
 
     #[test]
-    fn read_slice_requires_one_single_message_ref() {
+    fn read_lines_requires_one_single_message_ref() {
         let keys = vec![key(
             "project-a",
             "12345678-1234-4234-9234-123456789abc.jsonl",
         )];
         let conversation = keys[0].conversation_ref().canonical();
         let mut args = read_args(vec![format!("{conversation}:m1..m2")], None);
-        args.match_query = Some("needle".to_string());
+        args.lines = Some("1..2".parse().unwrap());
 
         let error =
             resolve_agent_read_args(&args, &keys, &SystemCanonicaliser::shared()).unwrap_err();
 
         assert!(error.to_string().contains("single-message ref"));
+    }
+
+    #[test]
+    fn read_match_of_call_names_its_message() {
+        let keys = vec![key(
+            "project-a",
+            "12345678-1234-4234-9234-123456789abc.jsonl",
+        )];
+        let conversation = keys[0].conversation_ref().canonical();
+        let mut args = read_args(vec![format!("{conversation}:s2:m7.3")], None);
+        args.match_query = Some("needle".to_string());
+
+        let error =
+            resolve_agent_read_args(&args, &keys, &SystemCanonicaliser::shared()).unwrap_err();
+
+        assert!(
+            error.to_string().ends_with(&format!(
+                "--match searches whole messages; use the call's message, {conversation}:s2:m7"
+            )),
+            "the error names the typed call's message: {error}"
+        );
     }
 
     #[test]

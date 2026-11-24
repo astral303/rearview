@@ -390,6 +390,7 @@ const READ_HEADER: &[OrderedAtom] = &[
     required("policy", is_policy),
     optional("last", is_message_list),
     required("over-budget", is_over_budget_runs),
+    optional("matched-messages", is_digits),
     required("tz", is_offset),
     optional("messages-in-window", is_digits),
     optional("subagent-messages-in-window", is_digits),
@@ -446,8 +447,14 @@ const LEGEND: &[OrderedAtom] = &[
     optional("in", is_handle),
 ];
 
+/// `match=…` is followed by `context=`, or by `before-context=` and
+/// `after-context=`.
 const CONTINUE_READ: &[OrderedAtom] = &[
     required("refs", is_message_runs),
+    optional("match", is_atom),
+    optional("context", is_digits),
+    optional("before-context", is_digits),
+    optional("after-context", is_digits),
     required("tools", is_flag),
     required("tool-results", is_flag),
     required("thinking", is_flag),

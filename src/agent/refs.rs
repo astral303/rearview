@@ -410,6 +410,20 @@ impl ReadRef {
             }
         })
     }
+
+    /// `ch_…:m7`, the ref of the message of a call's ref `ch_…:m7.2`; `None`
+    /// for any other ref.
+    pub fn call_message_ref(&self) -> Option<String> {
+        self.call?;
+        Some(format!("{}:{}", self.conversation, self.range?))
+    }
+}
+
+/// The detail of the error for a call's address given to `searcher`, a
+/// command or flag that searches whole messages: it names the call's
+/// message, `message_ref`.
+pub fn whole_message_searcher_rejects_call(searcher: &str, message_ref: &str) -> String {
+    format!("{searcher} searches whole messages; use the call's message, {message_ref}")
 }
 
 /// `path` without a Windows drive, `C:`, at its start.
