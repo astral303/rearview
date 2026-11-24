@@ -122,14 +122,18 @@
   `<ref>:m300..` reads from m300 to the last message, and
   `<ref>:s3:m10..` to the sub-agent's last. `agent read --lines 40..` reads
   from line 40 to the message's last line.
-- Add search hit context flags to `agent search` and `agent within`. A hit's
-  `read` recipe reads one message before the hit and one after it; the flags
-  set those two counts:
-  - `-B N` sets the messages before the hit to N.
-  - `-A N` sets the messages after the hit to N.
+- Add context flags to `agent search`, `agent within`, `agent read` and
+  `agent outline`. They count the messages around a hit on `search` and
+  `within`, the messages around the ref on `read` and `outline`, and the
+  lines around each match with `--match`:
+  - `-B N` sets the count before to N.
+  - `-A N` sets the count after to N.
   - `-C N` sets both to N. `-B` or `-A` beside `-C` sets its own side.
-  - `agent read --match` takes `-B` and `-A` for the lines before and after
-    each match, and `-C` as the short form of `--context`.
+  - Without the flags, a hit's `read` recipe reads one message before the
+    hit and one after it.
+  - `agent read <ref>:m8 -C 2` reads as `agent read <ref>:m6..m10 --hit m8`,
+    and `--anchor` widens around the anchor's message.
+  - With `--match`, `-C` is the short form of `--context`.
 - Accept the visibility flags on `agent search` and `agent within`: `--tools`,
   `--tool-results`, `--thinking` and `--subagents`. Each sets its value in
   every hit's `read` recipe, such as `subagents=true`; the hits don't change.
@@ -299,9 +303,28 @@
 - Fix `agent` commands dropping their warnings when `--budget` is too
   small for any complete output. They now print on stderr before
   `budget-too-small`.
-- Fix `agent read` and `agent outline` listing every agent's sessions before
-  rejecting a malformed ref, a flag the ref does not allow or `--after` later
-  than `--before`. They now fail at once.
+- Fix `agent read`, `agent outline` and `agent within` listing every agent's
+  sessions before rejecting a malformed ref, a flag the ref does not allow or
+  `--after` later than `--before`. They now fail at once.
+- Fix `agent within` rejecting an address after the ref, such as `<ref>:s3`
+  or `<ref>:m7..m40`. It now searches the messages `agent read` of the
+  address shows with every visibility flag, and its `conversation` record
+  names it: `ref=<ref>:s3`.
+  - A call's address, such as `<ref>:m7.2`, fails with an error naming its
+    message, `<ref>:m7`.
+  - A semantic hit's preview can start before the address.
+- Fix `agent read --match` rejecting a range, a sub-agent, a whole session or
+  several refs. It now prints each message with a matching line as a read of
+  that message alone prints it, and leaves out the others.
+  - The header counts the messages with a matching line, such as
+    `matched-messages=2`, on every `--match` read.
+- Fix `agent sessions` and `agent outline` rejecting flags an agent copies
+  from another command. They now accept them, and the flags change nothing
+  there:
+  - `agent sessions` accepts the context flags, `-B`, `-A` and `-C`, and the
+    visibility flags, `--tools`, `--tool-results`, `--thinking` and
+    `--subagents`.
+  - `agent outline` accepts `--hit <address>`.
 
 #### Claude Code
 
@@ -409,6 +432,10 @@
 - `agent read --match` now counts the matching lines of a message as
   `matches=`, such as `slice=match=B9 context=3 matches=2`. Before, it was
   `hits=`.
+- `agent read <ref>:m7 --match <text>` without a matching line now prints
+  only its header, with `matched-messages=0`, and its `conversation` record.
+  Before, it printed the message's record with `hits=0`, or its `hidden`
+  record for a message the flags hide.
 - `agent read`, `agent outline`, `agent search` and `agent within` now name
   what their budget left out `over-budget`. Before, the word was `omit` or
   `omitted`:

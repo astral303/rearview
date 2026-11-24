@@ -145,6 +145,8 @@ the protocol adds it here, in the same pull request:
   - Where grep or another common tool has a name and a behaviour for a
     feature, use both: a hit, its context, `-A`, `-B` and `-C`, inclusive
     ranges. One spelling has one meaning.
+  - `-B`, `-A` and `-C` count lines around a `--match` match and messages
+    around a hit or a ref.
   - Two spellings that read as equal are equal (least surprise): `m7` and
     `m7..m7` read the same messages, and `m7..` reads to the last message.
   - A recipe names a flag's value by the flag's name (nothing to memorise):

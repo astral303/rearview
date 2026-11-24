@@ -128,8 +128,9 @@ ranks, or chunks as stable addresses.
 
 A hit's recipe reads one message of context before and after the hit, in
 the hit's thread. `-B N` sets the messages before, `-A N` those after and
-`-C N` both, on `search` and `within`; `--before` and `--after` set the
-time window.
+`-C N` both, around each hit on `search` and `within` and around the ref on
+`read` and `outline`: `read ch_1234abcd5678:m8 -C 2` reads `:m6..m10` with
+`--hit m8`. `--before` and `--after` set the time window.
 
 The `project=pr_...` plus `uuid=...` pair is reporting identity. Commands accept
 the `ref=ch_...` handle, the `uuid=` value a record prints, or a transcript path.
@@ -141,7 +142,11 @@ If a hit needs better evidence, narrow within the conversation:
 
 ```sh
 rearview agent within ch_1234abcd5678 "auth cache bug" --mode lexical
+rearview agent within ch_1234abcd5678:s3 "auth cache bug"
 ```
+
+`within` accepts the addresses `outline` accepts, and searches the messages
+a read of the address shows with every visibility flag.
 
 To choose a section, outline it, then read only the emitted range. An outline
 spans the whole session, its messages inside the window, or a ref's `:m7..m9`,
@@ -163,7 +168,8 @@ rearview agent read ch_1234abcd5678:m8 --match "historical correction" --context
 Sliced output numbers content lines, each below its message's or call's
 record. A `>` marks a matching line, and `...` marks omitted lines between
 match windows. With `--match`, `-B N` and `-A N` set the lines before and
-after each match. `--lines` and `--match` require one single-message ref.
+after each match. `--lines` requires one single-message ref. `--match`
+accepts any address and prints only the messages with a matching line.
 
 Failures exit nonzero and write one typed compact line to stderr, after any
 warning records:
