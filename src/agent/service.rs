@@ -8662,6 +8662,41 @@ mod tests {
     }
 
     #[test]
+    fn sessions_and_outline_print_the_same_with_flags_copied_from_search_and_read() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        let search_flags = [
+            "-B",
+            "1",
+            "-A",
+            "2",
+            "-C",
+            "3",
+            "--tools",
+            "--tool-results",
+            "--thinking",
+            "--subagents",
+        ];
+
+        for (with_flags, without) in [
+            (
+                [&["sessions", "--all"][..], &search_flags].concat(),
+                vec!["sessions", "--all"],
+            ),
+            (
+                vec!["outline", &reference, "--hit", "m1"],
+                vec!["outline", &reference],
+            ),
+        ] {
+            assert_eq!(
+                sessions.run_beside_another_refresh(&with_flags),
+                sessions.run_beside_another_refresh(&without),
+                "{with_flags:?} prints what {without:?} prints"
+            );
+        }
+    }
+
+    #[test]
     fn read_with_flags_it_refuses_doesnt_discover_keys() {
         let sessions = CachedClaudeSessions::new();
 
@@ -9556,6 +9591,7 @@ mod tests {
                 .run_outline(
                     &AgentOutlineArgs {
                         conversation: reference.clone(),
+                        unused_read_flags: Default::default(),
                         context: None,
                         before_context: None,
                         after_context: None,
@@ -10700,6 +10736,7 @@ mode = "hybrid"
         let reference = key.conversation_ref().canonical();
         let args = AgentOutlineArgs {
             conversation: reference.clone(),
+            unused_read_flags: Default::default(),
             context: None,
             before_context: None,
             after_context: None,
@@ -10728,6 +10765,7 @@ mode = "hybrid"
         let reference = key.conversation_ref().canonical();
         let args = AgentOutlineArgs {
             conversation: reference.clone(),
+            unused_read_flags: Default::default(),
             context: None,
             before_context: None,
             after_context: None,

@@ -1504,6 +1504,7 @@ mod agent_command_tests {
         )];
         let args = AgentOutlineArgs {
             conversation: keys[0].conversation_ref().canonical(),
+            unused_read_flags: Default::default(),
             context: None,
             before_context: None,
             after_context: None,
@@ -2241,6 +2242,7 @@ mod agent_command_tests {
         let outline = run_agent_outline(
             &AgentOutlineArgs {
                 conversation: resolved.reference.canonical(),
+                unused_read_flags: Default::default(),
                 context: None,
                 before_context: None,
                 after_context: None,
@@ -2549,6 +2551,7 @@ mod agent_command_tests {
         fn outline(&self, window: cli::MessageTimeArgs) -> String {
             let args = AgentOutlineArgs {
                 conversation: self.reference.clone(),
+                unused_read_flags: Default::default(),
                 context: None,
                 before_context: None,
                 after_context: None,
@@ -2906,6 +2909,7 @@ mod agent_command_tests {
         let outline = run_agent_outline(
             &AgentOutlineArgs {
                 conversation: format!("{conversation}:m1..m9"),
+                unused_read_flags: Default::default(),
                 context: None,
                 before_context: None,
                 after_context: None,

@@ -387,8 +387,8 @@ const TUI_QUERIES: &[&str] = &[
     "zzqqxx",
 ];
 
-/// The `agent sessions` cases: budgets, pages, windows and an inverted
-/// window.
+/// The `agent sessions` cases: budgets, pages, windows, an inverted window
+/// and search flags that change nothing.
 const SESSIONS_CASES: &[&[&str]] = &[
     &["agent", "sessions"],
     &["agent", "sessions", "--no-budget"],
@@ -413,6 +413,7 @@ const SESSIONS_CASES: &[&[&str]] = &[
         "2026-08-01T06:02",
     ],
     &["agent", "sessions", "--since", "60d"],
+    &["agent", "sessions", "-C", "2", "--tools", "--subagents"],
     &[
         "agent",
         "sessions",
@@ -724,6 +725,13 @@ fn outline_records_of(reference: &str, agent: &str) -> String {
     ]);
     run(&["agent", "outline", reference, "--budget", "500"]);
     run(&["agent", "outline", &format!("{reference}:{range}")]);
+    run(&[
+        "agent",
+        "outline",
+        &format!("{reference}:{range}"),
+        "--hit",
+        message,
+    ]);
     run(&[
         "agent",
         "outline",

@@ -279,6 +279,33 @@ pub struct AgentSessionsArgs {
     pub perf_stats: bool,
     #[command(flatten)]
     pub time: TimeRangeArgs,
+    #[command(flatten)]
+    pub unused_search_flags: UnusedSearchFlags,
+}
+
+// The context flags and visibility flags of `agent search`, which an agent
+// copies into an `agent sessions` command. A list of sessions doesn't have
+// hits or message content to apply them to.
+#[derive(Debug, Default, ClapArgs)]
+#[expect(
+    dead_code,
+    reason = "accepted and changing nothing: nothing reads them"
+)]
+pub struct UnusedSearchFlags {
+    #[arg(short = 'B', long, value_name = "N", hide = true)]
+    before_context: Option<usize>,
+    #[arg(short = 'A', long, value_name = "N", hide = true)]
+    after_context: Option<usize>,
+    #[arg(short = 'C', long, value_name = "N", hide = true)]
+    context: Option<usize>,
+    #[arg(long, hide = true)]
+    tools: bool,
+    #[arg(long, hide = true)]
+    tool_results: bool,
+    #[arg(long, hide = true)]
+    thinking: bool,
+    #[arg(long, hide = true)]
+    subagents: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -433,11 +460,22 @@ pub struct AgentOutlineArgs {
     /// default
     #[arg(short = 'A', long, value_name = "N")]
     pub after_context: Option<usize>,
+    #[command(flatten)]
+    pub unused_read_flags: UnusedReadFlags,
     /// Report time per stage, what was read, and peak memory on stderr
     #[arg(long)]
     pub perf_stats: bool,
     #[command(flatten)]
     pub output: AgentOutputFlags,
+}
+
+// The `--hit` of a `read` recipe, which an agent copies into an `agent
+// outline` command. An outline doesn't keep a hit first.
+#[derive(Debug, Default, ClapArgs)]
+#[expect(dead_code, reason = "accepted and changing nothing: nothing reads it")]
+pub struct UnusedReadFlags {
+    #[arg(long, value_name = "ADDRESS", hide = true)]
+    hit: Option<String>,
 }
 
 impl AgentOutlineArgs {
@@ -1314,6 +1352,65 @@ mod tests {
             .to_string();
         assert!(read_help.contains("--anchor"));
         assert!(read_help.contains("Durable message anchor"));
+    }
+
+    /// The long help of `agent <name>`.
+    fn agent_subcommand_help(name: &str) -> String {
+        Args::command()
+            .find_subcommand_mut("agent")
+            .unwrap()
+            .find_subcommand_mut(name)
+            .unwrap()
+            .render_long_help()
+            .to_string()
+    }
+
+    #[test]
+    fn agent_sessions_and_outline_accept_flags_copied_from_search_and_read_unlisted() {
+        for flags in [
+            &["-B", "1"][..],
+            &["-A", "1"],
+            &["-C", "1"],
+            &["--tools"],
+            &["--tool-results"],
+            &["--thinking"],
+            &["--subagents"],
+        ] {
+            let args = [&["rearview", "agent", "sessions"][..], flags].concat();
+            assert!(
+                matches!(
+                    Args::try_parse_from(args).map(agent_command),
+                    Ok(AgentCommand::Sessions(_))
+                ),
+                "agent sessions accepts {flags:?}"
+            );
+        }
+        let outline =
+            Args::try_parse_from(["rearview", "agent", "outline", "ch_abc123", "--hit", "m3"]);
+        assert!(
+            matches!(outline.map(agent_command), Ok(AgentCommand::Outline(_))),
+            "agent outline accepts --hit"
+        );
+
+        let sessions_help = agent_subcommand_help("sessions");
+        for flag in [
+            "--before-context",
+            "--after-context",
+            "--context",
+            "--tools",
+            "--tool-results",
+            "--thinking",
+            "--subagents",
+        ] {
+            assert!(
+                !sessions_help.contains(flag),
+                "agent sessions --help leaves out {flag}: {sessions_help}"
+            );
+        }
+        assert!(
+            !agent_subcommand_help("outline").contains("--hit"),
+            "outline's --hit is unlisted"
+        );
     }
 
     #[test]
