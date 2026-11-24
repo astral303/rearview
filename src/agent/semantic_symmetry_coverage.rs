@@ -288,6 +288,7 @@ fn within_doesnt_embed_once_list_or_cache_generation_passages_are_embedded_for_e
                         tui_semantic_search: None,
                         budget: None,
                         window: *window,
+                        address: None,
                     };
                     let case = format!(
                         "{} {mode:?} within {window:?} after {}",

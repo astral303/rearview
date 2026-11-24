@@ -24,8 +24,9 @@ use crate::semantic::rank::RankedHits;
 use crate::semantic::types::{ChunkHits, SemanticHit, SemanticScoreBreakdown};
 use crate::time_filter::TimeFilter;
 use chrono::{DateTime, FixedOffset};
+use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 const SHORTLIST_MIN: usize = 50;
 const SHORTLIST_FACTOR: usize = 5;
@@ -100,6 +101,52 @@ pub struct AgentWithinRequest {
     pub budget: Option<usize>,
     /// Hits come only from the messages inside it.
     pub window: TimeFilter,
+    /// The address after the conversation ref; `None` searches the whole
+    /// session.
+    pub address: Option<WithinAddress>,
+}
+
+/// The address an `agent within` searches, such as `s3` or `m7..m40`: hits
+/// come only from the messages `agent read` of it shows with every flag.
+#[derive(Clone, Debug)]
+pub struct WithinAddress {
+    /// `s3`: the address as the `conversation` record prints it after the
+    /// ref.
+    pub ref_suffix: String,
+    /// The ordinals of the messages at the address.
+    pub messages: BTreeSet<usize>,
+}
+
+impl WithinAddress {
+    /// `transcript` with its messages at the address alone.
+    fn transcript_at(&self, transcript: &AgentTranscript) -> AgentTranscript {
+        AgentTranscript {
+            path: transcript.path.clone(),
+            messages: transcript
+                .messages
+                .iter()
+                .filter(|message| self.messages.contains(&message.ordinal))
+                .cloned()
+                .collect(),
+            malformed_lines: transcript.malformed_lines.clone(),
+            summary: transcript.summary.clone(),
+            custom_title: transcript.custom_title.clone(),
+            preview: transcript.preview.clone(),
+        }
+    }
+
+    /// `hit`'s passage narrowed to its first and last message at the
+    /// address; `None` when none of its messages is, or when a message
+    /// between those two is not at the address.
+    fn narrowed(&self, mut hit: SemanticHit) -> Option<SemanticHit> {
+        let range = hit.message_range;
+        let start = *self.messages.range(range.start..=range.end).next()?;
+        let end = *self.messages.range(range.start..=range.end).next_back()?;
+        (self.messages.range(start..=end).count() == end - start + 1).then(|| {
+            hit.message_range = MessageRange { start, end };
+            hit
+        })
+    }
 }
 
 impl AgentWithinRequest {
@@ -645,9 +692,21 @@ pub fn run_within_search(
         original_index: 0,
     }];
     let places = places_in_whole(transcript);
+    let at_address = request
+        .address
+        .as_ref()
+        .map(|address| address.transcript_at(transcript));
     let searched = TranscriptPlaces {
-        transcript,
+        transcript: at_address.as_ref().unwrap_or(transcript),
         places: &places,
+    };
+    let semantic_hits: Cow<'_, [SemanticHit]> = match &request.address {
+        Some(address) => semantic_hits
+            .iter()
+            .cloned()
+            .filter_map(|hit| address.narrowed(hit))
+            .collect(),
+        None => Cow::Borrowed(semantic_hits),
     };
     let hits = match mode {
         SearchMode::Lexical | SearchMode::Exact => retrieval_hits(
@@ -660,7 +719,7 @@ pub fn run_within_search(
             request.window,
         ),
         SearchMode::Semantic => {
-            semantic_output_hits(semantic_hits, request.top, &input, request.window)
+            semantic_output_hits(&semantic_hits, request.top, &input, request.window)
         }
         SearchMode::Hybrid => {
             let candidate_depth = modality_candidate_depth_for_hits(request.top);
@@ -674,7 +733,7 @@ pub fn run_within_search(
                     SearchMode::Lexical,
                     request.window,
                 ),
-                semantic_output_hits(semantic_hits, candidate_depth, &input, request.window),
+                semantic_output_hits(&semantic_hits, candidate_depth, &input, request.window),
                 request.top,
             )
         }
@@ -692,6 +751,9 @@ pub fn run_within_search(
         coverage: None,
     };
     attach_transcript_metadata(&mut output, resolved, searched);
+    if let (Some(target), Some(address)) = (output.target.as_mut(), &request.address) {
+        target.conversation_ref = format!("{}:{}", target.conversation_ref, address.ref_suffix);
+    }
     output
 }
 
@@ -1754,6 +1816,7 @@ mod tests {
             tui_semantic_search: None,
             budget: None,
             window: TimeFilter::default(),
+            address: None,
         }
     }
 
@@ -2243,6 +2306,133 @@ mod tests {
         assert!(rendered.contains(" | cache warming answer"));
         assert!(rendered.contains("read ref=ch_"));
         assert!(rendered.contains("hit=m2 "));
+    }
+
+    /// The address `ref_suffix`, naming the messages at `ordinals`.
+    fn address(
+        ref_suffix: &str,
+        ordinals: impl IntoIterator<Item = usize>,
+    ) -> Option<WithinAddress> {
+        Some(WithinAddress {
+            ref_suffix: ref_suffix.to_owned(),
+            messages: ordinals.into_iter().collect(),
+        })
+    }
+
+    #[test]
+    fn within_address_searches_its_messages_alone_before_top() {
+        let conv = conversation(&format!("{TEST_UUID}.jsonl"), "cache title");
+        let resolved = resolved(&format!("{TEST_UUID}.jsonl"));
+        let transcript = transcript(vec![
+            message(1, AgentMessageRole::User, "cache cache cache"),
+            message(2, AgentMessageRole::Assistant, "question"),
+            message(3, AgentMessageRole::User, "cache once"),
+        ]);
+        let request = AgentWithinRequest {
+            top: 1,
+            address: address("m2..m3", [2, 3]),
+            ..request("cache", Some(SearchMode::Lexical))
+        };
+
+        let rendered = format_agent_output(&run_within_search(
+            &request,
+            &conv,
+            &resolved,
+            &transcript,
+            &[],
+        ));
+
+        let reference = resolved.reference.canonical();
+        assert!(
+            rendered.contains(" hits=1 ") && rendered.contains(" hit=m3 "),
+            "--top 1 keeps m3, the best hit inside m2..m3; m1 is outside it: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(" ref={reference}:m2..m3\n")),
+            "the conversation record prints the address: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("read ref={reference}:m2..m3 hit=m3 ")),
+            "the recipe names the session's own ref: {rendered}"
+        );
+    }
+
+    #[test]
+    fn within_address_narrows_semantic_passage_to_its_messages() {
+        let conv = conversation(&format!("{TEST_UUID}.jsonl"), "semantic title");
+        let resolved = resolved(&format!("{TEST_UUID}.jsonl"));
+        let transcript = transcript(
+            (1..=6)
+                .map(|ordinal| message(ordinal, AgentMessageRole::User, "placeholder"))
+                .collect(),
+        );
+        let request = AgentWithinRequest {
+            address: address("s1", [3, 4, 6]),
+            ..request("semantic", Some(SearchMode::Semantic))
+        };
+
+        let output = run_within_search(
+            &request,
+            &conv,
+            &resolved,
+            &transcript,
+            &[
+                semantic_hit(0, MessageRange { start: 1, end: 4 }, "into s1", 0.9),
+                semantic_hit(0, MessageRange { start: 1, end: 2 }, "before s1", 0.8),
+                semantic_hit(0, MessageRange { start: 4, end: 6 }, "across m5", 0.7),
+            ],
+        );
+
+        let ranges = output
+            .hits
+            .iter()
+            .map(|hit| hit.hit_range)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            [MessageRange { start: 3, end: 4 }],
+            "a passage keeps its messages at the address; one without any, or \
+             with a message between them outside it, is left out"
+        );
+    }
+
+    #[test]
+    fn within_address_narrows_both_halves_of_hybrid_search() {
+        let conv = conversation(&format!("{TEST_UUID}.jsonl"), "hybrid title");
+        let resolved = resolved(&format!("{TEST_UUID}.jsonl"));
+        let transcript = transcript(vec![
+            message(1, AgentMessageRole::User, "cache question"),
+            message(2, AgentMessageRole::Assistant, "unrelated"),
+            message(3, AgentMessageRole::User, "cache answer"),
+            message(4, AgentMessageRole::Assistant, "placeholder"),
+        ]);
+        let request = AgentWithinRequest {
+            address: address("m2..m4", [2, 3, 4]),
+            ..request("cache", Some(SearchMode::Hybrid))
+        };
+
+        let output = run_within_search(
+            &request,
+            &conv,
+            &resolved,
+            &transcript,
+            &[
+                semantic_hit(0, MessageRange { start: 1, end: 1 }, "outside", 0.9),
+                semantic_hit(0, MessageRange { start: 4, end: 4 }, "inside", 0.8),
+            ],
+        );
+
+        let mut ranges = output
+            .hits
+            .iter()
+            .map(|hit| (hit.hit_range.start, hit.hit_range.end))
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        assert_eq!(
+            ranges,
+            [(3, 3), (4, 4)],
+            "m3's lexical hit and m4's semantic hit, inside m2..m4; m1's are outside it"
+        );
     }
 
     #[test]

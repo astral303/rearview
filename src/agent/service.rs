@@ -2067,7 +2067,7 @@ impl AgentService {
                     agent_config,
                     config_mode,
                     window,
-                    ..
+                    within_ref,
                 },
             resolved,
             operation,
@@ -2089,6 +2089,8 @@ impl AgentService {
             &transcript,
             &resolved.reference.canonical(),
         ));
+        let address = within_address(&within_ref, &resolved, &transcript)
+            .map_err(|error| target_error(error, &resolved))?;
         let request = agent::search::AgentWithinRequest {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_WITHIN_TOP, agent_config.within_top),
@@ -2102,6 +2104,7 @@ impl AgentService {
                 agent_config.output_chars,
             ),
             window,
+            address,
         };
         let mode = agent::search::effective_agent_mode(
             &request.query,
@@ -2180,13 +2183,44 @@ impl AgentService {
     }
 }
 
-/// `agent within`'s arguments, checked. The conversation's syntax is
-/// checked when it is resolved, after key discovery.
+/// The messages `within_ref`'s address names in `transcript`, as `agent read`
+/// of it selects them; `None` for a whole session.
+pub(crate) fn within_address(
+    within_ref: &agent::refs::ReadRef,
+    resolved: &agent::refs::ResolvedConversation,
+    transcript: &agent::transcript::AgentTranscript,
+) -> Result<Option<agent::search::WithinAddress>> {
+    let ref_suffix = match (within_ref.range, within_ref.subagent) {
+        (Some(range), _) => range.to_string(),
+        (None, Some(handle)) => format!("s{handle}"),
+        (None, None) => return Ok(None),
+    };
+    let range = within_ref
+        .range
+        .map(|range| agent::address::MessageAddresses::of_transcript(transcript).resolve(range))
+        .transpose()?;
+    let request = agent::protocol::ReadRequest {
+        resolved,
+        transcript,
+        range: range.map(|range| range.range),
+        subagent: within_ref
+            .subagent
+            .or(range.and_then(|range| range.subagent)),
+        call: None,
+        shortened_to: None,
+    };
+    Ok(Some(agent::search::WithinAddress {
+        ref_suffix,
+        messages: agent::protocol::requested_ordinals(&request)?,
+    }))
+}
+
+/// `agent within`'s arguments, checked.
 struct CheckedWithin {
     agent_config: AgentConfig,
     config_mode: Option<SearchMode>,
     window: TimeFilter,
-    conversation: String,
+    within_ref: agent::refs::ReadRef,
 }
 
 impl TargetedArgs for CheckedWithin {
@@ -2201,7 +2235,7 @@ impl TargetedArgs for CheckedWithin {
             config_mode: agent_config.mode.or(search_config.mode),
             agent_config,
             window,
-            conversation: args.conversation.clone(),
+            within_ref: agent::refs::parse_within_ref(&args.conversation)?,
         })
     }
 
@@ -2210,7 +2244,7 @@ impl TargetedArgs for CheckedWithin {
     }
 
     fn conversations(&self) -> Vec<&str> {
-        vec![&self.conversation]
+        vec![&self.within_ref.conversation]
     }
 
     fn resolve(
@@ -2218,7 +2252,7 @@ impl TargetedArgs for CheckedWithin {
         keys: &[agent::refs::AgentConversationKey],
         canonicaliser: &Arc<dyn Canonicaliser>,
     ) -> Result<Self::Resolved> {
-        resolve_agent_conversation_arg(&self.conversation, keys, canonicaliser)
+        self.within_ref.resolve_conversation(keys, canonicaliser)
     }
 
     fn targets(resolved: &Self::Resolved) -> Vec<&agent::refs::AgentConversationKey> {
@@ -4392,14 +4426,6 @@ pub(crate) fn retrieval_terms(query: &str, mode: SearchMode) -> search::Retrieva
         ),
         _ => search::RetrievalTerms::WordsAndLiterals,
     }
-}
-
-pub(crate) fn resolve_agent_conversation_arg(
-    reference: &str,
-    keys: &[agent::refs::AgentConversationKey],
-    canonicaliser: &Arc<dyn Canonicaliser>,
-) -> Result<agent::refs::ResolvedConversation> {
-    agent::refs::resolve_conversation_ref(keys, reference, canonicaliser)
 }
 
 /// A service on test time that reads this test's session cache and doesn't
@@ -7910,6 +7936,7 @@ mod tests {
             tui_semantic_search: None,
             budget: None,
             window: TimeFilter::default(),
+            address: None,
         };
 
         let searched = run_agent_within_semantic(
@@ -8434,7 +8461,7 @@ mod tests {
     }
 
     #[test]
-    fn read_and_outline_of_malformed_ref_dont_discover_keys() {
+    fn read_outline_and_within_of_malformed_ref_dont_discover_keys() {
         let sessions = CachedClaudeSessions::new();
 
         let wrong = commands_not_failing_before_key_discovery(
@@ -8446,6 +8473,9 @@ mod tests {
                 &["read", CHANGED_SESSION, "--hit", "x9"],
                 &["outline", "ch_12"],
                 &["outline", &format!("{CHANGED_SESSION}:x9")],
+                &["within", "ch_12", "x"],
+                &["within", &format!("{CHANGED_SESSION}:x9"), "x"],
+                &["within", &format!("{CHANGED_SESSION}:m1.1"), "x"],
             ],
         );
 
@@ -9027,6 +9057,56 @@ mod tests {
         assert!(
             output.contains("source=lexical") && output.contains("zebrafish"),
             "the output carries the lexical hit:\n{output}"
+        );
+    }
+
+    /// A hybrid `within` of an address in a session without a copy in the
+    /// session cache prints the lexical hits at the address alone.
+    #[test]
+    fn hybrid_within_of_address_falls_back_to_lexical_hits_at_address() {
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let cache = crate::tui::claude_home::admitted_cache();
+        let environment = home.environment_with_cache(
+            cache.path(),
+            history::ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+        );
+        let uncached = home.write(
+            "never",
+            6,
+            &[
+                "a zebrafish question",
+                "an unrelated reply",
+                "a zebrafish answer",
+            ],
+        );
+        let reference = format!("{}:m2..m3", uncached.to_string_lossy());
+        let failing = fail_the_first_data_commit(cache.path(), || {});
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&[
+                "within",
+                &reference,
+                "zebrafish",
+                "--mode",
+                "hybrid",
+            ]))
+            .unwrap_or_else(crate::error_report);
+
+        drop(failing);
+        assert!(
+            output.contains("protocol agent-warning kind=semantic-unavailable "),
+            "the output warns that semantic search is unavailable:\n{output}"
+        );
+        assert!(
+            output.contains(" hits=1 ") && output.contains(" hit=m3 "),
+            "the lexical hit on m3 shows; m1's is outside m2..m3:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("conversation ") && line.ends_with(":m2..m3")),
+            "the conversation record names the address:\n{output}"
         );
     }
 

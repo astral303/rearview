@@ -298,7 +298,11 @@ pub struct AgentScopeArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct AgentWithinArgs {
-    /// Conversation: a ch_ handle, a session ID, or a transcript path
+    /// Conversation to search: a ch_ handle, a session ID, or a transcript
+    /// path, optionally followed by :mN, :mA..mB, :mN.. to the end, :sN for
+    /// one sub-agent, or :sN:mN, :sN:mA..mB or :sN:mN.. for its messages; it
+    /// searches the messages `agent read` of that address shows with every
+    /// visibility flag
     #[arg(value_parser = non_empty_string)]
     pub conversation: String,
     /// Search query

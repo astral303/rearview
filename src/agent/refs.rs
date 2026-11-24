@@ -453,6 +453,7 @@ pub struct HitRef {
 enum RefCommand {
     Read,
     Outline,
+    Within,
 }
 
 impl RefCommand {
@@ -463,7 +464,7 @@ impl RefCommand {
             Self::Read => {
                 "after the conversation ref, use mN, mA..mB, mA.., mN.K for one call, sN, or sN:mN, sN:mA..mB, sN:mA.., sN:mN.K for a sub-agent's messages; pass an ma_ anchor with --anchor"
             }
-            Self::Outline => {
+            Self::Outline | Self::Within => {
                 "after the conversation ref, use mN, mA..mB, mA.., sN, or sN:mN, sN:mA..mB, sN:mA.. for a sub-agent's messages"
             }
         }
@@ -472,6 +473,18 @@ impl RefCommand {
     /// True when the command reads one call, `REF:mN.K`.
     fn takes_a_call(self) -> bool {
         self == Self::Read
+    }
+
+    /// The error for `part`, the address of a call after `conversation`, in
+    /// message `message` of its thread.
+    fn call_rejected(self, conversation: &str, part: &str, message: ThreadRange) -> AppError {
+        let detail = match self {
+            Self::Within => {
+                whole_message_searcher_rejects_call("within", &format!("{conversation}:{message}"))
+            }
+            Self::Read | Self::Outline => self.forms().to_owned(),
+        };
+        AgentError::invalid_ref(part, detail).into()
     }
 }
 
@@ -485,6 +498,12 @@ pub fn parse_read_ref(input: &str) -> Result<ReadRef> {
 /// `:sN`, or one of the message forms after `:sN` but a call.
 pub fn parse_outline_ref(input: &str) -> Result<ReadRef> {
     parse_ref(input, RefCommand::Outline)
+}
+
+/// An `agent within` ref: the forms of an `agent outline` ref. A call's
+/// address is `invalid-ref`; the error names the call's message.
+pub fn parse_within_ref(input: &str) -> Result<ReadRef> {
+    parse_ref(input, RefCommand::Within)
 }
 
 fn parse_ref(input: &str, command: RefCommand) -> Result<ReadRef> {
@@ -506,7 +525,11 @@ fn parse_ref(input: &str, command: RefCommand) -> Result<ReadRef> {
             Some(messages) => {
                 if let Some((message, call)) = parse_call_address(messages) {
                     if !command.takes_a_call() {
-                        return Err(AgentError::invalid_ref(part, command.forms()).into());
+                        return Err(command.call_rejected(
+                            conversation,
+                            part,
+                            ThreadRange::one(thread, message),
+                        ));
                     }
                     reference.range = Some(ThreadRange::one(thread, message));
                     reference.call = Some(call);
@@ -2060,6 +2083,57 @@ mod tests {
             parse_outline_ref("ch_12345678:s4").unwrap().subagent,
             Some(4)
         );
+    }
+
+    #[test]
+    fn within_ref_accepts_outlines_forms() {
+        for (reference, range, subagent) in [
+            ("ch_12345678", None, None),
+            ("ch_12345678:m7", Some(parent_range(7, 7)), None),
+            ("ch_12345678:m7..m40", Some(parent_range(7, 40)), None),
+            (
+                "ch_12345678:m7..",
+                Some(ThreadRange::open(Thread::Parent, 7)),
+                None,
+            ),
+            ("ch_12345678:s3", None, Some(3)),
+            (
+                "ch_12345678:s3:m2..m5",
+                Some(ThreadRange::closed(Thread::Subagent(3), 2, 5)),
+                None,
+            ),
+        ] {
+            let parsed = parse_within_ref(reference).unwrap();
+
+            assert_eq!(
+                (parsed.conversation.as_str(), parsed.range, parsed.subagent),
+                ("ch_12345678", range, subagent),
+                "within accepts {reference} as outline reads it"
+            );
+        }
+    }
+
+    #[test]
+    fn within_ref_of_call_names_its_message() {
+        for (reference, message) in [
+            ("ch_12345678:m7.2", "ch_12345678:m7"),
+            ("ch_12345678:s3:m2.1", "ch_12345678:s3:m2"),
+        ] {
+            let (kind, detail) =
+                agent_error_kind_and_detail(parse_within_ref(reference).unwrap_err());
+
+            assert_eq!(
+                kind,
+                AgentErrorKind::InvalidRef,
+                "within rejects the call {reference} as invalid-ref"
+            );
+            assert!(
+                detail.ends_with(&format!(
+                    "within searches whole messages; use the call's message, {message}"
+                )),
+                "the error for {reference} names {message}: {detail}"
+            );
+        }
     }
 
     #[test]

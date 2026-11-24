@@ -1007,9 +1007,7 @@ fn run_agent_command(mut command: Command) -> std::result::Result<(), String> {
 mod agent_command_tests {
     use super::*;
     use crate::agent::refs::AgentConversationKey;
-    use crate::agent::service::{
-        resolve_agent_conversation_arg, resolve_agent_read_args, run_agent_outline, run_agent_read,
-    };
+    use crate::agent::service::{resolve_agent_read_args, run_agent_outline, run_agent_read};
     use crate::agent::test_support::{
         assistant_jsonl_line as assistant, day_record, record_time, user_jsonl_line as user,
     };
@@ -1299,9 +1297,13 @@ mod agent_command_tests {
         assert!(resolve_agent_read_args(&hit, &keys, &SystemCanonicaliser::shared()).is_ok());
 
         assert_eq!(
-            resolve_agent_conversation_arg(uuid, &keys, &SystemCanonicaliser::shared())
-                .unwrap()
-                .key,
+            crate::agent::refs::resolve_conversation_ref(
+                &keys,
+                uuid,
+                &SystemCanonicaliser::shared()
+            )
+            .unwrap()
+            .key,
             keys[0]
         );
     }
@@ -1579,6 +1581,7 @@ mod agent_command_tests {
             tui_semantic_search: None,
             budget: None,
             window: time_filter::TimeFilter::default(),
+            address: None,
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1752,6 +1755,7 @@ mod agent_command_tests {
             tui_semantic_search: None,
             budget: None,
             window: time_filter::TimeFilter::default(),
+            address: None,
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1810,6 +1814,7 @@ mod agent_command_tests {
             tui_semantic_search: None,
             budget: None,
             window: time_filter::TimeFilter::default(),
+            address: None,
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -1867,6 +1872,7 @@ mod agent_command_tests {
             tui_semantic_search: None,
             budget: None,
             window: time_filter::TimeFilter::default(),
+            address: None,
         };
         let within = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,
@@ -2283,6 +2289,7 @@ mod agent_command_tests {
                 tui_semantic_search: None,
                 budget: None,
                 window: time_filter::TimeFilter::default(),
+                address: None,
             };
             agent::search::format_agent_output(&agent::search::run_within_search(
                 &request,
@@ -2630,6 +2637,7 @@ mod agent_command_tests {
                 tui_semantic_search: None,
                 budget: None,
                 window,
+                address: None,
             };
             agent::search::format_agent_output(&agent::search::run_within_search(
                 &request,
@@ -2745,6 +2753,7 @@ mod agent_command_tests {
             tui_semantic_search: None,
             budget: None,
             window: time_filter::TimeFilter::default(),
+            address: None,
         };
         let rendered = agent::search::format_agent_output(&agent::search::run_within_search(
             &within_request,

@@ -1158,6 +1158,7 @@ fn hit_recipes(session: &AgentSession, context: HitContext) -> HitRecipes {
             tui_semantic_search: None,
             budget: None,
             window: TimeFilter::default(),
+            address: None,
         };
         let output = format_agent_output_with_warnings(
             &run_within_search(&request, row, &loaded.resolved, &loaded.transcript, &[]),

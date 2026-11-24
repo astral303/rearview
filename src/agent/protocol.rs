@@ -2176,6 +2176,16 @@ fn requested_messages<'a>(
     }
 }
 
+/// The ordinals of the messages `request` names, as a read selects them,
+/// whatever its flags show.
+pub fn requested_ordinals(request: &ReadRequest<'_>) -> Result<BTreeSet<usize>> {
+    let index = TranscriptIndex::of(request.transcript);
+    Ok(requested_messages(request, &index)?
+        .into_iter()
+        .map(|message| message.ordinal)
+        .collect())
+}
+
 /// The message holding call `number` of message `ordinal`, and the messages
 /// holding its result. A call the message does not hold is `out-of-range`.
 fn call_messages<'a>(

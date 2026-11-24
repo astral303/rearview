@@ -504,7 +504,9 @@ impl AgentOutputs {
         let listed = listed_sessions();
         for session in &listed {
             let reference = session.reference.as_str();
-            outputs.within.push_str(&within_records_of(reference));
+            outputs
+                .within
+                .push_str(&within_records_of(reference, &session.agent));
             outputs
                 .read
                 .push_str(&read_records_of(reference, &session.agent));
@@ -544,19 +546,31 @@ fn records_of(cases: &[&[&str]]) -> String {
         .collect()
 }
 
-/// Every `agent within` case of the session `reference` names.
-fn within_records_of(reference: &str) -> String {
-    [
+/// Every `agent within` case of `agent`'s session `reference` names.
+fn within_records_of(reference: &str, agent: &str) -> String {
+    let (message, range) = case_messages_of(agent);
+    let in_range = format!("{reference}:{range}");
+    let to_the_end = format!("{reference}:m3..");
+    let call = format!("{reference}:m2.1");
+    let mut cases = vec![
         vec!["agent", "within", reference, "answer"],
         vec!["agent", "within", reference, "answer", "-B", "0", "-A", "2"],
         vec!["agent", "within", reference, "answer", "--subagents"],
         vec!["agent", "within", reference, "searchable", "--top", "2"],
         vec!["agent", "within", reference, "--mode", "exact", "Sentinel"],
         vec!["agent", "within", reference, "the", "--budget", "400"],
-    ]
-    .iter()
-    .map(|args| agent_command(args).record)
-    .collect()
+        vec!["agent", "within", &in_range, "answer"],
+        vec!["agent", "within", &to_the_end, "the", "--top", "2"],
+        vec!["agent", "within", &call, "answer"],
+    ];
+    let subagent = format!("{reference}:s1");
+    if message.starts_with("s1:") {
+        cases.push(vec!["agent", "within", &subagent, "answer"]);
+    }
+    cases
+        .iter()
+        .map(|args| agent_command(args).record)
+        .collect()
 }
 
 /// The message the one-message `agent read` cases of `agent`'s session read,
