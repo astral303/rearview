@@ -1386,7 +1386,7 @@ mod agent_command_tests {
 
         let output = run_agent_read(&args, Some(&keys)).unwrap();
 
-        assert!(output.contains("slice=match=historical%20correction context=1 hits=1"));
+        assert!(output.contains("slice=match=historical%20correction context=1 matches=1"));
         assert!(output.contains("|  2: two\n| >3: historical correction\n|  4: four\n"));
         assert!(!output.contains("1: one"));
         assert!(!output.contains("5: five"));

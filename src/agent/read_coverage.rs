@@ -31,7 +31,7 @@
 //! - Handles number the sub-agents in the order they start: at their
 //!   launch, else at their first message.
 //! - When exact search finds a marker in a message, a read of that message
-//!   alone with `--match <marker>` reports a hit.
+//!   alone with `--match <marker>` reports a match.
 //! - The `read ref=` recipe of each hit an exact `agent within` search for a
 //!   marker prints reads the messages of its `hit=`, and the `-B` and `-A`
 //!   messages of its thread before and after it, up to the thread's ends.
@@ -735,7 +735,7 @@ fn every_agents_read_with_subagents_shows_subagents_thinking_only_with_thinking(
 
 /// Each message `agent search` finds a marker of `session` in, with the
 /// record of that message's read alone with every flag and
-/// `--match <marker>`, when that read doesn't report a hit.
+/// `--match <marker>`, when that read doesn't report a match.
 fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<String> {
     let row = &session.row;
     let transcript =
@@ -775,18 +775,18 @@ fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<S
                 EVERY_FLAG,
             )
             .unwrap();
-            let hits = output
+            let match_count = output
                 .lines()
                 .find(|line| line.contains(" slice=match="))
-                .and_then(|record| atom(record, "hits"));
-            matches!(hits, None | Some("0"))
+                .and_then(|record| atom(record, "matches"));
+            matches!(match_count, None | Some("0"))
                 .then(|| format!("{:?} {} in m{ordinal}: {output}", row.source, marker.record))
         })
         .collect()
 }
 
 #[test]
-fn every_agents_marker_search_finds_is_hit_in_read_of_its_message_alone() {
+fn every_agents_marker_search_finds_is_matched_in_read_of_its_message_alone() {
     let unmatched: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(markers_a_read_of_their_message_doesnt_match)

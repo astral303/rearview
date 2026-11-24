@@ -632,7 +632,7 @@ protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none 
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
-s1:m3 06:00:02 slice=match=the context=3 hits=0 anchor=ma_3200d601e22cb40f
+s1:m3 06:00:02 slice=match=the context=3 matches=0 anchor=ma_3200d601e22cb40f
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:s1:m3 --match the -B 0 -A 1
 --- stdout
@@ -640,7 +640,7 @@ protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none 
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 subagent s1 span=s1:m1..m3 : agent-0
 day 2026-08-06
-s1:m3 06:00:02 slice=match=the before-context=0 after-context=1 hits=0 anchor=ma_3200d601e22cb40f
+s1:m3 06:00:02 slice=match=the before-context=0 after-context=1 matches=0 anchor=ma_3200d601e22cb40f
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df --tail 3
 --- stdout
@@ -1081,7 +1081,7 @@ protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none 
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
-s1:m2 06:00:03 slice=match=the context=3 hits=0 anchor=ma_4f60426316166883
+s1:m2 06:00:03 slice=match=the context=3 matches=0 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:s1:m2 --match the -B 0 -A 1
 --- stdout
@@ -1089,7 +1089,7 @@ protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none 
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 subagent s1 type=grunt span=s1:m1..m2 : 019f0000-0000-7000-8000-00000000000b
 day 2026-08-01
-s1:m2 06:00:03 slice=match=the before-context=0 after-context=1 hits=0 anchor=ma_4f60426316166883
+s1:m2 06:00:03 slice=match=the before-context=0 after-context=1 matches=0 anchor=ma_4f60426316166883
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49 --tail 3
 --- stdout
@@ -1537,13 +1537,13 @@ $ rearview agent read ch_974c3840e189:m3 --match the
 protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
-m3 user 22:04:12 slice=match=the context=3 hits=0 anchor=ma_1399308a5c280b78
+m3 user 22:04:12 slice=match=the context=3 matches=0 anchor=ma_1399308a5c280b78
 $ rearview agent read ch_974c3840e189:m3 --match the -B 0 -A 1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
 day 2026-01-01
-m3 user 22:04:12 slice=match=the before-context=0 after-context=1 hits=0 anchor=ma_1399308a5c280b78
+m3 user 22:04:12 slice=match=the before-context=0 after-context=1 matches=0 anchor=ma_1399308a5c280b78
 $ rearview agent read ch_974c3840e189 --tail 3
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=3 hidden-tool-results=3
@@ -2279,14 +2279,14 @@ protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none 
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
-s1:m3 19:00:01 slice=match=the context=3 hits=0 anchor=ma_ed09908ea14107f5
+s1:m3 19:00:01 slice=match=the context=3 matches=0 anchor=ma_ed09908ea14107f5
 $ rearview agent read ch_982349c13ee4:s1:m3 --match the -B 0 -A 1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-05:00
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
 subagent s1 span=s1:m1..m3 : explore
 day 1969-12-31
-s1:m3 19:00:01 slice=match=the before-context=0 after-context=1 hits=0 anchor=ma_ed09908ea14107f5
+s1:m3 19:00:01 slice=match=the before-context=0 after-context=1 matches=0 anchor=ma_ed09908ea14107f5
 $ rearview agent read ch_982349c13ee4 --tail 3
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=4 hidden-tool-results=4

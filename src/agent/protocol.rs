@@ -2659,7 +2659,7 @@ fn apply_read_slice<'a>(
                 })
                 .collect();
             rendered.slice = Some(format!(
-                "match={}{} hits={}",
+                "match={}{} matches={}",
                 escape_atom(query),
                 context.atoms(),
                 matches.len()
@@ -4184,7 +4184,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.contains("slice=match=needle context=1 hits=2 anchor=ma_"));
+        assert!(output.contains("slice=match=needle context=1 matches=2 anchor=ma_"));
         assert!(output.contains("|  1: zero\n| >2: Needle first\n|  3: two\n| ...\n"));
         assert!(output.contains("|  5: four\n| >6: needle second\n|  7: six\n"));
         assert!(!output.contains("4: three"));
@@ -4211,12 +4211,12 @@ mod tests {
         let past_both_ends = read_with(5, 9);
 
         assert!(
-            after_only.contains(" slice=match=needle before-context=0 after-context=2 hits=1 ")
+            after_only.contains(" slice=match=needle before-context=0 after-context=2 matches=1 ")
                 && after_only.ends_with("\n| >3: Needle\n|  4: three\n|  5: four\n"),
             "two lines after the match and none before: {after_only}"
         );
         assert!(
-            past_both_ends.contains(" before-context=5 after-context=9 hits=1 ")
+            past_both_ends.contains(" before-context=5 after-context=9 matches=1 ")
                 && past_both_ends.contains("\n|  1: zero\n")
                 && past_both_ends.ends_with("\n|  6: five\n"),
             "the message's first and last lines end the context: {past_both_ends}"
@@ -4224,7 +4224,7 @@ mod tests {
     }
 
     #[test]
-    fn match_slice_reports_zero_hits_without_dumping_message() {
+    fn match_slice_reports_zero_matches_without_dumping_message() {
         let resolved = resolved("session.jsonl");
         let transcript = transcript(vec![text_message(1, AgentMessageRole::User, "haystack")]);
         let output = format_read(
@@ -4245,7 +4245,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output.contains("slice=match=needle context=3 hits=0 anchor=ma_"));
+        assert!(output.contains("slice=match=needle context=3 matches=0 anchor=ma_"));
         assert!(!output.contains("haystack"));
     }
 
@@ -4401,7 +4401,7 @@ mod tests {
         };
         assert!(
             lines[0].starts_with(&format!(
-                "m1{} slice=match=cargo%20test context=0 hits=1 anchor=ma_",
+                "m1{} slice=match=cargo%20test context=0 matches=1 anchor=ma_",
                 record_time("2026-10-14T15:41:20Z", "2026-10-14T15:41:26Z")
             )),
             "{output}"
@@ -7721,7 +7721,7 @@ mod tests {
     /// `--match` in a read of one message matches a line a read of several
     /// messages leaves out of a call, numbered as `--lines` numbers it.
     #[test]
-    fn match_in_read_of_one_message_hits_command_line_and_body_line() {
+    fn match_in_read_of_one_message_matches_command_line_and_body_line() {
         for (transcript, last_line) in [
             (a_command_of_three_lines(), "cargo clippy"),
             (an_edit_of_three_lines(), "new line"),
@@ -7735,7 +7735,7 @@ mod tests {
             );
 
             assert!(
-                output.contains(" hits=1 ") && output.contains("| >4: "),
+                output.contains(" matches=1 ") && output.contains("| >4: "),
                 "{last_line} is m1's line 4: {output}"
             );
         }

@@ -406,6 +406,9 @@
 - A search hit and its `read` recipe now print the hit as `hit=m8`, and
   `agent read` takes it as `--hit m8`. Before, they were `focus=m8` and
   `--focus m8`. A read truncated around the hit prints `cut=head+hit+tail`.
+- `agent read --match` now counts the matching lines of a message as
+  `matches=`, such as `slice=match=B9 context=3 matches=2`. Before, it was
+  `hits=`.
 - `agent read`, `agent outline`, `agent search` and `agent within` now name
   what their budget left out `over-budget`. Before, the word was `omit` or
   `omitted`:
