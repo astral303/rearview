@@ -405,7 +405,7 @@ pub struct AgentReadArgs {
             "anchor",
             "hit",
             "lines",
-            "match_query",
+            "match_texts",
             "before_context",
             "after_context",
             "context",
@@ -414,12 +414,12 @@ pub struct AgentReadArgs {
     pub tail: Option<NonZeroUsize>,
     /// Inclusive content line range within one message; START.. reads to its
     /// last line
-    #[arg(long, value_name = "START..END", conflicts_with = "match_query")]
+    #[arg(long, value_name = "START..END", conflicts_with = "match_texts")]
     pub lines: Option<MessageLineRange>,
     /// Find text in each message read, case-insensitively, and show the
     /// messages with a matching line, those lines numbered with context
     #[arg(long = "match", value_parser = non_empty_string, conflicts_with = "lines")]
-    pub match_query: Option<String>,
+    pub match_texts: Vec<String>,
     /// With --match, content lines before and after each match, 3 by
     /// default; without it, messages of each ref's thread before and after
     /// the ref, and a read of one ref keeps that ref first as the --hit. -B
@@ -562,7 +562,7 @@ impl AgentReadArgs {
     /// The messages `-B`, `-A` and `-C` add around each ref without
     /// `--match`; `None` with `--match` or without any of them.
     pub fn message_context(&self) -> Option<HitContext> {
-        if self.match_query.is_some() {
+        if !self.match_texts.is_empty() {
             return None;
         }
         message_context_of_flags(self.before_context, self.after_context, self.context)
@@ -1478,7 +1478,7 @@ mod tests {
                 assert_eq!(read.anchor, None);
                 assert_eq!(read.hit.as_deref(), Some("m2"));
                 assert_eq!(read.lines, None);
-                assert_eq!(read.match_query, None);
+                assert!(read.match_texts.is_empty());
                 assert_eq!(read.context, None);
                 assert_eq!(read.output.budget, Some(1234));
                 assert!(!read.output.no_budget);
@@ -1566,9 +1566,29 @@ mod tests {
         .unwrap();
         match agent_command(matching) {
             AgentCommand::Read(read) => {
-                assert_eq!(read.match_query.as_deref(), Some("historical correction"));
+                assert_eq!(read.match_texts, ["historical correction"]);
                 assert_eq!(read.context, Some(12));
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let matching_several = Args::try_parse_from([
+            "rearview",
+            "agent",
+            "read",
+            "ch_abc123",
+            "--match",
+            "B9",
+            "--match",
+            "B12",
+        ])
+        .unwrap();
+        match agent_command(matching_several) {
+            AgentCommand::Read(read) => assert_eq!(
+                read.match_texts,
+                ["B9", "B12"],
+                "each --match text, in the order typed"
+            ),
             other => panic!("unexpected command: {other:?}"),
         }
     }

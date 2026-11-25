@@ -85,8 +85,10 @@ impl FromStr for MessageLineRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadSlice {
     Lines(MessageLineRange),
+    /// `--match`: `texts` in the order typed; a line matches when it
+    /// contains any of them.
     Match {
-        query: String,
+        texts: Vec<String>,
         context: MatchContext,
     },
 }
@@ -1381,9 +1383,9 @@ pub fn format_read_with_warnings(
             selected = tail_messages(request, selected, index, *count, &shape);
         }
         let mut request_entries = read_entries(request, selected, index, &shape)?;
-        if let Some(ReadSlice::Match { query, context }) = slice {
+        if let Some(ReadSlice::Match { texts, context }) = slice {
             request_entries =
-                matched_entries(request_entries, query, *context, &mut unshown_hidden);
+                matched_entries(request_entries, texts, *context, &mut unshown_hidden);
         }
         request_entry_counts.push(request_entries.len());
         entries.extend(request_entries);
@@ -2320,7 +2322,7 @@ fn named_message_ordinal(requests: &[ReadRequest<'_>]) -> Option<usize> {
 /// of them. The parts the others hide are added to `unshown_hidden`.
 fn matched_entries<'a>(
     entries: Vec<ReadEntry<'a>>,
-    query: &str,
+    texts: &[String],
     context: MatchContext,
     unshown_hidden: &mut HiddenParts<'a>,
 ) -> Vec<ReadEntry<'a>> {
@@ -2336,7 +2338,7 @@ fn matched_entries<'a>(
         }
         if let ReadEntry::Message { rendered, .. } = &mut entry {
             rendered.match_continuation = Some(MatchContinuation {
-                atoms: format!(" {}", match_atoms(query, context)),
+                atoms: format!(" {}", match_atoms(texts, context)),
                 through: last,
             });
         }
@@ -2350,7 +2352,7 @@ fn matched_entries<'a>(
 /// messages up to the next matched one, with the read's `--match`.
 #[derive(Clone, Debug)]
 struct MatchContinuation {
-    /// ` match=B9 context=3`.
+    /// ` match=B9 context=3`, or ` match=B9 match=B12 context=3`.
     atoms: String,
     /// The ordinal of the last message the recipe reads.
     through: usize,
@@ -2755,14 +2757,19 @@ fn apply_read_slice<'a>(
             selected = (range.start..=end).collect();
             rendered.slice = Some(format!("lines={}..{end}", range.start));
         }
-        ReadSlice::Match { query, context } => {
-            let query_lower = query.to_lowercase();
+        ReadSlice::Match { texts, context } => {
+            let texts_lower = texts
+                .iter()
+                .map(|text| text.to_lowercase())
+                .collect::<Vec<_>>();
             matches = lines
                 .iter()
                 .enumerate()
                 .filter_map(|(index, line)| {
-                    line.to_lowercase()
-                        .contains(&query_lower)
+                    let line_lower = line.to_lowercase();
+                    texts_lower
+                        .iter()
+                        .any(|text| line_lower.contains(text.as_str()))
                         .then_some(index + 1)
                 })
                 .collect();
@@ -2775,7 +2782,7 @@ fn apply_read_slice<'a>(
                 .collect();
             rendered.slice = Some(format!(
                 "{} matches={}",
-                match_atoms(query, *context),
+                match_atoms(texts, *context),
                 matches.len()
             ));
             rendered.matched_lines = Some(matches.len());
@@ -2786,11 +2793,15 @@ fn apply_read_slice<'a>(
     Ok(rendered)
 }
 
-/// `match=B9 context=3`: a `--match` query, percent-encoded, and the lines
-/// around each match, as a slice record and a `continue read` recipe print
-/// them.
-fn match_atoms(query: &str, context: MatchContext) -> String {
-    format!("match={}{}", escape_atom(query), context.atoms())
+/// `match=B9 match=B12 context=3`: each `--match` text, percent-encoded, and
+/// the lines around each match, as a slice record and a `continue read`
+/// recipe print them.
+fn match_atoms(texts: &[String], context: MatchContext) -> String {
+    let atoms = texts
+        .iter()
+        .map(|text| format!("match={}", escape_atom(text)))
+        .collect::<Vec<_>>();
+    format!("{}{}", atoms.join(" "), context.atoms())
 }
 
 /// The `selected` lines of `lines`, each numbered from 1 and marked `>` when
@@ -4311,7 +4322,7 @@ mod tests {
             }],
             None,
             Some(&ReadSlice::Match {
-                query: "needle".to_string(),
+                texts: vec!["needle".to_owned()],
                 context: lines_around(1),
             }),
             options(),
@@ -4325,6 +4336,60 @@ mod tests {
     }
 
     #[test]
+    fn match_slice_of_multiple_texts_matches_lines_containing_any_of_them() {
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "zero\nB9 first\ntwo\nthree\nfour\nb12 second\nsix\nseven\neight\nB9 and B12",
+        )]);
+
+        let output = read_slice(
+            &transcript,
+            ReadSlice::Match {
+                texts: vec!["B9".to_owned(), "B12".to_owned()],
+                context: lines_around(1),
+            },
+        );
+
+        assert!(
+            output.contains(" slice=match=B9 match=B12 context=1 matches=3 anchor=ma_"),
+            "the record prints each text in the order typed and counts the lines \
+             matching either, a line containing both once: {output}"
+        );
+        assert!(
+            output.contains("| >2: B9 first\n|  3: two\n| ...\n|  5: four\n| >6: b12 second\n"),
+            "each text matches its own line, case-insensitively: {output}"
+        );
+        assert!(
+            output.ends_with("|  7: six\n| ...\n|  9: eight\n| >10: B9 and B12\n"),
+            "a line containing both texts prints once: {output}"
+        );
+    }
+
+    #[test]
+    fn match_slice_reads_pipe_as_literal_text() {
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "B9 alone\nB9|B12 together",
+        )]);
+
+        let output = read_slice(
+            &transcript,
+            ReadSlice::Match {
+                texts: vec!["B9|B12".to_owned()],
+                context: lines_around(0),
+            },
+        );
+
+        assert!(
+            output.contains(" slice=match=B9%7CB12 context=0 matches=1 ")
+                && output.ends_with("\n| >2: B9|B12 together\n"),
+            "`|` matches only a literal `|`: {output}"
+        );
+    }
+
+    #[test]
     fn match_slice_shows_lines_before_and_after_each_match_as_its_sides_count_them() {
         let transcript = transcript(vec![text_message(
             1,
@@ -4335,7 +4400,7 @@ mod tests {
             read_slice(
                 &transcript,
                 ReadSlice::Match {
-                    query: "needle".to_owned(),
+                    texts: vec!["needle".to_owned()],
                     context: MatchContext { before, after },
                 },
             )
@@ -4381,7 +4446,7 @@ mod tests {
                 }],
                 None,
                 Some(&ReadSlice::Match {
-                    query: "needle".to_string(),
+                    texts: vec!["needle".to_owned()],
                     context: lines_around(3),
                 }),
                 options(),
@@ -4413,7 +4478,7 @@ mod tests {
             )],
             None,
             Some(&ReadSlice::Match {
-                query: "needle".to_owned(),
+                texts: vec!["needle".to_owned()],
                 context: lines_around(0),
             }),
             options,
@@ -4546,11 +4611,12 @@ mod tests {
         )
     }
 
-    /// The `--match needle` read of `references`, each the session's ref or
-    /// an address after it, in `transcript`.
+    /// The `--match` read of `texts` of `references`, each the session's ref
+    /// or an address after it, in `transcript`.
     fn match_read_of_refs(
         transcript: &AgentTranscript,
         references: &[String],
+        texts: &[&str],
         options: ProtocolOptions,
     ) -> String {
         let resolved = resolved("session.jsonl");
@@ -4579,7 +4645,7 @@ mod tests {
             &requests,
             None,
             Some(&ReadSlice::Match {
-                query: "needle".to_owned(),
+                texts: texts.iter().map(|&text| text.to_owned()).collect(),
                 context: lines_around(0),
             }),
             options,
@@ -4610,14 +4676,27 @@ mod tests {
         let transcript = sparse_needles_in_long_session();
         let reference = resolved("session.jsonl").reference.canonical();
         let budget = 1_200;
-        for (address, options) in [
-            (reference.clone(), every_flag()),
-            (format!("{reference}:m2.."), options()),
-            (format!("{reference}:s1"), options()),
-        ] {
+        let cases = [
+            (&["needle"][..], " match=needle context=0 "),
+            (
+                &["needle", "hay 3"],
+                " match=needle match=hay%203 context=0 ",
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(texts, recipe_atoms)| {
+            [
+                (reference.clone(), every_flag()),
+                (format!("{reference}:m2.."), options()),
+                (format!("{reference}:s1"), options()),
+            ]
+            .map(|(address, options)| (texts, recipe_atoms, address, options))
+        });
+        for (texts, recipe_atoms, address, options) in cases {
             let unbudgeted = match_read_of_refs(
                 &transcript,
                 std::slice::from_ref(&address),
+                texts,
                 ProtocolOptions {
                     budget: None,
                     ..options
@@ -4627,6 +4706,7 @@ mod tests {
                 match_read_of_refs(
                     &transcript,
                     references,
+                    texts,
                     ProtocolOptions {
                         budget: Some(budget),
                         ..options
@@ -4660,8 +4740,8 @@ mod tests {
                     break;
                 };
                 assert!(
-                    recipe.contains(" match=needle context=0 "),
-                    "{address}: the recipe carries the match: {recipe}"
+                    recipe.contains(recipe_atoms),
+                    "{address}: the recipe carries each --match text: {recipe}"
                 );
                 let flag = |name| atom(recipe, name) == Some("true");
                 let refs = atom(recipe, "refs")
@@ -4687,7 +4767,8 @@ mod tests {
             assert_eq!(
                 printed,
                 printed_messages(&unbudgeted),
-                "{address}: following the recipes prints what the unbudgeted read prints"
+                "{address} {texts:?}: following the recipes prints what the unbudgeted read \
+                 prints"
             );
         }
     }
@@ -4763,7 +4844,7 @@ mod tests {
                 }],
                 None,
                 Some(&ReadSlice::Match {
-                    query: "needle".to_string(),
+                    texts: vec!["needle".to_owned()],
                     context: lines_around(0),
                 }),
                 ProtocolOptions {
@@ -4835,7 +4916,7 @@ mod tests {
         let output = read_slice(
             &text_and_two_calls(),
             ReadSlice::Match {
-                query: "cargo test".to_owned(),
+                texts: vec!["cargo test".to_owned()],
                 context: lines_around(0),
             },
         );
@@ -7880,7 +7961,7 @@ mod tests {
         for slice in [
             ReadSlice::Lines(line_range(2, 2)),
             ReadSlice::Match {
-                query: "line".to_owned(),
+                texts: vec!["line".to_owned()],
                 context: lines_around(0),
             },
         ] {
@@ -8175,7 +8256,7 @@ mod tests {
             let output = read_slice(
                 &transcript,
                 ReadSlice::Match {
-                    query: last_line.to_owned(),
+                    texts: vec![last_line.to_owned()],
                     context: lines_around(0),
                 },
             );

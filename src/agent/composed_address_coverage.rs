@@ -4,6 +4,8 @@
 //!   every flag, shows exactly the messages a read of each one alone with
 //!   `--match` finds a line in, each with the records and lines that read
 //!   prints.
+//! - `agent read --match A --match B` of a whole session prints the lines
+//!   the reads with `--match A` and with `--match B` print.
 //! - An exact `agent within` of an address, a range of the session's own
 //!   messages or a sub-agent's, for each marker, returns the whole session's
 //!   hits on the messages `agent read` of that address shows with every
@@ -26,9 +28,9 @@ use crate::search::mode::SearchMode;
 use crate::time_filter::TimeFilter;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The `--match` queries each session is read with: its markers and a common
+/// The `--match` texts each session is read with: its markers and a common
 /// word.
-fn match_queries(session: &AgentSession) -> Vec<String> {
+fn match_texts(session: &AgentSession) -> Vec<String> {
     session
         .markers
         .iter()
@@ -89,17 +91,17 @@ fn message_of(address: &str) -> &str {
     }
 }
 
-/// The messages whose `--match <query>` read of the whole of `session`
+/// The messages whose `--match <text>` read of the whole of `session`
 /// differs from their reads alone with `options`, and how many messages
 /// matched.
 fn match_read_differences(
     session: &AgentSession,
     loaded: &LoadedSession,
-    query: &str,
+    text: &str,
     options: ProtocolOptions,
 ) -> (Vec<String>, usize) {
     let slice = ReadSlice::Match {
-        query: query.to_owned(),
+        texts: vec![text.to_owned()],
         context: MatchContext {
             before: 1,
             after: 1,
@@ -128,7 +130,7 @@ fn match_read_differences(
     for address in shown.keys().chain(expected.keys()) {
         if shown.get(address) != expected.get(address) {
             differences.push(format!(
-                "{:?} --match {query:?} tools={}: {address}\nwhole read: {:#?}\nalone: {:#?}",
+                "{:?} --match {text:?} tools={}: {address}\nwhole read: {:#?}\nalone: {:#?}",
                 session.row.source,
                 options.tools,
                 shown.get(address),
@@ -143,7 +145,7 @@ fn match_read_differences(
         .map(str::to_owned);
     if header_count != Some(matched.to_string()) {
         differences.push(format!(
-            "{:?} --match {query:?}: matched-messages={header_count:?}, {matched} matched alone",
+            "{:?} --match {text:?}: matched-messages={header_count:?}, {matched} matched alone",
             session.row.source
         ));
     }
@@ -363,7 +365,7 @@ fn every_agents_match_read_of_own_message_searches_subagent_messages_written_dur
             .unwrap();
             for marker in &session.markers {
                 let slice = ReadSlice::Match {
-                    query: marker.text.to_owned(),
+                    texts: vec![marker.text.to_owned()],
                     context: MatchContext {
                         before: 0,
                         after: 0,
@@ -394,15 +396,126 @@ fn every_agents_match_read_of_own_message_searches_subagent_messages_written_dur
     );
 }
 
+/// The numbered content lines of each message in a `--match` read, keyed by
+/// the address of the record above the line and the line's number; true for
+/// a matching line (`>`).
+fn line_marks(read: &str) -> BTreeMap<String, BTreeMap<(String, usize), bool>> {
+    message_blocks(read)
+        .into_iter()
+        .map(|(message, block)| {
+            let mut lines = BTreeMap::new();
+            let mut record = String::new();
+            for line in block {
+                let Some(content) = line.strip_prefix("| ") else {
+                    record = line.split(' ').next().unwrap_or_default().to_owned();
+                    continue;
+                };
+                let number = content
+                    .get(1..)
+                    .and_then(|rest| rest.split_once(':'))
+                    .and_then(|(number, _)| number.parse::<usize>().ok());
+                if let Some(number) = number {
+                    lines.insert((record.clone(), number), content.starts_with('>'));
+                }
+            }
+            (message, lines)
+        })
+        .collect()
+}
+
+/// The differences between the `--match` read of `texts` of the whole of
+/// `session` and the union of the reads of each text alone, and the count
+/// of messages every read alone prints.
+fn several_texts_read_differences(
+    session: &AgentSession,
+    loaded: &LoadedSession,
+    texts: &[String],
+    options: ProtocolOptions,
+) -> (Vec<String>, usize) {
+    let reference = loaded.resolved.reference.canonical();
+    let read_of = |texts: &[String]| {
+        let slice = ReadSlice::Match {
+            texts: texts.to_vec(),
+            context: MatchContext {
+                before: 1,
+                after: 1,
+            },
+        };
+        loaded.read_sliced(&reference, Some(&slice), options)
+    };
+    let together = read_of(texts);
+    let mut expected: BTreeMap<String, BTreeMap<(String, usize), bool>> = BTreeMap::new();
+    let mut printed_by_each = BTreeMap::<String, usize>::new();
+    for text in texts {
+        for (message, lines) in line_marks(&read_of(std::slice::from_ref(text))) {
+            *printed_by_each.entry(message.clone()).or_default() += 1;
+            let message_lines = expected.entry(message).or_default();
+            for (line, is_match) in lines {
+                *message_lines.entry(line).or_default() |= is_match;
+            }
+        }
+    }
+    let printed_by_all = printed_by_each
+        .values()
+        .filter(|&&count| count == texts.len())
+        .count();
+    let mut differences = Vec::new();
+    let shown = line_marks(&together);
+    if shown != expected {
+        differences.push(format!(
+            "{:?} --match {texts:?} tools={} prints the lines of the reads of each text \
+             alone, {expected:#?}:\n{together}",
+            session.row.source, options.tools
+        ));
+    }
+    let header_count = together
+        .lines()
+        .next()
+        .and_then(|header| atom(header, "matched-messages"))
+        .map(str::to_owned);
+    if header_count != Some(expected.len().to_string()) {
+        differences.push(format!(
+            "{:?} --match {texts:?}: matched-messages={header_count:?}, {} matched by a \
+             text alone",
+            session.row.source,
+            expected.len()
+        ));
+    }
+    (differences, printed_by_all)
+}
+
+#[test]
+fn every_agents_match_read_of_multiple_texts_prints_lines_reads_of_each_text_print() {
+    let mut differences = Vec::new();
+    let mut printed_by_both = 0;
+    for session in every_record_sessions() {
+        let loaded = LoadedSession::of(&session);
+        for texts in match_texts(&session).windows(2) {
+            for options in [DEFAULT_FLAGS, EVERY_FLAG] {
+                let (found, count) =
+                    several_texts_read_differences(&session, &loaded, texts, options);
+                differences.extend(found);
+                printed_by_both += count;
+            }
+        }
+    }
+
+    assert!(differences.is_empty(), "{}", differences.join("\n\n"));
+    assert!(
+        printed_by_both > 0,
+        "a message prints in the reads of each of two texts alone"
+    );
+}
+
 #[test]
 fn every_agents_match_read_of_whole_session_shows_what_reads_of_each_message_alone_match() {
     let mut differences = Vec::new();
     let mut matched = 0;
     for session in every_record_sessions() {
         let loaded = LoadedSession::of(&session);
-        for query in match_queries(&session) {
+        for text in match_texts(&session) {
             for options in [DEFAULT_FLAGS, EVERY_FLAG] {
-                let (found, count) = match_read_differences(&session, &loaded, &query, options);
+                let (found, count) = match_read_differences(&session, &loaded, &text, options);
                 differences.extend(found);
                 matched += count;
             }
@@ -410,5 +523,5 @@ fn every_agents_match_read_of_whole_session_shows_what_reads_of_each_message_alo
     }
 
     assert!(differences.is_empty(), "{}", differences.join("\n\n"));
-    assert!(matched > 0, "a query matches a message");
+    assert!(matched > 0, "a text matches a message");
 }

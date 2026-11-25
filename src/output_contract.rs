@@ -646,6 +646,9 @@ fn read_records_of(reference: &str, agent: &str) -> String {
     ]);
     run(&["agent", "read", reference, "--match", "zzqqxx"]);
     run(&[
+        "agent", "read", reference, "--match", "answer", "--match", "Sentinel", "-C", "0",
+    ]);
+    run(&[
         "agent",
         "read",
         &format!("{reference}:{message}"),

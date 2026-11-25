@@ -360,11 +360,13 @@ impl Grammar {
 type ValueCheck = fn(&str) -> bool;
 
 /// An atom of a record whose atoms come in a fixed order: its name, the
-/// values it accepts, and whether every such record carries it.
+/// values it accepts, whether every such record carries it, and whether it
+/// can print several times in a row.
 struct OrderedAtom {
     name: &'static str,
     values: ValueCheck,
     required: bool,
+    repeats: bool,
 }
 
 const fn required(name: &'static str, values: ValueCheck) -> OrderedAtom {
@@ -372,6 +374,7 @@ const fn required(name: &'static str, values: ValueCheck) -> OrderedAtom {
         name,
         values,
         required: true,
+        repeats: false,
     }
 }
 
@@ -380,6 +383,18 @@ const fn optional(name: &'static str, values: ValueCheck) -> OrderedAtom {
         name,
         values,
         required: false,
+        repeats: false,
+    }
+}
+
+/// An optional atom that can print several times in a row: `match=B9
+/// match=B12`.
+const fn optional_repeated(name: &'static str, values: ValueCheck) -> OrderedAtom {
+    OrderedAtom {
+        name,
+        values,
+        required: false,
+        repeats: true,
     }
 }
 
@@ -447,11 +462,11 @@ const LEGEND: &[OrderedAtom] = &[
     optional("in", is_handle),
 ];
 
-/// `match=…` is followed by `context=`, or by `before-context=` and
-/// `after-context=`.
+/// The `match=…` atoms are followed by `context=`, or by `before-context=`
+/// and `after-context=`.
 const CONTINUE_READ: &[OrderedAtom] = &[
     required("refs", is_message_runs),
-    optional("match", is_atom),
+    optional_repeated("match", is_atom),
     optional("context", is_digits),
     optional("before-context", is_digits),
     optional("after-context", is_digits),
@@ -481,8 +496,9 @@ const READ_RUNS: &[OrderedAtom] = &[
 ];
 
 /// A message's record in a read: `m3 s1 01:50:01 call=m2.1..2 tool=Agent`.
-/// `slice=match=…` is followed by `context=`, or by `before-context=` and
-/// `after-context=`, then by `matches=`.
+/// `slice=match=…` is followed by a `match=` atom for each further text,
+/// then by `context=` or by `before-context=` and `after-context=`, then by
+/// `matches=`.
 const READ_MESSAGE: &[OrderedAtom] = &[
     optional("from", is_handle),
     optional("call", is_call_list),
@@ -492,6 +508,7 @@ const READ_MESSAGE: &[OrderedAtom] = &[
     optional("hidden-tool-results", is_digits),
     optional("hidden-thinking", is_digits),
     optional("slice", is_slice),
+    optional_repeated("match", is_atom),
     optional("context", is_digits),
     optional("before-context", is_digits),
     optional("after-context", is_digits),
@@ -679,17 +696,22 @@ fn first_atom_mismatch<'a>(
 ) -> Option<AtomMismatch<'a>> {
     let mut fields = fields.peekable();
     for atom in atoms {
-        let field = fields.next_if(|field| {
+        let mut present = false;
+        while let Some(field) = fields.next_if(|field| {
             field
                 .split_once('=')
                 .is_some_and(|(name, _)| name == atom.name)
-        });
-        match field {
-            Some(field) if !(atom.values)(&field[atom.name.len() + 1..]) => {
+        }) {
+            if !(atom.values)(&field[atom.name.len() + 1..]) {
                 return Some(AtomMismatch::Value(field));
             }
-            None if atom.required => return Some(AtomMismatch::Missing(atom.name)),
-            _ => {}
+            present = true;
+            if !atom.repeats {
+                break;
+            }
+        }
+        if !present && atom.required {
+            return Some(AtomMismatch::Missing(atom.name));
         }
     }
     fields.next().map(AtomMismatch::OutOfPlace)
@@ -1048,7 +1070,7 @@ fn is_line_range(value: &str) -> bool {
     value.parse::<MessageLineRange>().is_ok()
 }
 
-/// True for `lines=2..4` or `match=QUERY`.
+/// True for `lines=2..4` or `match=TEXT`.
 fn is_slice(value: &str) -> bool {
     value.strip_prefix("lines=").is_some_and(is_line_range)
         || value.strip_prefix("match=").is_some_and(is_atom)

@@ -1042,7 +1042,7 @@ mod agent_command_tests {
             hit,
             tail: None,
             lines: None,
-            match_query: None,
+            match_texts: Vec::new(),
             context: None,
             before_context: None,
             after_context: None,
@@ -1376,7 +1376,7 @@ mod agent_command_tests {
         )];
         let conversation = keys[0].conversation_ref().canonical();
         let mut args = read_args(vec![format!("{conversation}:s2:m7.3")], None);
-        args.match_query = Some("needle".to_string());
+        args.match_texts = vec!["needle".to_string()];
 
         let error =
             resolve_agent_read_args(&args, &keys, &SystemCanonicaliser::shared()).unwrap_err();
@@ -1478,7 +1478,7 @@ mod agent_command_tests {
         )];
         let conversation = keys[0].conversation_ref().canonical();
         let mut args = read_args(vec![format!("{conversation}:m1")], None);
-        args.match_query = Some("historical correction".to_string());
+        args.match_texts = vec!["historical correction".to_string()];
         args.context = Some(1);
 
         let output = run_agent_read(&args, Some(&keys)).unwrap();
@@ -1607,7 +1607,7 @@ mod agent_command_tests {
             hit,
             tail: None,
             lines: None,
-            match_query: None,
+            match_texts: Vec::new(),
             context: None,
             before_context: None,
             after_context: None,

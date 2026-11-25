@@ -779,7 +779,7 @@ fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<S
                 }],
                 None,
                 Some(&ReadSlice::Match {
-                    query: marker.text.to_owned(),
+                    texts: vec![marker.text.to_owned()],
                     context: lines_around(0),
                 }),
                 EVERY_FLAG,
