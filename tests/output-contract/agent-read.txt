@@ -244,6 +244,11 @@ $ rearview agent read ch_581699c40efc --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagent-messages=5
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+$ rearview agent read ch_581699c40efc --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagent-messages=5 warnings=1 warning-records=1
+conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
 $ rearview agent read ch_581699c40efc --match answer --match Sentinel -C 0
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=14 tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagent-messages=5
@@ -725,6 +730,12 @@ $ rearview agent read ch_0b26e45343df --match zzqqxx
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
+$ rearview agent read ch_0b26e45343df --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=2 warning-records=2
+conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
 $ rearview agent read ch_0b26e45343df --match answer --match Sentinel -C 0
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=7 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
@@ -1231,6 +1242,12 @@ $ rearview agent read ch_74aec3f6df49 --match zzqqxx
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagent-messages=5 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
+$ rearview agent read ch_74aec3f6df49 --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagent-messages=5 warnings=2 warning-records=2
+conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
 $ rearview agent read ch_74aec3f6df49 --match answer --match Sentinel -C 0
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=7 tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagent-messages=5 warnings=1 warning-records=1
@@ -1742,6 +1759,11 @@ $ rearview agent read ch_974c3840e189 --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+$ rearview agent read ch_974c3840e189 --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2 warnings=1 warning-records=1
+conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
 $ rearview agent read ch_974c3840e189 --match answer --match Sentinel -C 0
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=3 tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2
@@ -2047,6 +2069,11 @@ $ rearview agent read ch_efbbec792ccc --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+$ rearview agent read ch_efbbec792ccc --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
+conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
 $ rearview agent read ch_efbbec792ccc --match answer --match Sentinel -C 0
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=2 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
@@ -2336,6 +2363,11 @@ $ rearview agent read ch_f04d3718e406 --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+$ rearview agent read ch_f04d3718e406 --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1 warnings=1 warning-records=1
+conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
 $ rearview agent read ch_f04d3718e406 --match answer --match Sentinel -C 0
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=2 tz=-05:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1
@@ -2603,6 +2635,11 @@ $ rearview agent read ch_982349c13ee4 --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+$ rearview agent read ch_982349c13ee4 --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
+conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
 $ rearview agent read ch_982349c13ee4 --match answer --match Sentinel -C 0
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=2 tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3

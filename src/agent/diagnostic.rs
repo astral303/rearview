@@ -114,6 +114,9 @@ pub enum AgentWarningKind {
     /// the detail holds the record's `refs=`, `cached-until=` and
     /// `omitted-sessions=` atoms and the sentence for its cause.
     StaleCache,
+    /// A `--match` read of a text containing `|` that didn't match anything;
+    /// the detail lists a `--match` flag for each part.
+    LiteralPipe,
 }
 
 impl AgentWarningKind {
@@ -126,6 +129,7 @@ impl AgentWarningKind {
             Self::Ignored => "ignored",
             Self::PartialIndex => "partial-index",
             Self::StaleCache => "stale-cache",
+            Self::LiteralPipe => "literal-pipe",
         }
     }
 
@@ -139,6 +143,7 @@ impl AgentWarningKind {
             Self::Ignored,
             Self::PartialIndex,
             Self::StaleCache,
+            Self::LiteralPipe,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == atom)
@@ -224,6 +229,14 @@ impl AgentWarning {
     pub fn partial_index(detail: impl Into<String>) -> Self {
         Self {
             kind: AgentWarningKind::PartialIndex,
+            reference: None,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn literal_pipe(detail: impl Into<String>) -> Self {
+        Self {
+            kind: AgentWarningKind::LiteralPipe,
             reference: None,
             detail: detail.into(),
         }

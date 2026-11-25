@@ -1333,7 +1333,9 @@ pub fn format_read(
 }
 
 /// The read of `requests`, its times in `written_at`'s zone. `written_at`
-/// sets the `tz=` offset of a read that does not show a time.
+/// sets the `tz=` offset of a read that does not show a time. A `--match`
+/// read without a matched message, of a text containing `|` and a non-empty
+/// part, adds a `literal-pipe` warning to the `warnings` it is passed.
 pub fn format_read_with_warnings(
     requests: &[ReadRequest<'_>],
     priority: ReadPriority,
@@ -1390,9 +1392,18 @@ pub fn format_read_with_warnings(
         request_entry_counts.push(request_entries.len());
         entries.extend(request_entries);
     }
-    let (warning_count, warning_records) = format_warning_records(warnings);
     let matched_messages =
         searches_each_message.then(|| entries.iter().filter(|entry| entry.has_match()).count());
+    let literal_pipe = match (slice, matched_messages) {
+        (Some(ReadSlice::Match { texts, .. }), Some(0)) => literal_pipe_warning(texts),
+        _ => None,
+    };
+    let warnings = warnings
+        .iter()
+        .cloned()
+        .chain(literal_pipe)
+        .collect::<Vec<_>>();
+    let (warning_count, warning_records) = format_warning_records(&warnings);
     let mut header = ReadHeader::new(
         header_options,
         requests,
@@ -2791,6 +2802,47 @@ fn apply_read_slice<'a>(
     rendered.content = rendered.content.sliced(&selected, &matches);
     rendered.has_own_record = true;
     Ok(rendered)
+}
+
+/// The `literal-pipe` warning of a `--match` read of `texts` without a match,
+/// when a text contains `|` and a non-empty part: it names the first text
+/// containing `|`, and lists a flag for each non-empty part of such a text,
+/// a text without `|` and a text made only of `|` as typed.
+fn literal_pipe_warning(texts: &[String]) -> Option<AgentWarning> {
+    /// The parts of `text` between `|`, without the spaces around them,
+    /// those left empty dropped; none for a text without `|`.
+    fn piped_parts(text: &str) -> Vec<&str> {
+        if !text.contains('|') {
+            return Vec::new();
+        }
+        text.split('|')
+            .map(|part| part.trim_matches(' '))
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+    if texts.iter().all(|text| piped_parts(text).is_empty()) {
+        return None;
+    }
+    let first_piped = texts.iter().find(|text| text.contains('|'))?;
+    let flags = texts
+        .iter()
+        .flat_map(|text| match piped_parts(text) {
+            parts if parts.is_empty() => vec![text.as_str()],
+            parts => parts,
+        })
+        .map(|text| {
+            if text.contains([' ', '|']) {
+                format!("--match \"{text}\"")
+            } else {
+                format!("--match {text}")
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(AgentWarning::literal_pipe(format!(
+        "--match searched for the literal text {first_piped}; to match any of several \
+         texts, repeat the flag: {}",
+        flags.join(" ")
+    )))
 }
 
 /// `match=B9 match=B12 context=3`: each `--match` text, percent-encoded, and
@@ -4386,6 +4438,194 @@ mod tests {
             output.contains(" slice=match=B9%7CB12 context=0 matches=1 ")
                 && output.ends_with("\n| >2: B9|B12 together\n"),
             "`|` matches only a literal `|`: {output}"
+        );
+    }
+
+    /// The `--match` read of `texts` of m1 of a session whose one message
+    /// reads `haystack`.
+    fn match_read_of_haystack(texts: &[&str]) -> String {
+        let transcript = transcript(vec![text_message(
+            1,
+            AgentMessageRole::Assistant,
+            "haystack",
+        )]);
+        read_slice(
+            &transcript,
+            ReadSlice::Match {
+                texts: texts.iter().map(|&text| text.to_owned()).collect(),
+                context: lines_around(0),
+            },
+        )
+    }
+
+    /// The detail of the `literal-pipe` warning record of `read`, decoded.
+    fn literal_pipe_detail(read: &str) -> Option<String> {
+        let record = read
+            .lines()
+            .find(|line| line.starts_with("protocol agent-warning kind=literal-pipe "))?;
+        let detail = atom(record, "detail")?;
+        Some(percent_decoded(detail))
+    }
+
+    /// `atom` with each `%XX` replaced by its byte.
+    fn percent_decoded(atom: &str) -> String {
+        let mut bytes = Vec::new();
+        let mut rest = atom.as_bytes();
+        while let Some((&byte, after)) = rest.split_first() {
+            if byte == b'%' {
+                let hex = std::str::from_utf8(&after[..2]).unwrap();
+                bytes.push(u8::from_str_radix(hex, 16).unwrap());
+                rest = &after[2..];
+            } else {
+                bytes.push(byte);
+                rest = after;
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn match_read_of_pipe_text_without_match_warns_with_flag_for_each_part() {
+        let output = match_read_of_haystack(&["B9|B12"]);
+
+        let header = output.lines().next().unwrap();
+        assert!(
+            header.contains(" matched-messages=0 ")
+                && header.ends_with(" warnings=1 warning-records=1"),
+            "the header counts the warning record: {header}"
+        );
+        assert!(
+            output.ends_with(
+                "\nprotocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20B9%7CB12%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20B9%20--match%20B12\n"
+            ),
+            "the warning record prints last: {output}"
+        );
+    }
+
+    #[test]
+    fn literal_pipe_warning_of_multiple_texts_names_first_pipe_text_and_lists_every_text() {
+        let output = match_read_of_haystack(&["needle", "B9|B12", "pin"]);
+        let two_pipe_texts = match_read_of_haystack(&["B9|B12", "B7|B8"]);
+
+        assert_eq!(
+            literal_pipe_detail(&output).as_deref(),
+            Some(
+                "--match searched for the literal text B9|B12; to match any of several texts, \
+                 repeat the flag: --match needle --match B9 --match B12 --match pin"
+            ),
+            "the suggestion lists every text, the `|` text split in its place: {output}"
+        );
+        assert_eq!(
+            literal_pipe_detail(&two_pipe_texts).as_deref(),
+            Some(
+                "--match searched for the literal text B9|B12; to match any of several texts, \
+                 repeat the flag: --match B9 --match B12 --match B7 --match B8"
+            ),
+            "the detail names the first text containing `|` and splits each: {two_pipe_texts}"
+        );
+    }
+
+    #[test]
+    fn literal_pipe_suggestion_leaves_out_empty_parts_and_quotes_part_with_space() {
+        let output = match_read_of_haystack(&["|B9||big cat|"]);
+
+        assert_eq!(
+            literal_pipe_detail(&output).as_deref(),
+            Some(
+                "--match searched for the literal text |B9||big cat|; to match any of several \
+                 texts, repeat the flag: --match B9 --match \"big cat\""
+            ),
+            "the suggestion leaves out empty parts and quotes a part with a space: {output}"
+        );
+    }
+
+    #[test]
+    fn literal_pipe_suggestion_trims_spaces_around_parts() {
+        let output = match_read_of_haystack(&["B9 | B12 | "]);
+
+        assert_eq!(
+            literal_pipe_detail(&output).as_deref(),
+            Some(
+                "--match searched for the literal text B9 | B12 | ; to match any of several \
+                 texts, repeat the flag: --match B9 --match B12"
+            ),
+            "the suggestion trims the spaces around each part and leaves out a part \
+             of spaces alone: {output}"
+        );
+    }
+
+    #[test]
+    fn literal_pipe_suggestion_of_text_with_one_part_lists_that_part() {
+        let output = match_read_of_haystack(&["B9|"]);
+
+        assert_eq!(
+            literal_pipe_detail(&output).as_deref(),
+            Some(
+                "--match searched for the literal text B9|; to match any of several texts, \
+                 repeat the flag: --match B9"
+            ),
+            "a text with one non-empty part warns with a flag for that part: {output}"
+        );
+    }
+
+    #[test]
+    fn literal_pipe_suggestion_quotes_unsplit_text_with_space() {
+        let output = match_read_of_haystack(&["big cat", "B9|B12"]);
+
+        assert_eq!(
+            literal_pipe_detail(&output).as_deref(),
+            Some(
+                "--match searched for the literal text B9|B12; to match any of several texts, \
+                 repeat the flag: --match \"big cat\" --match B9 --match B12"
+            ),
+            "the suggestion quotes a text with a space that it doesn't split: {output}"
+        );
+    }
+
+    #[test]
+    fn match_read_of_pipes_alone_doesnt_warn() {
+        for texts in [&["||"][..], &[" | "]] {
+            let output = match_read_of_haystack(texts);
+
+            assert!(
+                output.contains(" matched-messages=0 ") && !output.contains("literal-pipe"),
+                "{texts:?}, a text without a non-empty part, doesn't print the warning: \
+                 {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_pipe_suggestion_lists_pipes_alone_as_typed_and_quoted() {
+        let output = match_read_of_haystack(&["|", "B9|B12"]);
+
+        assert_eq!(
+            literal_pipe_detail(&output).as_deref(),
+            Some(
+                "--match searched for the literal text |; to match any of several texts, \
+                 repeat the flag: --match \"|\" --match B9 --match B12"
+            ),
+            "the suggestion lists a text made only of `|` as typed, quoted: {output}"
+        );
+    }
+
+    #[test]
+    fn match_read_with_match_doesnt_warn_of_pipe_text() {
+        let output = match_read_of_haystack(&["B9|B12", "hay"]);
+
+        assert!(
+            output.contains(" matched-messages=1 ") && !output.contains("literal-pipe"),
+            "a read that matches doesn't print the warning: {output}"
+        );
+    }
+
+    #[test]
+    fn match_read_without_pipe_text_doesnt_warn() {
+        let output = match_read_of_haystack(&["B9", "B12"]);
+
+        assert!(
+            output.contains(" matched-messages=0 ") && !output.contains("agent-warning"),
+            "a read of texts without `|` doesn't print the warning: {output}"
         );
     }
 
