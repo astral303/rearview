@@ -31,7 +31,7 @@
 //! - Handles number the sub-agents in the order they start: at their
 //!   launch, else at their first message.
 //! - When exact search finds a marker in a message, a read of that message
-//!   alone with `--match <marker>` reports a hit.
+//!   alone with `--match <marker>` reports a match.
 //! - The `read ref=` recipe of each hit an exact `agent within` search for a
 //!   marker prints reads the messages of its `hit=`, and the `-B` and `-A`
 //!   messages of its thread before and after it, up to the thread's ends.
@@ -72,7 +72,7 @@ const WITH_TOOLS_AND_SUBAGENTS: ProtocolOptions = ProtocolOptions {
     },
 };
 
-const DEFAULT_FLAGS: ProtocolOptions = ProtocolOptions {
+pub(super) const DEFAULT_FLAGS: ProtocolOptions = ProtocolOptions {
     budget: None,
     tools: false,
     tool_results: false,
@@ -84,7 +84,7 @@ const DEFAULT_FLAGS: ProtocolOptions = ProtocolOptions {
     },
 };
 
-const EVERY_FLAG: ProtocolOptions = ProtocolOptions {
+pub(super) const EVERY_FLAG: ProtocolOptions = ProtocolOptions {
     budget: None,
     tools: true,
     tool_results: true,
@@ -168,14 +168,14 @@ fn read_ref(session: &AgentSession, reference: &str, options: ProtocolOptions) -
 }
 
 /// A session's transcript, loaded once for many reads of its refs.
-struct LoadedSession {
-    transcript: AgentTranscript,
-    resolved: ResolvedConversation,
-    addresses: MessageAddresses,
+pub(super) struct LoadedSession {
+    pub(super) transcript: AgentTranscript,
+    pub(super) resolved: ResolvedConversation,
+    pub(super) addresses: MessageAddresses,
 }
 
 impl LoadedSession {
-    fn of(session: &AgentSession) -> Self {
+    pub(super) fn of(session: &AgentSession) -> Self {
         let row = &session.row;
         let transcript =
             AgentTranscript::load_cached_for_test(row.source, &row.path, &row.subagents).unwrap();
@@ -189,6 +189,16 @@ impl LoadedSession {
 
     /// `agent read` of `reference`, as [`read_ref`] reads it.
     fn read_ref(&self, reference: &str, options: ProtocolOptions) -> String {
+        self.read_sliced(reference, None, options)
+    }
+
+    /// `agent read` of `reference` with `slice`, `--lines` or `--match`.
+    pub(super) fn read_sliced(
+        &self,
+        reference: &str,
+        slice: Option<&ReadSlice>,
+        options: ProtocolOptions,
+    ) -> String {
         let read_ref = parse_read_ref(reference).unwrap();
         let range = read_ref
             .range
@@ -203,7 +213,7 @@ impl LoadedSession {
                 shortened_to: range.and_then(|range| range.shortened_to),
             }],
             None,
-            None,
+            slice,
             options,
         )
         .unwrap()
@@ -735,7 +745,7 @@ fn every_agents_read_with_subagents_shows_subagents_thinking_only_with_thinking(
 
 /// Each message `agent search` finds a marker of `session` in, with the
 /// record of that message's read alone with every flag and
-/// `--match <marker>`, when that read doesn't report a hit.
+/// `--match <marker>`, when that read doesn't report a match.
 fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<String> {
     let row = &session.row;
     let transcript =
@@ -775,18 +785,18 @@ fn markers_a_read_of_their_message_doesnt_match(session: &AgentSession) -> Vec<S
                 EVERY_FLAG,
             )
             .unwrap();
-            let hits = output
+            let match_count = output
                 .lines()
                 .find(|line| line.contains(" slice=match="))
-                .and_then(|record| atom(record, "hits"));
-            matches!(hits, None | Some("0"))
+                .and_then(|record| atom(record, "matches"));
+            matches!(match_count, None | Some("0"))
                 .then(|| format!("{:?} {} in m{ordinal}: {output}", row.source, marker.record))
         })
         .collect()
 }
 
 #[test]
-fn every_agents_marker_search_finds_is_hit_in_read_of_its_message_alone() {
+fn every_agents_marker_search_finds_is_matched_in_read_of_its_message_alone() {
     let unmatched: Vec<String> = every_record_sessions()
         .iter()
         .flat_map(markers_a_read_of_their_message_doesnt_match)
@@ -1148,6 +1158,7 @@ fn hit_recipes(session: &AgentSession, context: HitContext) -> HitRecipes {
             tui_semantic_search: None,
             budget: None,
             window: TimeFilter::default(),
+            address: None,
         };
         let output = format_agent_output_with_warnings(
             &run_within_search(&request, row, &loaded.resolved, &loaded.transcript, &[]),

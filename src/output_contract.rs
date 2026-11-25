@@ -387,8 +387,8 @@ const TUI_QUERIES: &[&str] = &[
     "zzqqxx",
 ];
 
-/// The `agent sessions` cases: budgets, pages, windows and an inverted
-/// window.
+/// The `agent sessions` cases: budgets, pages, windows, an inverted window
+/// and search flags that change nothing.
 const SESSIONS_CASES: &[&[&str]] = &[
     &["agent", "sessions"],
     &["agent", "sessions", "--no-budget"],
@@ -413,6 +413,7 @@ const SESSIONS_CASES: &[&[&str]] = &[
         "2026-08-01T06:02",
     ],
     &["agent", "sessions", "--since", "60d"],
+    &["agent", "sessions", "-C", "2", "--tools", "--subagents"],
     &[
         "agent",
         "sessions",
@@ -504,7 +505,9 @@ impl AgentOutputs {
         let listed = listed_sessions();
         for session in &listed {
             let reference = session.reference.as_str();
-            outputs.within.push_str(&within_records_of(reference));
+            outputs
+                .within
+                .push_str(&within_records_of(reference, &session.agent));
             outputs
                 .read
                 .push_str(&read_records_of(reference, &session.agent));
@@ -544,19 +547,31 @@ fn records_of(cases: &[&[&str]]) -> String {
         .collect()
 }
 
-/// Every `agent within` case of the session `reference` names.
-fn within_records_of(reference: &str) -> String {
-    [
+/// Every `agent within` case of `agent`'s session `reference` names.
+fn within_records_of(reference: &str, agent: &str) -> String {
+    let (message, range) = case_messages_of(agent);
+    let in_range = format!("{reference}:{range}");
+    let to_the_end = format!("{reference}:m3..");
+    let call = format!("{reference}:m2.1");
+    let mut cases = vec![
         vec!["agent", "within", reference, "answer"],
         vec!["agent", "within", reference, "answer", "-B", "0", "-A", "2"],
         vec!["agent", "within", reference, "answer", "--subagents"],
         vec!["agent", "within", reference, "searchable", "--top", "2"],
         vec!["agent", "within", reference, "--mode", "exact", "Sentinel"],
         vec!["agent", "within", reference, "the", "--budget", "400"],
-    ]
-    .iter()
-    .map(|args| agent_command(args).record)
-    .collect()
+        vec!["agent", "within", &in_range, "answer"],
+        vec!["agent", "within", &to_the_end, "the", "--top", "2"],
+        vec!["agent", "within", &call, "answer"],
+    ];
+    let subagent = format!("{reference}:s1");
+    if message.starts_with("s1:") {
+        cases.push(vec!["agent", "within", &subagent, "answer"]);
+    }
+    cases
+        .iter()
+        .map(|args| agent_command(args).record)
+        .collect()
 }
 
 /// The message the one-message `agent read` cases of `agent`'s session read,
@@ -574,7 +589,7 @@ fn case_messages_of(agent: &str) -> (&'static str, &'static str) {
 
 /// Every `agent read` case of `agent`'s session `reference` names.
 fn read_records_of(reference: &str, agent: &str) -> String {
-    let (message, _) = case_messages_of(agent);
+    let (message, range) = case_messages_of(agent);
     let mut records = String::new();
     let mut run = |args: &[&str]| {
         let command = agent_command(args);
@@ -616,6 +631,25 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         "-B",
         "0",
         "-A",
+        "1",
+    ]);
+    run(&[
+        "agent",
+        "read",
+        &format!("{reference}:{range}"),
+        "--match",
+        "the",
+    ]);
+    run(&["agent", "read", reference, "--match", "answer", "-C", "0"]);
+    run(&[
+        "agent", "read", reference, "--match", "the", "-C", "0", "--budget", "800",
+    ]);
+    run(&["agent", "read", reference, "--match", "zzqqxx"]);
+    run(&[
+        "agent",
+        "read",
+        &format!("{reference}:{message}"),
+        "-C",
         "1",
     ]);
     run(&["agent", "read", reference, "--tail", "3"]);
@@ -671,7 +705,7 @@ fn read_records_of(reference: &str, agent: &str) -> String {
 
 /// Every `agent outline` case of `agent`'s session `reference` names.
 fn outline_records_of(reference: &str, agent: &str) -> String {
-    let (_, range) = case_messages_of(agent);
+    let (message, range) = case_messages_of(agent);
     let mut records = String::new();
     let mut run = |args: &[&str]| {
         let command = agent_command(args);
@@ -691,6 +725,22 @@ fn outline_records_of(reference: &str, agent: &str) -> String {
     ]);
     run(&["agent", "outline", reference, "--budget", "500"]);
     run(&["agent", "outline", &format!("{reference}:{range}")]);
+    run(&[
+        "agent",
+        "outline",
+        &format!("{reference}:{range}"),
+        "--hit",
+        message,
+    ]);
+    run(&[
+        "agent",
+        "outline",
+        &format!("{reference}:{message}"),
+        "-B",
+        "1",
+        "-A",
+        "2",
+    ]);
     run(&["agent", "outline", &format!("{reference}:m17..m9999")]);
     if outline.lines().any(|line| line.starts_with("subagent s1 ")) {
         run(&["agent", "outline", &format!("{reference}:s1")]);

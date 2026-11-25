@@ -2067,7 +2067,7 @@ impl AgentService {
                     agent_config,
                     config_mode,
                     window,
-                    ..
+                    within_ref,
                 },
             resolved,
             operation,
@@ -2089,6 +2089,8 @@ impl AgentService {
             &transcript,
             &resolved.reference.canonical(),
         ));
+        let address = within_address(&within_ref, &resolved, &transcript)
+            .map_err(|error| target_error(error, &resolved))?;
         let request = agent::search::AgentWithinRequest {
             query: args.query.clone(),
             top: configured_usize(args.top, DEFAULT_WITHIN_TOP, agent_config.within_top),
@@ -2102,6 +2104,7 @@ impl AgentService {
                 agent_config.output_chars,
             ),
             window,
+            address,
         };
         let mode = agent::search::effective_agent_mode(
             &request.query,
@@ -2180,13 +2183,35 @@ impl AgentService {
     }
 }
 
-/// `agent within`'s arguments, checked. The conversation's syntax is
-/// checked when it is resolved, after key discovery.
+/// The messages `within_ref`'s address names in `transcript`, as `agent read`
+/// of it selects them; `None` for a whole session.
+pub(crate) fn within_address(
+    within_ref: &agent::refs::ReadRef,
+    resolved: &agent::refs::ResolvedConversation,
+    transcript: &agent::transcript::AgentTranscript,
+) -> Result<Option<agent::search::WithinAddress>> {
+    let ref_suffix = match (within_ref.range, within_ref.subagent) {
+        (Some(range), _) => range.to_string(),
+        (None, Some(handle)) => format!("s{handle}"),
+        (None, None) => return Ok(None),
+    };
+    let range = within_ref
+        .range
+        .map(|range| agent::address::MessageAddresses::of_transcript(transcript).resolve(range))
+        .transpose()?;
+    let request = read_request(within_ref, resolved, transcript, range)?;
+    Ok(Some(agent::search::WithinAddress {
+        ref_suffix,
+        messages: agent::protocol::requested_ordinals(&request)?,
+    }))
+}
+
+/// `agent within`'s arguments, checked.
 struct CheckedWithin {
     agent_config: AgentConfig,
     config_mode: Option<SearchMode>,
     window: TimeFilter,
-    conversation: String,
+    within_ref: agent::refs::ReadRef,
 }
 
 impl TargetedArgs for CheckedWithin {
@@ -2201,7 +2226,7 @@ impl TargetedArgs for CheckedWithin {
             config_mode: agent_config.mode.or(search_config.mode),
             agent_config,
             window,
-            conversation: args.conversation.clone(),
+            within_ref: agent::refs::parse_within_ref(&args.conversation)?,
         })
     }
 
@@ -2210,7 +2235,7 @@ impl TargetedArgs for CheckedWithin {
     }
 
     fn conversations(&self) -> Vec<&str> {
-        vec![&self.conversation]
+        vec![&self.within_ref.conversation]
     }
 
     fn resolve(
@@ -2218,7 +2243,7 @@ impl TargetedArgs for CheckedWithin {
         keys: &[agent::refs::AgentConversationKey],
         canonicaliser: &Arc<dyn Canonicaliser>,
     ) -> Result<Self::Resolved> {
-        resolve_agent_conversation_arg(&self.conversation, keys, canonicaliser)
+        self.within_ref.resolve_conversation(keys, canonicaliser)
     }
 
     fn targets(resolved: &Self::Resolved) -> Vec<&agent::refs::AgentConversationKey> {
@@ -4018,28 +4043,46 @@ impl AgentService {
                 .collect::<Result<Vec<_>>>()
         })?;
         let (transcripts, mut ranges): (Vec<_>, Vec<_>) = loaded.into_iter().unzip();
+        let mut hit = hit;
         if let Some(anchor) = args.anchor.as_deref() {
             let ordinal = transcripts[0].resolve_anchor(&resolved_refs[0].1, anchor)?;
-            ranges[0] = Some(agent::address::ResolvedRange {
-                range: agent::refs::MessageRange::single(ordinal),
-                subagent: None,
-                shortened_to: None,
+            ranges[0] = Some(match args.message_context() {
+                None => agent::address::ResolvedRange {
+                    range: agent::refs::MessageRange::single(ordinal),
+                    subagent: None,
+                    shortened_to: None,
+                },
+                Some(context) => {
+                    let addresses =
+                        agent::address::MessageAddresses::of_transcript(&transcripts[0]);
+                    let anchored = resolved_refs[0]
+                        .0
+                        .clone()
+                        .of_messages(addresses.address(ordinal));
+                    let (widened, widened_hit) = widened_refs(vec![anchored], None, context);
+                    hit = hit.or(widened_hit.map(|widened_hit| ResolvedHit {
+                        conversation: None,
+                        range: widened_hit.range,
+                    }));
+                    agent::address::ResolvedRange {
+                        shortened_to: None,
+                        ..addresses.resolve(
+                            widened[0]
+                                .range
+                                .expect("a ref of an anchor's message names messages"),
+                        )?
+                    }
+                }
             });
         }
         let requests = resolved_refs
             .iter()
             .zip(transcripts.iter().zip(&ranges))
-            .map(
-                |((read_ref, resolved), (transcript, range))| agent::protocol::ReadRequest {
-                    resolved,
-                    transcript,
-                    range: range.map(|range| range.range),
-                    subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
-                    call: read_ref.call,
-                    shortened_to: range.and_then(|range| range.shortened_to),
-                },
-            )
-            .collect::<Vec<_>>();
+            .map(|((read_ref, resolved), (transcript, range))| {
+                read_request(read_ref, resolved, transcript, *range)
+                    .map_err(|error| target_error(error, resolved))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let priority = match (args.tail, hit) {
             (Some(tail), _) => agent::protocol::ReadPriority::Tail(tail),
             (None, Some(hit)) => agent::protocol::ReadPriority::Hit(hit_messages(&hit, &requests)?),
@@ -4109,16 +4152,8 @@ impl AgentService {
             &resolved.reference.canonical(),
         ));
         let warnings = self.with_stale_cache_record(warnings, &CommandTargets);
-        let request = agent::protocol::ReadRequest {
-            resolved: &resolved,
-            transcript: &transcript,
-            range: range.map(|range| range.range),
-            subagent: outline_ref
-                .subagent
-                .or(range.and_then(|range| range.subagent)),
-            call: None,
-            shortened_to: range.and_then(|range| range.shortened_to),
-        };
+        let request = read_request(&outline_ref, &resolved, &transcript, range)
+            .map_err(|error| target_error(error, &resolved))?;
         let records = perf
             .time(Stage::Render, || {
                 agent::protocol::format_outline_with_warnings(
@@ -4132,6 +4167,62 @@ impl AgentService {
         operation.finish().fail_if_low_space()?;
         Ok(CommandOutput { records, warnings })
     }
+}
+
+/// The read of `read_ref`'s messages, resolved as `range` in `transcript`.
+fn read_request<'a>(
+    read_ref: &agent::refs::ReadRef,
+    resolved: &'a agent::refs::ResolvedConversation,
+    transcript: &'a agent::transcript::AgentTranscript,
+    range: Option<agent::address::ResolvedRange>,
+) -> Result<agent::protocol::ReadRequest<'a>> {
+    Ok(agent::protocol::ReadRequest {
+        resolved,
+        transcript,
+        range: range.map(|range| range.range),
+        subagent: read_ref.subagent.or(range.and_then(|range| range.subagent)),
+        call: read_ref.call,
+        shortened_to: shortened_end(read_ref, transcript, range.as_ref())?,
+    })
+}
+
+/// The `last=` of `read_ref`, its messages resolved as `range` in
+/// `transcript`: its thread's last message when the range the ref named ends
+/// past it. A range `-B`, `-A` or `-C` widened resolves again as named, and
+/// fails when that range starts past its thread's last message.
+fn shortened_end(
+    read_ref: &agent::refs::ReadRef,
+    transcript: &agent::transcript::AgentTranscript,
+    range: Option<&agent::address::ResolvedRange>,
+) -> Result<Option<agent::refs::ThreadRange>> {
+    match read_ref.widened_from {
+        Some(named) => Ok(agent::address::MessageAddresses::of_transcript(transcript)
+            .resolve(named)?
+            .shortened_to),
+        None => Ok(range.and_then(|range| range.shortened_to)),
+    }
+}
+
+/// `refs` with `context`'s messages of each ref's thread around the ref, and
+/// the hit a read of them keeps first: `hit`, else the messages a single ref
+/// named before it was widened.
+fn widened_refs(
+    refs: Vec<agent::refs::ReadRef>,
+    hit: Option<agent::refs::HitRef>,
+    context: agent::address::HitContext,
+) -> (Vec<agent::refs::ReadRef>, Option<agent::refs::HitRef>) {
+    let refs = refs
+        .into_iter()
+        .map(|reference| reference.widened(context))
+        .collect::<Vec<_>>();
+    let hit = match (refs.as_slice(), hit) {
+        ([widened], None) => widened.widened_from.map(|range| agent::refs::HitRef {
+            conversation: None,
+            range,
+        }),
+        (_, hit) => hit,
+    };
+    (refs, hit)
 }
 
 /// `agent read`'s arguments, checked.
@@ -4195,7 +4286,10 @@ impl TargetedArgs for CheckedOutline {
     fn check(args: &Self::CliArgs, config: config::ConfigFile, clock: &dyn Clock) -> Result<Self> {
         let agent_config = config.agent.unwrap_or_default();
         let options = agent_protocol_options(&args.output, &agent_config, clock)?;
-        let outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
+        let mut outline_ref = agent::refs::parse_outline_ref(&args.conversation)?;
+        if let Some(context) = args.message_context() {
+            outline_ref = outline_ref.widened(context);
+        }
         Ok(Self {
             options,
             outline_ref,
@@ -4224,7 +4318,8 @@ impl TargetedArgs for CheckedOutline {
 }
 
 /// `agent read`'s refs and `--hit`, parsed, with the flags that depend
-/// on the refs checked against them.
+/// on the refs checked against them, and widened by [`widened_refs`] for
+/// `-B`, `-A` and `-C` without `--match`.
 struct ParsedReadRefs {
     refs: Vec<agent::refs::ReadRef>,
     hit: Option<agent::refs::HitRef>,
@@ -4244,15 +4339,21 @@ impl ParsedReadRefs {
                 "--anchor requires exactly one conversation ref without an mN range".to_string(),
             ));
         }
-        if (args.lines.is_some() || args.match_query.is_some())
+        if args.lines.is_some()
             && (refs.len() != 1
                 || refs[0].call.is_some()
                 || (!refs[0].range.is_some_and(|range| range.names_one_message())
                     && args.anchor.is_none()))
         {
             return Err(AppError::ConfigError(
-                "--lines and --match require exactly one single-message ref such as ch_...:m7"
-                    .to_string(),
+                "--lines requires exactly one single-message ref such as ch_...:m7".to_string(),
+            ));
+        }
+        if args.match_query.is_some()
+            && let Some(message_ref) = refs.iter().find_map(agent::refs::ReadRef::call_message_ref)
+        {
+            return Err(AppError::ConfigError(
+                agent::refs::whole_message_searcher_rejects_call("--match", &message_ref),
             ));
         }
         let hit = args
@@ -4260,6 +4361,10 @@ impl ParsedReadRefs {
             .as_deref()
             .map(agent::refs::parse_hit_ref)
             .transpose()?;
+        let (refs, hit) = match args.message_context() {
+            Some(context) => widened_refs(refs, hit, context),
+            None => (refs, hit),
+        };
         Ok(Self { refs, hit })
     }
 
@@ -4386,14 +4491,6 @@ pub(crate) fn retrieval_terms(query: &str, mode: SearchMode) -> search::Retrieva
         ),
         _ => search::RetrievalTerms::WordsAndLiterals,
     }
-}
-
-pub(crate) fn resolve_agent_conversation_arg(
-    reference: &str,
-    keys: &[agent::refs::AgentConversationKey],
-    canonicaliser: &Arc<dyn Canonicaliser>,
-) -> Result<agent::refs::ResolvedConversation> {
-    agent::refs::resolve_conversation_ref(keys, reference, canonicaliser)
 }
 
 /// A service on test time that reads this test's session cache and doesn't
@@ -4597,7 +4694,7 @@ mod tests {
             tail: None,
             lines: None,
             match_query: None,
-            context: 3,
+            context: None,
             before_context: None,
             after_context: None,
             perf_stats: false,
@@ -6431,6 +6528,116 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
     }
 
+    /// For every agent's every-record session: `read` and `outline` with
+    /// `-B`, `-A` or `-C` and without `--match` print what the command
+    /// reading their ref widened by those messages of its thread prints, with
+    /// the ref as `--hit` for a read. A whole session, a whole sub-agent
+    /// and a call read as without the flags.
+    #[test]
+    fn every_agents_context_flags_read_and_outline_their_widened_ref() {
+        let mut wrong = Vec::new();
+        for fixture in history::provider::contract_tests::registered_fixtures() {
+            let source = fixture.provider().source();
+            let home = tempfile::tempdir().unwrap();
+            fixture.write_every_record_session(home.path(), &fixture.every_record_session());
+            let storage =
+                history::provider::contract_tests::kept_storage_under(fixture, home.path());
+            let cache = crate::tui::claude_home::admitted_cache();
+            let reference = cache_session_and_reference_it(storage, cache.path());
+            let run = |args: &[String]| {
+                let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                AgentService::new(test_environment(vec![storage], Some(cache.path())))
+                    .execute(agent_command(&args))
+                    .unwrap_or_else(crate::error_report)
+            };
+            let command = |words: &[&str]| -> Vec<String> {
+                words
+                    .iter()
+                    .map(|word| match word.strip_prefix(':') {
+                        Some(address) => format!("{reference}:{address}"),
+                        None if *word == "REF" => reference.clone(),
+                        None => (*word).to_owned(),
+                    })
+                    .collect()
+            };
+            let outline = run(&command(&["outline", "REF"]));
+            let own_messages =
+                agent::test_support::atom(outline.lines().next().unwrap(), "messages")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+            let last = format!(":m{own_messages}");
+            let before_last = format!(":m{}..m{own_messages}", own_messages - 1);
+            let hit_last = format!("m{own_messages}");
+            let mut cases = vec![
+                (
+                    vec!["read", ":m3", "-C", "1"],
+                    vec!["read", ":m2..m4", "--hit", "m3"],
+                ),
+                (
+                    vec!["read", ":m1", "-B", "2", "-A", "1"],
+                    vec!["read", ":m1..m2", "--hit", "m1"],
+                ),
+                (
+                    vec!["read", ":m3..m4", "-B", "1"],
+                    vec!["read", ":m2..m4", "--hit", "m3..m4"],
+                ),
+                (
+                    vec!["read", ":m3", "-C", "1", "--hit", "m4"],
+                    vec!["read", ":m2..m4", "--hit", "m4"],
+                ),
+                (
+                    vec!["read", &last, "-B", "1", "-A", "3"],
+                    vec!["read", &before_last, "--hit", &hit_last],
+                ),
+                (vec!["read", "REF", "-C", "2"], vec!["read", "REF"]),
+                (
+                    vec!["outline", ":m3", "-C", "1"],
+                    vec!["outline", ":m2..m4"],
+                ),
+                (vec!["outline", "REF", "-A", "1"], vec!["outline", "REF"]),
+            ];
+            if outline.lines().any(|line| line.starts_with("subagent s1 ")) {
+                cases.push((vec!["read", ":s1", "-C", "2"], vec!["read", ":s1"]));
+            }
+            let with_tools = run(&command(&["read", "REF", "--tools"]));
+            let call = with_tools
+                .lines()
+                .filter_map(|line| line.split(' ').next())
+                .find(|address| address.starts_with('m') && address.contains('.'))
+                .map(|address| format!(":{address}"));
+            if let Some(call) = call.as_deref() {
+                cases.push((vec!["read", call, "-C", "2"], vec!["read", call]));
+            }
+            let every_flag = ["--tools", "--tool-results", "--thinking", "--subagents"];
+            let alone = run(&command(&[&["read", ":m3"][..], &every_flag].concat()));
+            let anchor = alone
+                .lines()
+                .find(|line| line.starts_with("m3 "))
+                .and_then(|record| agent::test_support::atom(record, "anchor"))
+                .unwrap_or_else(|| panic!("{source:?}: m3 has an anchor:\n{alone}"))
+                .to_owned();
+            cases.push((
+                vec!["read", "REF", "--anchor", &anchor, "-C", "1"],
+                vec!["read", ":m2..m4", "--hit", "m3"],
+            ));
+            for (words, equivalent) in &cases {
+                let (output, expected) = (run(&command(words)), run(&command(equivalent)));
+                if output != expected
+                    || [&output, &expected]
+                        .iter()
+                        .any(|read| read.contains("protocol agent-error "))
+                {
+                    wrong.push(format!(
+                        "{source:?} {words:?} prints what {equivalent:?} prints, without an \
+                         error:\n{output}\n{expected}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+    }
+
     /// True when the perf `records` of a command show that it listed the
     /// sessions of `source`'s agent.
     fn lists_sessions_of(records: &str, source: history::Source) -> bool {
@@ -7904,6 +8111,7 @@ mod tests {
             tui_semantic_search: None,
             budget: None,
             window: TimeFilter::default(),
+            address: None,
         };
 
         let searched = run_agent_within_semantic(
@@ -8428,7 +8636,7 @@ mod tests {
     }
 
     #[test]
-    fn read_and_outline_of_malformed_ref_dont_discover_keys() {
+    fn read_outline_and_within_of_malformed_ref_dont_discover_keys() {
         let sessions = CachedClaudeSessions::new();
 
         let wrong = commands_not_failing_before_key_discovery(
@@ -8440,6 +8648,9 @@ mod tests {
                 &["read", CHANGED_SESSION, "--hit", "x9"],
                 &["outline", "ch_12"],
                 &["outline", &format!("{CHANGED_SESSION}:x9")],
+                &["within", "ch_12", "x"],
+                &["within", &format!("{CHANGED_SESSION}:x9"), "x"],
+                &["within", &format!("{CHANGED_SESSION}:m1.1"), "x"],
             ],
         );
 
@@ -8448,6 +8659,41 @@ mod tests {
             "each command fails with invalid-ref before the keys stage:\n{}",
             wrong.join("\n")
         );
+    }
+
+    #[test]
+    fn sessions_and_outline_print_the_same_with_flags_copied_from_search_and_read() {
+        let sessions = CachedClaudeSessions::new();
+        let reference = sessions.changed_reference();
+        let search_flags = [
+            "-B",
+            "1",
+            "-A",
+            "2",
+            "-C",
+            "3",
+            "--tools",
+            "--tool-results",
+            "--thinking",
+            "--subagents",
+        ];
+
+        for (with_flags, without) in [
+            (
+                [&["sessions", "--all"][..], &search_flags].concat(),
+                vec!["sessions", "--all"],
+            ),
+            (
+                vec!["outline", &reference, "--hit", "m1"],
+                vec!["outline", &reference],
+            ),
+        ] {
+            assert_eq!(
+                sessions.run_beside_another_refresh(&with_flags),
+                sessions.run_beside_another_refresh(&without),
+                "{with_flags:?} prints what {without:?} prints"
+            );
+        }
     }
 
     #[test]
@@ -8460,6 +8706,7 @@ mod tests {
             &[
                 &["read", CHANGED_SESSION, OTHER_SESSION, "--anchor", "ma_1"],
                 &["read", CHANGED_SESSION, "--lines", "1..2"],
+                &["read", &format!("{CHANGED_SESSION}:m1.1"), "--match", "x"],
             ],
         );
 
@@ -9023,6 +9270,56 @@ mod tests {
         );
     }
 
+    /// A hybrid `within` of an address in a session without a copy in the
+    /// session cache prints the lexical hits at the address alone.
+    #[test]
+    fn hybrid_within_of_address_falls_back_to_lexical_hits_at_address() {
+        let home = crate::tui::claude_home::ClaudeHome::new();
+        let cache = crate::tui::claude_home::admitted_cache();
+        let environment = home.environment_with_cache(
+            cache.path(),
+            history::ProcessIdentity::default(),
+            Arc::new(TestClock::default()),
+        );
+        let uncached = home.write(
+            "never",
+            6,
+            &[
+                "a zebrafish question",
+                "an unrelated reply",
+                "a zebrafish answer",
+            ],
+        );
+        let reference = format!("{}:m2..m3", uncached.to_string_lossy());
+        let failing = fail_the_first_data_commit(cache.path(), || {});
+
+        let output = AgentService::new(environment)
+            .execute(agent_command(&[
+                "within",
+                &reference,
+                "zebrafish",
+                "--mode",
+                "hybrid",
+            ]))
+            .unwrap_or_else(crate::error_report);
+
+        drop(failing);
+        assert!(
+            output.contains("protocol agent-warning kind=semantic-unavailable "),
+            "the output warns that semantic search is unavailable:\n{output}"
+        );
+        assert!(
+            output.contains(" hits=1 ") && output.contains(" hit=m3 "),
+            "the lexical hit on m3 shows; m1's is outside m2..m3:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("conversation ") && line.ends_with(":m2..m3")),
+            "the conversation record names the address:\n{output}"
+        );
+    }
+
     /// The `refresh-round` records of `service`'s command.
     fn refresh_rounds(service: &AgentService) -> Vec<String> {
         service
@@ -9294,6 +9591,10 @@ mod tests {
                 .run_outline(
                     &AgentOutlineArgs {
                         conversation: reference.clone(),
+                        unused_read_flags: Default::default(),
+                        context: None,
+                        before_context: None,
+                        after_context: None,
                         perf_stats: false,
                         output: output_flags(),
                     },
@@ -10343,7 +10644,7 @@ mode = "hybrid"
             tail: None,
             lines: None,
             match_query: None,
-            context: 3,
+            context: None,
             before_context: None,
             after_context: None,
             perf_stats: false,
@@ -10386,7 +10687,7 @@ mode = "hybrid"
             tail: None,
             lines: None,
             match_query: None,
-            context: 3,
+            context: None,
             before_context: None,
             after_context: None,
             perf_stats: false,
@@ -10435,6 +10736,10 @@ mode = "hybrid"
         let reference = key.conversation_ref().canonical();
         let args = AgentOutlineArgs {
             conversation: reference.clone(),
+            unused_read_flags: Default::default(),
+            context: None,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: output_flags(),
         };
@@ -10460,6 +10765,10 @@ mode = "hybrid"
         let reference = key.conversation_ref().canonical();
         let args = AgentOutlineArgs {
             conversation: reference.clone(),
+            unused_read_flags: Default::default(),
+            context: None,
+            before_context: None,
+            after_context: None,
             perf_stats: false,
             output: output_flags(),
         };

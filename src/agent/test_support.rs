@@ -390,6 +390,7 @@ const READ_HEADER: &[OrderedAtom] = &[
     required("policy", is_policy),
     optional("last", is_message_list),
     required("over-budget", is_over_budget_runs),
+    optional("matched-messages", is_digits),
     required("tz", is_offset),
     optional("messages-in-window", is_digits),
     optional("subagent-messages-in-window", is_digits),
@@ -446,8 +447,14 @@ const LEGEND: &[OrderedAtom] = &[
     optional("in", is_handle),
 ];
 
+/// `match=…` is followed by `context=`, or by `before-context=` and
+/// `after-context=`.
 const CONTINUE_READ: &[OrderedAtom] = &[
     required("refs", is_message_runs),
+    optional("match", is_atom),
+    optional("context", is_digits),
+    optional("before-context", is_digits),
+    optional("after-context", is_digits),
     required("tools", is_flag),
     required("tool-results", is_flag),
     required("thinking", is_flag),
@@ -475,7 +482,7 @@ const READ_RUNS: &[OrderedAtom] = &[
 
 /// A message's record in a read: `m3 s1 01:50:01 call=m2.1..2 tool=Agent`.
 /// `slice=match=…` is followed by `context=`, or by `before-context=` and
-/// `after-context=`, then by `hits=`.
+/// `after-context=`, then by `matches=`.
 const READ_MESSAGE: &[OrderedAtom] = &[
     optional("from", is_handle),
     optional("call", is_call_list),
@@ -488,7 +495,7 @@ const READ_MESSAGE: &[OrderedAtom] = &[
     optional("context", is_digits),
     optional("before-context", is_digits),
     optional("after-context", is_digits),
-    optional("hits", is_digits),
+    optional("matches", is_digits),
     optional("anchor", is_atom),
 ];
 
@@ -1376,7 +1383,7 @@ mod tests {
             "| Agent (Explore): scout\n",
             "s1:m1 01:50:01 call=m2.1..2 tool=Agent hidden-tools=Read%20File anchor=ma_1\n",
             "day 2026-11-01 tz=-05:00\n",
-            "m3 report 01:10:00 from=s1 slice=match=cargo%20test context=1 hits=2\n",
+            "m3 report 01:10:00 from=s1 slice=match=cargo%20test context=1 matches=2\n",
             "s1:m4..m5 hidden 01:10:01..01:10:05 tools=1 calls=s1:m2.3\n",
             "read refs=ch_0a1:s1:m4;ch_0a1:m4..m5 tools=true tool-results=true thinking=false subagents=false\n",
             "continue read refs=ch_0a1:m9;ch_0a1:s1:m6 tools=true tool-results=false thinking=false subagents=true\n",

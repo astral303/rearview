@@ -1,5 +1,7 @@
 pub mod address;
 pub mod call_links;
+#[cfg(test)]
+mod composed_address_coverage;
 pub mod diagnostic;
 pub mod hidden_parts;
 #[cfg(test)]

@@ -86,8 +86,13 @@ impl MessageAddresses {
 
     /// `m7` or `s3:m2`: message `ordinal`.
     pub fn message(&self, ordinal: usize) -> String {
+        self.address(ordinal).to_string()
+    }
+
+    /// Message `ordinal`'s thread and number in it.
+    pub fn address(&self, ordinal: usize) -> ThreadRange {
         let place = self.place(ordinal);
-        ThreadRange::one(place.thread, place.number).to_string()
+        ThreadRange::one(place.thread, place.number)
     }
 
     /// `m7`, `m7..m9` or `s3:m2..m4`: messages `first` to `last`. Messages of
@@ -413,23 +418,39 @@ impl HitAddresses {
     /// messages of its thread before and after it, shortened at the
     /// thread's ends.
     pub fn recipe_range(&self, context: HitContext) -> ThreadRange {
-        let first = self.hit.first;
-        let last = self.hit.last.unwrap_or(first);
-        ThreadRange::closed(
+        let hit = ThreadRange::closed(
             self.hit.thread,
-            first.saturating_sub(context.before).max(1),
-            last.saturating_add(context.after).min(self.thread_length),
-        )
+            self.hit.first,
+            self.hit.last.unwrap_or(self.hit.first),
+        );
+        let around = context.around(hit);
+        let last = around
+            .last
+            .expect("the context around a closed range ends in a message");
+        ThreadRange::closed(around.thread, around.first, last.min(self.thread_length))
     }
 }
 
-/// The messages of a hit's thread before and after the hit that its
-/// `read ref=` recipe covers: `-B`, `-A` and `-C` of `agent search` and
-/// `agent within`.
+/// The messages of a thread before and after a hit or a ref that `-B`,
+/// `-A` and `-C` add: a hit's `read ref=` recipe on `agent search` and
+/// `agent within`, the messages `agent read` and `agent outline` read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HitContext {
     pub before: usize,
     pub after: usize,
+}
+
+impl HitContext {
+    /// `range` with `before` messages of its thread before it, from the
+    /// thread's first message, and `after` messages after it. An open end
+    /// stays open; a closed end can pass the thread's last message.
+    pub fn around(self, range: ThreadRange) -> ThreadRange {
+        ThreadRange {
+            thread: range.thread,
+            first: range.first.saturating_sub(self.before).max(1),
+            last: range.last.map(|last| last.saturating_add(self.after)),
+        }
+    }
 }
 
 impl Default for HitContext {
@@ -720,6 +741,29 @@ mod tests {
                 hit_with_context(&places, start, end, context),
                 (hit_address.to_owned(), read.to_owned()),
                 "the hit on ordinals {start}..{end} with {context:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_around_ref_keeps_its_thread_and_an_open_end() {
+        let context = HitContext {
+            before: 2,
+            after: 3,
+        };
+
+        for (reference, around) in [
+            ("m5", "m3..m8"),
+            ("m1..m2", "m1..m5"),
+            ("s3:m4..m6", "s3:m2..m9"),
+            ("m7..", "m5.."),
+        ] {
+            assert_eq!(
+                context
+                    .around(parse_messages(reference).unwrap())
+                    .to_string(),
+                around,
+                "{reference}"
             );
         }
     }

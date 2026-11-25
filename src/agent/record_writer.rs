@@ -591,15 +591,17 @@ pub(crate) fn read_record(
 
 /// `continue read refs=ch_…:m3..m5;ch_…:m9 tools=true tool-results=false
 /// thinking=false subagents=false`: the read showing `runs` of the messages
-/// at `reference` that a budget omitted, with `flags`.
+/// at `reference` that a budget omitted, with `match_atoms`, such as
+/// ` match=B9 context=3`, and `flags`.
 pub(crate) fn continue_read_record(
     reference: &str,
     addresses: &MessageAddresses,
     runs: &MessageRuns,
+    match_atoms: &str,
     flags: ContentVisibility,
 ) -> String {
     format!(
-        "continue read refs={}{}\n",
+        "continue read refs={}{match_atoms}{}\n",
         runs.refs(reference, addresses).join(";"),
         flags.recipe_atoms()
     )
