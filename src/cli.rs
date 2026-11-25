@@ -417,8 +417,15 @@ pub struct AgentReadArgs {
     #[arg(long, value_name = "START..END", conflicts_with = "match_texts")]
     pub lines: Option<MessageLineRange>,
     /// Find text in each message read, case-insensitively, and show the
-    /// messages with a matching line, those lines numbered with context
-    #[arg(long = "match", value_parser = non_empty_string, conflicts_with = "lines")]
+    /// messages with a matching line, those lines numbered with context.
+    /// Repeat to match a line containing any of several texts; every
+    /// character is literal
+    #[arg(
+        long = "match",
+        value_name = "TEXT",
+        value_parser = non_empty_string,
+        conflicts_with = "lines"
+    )]
     pub match_texts: Vec<String>,
     /// With --match, content lines before and after each match, 3 by
     /// default; without it, messages of each ref's thread before and after

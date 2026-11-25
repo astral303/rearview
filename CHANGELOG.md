@@ -137,6 +137,12 @@
 - Accept the visibility flags on `agent search` and `agent within`: `--tools`,
   `--tool-results`, `--thinking` and `--subagents`. Each sets its value in
   every hit's `read` recipe, such as `subagents=true`; the hits don't change.
+- Match lines containing any of several texts in `agent read`, as grep's `-e`
+  does: `agent read <ref> --match <text> --match <text>` shows the lines
+  containing either text.
+  - Each text is literal, `|` included. When a text contains `|` and the
+    read doesn't match anything, a `literal-pipe` warning prints the
+    `--match` flags, one for each part of the text.
 - Count in the `agent outline` header what its flags hide, such as
   `hidden-tools=17 hidden-tool-results=15 hidden-thinking=1`.
 - Copy one block of a message in the viewer. In message navigation, focus a
