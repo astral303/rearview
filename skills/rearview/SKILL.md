@@ -170,6 +170,8 @@ record. A `>` marks a matching line, and `...` marks omitted lines between
 match windows. With `--match`, `-B N` and `-A N` set the lines before and
 after each match. `--lines` requires one single-message ref. `--match`
 accepts any address and prints only the messages with a matching line.
+Repeat it to match lines containing any of several texts:
+`--match B9 --match B12`.
 
 Failures exit nonzero and write one typed compact line to stderr, after any
 warning records:
@@ -192,7 +194,8 @@ print as one `kind=` `count=` record; a budget never cuts them. A
 `semantic-unavailable` warning on hybrid output means lexical fallback; a
 semantic `agent within` of a session without a copy in the session cache
 fails with that kind, so retry with `--mode lexical`.
-Mention reduced coverage when it matters.
+Mention reduced coverage when it matters. A `literal-pipe` warning lists
+the `--match` flags to run.
 
 Agent defaults can come from `[agent]`: scope, mode, output budget, result depth,
 project exclusions, and visibility policy. Command flags override config;

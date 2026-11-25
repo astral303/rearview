@@ -645,6 +645,10 @@ fn read_records_of(reference: &str, agent: &str) -> String {
         "agent", "read", reference, "--match", "the", "-C", "0", "--budget", "800",
     ]);
     run(&["agent", "read", reference, "--match", "zzqqxx"]);
+    run(&["agent", "read", reference, "--match", "zzqq|xxyy"]);
+    run(&[
+        "agent", "read", reference, "--match", "answer", "--match", "Sentinel", "-C", "0",
+    ]);
     run(&[
         "agent",
         "read",
@@ -877,11 +881,12 @@ fn agent_command(args: &[&str]) -> AgentCommandRun {
     AgentCommandRun { record, stdout }
 }
 
-/// `args` as a shell line: an argument with a space or a quote is quoted.
+/// `args` as a shell line: an argument with a space, a quote or a `|` is
+/// quoted.
 fn quoted(args: &[&str]) -> String {
     args.iter()
         .map(|arg| {
-            if arg.is_empty() || arg.contains([' ', '"', '\'']) {
+            if arg.is_empty() || arg.contains([' ', '"', '\'', '|']) {
                 format!("'{}'", arg.replace('\'', "'\\''"))
             } else {
                 (*arg).to_owned()

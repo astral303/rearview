@@ -244,6 +244,44 @@ $ rearview agent read ch_581699c40efc --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagent-messages=5
 conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+$ rearview agent read ch_581699c40efc --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagent-messages=5 warnings=1 warning-records=1
+conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
+$ rearview agent read ch_581699c40efc --match answer --match Sentinel -C 0
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=14 tz=-04:00 hidden-tools=17 hidden-tool-results=15 hidden-thinking=1 hidden-subagent-messages=5
+conversation project=pr_21cafa6a9e25db55 uuid=5c0f1a2b-3d4e-4f60-8172-93a4b5c6d7e8 ref=ch_581699c40efc
+day 2026-09-01
+m1 user 06:00:00 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_b70d0050c8cbc1e7
+| >1: USER_TEXT_SENTINEL: check the plugin's files and how it starts
+m2 06:00:02 hidden-tools=Bash hidden-thinking=1 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_9118b1c616e424d6
+| >1: ASSISTANT_TEXT_SENTINEL: listing the files first.
+m8 report 06:01:00 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_fe37f6fb3610a863
+| >3: TASK_REPORT_SENTINEL: the background check passed.
+m9 user 06:02:00 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_56486015a74c7729
+| >1: /model SLASH_COMMAND_SENTINEL
+m10 user 06:02:01 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_f8d8c4b8a769bcad
+| >1: SLASH_OUTPUT_SENTINEL: set model to Opus 5
+m12 user 06:02:01 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_3a53dbf2ba796dfe
+| >1: FAILED_SLASH_COMMAND_SENTINEL: Error during compaction: API Error: Connection lost mid-response.
+m13 user 06:02:02 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_9b62236225d2c363
+| >1: QUEUED_PROMPT_SENTINEL: and run the tests
+m23 user 06:02:07 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_bd3244691214c294
+| >1: [Hook] UserPromptSubmit: HOOK_ROW_SENTINEL: run the tests before you finish
+m24 user 06:02:09 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_272ecd5a083d8ee4
+| >1: [Hook] Stop error: STOP_HOOK_ERROR_SENTINEL: notify: not found
+m25 user 06:02:10 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_1f3f5a824136e00f
+| >4: [Line 3:5] DIAGNOSTICS_SENTINEL: cannot find value `x` in this scope [E0425] (rustc)
+m26 user 06:30:00 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_70082725cbe6bc64
+| >1: [Recap] RECAP_SENTINEL: fix the parser, then run the tests.
+m27 user 06:31:00 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_edb9945a944d3f01
+| >1: [Notice] NOTICE_SENTINEL: safeguards flagged this message; switched model.
+m30 06:32:02 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_9f5465756dd3a760
+| >1: NUMBERED_REPLY_SENTINEL: the reader keeps its numbering in one module.
+m45 user 06:34:00 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_625cd96f3184c512
+| >1: is <command-name>/model</command-name> QUOTED_TAG_SENTINEL?
 $ rearview agent read ch_581699c40efc:m3 -C 1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=2 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=1
@@ -691,6 +729,32 @@ $ rearview agent read ch_0b26e45343df --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
 conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
+$ rearview agent read ch_0b26e45343df --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=2 warning-records=2
+conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
+protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
+$ rearview agent read ch_0b26e45343df --match answer --match Sentinel -C 0
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=7 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
+conversation project=pr_d1f3a41d6218050d uuid=session_0f000000-0000-4000-8000-000000000001 ref=ch_0b26e45343df
+day 2026-08-06
+m3 06:00:04 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_71a0c737ae0a7d42
+| >1: kimi answer searchable
+m8 report 06:03:20 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_263ac382190aa668
+| >1: TASK_NOTICE_SENTINEL: headless trace completed.
+m9 user 06:03:20 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_dc1e8378746fa41b
+| >1: [Hook] UserPromptSubmit: HOOK_RESULT_SENTINEL: prompt quality C.
+m10 user 06:03:20 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_05cd1219d7907a09
+| >1: [Hook] PreToolUse blocked: BLOCKED_HOOK_SENTINEL: rm is not allowed.
+m11 user 06:03:20 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_b4589e32e612f3c5
+| >1: [Scheduled] SCHEDULED_SENTINEL: check the build.
+m14 user 06:03:20 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_5f50be2088afda6a
+| >1: /mcp-config SLASH_ARGS_SENTINEL
+m18 06:03:21 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_bffed4c0bd40c998
+| >1: NUMBERED_REPLY_SENTINEL: the command printed nothing.
 protocol agent-warning kind=malformed-transcript ref=ch_0b26e45343df detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2014
 $ rearview agent read ch_0b26e45343df:s1:m3 -C 1
 --- stdout
@@ -1177,6 +1241,34 @@ $ rearview agent read ch_74aec3f6df49 --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagent-messages=5 warnings=1 warning-records=1
 conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
+$ rearview agent read ch_74aec3f6df49 --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagent-messages=5 warnings=2 warning-records=2
+conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
+protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
+$ rearview agent read ch_74aec3f6df49 --match answer --match Sentinel -C 0
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=7 tz=-04:00 hidden-tools=31 hidden-tool-results=24 hidden-thinking=1 hidden-subagent-messages=5 warnings=1 warning-records=1
+conversation project=pr_8e04fd81f1edba6b uuid=019f0000-0000-7000-8000-00000000000a ref=ch_74aec3f6df49
+day 2026-08-01
+m3 06:00:05 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_eb1c272f9dd484f3
+| >1: codex answer searchable
+m14 06:02:30 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_7100872509cb233e
+| >1: closing answer
+m16 user 06:03:01 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_81073082ec9c8aaf
+| >1: [Goal] GOAL_SENTINEL: ship the parser
+m23 06:03:08 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_b62ed18cf7fc160b
+| >1: NUMBERED_REPLY_SENTINEL: the command printed nothing.
+m43 user 06:03:26 slice=match=answer match=Sentinel context=0 matches=2 anchor=ma_5d090b767c0eeae0
+| >1: > QUESTION_TITLE_SENTINEL: which profile?
+| ...
+| >3: PICKED_OPTION_SENTINEL: warm idle
+m44 user 06:03:27 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_4e7b5a1be4214e7a
+| >4: TYPED_ANSWER_SENTINEL: then save the log.
+m45 user 06:03:28 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_0a4fc9eaa358ccd0
+| >2: [{"answer":"QUOTED_ENVELOPE_SENTINEL","question":"Ship it?","questionItemId":"call_other"}]
 protocol agent-warning kind=malformed-transcript ref=ch_74aec3f6df49 detail=skipped%201%20malformed%20JSONL%20record%28s%29%20at%20lines%2017
 $ rearview agent read ch_74aec3f6df49:s1:m2 -C 1
 --- stdout
@@ -1667,6 +1759,22 @@ $ rearview agent read ch_974c3840e189 --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2
 conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+$ rearview agent read ch_974c3840e189 --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2 warnings=1 warning-records=1
+conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
+$ rearview agent read ch_974c3840e189 --match answer --match Sentinel -C 0
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=3 tz=-05:00 hidden-tools=6 hidden-tool-results=4 hidden-thinking=1 hidden-subagent-messages=2
+conversation project=pr_ff736763805b1bd0 uuid=omp_session_custom_id ref=ch_974c3840e189
+day 2026-01-01
+m2 22:04:07 hidden-thinking=1 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_ae82025b1bde4dd6
+| >1: OMP root answer
+m4 22:04:13 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_676971aef9ade34e
+| >1: OMP active answer
+m11 22:04:20 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_df3b84fec509f023
+| >1: NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
 $ rearview agent read ch_974c3840e189:m3 -C 1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-thinking=1 hidden-subagent-messages=2
@@ -1961,6 +2069,20 @@ $ rearview agent read ch_efbbec792ccc --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+$ rearview agent read ch_efbbec792ccc --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
+conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
+$ rearview agent read ch_efbbec792ccc --match answer --match Sentinel -C 0
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=2 tz=-04:00 hidden-tools=8 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
+conversation project=pr_bee3e188a306f039 uuid=ses_standard ref=ch_efbbec792ccc
+day 2025-08-12
+m1 user 08:01:40 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_c1e9c7fdb755a0e4
+| >1: The user made the following comment regarding lines 40 through 68 of errorHandler.ts: COMMENT_SENTINEL this looks messy
+m12 08:05:30 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_ed3512b1a4b46d93
+| >1: NUMBERED_REPLY_SENTINEL: the command printed nothing.
 $ rearview agent read ch_efbbec792ccc:m3 -C 1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-04:00 hidden-tools=1 hidden-tool-results=1 hidden-thinking=1 hidden-subagent-messages=3
@@ -2241,6 +2363,20 @@ $ rearview agent read ch_f04d3718e406 --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1
 conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+$ rearview agent read ch_f04d3718e406 --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1 warnings=1 warning-records=1
+conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
+$ rearview agent read ch_f04d3718e406 --match answer --match Sentinel -C 0
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=2 tz=-05:00 hidden-tools=7 hidden-tool-results=5 hidden-thinking=1
+conversation project=pr_a9bea395f21dc494 uuid=01912345-6789-7abc-8def-0123456789ab ref=ch_f04d3718e406
+day 2024-02-29
+m2 19:02:00 hidden-tools=read hidden-thinking=1 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_0763fac584b77a74
+| >1: root answer
+m15 19:19:05 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_95ccedad674c9d55
+| >1: NUMBERED_REPLY_SENTINEL: the build is clean and the notes file is empty.
 $ rearview agent read ch_f04d3718e406:m3 -C 1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none tz=-05:00 hidden-tools=2 hidden-tool-results=2 hidden-thinking=1
@@ -2499,6 +2635,20 @@ $ rearview agent read ch_982349c13ee4 --match zzqqxx
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
 conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+$ rearview agent read ch_982349c13ee4 --match 'zzqq|xxyy'
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=0 tz=-04:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3 warnings=1 warning-records=1
+conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+protocol agent-warning kind=literal-pipe detail=--match%20searched%20for%20the%20literal%20text%20zzqq%7Cxxyy%3B%20to%20match%20any%20of%20several%20texts%2C%20repeat%20the%20flag:%20--match%20zzqq%20--match%20xxyy
+$ rearview agent read ch_982349c13ee4 --match answer --match Sentinel -C 0
+--- stdout
+protocol agent-read cut=none chars=20000 policy=text over-budget=none matched-messages=2 tz=-05:00 hidden-tools=7 hidden-tool-results=6 hidden-thinking=1 hidden-subagent-messages=3
+conversation project=pr_189d5258b8d193e6 uuid=019a0000-0000-7000-8000-000000000001 ref=ch_982349c13ee4
+day 1969-12-31
+m3 19:00:01 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_8def110f79b46925
+| >1: grok answer searchable
+m10 19:00:01 slice=match=answer match=Sentinel context=0 matches=1 anchor=ma_c07158a92b7c10ab
+| >1: NUMBERED_REPLY_SENTINEL: the command printed nothing.
 $ rearview agent read ch_982349c13ee4:s1:m3 -C 1
 --- stdout
 protocol agent-read cut=none chars=20000 policy=text+subagents over-budget=none tz=-05:00 hidden-thinking=1

@@ -4091,12 +4091,10 @@ impl AgentService {
         let slice = if let Some(range) = args.lines {
             Some(agent::protocol::ReadSlice::Lines(range))
         } else {
-            args.match_query
-                .as_ref()
-                .map(|query| agent::protocol::ReadSlice::Match {
-                    query: query.clone(),
-                    context: args.match_context(),
-                })
+            (!args.match_texts.is_empty()).then(|| agent::protocol::ReadSlice::Match {
+                texts: args.match_texts.clone(),
+                context: args.match_context(),
+            })
         };
         let mut warnings = discovery_warnings;
         warnings.extend(resolved_refs.iter().zip(transcripts.iter()).filter_map(
@@ -4349,7 +4347,7 @@ impl ParsedReadRefs {
                 "--lines requires exactly one single-message ref such as ch_...:m7".to_string(),
             ));
         }
-        if args.match_query.is_some()
+        if !args.match_texts.is_empty()
             && let Some(message_ref) = refs.iter().find_map(agent::refs::ReadRef::call_message_ref)
         {
             return Err(AppError::ConfigError(
@@ -4693,7 +4691,7 @@ mod tests {
             hit: None,
             tail: None,
             lines: None,
-            match_query: None,
+            match_texts: Vec::new(),
             context: None,
             before_context: None,
             after_context: None,
@@ -10643,7 +10641,7 @@ mode = "hybrid"
             hit: None,
             tail: None,
             lines: None,
-            match_query: None,
+            match_texts: Vec::new(),
             context: None,
             before_context: None,
             after_context: None,
@@ -10686,7 +10684,7 @@ mode = "hybrid"
             hit: None,
             tail: None,
             lines: None,
-            match_query: None,
+            match_texts: Vec::new(),
             context: None,
             before_context: None,
             after_context: None,
